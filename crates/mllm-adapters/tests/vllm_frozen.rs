@@ -287,9 +287,14 @@ fn discrete_effective() -> EffectiveDeployment {
 #[test]
 fn a_discrete_plan_sizes_utilization_from_the_device_request() {
     let effective = discrete_effective();
+    // The card is charged the request and the CUDA context and graphs; vLLM
+    // is sized from the request alone (76 % of the card below).
     assert_eq!(
         effective.ready_device_allocation(),
-        Some((Some(0), 12 << 30))
+        Some((
+            Some(0),
+            (12 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+        ))
     );
     // Without the card's total the plan keeps the gate; the launch paths
     // refuse such a launch before building it (`with_device_total`).

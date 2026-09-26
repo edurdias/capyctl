@@ -1605,48 +1605,13 @@ async fn start_standalone_inner(
             &gpu_shape,
         );
         models.write_into(&mut host);
-        // Design §3: on a discrete host the probe is the discrete template,
-        // sized for an empty checkpoint, on the GPU the picker would choose
-        // first; its resolution states those zero weights.
-        let (memory, facts) = match &gpu_shape {
-            HostShape::Discrete(gpus) => (
-                crate::standalone_config::discrete_template_memory(
-                    gpus,
-                    capacity_bytes,
-                    Some(0),
-                    None,
-                )
-                .ok_or_else(|| StartError::Deploy("host policy invalid: no GPU".into()))?,
-                mllm_config::effective::CheckpointFacts {
-                    weights_bytes: Some(0),
-                    ..Default::default()
-                },
-            ),
-            HostShape::Unified | HostShape::NoGpu => (
-                crate::standalone_config::TemplateMemory::Unified { capacity_bytes },
-                mllm_config::effective::CheckpointFacts::default(),
-            ),
-        };
-        let probe = crate::standalone_config::deployment_document(
-            "policy-probe",
-            "policy-probe",
-            &ModelSource::Local {
-                path: "/dev/null".into(),
-            },
-            installation.engine,
-            &memory,
-            crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
-            installation.deep_park,
-            &named[0].profile,
-        )
-        .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
-        let probe = mllm_config::instances::device_choices(&probe, &host)
-            .ok()
-            .and_then(|choices| choices.into_iter().next())
-            .map_or(probe, |(_, chosen)| chosen);
-        mllm_config::effective::resolve_effective_with_checkpoint(&probe, &host, facts)
+        // The host's own policy, normalized exactly as resolution normalizes
+        // it (`resolve_effective(..).host` is this same value). Nothing here
+        // sizes a deployment: a card too small for any template boots and
+        // refuses each deployment with `insufficient_device_memory` and its
+        // numbers, instead of the whole start failing on a sized probe.
+        mllm_config::effective::normalize_host_policy(&host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
-            .host
     };
 
     // Spec §3: the identity key that seals every per-launch engine key lives in a

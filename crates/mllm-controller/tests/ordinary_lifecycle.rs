@@ -3324,9 +3324,11 @@ async fn instances_start_on_the_gpu_with_room() {
             .sum()
     };
     let second = format!("deployment:{}/instance:1", fence.deployment_id);
-    assert_eq!(on(&fence.deployment_id, "gpu1"), 12 << 30);
+    // The request plus the engine's CUDA context and graphs (ADR 0019).
+    let on_card = (12 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    assert_eq!(on(&fence.deployment_id, "gpu1"), on_card);
     assert_eq!(on(&fence.deployment_id, "gpu0"), 0);
-    assert_eq!(on(&second, "gpu0"), 12 << 30);
+    assert_eq!(on(&second, "gpu0"), on_card);
     assert_eq!(on(&second, "gpu1"), 0);
     worker.shutdown().await.unwrap();
 }

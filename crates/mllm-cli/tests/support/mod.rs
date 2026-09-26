@@ -309,7 +309,7 @@ pub fn binary_template_memory() -> mllm_cli::standalone_config::TemplateMemory {
 
 /// The card a binary test sizes a discrete deployment for (see
 /// [`binary_template_memory`]).
-pub const BINARY_TEST_DEVICE_BYTES: i64 = 4 << 30;
+pub const BINARY_TEST_DEVICE_BYTES: i64 = 10 << 30;
 
 pub fn test_memory() -> mllm_cli::host_observation::MemoryReader {
     mllm_cli::host_observation::fixed_memory(TEST_CAPACITY_BYTES, TEST_CAPACITY_BYTES)

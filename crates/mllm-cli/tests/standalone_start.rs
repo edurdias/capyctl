@@ -722,14 +722,17 @@ async fn a_discrete_standalone_sizes_its_deployment_from_the_checkpoint() {
             limits.managed_limit,
             gpu.total_bytes,
         );
+        // The card is charged the request and the engine's CUDA context and
+        // graphs (ADR 0019).
+        let on_card = request + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
         let ready = &effective["resources"]["ready"]["allocations"];
         assert_eq!(ready[0]["domain"], "gpu0", "{effective}");
-        assert_eq!(ready[0]["bytes"], request, "{effective}");
+        assert_eq!(ready[0]["bytes"], on_card, "{effective}");
         assert_eq!(ready[1]["domain"], "system", "{effective}");
         // The startup peak on the card is the request: a derived peak of
         // weights x 1.6 plus a margin would not fit a 16 GB card.
         let cold = &effective["resources"]["cold"]["allocations"];
-        assert_eq!(cold[0]["bytes"], request, "{effective}");
+        assert_eq!(cold[0]["bytes"], on_card, "{effective}");
         let _ = app.shutdown().await;
     }
 }
@@ -1008,5 +1011,46 @@ async fn an_engine_charged_under_the_previous_policy_is_stopped_before_the_migra
             .collect::<Vec<_>>(),
         ["gpu0", "system"]
     );
+    let _ = app.shutdown().await;
+}
+
+/// ADR 0019 (final review I3): the device domain is charged the request plus
+/// the engine's CUDA context and graphs. A card too small for any vLLM
+/// template no longer fails the whole start (it did below about 4 GiB, from
+/// a sized probe at boot); the host boots and each deployment is refused
+/// with `insufficient_device_memory` and its numbers.
+// T26
+#[tokio::test]
+async fn a_card_too_small_for_vllm_boots_and_refuses_the_deployment() {
+    use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, GpuSample};
+    let small = || {
+        Some(GpuSample {
+            devices: vec![GpuDevice {
+                index: 0,
+                uuid: "GPU-00000000-2222-3333-4444-555555555555".into(),
+                pci_bus_id: "00000000:01:00.0".into(),
+                name: "small".into(),
+                memory: Some(GpuMemory {
+                    total_bytes: 3 << 30,
+                    used_bytes: 0,
+                    free_bytes: 3 << 30,
+                }),
+            }],
+            sampled_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        })
+    };
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(1 << 30);
+    let app = support::try_boot_discrete(dir.path(), small, store.path(), true)
+        .await
+        .expect("a small card boots");
+    let error = app
+        .deploy("m", ModelSource::Local { path: "m".into() })
+        .expect_err("vLLM cannot fit a 3 GiB card");
+    let structured = mllm_cli::output::StructuredError::from(error);
+    assert_eq!(structured.code, "insufficient_device_memory");
     let _ = app.shutdown().await;
 }

@@ -76,12 +76,16 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// to check authority, not to launch), the low unified gate. A launch on a
 /// device domain states the total first (`EffectiveDeployment::with_device_total`)
 /// or is refused.
+///
+/// The share is the memory request, not the device domain's charge: the
+/// charge also carries the CUDA context and graphs vLLM holds beyond its
+/// utilization budget (ADR 0019), which vLLM must not be told to allocate.
 fn utilization_pct(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u8 {
     match (
         effective.ready_device_allocation(),
         settings.memory.device_total_bytes,
     ) {
-        (Some((_, request)), Some(total)) => device_utilization_pct(request, total),
+        (Some(_), Some(total)) => device_utilization_pct(settings.memory.request_bytes, total),
         _ => GPU_UTILIZATION_GATE_PCT,
     }
 }

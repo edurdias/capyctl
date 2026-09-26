@@ -532,14 +532,15 @@ the host refuses to start if a `device` domain does not match the GPU it
 observes (`device_policy_mismatch`, exit 2).
 
 **Both domains are charged.** Every deployment on a discrete GPU is charged on
-the card (weights, KV cache, the engine's CUDA memory) and in host RAM (the
-engine process itself, 4 GiB until measured). A deployment that states no
-memory is sized from its checkpoint: `weights × 1.10` plus a KV cache of
-`min(4 GiB, 25 % of the card's managed limit)`. A vLLM deployment asks for at
-least 75 % of the card, because vLLM 0.29 with CUDA graphs does not start a 4B
-model on a 16 GB card below `--gpu-memory-utilization 0.75`; for the same
-reason, a standalone start with a vLLM installation fails at boot on a card
-with less than about 4 GiB. A deployment that lists `resources:` itself must
+the card (weights, KV cache, and the engine's CUDA context and graphs, 1.25 GiB
+until measured) and in host RAM (the engine process itself, 4 GiB until
+measured). A deployment that states no memory is sized from its checkpoint:
+`weights × 1.10` plus a KV cache of `min(4 GiB, 25 % of the card's managed
+limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
+0.29 with CUDA graphs does not start a 4B model on a 16 GB card below
+`--gpu-memory-utilization 0.75`; for the same reason vLLM needs a card of
+about 10 GiB or more. On a smaller card the host still starts, and each vLLM
+deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
 name the `system` domain as well as the GPU's (`missing_system_allocation`
 otherwise); leaving them out and letting mllm derive them is the portable form.
 

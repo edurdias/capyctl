@@ -107,9 +107,13 @@ domain.
 A deployment that states no memory gets a device request of `weights × 1.10 + kv_cache`,
 with `kv_cache = min(4 GiB, 25 % of the device managed limit)`. A vLLM request is at least
 75 % of the card: vLLM 0.29 with CUDA graphs needs `--gpu-memory-utilization` of at least
-0.75 to start a 4B model on a 16 GB card (observed on the discrete-GPU laptop host). A
-weights-derived request larger than the device managed limit is refused at deploy with
-`insufficient_device_memory`, before anything is stored. Unknown weights (a Hugging Face or
+0.75 to start a 4B model on a 16 GB card (observed on the discrete-GPU laptop host). The
+device domain is charged the request plus the engine's CUDA context and graphs, which it
+holds beyond the request (a 1.25 GiB placeholder for both engines; measured live, vLLM
+0.29 held 13.2 GiB against a 12.0 GiB request), so the planner, admission and the launch
+check judge what the engine really holds. A request whose charge is larger than the device
+managed limit is refused at deploy with `insufficient_device_memory`, before anything is
+stored. Unknown weights (a Hugging Face or
 HTTP source not yet downloaded) are accepted provisionally and re-resolved once the
 checkpoint digest measures them (ADR 0014 §7). A declared KV cache
 (`local_engine.kv_cache`, `--kv-cache`, `MLLM_KV_CACHE_BYTES`) is honoured within the
@@ -357,9 +361,10 @@ added.
   one line.
 - One more closed-set capability exists; an older host with a discrete GPU stays refused,
   now with a precise reason.
-- On a card under about 4 GiB a standalone start with a vLLM installation fails at boot
-  (the host policy is invalid), because the 0.75 utilization floor exceeds the device
-  managed limit.
+- With the 0.75 utilization floor and the device overhead, a vLLM deployment needs a card
+  of about 10 GiB or more (an 8 GB card's managed limit is below 0.75 of the card plus the
+  overhead); on a smaller card the host still boots and each vLLM deployment is refused
+  `insufficient_device_memory` with its numbers. SGLang has no floor.
 - CPU and Fake-engine tests pin the accounting and the configuration. They are not
   qualification: that a native engine recipe works on a discrete card is established only
   by the live rows (DG1–DG7).

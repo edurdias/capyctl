@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 const NOW: i64 = 10_000;
 const DEADLINE: i64 = 200_000;
 const GIB: i64 = 1 << 30;
+/// ADR 0019: the device domain also carries the engine\'s CUDA context and graphs.
+const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
 const HOST: (&str, &str) = ("host-a", "laptop");
 const UUID1: &str = "GPU-11111111-1111-1111-1111-111111111111";
 
@@ -339,8 +341,16 @@ fn a_remote_multi_gpu_host_places_and_pins_like_a_discrete_standalone() {
     for (n, (step, _, _)) in planned.iter().enumerate() {
         t.ready(step, 100 + 10 * n as u32);
     }
-    assert_eq!(t.charged("gpu1"), 12 * GIB, "instance 0 is charged on gpu1");
-    assert_eq!(t.charged("gpu0"), 12 * GIB, "instance 1 is charged on gpu0");
+    assert_eq!(
+        t.charged("gpu1"),
+        12 * GIB + OVERHEAD,
+        "instance 0 is charged on gpu1"
+    );
+    assert_eq!(
+        t.charged("gpu0"),
+        12 * GIB + OVERHEAD,
+        "instance 1 is charged on gpu0"
+    );
     assert_eq!(t.charged("system"), 2 * (4 * GIB), "engine host overhead");
 
     // The host pins each launch to its own GPU: gpu1 by the UUID it
@@ -484,7 +494,7 @@ fn a_remote_discrete_host_is_credited_per_domain() {
         if split {
             let context = armed.expect("instance 0's GPU bytes are credited on gpu1");
             t.complete(&planned[1].0, context, 200);
-            assert_eq!(t.charged("gpu1"), 24 * GIB);
+            assert_eq!(t.charged("gpu1"), 2 * (12 * GIB + OVERHEAD));
         } else {
             assert!(
                 armed.is_err(),

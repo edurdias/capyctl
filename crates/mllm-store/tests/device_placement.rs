@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 const NOW: i64 = 10_000;
 const DEADLINE: i64 = 200_000;
 const GIB: i64 = 1 << 30;
+/// ADR 0019: the device domain also carries the engine\'s CUDA context and graphs.
+const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
 
 struct Gpus {
     _dir: tempfile::TempDir,
@@ -392,8 +394,16 @@ fn instances_land_on_the_gpu_with_room_and_keep_it() {
     for (n, (step, _, _)) in planned.iter().enumerate() {
         t.ready(step, 100 + 10 * n as u32);
     }
-    assert_eq!(t.charged("gpu1"), 12 * GIB, "instance 0 is charged on gpu1");
-    assert_eq!(t.charged("gpu0"), 12 * GIB, "instance 1 is charged on gpu0");
+    assert_eq!(
+        t.charged("gpu1"),
+        12 * GIB + OVERHEAD,
+        "instance 0 is charged on gpu1"
+    );
+    assert_eq!(
+        t.charged("gpu0"),
+        12 * GIB + OVERHEAD,
+        "instance 1 is charged on gpu0"
+    );
 
     // Both stop; instance 1 starts alone. Both cards are empty, and gpu1 has
     // more room, but the instance prefers the GPU it last ran on.
@@ -405,7 +415,10 @@ fn instances_land_on_the_gpu_with_room_and_keep_it() {
     assert_eq!(planned.len(), 1);
     assert_eq!((planned[0].1, planned[0].2.as_str()), (1, "gpu0"));
     t.ready(&planned[0].0, 300);
-    assert_eq!((t.charged("gpu0"), t.charged("gpu1")), (12 * GIB, 0));
+    assert_eq!(
+        (t.charged("gpu0"), t.charged("gpu1")),
+        (12 * GIB + OVERHEAD, 0)
+    );
 }
 
 // Discrete GPU design §7 (W10 per GPU): with both cards full, the switch

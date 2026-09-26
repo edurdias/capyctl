@@ -1379,7 +1379,9 @@ fn unified_observations() -> Vec<MemoryObservation> {
 
 fn charge(store: &crate::Store, owner: &str, domain: &str) {
     store.conn.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES(?1,?1,'model',NULL,'running',1,0,1,1)", [owner]).unwrap();
-    let footprint = serde_json::json!({"version":1,"phase":"ready","allocations":[[domain,30,0]],"devices":[]}).to_string();
+    let footprint =
+        serde_json::json!({"version":1,"phase":"ready","allocations":[[domain,30,0]],"devices":[]})
+            .to_string();
     store
         .conn
         .execute(

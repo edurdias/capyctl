@@ -176,9 +176,9 @@ fn a_minimal_file_resolves_on_a_discrete_host() {
         .map(|a| a.domain.as_str())
         .collect();
     assert_eq!(domains, ["gpu0", "system"]);
-    // 9 GiB of weights plus the engine's host overhead exceed what the system
+    // 8 GiB of weights plus the engine's host overhead exceed what the system
     // domain holds parked: deep.
-    let large = resolve_effective_with_checkpoint(&deployment, &host, weights(9 * GIB)).unwrap();
+    let large = resolve_effective_with_checkpoint(&deployment, &host, weights(8 * GIB)).unwrap();
     assert_eq!(large.residency, Residency::Deep);
     // A stated residency is kept.
     let mut stated = deployment.clone();
@@ -200,11 +200,11 @@ fn a_defaulted_residency_is_chosen_again_from_the_measured_weights() {
     assert_eq!(provisional.residency, Residency::HostBacked);
     let snapshot = serde_json::to_string(&provisional).unwrap();
     assert_eq!(decode_effective_snapshot(&snapshot).unwrap(), provisional);
-    let measured = resolve_snapshot_with_checkpoint(&snapshot, weights(9 * GIB)).unwrap();
+    let measured = resolve_snapshot_with_checkpoint(&snapshot, weights(8 * GIB)).unwrap();
     assert_eq!(measured.residency, Residency::Deep);
     assert_eq!(
         measured,
-        resolve_effective_with_checkpoint(&deployment, &host, weights(9 * GIB)).unwrap()
+        resolve_effective_with_checkpoint(&deployment, &host, weights(8 * GIB)).unwrap()
     );
     let snapshot = serde_json::to_string(&measured).unwrap();
     assert_eq!(decode_effective_snapshot(&snapshot).unwrap(), measured);

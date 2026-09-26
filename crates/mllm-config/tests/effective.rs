@@ -1612,10 +1612,14 @@ fn phase(p: &PhaseFootprint) -> Vec<(String, i64)> {
 fn deep_budgets_charge_device_and_system() {
     let d = deployment_with("deep", "vllm", "10GiB");
     let r = resolve(&d, &discrete_host()).unwrap().resources;
+    // The card holds the request and the engine's CUDA context and graphs.
     assert_eq!(
         phase(&r.ready),
         vec![
-            ("gpu0".into(), 10 * GIB),
+            (
+                "gpu0".into(),
+                10 * GIB + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+            ),
             ("system".into(), ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES)
         ]
     );
@@ -1763,8 +1767,9 @@ fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
     let request = 8 * GIB / 100 * 110 + GIB;
     assert_eq!(sglang.engine_config.memory().request_bytes, request);
     assert_eq!(sglang.engine_config.memory().startup_bytes, Some(request));
-    assert_eq!(sglang.ready_device_allocation(), Some((Some(0), request)));
-    assert_eq!(phase(&sglang.resources.cold)[0], ("gpu0".into(), request));
+    let on_card = request + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    assert_eq!(sglang.ready_device_allocation(), Some((Some(0), on_card)));
+    assert_eq!(phase(&sglang.resources.cold)[0], ("gpu0".into(), on_card));
     // vLLM: at least 0.75 of the card the device domain declares (managed
     // limit plus free reserve, 16 GiB here).
     let vllm = resolve(&kv_only("vllm"), &discrete_host()).unwrap();

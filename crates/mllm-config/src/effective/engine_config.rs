@@ -34,6 +34,16 @@ pub const ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES: i64 = 4 << 30;
 /// `PARKED_RESIDUAL_PLACEHOLDER_BYTES` stays for unified hosts.
 pub const PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES: i64 = 1 << 30;
 
+/// ADR 0019 (discrete GPU design §3): the device memory an engine holds beyond
+/// its memory request (the CUDA context and the CUDA graphs it captures after
+/// sizing its KV cache), charged on the device domain in every active phase.
+/// Measured live on a 16 GB discrete GPU with vLLM 0.29: a 12.0 GiB request
+/// held 13.2 GiB of the card, 1.2 GiB beyond it. SGLang's static memory
+/// fraction likewise leaves its graphs outside it, so one rule charges both
+/// engines. A placeholder (1.25 GiB) until the measured device peak replaces
+/// it.
+pub const ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES: i64 = 5 << 28;
+
 /// Discrete GPU design §3: the host RAM a `host_backed` copy of `weights`
 /// bytes takes. The copy is pinned host memory, which PyTorch's pinned
 /// allocator rounds up per tensor. Measured live on a 16 GB discrete GPU with
@@ -218,13 +228,15 @@ fn device_request_from_weights(
         Engine::Sglang => 0,
     };
     let request = request.max(floor);
-    if request > device.managed_limit {
+    let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
+    if charged > device.managed_limit {
         return Err(invalid(
             "engine_config.memory.request",
             format!(
-                "insufficient_device_memory: the deployment needs a device memory request of \
-                 {request} bytes (weights x 1.10 plus the KV cache), above the {} bytes the \
-                 device domain manages; use a smaller or quantized checkpoint",
+                "insufficient_device_memory: the deployment needs {charged} bytes of device \
+                 memory (a request of {request} bytes, weights x 1.10 plus the KV cache, and \
+                 the engine's CUDA context and graphs), above the {} bytes the device domain \
+                 manages; use a smaller or quantized checkpoint",
                 device.managed_limit
             ),
         ));
@@ -568,6 +580,32 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     // copy's size after the wake), so both are charged it in every phase.
     let always = copy;
     let overhead = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+    // The engine holds its CUDA context and graphs on the card beside the
+    // request (measured live: 13.2 GiB held against a 12.0 GiB request), so
+    // the device domain is charged both, and planner, admission and the
+    // launch check judge the same figure.
+    let on_card = |bytes: i64| {
+        bytes
+            .checked_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let active = on_card(request)?;
+    let cold = on_card(cold)?;
+    if let Some(limit) = host
+        .domains
+        .get(&device_domain)
+        .map(|domain| domain.managed_limit)
+        .filter(|limit| active > *limit)
+    {
+        return Err(invalid(
+            "engine_config.memory.request",
+            format!(
+                "insufficient_device_memory: the deployment needs {active} bytes of device \
+                 memory (a request of {request} bytes and the engine's CUDA context and \
+                 graphs), above the {limit} bytes the device domain manages"
+            ),
+        ));
+    }
     let two = |device: i64, system_bytes: i64, devices: Vec<DeviceClaim>| PhaseFootprint {
         allocations: vec![
             Allocation {
@@ -602,10 +640,10 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     };
     Ok(RecipeFootprints {
         cold: two(cold, steady, devices.to_vec()),
-        ready: two(request, steady, devices.to_vec()),
-        parking: two(request, with_copy, devices.to_vec()),
+        ready: two(active, steady, devices.to_vec()),
+        parking: two(active, with_copy, devices.to_vec()),
         parked,
-        wake: two(request, with_copy, devices.to_vec()),
+        wake: two(active, with_copy, devices.to_vec()),
     })
 }
 

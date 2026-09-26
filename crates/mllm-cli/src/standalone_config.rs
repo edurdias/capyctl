@@ -604,8 +604,12 @@ fn discrete_document(
     // Spec §3: a request the device domain can never hold is refused at
     // deploy, with the numbers, before anything is stored. A KV cache the
     // operator stated is named in the refusal (controller ruling).
-    if request > sizing.managed_limit {
-        return Err(too_large(request));
+    // ADR 0019: the device domain is charged the request and the engine's
+    // CUDA context and graphs, so the template refuses what resolution would.
+    let charged =
+        request.saturating_add(mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
+    if charged > sizing.managed_limit {
+        return Err(too_large(charged));
     }
     let residency = default_residency(deep_park, Some((weights_bytes, sizing.system_parked_limit)));
     Ok(discrete_json(
