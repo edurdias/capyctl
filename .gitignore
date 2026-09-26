@@ -10,3 +10,4 @@ __pycache__/
 /AGENTS.md
 .superpowers/
 /scripts/live/matrix/hosts.local.env
+/scripts/private-denylist.txt

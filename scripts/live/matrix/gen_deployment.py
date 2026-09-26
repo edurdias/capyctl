@@ -48,7 +48,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gen_budgets import load_models  # noqa: E402
 
-NAME = re.compile(r"^(?P<engine>[vs])(?P<host>a|b)-(?P<model>4|14|27f|27|30)$")
+# Model keys come from models.json (2026-09-25: the single-box benchmark adds
+# mc2, q36, ling, g2, 27b and their drafter variants).
+NAME = re.compile(r"^(?P<engine>[vs])(?P<host>a|b)-(?P<model>[a-z0-9]+)$")
 # Host names and the models root come from the harness environment (lib.sh,
 # from hosts.local.env), so no lab-specific name or path lives here.
 def _env(name):
@@ -80,10 +82,12 @@ def host_ids(path):
 def fixture(name, args, models, ids, checkpoints):
     match = NAME.match(name)
     if not match:
-        sys.exit(f"{name!r} is not <v|s><a|b>-<4|14|27|27f|30>")
+        sys.exit(f"{name!r} is not <v|s><a|b>-<model key>")
     engine = ENGINES[match["engine"]]
     host = HOSTS[match["host"]]
     key = match["model"]
+    if key not in models:
+        sys.exit(f"models.json has no model {key!r}")
     spec = models[key]
     if args.co:
         if "co" not in spec:
@@ -94,7 +98,9 @@ def fixture(name, args, models, ids, checkpoints):
         sys.exit(f"{host} is not in the hosts listing; enroll it first")
     if not ULID.match(ids[host]) and not ids[host].startswith("01DRYRUN"):
         sys.exit(f"host id {ids[host]!r} is not a ULID")
-    residency = args.residency
+    # A model may pin its residency (2026-09-25 benchmark: restart_only, since
+    # SGLang refuses deep parking for modelopt checkpoints and parking is not measured).
+    residency = spec.get("residency") or args.residency
     if engine == "sglang" and residency != "deep":
         # SGLang's protected entry refuses a launch shape without the memory
         # saver, which only a deep residency derives (found live, standalone template).
@@ -127,13 +133,21 @@ def fixture(name, args, models, ids, checkpoints):
         extra_args = extra_args.get(engine)
     if extra_args:
         config["accept_extra_args"] = True
-        config["extra_args"] = list(extra_args)
+        # Drafter checkpoints are named relative to the host's model store.
+        config["extra_args"] = [a.replace("@MODELS_ROOT@", MODELS_ROOT) for a in extra_args]
     digest = None
     if checkpoints:
         per_host = checkpoints.get(host, {})
         digest = per_host.get(spec["dir"])
         if digest is None:
             sys.exit(f"checkpoints.json has no digest for {spec['dir']} on {host}")
+    # ADR 0008 amendment 2026-09-24: a model with `hf` declares a pinned Hugging
+    # Face source; the host materializes it under <model store>/sources/ before
+    # the first placement (the host document must allow huggingface sources).
+    if spec.get("hf"):
+        source = {"type": "huggingface", "repo": spec["hf"]["repo"], "revision": spec["hf"]["revision"]}
+    else:
+        source = {"type": "local", "path": f"{MODELS_ROOT}/{spec['dir']}"}
     return {
         "schema_version": 1,
         "kind": "deployment",
@@ -147,7 +161,7 @@ def fixture(name, args, models, ids, checkpoints):
         "recovery": "reconcile",
         "request_deadline": args.request_deadline,
         "model": {
-            "source": {"type": "local", "path": f"{MODELS_ROOT}/{spec['dir']}"},
+            "source": source,
             "content_fingerprint": f"sha256:{digest}" if digest else f"sha256:{spec['dir']}",
             "revision": "r1",
         },

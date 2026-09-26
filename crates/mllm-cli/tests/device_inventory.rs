@@ -52,6 +52,7 @@ fn installation() -> EngineInstallation {
         runtime_dir: "/opt/mllm/runtime".into(),
         args: Vec::new(),
         installation_drift: Default::default(),
+        cuda_home: None,
         engine_ports: (8100, 8199),
     }
 }

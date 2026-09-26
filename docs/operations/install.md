@@ -570,6 +570,21 @@ In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
 with them.
 
+**CUDA toolkit and compile jobs.** Engines compile some GPU kernels the first
+time they start. `mllm engine add` records the CUDA toolkit as the profile's
+`cuda_home`: `CUDA_HOME` if it holds `bin/nvcc`, otherwise `/usr/local/cuda`
+if that holds it. For the standalone environment installation, set
+`MLLM_CUDA_HOME`. The engine then gets `<cuda_home>/bin` on its PATH and
+`CUDA_HOME` set; vLLM uses FlashInfer only when `nvcc` is found. Without
+`cuda_home`, the engine PATH has only the engine's own `bin` and the system
+directories.
+
+Each compile job can take several GB. mllm sets `MAX_JOBS` to the free memory
+at launch divided by 8 GiB, at most the CPU count, and
+`FLASHINFER_NVCC_THREADS=1`. The host log prints the chosen value at every
+launch. To choose other limits, put `MAX_JOBS` or `FLASHINFER_NVCC_THREADS`
+(positive integers) in the profile's `env`.
+
 **With the system units, run `mllm engine` as root with the unit's
 `--config`.** The host unit reads `/etc/mllm/host.yaml`, so its `engines.yaml`
 is `/etc/mllm/engines.yaml`. `/etc/mllm` is root's (mode 0750, group `mllm`),

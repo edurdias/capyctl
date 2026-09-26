@@ -895,6 +895,11 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
             spawned[0].env["PATH"],
             format!("{}:/usr/bin:/bin", engine_bin.display())
         );
+        // Owner decision 2026-09-25: no profile CUDA home, no CUDA_HOME; the
+        // JIT build limits are always set.
+        assert!(!spawned[0].env.contains_key("CUDA_HOME"));
+        assert!(spawned[0].env["MAX_JOBS"].parse::<usize>().unwrap() >= 1);
+        assert_eq!(spawned[0].env["FLASHINFER_NVCC_THREADS"], "1");
         assert_eq!(
             spawned[0]
                 .env
@@ -1027,4 +1032,36 @@ async fn a_host_named_rendezvous_directory_reaches_the_entry() {
             named
         );
     }
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): a profile's host-approved
+/// `cuda_home` puts `<cuda_home>/bin` after the engine's own bin and sets
+/// `CUDA_HOME`; a profile `env` build limit overrides the computed one.
+// T21 T22
+#[tokio::test]
+async fn a_profile_cuda_home_and_build_limit_reach_the_sglang_engine() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port).with_toolchain(
+        Some("/usr/local/cuda-13.0".into()),
+        [("FLASHINFER_NVCC_THREADS".to_string(), "2".to_string())].into(),
+    );
+    let adapter = equipped(launch, tool.clone(), &log);
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let spawned = tool.spawned.lock().unwrap();
+    let engine_bin = std::path::Path::new(&spawned[0].argv[0]).parent().unwrap();
+    assert_eq!(
+        spawned[0].env["PATH"],
+        format!(
+            "{}:/usr/local/cuda-13.0/bin:/usr/bin:/bin",
+            engine_bin.display()
+        )
+    );
+    assert_eq!(spawned[0].env["CUDA_HOME"], "/usr/local/cuda-13.0");
+    assert_eq!(spawned[0].env["FLASHINFER_NVCC_THREADS"], "2");
 }

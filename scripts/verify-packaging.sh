@@ -16,8 +16,12 @@
 #    SHA256SUMS and the .sha256 must verify; the binary must be stripped,
 #    report BUILDINFO's version and carry BUILDINFO's runtime manifest.
 # 5. No builder-identifying paths in bin/mllm (the builder's $HOME,
-#    $CARGO_HOME or the checkout path), and no machine names or a AGENTS.md
-#    mention in the tracked runtime/*.py sources that build.rs embeds into it.
+#    $CARGO_HOME or the checkout path), no lab host identifiers (when known;
+#    see scripts/live/matrix/hosts.local.env), and no match of any pattern
+#    from the untracked private denylist (scripts/private-denylist.txt; see
+#    scripts/README.md) in bin/mllm's strings or in the tracked runtime/*.py
+#    sources that build.rs embeds into it. Absent denylist: skipped, not
+#    failed.
 # 6. packaging/install.sh against a file:// release holding that tarball
 #    (scripts/test-install.sh).
 #
@@ -317,16 +321,53 @@ else
 fi
 
 # runtime/*.py is not shipped as files (it is compiled into bin/mllm; see the
-# owner/mode check above), so its tracked sources are checked directly for a
-# AGENTS.md mention and, when the lab's host names are known
+# owner/mode check above), so its tracked sources are checked directly against
+# the private denylist below, and, when the lab's host names are known
 # (scripts/live/matrix/hosts.local.env, gitignored, absent outside the lab),
 # for those names too.
 mapfile -t runtime_files < <(git ls-files -- 'runtime/*.py' ':(exclude)runtime/tests' | grep -v '/.*/' || true)
-instruction_file_hits=$(grep -lF 'AGENTS.md' "${runtime_files[@]}" 2>/dev/null || true)
-if [ -z "$instruction_file_hits" ]; then
-  pass "embedded runtime source does not mention AGENTS.md"
+
+# Private denylist: patterns that must never appear in the embedded runtime
+# source or in the release binary (tool/agent names, personal or lab-machine
+# names — anything that must not be committed to a tracked file). One
+# case-insensitive substring per line in the untracked, gitignored
+# scripts/private-denylist.txt; '#' starts a comment. See scripts/README.md.
+# The file is optional: absent, this check is SKIPPED (reported, not failed).
+denylist_file="scripts/private-denylist.txt"
+if [ -f "$denylist_file" ]; then
+  denylist=()
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    pattern=${pattern%%#*}
+    pattern=$(printf '%s' "$pattern" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$pattern" ] && denylist+=("$pattern")
+  done <"$denylist_file"
+  if [ "${#denylist[@]}" -eq 0 ]; then
+    skip "$denylist_file is present but has no patterns"
+  else
+    source_hits=()
+    for pattern in "${denylist[@]}"; do
+      hit=$(grep -liF -- "$pattern" "${runtime_files[@]}" 2>/dev/null || true)
+      [ -n "$hit" ] && source_hits+=("'$pattern' in $hit")
+    done
+    if [ "${#source_hits[@]}" -eq 0 ]; then
+      pass "embedded runtime source matches no private-denylist pattern"
+    else
+      fail "embedded runtime source matches the private denylist:"
+      printf '  %s\n' "${source_hits[@]}" >&2
+    fi
+
+    binary_hits=()
+    for pattern in "${denylist[@]}"; do
+      strings "$pkg/bin/mllm" | grep -qiF -- "$pattern" && binary_hits+=("$pattern")
+    done
+    if [ "${#binary_hits[@]}" -eq 0 ]; then
+      pass "bin/mllm matches no private-denylist pattern"
+    else
+      fail "bin/mllm matches the private denylist: ${binary_hits[*]}"
+    fi
+  fi
 else
-  fail "embedded runtime source mentions AGENTS.md: $instruction_file_hits"
+  skip "$denylist_file not present; private-name check skipped (see scripts/README.md)"
 fi
 
 hosts_env="scripts/live/matrix/hosts.local.env"

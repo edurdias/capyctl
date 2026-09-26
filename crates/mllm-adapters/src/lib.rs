@@ -1,3 +1,4 @@
+pub mod engine_env;
 pub mod forward;
 // SPEC §§6.4, 13.2: the bounded summary of an engine that exited before readiness.
 pub mod launch_failure;

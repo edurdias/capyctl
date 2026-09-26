@@ -71,6 +71,11 @@ runtime_profiles:
     executable: /opt/vllm/bin/vllm
     build_fingerprint: "vllm 0.29.0"
     args: []
+    # Optional: the CUDA toolkit whose bin/ joins the engine PATH (vLLM needs
+    # nvcc there to use FlashInfer). Omit it to keep the minimal PATH.
+    cuda_home: /usr/local/cuda
+    # Optional overrides of the JIT build limits mllm computes at launch
+    # (MAX_JOBS = free memory / 8 GiB, at most the CPU count).
     env: {}
     log_policy:
       max_file_bytes: "16MiB"

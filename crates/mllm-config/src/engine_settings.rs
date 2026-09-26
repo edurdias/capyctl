@@ -484,6 +484,7 @@ pub fn apply_to_host(
                 deep_park: settings.deep_park,
                 installation_drift: settings.installation_drift,
                 args,
+                cuda_home: None,
             });
         profile["security"]["trust_remote_code"] = json!(settings.trust_remote_code);
         crate::registration::check_profile(name, &profile)?;

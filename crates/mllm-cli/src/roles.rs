@@ -61,6 +61,9 @@ const MODELS_ROOT: &str = mllm_config::model_settings::MODELS_ROOT_ENV;
 const KV_CACHE_BYTES: &str = mllm_config::engine_settings::KV_CACHE_ENV;
 const ENGINE_FINGERPRINT: &str = mllm_config::engine_settings::ENGINE_FINGERPRINT_ENV;
 const RUNTIME_DIR: &str = mllm_config::engine_settings::RUNTIME_DIR_ENV;
+/// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root of
+/// the `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` installation (its `cuda_home`).
+const CUDA_HOME_ENV: &str = "MLLM_CUDA_HOME";
 /// SPEC §15.2: a run-time override of the engines' loopback port range, as
 /// `start-end`, so two roles on one machine lease different engine ports
 /// (owner rule 2026-09-25: one name for both roles; the standalone-only
@@ -771,6 +774,9 @@ impl EnvEngineProvider {
             )?,
             args,
             installation_drift,
+            // SPEC §13.3 amendment (owner decision 2026-09-25): an environment
+            // installation names its CUDA toolkit explicitly; nothing is detected.
+            cuda_home: env_value(CUDA_HOME_ENV).map(PathBuf::from),
             engine_ports,
         })
     }

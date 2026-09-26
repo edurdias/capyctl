@@ -80,7 +80,7 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
     if installation.installation_drift == mllm_config::effective::InstallationDrift::Refuse {
         security["installation_drift"] = json!("refuse");
     }
-    json!({
+    let mut profile = json!({
         "engine": engine_name(installation.engine),
         "revision": 1,
         "executable": installation.executable.to_string_lossy(),
@@ -89,7 +89,13 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
         "env": {},
         "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
         "security": security
-    })
+    });
+    // SPEC §13.3 amendment (owner decision 2026-09-25): stated only when the
+    // installation names one, so a default document is unchanged.
+    if let Some(cuda_home) = &installation.cuda_home {
+        profile["cuda_home"] = json!(cuda_home.to_string_lossy());
+    }
+    profile
 }
 
 /// The host policy standalone publishes: the engine installations it offers (ADR

@@ -81,6 +81,12 @@ pub struct PlanInputVllm {
     /// Extra PATH entries for the engine's runtime environment (venv bin:
     /// the JIT compile step needs the venv's tools, e.g. ninja).
     pub engine_path_extra: Option<String>,
+    /// SPEC §13.3 amendment: the profile's host-approved CUDA toolkit root;
+    /// `<cuda_home>/bin` joins PATH and `CUDA_HOME` is set (engine_env.rs).
+    pub cuda_home: Option<String>,
+    /// The profile `env` build-limit overrides (`MAX_JOBS`,
+    /// `FLASHINFER_NVCC_THREADS`; engine_env.rs).
+    pub build_env: std::collections::BTreeMap<String, String>,
     /// Where the launcher writes the engine's stdout/stderr (diagnosability
     /// + the runbook's evidence record).
     pub engine_log: Option<String>,
@@ -127,6 +133,8 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("sleep_flags", &self.sleep_flags)
             .field("api_key", &crate::traits::redacted(self.api_key.is_some()))
             .field("engine_path_extra", &self.engine_path_extra)
+            .field("cuda_home", &self.cuda_home)
+            .field("build_env", &self.build_env)
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
             .field("cuda_namespace", &self.cuda_namespace)

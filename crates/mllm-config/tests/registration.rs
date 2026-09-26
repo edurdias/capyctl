@@ -209,6 +209,7 @@ fn spec(engine: Engine) -> ProfileSpec {
         deep_park: true,
         installation_drift: InstallationDrift::Warn,
         args: vec![],
+        cuda_home: None,
     }
 }
 
@@ -381,4 +382,47 @@ fn write_refuses_a_hard_linked_engines_file() {
         after.permissions().mode() & 0o777
     );
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), before_text);
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): `engine add` records the
+/// CUDA toolkit: `CUDA_HOME` when it holds `bin/nvcc`, else `/usr/local/cuda`
+/// when it does, else nothing; the profile it writes passes the resolution
+/// rules and names `cuda_home` only when detected.
+// T03 T21
+#[test]
+fn engine_add_detects_and_writes_the_cuda_home() {
+    use mllm_config::registration::{check_profile, detect_cuda_home, profile_document};
+    use std::path::{Path, PathBuf};
+    let nvcc_in = |homes: &'static [&'static str]| {
+        move |nvcc: &Path| {
+            homes
+                .iter()
+                .any(|home| nvcc == Path::new(home).join("bin/nvcc"))
+        }
+    };
+    assert_eq!(
+        detect_cuda_home(
+            Some("/opt/cuda-13.0/"),
+            nvcc_in(&["/opt/cuda-13.0", "/usr/local/cuda"])
+        ),
+        Some(PathBuf::from("/opt/cuda-13.0"))
+    );
+    // A CUDA_HOME without nvcc, or not absolute, falls back to /usr/local/cuda.
+    for env in [Some("/opt/empty"), Some("cuda"), Some("/opt/../cuda"), None] {
+        assert_eq!(
+            detect_cuda_home(env, nvcc_in(&["/usr/local/cuda", "/opt/../cuda"])),
+            Some(PathBuf::from("/usr/local/cuda")),
+            "{env:?}"
+        );
+    }
+    assert_eq!(detect_cuda_home(None, nvcc_in(&[])), None);
+
+    let mut with = spec(Engine::Vllm);
+    with.cuda_home = Some(PathBuf::from("/usr/local/cuda"));
+    let document = profile_document(&with);
+    assert_eq!(document["cuda_home"], "/usr/local/cuda");
+    check_profile("vllm", &document).expect("a detected cuda_home is valid");
+    assert!(profile_document(&spec(Engine::Vllm))
+        .get("cuda_home")
+        .is_none());
 }

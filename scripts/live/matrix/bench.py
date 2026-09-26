@@ -244,6 +244,14 @@ def derive(rec, estimated_prompt_tokens):
         "tpot_s": (round((ttlt - ttft) / (completion_tokens - 1), 6)
                    if completion_tokens and completion_tokens > 1 else None),
         "itl_s": [round(g, 6) for g in gaps],
+        # Stream end ([DONE] arrival). With ignore_eos, tokens after the model's
+        # own end of sequence often detokenize to no text, so the last text
+        # chunk comes early and TTLT/decode from it overstate speed (found live
+        # 2026-09-25, MiniCPM5-2B); these use the whole stream.
+        "e2e_s": rec.get("elapsed_s"),
+        "decode_e2e_tps": (round((completion_tokens - 1) / (rec["elapsed_s"] - ttft), 3)
+                           if completion_tokens and completion_tokens > 1 and rec.get("elapsed_s")
+                           and rec["elapsed_s"] > ttft else None),
         "short_completion": bool(completion_tokens is not None and completion_tokens < rec["max_tokens"]),
     })
     return m
@@ -264,7 +272,7 @@ def pct(values, q):
     return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
 
 
-def dist(values, qs=(50, 95, 99)):
+def dist(values, qs=(50, 90, 95, 99)):
     vals = [v for v in values if v is not None]
     out = {"n": len(vals), "mean": round(sum(vals) / len(vals), 6) if vals else None}
     for q in qs:
@@ -393,9 +401,11 @@ def summarize_cell(measured, words_per_token, t0=None, t1=None):
         "completion_tokens": dist([m["completion_tokens"] for m in good], (50,)),
         "ttft_s": dist([m["ttft_s"] for m in good]),
         "ttlt_s": dist([m["ttlt_s"] for m in good]),
-        "prefill_tps": dist([m["prefill_tps"] for m in good], (50, 95)),
-        "decode_tps": dist([m["decode_tps"] for m in good], (50, 95)),
+        "prefill_tps": dist([m["prefill_tps"] for m in good], (10, 50, 90, 95)),
+        "decode_tps": dist([m["decode_tps"] for m in good], (10, 50, 90, 95)),
         "tpot_s": dist([m["tpot_s"] for m in good]),
+        "e2e_s": dist([m.get("e2e_s") for m in good]),
+        "decode_e2e_tps": dist([m.get("decode_e2e_tps") for m in good], (10, 50, 90, 95)),
         "itl_s": dist(itl),
         "tokens_per_chunk": round(out_tokens / chunks, 3) if chunks else None,
         "throughput": {
