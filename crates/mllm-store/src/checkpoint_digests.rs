@@ -156,23 +156,37 @@ pub(crate) fn admit_start(
     deployment: &str,
     revision: i64,
 ) -> std::result::Result<(), LifecycleError> {
-    let row: Option<(String, bool)> = tx
+    let row: Option<(String, bool, Option<String>)> = tx
         .query_row(
-            "SELECT state,provisional FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
+            "SELECT state,provisional,diagnostic FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
             params![deployment, revision],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     match row {
         None => Ok(()),
-        Some((state, provisional)) => match state.as_str() {
+        Some((state, provisional, diagnostic)) => match state.as_str() {
             "recorded" => Ok(()),
             "pending" if !provisional => Ok(()),
             "pending" => Err(LifecycleError::CheckpointDigestPending),
-            "mismatch" | "unusable" => Err(LifecycleError::CheckpointMismatch),
+            // Discrete GPU design §11: a closed refusal the measured weights
+            // met is the start's refusal (exit 4 for insufficient_device_memory).
+            "unusable" => match diagnostic.filter(|d| closed_refusal(d)) {
+                Some(reason) => Err(LifecycleError::CheckpointUnusable(reason)),
+                None => Err(LifecycleError::CheckpointMismatch),
+            },
+            "mismatch" => Err(LifecycleError::CheckpointMismatch),
             _ => Err(LifecycleError::CorruptStoredData),
         },
     }
+}
+
+/// Discrete GPU design §11: the resolution refusals a measured checkpoint can
+/// meet that name their own closed code as a `<code>: ...` prefix.
+const CLOSED_REFUSALS: &[&str] = &["insufficient_device_memory:", "host_backed_unavailable:"];
+
+fn closed_refusal(text: &str) -> bool {
+    CLOSED_REFUSALS.iter().any(|code| text.starts_with(code))
 }
 
 /// One stored row: state, host, expected, digest, weights, provisional, diagnostic.
@@ -520,10 +534,19 @@ impl crate::Store {
                     )
                     .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
                 }
-                Err(_) => {
+                Err(error) => {
+                    // Discrete GPU design §11: a closed refusal keeps its code
+                    // and numbers (bounded) so a start can be refused with it.
+                    let diagnostic = Some(error.detail.chars().take(512).collect::<String>())
+                        .filter(|detail| closed_refusal(detail))
+                        .unwrap_or_else(|| {
+                            "the derived memory request does not resolve with the measured \
+                             weights; replace the configuration"
+                                .to_owned()
+                        });
                     tx.execute(
-                        "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic='the derived memory request does not resolve with the measured weights; replace the configuration',updated_at_ms=?5 WHERE deployment_id=?1 AND revision=?2",
-                        params![deployment, revision, digest, host_id, now_ms],
+                        "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5 WHERE deployment_id=?1 AND revision=?2",
+                        params![deployment, revision, digest, host_id, now_ms, diagnostic],
                     )?;
                     tx.commit()?;
                     return Ok(RecordOutcome::Unusable);

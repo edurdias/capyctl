@@ -839,6 +839,9 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // ADR 0014 §7 (WE3).
             LifecycleError::CheckpointDigestPending => F::CheckpointDigestPending,
             LifecycleError::CheckpointMismatch => F::CheckpointMismatch,
+            // Discrete GPU design §11: `insufficient_device_memory: ...`
+            // travels in the message, which the CLI maps to its exit.
+            LifecycleError::CheckpointUnusable(reason) => F::CapacityBlockedBecause(reason),
             // ADR 0008.
             LifecycleError::ModelSourcePending => F::ModelSourcePending,
             LifecycleError::ModelSourceFailed => F::ModelSourceFailed,
