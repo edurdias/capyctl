@@ -36,7 +36,8 @@ pub const PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES: i64 = 1 << 30;
 
 /// ADR 0019 (discrete GPU design §3): the device memory an engine holds beyond
 /// its memory request (the CUDA context and the CUDA graphs it captures after
-/// sizing its KV cache), charged on the device domain in every active phase.
+/// sizing its KV cache), charged on the device domain, or the unified pool, in
+/// every active phase: one rule on every host shape.
 /// Measured live on a 16 GB discrete GPU with vLLM 0.29: a 12.0 GiB request
 /// held 13.2 GiB of the card, 1.2 GiB beyond it. SGLang's static memory
 /// fraction likewise leaves its graphs outside it, so one rule charges both
@@ -102,6 +103,10 @@ pub struct CheckpointFacts {
     /// startup peak; it is re-resolved exactly as it was, with a cold phase
     /// equal to the request. Never set for a new resolution.
     pub legacy_startup: bool,
+    /// A snapshot frozen before the engine's CUDA context and graphs were
+    /// charged records no `overhead_bytes`; it re-resolves exactly as it was,
+    /// without them. Never set for a new resolution.
+    pub legacy_overhead: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -392,6 +397,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             weights_bytes: inputs.weights,
             startup_bytes: None,
             device_total_bytes: None,
+            overhead_bytes: None,
         },
         derived,
     ))
@@ -455,6 +461,7 @@ pub(super) fn derive_resources(
     devices: &[DeviceClaim],
     host: &HostPolicy,
     weights_bytes: Option<i64>,
+    overhead: i64,
 ) -> Result<RecipeFootprints, ConfigError> {
     let mut domains = BTreeSet::new();
     for claim in devices {
@@ -490,8 +497,18 @@ pub(super) fn derive_resources(
             host,
             device_domain: domain,
             weights_bytes,
+            overhead,
         });
     }
+    // Re-review (parity rule): the engine's CUDA context and graphs sit
+    // outside its request in a unified pool as on a card, so the pool is
+    // charged them too, by the rule `derive_discrete` applies.
+    let on_pool = |bytes: i64| {
+        bytes
+            .checked_add(overhead)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let (request_charge, cold) = (on_pool(request)?, on_pool(cold)?);
     let active = |bytes: i64| PhaseFootprint {
         allocations: vec![Allocation {
             domain: domain.clone(),
@@ -507,8 +524,8 @@ pub(super) fn derive_resources(
     };
     Ok(RecipeFootprints {
         cold: active(cold),
-        ready: active(request),
-        parking: active(request),
+        ready: active(request_charge),
+        parking: active(request_charge),
         parked: PhaseFootprint {
             allocations: vec![Allocation {
                 domain: domain.clone(),
@@ -517,7 +534,7 @@ pub(super) fn derive_resources(
             }],
             devices: Vec::new(),
         },
-        wake: active(request),
+        wake: active(request_charge),
     })
 }
 
@@ -529,6 +546,7 @@ struct DiscreteInputs<'a> {
     host: &'a HostPolicy,
     device_domain: String,
     weights_bytes: Option<i64>,
+    overhead: i64,
 }
 
 /// Discrete GPU design §3 (ADR 0019): VRAM in the device domain, the engine's host
@@ -543,6 +561,7 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
         host,
         device_domain,
         weights_bytes,
+        overhead: context_overhead,
     } = inputs;
     let systems: Vec<&String> = host
         .domains
@@ -586,7 +605,7 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     // launch check judge the same figure.
     let on_card = |bytes: i64| {
         bytes
-            .checked_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
+            .checked_add(context_overhead)
             .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
     };
     let active = on_card(request)?;

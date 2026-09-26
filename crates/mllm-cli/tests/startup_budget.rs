@@ -63,13 +63,14 @@ fn validate_shows_the_startup_reservation_and_its_provenance() {
     for (doc, bytes, provenance) in [
         (
             derived(json!({"request": "8GiB", "kv_cache": "4GiB", "startup": "12GiB"})),
-            12_i64 << 30,
+            // The reservation carries the engine's CUDA context and graphs.
+            (12_i64 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "declared",
         ),
         // Weights pending: the placeholder is the request.
         (
             derived(json!({"request": "8GiB", "kv_cache": "4GiB"})),
-            8_i64 << 30,
+            (8_i64 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "default",
         ),
         (

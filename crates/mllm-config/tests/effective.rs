@@ -1863,3 +1863,23 @@ fn the_short_pin_form_takes_the_hosts_sharing() {
         mllm_config::effective::Sharing::Exclusive
     );
 }
+
+// T26 (re-review parity rule): the engine's CUDA context and graphs are
+// charged beside the request by one rule on a unified pool and on a card, and
+// the revision records the charge so a snapshot re-derives it; a revision
+// frozen before the charge (no `overhead_bytes`) still decodes without it.
+#[test]
+fn the_cuda_context_is_charged_alike_on_unified_and_discrete_hosts() {
+    let overhead = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    let d = deployment_with("deep", "vllm", "10GiB");
+    for host in [host(), discrete_host()] {
+        let r = resolve(&d, &host).unwrap();
+        assert_eq!(r.resources.ready.allocations[0].bytes, 10 * GIB + overhead);
+        assert_eq!(r.engine_config.memory().overhead_bytes, Some(overhead));
+        let snapshot = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            mllm_config::effective::decode_effective_snapshot(&snapshot).unwrap(),
+            r
+        );
+    }
+}

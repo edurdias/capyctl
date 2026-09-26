@@ -108,8 +108,9 @@ A deployment that states no memory gets a device request of `weights × 1.10 + k
 with `kv_cache = min(4 GiB, 25 % of the device managed limit)`. A vLLM request is at least
 75 % of the card: vLLM 0.29 with CUDA graphs needs `--gpu-memory-utilization` of at least
 0.75 to start a 4B model on a 16 GB card (observed on the discrete-GPU laptop host). The
-device domain is charged the request plus the engine's CUDA context and graphs, which it
-holds beyond the request (a 1.25 GiB placeholder for both engines; measured live, vLLM
+device domain, and a unified pool alike, is charged the request plus the engine's CUDA
+context and graphs, which it holds beyond the request (a 1.25 GiB placeholder for both
+engines, recorded in each revision so one frozen before the charge re-derives without it; measured live, vLLM
 0.29 held 13.2 GiB against a 12.0 GiB request), so the planner, admission and the launch
 check judge what the engine really holds. A request whose charge is larger than the device
 managed limit is refused at deploy with `insufficient_device_memory`, before anything is

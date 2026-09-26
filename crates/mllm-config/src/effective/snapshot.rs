@@ -275,6 +275,9 @@ pub(super) fn declared_engine_config(
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),
+            // Re-review parity rule: a snapshot frozen before the engine's
+            // CUDA context was charged re-derives without it.
+            legacy_overhead: memory.get("overhead_bytes").is_none(),
         },
     ))
 }

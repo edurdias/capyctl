@@ -1165,6 +1165,14 @@ pub fn resolve_effective_with_checkpoint(
     let resources = match declared_resources {
         Some(resources) => resources,
         None => {
+            // Re-review parity rule: the engine's CUDA context and graphs are
+            // charged on every host shape; a revision frozen before the charge
+            // re-derives without it.
+            let overhead = if facts.legacy_overhead {
+                0
+            } else {
+                ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+            };
             let derived = engine_config::derive_resources(
                 engine_config.memory().request_bytes,
                 engine_config.memory().startup_bytes,
@@ -1172,7 +1180,11 @@ pub fn resolve_effective_with_checkpoint(
                 &devices,
                 &host,
                 facts.weights_bytes,
+                overhead,
             )?;
+            if !facts.legacy_overhead {
+                engine_config.memory_mut().overhead_bytes = Some(overhead);
+            }
             let provenance = match &mut engine_config {
                 LaunchSettings::Vllm(settings) => &mut settings.provenance,
                 LaunchSettings::Sglang(settings) => &mut settings.provenance,

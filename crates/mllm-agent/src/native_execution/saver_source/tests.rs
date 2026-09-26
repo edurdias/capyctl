@@ -171,6 +171,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
                 weights_bytes: None,
                 startup_bytes: None,
                 device_total_bytes: None,
+                overhead_bytes: None,
             },
             max_total_tokens: None,
             chunked_prefill_size: None,

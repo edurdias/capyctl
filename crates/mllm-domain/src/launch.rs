@@ -118,6 +118,12 @@ pub struct MemoryRequest {
     /// fraction and vLLM's `--gpu-memory-utilization` are fractions of the card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_total_bytes: Option<i64>,
+    /// ADR 0019 (parity rule): the engine's CUDA context and graphs, charged
+    /// beside the request in every active derived phase on every host shape.
+    /// Absent in a revision frozen before the charge existed (or one whose
+    /// `resources:` are declared), which re-derives without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overhead_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

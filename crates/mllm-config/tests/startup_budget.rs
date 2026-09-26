@@ -30,6 +30,10 @@ fn weights(bytes: i64) -> CheckpointFacts {
     }
 }
 
+/// The engine's CUDA context and graphs, charged beside the request in every
+/// active derived phase (re-review parity rule).
+const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+
 fn cold(effective: &mllm_config::effective::EffectiveDeployment) -> i64 {
     effective.resources.cold.allocations[0].bytes
 }
@@ -49,10 +53,16 @@ fn a_declared_startup_peak_is_the_cold_phase_until_ready() {
         json!({"request": "40GiB", "kv_cache": "8GiB", "startup": "70GiB"});
     parse_strict(ConfigKind::Deployment, &deployment.to_string()).unwrap();
     let effective = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(cold(&effective), 70 * GIB);
-    assert_eq!(ready(&effective), 40 * GIB);
-    assert_eq!(effective.resources.parking.allocations[0].bytes, 40 * GIB);
-    assert_eq!(effective.resources.wake.allocations[0].bytes, 40 * GIB);
+    assert_eq!(cold(&effective), 70 * GIB + OVERHEAD);
+    assert_eq!(ready(&effective), 40 * GIB + OVERHEAD);
+    assert_eq!(
+        effective.resources.parking.allocations[0].bytes,
+        40 * GIB + OVERHEAD
+    );
+    assert_eq!(
+        effective.resources.wake.allocations[0].bytes,
+        40 * GIB + OVERHEAD
+    );
     assert_eq!(
         effective.engine_config.memory().startup_bytes,
         Some(70 * GIB)
@@ -62,7 +72,7 @@ fn a_declared_startup_peak_is_the_cold_phase_until_ready() {
         .provenance()
         .contains_key("memory.startup"));
     let budget = startup_budget(&effective);
-    assert_eq!(budget.bytes, 70 * GIB);
+    assert_eq!(budget.bytes, 70 * GIB + OVERHEAD);
     assert_eq!(budget.provenance, StartupProvenance::Declared);
     let snapshot = serde_json::to_string(&effective).unwrap();
     assert_eq!(decode_effective_snapshot(&snapshot).unwrap(), effective);
@@ -118,8 +128,8 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
         resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     let expected = 30 * GIB * 8 / 5 + VLLM_OVERHEAD_MARGIN_BYTES;
     assert_eq!(expected, 56 * GIB);
-    assert_eq!(cold(&effective), expected);
-    assert_eq!(ready(&effective), 40 * GIB);
+    assert_eq!(cold(&effective), expected + OVERHEAD);
+    assert_eq!(ready(&effective), 40 * GIB + OVERHEAD);
     assert_eq!(
         effective.engine_config.provenance().get("memory.startup"),
         Some(&SettingSource::Derived)
@@ -140,10 +150,10 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
 
     // Small weights: the request is already above the placeholder.
     let small = resolve_effective_with_checkpoint(&deployment, &host, weights(GIB)).unwrap();
-    assert_eq!(cold(&small), 40 * GIB);
+    assert_eq!(cold(&small), 40 * GIB + OVERHEAD);
     // Unknown weights: the request.
     let unknown = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(cold(&unknown), 40 * GIB);
+    assert_eq!(cold(&unknown), 40 * GIB + OVERHEAD);
     assert_eq!(
         default_startup_bytes(40 * GIB, None, 8 * GIB),
         Some(40 * GIB)
@@ -161,30 +171,24 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
 fn a_revision_frozen_before_the_budget_still_decodes_with_its_request() {
     let (mut deployment, host) = fixture();
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
-    let effective =
-        resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    let mut legacy = serde_json::to_value(&effective).unwrap();
-    legacy["engine_config"]["memory"]
-        .as_object_mut()
-        .unwrap()
-        .remove("startup_bytes");
-    legacy["engine_config"]["provenance"]
-        .as_object_mut()
-        .unwrap()
-        .remove("memory.startup");
-    legacy["resources"]["cold"]["allocations"][0]["bytes"] = json!(40 * GIB);
-    // The fingerprint covers the phases; recompute what the old release wrote
-    // by resolving the same inputs as it did.
+    // What the old release wrote: no startup peak, no CUDA context charge.
     let old = resolve_effective_with_checkpoint(
         &deployment,
         &host,
         CheckpointFacts {
             weights_bytes: Some(30 * GIB),
             legacy_startup: true,
+            legacy_overhead: true,
         },
     )
     .unwrap();
-    legacy["recipe_fingerprint"] = json!(old.recipe_fingerprint);
+    let legacy = serde_json::to_value(&old).unwrap();
+    assert!(legacy["engine_config"]["memory"]
+        .get("startup_bytes")
+        .is_none());
+    assert!(legacy["engine_config"]["memory"]
+        .get("overhead_bytes")
+        .is_none());
     let decoded = decode_effective_snapshot(&legacy.to_string()).unwrap();
     assert_eq!(decoded, old);
     assert_eq!(cold(&decoded), 40 * GIB);
