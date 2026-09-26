@@ -9,11 +9,6 @@ address in `100.64.0.0/10`, as a Tailscale tailnet gives; the server sends
 requests to its engines there. Below, the server is `100.64.0.10` and the GPU
 machine `gpu-box` is `100.64.0.21`.
 
-A host describes its memory as one pool shared by the GPU and the system, as
-on unified-memory machines. A host whose GPU has its own separate memory is
-not supported yet; run such a machine on its own with
-[standalone](one-machine.md).
-
 ## 1. Start the server
 
 On the server machine:
@@ -28,8 +23,9 @@ mllm init server --output server.yaml
 
 Edit `server.yaml` so hosts can reach it. Set the `bootstrap` and `control`
 listeners to the server's address, and the two `enrollment` addresses to a
-name or address hosts use for it. Keep `management` and `inference` on
-`127.0.0.1`.
+name or address hosts use for it. Keep `management` on `127.0.0.1`. The
+`inference` listener is the endpoint your apps use; it serves every interface
+and needs the API key.
 
 ```yaml title="server.yaml"
 schema_version: 1
@@ -42,7 +38,7 @@ listeners:
     bind: "127.0.0.1:7443"
     authentication: token
   inference:
-    bind: "127.0.0.1:8443"
+    bind: "0.0.0.0:8443"
     authentication: api_key
   bootstrap:
     bind: "100.64.0.10:7444"
@@ -60,7 +56,7 @@ mllm start server --config ~/server.yaml
 ```
 
 ```text
-{"management":"127.0.0.1:7443","role":"server","state_dir":"/home/me/.local/state/mllm"}
+{"credentials":"/home/me/.local/state/mllm/identity/server-credentials.json","inference":"0.0.0.0:8443","management":"127.0.0.1:7443","role":"server","state_dir":"/home/me/.local/state/mllm"}
 ```
 
 Leave it running. Pass `--config ~/server.yaml` to every command you run on
@@ -94,8 +90,14 @@ mllm init host --output host.yaml
 
 Edit `host.yaml`: its `name` (the one in the invitation), `model_store` (your
 models directory), `ingress` (this machine's private address), two labels of
-your choice for the hardware and the software, and its memory: how much mllm
-may hand out (`managed_limit`) and how much to keep free (`free_reserve`).
+your choice for the hardware and the software, and its memory. For each kind
+of memory, say how much mllm may hand out (`managed_limit`), how much to keep
+free (`free_reserve`) and, optionally, how much parked models may keep
+(`parked_limit`).
+
+On a discrete card there are two kinds: host RAM (`system`) and the card
+(`gpu0`, one per GPU, numbered as `nvidia-smi -L` shows them). This one is
+for a 16 GB card:
 
 ```yaml title="host.yaml"
 schema_version: 1
@@ -114,18 +116,53 @@ environment_fingerprint: gpu-box-env-1
 runtime_profiles: {}
 resource_policy:
   domains:
+    system:
+      memory: distinct
+      managed_limit: "24GiB"
+      free_reserve: "8GiB"
+      parked_limit: "12GiB"
+    gpu0:
+      memory: device
+      device: gpu0
+      managed_limit: "14GiB"
+      free_reserve: "1GiB"
+      parked_limit: "2GiB"
+  devices:
+    gpu0:
+      domain: gpu0
+      sharing: shared
+  device_sharing: shared
+```
+
+On a unified-memory machine there is one pool shared by the GPU and the
+system:
+
+```yaml title="host.yaml (unified memory)"
+schema_version: 1
+kind: host
+name: gpu-box
+state_dir: /home/me/.local/state/mllm
+identity_dir: /home/me/.local/state/mllm/identity
+model_store:
+  path: /home/me/models
+ingress:
+  transport: trusted_private_link
+  address: "http://100.64.0.21:8444"
+  bind: "100.64.0.21:8444"
+hardware_fingerprint: gpu-box-1
+environment_fingerprint: gpu-box-env-1
+runtime_profiles: {}
+resource_policy:
+  domains:
     unified:
       memory: unified
-      managed_limit: "40GiB"
-      free_reserve: "8GiB"
+      managed_limit: "100GiB"
+      free_reserve: "16GiB"
   devices:
     gpu0:
       domain: unified
       sharing: shared
   device_sharing: shared
-  endpoint_port_range:
-    start: 8100
-    end: 8199
 ```
 
 ```bash
@@ -135,14 +172,15 @@ mllm join host --join-file gpu-box.join --config ~/host.yaml
 
 ```text
 {"file":"/home/me/host.yaml","kind":"host","resolved_against":null,"valid":true}
-{"enrolled":true,"host_id":"01M3CQBFG2TRXXWTAMAK7X6D1A"}
+{"enrolled":true,"host_id":"01M3FQFNW43NNRJPESDH642C14"}
 ```
 
 ```bash
 mllm start host --config ~/host.yaml
 ```
 
-Leave it running.
+Leave it running. The host checks each card you described against the GPUs
+it finds, and refuses to start if they do not match.
 
 ## 4. Add engines on each host
 
@@ -153,7 +191,7 @@ mllm engine add ~/venvs/vllm --config ~/host.yaml
 ```
 
 ```text
-{"custom":false,"deep_park":"enabled","deep_park_probe":"available","engine":"vllm","engines_file":"/home/me/engines.yaml","executable":"/home/me/venvs/vllm/bin/vllm","fingerprint":{"digest":"sha256:75e6dea2b0a0bb2a620d8ac4c492c5cb89d9fb0debaa09c3504bfcd6c7adae57","version":"0.29.0"},"profile":"vllm","published":"published","revision":1,"version":"0.29.0"}
+{"cuda_home":"/usr/local/cuda","custom":false,"deep_park":"enabled","deep_park_probe":"available","engine":"vllm","engines_file":"/home/me/engines.yaml","executable":"/home/me/venvs/vllm/bin/vllm","fingerprint":{"digest":"sha256:75e6dea2b0a0bb2a620d8ac4c492c5cb89d9fb0debaa09c3504bfcd6c7adae57","version":"0.29.0"},"profile":"vllm","published":"published","revision":1,"version":"0.29.0"}
 ```
 
 Repeat steps 2 to 4 for each GPU machine. On the server:
@@ -165,19 +203,18 @@ mllm list engines --config ~/server.yaml
 
 ```text
 NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.0-rc.4   supported       31.8 GiB / 61.2 GiB     vllm
+gpu-box   online   yes        0.1.0-rc.4   supported       46.5 GiB / 77.2 GiB     vllm
 HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
 gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 ```
 
 ## 5. Deploy
 
-Use the file from [Deploy a model](deploy.md) with one more line,
-`host: gpu-box`, after `name`. On the server:
+Use the file from [Deploy a model](deploy.md). mllm places the model on a
+machine with room; add `host: gpu-box` to choose one. On the server:
 
 ```bash
-mllm deploy model --file my-model.yaml --config ~/server.yaml
-mllm start deployment my-model --wait --config ~/server.yaml
+mllm deploy model --file my-model.yaml --activate --wait --config ~/server.yaml
 mllm list deployments --config ~/server.yaml
 ```
 
@@ -198,11 +235,11 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790354782,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790455580,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
 ```
 
-To send requests from other computers, see
-[Make a request](requests.md#from-another-machine).
+From other computers, use the server's address instead of `127.0.0.1`
+([Make a request](requests.md#from-another-machine)).
 
 ## Take a machine out
 

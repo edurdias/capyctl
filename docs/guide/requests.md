@@ -1,7 +1,9 @@
 # Make a request
 
-mllm serves the OpenAI chat API. On one machine the endpoint is
-`http://127.0.0.1:8443/v1`. Send the deployment's `name` as `model`.
+mllm serves the OpenAI chat API on port 8443 of the machine that runs it (the
+server, with several machines), on every interface, with an API key. On that
+machine the endpoint is `http://127.0.0.1:8443/v1`. Send the deployment's
+`name` as `model`.
 
 ## The API key
 
@@ -28,7 +30,8 @@ curl -s http://127.0.0.1:8443/v1/models -H "Authorization: Bearer $KEY"
 {"data":[{"id":"my-model","object":"model"}],"object":"list"}
 ```
 
-Listing never wakes a model.
+Listing never wakes a model. A request without the key, or with a wrong one,
+is answered `401`.
 
 ## Chat
 
@@ -39,7 +42,7 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
 ```
 
 The answer text comes from your model; this one is an example.
@@ -55,23 +58,23 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" How"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" How"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" can"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" can"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" I"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" I"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" help"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" help"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" you"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" you"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" today?"},"finish_reason":null,"index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" today?"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1790354734,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
 data: [DONE]
 ```
@@ -120,12 +123,17 @@ takes longer than usual; nothing else changes for the client. See
 
 ## From another machine
 
-The endpoint listens on `127.0.0.1` of the machine that runs mllm (the
-server, with several machines). To use it from another computer, forward the
-port, for example over SSH:
+Use the machine's name, LAN address or Tailscale address instead of
+`127.0.0.1`, with the same key:
 
 ```bash
-ssh -N -L 8443:127.0.0.1:8443 you@mllm-server
+curl -s http://gpu-box:8443/v1/models -H "Authorization: Bearer $KEY"
 ```
 
-Then use `http://127.0.0.1:8443/v1` on that computer.
+In an OpenAI client, set the base URL to `http://gpu-box:8443/v1`.
+
+To keep the endpoint on the machine itself, start mllm with
+`--listen 127.0.0.1:8443`; to limit it to your tailnet, use the machine's
+Tailscale address there. The endpoint is plain HTTP: for the internet, put a
+TLS reverse proxy in front. [Network access](../operations/network-access.md)
+covers each of these.

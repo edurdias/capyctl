@@ -4,8 +4,23 @@ A GPU holds one or two models at a time. mllm keeps the others parked: the
 engine stays up but gives back its GPU memory. A request for a parked model
 wakes it, which is much faster than starting it from scratch.
 
-Parking needs `residency: deep` in the deployment and an engine that
-supports it; `mllm engine list` shows `DEEP PARK enabled`.
+A deployment parks unless it says `residency: restart_only`, as long as its
+engine supports parking: `mllm engine list` shows `DEEP PARK enabled`.
+[How it works](how-it-works.md#ready-parked-stopped) shows where the memory
+goes in each state.
+
+## How a model parks
+
+mllm picks the way from your hardware:
+
+- On a discrete card, a parked model's weights are copied to host RAM, and a
+  wake copies them back in seconds. When the copy does not fit in host RAM,
+  the model parks deep instead.
+- On unified memory, a model parks deep: its weights are dropped, and a wake
+  reloads them from disk.
+
+To choose yourself, set `residency: host_backed` (host RAM, discrete cards
+only), `residency: deep` or `residency: restart_only` in the deployment.
 
 ## Park and wake
 
@@ -38,8 +53,8 @@ mllm start deployment other-model --evict
 ```
 
 ```text
-Request identity: 01M3CQAQ4VA6T7Q7KQQV82KFZ4 (reuse --request-id 01M3CQAQ4VA6T7Q7KQQV82KFZ4 to recover this command)
-{"api_version":"1","deployment_id":"01M3CQAK6XXW1E1DG0TZRRQY2S","joined":false,"operation_id":"01M3CQAQ953JSBEDC8XXS1Z8J6","revision":"1","switch_id":"01M3CQAQ6G0MZ4WMN79RN5YNSD","victims":["01M3CQAA0FE9VY13FNY5N94EKD/0"]}
+Request identity: 01M3FQEMCRX6ZMRVTDBHC21DAM (reuse --request-id 01M3FQEMCRX6ZMRVTDBHC21DAM to recover this command)
+{"api_version":"1","deployment_id":"01M3FQEMC25J8DBR0N2DVZYXEV","joined":false,"operation_id":"01M3FQEPFG6PWPPHA9BB5DJ5EK","revision":"1","switch_id":"01M3FQEMH2RMGGNAHF15KEGY62","victims":["01M3FQEE238THV698Y20FHNEXF/0"]}
 ```
 
 `victims` names what it parked: instance 0 of `my-model`.
@@ -66,15 +81,18 @@ other-model   model   ready     parked   0/1     1          gpu-box
 ```
 
 mllm waits for requests in progress to finish before it parks a model; it
-never cuts an answer off.
+never cuts an answer off. When there is no room to keep a parked copy, mllm
+stops the idle model instead and says so:
+`released: stopped (no room to park)`.
 
 ## Park or stop
 
-| | Parked | Stopped |
-|---|---|---|
-| GPU memory | freed | freed |
-| A request | wakes it | is refused (`deployment_stopped`) |
-| Back to ready | fast | a full start |
+| | Parked in host RAM | Parked, deep | Stopped |
+|---|---|---|---|
+| GPU memory | freed | freed | freed |
+| Host RAM | engine and a copy of the weights | engine | none |
+| A request | wakes it | wakes it | is refused (`deployment_stopped`) |
+| Back to ready | seconds | a reload from disk | a full start |
 
 `mllm stop deployment other-model` stops it; `mllm start deployment other-model --wait`
 starts it again.

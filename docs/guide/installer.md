@@ -17,12 +17,16 @@ curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<ver
 ## Run standalone as a service
 
 ```bash
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --systemd standalone
-mkdir -p ~/.config/mllm
-printf 'MLLM_VLLM_BIN=%s\nMLLM_MODELS_ROOT=%s\n' ~/venvs/vllm/bin/vllm ~/models > ~/.config/mllm/standalone.env
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<version> --systemd standalone
+mllm engine add ~/venvs/vllm
 systemctl --user enable --now mllm-standalone
 loginctl enable-linger "$USER"    # keep it running after you log out
 ```
+
+The service uses the same state, engines and `~/models` as `mllm start
+standalone` in your shell. To change a setting for the service, put its variable in
+`~/.config/mllm/standalone.env`, for example `MLLM_MODELS_ROOT=/srv/models`
+([settings](../operations/configuration.md)).
 
 Stopping or restarting the service leaves running models alone; the next
 start picks them up again.
