@@ -1094,3 +1094,49 @@ async fn arrivals_during_one_activation_join_it() {
     );
     let _ = app.shutdown().await;
 }
+
+/// T10 T14 (final review M11, found live on the discrete-GPU laptop host): a
+/// request for a deployment whose checkpoint is still being measured (its
+/// revision is provisional until the digest sizes it, ADR 0014 §7) was
+/// answered 429 "no room could be made ... after 3 switch rounds". It is
+/// starting: the answer is retryable and says so.
+// T10 T14
+#[tokio::test]
+async fn a_request_while_the_checkpoint_is_measured_is_told_it_is_starting() {
+    let dir = safe_state_dir();
+    let app = boot(dir.path()).await;
+    let minimal =
+        serde_json::json!({"name": "measured", "engine": "local", "model": "/models/measured"});
+    let id = app
+        .controller
+        .create_configuration(
+            "standalone",
+            "measured",
+            &serde_json::json!({ "config": minimal }).to_string(),
+            &app.host_document(),
+        )
+        .expect("a minimal document deploys")
+        .deployment_id;
+    let revision = app.store.current_revision(&id).unwrap().unwrap();
+    assert!(
+        app.store
+            .checkpoint_digest(&id, revision)
+            .unwrap()
+            .unwrap()
+            .provisional,
+        "sized once measured"
+    );
+    let refused = app
+        .controller
+        .activate_for_request(&id)
+        .await
+        .expect_err("not startable until measured");
+    match refused {
+        mllm_controller::LifecycleFault::Unavailable(message) => {
+            assert!(message.contains("is starting"), "{message}");
+            assert!(message.contains("being measured"), "{message}");
+        }
+        other => panic!("a retryable starting answer, not {other:?}"),
+    }
+    let _ = app.shutdown().await;
+}

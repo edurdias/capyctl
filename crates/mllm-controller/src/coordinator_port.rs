@@ -604,6 +604,24 @@ impl CoordinatorLifecycle {
         }))
     }
 
+    /// Whether the deployment's current revision waits for its checkpoint
+    /// digest before it can be sized (ADR 0014 §7: provisional and pending).
+    fn measuring_checkpoint(&self, deployment: &str) -> Result<bool, LifecycleFault> {
+        self.commands.read(|store| {
+            let Some(revision) = store.current_revision(deployment)? else {
+                return Ok(false);
+            };
+            Ok(store
+                .checkpoint_digest(deployment, revision)
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record.provisional
+                        && record.state == mllm_store::checkpoint_digests::DigestState::Pending
+                }))
+        })
+    }
+
     fn unsupported(what: &str) -> LifecycleFault {
         LifecycleFault::Blocked(format!(
             "the coordinator cannot {what} yet; refusing rather than performing a \
@@ -906,6 +924,17 @@ impl LifecyclePort for CoordinatorLifecycle {
                     )))
                 }
                 RequestView::Idle => {}
+            }
+            // Final review M11 (found live on the discrete-GPU laptop host): a
+            // revision sized from a checkpoint not yet measured cannot be
+            // placed or started until its digest is recorded (ADR 0014 §7).
+            // Answering that as "no room could be made" (429) sent clients
+            // looking for capacity; it is starting, and a retry succeeds.
+            if self.measuring_checkpoint(deployment)? {
+                return Err(LifecycleFault::Unavailable(format!(
+                    "deployment {deployment} is starting: its checkpoint is being measured \
+                     before it can be sized; retry shortly"
+                )));
             }
             if round >= rounds {
                 return Err(LifecycleFault::Blocked(format!(
