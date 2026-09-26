@@ -67,8 +67,11 @@ impl HostControl {
 
     /// The document on disk, measured against the accepted set's inventory.
     async fn measured(&self) -> Result<ProfileSet, Value> {
+        // Owner decision 2026-09-25: the generic overrides the host started
+        // with apply to the reloaded document too.
         let loaded =
-            HostConfig::load_with_engines(&self.document, &self.engines).map_err(invalid)?;
+            HostConfig::load_with_overrides(&self.document, &self.engines, &self.running.overrides)
+                .map_err(invalid)?;
         // Owner decisions 2026-09-25: the models directory, the model-source
         // policy and the engine settings (runtime directory, port range and
         // the `local_engine` profiles) were resolved at start (flags,

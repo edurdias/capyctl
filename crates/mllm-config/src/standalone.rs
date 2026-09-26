@@ -11,16 +11,16 @@
 //! value is refused here with the path that names it.
 //!
 //! What is accepted is exactly what the role does: the per-role state
-//! directories under the state root, the management listener on loopback at its
-//! default with its admin token, the inference listener at any unicast
+//! directories under the state root, the management listener on loopback (any
+//! port, owner decision 2026-09-25) with its admin token, the inference listener at any unicast
 //! address with a port (design §9: `0.0.0.0:8443` by default, as for a
 //! server) with `api_key` or the explicit `none` authentication, an `embedded` connection, `auto` resource values and no
 //! runtime profiles. The models directory and model sources, the engine
 //! installation (`host.local_engine`), the runtime directory
 //! (`host.runtime_dir`) and the engines' port range
 //! (`host.resource_policy.endpoint_port_range`) are honoured as on a host
-//! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` (inference
-//! only) or `MLLM_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
+//! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` /
+//! `MLLM_INFERENCE_ADDR` or `--management-listen` / `MLLM_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
 //! are labels and are not checked.
 //!
@@ -76,6 +76,35 @@ pub fn inference_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
             PATH,
             "the inference listener binds an address with a non-zero port that is not \
              multicast, e.g. 0.0.0.0:8443, 127.0.0.1:8443 or a Tailscale address",
+        )
+    })
+}
+
+/// SPEC §16.5 (owner decision 2026-09-25): the one rule for the standalone
+/// management address, whichever document, flag or variable states it: a
+/// loopback socket address with a non-zero port. Management carries the admin
+/// token and never leaves loopback.
+pub fn management_address(text: &str) -> Option<SocketAddr> {
+    text.parse::<SocketAddr>()
+        .ok()
+        .filter(|address| address.port() != 0 && address.ip().is_loopback())
+}
+
+/// The standalone management listener's default address.
+pub const DEFAULT_MANAGEMENT_BIND: &str = "127.0.0.1:7443";
+
+/// The management address a standalone `document` binds:
+/// `server.listeners.management.bind` when stated, else
+/// [`DEFAULT_MANAGEMENT_BIND`].
+pub fn management_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
+    let Some(bind) = document["server"]["listeners"]["management"].get("bind") else {
+        return Ok(DEFAULT_MANAGEMENT_BIND.parse().expect("valid default"));
+    };
+    bind.as_str().and_then(management_address).ok_or_else(|| {
+        refuse(
+            "server.listeners.management.bind",
+            "the management listener binds a loopback address with a non-zero port, e.g. \
+             127.0.0.1:7443",
         )
     })
 }
@@ -264,6 +293,15 @@ pub fn check_honoured(
     let root = resolve(config_dir, &state_root.to_string_lossy());
     let server = &document["server"];
     let host = &document["host"];
+    // Owner decision 2026-09-25: the top-level `state_dir` is the YAML form
+    // of the state root, read before the role starts (`--state-dir` and
+    // `MLLM_STATE_DIR` win over it); it must be a path.
+    if let Some(value) = document.get("state_dir") {
+        value
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| refuse("state_dir", "must be a path"))?;
+    }
     check_state_dir(server, "server.state_dir", config_dir, &root.join("server"))?;
     check_state_dir(host, "host.state_dir", config_dir, &root.join("host"))?;
     if let Some(tls) = server.get("tls") {
@@ -280,8 +318,7 @@ pub fn check_honoured(
     if let Some(listeners) = server.get("listeners").and_then(Value::as_object) {
         for (name, listener) in listeners {
             let path = format!("server.listeners.{name}");
-            let Some((_, address, authentication)) =
-                LISTENERS.iter().find(|(known, _, _)| known == name)
+            let Some((_, _, authentication)) = LISTENERS.iter().find(|(known, _, _)| known == name)
             else {
                 return Err(refuse(
                     &path,
@@ -291,18 +328,10 @@ pub fn check_honoured(
             if name == "inference" {
                 // Design §9: any unicast address, as for a server.
                 inference_bind(document)?;
-            } else if let Some(bind) = listener.get("bind") {
-                // SPEC §16.5: management stays on loopback at its default.
-                if bind.as_str() != Some(address) {
-                    return Err(refuse(
-                        &format!("{path}.bind"),
-                        format!(
-                            "standalone binds {address}; move it for one run with \
-                             MLLM_STANDALONE_{}_ADDR, not in the document",
-                            name.to_ascii_uppercase()
-                        ),
-                    ));
-                }
+            } else {
+                // SPEC §16.5, owner decision 2026-09-25: management stays on
+                // loopback, at any port.
+                management_bind(document)?;
             }
             if name == "inference" {
                 // Design §9: `api_key` (default) or the explicit `none`.
@@ -503,6 +532,10 @@ mod tests {
                 }),
             ),
             (
+                "server.listeners.management.bind",
+                Box::new(|d| d["server"]["listeners"]["management"]["bind"] = json!("127.0.0.1:0")),
+            ),
+            (
                 "server.listeners.management.authentication",
                 Box::new(|d| {
                     d["server"]["listeners"]["management"]["authentication"] = json!("none")
@@ -565,6 +598,15 @@ mod tests {
     // the document, as on a host.
     #[test]
     fn the_engine_settings_are_accepted_in_the_document() {
+        // Owner decision 2026-09-25: the management listener moves to any
+        // loopback address with a port.
+        let mut moved = generated("/s");
+        moved["server"]["listeners"]["management"]["bind"] = json!("127.0.0.1:7543");
+        check_honoured(&moved, Path::new("/s/config"), Path::new("/s")).unwrap();
+        assert_eq!(
+            management_bind(&moved).unwrap(),
+            "127.0.0.1:7543".parse().unwrap()
+        );
         let mut doc = generated("/s");
         doc["server"]["state_dir"] = json!("/s/server");
         doc["host"]["local_engine"] = json!({

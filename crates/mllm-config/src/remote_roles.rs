@@ -222,6 +222,11 @@ pub struct HostConfig {
     /// `shutdown.drain_timeout`: how long a signalled role lets admitted work finish.
     pub drain_timeout: Duration,
     pub document: Value,
+    /// Owner decision 2026-09-25: the generic overrides (`--set`,
+    /// `MLLM_SET__…`) the host started with. A live reload of the document
+    /// applies them again, so the reloaded document is compared with what the
+    /// host runs, not with the file alone.
+    pub overrides: crate::setting_overrides::SettingOverrides,
 }
 /// The shutdown drain bound when a role document names none (plan W11).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -500,6 +505,7 @@ impl HostConfig {
             load_report_interval,
             drain_timeout: drain_timeout(&document)?,
             document,
+            overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })
     }
     /// Owner decision 2026-09-25: state the host's models directory and
@@ -536,9 +542,12 @@ impl HostConfig {
     ) -> Result<Self, ConfigError> {
         let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
         let settings = crate::engine_settings::resolve(flags, env, &stated);
+        let overrides = self.overrides;
         let mut document = self.document;
         crate::engine_settings::apply_to_host(&mut document, &settings, probe)?;
-        Self::parse(&document.to_string())
+        let mut config = Self::parse(&document.to_string())?;
+        config.overrides = overrides;
+        Ok(config)
     }
     pub fn template(root: &Path) -> String {
         serde_json::to_string_pretty(&json!({
@@ -559,6 +568,21 @@ impl HostConfig {
     /// for a host started without a named document is
     /// `<config home>/mllm/engines.yaml`, not the file beside it.
     pub fn load_with_engines(path: &Path, engines: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_overrides(
+            path,
+            engines,
+            &crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+        )
+    }
+    /// As [`HostConfig::load_with_engines`], with this run's generic
+    /// overrides (owner decision 2026-09-25: `--set` > `MLLM_SET__…` > YAML)
+    /// applied to the document before it is validated, exactly as if the
+    /// file stated them.
+    pub fn load_with_overrides(
+        path: &Path,
+        engines: &Path,
+        overrides: &crate::setting_overrides::SettingOverrides,
+    ) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             ConfigError::new(
                 ConfigErrorCode::Io,
@@ -566,9 +590,12 @@ impl HostConfig {
                 e.to_string(),
             )
         })?;
-        let mut document = crate::parse_strict(crate::ConfigKind::Host, &text)?;
+        let document = crate::parse_document(&text)?;
+        let mut document = overrides.apply_and_validate(document)?;
         let engines = crate::registration::EnginesFile::load(engines)?;
         crate::registration::merge_into_host(&mut document, &engines)?;
-        Self::parse(&document.to_string())
+        let mut config = Self::parse(&document.to_string()).map_err(|e| overrides.annotate(e))?;
+        config.overrides = overrides.clone();
+        Ok(config)
     }
 }

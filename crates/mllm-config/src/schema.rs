@@ -509,6 +509,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
+                // Owner decision 2026-09-25: the state root, as `--state-dir`
+                // and `MLLM_STATE_DIR` name it (they win over it).
+                ("state_dir", SCALAR),
                 ("server", FieldSpec::Struct(STANDALONE_SERVER)),
                 ("host", FieldSpec::Struct(STANDALONE_HOST)),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),

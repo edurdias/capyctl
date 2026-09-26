@@ -28,6 +28,9 @@ pub mod remote_resources;
 pub mod remote_roles;
 pub mod resource_controls;
 pub mod schema;
+// Owner decision 2026-09-25: every YAML setting of a role three ways, through
+// the generic `--set path=value` and `MLLM_SET__PATH=value` overrides.
+pub mod setting_overrides;
 // SPEC §15.3: standalone values the role does not honour are refused.
 pub mod standalone;
 pub mod strict_yaml;

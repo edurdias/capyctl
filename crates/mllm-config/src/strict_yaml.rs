@@ -240,6 +240,13 @@ pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
         .ok_or_else(|| ConfigError::new(ConfigErrorCode::SchemaVersion, "", "empty YAML document"))
 }
 
+/// A plain YAML scalar's value (`true`, `30`, `30s`), typed exactly as the
+/// same text in a document is (owner decision 2026-09-25: a generic override
+/// is validated like YAML).
+pub(crate) fn plain_scalar(scalar: &str) -> Value {
+    scalar_value(scalar, ScalarStyle::Plain)
+}
+
 /// Interpret a scalar as a JSON value. Plain scalars get YAML-typed
 /// coercion (bool/null/int/float); quoted and block styles stay strings,
 /// so `max_buffered_bytes_total: "64"` is distinguishable from `64`.
