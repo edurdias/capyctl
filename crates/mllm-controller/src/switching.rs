@@ -382,7 +382,7 @@ impl Switcher {
     async fn start_rooms(self: &Arc<Self>, target: &str) -> Result<Vec<Room>, NoRoom> {
         let steps = match self
             .commands
-            .plan_start_switch(target, &self.protected())
+            .plan_start_switch(target, &self.protected(), &Default::default())
             .map_err(fault)?
         {
             StartSwitchPlan::Steps(steps) => steps,
@@ -419,10 +419,12 @@ impl Switcher {
             turns.insert(host.clone(), self.turn(host).lock_owned().await);
         }
         // The plan again under the turns: an earlier group may have changed
-        // a host meanwhile.
+        // a host meanwhile. Final review I4: with each host's fresh
+        // observation, so a park its memory cannot take is planned a stop.
+        let observed = self.commands.observe_for_planning(hosts.clone()).await;
         let steps = match self
             .commands
-            .plan_start_switch(target, &self.protected())
+            .plan_start_switch(target, &self.protected(), &observed)
             .map_err(fault)?
         {
             StartSwitchPlan::Steps(steps) => steps,
@@ -531,7 +533,13 @@ impl Switcher {
     ) -> Result<Option<Room>, NoRoom> {
         let plan = self
             .commands
-            .plan_switch(target, only, explicit, &self.protected())
+            .plan_switch(
+                target,
+                only,
+                explicit,
+                &self.protected(),
+                &Default::default(),
+            )
             .map_err(fault)?;
         let host = match plan {
             SwitchPlan::FitsNow => return Ok(None),
@@ -551,9 +559,12 @@ impl Switcher {
         };
         // SPEC §10: the oldest waiting group first. Turns are FIFO.
         let turn = self.turn(&host).lock_owned().await;
+        // Final review I4: planned again with the host's fresh observation,
+        // so a park its memory cannot take now is planned as a stop.
+        let observed = self.commands.observe_for_planning([host.clone()]).await;
         let plan = self
             .commands
-            .plan_switch(target, only, explicit, &self.protected())
+            .plan_switch(target, only, explicit, &self.protected(), &observed)
             .map_err(fault)?;
         match plan {
             SwitchPlan::FitsNow => Ok(Some(Room {

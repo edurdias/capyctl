@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 const NOW: i64 = 10_000;
 const DEADLINE: i64 = 200_000;
 const GIB: i64 = 1 << 30;
-/// ADR 0019: the device domain also carries the engine\'s CUDA context and graphs.
+/// ADR 0019: the device domain also carries the engine's CUDA context and graphs.
 const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
 const HOST: (&str, &str) = ("host-a", "laptop");
 const UUID1: &str = "GPU-11111111-1111-1111-1111-111111111111";

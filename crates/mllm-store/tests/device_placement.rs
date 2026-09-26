@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 const NOW: i64 = 10_000;
 const DEADLINE: i64 = 200_000;
 const GIB: i64 = 1 << 30;
-/// ADR 0019: the device domain also carries the engine\'s CUDA context and graphs.
+/// ADR 0019: the device domain also carries the engine's CUDA context and graphs.
 const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
 
 struct Gpus {
@@ -469,6 +469,7 @@ fn eviction_frees_one_gpu_by_least_recent_use() {
                 None,
                 &std::collections::BTreeSet::new(),
                 &activity,
+                &Default::default(),
             )
             .unwrap()
         {
@@ -542,6 +543,7 @@ fn a_host_backed_victim_parks_only_where_its_copy_fits() {
             None,
             &std::collections::BTreeSet::new(),
             &|_: &str, _: i64| Some(1),
+            &Default::default(),
         )
         .unwrap()
     {
@@ -585,4 +587,171 @@ fn a_host_backed_victim_parks_only_where_its_copy_fits() {
     );
     ready(&b, 200);
     assert_eq!(plan(&c), vec![(a.clone(), false, true)]);
+}
+
+// T27 T16 (final review I4, found live on the discrete-GPU laptop host, DG1):
+// the ledger alone planned a host_backed park that host RAM, held largely by
+// other programs, could not take; the arm refused it and the victim was
+// stopped anyway, after a wasted park. With the host's fresh observation the
+// planner decides park or stop by min(ledger room, observed free memory minus
+// the reserve): the same victim parks when the host has the memory and is
+// planned a stop up front when it does not. Nothing is released on the
+// observation alone: the victim set is the ledger's.
+#[test]
+fn a_host_backed_victim_is_planned_a_stop_when_observed_host_ram_cannot_take_its_copy() {
+    let t = two_gpus();
+    let deploy = |name: &str, resources: Value| {
+        t.deploy_as(
+            name,
+            json!({"instances": 1, "residency": "host_backed",
+                   "devices": [{"id": "gpu0", "sharing": "shared"}],
+                   "engine_config": {"memory": {"kv_cache": "4GiB"}},
+                   "resources": resources}),
+        )
+    };
+    let a = deploy("a", host_backed_resources(12, 4, 8));
+    t.start(&a, "start-a", StartScope::All);
+    let planned = t.planned(&a);
+    t.ready(&planned[0].0, 100);
+    let c = deploy("c", host_backed_resources(12, 4, 8));
+    let host = t.host["name"].as_str().unwrap().to_owned();
+    let plan = |system_available: i64| {
+        let mut observed = mllm_store::ordinary_lifecycle::switching::PlanningObservations::new();
+        if system_available > 0 {
+            let observation = |domain: &str, capacity: i64, available: i64| MemoryObservation {
+                domain: domain.into(),
+                capacity_bytes: capacity,
+                available_bytes: available,
+                sampled_at_ms: NOW,
+            };
+            observed.insert(
+                host.clone(),
+                (
+                    vec![
+                        observation("system", 32 * GIB, system_available),
+                        observation("gpu0", 23 * GIB, 11 * GIB),
+                        observation("gpu1", 31 * GIB, 31 * GIB),
+                    ],
+                    // a's engine, sampled beside the availability: 12 GiB on
+                    // the card, 2 GiB of host RAM.
+                    vec![mllm_domain::resources::ProcessResident {
+                        pid: 100,
+                        boot_id: "boot".into(),
+                        start_ticks: 1000,
+                        bytes: 14 * GIB,
+                        device_bytes: 12 * GIB,
+                        host_bytes: 2 * GIB,
+                    }],
+                ),
+            );
+        }
+        match t
+            .store
+            .plan_switch(
+                &t.session,
+                &c,
+                None,
+                false,
+                None,
+                &std::collections::BTreeSet::new(),
+                &|_: &str, _: i64| Some(1),
+                &observed,
+            )
+            .unwrap()
+        {
+            mllm_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => victims
+                .into_iter()
+                .map(|v| (v.deployment_id, v.parks, v.park_does_not_fit))
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        }
+    };
+    // The ledger alone: a's parked copy fits the 24 GiB system domain.
+    assert_eq!(plan(0), vec![(a.clone(), true, false)]);
+    // 30 GiB of host RAM free: with a's 2 GiB returned, a parked (12) and c
+    // (4) leave 16, above the 8 GiB reserve: a parks.
+    assert_eq!(plan(30 * GIB), vec![(a.clone(), true, false)]);
+    // Other programs hold most of it: 20 GiB free leaves 6, below the
+    // reserve, so a is planned a stop, the same victim, never another.
+    assert_eq!(plan(20 * GIB), vec![(a.clone(), false, true)]);
+}
+
+// T27 (final review M9, found live on the discrete-GPU laptop host): a switch
+// park the arm refused because host memory could not take the copy
+// (`parked_capacity`) left the victim reported `released: stopped` on the
+// next round, as if it did not park at all. It is reported `stopped (host
+// RAM full)`.
+#[test]
+fn a_victim_whose_switch_park_was_refused_for_memory_is_reported_host_ram_full() {
+    let t = two_gpus();
+    let a = t.deploy_as(
+        "a",
+        json!({"instances": 1, "residency": "host_backed",
+               "devices": [{"id": "gpu0", "sharing": "shared"}],
+               "engine_config": {"memory": {"kv_cache": "4GiB"}},
+               "resources": host_backed_resources(12, 4, 8)}),
+    );
+    t.start(&a, "start-a", StartScope::All);
+    let planned = t.planned(&a);
+    t.ready(&planned[0].0, 100);
+    let park = t
+        .store
+        .accept_park_command(
+            &t.session,
+            "switch",
+            &a,
+            t.store.current_revision(&a).unwrap().unwrap(),
+            "park-a",
+            NOW,
+            DEADLINE,
+        )
+        .unwrap();
+    let (_, limits, ttl, max_parked) = t.admission();
+    let low: Vec<_> = [("system", 32, 9), ("gpu0", 23, 11), ("gpu1", 31, 31)]
+        .iter()
+        .map(|(domain, capacity, available)| MemoryObservation {
+            domain: (*domain).into(),
+            capacity_bytes: capacity * GIB,
+            available_bytes: available * GIB,
+            sampled_at_ms: NOW,
+        })
+        .collect();
+    assert!(matches!(
+        t.store
+            .arm_residency(
+                &t.session,
+                &park.step_id,
+                AdmissionContext::new(&low, &limits, NOW, ttl, max_parked),
+            )
+            .unwrap(),
+        mllm_store::ordinary_lifecycle::park::ResidencyArm::Refused("parked_capacity")
+    ));
+    let c = t.deploy_as(
+        "c",
+        json!({"instances": 1, "residency": "host_backed",
+               "devices": [{"id": "gpu0", "sharing": "shared"}],
+               "engine_config": {"memory": {"kv_cache": "4GiB"}},
+               "resources": host_backed_resources(12, 4, 8)}),
+    );
+    let victims = match t
+        .store
+        .plan_switch(
+            &t.session,
+            &c,
+            None,
+            false,
+            None,
+            &std::collections::BTreeSet::new(),
+            &|_: &str, _: i64| Some(1),
+            &Default::default(),
+        )
+        .unwrap()
+    {
+        mllm_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => victims
+            .into_iter()
+            .map(|v| (v.deployment_id, v.parks, v.park_does_not_fit))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(victims, vec![(a, false, true)]);
 }

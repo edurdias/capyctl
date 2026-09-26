@@ -11,7 +11,7 @@
 use mllm_domain::resources::{LedgerSnapshot, MemoryLimit, PhaseFootprint};
 
 use crate::placement::{fits, HostRefusal};
-use crate::switching::{choose_victims, Victim, VictimCandidate};
+use crate::switching::{Victim, VictimCandidate};
 
 /// One device of the host the instance may run on, with the footprint it
 /// resolved to there.
@@ -120,6 +120,22 @@ pub fn choose_device_with_eviction(
     max_parked: usize,
     victims: &[VictimCandidate],
 ) -> Result<(String, Vec<Victim>), HostRefusal> {
+    choose_device_with_eviction_within(ledger, owner, options, limits, max_parked, victims, &|_| {
+        true
+    })
+}
+
+/// [`choose_device_with_eviction`], keeping a park only where `room` accepts
+/// the state it leaves (see [`crate::switching::choose_victims_within`]).
+pub fn choose_device_with_eviction_within(
+    ledger: &LedgerSnapshot,
+    owner: &str,
+    options: &[DeviceOption],
+    limits: &[MemoryLimit],
+    max_parked: usize,
+    victims: &[VictimCandidate],
+    room: &dyn Fn(&LedgerSnapshot) -> bool,
+) -> Result<(String, Vec<Victim>), HostRefusal> {
     let mut best: Option<(&DeviceOption, Vec<Victim>, i64)> = None;
     let mut last = HostRefusal::Insufficient;
     for option in options {
@@ -135,7 +151,15 @@ pub fn choose_device_with_eviction(
             })
             .cloned()
             .collect();
-        match choose_victims(ledger, owner, &option.footprint, limits, max_parked, &here) {
+        match crate::switching::choose_victims_within(
+            ledger,
+            owner,
+            &option.footprint,
+            limits,
+            max_parked,
+            &here,
+            room,
+        ) {
             Ok(chosen) => {
                 let recency = here
                     .iter()

@@ -90,6 +90,35 @@ pub fn choose_victims(
     max_parked: usize,
     ordered: &[VictimCandidate],
 ) -> Result<Vec<Victim>, HostRefusal> {
+    choose_victims_within(
+        ledger,
+        owner,
+        footprint,
+        limits,
+        max_parked,
+        ordered,
+        &|_| true,
+    )
+}
+
+/// [`choose_victims`], keeping a park only when `room` also accepts the state
+/// it leaves (every victim applied, the waiting footprint charged to `owner`).
+///
+/// Final review I4 (found live on the discrete-GPU laptop host, DG1): the
+/// ledger alone does not see memory other programs hold, so a park the
+/// ledger admits was refused at arm and its victim stopped anyway. `room` is
+/// the fresh observation's verdict ([`observed_room`]); the victim set itself
+/// is still chosen from the ledger, so nothing is released on the
+/// observation alone.
+pub fn choose_victims_within(
+    ledger: &LedgerSnapshot,
+    owner: &str,
+    footprint: &PhaseFootprint,
+    limits: &[MemoryLimit],
+    max_parked: usize,
+    ordered: &[VictimCandidate],
+    room: &dyn Fn(&LedgerSnapshot) -> bool,
+) -> Result<Vec<Victim>, HostRefusal> {
     let without = |released: &[String]| {
         let mut state = ledger.clone();
         for victim in released {
@@ -146,7 +175,11 @@ pub fn choose_victims(
                 }
             }
         }
-        fits(&state, owner, footprint, limits, max_parked).is_ok()
+        if fits(&state, owner, footprint, limits, max_parked).is_err() {
+            return false;
+        }
+        state.owners.insert(owner.to_owned(), footprint.clone());
+        room(&state)
     };
     let mut releases: Vec<Victim> = chosen
         .into_iter()
@@ -161,6 +194,52 @@ pub fn choose_victims(
         }
     }
     Ok(releases)
+}
+
+/// Final review I4 (ADR 0007, SPEC §7): whether `state` (the owners charged
+/// after a switch, the waiting owner included) leaves each observed domain its
+/// free reserve. The memory each owner of `original` was sampled holding
+/// (`floors`, a verified lower bound) returns to the host when it stops or
+/// shrinks, and every owner of `state` may use its whole charge:
+///
+/// `available + sum(floors of original) - sum(charges of state) >= reserve`.
+///
+/// An owner with no floor frees nothing the planner can prove, so without a
+/// process sample the verdict is conservative (a stop, never an overcommit).
+/// A domain without an observation is left to the ledger. This is
+/// `min(ledger room, observed free memory minus the reserve)`; the planner
+/// uses it to decide park or stop, as the arm judges the park afterwards.
+pub fn observed_room(
+    original: &LedgerSnapshot,
+    limits: &[MemoryLimit],
+    observations: &[mllm_domain::resources::MemoryObservation],
+    floors: &[mllm_domain::resources::ResidentFloor],
+    state: &LedgerSnapshot,
+) -> bool {
+    let amount = |footprint: &PhaseFootprint, domain: &str| {
+        footprint
+            .allocations
+            .iter()
+            .filter(|a| a.domain == domain)
+            .fold(0_i64, |sum, a| sum.saturating_add(a.bytes))
+    };
+    limits.iter().all(|limit| {
+        let Some(observed) = observations.iter().find(|o| o.domain == limit.domain) else {
+            return true;
+        };
+        let returned = floors
+            .iter()
+            .filter(|f| f.domain == limit.domain && original.owners.contains_key(&f.owner))
+            .fold(0_i64, |sum, f| sum.saturating_add(f.bytes));
+        let charged = state.owners.values().fold(0_i64, |sum, footprint| {
+            sum.saturating_add(amount(footprint, &limit.domain))
+        });
+        observed
+            .available_bytes
+            .saturating_add(returned)
+            .saturating_sub(charged)
+            >= limit.free_reserve_bytes
+    })
 }
 
 #[cfg(test)]
@@ -481,5 +560,65 @@ mod tests {
         )
         .unwrap();
         assert!(chosen.iter().all(|v| v.release == Release::Stop));
+    }
+
+    // T16 T26 (final review I4): a victim the ledger would park is stopped
+    // when the observed memory cannot take its parked footprint; the victim
+    // set itself is unchanged. The same rule on a unified pool.
+    #[test]
+    fn a_park_the_observed_memory_cannot_take_becomes_a_stop() {
+        let led = ledger(&[("a", 8)]);
+        let mut offered = candidate("a", false, 1);
+        offered.parked = Some(footprint(4 * GIB, ResourcePhase::Parked));
+        let mut limits = limits(12 * GIB);
+        limits[0].free_reserve_bytes = 2 * GIB;
+        let target = footprint(8 * GIB, ResourcePhase::Cold);
+        let ledger_only = choose_victims(
+            &led,
+            "n",
+            &target,
+            &limits,
+            4,
+            std::slice::from_ref(&offered),
+        )
+        .unwrap();
+        assert_eq!(ledger_only[0].release, Release::Park);
+        let observe = |available: i64| {
+            vec![mllm_domain::resources::MemoryObservation {
+                domain: "unified".into(),
+                capacity_bytes: 64 * GIB,
+                available_bytes: available,
+                sampled_at_ms: 1,
+            }]
+        };
+        // a was sampled holding its 8 GiB: parked it keeps 4, n takes 8.
+        let floors = vec![mllm_domain::resources::ResidentFloor {
+            owner: "a".into(),
+            domain: "unified".into(),
+            bytes: 8 * GIB,
+            sampled_at_ms: 1,
+        }];
+        let decide = |available: i64| {
+            let observations = observe(available);
+            let room = |state: &LedgerSnapshot| {
+                observed_room(&led, &limits, &observations, &floors, state)
+            };
+            choose_victims_within(
+                &led,
+                "n",
+                &target,
+                &limits,
+                4,
+                std::slice::from_ref(&offered),
+                &room,
+            )
+            .unwrap()
+        };
+        // 10 GiB free + 8 returned - 12 charged = 6 >= 2: parks.
+        assert_eq!(decide(10 * GIB)[0].release, Release::Park);
+        // 5 GiB free (other programs hold the rest): 1 < 2: the same victim stops.
+        let stopped = decide(5 * GIB);
+        assert_eq!(owners(stopped.clone()), ["a"]);
+        assert_eq!(stopped[0].release, Release::Stop);
     }
 }

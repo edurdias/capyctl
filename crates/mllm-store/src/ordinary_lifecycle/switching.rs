@@ -24,10 +24,23 @@ use super::*;
 use crate::events::{append_event, EventMetadata, SwitchPhase};
 use crate::instances::instance_owner_id;
 use mllm_config::instances::Placement;
-use mllm_scheduler::device_choice::choose_device_with_eviction;
+use mllm_scheduler::device_choice::choose_device_with_eviction_within;
 use mllm_scheduler::placement::{candidate_fits, fits};
-use mllm_scheduler::switching::{choose_victims, order_victims, Release, Victim, VictimCandidate};
-use std::collections::BTreeSet;
+use mllm_scheduler::switching::{
+    choose_victims_within, observed_room, order_victims, Release, Victim, VictimCandidate,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Final review I4: a fresh observation of each host a switch plans on (its
+/// domains' availability and the processes sampled beside it), keyed by host
+/// id. A host without one is planned from the ledger alone.
+pub type PlanningObservations = BTreeMap<
+    String,
+    (
+        Vec<mllm_domain::resources::MemoryObservation>,
+        Vec<mllm_domain::resources::ProcessResident>,
+    ),
+>;
 
 /// The default fairness window when a host publishes no queue policy
 /// (`resource_policy.queue.admission_window`, SPEC §16.2).
@@ -207,6 +220,24 @@ fn park_refused(
     )?)
 }
 
+/// Final review M9: whether this generation's switch park was refused
+/// because the host's memory could not take its parked footprint
+/// (`parked_capacity`), which is "host RAM full", not "it does not park".
+fn park_refused_for_room(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+    generation: i64,
+) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations o JOIN lifecycle_runs r ON r.operation_id=o.id
+          WHERE o.deployment_id=?1 AND r.instance_index=?2 AND r.generation=?3 AND o.kind='park'
+            AND o.state='failed' AND o.error_code='park_parked_capacity')",
+        params![deployment, instance, generation],
+        |r| r.get(0),
+    )?)
+}
+
 /// SPEC §6.1 admission column: what a request arriving for a deployment
 /// finds, to decide whether it dispatches, queues or is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +314,7 @@ impl crate::Store {
         eligible: placement::Eligible<'_>,
         protected: &BTreeSet<String>,
         activity: &dyn Fn(&str, i64) -> Option<i64>,
+        observed: &PlanningObservations,
     ) -> Result<SwitchPlan, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, s)?;
@@ -295,6 +327,7 @@ impl crate::Store {
             protected,
             activity,
             &Assumed::default(),
+            observed,
         )? {
             Planned::Settled | Planned::Fits { .. } => SwitchPlan::FitsNow,
             Planned::Evict(plan, _) => plan,
@@ -326,10 +359,11 @@ impl crate::Store {
         eligible: placement::Eligible<'_>,
         protected: &BTreeSet<String>,
         activity: &dyn Fn(&str, i64) -> Option<i64>,
+        observed: &PlanningObservations,
     ) -> Result<StartSwitchPlan, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, s)?;
-        let plan = plan_start_in(&tx, target, eligible, protected, activity)?;
+        let plan = plan_start_in(&tx, target, eligible, protected, activity, observed)?;
         tx.commit()?;
         Ok(plan)
     }
@@ -783,6 +817,7 @@ fn plan_in(
     protected: &BTreeSet<String>,
     activity: &dyn Fn(&str, i64) -> Option<i64>,
     assumed: &Assumed,
+    observed: &PlanningObservations,
 ) -> Result<Planned, LifecycleError> {
     // Rule 1: a dispatch-open READY instance serves; an activation in flight
     // is joined, never planned twice (T15). `only` (an explicit `start
@@ -967,6 +1002,8 @@ fn plan_in(
         // empties), and SPEC §9.2: a victim with an uncertain request stops;
         // its release would refuse the park anyway.
         let mut parkable = std::collections::BTreeMap::new();
+        // Victims whose switch park this generation was refused for memory.
+        let mut full = BTreeSet::new();
         for (deployment, index, generation) in rows {
             // Rule 4: never an instance serving a waiting group.
             if protected.contains(&deployment) {
@@ -988,6 +1025,9 @@ fn plan_in(
                 && !park_refused(tx, &deployment, index, generation)?
                 && !uncertain_leases(tx, &deployment, index)?;
             parkable.insert(victim_owner.clone(), may_park);
+            if parks(&e) && park_refused_for_room(tx, &deployment, index, generation)? {
+                full.insert(victim_owner.clone());
+            }
             offered.push(VictimCandidate {
                 owner: victim_owner.clone(),
                 serves_elsewhere: elsewhere,
@@ -1029,6 +1069,37 @@ fn plan_in(
             .cloned()
             .collect();
         let mut device = None;
+        // Final review I4 (found live, DG1): park or stop is decided by the
+        // ledger and by the host's fresh observation, the rule the arm
+        // applies (resident floors credited as admission credits them), so a
+        // copy host memory cannot take now is planned as a stop up front.
+        let floors = match observed.get(&c.host_id) {
+            Some((observations, residents)) => {
+                let kinds = read_selected_policy(tx, &c.host_id)
+                    .ok()
+                    .flatten()
+                    .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+                    .unwrap_or_default();
+                Some((
+                    observations,
+                    crate::resident_floors::resident_floors(
+                        tx,
+                        &c.ledger,
+                        &owner,
+                        observations,
+                        residents,
+                        &kinds,
+                    )?,
+                ))
+            }
+            None => None,
+        };
+        let room = |state: &mllm_domain::resources::LedgerSnapshot| match &floors {
+            Some((observations, floors)) => {
+                observed_room(&c.ledger, &c.limits, observations, floors, state)
+            }
+            None => true,
+        };
         // W10 gap (e): an occupant is released at its tier as before; the
         // park it is accepted as is admitted against the ledger on its own.
         let occupant_releases = || {
@@ -1081,13 +1152,14 @@ fn plan_in(
         } else if !c.device_options.is_empty() {
             // ADR 0019 (discrete GPU design §7): eviction is per GPU; only
             // instances charged on a GPU's own domain can make room there.
-            choose_device_with_eviction(
+            choose_device_with_eviction_within(
                 &freed,
                 &owner,
                 &c.device_options,
                 &c.limits,
                 c.max_parked,
                 &rest,
+                &room,
             )
             .map(|(on, more)| {
                 device = Some(on);
@@ -1097,14 +1169,21 @@ fn plan_in(
                     .collect::<Vec<_>>()
             })
         } else {
-            choose_victims(&freed, &owner, &c.footprint, &c.limits, c.max_parked, &rest).map(
-                |more| {
-                    occupant_releases()
-                        .into_iter()
-                        .chain(more)
-                        .collect::<Vec<_>>()
-                },
+            choose_victims_within(
+                &freed,
+                &owner,
+                &c.footprint,
+                &c.limits,
+                c.max_parked,
+                &rest,
+                &room,
             )
+            .map(|more| {
+                occupant_releases()
+                    .into_iter()
+                    .chain(more)
+                    .collect::<Vec<_>>()
+            })
         };
         match decided {
             Ok(chosen) if chosen.is_empty() => {
@@ -1121,7 +1200,10 @@ fn plan_in(
                         // Discrete GPU design §5: it parks only where its
                         // parked footprint fits the host after the switch.
                         parks: may_park && victim.release == Release::Park,
-                        park_does_not_fit: may_park && victim.release == Release::Stop,
+                        // Final review M9: also when the arm refused its
+                        // park for memory (`parked_capacity`) earlier.
+                        park_does_not_fit: victim.release == Release::Stop
+                            && (may_park || full.contains(&victim.owner)),
                         last_ready: false,
                         serves_elsewhere: elsewhere,
                         deployment_id: deployment,
@@ -1289,6 +1371,7 @@ fn plan_start_in(
     eligible: placement::Eligible<'_>,
     protected: &BTreeSet<String>,
     activity: &dyn Fn(&str, i64) -> Option<i64>,
+    observed: &PlanningObservations,
 ) -> Result<StartSwitchPlan, LifecycleError> {
     let revision: i64 = tx
         .query_row(
@@ -1324,6 +1407,7 @@ fn plan_start_in(
             protected,
             activity,
             &assumed,
+            observed,
         )? {
             Planned::Settled => continue,
             Planned::Fits { host, device } => host.map(|host| (host, device)),

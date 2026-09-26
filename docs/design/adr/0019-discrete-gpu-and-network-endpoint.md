@@ -133,10 +133,12 @@ a discrete host must name the system domain too, or they are refused
   system domain; on a unified host the two are summed as before. Found live on a 16 GB
   card: a `host_backed` copy is pinned host memory, which the kernel counts as shared, not
   anonymous (vLLM's parked copy of Qwen3-4B was 11.2 GB of `RssShmem` beside 1.9 GB of
-  `RssAnon`). A settled parked owner is credited on `device` and `distinct` domains too
-  (its residue and its copy are in use); on a `unified` domain it keeps its full charge.
-  A park or a wake is charged only what it adds beyond the owner's own charge on those
-  domains, and a domain it adds nothing to is not judged on free memory. The credit stays bound to the recorded runtime identity (ADR 0007),
+  `RssAnon`). A settled parked owner is credited too (its residue and its copy are in
+  use). A park or a wake is charged only what it adds beyond the owner's own charge, and a
+  domain it adds nothing to is not judged on free memory. These are one rule on every
+  host shape (decided 2026-09-26: mllm behaves the same on discrete GPUs and unified
+  memory; only which sampled figure counts differs, because the hardware pools the memory
+  differently). The credit stays bound to the recorded runtime identity (ADR 0007),
   and every allocation of a multi-domain footprint is credited.
 - **Admission and switching** keep their algorithms; the device domain is simply the
   binding constraint on a small card. Two models whose device requests do not fit together
@@ -186,7 +188,13 @@ a discrete host must name the system domain too, or they are refused
   refused with the same code.
 - **When a copy does not fit at switch time.** The switch planner parks a victim when its
   parked footprint still fits after the switch and stops it otherwise, never silently
-  parking `deep` and never overcommitting. The switch record says which:
+  parking `deep` and never overcommitting. "Fits" is the smaller of the ledger's room and
+  the host's fresh observation (free memory plus what the victims' sampled processes
+  return, less every charge and the free reserve), the rule the arm applies, so a copy that
+  memory other programs hold leaves no room for is planned a stop up front. The victim set
+  is the ledger's; nothing is released on the observation alone. A switch park the arm
+  still refuses for memory is refused `parked_capacity` on every host shape and the victim
+  is stopped. The switch record says which:
   `released: parked`, `released: stopped (host RAM full)` or `released: stopped`. On a
   unified host a `deep` victim whose parked residue would not fit beside the waiting
   instance is stopped for the same reason.
