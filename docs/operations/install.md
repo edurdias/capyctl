@@ -356,9 +356,13 @@ server machine run as the service user with the same document, for example
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
   mllm init host --output /var/lib/mllm/host/config/host.yaml
 install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
-# Edit /etc/mllm/host.yaml: name, model_store, ingress, resource_policy,
-# runtime_profiles (see docs/examples/host.yaml). Leave runtime_dir out.
-# model_store and model_sources are optional (see "Models and downloads").
+# The generated document validates as written: its resource_policy is derived
+# from this machine's memory and GPUs as standalone derives its own, and models
+# live in ~/models of the service user (downloads in ~/models/sources) unless
+# model_store names another directory (see "Models and downloads").
+# Edit /etc/mllm/host.yaml for name, ingress (the address the server forwards
+# inference to) and, if you like, the limits (see docs/examples/host.yaml).
+# Leave runtime_dir out.
 mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).

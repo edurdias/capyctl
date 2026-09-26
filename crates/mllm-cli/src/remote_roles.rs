@@ -221,13 +221,43 @@ fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Opt
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
+/// Owner rule 2026-09-25 (standalone is a server plus one host, with the
+/// same defaults): the document `init host` writes validates as written. The
+/// models directory and model downloads are left to the shared defaults
+/// (`~/models`, downloads in `<model_store>/sources`, allowed; each settable
+/// three ways at start), and the resource policy is derived from this
+/// machine's memory and GPU shape exactly as standalone derives its own.
+fn host_template(root: &Path) -> Result<String, StructuredError> {
+    let mut document: Value =
+        serde_json::from_str(&HostConfig::template(root)).map_err(|_| unavailable())?;
+    if let Some(fields) = document.as_object_mut() {
+        fields.remove("model_store");
+    }
+    let capacity = mllm_agent::memory::read_host_memory()
+        .map_err(|_| error("Host memory inventory unavailable"))?
+        .memory
+        .capacity_bytes;
+    let sample = mllm_agent::gpu_memory::sample();
+    let shape =
+        mllm_agent::gpu_memory::shape(sample.as_ref()).map_err(|e| error(&e.to_string()))?;
+    document["hardware_fingerprint"] = json!("mllm-host");
+    document["environment_fingerprint"] = json!("mllm-host");
+    document["resource_policy"] = crate::standalone_config::resource_policy(
+        capacity,
+        None,
+        &shape,
+        mllm_config::engine_settings::DEFAULT_ENGINE_PORTS,
+    );
+    serde_json::to_string_pretty(&document).map_err(|_| unavailable())
+}
+
 fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, StructuredError> {
     if fs::symlink_metadata(output).is_ok() {
         return Err(error("Output already exists; nothing was overwritten"));
     }
     let text = match role {
         InitTarget::Server => ServerConfig::template(root),
-        InitTarget::Host => HostConfig::template(root),
+        InitTarget::Host => host_template(root)?,
     };
     match role {
         InitTarget::Server => {

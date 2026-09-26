@@ -495,3 +495,55 @@ async fn deploy_activate_gives_up_on_a_source_after_the_initialize_window() {
     assert_eq!(state.starts.load(Ordering::SeqCst), 0);
     assert_eq!(state.refused_starts.load(Ordering::SeqCst), 0);
 }
+
+// T14 (standalone is a server plus one host, shared defaults): `init host`
+// writes a document that validates as written, and its models directory is
+// the shared default (`~/models`, downloads in `~/models/sources`, allowed),
+// not a directory under the state root.
+#[test]
+fn init_host_writes_a_document_that_validates_with_the_shared_defaults() {
+    let root = private_dir();
+    mkdir(&root.path().join("home"));
+    let output = mllm(root.path(), root.path(), &["init", "host"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let config = root.path().join("state/config/host.yaml");
+    let document: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    assert!(
+        document["model_store"]["path"]
+            .as_str()
+            .is_none_or(|path| !path.starts_with(root.path().join("state").to_str().unwrap())),
+        "{document}"
+    );
+    let output = mllm(
+        root.path(),
+        root.path(),
+        &["validate", "config", "--file", config.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let output = mllm(
+        root.path(),
+        root.path(),
+        &["config", "show", "--role", "host", "--json"],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let setting = |path: &str| {
+        shown["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["path"] == path)
+            .unwrap_or_else(|| panic!("{path} in {shown}"))
+            .clone()
+    };
+    let models = root.path().join("home/models");
+    assert_eq!(
+        setting("model_store.path")["value"],
+        models.to_str().unwrap()
+    );
+    assert_eq!(setting("model_store.path")["source"], "default");
+    assert_eq!(setting("model_sources.huggingface")["value"], "allowed");
+    assert_eq!(setting("model_sources.http")["value"], "allowed");
+}

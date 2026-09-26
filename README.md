@@ -168,8 +168,8 @@ Copy `gpu-box.join` to the GPU machine, then:
 
 ```bash
 mllm init host --output host.yaml
-# edit host.yaml: name, model store, resource policy and engine
-# installations (docs/examples/host.yaml)
+# host.yaml validates as written (limits derived from this machine, models
+# in ~/models); edit its name and ingress (docs/examples/host.yaml)
 mllm validate config --file host.yaml
 mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
