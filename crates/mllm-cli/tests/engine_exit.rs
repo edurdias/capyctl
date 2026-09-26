@@ -282,7 +282,8 @@ impl Installation {
             .env("MLLM_ENGINE_FINGERPRINT", "fake-vllm-w13")
             .env("MLLM_KV_CACHE_BYTES", "64MiB")
             .env("MLLM_DEEP_PARK", "off")
-            .env("MLLM_STANDALONE_INFERENCE_ADDR", &self.inference)
+            .env("MLLM_INFERENCE_ADDR", &self.inference)
+            .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
             .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
             .env("MLLM_STANDALONE_ENGINE_PORTS", &self.engines);
         command

@@ -9,6 +9,7 @@ use mllm_agent::{
     identity_storage::IdentityDirectory,
     journal::HostJournal,
 };
+use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 use mllm_config::remote_roles::{HostConfig, ServerConfig};
 use mllm_controller::{
     agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
@@ -1043,19 +1044,45 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             }
             let source = read_config(&path)?;
             if *role == Role::Server {
-                let config = ServerConfig::parse(&source)
-                    .map_err(|_| error("Invalid server configuration"))?;
-                // Design §9: `--listen` replaces the inference bind for this
-                // run, under the document's rule.
-                let config = match invocation.listen {
-                    Some(address) => config.with_inference(address).map_err(|_| {
-                        error(&format!(
-                            "--listen {address} collides with another server listener \
-                             or is not a unicast address with a non-zero port"
-                        ))
-                    })?,
-                    None => config,
+                // Design §9: a bad `--listen` or MLLM_INFERENCE_ADDR refuses
+                // before the document is touched.
+                crate::roles::inference_override(invocation.listen)?;
+                if let Some(warning) =
+                    crate::roles::deprecated_inference_env_warning(invocation.listen)
+                {
+                    eprintln!("{warning}");
+                }
+                let parse = |source: &str| {
+                    ServerConfig::parse(source).map_err(|_| error("Invalid server configuration"))
                 };
+                let mut config = parse(&source)?;
+                // ADR 0019, design §9: the old loopback default moves to
+                // 0.0.0.0:8443 once, after the document has been accepted.
+                let document_bind = match crate::roles::listener_migration(
+                    &path,
+                    &config.state_dir,
+                    Some(&config.inference.to_string()),
+                ) {
+                    Migration::Rewritten { .. } => {
+                        config = parse(&read_config(&path)?)?;
+                        config.inference
+                    }
+                    Migration::BindOnly { .. } => {
+                        NEW_INFERENCE_DEFAULT.parse().expect("valid default")
+                    }
+                    Migration::NotNeeded => config.inference,
+                };
+                // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document,
+                // by the rule the standalone role uses, and never onto another
+                // server listener.
+                let address =
+                    crate::roles::effective_inference_address(document_bind, invocation.listen)?;
+                let config = config.with_inference(address).map_err(|_| {
+                    error(&format!(
+                        "inference address {address} collides with another server listener \
+                         or is not a unicast address with a non-zero port"
+                    ))
+                })?;
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,

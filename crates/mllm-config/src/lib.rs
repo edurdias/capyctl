@@ -8,6 +8,8 @@ pub mod effective;
 pub mod engine_policy;
 pub mod error;
 pub mod instances;
+// ADR 0019, design §9: the one-time move of the old loopback inference bind.
+pub mod listener_migration;
 // ADR 0008: declared model sources and the host's model-source policy.
 pub mod model_source;
 // ADR 0018 §2: `engines.yaml`, the mllm-owned engines file beside the role

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
+use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 use mllm_config::schema::ConfigKind;
 use mllm_controller::coordinator::{
     CoordinatorOptions, EngineBindings, OwnedCoordinator, ServiceClock, ServiceObservation as _,
@@ -158,6 +159,8 @@ pub struct App {
     /// Design §9: the document's `server.listeners.inference.bind`, or the
     /// `0.0.0.0:8443` default when it states none.
     inference_bind: std::net::SocketAddr,
+    /// ADR 0019, design §9: what this start's one-time listener migration did.
+    listener_migration: Migration,
 }
 
 impl App {
@@ -178,10 +181,16 @@ impl App {
 
     /// Design §9: the inference bind the standalone document states (default
     /// `0.0.0.0:8443`). The listener binds it unless `--listen` or
-    /// `MLLM_STANDALONE_INFERENCE_ADDR` overrides it
+    /// `MLLM_INFERENCE_ADDR` overrides it
     /// ([`effective_inference_address`]).
     pub fn inference_bind(&self) -> std::net::SocketAddr {
         self.inference_bind
+    }
+
+    /// ADR 0019, design §9: what this start's one-time migration of the old
+    /// loopback inference bind did (reported on stderr as it happened).
+    pub fn listener_migration(&self) -> &Migration {
+        &self.listener_migration
     }
 
     pub fn deps(&self) -> &mllm_router::RouterDeps {
@@ -240,7 +249,13 @@ impl App {
 /// setting). Management stays on loopback (SPEC §16.5), so a management
 /// address that is not loopback is refused. Inference follows the document's
 /// rule (design §9): any unicast address with a non-zero port.
-pub const INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
+///
+/// Design §9: one variable moves the inference listener of either role, the
+/// server's and the standalone one's alike.
+pub const INFERENCE_ADDR_ENV: &str = "MLLM_INFERENCE_ADDR";
+/// The standalone-only name [`INFERENCE_ADDR_ENV`] replaces. Still read, after
+/// it, with a deprecation warning.
+pub const DEPRECATED_INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
 pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
 
 fn loopback_address(variable: &str, default: &str) -> Result<std::net::SocketAddr, StartError> {
@@ -260,10 +275,12 @@ fn loopback_address(variable: &str, default: &str) -> Result<std::net::SocketAdd
         })
 }
 
-/// Design §9: the run-time override of the inference bind, if any: `--listen`
-/// wins over `MLLM_STANDALONE_INFERENCE_ADDR`. Either must be a unicast
-/// address with a non-zero port ([`mllm_config::standalone::inference_address`]).
-/// Checked before the role boots, so a bad value refuses without side effects.
+/// Design §9: the run-time override of the inference bind, if any, for the
+/// server and standalone roles alike. Precedence: `--listen`, then
+/// `MLLM_INFERENCE_ADDR`, then the deprecated `MLLM_STANDALONE_INFERENCE_ADDR`
+/// ([`deprecated_inference_env_warning`]). Each must be a unicast address with a
+/// non-zero port ([`mllm_config::standalone::inference_address`]). Checked
+/// before the role boots, so a bad value refuses without side effects.
 pub fn inference_override(
     listen: Option<std::net::SocketAddr>,
 ) -> Result<Option<std::net::SocketAddr>, StartError> {
@@ -277,8 +294,12 @@ pub fn inference_override(
                 ))
             });
     }
-    let Some(value) = std::env::var_os(INFERENCE_ADDR_ENV) else {
-        return Ok(None);
+    let (variable, value) = match std::env::var_os(INFERENCE_ADDR_ENV) {
+        Some(value) => (INFERENCE_ADDR_ENV, value),
+        None => match std::env::var_os(DEPRECATED_INFERENCE_ADDR_ENV) {
+            Some(value) => (DEPRECATED_INFERENCE_ADDR_ENV, value),
+            None => return Ok(None),
+        },
     };
     value
         .into_string()
@@ -287,15 +308,32 @@ pub fn inference_override(
         .map(Some)
         .ok_or_else(|| {
             StartError::Setting(format!(
-                "{INFERENCE_ADDR_ENV} must be an address with a non-zero port that is not \
+                "{variable} must be an address with a non-zero port that is not \
                  multicast, e.g. 0.0.0.0:8443 or 127.0.0.1:8443"
             ))
         })
 }
 
-/// Design §9: the address the inference listener binds for this run.
-/// Precedence: `--listen` > `MLLM_STANDALONE_INFERENCE_ADDR` > the document's
-/// `listeners.inference.bind` (`document_bind`, default `0.0.0.0:8443`).
+/// The warning a role prints once at start when the deprecated
+/// `MLLM_STANDALONE_INFERENCE_ADDR` is set, or `None`.
+pub fn deprecated_inference_env_warning(listen: Option<std::net::SocketAddr>) -> Option<String> {
+    std::env::var_os(DEPRECATED_INFERENCE_ADDR_ENV)?;
+    let ignored = listen.is_some() || std::env::var_os(INFERENCE_ADDR_ENV).is_some();
+    Some(format!(
+        "warning: {DEPRECATED_INFERENCE_ADDR_ENV} is deprecated; use {INFERENCE_ADDR_ENV}{}",
+        if ignored {
+            " (ignored for this run: --listen or MLLM_INFERENCE_ADDR is set)"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// Design §9, owner rule (flag > environment > document > default): the
+/// address the inference listener of either role binds for this run.
+/// `--listen` > `MLLM_INFERENCE_ADDR` (or its deprecated alias) > the
+/// document's inference `bind` (`document_bind`, which is `0.0.0.0:8443` when
+/// the document states none).
 pub fn effective_inference_address(
     document_bind: std::net::SocketAddr,
     listen: Option<std::net::SocketAddr>,
@@ -1065,6 +1103,30 @@ pub async fn start_standalone_configured(
     start_standalone_inner(state_dir, config, provider, memory, no_gpu()).await
 }
 
+/// ADR 0019, design §9: run the one-time migration of the role `document`
+/// under `state_dir` and report it on stderr, which is the role's log: the
+/// notice on the start that migrated, and `config_migration_failed` when the
+/// document could not be rewritten (the role then binds 0.0.0.0:8443 for this
+/// run). Shared by the standalone and server roles.
+pub fn listener_migration(
+    document: &Path,
+    state_dir: &Path,
+    parsed_bind: Option<&str>,
+) -> Migration {
+    let outcome = mllm_config::listener_migration::migrate(document, state_dir, parsed_bind);
+    if let Migration::BindOnly { reason } = &outcome {
+        eprintln!(
+            "warning: config_migration_failed: {} was not rewritten ({reason}); \
+             inference binds {NEW_INFERENCE_DEFAULT} for this run",
+            document.display()
+        );
+    }
+    if let Some(notice) = mllm_config::listener_migration::notice(document, &outcome) {
+        eprintln!("{notice}");
+    }
+    outcome
+}
+
 async fn start_standalone_inner(
     state_dir: &Path,
     config: Option<&Path>,
@@ -1090,24 +1152,45 @@ async fn start_standalone_inner(
     );
     // SPEC §10 (W10): the switch drain bound, `server.switching.drain_timeout`
     // of the standalone document; 30 s when it names none.
-    let (switch_drain_timeout, timing_header, config_notices, inference_bind) = {
+    let (switch_drain_timeout, timing_header, config_notices, inference_bind, listener_migration) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
             LoadOutcome::Generated { config_path, .. } => config_path.clone(),
         };
-        let text = std::fs::read_to_string(&path)?;
-        let document = mllm_config::parse_strict(ConfigKind::Standalone, &text)
-            .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
-        // SPEC §15.3: a value this role would silently ignore (another state
-        // directory or listener, TLS, a model store, profiles, numeric limits)
-        // is refused before any side effect.
         let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
         let config_dir = absolute(path.parent().unwrap_or(Path::new(".")));
-        // SPEC §15.2 (R13): the `server.tls` block an older generator wrote is
-        // accepted and reported, never rewritten; every other value is refused.
-        let ignored =
-            mllm_config::standalone::check_honoured(&document, &config_dir, &absolute(state_dir))
-                .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
+        let load = || -> Result<_, StartError> {
+            let text = std::fs::read_to_string(&path)?;
+            let document =
+                mllm_config::parse_strict(ConfigKind::Standalone, &text).map_err(|error| {
+                    StartError::Deploy(format!("standalone configuration: {error}"))
+                })?;
+            // SPEC §15.3: a value this role would silently ignore (another state
+            // directory or listener, TLS, a model store, profiles, numeric limits)
+            // is refused before any side effect.
+            // SPEC §15.2 (R13): the `server.tls` block an older generator wrote is
+            // accepted and reported; every other value is refused.
+            let ignored = mllm_config::standalone::check_honoured(
+                &document,
+                &config_dir,
+                &absolute(state_dir),
+            )
+            .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
+            Ok((document, ignored))
+        };
+        let (mut document, mut ignored) = load()?;
+        // ADR 0019, design §9: a document still stating the old loopback
+        // default is migrated to 0.0.0.0:8443 once, after it has been accepted
+        // and before its listeners are read. A refused document is never
+        // touched.
+        let migration = listener_migration(
+            &path,
+            state_dir,
+            document["server"]["listeners"]["inference"]["bind"].as_str(),
+        );
+        if matches!(migration, Migration::Rewritten { .. }) {
+            (document, ignored) = load()?;
+        }
         (
             mllm_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
                 |error| StartError::Deploy(format!("standalone configuration: {error}")),
@@ -1117,10 +1200,15 @@ async fn start_standalone_inner(
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             ignored.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            // Design §9: validated by `check_honoured` above.
-            mllm_config::standalone::inference_bind(&document).map_err(|error| {
-                StartError::Deploy(format!("standalone configuration: {error}"))
-            })?,
+            // Design §9: validated by `check_honoured` above. A document the
+            // migration could not rewrite still serves on the new default.
+            match migration {
+                Migration::BindOnly { .. } => NEW_INFERENCE_DEFAULT.parse().expect("valid default"),
+                _ => mllm_config::standalone::inference_bind(&document).map_err(|error| {
+                    StartError::Deploy(format!("standalone configuration: {error}"))
+                })?,
+            },
+            migration,
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
@@ -1546,6 +1634,7 @@ async fn start_standalone_inner(
         supervision,
         switcher,
         config_notices,
+        listener_migration,
         inference_bind,
     })
 }

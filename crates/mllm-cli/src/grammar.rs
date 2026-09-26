@@ -485,7 +485,8 @@ enum StartTarget {
     Server {
         /// Serve inference on this address for this run instead of the
         /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
-        /// example 127.0.0.1:8443 or a Tailscale address.
+        /// example 127.0.0.1:8443 or a Tailscale address. Wins over
+        /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
     },
@@ -501,7 +502,7 @@ enum StartTarget {
         /// Serve inference on this address for this run instead of the
         /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
         /// example 127.0.0.1:8443 or a Tailscale address. Wins over
-        /// MLLM_STANDALONE_INFERENCE_ADDR.
+        /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
     },

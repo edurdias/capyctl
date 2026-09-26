@@ -16,7 +16,7 @@
 //! §9: `0.0.0.0:8443` by default, as for a server), each with its fixed
 //! authentication, an `embedded` connection, `auto` resource values and no
 //! runtime profiles. A listener moves for one run through `--listen` (inference
-//! only) or `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
+//! only) or `MLLM_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
 //! are labels and are not checked.
 //!

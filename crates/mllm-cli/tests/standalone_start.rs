@@ -159,18 +159,24 @@ fn legacy_generated(state: &str) -> String {
 }
 
 /// T03 (SPEC §15.2, R13): an installation whose `standalone.yaml` an older mllm
-/// generated still starts. Its `server.tls` block is reported as ignored, and
-/// the file is left byte for byte as it was: generated configuration is never
-/// replaced.
+/// generated still starts. Its `server.tls` block is reported as ignored and
+/// kept. T02 (ADR 0019, design §9): the only change the role makes to the file
+/// is the one-time move of the old loopback inference default, with the
+/// original kept beside it; the role then binds `0.0.0.0:8443`, and a second
+/// start changes nothing.
 #[tokio::test]
 async fn standalone_starts_from_a_document_an_older_generator_wrote() {
+    use mllm_config::listener_migration::{Migration, MARKER};
     let dir = safe_state_dir();
     let (path, _) =
         mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
     let legacy = legacy_generated(&dir.path().to_string_lossy());
     std::fs::write(&path, &legacy).unwrap();
 
-    let app = boot(dir.path()).await;
+    // A restart passes the same engine port range, as an unchanged
+    // environment would.
+    let ports = support::engine_ports();
+    let app = support::try_boot_on(dir.path(), ports).await.unwrap();
 
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
@@ -178,11 +184,56 @@ async fn standalone_starts_from_a_document_an_older_generator_wrote() {
         notices[0].contains("server.tls") && notices[0].contains("ignored"),
         "{notices:?}"
     );
+    let backup = path.with_file_name("standalone.yaml.pre-0.1.0");
+    assert_eq!(
+        app.listener_migration(),
+        &Migration::Rewritten {
+            backup: backup.clone()
+        }
+    );
+    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        legacy,
-        "the file is not rewritten"
+        legacy.replace("\"127.0.0.1:8443\"", "\"0.0.0.0:8443\""),
+        "only the inference bind changes"
     );
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), legacy);
+    assert!(dir.path().join(MARKER).exists());
+    let _ = app.shutdown().await;
+
+    let app = support::try_boot_on(dir.path(), ports).await.unwrap();
+    assert_eq!(app.listener_migration(), &Migration::NotNeeded);
+    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
+    let _ = app.shutdown().await;
+}
+
+/// T02 (design §9, `config_migration_failed`): a legacy document that cannot
+/// be rewritten unambiguously is left byte for byte as it was, and the role
+/// still binds `0.0.0.0:8443` for this run; the API key stays required.
+#[tokio::test]
+async fn an_ambiguous_legacy_document_binds_the_new_default_without_a_rewrite() {
+    use mllm_config::listener_migration::Migration;
+    let dir = safe_state_dir();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
+    let legacy = format!(
+        "# inference was 127.0.0.1:8443\n{}",
+        legacy_generated(&dir.path().to_string_lossy())
+    );
+    std::fs::write(&path, &legacy).unwrap();
+
+    let app = boot(dir.path()).await;
+
+    assert!(
+        matches!(app.listener_migration(), Migration::BindOnly { .. }),
+        "{:?}",
+        app.listener_migration()
+    );
+    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
+    assert!(!app.api_key().is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    assert!(!path.with_file_name("standalone.yaml.pre-0.1.0").exists());
+    let _ = app.shutdown().await;
 }
 
 /// T02 T37 (design §9): a new standalone installation binds inference on every
@@ -196,12 +247,16 @@ async fn standalone_binds_inference_on_every_interface_by_default() {
 }
 
 /// T03 (design §9): the document's inference bind is the one the role binds,
-/// for example a tailnet address; the old loopback default is honoured as
-/// written until the one-time migration runs.
+/// for example a tailnet address. After the one-time migration has run, the
+/// old loopback default is an operator's choice and is honoured as written.
 #[tokio::test]
 async fn standalone_binds_the_inference_address_its_document_states() {
+    use mllm_config::listener_migration::MARKER;
     for bind in ["100.64.0.5:8443", "127.0.0.1:8443"] {
         let dir = safe_state_dir();
+        let marker = dir.path().join(MARKER);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "").unwrap();
         let explicit = dir.path().join("explicit.yaml");
         let text = legacy_generated(&dir.path().to_string_lossy())
             .replace("\"127.0.0.1:8443\"", &format!("\"{bind}\""));
@@ -210,38 +265,79 @@ async fn standalone_binds_the_inference_address_its_document_states() {
             .await
             .expect("a valid explicit document boots");
         assert_eq!(app.inference_bind().to_string(), bind);
+        assert_eq!(std::fs::read_to_string(&explicit).unwrap(), text);
     }
 }
 
-/// T03 (design §9): `--listen` wins over `MLLM_STANDALONE_INFERENCE_ADDR`,
-/// which wins over the document. Either may name any unicast address with a
-/// port; a multicast address or port 0 is refused.
+/// T03 (design §9, owner rule): `--listen` wins over `MLLM_INFERENCE_ADDR`,
+/// which wins over the document, for the server and standalone roles alike
+/// (one function decides both). The deprecated
+/// `MLLM_STANDALONE_INFERENCE_ADDR` is read after `MLLM_INFERENCE_ADDR`. Any
+/// unicast address with a port is accepted; a multicast address or port 0 is
+/// refused, naming the variable.
 #[test]
 fn listen_beats_environment_beats_document() {
-    use mllm_cli::roles::{effective_inference_address, INFERENCE_ADDR_ENV};
+    use mllm_cli::roles::{
+        deprecated_inference_env_warning, effective_inference_address,
+        DEPRECATED_INFERENCE_ADDR_ENV, INFERENCE_ADDR_ENV,
+    };
     use std::net::SocketAddr;
-    let doc: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+    let standalone: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+    // The server's document bind, as the server parses it.
+    let server = mllm_config::remote_roles::ServerConfig::parse(
+        &mllm_config::remote_roles::ServerConfig::template(std::path::Path::new("/srv/mllm"))
+            .replace("0.0.0.0:8443", "100.64.0.9:8443"),
+    )
+    .unwrap()
+    .inference;
+    assert_eq!(server.to_string(), "100.64.0.9:8443");
     std::env::remove_var(INFERENCE_ADDR_ENV);
-    assert_eq!(effective_inference_address(doc, None).unwrap(), doc);
-    std::env::set_var(INFERENCE_ADDR_ENV, "100.64.0.5:8443");
+    std::env::remove_var(DEPRECATED_INFERENCE_ADDR_ENV);
+    for doc in [standalone, server] {
+        assert_eq!(effective_inference_address(doc, None).unwrap(), doc);
+        std::env::set_var(INFERENCE_ADDR_ENV, "100.64.0.5:8443");
+        assert_eq!(
+            effective_inference_address(doc, None).unwrap().to_string(),
+            "100.64.0.5:8443"
+        );
+        assert_eq!(
+            effective_inference_address(doc, Some("127.0.0.1:1".parse().unwrap()))
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:1"
+        );
+        std::env::remove_var(INFERENCE_ADDR_ENV);
+    }
+    assert_eq!(deprecated_inference_env_warning(None), None);
+    std::env::set_var(DEPRECATED_INFERENCE_ADDR_ENV, "127.0.0.1:2");
     assert_eq!(
-        effective_inference_address(doc, None).unwrap().to_string(),
-        "100.64.0.5:8443"
-    );
-    assert_eq!(
-        effective_inference_address(doc, Some("127.0.0.1:1".parse().unwrap()))
+        effective_inference_address(standalone, None)
             .unwrap()
             .to_string(),
-        "127.0.0.1:1"
+        "127.0.0.1:2"
     );
+    assert!(deprecated_inference_env_warning(None)
+        .unwrap()
+        .contains("MLLM_STANDALONE_INFERENCE_ADDR is deprecated; use MLLM_INFERENCE_ADDR"));
+    std::env::set_var(INFERENCE_ADDR_ENV, "127.0.0.1:3");
+    assert_eq!(
+        effective_inference_address(standalone, None)
+            .unwrap()
+            .to_string(),
+        "127.0.0.1:3"
+    );
+    assert!(deprecated_inference_env_warning(None)
+        .unwrap()
+        .contains("ignored"));
+    std::env::remove_var(DEPRECATED_INFERENCE_ADDR_ENV);
     for bad in ["224.0.0.1:8443", "0.0.0.0:0", "nonsense"] {
         std::env::set_var(INFERENCE_ADDR_ENV, bad);
-        let error = effective_inference_address(doc, None).unwrap_err();
+        let error = effective_inference_address(standalone, None).unwrap_err();
         assert!(error.to_string().contains(INFERENCE_ADDR_ENV), "{error}");
     }
     std::env::remove_var(INFERENCE_ADDR_ENV);
-    assert!(effective_inference_address(doc, Some("0.0.0.0:0".parse().unwrap())).is_err());
-    assert!(effective_inference_address(doc, Some("224.0.0.1:1".parse().unwrap())).is_err());
+    assert!(effective_inference_address(standalone, Some("0.0.0.0:0".parse().unwrap())).is_err());
+    assert!(effective_inference_address(standalone, Some("224.0.0.1:1".parse().unwrap())).is_err());
 }
 
 /// T03 (SPEC §15.3): the current generated document reports nothing ignored.
@@ -263,6 +359,8 @@ fn assert_untouched(state: &std::path::Path) {
         "config/standalone.yaml",
         "identity/credentials",
         "server/srv.sqlite3",
+        // ADR 0019: a refused document is never migrated.
+        mllm_config::listener_migration::MARKER,
     ] {
         assert!(!state.join(leaf).exists(), "{leaf} was created");
     }
@@ -354,10 +452,12 @@ async fn standalone_honours_a_valid_explicit_document() {
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("server.tls"), "{notices:?}");
+    // ADR 0019, design §9: an explicit document goes through the same
+    // one-time migration; nothing but the inference bind changes.
     assert_eq!(
         std::fs::read_to_string(&explicit).unwrap(),
-        text,
-        "not rewritten"
+        text.replace("\"127.0.0.1:8443\"", "\"0.0.0.0:8443\""),
+        "only the inference bind is rewritten"
     );
     assert!(
         !dir.path().join("config/standalone.yaml").exists(),

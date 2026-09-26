@@ -293,7 +293,7 @@ fn run_standalone(
 
 /// Boot the standalone graph and serve the inference listener (design §9:
 /// the document's bind, `0.0.0.0:8443` by default, unless `--listen` or
-/// `MLLM_STANDALONE_INFERENCE_ADDR` moves it for this run) until the process
+/// `MLLM_INFERENCE_ADDR` moves it for this run) until the process
 /// is signalled.
 ///
 /// SPEC §4.3 (owner decision P3): SIGTERM or SIGINT is a service restart.
@@ -315,10 +315,13 @@ async fn serve_standalone(
     .map_err(roles::StartError::Setting)?;
     // Checked before the boot, so a bad override refuses without side effects.
     roles::inference_override(listen)?;
+    if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
+        eprintln!("{warning}");
+    }
     let management_address = roles::standalone_management_address()?;
     let mut signals = shutdown::Signals::install()?;
     let app = roles::start_standalone_from(state_dir, config).await?;
-    // Design §9: `--listen` > MLLM_STANDALONE_INFERENCE_ADDR > the document.
+    // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document.
     let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
