@@ -1272,13 +1272,15 @@ fn source() -> ModelSource {
     }
 }
 
-// T26/T23: a 4B bf16 model (~8 GiB) on a 16 GB card: request, no fixed shares.
+// T26/T23: a 3B bf16 model (~6 GiB) on a 16 GB card: request, no fixed
+// shares; its pinned copy (1.5 x 6 GiB) plus the engine's 4 GiB fits the
+// 15 GiB the system domain holds parked, so it parks host_backed.
 #[test]
 fn a_discrete_template_states_a_request_and_derives_phases() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
         device_total: 16376 << 20,
-        weights_bytes: Some(8 << 30),
+        weights_bytes: Some(6 << 30),
         system_parked_limit: 15 << 30,
         kv_cache_bytes: None,
     };
@@ -1297,7 +1299,7 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     // The picker chooses the GPU (discrete GPU design §7); the deployment
     // parser requires the key, so the template pins nothing with an empty list.
     assert_eq!(doc["devices"], serde_json::json!([]));
-    let (request, kv) = device_request(Engine::Sglang, 8 << 30, 15 << 30, 16376 << 20);
+    let (request, kv) = device_request(Engine::Sglang, 6 << 30, 15 << 30, 16376 << 20);
     assert_eq!(kv, (15i64 << 30) / 4); // min(4 GiB, 3.75 GiB)
     assert_eq!(
         doc["engine_config"]["memory"]["request"],
@@ -1320,10 +1322,12 @@ fn the_vllm_request_has_a_floor() {
 // Owner decision 2: host_backed is the discrete default when the copy fits.
 #[test]
 fn the_default_tier_follows_the_host() {
+    // The pinned copy is charged at 1.5 times the weights: 12 + 4 <= 16.
     assert_eq!(
-        default_residency(true, Some((8 << 30, 15 << 30))),
+        default_residency(true, Some((8 << 30, 16 << 30))),
         "host_backed"
     );
+    assert_eq!(default_residency(true, Some((8 << 30, 15 << 30))), "deep");
     assert_eq!(default_residency(true, Some((20 << 30, 15 << 30))), "deep");
     assert_eq!(default_residency(true, None), "deep");
     assert_eq!(
@@ -1420,7 +1424,7 @@ fn the_discrete_template_resolves_and_fits_the_card() {
             &TemplateMemory::Device {
                 managed_limit: limits.managed_limit,
                 device_total: gpu.total_bytes,
-                weights_bytes: Some(8 * GIB),
+                weights_bytes: Some(6 * GIB),
                 system_parked_limit: system_parked,
                 kv_cache_bytes: None,
             },
@@ -1442,7 +1446,7 @@ fn the_discrete_template_resolves_and_fits_the_card() {
             chosen,
             &host,
             mllm_config::effective::CheckpointFacts {
-                weights_bytes: Some(8 * GIB),
+                weights_bytes: Some(6 * GIB),
                 ..Default::default()
             },
         )

@@ -1379,7 +1379,7 @@ fn discrete_host() -> serde_json::Value {
     let mut h = host();
     h["resource_policy"]["domains"] = serde_json::json!({
         "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
-                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
         "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
                  "free_reserve": "1536MiB", "parked_limit": "2GiB"}
     });
@@ -1630,50 +1630,31 @@ fn deep_budgets_charge_device_and_system() {
     assert_eq!(r.ready.devices.len(), 1);
 }
 
-// T26/T23: vLLM host_backed charges the weights copy only while parked.
+// T26/T23: host_backed charges the pinned weights copy (1.5 times the
+// weights) in every phase, for vLLM as for SGLang. Found live on a 16 GB
+// discrete GPU: vLLM 0.29's pinned backup took 1.37 times the weights and
+// stayed allocated after the wake.
 #[test]
-fn vllm_host_backed_charges_the_copy_when_parked() {
-    let r = resolve(
-        &deployment_with("host_backed", "vllm", "10GiB"),
-        &discrete_host(),
-    )
-    .unwrap()
-    .resources;
-    assert_eq!(phase(&r.ready)[1].1, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES);
-    assert_eq!(
-        phase(&r.parked)[1].1,
-        ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES + 8 * GIB
-    );
-    assert_eq!(
-        phase(&r.parked)[0].1,
-        PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES
-    );
-    assert!(r.parked.allocations.iter().all(|a| a.host_kv_bytes == 0));
-    // The copy exists while the weights move into and out of it, so the two
-    // transitions carry it; a cold start does not.
-    assert_eq!(phase(&r.cold)[1].1, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES);
-    for p in [&r.parking, &r.wake] {
+fn host_backed_charges_the_pinned_copy_in_every_phase() {
+    for engine in ["vllm", "sglang"] {
+        let r = resolve(
+            &deployment_with("host_backed", engine, "10GiB"),
+            &discrete_host(),
+        )
+        .unwrap()
+        .resources;
+        for p in [&r.cold, &r.ready, &r.parking, &r.parked, &r.wake] {
+            assert_eq!(
+                phase(p)[1].1,
+                ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES + 12 * GIB,
+                "{engine}"
+            );
+        }
         assert_eq!(
-            phase(p)[1].1,
-            ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES + 8 * GIB
+            phase(&r.parked)[0].1,
+            PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES
         );
-    }
-}
-
-// T26: SGLang's CPU backup lives for the engine's life.
-#[test]
-fn sglang_host_backed_charges_the_copy_in_every_phase() {
-    let r = resolve(
-        &deployment_with("host_backed", "sglang", "10GiB"),
-        &discrete_host(),
-    )
-    .unwrap()
-    .resources;
-    for p in [&r.cold, &r.ready, &r.parking, &r.parked, &r.wake] {
-        assert_eq!(
-            phase(p)[1].1,
-            ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES + 8 * GIB
-        );
+        assert!(r.parked.allocations.iter().all(|a| a.host_kv_bytes == 0));
     }
 }
 

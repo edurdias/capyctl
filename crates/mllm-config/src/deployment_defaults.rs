@@ -322,7 +322,8 @@ pub fn default_residency(
     match (deep_park, discrete) {
         (false, _) => Residency::RestartOnly,
         (true, Some((Some(weights), parked_limit)))
-            if weights.saturating_add(OVERHEAD) <= parked_limit =>
+            if crate::effective::host_backed_copy_bytes(weights).saturating_add(OVERHEAD)
+                <= parked_limit =>
         {
             Residency::HostBacked
         }
@@ -491,11 +492,11 @@ mod tests {
             Residency::RestartOnly
         );
         assert_eq!(
-            default_residency(true, Some((Some(8 << 30), (8 << 30) + OVERHEAD))),
+            default_residency(true, Some((Some(8 << 30), (12 << 30) + OVERHEAD))),
             Residency::HostBacked
         );
         assert_eq!(
-            default_residency(true, Some((Some(8 << 30), 8 << 30))),
+            default_residency(true, Some((Some(8 << 30), (12 << 30) + OVERHEAD - 1))),
             Residency::Deep
         );
         assert_eq!(

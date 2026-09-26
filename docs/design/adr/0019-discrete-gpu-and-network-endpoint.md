@@ -95,11 +95,14 @@ The engine host overhead is the placeholder `ENGINE_HOST_OVERHEAD_PLACEHOLDER_BY
 (4 GiB) and the parked device residue `PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES` (1 GiB),
 both labelled `derived` until a first run measures them. The unified placeholder
 `PARKED_RESIDUAL_PLACEHOLDER_BYTES` (2 GiB) is unchanged. The `host_backed` weights copy is
-the checkpoint's weight bytes, charged on the system domain as parked residue, so it counts
-against the system `parked_limit` as well as `managed_limit`. SGLang's weights CPU backup
-holds the copy for the engine's whole life, so an SGLang `host_backed` deployment carries it
-in every phase; vLLM level 1 allocates it only while asleep. A host-KV budget charges the
-system domain, never the device domain.
+1.5 times the checkpoint's weight bytes (`HOST_BACKED_COPY_FACTOR`: pinned host memory is
+rounded up per tensor; measured live at 1.37 times with vLLM 0.29 on two models), charged on
+the system domain as parked residue, so it counts against the system `parked_limit` as well
+as `managed_limit`. SGLang's weights CPU backup holds the copy for the engine's whole life,
+and so does vLLM 0.29 in practice (level 1 frees its backup tensors on wake, but the pinned
+allocator keeps the memory; measured live), so a `host_backed` deployment carries it in
+every phase on both engines. A host-KV budget charges the system domain, never the device
+domain.
 
 A deployment that states no memory gets a device request of `weights × 1.10 + kv_cache`,
 with `kv_cache = min(4 GiB, 25 % of the device managed limit)`. A vLLM request is at least
@@ -122,8 +125,14 @@ a discrete host must name the system domain too, or they are refused
   device missing from a fresh sample is unknown: admission on that domain closes
   (`device_unobserved`, SPEC §7.2) and every existing reservation stays charged.
 - **Residents.** On a discrete host a process's GPU bytes are credited to the device domain
-  its device maps to and its anonymous RSS to the system domain; on a unified host the two
-  are summed as before. The credit stays bound to the recorded runtime identity (ADR 0007),
+  its device maps to and its anonymous and shared RSS (`RssAnon` + `RssShmem`) to the
+  system domain; on a unified host the two are summed as before. Found live on a 16 GB
+  card: a `host_backed` copy is pinned host memory, which the kernel counts as shared, not
+  anonymous (vLLM's parked copy of Qwen3-4B was 11.2 GB of `RssShmem` beside 1.9 GB of
+  `RssAnon`). A settled parked owner is credited on `device` and `distinct` domains too
+  (its residue and its copy are in use); on a `unified` domain it keeps its full charge.
+  A park or a wake is charged only what it adds beyond the owner's own charge on those
+  domains, and a domain it adds nothing to is not judged on free memory. The credit stays bound to the recorded runtime identity (ADR 0007),
   and every allocation of a multi-domain footprint is credited.
 - **Admission and switching** keep their algorithms; the device domain is simply the
   binding constraint on a small card. Two models whose device requests do not fit together

@@ -10,8 +10,9 @@ mod startup;
 mod timeouts;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
 pub use engine_config::{
-    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
-    MemoryInputs, ResolvedMemory, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
+    default_startup_bytes, host_backed_copy_bytes, overhead_margin, resolve_memory,
+    resolve_startup, CheckpointFacts, MemoryInputs, ResolvedMemory,
+    ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES, HOST_BACKED_COPY_FACTOR,
     PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES, PARKED_RESIDUAL_PLACEHOLDER_BYTES,
     SGLANG_OVERHEAD_MARGIN_BYTES, STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
 };
@@ -1170,7 +1171,6 @@ pub fn resolve_effective_with_checkpoint(
                 &devices,
                 &host,
                 facts.weights_bytes,
-                profile.engine,
             )?;
             let provenance = match &mut engine_config {
                 LaunchSettings::Vllm(settings) => &mut settings.provenance,

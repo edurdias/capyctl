@@ -694,7 +694,13 @@ fn store_with_checkpoint(weights: u64) -> tempfile::TempDir {
 async fn a_discrete_standalone_sizes_its_deployment_from_the_checkpoint() {
     let gpu = discrete_card().unwrap().devices[0].memory.clone().unwrap();
     let limits = mllm_cli::standalone_config::device_limits(&gpu, 4);
-    for (weights, residency) in [(3_i64 << 30, "host_backed"), (8 << 30, "deep")] {
+    // The system domain holds 8 GiB parked here: a 2 GiB model's pinned copy
+    // (1.5 x 2 GiB) plus the engine's 4 GiB fits, a 3 GiB one's does not.
+    for (weights, residency) in [
+        (2_i64 << 30, "host_backed"),
+        (3 << 30, "deep"),
+        (8 << 30, "deep"),
+    ] {
         let dir = safe_state_dir();
         let store = store_with_checkpoint(weights as u64);
         let app = support::try_boot_discrete(dir.path(), discrete_card, store.path(), true)

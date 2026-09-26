@@ -34,6 +34,20 @@ pub const ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES: i64 = 4 << 30;
 /// `PARKED_RESIDUAL_PLACEHOLDER_BYTES` stays for unified hosts.
 pub const PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES: i64 = 1 << 30;
 
+/// Discrete GPU design §3: the host RAM a `host_backed` copy of `weights`
+/// bytes takes. The copy is pinned host memory, which PyTorch's pinned
+/// allocator rounds up per tensor. Measured live on a 16 GB discrete GPU with
+/// vLLM 0.29: about 1.37 times the weights (11.1 GB for 8.04 GB of Qwen3-4B,
+/// 4.2 GB for 3.09 GB of Qwen2.5-1.5B), so the placeholder charges 1.5 times
+/// until a first park measures it.
+pub const HOST_BACKED_COPY_FACTOR: (i64, i64) = (3, 2);
+
+/// The `host_backed` copy of `weights` bytes, as charged in host RAM.
+pub fn host_backed_copy_bytes(weights: i64) -> i64 {
+    let (numerator, denominator) = HOST_BACKED_COPY_FACTOR;
+    weights.saturating_mul(numerator) / denominator
+}
+
 /// Owner decision 2026-09-23 (startup memory budget): until a deployment
 /// declares `memory.startup` or a first run on a host measures the peak, the
 /// startup reservation is `max(request, weights × STARTUP_WEIGHTS_FACTOR +
@@ -429,7 +443,6 @@ pub(super) fn derive_resources(
     devices: &[DeviceClaim],
     host: &HostPolicy,
     weights_bytes: Option<i64>,
-    engine: Engine,
 ) -> Result<RecipeFootprints, ConfigError> {
     let mut domains = BTreeSet::new();
     for claim in devices {
@@ -465,7 +478,6 @@ pub(super) fn derive_resources(
             host,
             device_domain: domain,
             weights_bytes,
-            engine,
         });
     }
     let active = |bytes: i64| PhaseFootprint {
@@ -505,7 +517,6 @@ struct DiscreteInputs<'a> {
     host: &'a HostPolicy,
     device_domain: String,
     weights_bytes: Option<i64>,
-    engine: Engine,
 }
 
 /// Discrete GPU design §3 (ADR 0019): VRAM in the device domain, the engine's host
@@ -520,7 +531,6 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
         host,
         device_domain,
         weights_bytes,
-        engine,
     } = inputs;
     let systems: Vec<&String> = host
         .domains
@@ -541,7 +551,7 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     // provisional and re-resolves it with the measured weights, exactly as a
     // memory request derived from the weights.
     let copy = match residency {
-        Residency::HostBacked => weights_bytes.ok_or_else(|| {
+        Residency::HostBacked => weights_bytes.map(host_backed_copy_bytes).ok_or_else(|| {
             ConfigError::new(
                 ConfigErrorCode::NotMaterializable,
                 "engine_config.memory",
@@ -551,9 +561,12 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
         })?,
         _ => 0,
     };
-    // SGLang's --enable-weights-cpu-backup holds the copy for the engine's life;
-    // vLLM level 1 allocates it only while asleep (discrete GPU design §3).
-    let always = if engine == Engine::Sglang { copy } else { 0 };
+    // SGLang's --enable-weights-cpu-backup holds the copy for the engine's
+    // life. So does vLLM 0.29 in practice: level 1 frees its backup tensors on
+    // wake, but PyTorch's pinned allocator keeps the memory cached (measured
+    // live on a 16 GB discrete GPU: the process's shared memory stayed at the
+    // copy's size after the wake), so both are charged it in every phase.
+    let always = copy;
     let overhead = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
     let two = |device: i64, system_bytes: i64, devices: Vec<DeviceClaim>| PhaseFootprint {
         allocations: vec![

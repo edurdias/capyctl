@@ -574,10 +574,13 @@ several times faster than a reload from disk. mllm chooses it when the copy
 plus the engine process fits the `system` domain's parked limit, and `deep`
 otherwise (also while a downloaded model's size is not known yet);
 `restart_only` when the engine's deep parking is off. The copy is charged in
-host RAM: SGLang keeps it for the engine's whole life, vLLM only while the
-model is parked. When a model must make room and its copy no longer fits in
-host RAM, it is stopped rather than parked, and the switch record says
-`released: stopped (host RAM full)`. An engine build without parking support
+host RAM at 1.5 times the weights (pinned memory is rounded up; vLLM 0.29
+measured 1.37 times), for the engine's whole life: SGLang keeps its backup,
+and vLLM keeps the pinned memory after a wake. When a model must make room and
+its copy no longer fits in host RAM, it is stopped rather than parked, and the
+switch record says `released: stopped (host RAM full)`; a park the switch
+planned that host memory cannot take when it is sent (other programs hold the
+RAM) is refused and the model is stopped instead. An engine build without parking support
 refuses a `host_backed` or `deep` launch with `capability_missing:deep_park`,
 and so does an SGLang ModelOpt (NVFP4) checkpoint: its wake is not proven yet,
 so choose `restart_only` for it. On a unified machine `host_backed` is refused
