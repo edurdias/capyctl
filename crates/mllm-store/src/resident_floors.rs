@@ -10,13 +10,13 @@
 //! A floor is a verified lower bound: the memory the host sampled for the
 //! exact processes (pid, boot id and start ticks) of a runtime this store
 //! recorded, beside the same availability sample, capped at the owner's
-//! reservation. Only a Ready owner with no lifecycle run in flight is
-//! credited: its footprint is settled, so the sample reflects it, and a
-//! transitioning owner keeps its full charge. A settled parked owner whose
-//! processes are sampled alive is credited what they hold on a discrete
-//! host's `device` and `distinct` domains; it keeps its full charge on a
-//! `unified` domain. The candidate is
-//! never credited. A domain whose floors would exceed the memory in use
+//! reservation. Only a settled owner (Ready or parked, with no lifecycle run
+//! in flight) is credited: its footprint is settled, so the sample reflects
+//! it, and a transitioning owner keeps its full charge. The candidate is
+//! never credited. One rule for every host shape (final review I5, owner
+//! rule 2026-09-26: mllm behaves the same on discrete GPUs and unified
+//! memory): only which sampled figure counts differs, because the hardware
+//! puts the memory in different pools (`credited_bytes`). A domain whose floors would exceed the memory in use
 //! gets none (fail closed), as does anything without a sample.
 //!
 //! ADR 0019: a discrete host holds an engine's weights in a device domain and
@@ -99,16 +99,16 @@ pub(crate) fn resident_floors(
         let Some(footprint) = scoped.owners.get(&owner) else {
             continue;
         };
-        // Found live on a 16 GB discrete GPU: a parked engine's residue on
-        // the card and its host_backed copy in host RAM are in use too, and
-        // charging them again stopped every model parked beside a start. A
-        // settled park is credited on `device` and `distinct` domains only; a
-        // `unified` domain keeps the parked charge (ADR 0007 unchanged).
-        let parked = match footprint.phase {
-            ResourcePhase::Ready => false,
-            ResourcePhase::Parked => true,
-            _ => continue,
-        };
+        // Found live on a 16 GB discrete GPU: a parked engine's residue and
+        // its host_backed copy are in use too, and charging them again stopped
+        // every model parked beside a start. The same holds in a unified
+        // pool, so a settled park is credited on every domain kind.
+        if !matches!(
+            footprint.phase,
+            ResourcePhase::Ready | ResourcePhase::Parked
+        ) {
+            continue;
+        }
         let Ok(identities) = serde_json::from_str::<Vec<Identity>>(&identities) else {
             continue;
         };
@@ -130,9 +130,6 @@ pub(crate) fn resident_floors(
             let Some(&kind) = kinds.get(&allocation.domain) else {
                 continue;
             };
-            if parked && kind == DomainMemory::Unified {
-                continue;
-            }
             let resident = processes
                 .iter()
                 .try_fold(0_i64, |sum, p| sum.checked_add(credited_bytes(p, kind)));
@@ -167,10 +164,10 @@ pub(crate) fn resident_floors(
 /// check only when a transition adds nothing; a host_backed park adds the
 /// weights copy on the system domain while keeping its GPU charge, and without
 /// this its whole footprint was charged against the card's free memory again,
-/// as was a wake's parked residue. Each held allocation on a `device` or
-/// `distinct` domain is credited, capped at what the domain has in use beside
-/// the floors already credited there, so the transition is charged only what
-/// it adds. A `unified` domain is left exactly as it was (ADR 0007).
+/// as was a wake's parked residue. Each held allocation is credited, capped at
+/// what the domain has in use beside the floors already credited there, so
+/// the transition is charged only what it adds. One rule on every domain kind
+/// (final review I5): the held memory is in use in a unified pool as on a card.
 pub(crate) fn credit_own_charge(
     floors: &mut Vec<ResidentFloor>,
     owner: &str,
@@ -179,10 +176,8 @@ pub(crate) fn credit_own_charge(
     kinds: &BTreeMap<String, DomainMemory>,
 ) {
     for allocation in &held.allocations {
-        if !matches!(
-            kinds.get(&allocation.domain),
-            Some(DomainMemory::Device | DomainMemory::Distinct)
-        ) {
+        // A domain the policy does not describe gets no credit (fail closed).
+        if !kinds.contains_key(&allocation.domain) {
             continue;
         }
         let Some(observation) = observations.iter().find(|o| o.domain == allocation.domain) else {

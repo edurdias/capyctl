@@ -1741,17 +1741,14 @@ fn arm(
         // its deadline (it never evicts Ready work).
         Fit::Impossible(why) => {
             // Discrete GPU design §5 (found live on a 16 GB card): a switch
-            // victim whose copy host memory cannot take now is stopped rather
-            // than parked. Waiting only held the switch until its deadline,
-            // while the memory it waits for is the one the switch frees.
-            // A stale or unknown observation still waits, and a unified host
-            // keeps waiting as before.
+            // victim whose parked footprint the host's memory cannot take now
+            // is stopped rather than parked. Waiting only held the switch
+            // until its deadline, while the memory it waits for is the one
+            // the switch frees. A stale or unknown observation still waits.
+            // One rule for every host shape (final review I5).
             let parking =
                 mllm_scheduler::residency::admit_phase(&scoped, &owner, &f.parking, context);
             let switch_victim = p.principal == SWITCH_PRINCIPAL
-                && kinds
-                    .values()
-                    .any(|kind| *kind != mllm_config::effective::DomainMemory::Unified)
                 && matches!(
                     parking,
                     Err(mllm_domain::resources::ResourceError::Insufficient

@@ -1036,8 +1036,8 @@ fn a_park_that_increases_nothing_arms_when_free_memory_is_low() {
 // free. A park is charged only what it adds beyond what the owner holds.
 #[test]
 fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
-    // A discrete host's domains are never `unified`; the rule leaves a
-    // unified domain exactly as it was.
+    // One rule on every host shape (final review I5, owner rule 2026-09-26):
+    // a unified domain is judged exactly as a discrete host's.
     let lab = Lab::new(|host| {
         host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
     });
@@ -1070,7 +1070,8 @@ fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
     let context = new_context(arm(17 << 30, 1_300));
     lab.complete(&context, ResidencyKind::Park, 10, 1_400);
     assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Parked);
-    // A unified domain is unchanged: the same park still waits there.
+    // A unified domain follows the same rule: the same park arms there
+    // (before the one-rule change it waited, charged its own 8 GiB again).
     let unified = Lab::new(|_| {});
     let u = unified.deploy("u", |_| {});
     unified.ready(&u, 1_000, 10);
@@ -1091,7 +1092,7 @@ fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
                 unified.context(&observation, &limits, 1_300),
             )
             .unwrap(),
-        ResidencyArm::Blocked(_)
+        ResidencyArm::New(_)
     ));
 }
 
@@ -1146,7 +1147,8 @@ fn a_switch_park_that_host_memory_cannot_take_is_refused() {
         ResidencyArm::Refused("parked_capacity")
     ));
     assert!(matches!(park_as("operator", "o"), ResidencyArm::Blocked(_)));
-    // A unified host keeps waiting, as before.
+    // A unified host follows the same rule (final review I5): its switch
+    // park is refused too, so the switch stops the victim instead of waiting.
     let unified = Lab::new(|_| {});
     let fence = unified.deploy("u", |_| {});
     unified.ready(&fence, 1_000, 10);
@@ -1173,7 +1175,7 @@ fn a_switch_park_that_host_memory_cannot_take_is_refused() {
                 unified.context(&observation, &limits, 1_200),
             )
             .unwrap(),
-        ResidencyArm::Blocked(_)
+        ResidencyArm::Refused("parked_capacity")
     ));
 }
 
@@ -1394,10 +1396,11 @@ fn a_two_domain_owner_is_credited_per_domain() {
 // weights copy in host RAM; both are in use and out of the host's free
 // memory, and charging the parked reservation again made every start beside
 // a parked model stop it instead. A parked owner whose park completed is
-// credited what its own processes hold on a `device` or `distinct` domain,
-// capped at its parked reservation; a `unified` domain is unchanged.
+// credited what its own processes hold, capped at its parked reservation. One
+// rule on every host shape (final review I5, owner rule 2026-09-26): on a
+// unified domain it is credited the figure of the one pool.
 #[test]
-fn a_parked_owner_is_credited_on_discrete_domains_only() {
+fn a_parked_owner_is_credited_on_every_domain_kind() {
     use mllm_config::effective::DomainMemory;
     use mllm_domain::resources::{Allocation, ProcessResident};
     use std::collections::BTreeMap;
@@ -1460,12 +1463,15 @@ fn a_parked_owner_is_credited_on_discrete_domains_only() {
     // of host pages (the pinned copy included) on the system domain.
     assert_eq!(credited["gpu0"], 1 << 30);
     assert_eq!(credited["system"], 10 << 30);
-    // The same owner on unified domains is not credited (ADR 0007 unchanged).
+    // The same owner on unified domains is credited by the same rule, from
+    // the pool's figure (device plus host pages), capped at each allocation.
     let unified = BTreeMap::from([
         ("gpu0".to_string(), DomainMemory::Unified),
         ("system".to_string(), DomainMemory::Unified),
     ]);
-    assert!(floors(&unified).is_empty());
+    let pooled = floors(&unified);
+    assert_eq!(pooled["gpu0"], 1 << 30);
+    assert_eq!(pooled["system"], (1600 << 20) + (10 << 30));
     // A wake in flight: no credit.
     lab.wake(&s, WakeScope::OnDemand, "wake-s", 1_500).unwrap();
     assert!(floors(&discrete).is_empty());
