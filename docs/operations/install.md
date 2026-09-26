@@ -581,8 +581,9 @@ otherwise (also while a downloaded model's size is not known yet);
 host RAM at 1.5 times the weights (pinned memory is rounded up; vLLM 0.29
 measured 1.37 times), for the engine's whole life: SGLang keeps its backup,
 and vLLM keeps the pinned memory after a wake. When a model must make room and
-its copy no longer fits in host RAM, it is stopped rather than parked, and the
-switch record says `released: stopped (host RAM full)`; a park the switch
+its copy no longer fits in host RAM (or a `deep` model's parked residue no
+longer fits on the card beside the model being started), it is stopped rather
+than parked, and the switch record says `released: stopped (no room to park)`; a park the switch
 planned that host memory cannot take when it is sent (other programs hold the
 RAM) is refused and the model is stopped instead. An engine build without parking support
 refuses a `host_backed` or `deep` launch with `capability_missing:deep_park`,

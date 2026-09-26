@@ -222,7 +222,7 @@ fn park_refused(
 
 /// Final review M9: whether this generation's switch park was refused
 /// because the host's memory could not take its parked footprint
-/// (`parked_capacity`), which is "host RAM full", not "it does not park".
+/// (`parked_capacity`), which is "no room to park", not "it does not park".
 fn park_refused_for_room(
     tx: &Transaction<'_>,
     deployment: &str,

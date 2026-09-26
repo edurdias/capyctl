@@ -196,9 +196,9 @@ a discrete host must name the system domain too, or they are refused
   is the ledger's; nothing is released on the observation alone. A switch park the arm
   still refuses for memory is refused `parked_capacity` on every host shape and the victim
   is stopped. The switch record says which:
-  `released: parked`, `released: stopped (host RAM full)` or `released: stopped`. On a
-  unified host a `deep` victim whose parked residue would not fit beside the waiting
-  instance is stopped for the same reason.
+  `released: parked`, `released: stopped (no room to park)` or `released: stopped`. A
+  `deep` victim whose parked residue would not fit beside the waiting instance (in the
+  unified pool, or on the card of a discrete host) is stopped for the same reason.
 - **Capability.** A `host_backed` launch is gated on the engine's parking capability like
   `deep`: a build whose probe lacks it is refused before any effect with
   `capability_missing:deep_park` (the existing capability, whose hint names parking of

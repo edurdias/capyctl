@@ -912,7 +912,10 @@ impl Drop for Active {
 /// classing it as a capacity block, and each host's shortfall follows.
 /// Discrete GPU design §5: the status line for one released victim says
 /// whether it parked or stopped, and names a victim that parks but stopped
-/// because its parked copy did not fit the host after the switch.
+/// because its parked footprint did not fit the host after the switch. That
+/// can be host RAM (a `host_backed` copy) or the card (a `deep` residue beside
+/// the waiting instance), so the line names neither (found live 2026-09-26: a
+/// `deep` victim on a full card was reported "host RAM full").
 fn release_line(v: &SwitchVictim, r: &SwitchRelease) -> String {
     format!(
         "{}/{} released: {} ({})",
@@ -921,7 +924,7 @@ fn release_line(v: &SwitchVictim, r: &SwitchRelease) -> String {
         if r.parked {
             "parked"
         } else if v.park_does_not_fit {
-            "stopped (host RAM full)"
+            "stopped (no room to park)"
         } else {
             "stopped"
         },
@@ -968,7 +971,7 @@ mod release_line_tests {
         );
         assert_eq!(
             release_line(&victim(true), &release(false)),
-            "d/0 released: stopped (host RAM full) (op)"
+            "d/0 released: stopped (no room to park) (op)"
         );
         assert_eq!(
             release_line(&victim(false), &release(false)),
