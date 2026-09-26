@@ -12,6 +12,9 @@ pub mod instances;
 pub mod listener_migration;
 // ADR 0008: declared model sources and the host's model-source policy.
 pub mod model_source;
+// Owner decisions 2026-09-25: the models directory and the model-source
+// switches, resolved once for every role (flag > environment > YAML > default).
+pub mod model_settings;
 // ADR 0018 §2: `engines.yaml`, the mllm-owned engines file beside the role
 // document, its lock, atomic write, and the merge into the host document.
 pub mod registration;

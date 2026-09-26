@@ -602,3 +602,45 @@ fn no_inference_auth_is_parsed_on_start_standalone_and_server() {
     assert!(parse_invocation(["mllm", "start", "host", "--no-inference-auth"]).is_err());
     assert!(parse_invocation(["mllm", "status", "--no-inference-auth"]).is_err());
 }
+
+// T01 T03 (owner decision 2026-09-25): `--models-root`, `--model-sources` and
+// `--model-sources-max` on `start standalone` and `start host`, the roles
+// that hold a model store; malformed values are refused at parse time.
+#[test]
+fn model_flags_are_parsed_on_start_standalone_and_host() {
+    use mllm_config::model_source::SourceSwitch;
+    for role in ["standalone", "host"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--models-root",
+            "/data/models",
+            "--model-sources",
+            "disabled",
+            "--model-sources-max",
+            "100GiB",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.model_overrides.models_root.as_deref(),
+            Some(std::path::Path::new("/data/models"))
+        );
+        assert_eq!(i.model_overrides.sources, Some(SourceSwitch::Denied));
+        assert_eq!(i.model_overrides.sources_max.as_deref(), Some("100GiB"));
+        let i = parse_invocation(["mllm", "start", role, "--model-sources", "allowed"]).unwrap();
+        assert_eq!(i.model_overrides.sources, Some(SourceSwitch::Allowed));
+        assert!(parse_invocation(["mllm", "start", role, "--model-sources", "maybe"]).is_err());
+        assert!(parse_invocation(["mllm", "start", role, "--model-sources-max", "lots"]).is_err());
+        // A relative directory is made absolute against the working directory.
+        let i = parse_invocation(["mllm", "start", role, "--models-root", "m"]).unwrap();
+        assert!(i.model_overrides.models_root.unwrap().is_absolute());
+    }
+    assert_eq!(
+        parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .model_overrides,
+        Default::default()
+    );
+    assert!(parse_invocation(["mllm", "start", "server", "--models-root", "/m"]).is_err());
+}

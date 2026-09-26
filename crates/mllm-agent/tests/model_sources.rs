@@ -7,7 +7,7 @@
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
-use mllm_agent::sources::{prune, reason, SourceStatus, SourceStore};
+use mllm_agent::sources::{prune, reason, SourceStatus, SourceStore, FREE_SPACE_RESERVE};
 use mllm_config::effective::{ModelSourcePolicy, SourceSwitch};
 use mllm_config::model_source::{Archive, ModelSource};
 use sha1::Digest as _;
@@ -260,6 +260,7 @@ fn policy(max_bytes: i64) -> ModelSourcePolicy {
         max_bytes: Some(max_bytes),
         allowed_hosts: vec![],
         huggingface_endpoint: Some("https://hub.example.test".into()),
+        path: None,
     }
 }
 
@@ -521,17 +522,16 @@ async fn size_over_limit_is_refused_before_download() {
     assert_eq!(failure.reason, reason::SIZE_UNKNOWN);
 }
 
-// T14 (ADR 0008): remote sources are denied unless the host opts in; a
-// denied request reaches no origin.
+// T14 (ADR 0008, owner decision 2026-09-25): a host that turns remote
+// sources off keeps them off, and a denied request reaches no origin.
 #[tokio::test]
-async fn host_policy_denies_remote_sources() {
+async fn host_policy_denies_remote_sources_it_turned_off() {
     let f = fixture().await;
-    let store = SourceStore::with_loopback_origin(
-        &f.store,
-        ModelSourcePolicy::default(),
-        Some(f.secrets.clone()),
-        &f.origin,
-    );
+    let mut off = policy(1 << 30);
+    off.huggingface = SourceSwitch::Denied;
+    off.http = SourceSwitch::Denied;
+    let store =
+        SourceStore::with_loopback_origin(&f.store, off, Some(f.secrets.clone()), &f.origin);
     for source in [hf(vec![], false), http("x.bin", b"x", Archive::None)] {
         match store.request(&source) {
             SourceStatus::Failed(failure) => assert_eq!(failure.reason, reason::DENIED),
@@ -548,6 +548,39 @@ async fn host_policy_denies_remote_sources() {
     assert!(
         f.hub.lock().unwrap().log.is_empty(),
         "no origin was contacted"
+    );
+}
+
+// T14 (SPEC §7.3, owner decision 2026-09-25): a download that would leave
+// less than the free-space reserve on the filesystem is refused
+// `insufficient_space` before any byte is written; the default policy (500
+// GiB ceiling) materializes one that fits.
+#[tokio::test]
+async fn a_download_that_would_fill_the_disk_is_refused() {
+    let f = fixture().await;
+    let payload = vec![7_u8; 4_000];
+    f.hub.lock().unwrap().payloads.insert(
+        "w.bin".into(),
+        Payload {
+            bytes: payload.clone(),
+            cut_after_once: None,
+            chunked: false,
+            delay: None,
+        },
+    );
+    let source = http("w.bin", &payload, Archive::None);
+    let store =
+        SourceStore::with_loopback_origin(&f.store, ModelSourcePolicy::default(), None, &f.origin);
+    let needed = payload.len() as u64 + FREE_SPACE_RESERVE;
+    store.set_free_bytes_for_test(Some(needed - 1));
+    let failure = store.materialize(&source).await.unwrap_err();
+    assert_eq!(failure.reason, reason::INSUFFICIENT_SPACE);
+    assert!(f.state_files(".reservation").is_empty());
+    assert!(f.requests("/files/").len() <= 1, "sized, never streamed");
+    store.set_free_bytes_for_test(Some(needed));
+    assert_eq!(
+        store.materialize(&source).await.unwrap(),
+        payload.len() as u64
     );
 }
 

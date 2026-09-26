@@ -727,6 +727,29 @@ fn check_host_device_policy(
         .map_err(|message| error(&message))
 }
 
+/// ADR 0018 §2: the host document at `path` merged with `engines`, with its
+/// models directory and model-source policy resolved (owner decision
+/// 2026-09-25: `flags` > `MLLM_MODELS_ROOT` / `MLLM_MODEL_SOURCES` /
+/// `MLLM_MODEL_SOURCES_MAX` > the document > `~/models`, sources allowed with
+/// a 500 GiB ceiling in `<state_dir>/models/sources`).
+fn load_host(
+    path: &Path,
+    engines: &Path,
+    flags: &mllm_config::model_settings::ModelOverrides,
+) -> Result<HostConfig, StructuredError> {
+    let invalid = |e: mllm_config::ConfigError| {
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    };
+    let env = mllm_config::model_settings::ModelOverrides::from_process_env().map_err(invalid)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    HostConfig::load_with_engines(path, engines)
+        .and_then(|config| config.with_models(flags, &env, home.as_deref()))
+        .map_err(invalid)
+}
+
 /// `document` is the host.yaml `config` was loaded from, merged with
 /// `engines` (the role's engines.yaml); the control handler re-reads both
 /// (ADR 0018 §3).
@@ -1124,12 +1147,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // checks.
                 let engines = host_engines(named.as_deref(), &path);
                 serve_host(
-                    HostConfig::load_with_engines(&path, &engines).map_err(|e| {
-                        error(&format!(
-                            "Invalid host configuration: {}: {}",
-                            e.path, e.detail
-                        ))
-                    })?,
+                    load_host(&path, &engines, &invocation.model_overrides)?,
                     path.clone(),
                     engines,
                 )
@@ -1143,12 +1161,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
             let engines = host_engines(named.as_deref(), &path);
-            let config = HostConfig::load_with_engines(&path, &engines).map_err(|e| {
-                error(&format!(
-                    "Invalid host configuration: {}: {}",
-                    e.path, e.detail
-                ))
-            })?;
+            let config = load_host(&path, &engines, &Default::default())?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery

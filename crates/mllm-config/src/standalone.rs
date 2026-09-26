@@ -321,12 +321,19 @@ pub fn check_honoured(
             ));
         }
     }
-    if host.get("model_store").is_some() {
-        return Err(refuse(
-            "host.model_store",
-            "standalone keeps models under its engine installation's models root; \
-             another store is not supported",
-        ));
+    // Owner decision 2026-09-25: the models directory and the model-source
+    // policy are honoured here exactly as on a host
+    // (`crate::model_settings`); a malformed value is refused before any
+    // side effect.
+    if host.get("model_store").is_some() || host.get("model_sources").is_some() {
+        crate::model_settings::resolve(
+            host,
+            &root,
+            &Default::default(),
+            &Default::default(),
+            Some(Path::new("/")),
+        )
+        .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     }
     if let Some(policy) = host.get("resource_policy") {
         only_auto(policy, "host.resource_policy")?;
@@ -381,6 +388,13 @@ mod tests {
         // Omitted fields are not settings.
         let bare = json!({"schema_version": 1, "kind": "standalone", "name": "x"});
         check_honoured(&bare, Path::new("/s/config"), root).unwrap();
+        // T14 (owner decision 2026-09-25): the models directory and the
+        // model-source policy are honoured, as on a host.
+        let mut doc = generated("/s");
+        doc["host"]["model_store"] = json!({"path": "/data/models"});
+        doc["host"]["model_sources"] =
+            json!({"huggingface": "disabled", "http": "allowed", "max_bytes": "100GiB"});
+        check_honoured(&doc, Path::new("/s/config"), root).unwrap();
     }
 
     // T03 (SPEC §15.2, R13): a document written by an older mllm generator carries
@@ -490,8 +504,12 @@ mod tests {
                 Box::new(|d| d["host"]["connection"] = json!("remote")),
             ),
             (
-                "host.model_store",
-                Box::new(|d| d["host"]["model_store"] = json!({"path": "/m"})),
+                "host.model_store.path",
+                Box::new(|d| d["host"]["model_store"] = json!({"path": "relative/m"})),
+            ),
+            (
+                "host.model_sources.max_bytes",
+                Box::new(|d| d["host"]["model_sources"] = json!({"max_bytes": "0B"})),
             ),
             (
                 "host.resource_policy.memory.system.managed_limit",

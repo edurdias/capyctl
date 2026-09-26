@@ -464,7 +464,12 @@ impl HostConfig {
         {
             return Err(invalid("name"));
         }
-        path(&document["model_store"], "path")?;
+        // Owner decision 2026-09-25: the model store may be omitted (the role
+        // fills `~/models`, `MLLM_MODELS_ROOT` or `--models-root` through
+        // `crate::model_settings` before publishing); stated, it is a path.
+        if document.get("model_store").is_some() {
+            path(&document["model_store"], "path")?;
+        }
         let profiles = match document.get("runtime_profiles") {
             None => Map::new(),
             Some(v) => v
@@ -496,6 +501,26 @@ impl HostConfig {
             drain_timeout: drain_timeout(&document)?,
             document,
         })
+    }
+    /// Owner decision 2026-09-25: state the host's models directory and
+    /// model-source policy in its document, resolved by the shared rule
+    /// (`crate::model_settings`, flag > environment > document > default:
+    /// `~/models` from `home`, downloads under `<state_dir>/models`), so the
+    /// document the host publishes is the one it enforces.
+    pub fn with_models(
+        mut self,
+        flags: &crate::model_settings::ModelOverrides,
+        env: &crate::model_settings::ModelOverrides,
+        home: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        crate::model_settings::apply(
+            &mut self.document,
+            &self.state_dir,
+            flags,
+            env,
+            crate::model_settings::default_models_root(home).as_deref(),
+        )?;
+        Ok(self)
     }
     pub fn template(root: &Path) -> String {
         serde_json::to_string_pretty(&json!({

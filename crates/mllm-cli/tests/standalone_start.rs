@@ -42,7 +42,7 @@ async fn a_declared_deployment_accepts_a_start_command() {
 /// Spec §8: no engine installation, no boot. A host that came up serving nothing
 /// would report itself healthy and refuse every deployment later, at the point
 /// where the refusal is hardest to read, so the refusal happens at boot and names
-/// the variables that would fix it.
+/// the variable that would fix it.
 #[tokio::test]
 async fn standalone_refuses_to_boot_without_an_engine_installation() {
     let dir = safe_state_dir();
@@ -59,8 +59,10 @@ async fn standalone_refuses_to_boot_without_an_engine_installation() {
         "{error:?}"
     );
     let said = error.to_string();
+    // Owner decision 2026-09-25: the models directory defaults to ~/models,
+    // so only the engine is demanded.
     assert!(
-        said.contains("MLLM_VLLM_BIN") && said.contains("MLLM_MODELS_ROOT"),
+        said.contains("MLLM_VLLM_BIN") && !said.contains("MLLM_MODELS_ROOT"),
         "the refusal names what it expected: {said}"
     );
 }
@@ -816,8 +818,8 @@ async fn a_discrete_standalone_honours_a_declared_kv_cache() {
 
 /// Controller ruling: a Hugging Face source is not refused on a discrete host
 /// for being remote. Standalone decides it exactly as a unified host does, by
-/// the host's own `model_sources` policy (which standalone does not opt in to
-/// today); the sizing never refuses it. On a host that allows the source the
+/// the host's own `model_sources` policy (allowed by default since the owner
+/// decision of 2026-09-25); the sizing never refuses it. On a host that allows the source the
 /// template states the KV cache alone and the revision is sized once the
 /// download is measured (`standalone_config` tests).
 // T26
@@ -829,30 +831,23 @@ async fn a_discrete_standalone_treats_a_remote_source_as_a_unified_one_does() {
         files: vec![],
         token_ref: None,
     };
-    let outcome = |result: Result<String, mllm_cli::roles::StartError>| {
-        result.map(|_| ()).map_err(|error| {
-            assert!(
-                !error.to_string().contains("sized"),
-                "a remote source is not refused for its size: {error}"
-            );
-            assert!(
-                error.to_string().contains("model_sources"),
-                "only the host's source policy decides: {error}"
-            );
-            mllm_cli::output::StructuredError::from(error).code
-        })
-    };
+    // Owner decision 2026-09-25: remote sources are allowed by default, so
+    // both hosts accept the deployment; neither refuses it for its size.
     let dir = safe_state_dir();
     let store = store_with_checkpoint(3 << 30);
     let discrete = support::try_boot_discrete(dir.path(), discrete_card, store.path(), true)
         .await
         .expect("a discrete host boots");
-    let on_discrete = outcome(discrete.deploy("m", source()));
+    discrete
+        .deploy("m", source())
+        .expect("a remote source is accepted on a discrete host");
     let _ = discrete.shutdown().await;
     let dir = safe_state_dir();
     let unified = support::try_boot_with_gpu(dir.path(), || None)
         .await
         .expect("a host without a GPU boots");
-    let on_unified = outcome(unified.deploy("m", source()));
-    assert_eq!(on_discrete, on_unified);
+    unified
+        .deploy("m", source())
+        .expect("a remote source is accepted on a unified host");
+    let _ = unified.shutdown().await;
 }

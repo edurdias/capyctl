@@ -402,3 +402,84 @@ fn server_inference_authentication_may_be_none() {
         assert!(ServerConfig::parse(&doc).is_err(), "{from} -> {to}");
     }
 }
+
+// T14 T03 (owner decisions 2026-09-25): an enrolled host behaves as the
+// standalone one does. With nothing stated its models live in ~/models,
+// Hugging Face and HTTP sources are allowed with the 500 GiB ceiling, and
+// downloads go to <state_dir>/models/sources; the resolved values are in the
+// document the host publishes. An explicit `disabled` stays disabled, and a
+// flag or variable wins over the document.
+#[test]
+fn a_server_host_allows_model_sources_by_default() {
+    use mllm_config::model_settings::ModelOverrides;
+    use mllm_config::model_source::SourceSwitch;
+    let root = Path::new("/home/operator/.local/state/mllm");
+    let home = Path::new("/home/operator");
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/f2-deployment.json")).unwrap();
+    let mut bare = serde_json::json!({
+        "schema_version": 1, "kind": "host", "name": "h",
+        "state_dir": root, "identity_dir": root.join("identity"),
+    });
+    for field in [
+        "hardware_fingerprint",
+        "environment_fingerprint",
+        "resource_policy",
+        "runtime_profiles",
+    ] {
+        bare[field] = fixture["host"][field].clone();
+    }
+    let policy = |document: &serde_json::Value, flags: &ModelOverrides, env: &ModelOverrides| {
+        let config = HostConfig::parse(&document.to_string())
+            .expect("a host document may omit model_store")
+            .with_models(flags, env, Some(home))
+            .unwrap();
+        let local = mllm_config::remote_resources::local_host_document(&config.document).unwrap();
+        mllm_config::effective::normalize_host_policy(&local).unwrap()
+    };
+    let none = ModelOverrides::default();
+    let defaults = policy(&bare, &none, &none);
+    assert_eq!(defaults.model_store, home.join("models"));
+    assert_eq!(defaults.model_sources.huggingface, SourceSwitch::Allowed);
+    assert_eq!(defaults.model_sources.http, SourceSwitch::Allowed);
+    assert_eq!(defaults.model_sources.max_bytes, Some(500 << 30));
+    assert_eq!(
+        defaults.model_sources.root(&defaults.model_store),
+        root.join("models")
+    );
+    // A stated store is kept; with the template's layout (`<state_dir>/models`)
+    // downloads land where they always did.
+    let mut template = bare.clone();
+    template["model_store"] = serde_json::json!({"path": root.join("models")});
+    let kept = policy(&template, &none, &none);
+    assert_eq!(kept.model_store, root.join("models"));
+    assert_eq!(
+        kept.model_sources.root(&kept.model_store),
+        root.join("models")
+    );
+    // Explicitly disabled stays disabled.
+    let mut disabled = bare.clone();
+    disabled["model_sources"] = serde_json::json!({"huggingface": "disabled", "http": "denied"});
+    let off = policy(&disabled, &none, &none);
+    assert_eq!(off.model_sources.huggingface, SourceSwitch::Denied);
+    assert_eq!(off.model_sources.http, SourceSwitch::Denied);
+    // The environment, then the flag, win over the document.
+    let env = ModelOverrides {
+        models_root: Some("/srv/env-models".into()),
+        sources: Some(SourceSwitch::Allowed),
+        sources_max: Some("64GiB".into()),
+    };
+    let from_env = policy(&disabled, &none, &env);
+    assert_eq!(from_env.model_store, Path::new("/srv/env-models"));
+    assert_eq!(from_env.model_sources.huggingface, SourceSwitch::Allowed);
+    assert_eq!(from_env.model_sources.max_bytes, Some(64 << 30));
+    let flags = ModelOverrides {
+        models_root: Some("/srv/flag-models".into()),
+        sources: Some(SourceSwitch::Denied),
+        sources_max: None,
+    };
+    let from_flag = policy(&disabled, &flags, &env);
+    assert_eq!(from_flag.model_store, Path::new("/srv/flag-models"));
+    assert_eq!(from_flag.model_sources.http, SourceSwitch::Denied);
+    assert_eq!(from_flag.model_sources.max_bytes, Some(64 << 30));
+}

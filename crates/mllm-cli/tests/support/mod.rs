@@ -48,6 +48,7 @@ pub async fn try_boot_on(
             members: None,
             models_root: None,
             kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
     )
@@ -68,6 +69,7 @@ pub async fn try_boot_with_gpu(
             members: None,
             models_root: None,
             kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
         Arc::new(gpu),
@@ -103,6 +105,7 @@ pub async fn try_boot_discrete_with_kv(
             members: None,
             models_root: Some(models_root.to_path_buf()),
             kv_cache,
+            source_origin: None,
         }),
         test_memory(),
         Arc::new(gpu),
@@ -130,6 +133,7 @@ pub async fn boot_deep_parking(
             members: Some(members),
             models_root: None,
             kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
     )
@@ -163,8 +167,41 @@ pub async fn boot_configured_on(
             members: None,
             models_root: None,
             kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
+    )
+    .await
+}
+
+/// Owner decision 2026-09-25: boot with the role document `config` (if any),
+/// this run's model flags, and an installation whose models directory is
+/// `models_root` (an empty path names none, as `MLLM_MODELS_ROOT` unset does;
+/// `None` is the testkit's store). Model-source downloads are served from
+/// `source_origin`, else from an origin nothing listens on; the GPUs are
+/// sampled through `gpu`.
+pub async fn boot_with_models(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    models_root: Option<std::path::PathBuf>,
+    flags: &mllm_cli::roles::ModelOverrides,
+    source_origin: Option<String>,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_configured_with_models(
+        state_dir,
+        config,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root,
+            kv_cache: None,
+            source_origin,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+        flags,
     )
     .await
 }
@@ -250,6 +287,9 @@ struct PortedProvider {
     models_root: Option<std::path::PathBuf>,
     /// The KV cache the operator stated (`MLLM_KV_CACHE_BYTES`), if any.
     kv_cache: Option<&'static str>,
+    /// The loopback origin model-source downloads are served from; unset,
+    /// one nothing listens on, so no test reaches the network.
+    source_origin: Option<String>,
 }
 
 impl mllm_controller::EngineProvider for PortedProvider {
@@ -288,6 +328,14 @@ impl mllm_controller::EngineProvider for PortedProvider {
 
     fn tools_factory(&self) -> mllm_controller::coordinator::ToolsFactory {
         mllm_testkit::fake_tools_factory()
+    }
+
+    fn model_source_origin(&self) -> Option<String> {
+        Some(
+            self.source_origin
+                .clone()
+                .unwrap_or_else(|| mllm_testkit::NO_NETWORK_ORIGIN.into()),
+        )
     }
 }
 

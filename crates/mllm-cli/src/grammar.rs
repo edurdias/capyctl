@@ -500,6 +500,20 @@ enum StartTarget {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
         debug_engine_logs: bool,
+        /// The models directory a relative model path resolves under for this
+        /// run (default ~/models). Wins over MLLM_MODELS_ROOT and
+        /// model_store.path.
+        #[arg(long, value_name = "DIR", value_parser = parse_models_root)]
+        models_root: Option<PathBuf>,
+        /// Allow or disable Hugging Face and HTTP model downloads for this
+        /// run (default allowed). Wins over MLLM_MODEL_SOURCES and
+        /// model_sources in the document.
+        #[arg(long, value_name = "allowed|disabled", value_parser = parse_model_sources)]
+        model_sources: Option<mllm_config::model_source::SourceSwitch>,
+        /// The most bytes downloaded models may take (default 500GiB). Wins
+        /// over MLLM_MODEL_SOURCES_MAX and model_sources.max_bytes.
+        #[arg(long, value_name = "SIZE", value_parser = parse_model_sources_max)]
+        model_sources_max: Option<String>,
     },
     Standalone {
         /// Retain full native engine logs in private files (may contain secrets).
@@ -517,6 +531,20 @@ enum StartTarget {
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
         #[arg(long)]
         no_inference_auth: bool,
+        /// The models directory a relative model path resolves under for this
+        /// run (default ~/models). Wins over MLLM_MODELS_ROOT and
+        /// model_store.path.
+        #[arg(long, value_name = "DIR", value_parser = parse_models_root)]
+        models_root: Option<PathBuf>,
+        /// Allow or disable Hugging Face and HTTP model downloads for this
+        /// run (default allowed). Wins over MLLM_MODEL_SOURCES and
+        /// model_sources in the document.
+        #[arg(long, value_name = "allowed|disabled", value_parser = parse_model_sources)]
+        model_sources: Option<mllm_config::model_source::SourceSwitch>,
+        /// The most bytes downloaded models may take (default 500GiB). Wins
+        /// over MLLM_MODEL_SOURCES_MAX and model_sources.max_bytes.
+        #[arg(long, value_name = "SIZE", value_parser = parse_model_sources_max)]
+        model_sources_max: Option<String>,
     },
     Deployment {
         deployment: String,
@@ -855,6 +883,9 @@ pub struct Invocation {
     /// Design §9: `--no-inference-auth` on `start standalone` and `start
     /// server`: the inference key is off for this run.
     pub no_inference_auth: bool,
+    /// Owner decision 2026-09-25: `--models-root`, `--model-sources` and
+    /// `--model-sources-max` on `start standalone` and `start host`.
+    pub model_overrides: mllm_config::model_settings::ModelOverrides,
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>
@@ -882,7 +913,8 @@ where
                 debug_engine_logs: true,
                 ..
             } | StartTarget::Host {
-                debug_engine_logs: true
+                debug_engine_logs: true,
+                ..
             }
         }
     );
@@ -926,6 +958,30 @@ where
             },
         }
     );
+    // Owner decision 2026-09-25: the model flags on `start standalone` and
+    // `start host`, the two roles that hold a model store.
+    let model_overrides = match &cli.command {
+        CliCommand::Start {
+            target:
+                StartTarget::Standalone {
+                    models_root,
+                    model_sources,
+                    model_sources_max,
+                    ..
+                }
+                | StartTarget::Host {
+                    models_root,
+                    model_sources,
+                    model_sources_max,
+                    ..
+                },
+        } => mllm_config::model_settings::ModelOverrides {
+            models_root: models_root.clone(),
+            sources: *model_sources,
+            sources_max: model_sources_max.clone(),
+        },
+        _ => Default::default(),
+    };
     let evict = matches!(
         &cli.command,
         CliCommand::Start {
@@ -995,7 +1051,26 @@ where
         wait,
         listen,
         no_inference_auth,
+        model_overrides,
     })
+}
+
+/// Owner decision 2026-09-25: `--models-root`, made absolute against the
+/// working directory.
+fn parse_models_root(text: &str) -> Result<PathBuf, String> {
+    mllm_config::model_settings::absolute("--models-root", text).map_err(|error| error.detail)
+}
+
+/// Owner decision 2026-09-25: `--model-sources allowed|disabled`.
+fn parse_model_sources(text: &str) -> Result<mllm_config::model_source::SourceSwitch, String> {
+    mllm_config::model_settings::switch("--model-sources", text).map_err(|error| error.detail)
+}
+
+/// Owner decision 2026-09-25: `--model-sources-max <size>`, e.g. `500GiB`.
+fn parse_model_sources_max(text: &str) -> Result<String, String> {
+    mllm_config::model_settings::max_bytes("--model-sources-max", text)
+        .map(|_| text.to_owned())
+        .map_err(|error| error.detail)
 }
 
 /// Design §9: an inference address for `--listen`: a socket address with a

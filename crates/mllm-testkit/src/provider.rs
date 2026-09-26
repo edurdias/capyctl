@@ -176,6 +176,11 @@ pub fn spawn_fake_coordinator(
     )
 }
 
+/// A loopback origin nothing listens on: a model-source download a test
+/// provider starts fails at once with `network` instead of reaching the
+/// internet (ADR 0008; tests never download).
+pub const NO_NETWORK_ORIGIN: &str = "http://127.0.0.1:9";
+
 /// The Fake as a host's one engine installation.
 pub fn fake_provider() -> Arc<dyn EngineProvider> {
     Arc::new(FakeProvider)
@@ -199,6 +204,10 @@ impl EngineProvider for FakeProvider {
 
     fn tools_factory(&self) -> ToolsFactory {
         fake_tools_factory()
+    }
+
+    fn model_source_origin(&self) -> Option<String> {
+        Some(NO_NETWORK_ORIGIN.into())
     }
 }
 

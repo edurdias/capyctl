@@ -190,13 +190,16 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("url", SCALAR), ("sha256", SCALAR), ("archive", SCALAR)]),
         ),
     ]);
-    // ADR 0008: remote model sources are denied unless the host opts in.
+    // ADR 0008 (owner decision 2026-09-25): remote model sources are allowed
+    // by default; a host states `denied` (or `disabled`) to turn one off.
+    // `path` names the sources store (default `<state_dir>/models`).
     const MODEL_SOURCES: FieldSpec = FieldSpec::Struct(&[
         ("huggingface", SCALAR),
         ("http", SCALAR),
         ("max_bytes", BYTES),
         ("allowed_hosts", FieldSpec::Seq(&SCALAR)),
         ("huggingface_endpoint", SCALAR),
+        ("path", SCALAR),
     ]);
     const MODEL: &[(&str, FieldSpec)] = &[
         // Spec §7: `path` predates `source` and still means a local source.
@@ -340,9 +343,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("name", SCALAR),
         ("state_dir", SCALAR),
         ("connection", SCALAR),
-        // Spec §7: allowed here so a standalone document can carry the store the
-        // host block is translated into; the generated default does not set one yet.
+        // Owner decision 2026-09-25: the models directory (default
+        // `~/models`) and the model-source policy, as on a host.
         ("model_store", MODEL_STORE),
+        ("model_sources", MODEL_SOURCES),
         ("resource_policy", FieldSpec::Struct(RESOURCE_POLICY)),
         // Emitted empty by the generator; empty allowlist accepts `{}`
         // only until profile shapes are specified.
@@ -391,10 +395,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             ],
         },
         ConfigKind::Host => &KindSchema {
-            // Spec §7: the model store is required, not defaulted. Guessing a
-            // directory would make a relative model path resolve somewhere the
-            // operator never named.
-            required: &["schema_version", "kind", "name", "model_store"],
+            // Owner decision 2026-09-25: the model store defaults to
+            // `~/models` (or `--models-root`, `MLLM_MODELS_ROOT`); the role
+            // states the resolved directory in the document it publishes.
+            required: &["schema_version", "kind", "name"],
             fields: &[
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),

@@ -22,6 +22,7 @@ use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
 use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
+pub use mllm_config::model_settings::ModelOverrides;
 use mllm_config::schema::ConfigKind;
 use mllm_controller::coordinator::{
     CoordinatorOptions, EngineBindings, OwnedCoordinator, ServiceClock, ServiceObservation as _,
@@ -52,9 +53,10 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 /// 0018 §5: both set publish two profiles, `local-vllm` and `local-sglang`.
 const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
 const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
-/// The directory model weights live under (Spec §7). Required for the same reason:
-/// a guessed store resolves relative paths somewhere the operator never named.
-const MODELS_ROOT: &str = "MLLM_MODELS_ROOT";
+/// The directory model weights live under (Spec §7). Optional (owner decision
+/// 2026-09-25): `~/models` unless `--models-root`, this variable or
+/// `host.model_store.path` names another.
+const MODELS_ROOT: &str = mllm_config::model_settings::MODELS_ROOT_ENV;
 const KV_CACHE_BYTES: &str = "MLLM_KV_CACHE_BYTES";
 const ENGINE_ARGS: &str = "MLLM_ENGINE_ARGS";
 const ENGINE_FINGERPRINT: &str = "MLLM_ENGINE_FINGERPRINT";
@@ -724,18 +726,24 @@ impl EnvEngineProvider {
         fingerprint: Option<&str>,
         deep_park: Option<bool>,
     ) -> Result<EngineInstallation, ProviderError> {
-        let models_root = PathBuf::from(env_value(MODELS_ROOT).ok_or_else(|| {
-            no_installation(format!(
-                "this host names no model store: set {MODELS_ROOT} to the directory \
-                 weights live under (the engine itself comes from {ENGINE_BIN})"
-            ))
-        })?);
-        if !models_root.is_dir() {
-            return Err(no_installation(format!(
-                "{MODELS_ROOT} is not a directory: {}",
-                models_root.display()
-            )));
-        }
+        // Owner decision 2026-09-25: the models directory is optional here.
+        // Unset, the installation names none (an empty path) and the role
+        // resolves `model_store.path` or `~/models` with the shared rule
+        // (`mllm_config::model_settings`); set, it must be a directory.
+        let models_root = match env_value(MODELS_ROOT) {
+            None => PathBuf::new(),
+            Some(value) => {
+                let root = mllm_config::model_settings::absolute(MODELS_ROOT, &value)
+                    .map_err(|error| no_installation(error.detail))?;
+                if !root.is_dir() {
+                    return Err(no_installation(format!(
+                        "{MODELS_ROOT} is not a directory: {}",
+                        root.display()
+                    )));
+                }
+                root
+            }
+        };
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking. A malformed
         // switch is refused even when a registered profile states its own.
@@ -796,8 +804,7 @@ impl EngineProvider for EnvEngineProvider {
             (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang.into()),
             (None, None) => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang) to the engine's executable and {MODELS_ROOT} to the \
-                 directory its weights live under"
+                 for SGLang) to the engine's executable"
             ))),
         }
     }
@@ -857,8 +864,7 @@ impl EngineProvider for EnvEngineProvider {
         if all.is_empty() {
             return Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} to the \
-                 engine's executable (and {MODELS_ROOT} to the directory its weights \
-                 live under), or register one with `mllm engine add`"
+                 engine's executable, or register one with `mllm engine add`"
             )));
         }
         Ok(all)
@@ -1067,6 +1073,17 @@ pub async fn start_standalone_from(
     state_dir: &Path,
     config: Option<&Path>,
 ) -> Result<App, StartError> {
+    start_standalone_with_models(state_dir, config, &ModelOverrides::default()).await
+}
+
+/// As [`start_standalone_from`], with this run's `--models-root`,
+/// `--model-sources` and `--model-sources-max` (owner decision 2026-09-25:
+/// flag > environment > document > default).
+pub async fn start_standalone_with_models(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+) -> Result<App, StartError> {
     start_standalone_inner(
         state_dir,
         config,
@@ -1078,6 +1095,7 @@ pub async fn start_standalone_from(
         // `nvidia-smi` collector. A machine without one samples nothing and
         // publishes the unified shape, exactly as before.
         Arc::new(mllm_agent::gpu_memory::sample),
+        flags,
     )
     .await
 }
@@ -1098,6 +1116,7 @@ pub async fn start_standalone_with(
         provider,
         crate::host_observation::proc_meminfo(),
         no_gpu(),
+        &ModelOverrides::default(),
     )
     .await
 }
@@ -1111,7 +1130,15 @@ pub async fn start_standalone_with_memory(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, memory, no_gpu()).await
+    start_standalone_inner(
+        state_dir,
+        None,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+    )
+    .await
 }
 
 /// As [`start_standalone_with_memory`], sampling the host's GPUs through `gpu`
@@ -1122,7 +1149,15 @@ pub async fn start_standalone_with_gpu(
     memory: crate::host_observation::MemoryReader,
     gpu: Arc<GpuSampler>,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, memory, gpu).await
+    start_standalone_inner(
+        state_dir,
+        None,
+        provider,
+        memory,
+        gpu,
+        &ModelOverrides::default(),
+    )
+    .await
 }
 
 /// The sampler of a boot that observes no GPU.
@@ -1138,7 +1173,28 @@ pub async fn start_standalone_configured(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, config, provider, memory, no_gpu()).await
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+    )
+    .await
+}
+
+/// As [`start_standalone_configured`], sampling the GPUs through `gpu`, with
+/// this run's model flags ([`start_standalone_with_models`]).
+pub async fn start_standalone_configured_with_models(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
+) -> Result<App, StartError> {
+    start_standalone_inner(state_dir, config, provider, memory, gpu, flags).await
 }
 
 /// ADR 0019, design §9: run the one-time migration of the role `document`
@@ -1165,12 +1221,54 @@ pub fn listener_migration(
     outcome
 }
 
+/// Owner decision 2026-09-25: the embedded host's models directory and
+/// model-source policy, resolved by the shared rule
+/// (`mllm_config::model_settings`): flag > environment > `host:` block of the
+/// standalone document > default. An installation that names a models
+/// directory (`MLLM_MODELS_ROOT`, or a test provider's own) is the
+/// environment's layer; the default is `~/models`, created when missing. A
+/// named directory must already exist.
+fn standalone_models(
+    stated_host: &serde_json::Value,
+    state_dir: &Path,
+    named: &[NamedInstallation],
+    flags: &ModelOverrides,
+) -> Result<mllm_config::model_settings::ModelSettings, StartError> {
+    use mllm_config::model_settings::{default_models_root, resolve, RootSource};
+    let mut env = ModelOverrides::from_process_env()
+        .map_err(|error| StartError::Setting(format!("{}: {}", error.path, error.detail)))?;
+    env.models_root = named
+        .first()
+        .map(|first| first.installation.models_root.clone())
+        .filter(|root| !root.as_os_str().is_empty());
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let state_dir = std::path::absolute(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let settings = resolve(
+        stated_host,
+        &state_dir,
+        flags,
+        &env,
+        default_models_root(home.as_deref()).as_deref(),
+    )
+    .map_err(|error| StartError::Setting(format!("{}: {}", error.path, error.detail)))?;
+    if settings.root_source == RootSource::Default {
+        std::fs::create_dir_all(&settings.models_root)?;
+    } else if !settings.models_root.is_dir() {
+        return Err(StartError::Setting(format!(
+            "the models directory is not a directory: {}",
+            settings.models_root.display()
+        )));
+    }
+    Ok(settings)
+}
+
 async fn start_standalone_inner(
     state_dir: &Path,
     config: Option<&Path>,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
     gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2, design §9): the generated api key
     // lives in the protected credentials file. There is no constant fallback:
@@ -1189,6 +1287,7 @@ async fn start_standalone_inner(
         inference_bind,
         inference_auth,
         listener_migration,
+        stated_host,
     ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
@@ -1252,6 +1351,9 @@ async fn start_standalone_inner(
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             migration,
+            // Owner decision 2026-09-25: `host.model_store` and
+            // `host.model_sources`, validated by `check_honoured` above.
+            document["host"].clone(),
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
@@ -1288,7 +1390,13 @@ async fn start_standalone_inner(
     for (name, profile) in &registered {
         mllm_config::registration::check_profile(name, profile)?;
     }
-    let named = provider.installations(&registered)?;
+    let mut named = provider.installations(&registered)?;
+    // Owner decision 2026-09-25 (standalone is a server plus one host): the
+    // models directory and the model-source policy, by the rule a host uses.
+    let models = standalone_models(&stated_host, state_dir, &named, flags)?;
+    for n in &mut named {
+        n.installation.models_root = models.models_root.clone();
+    }
     // Role-level settings (runtime directory, ports, model store) are the same
     // for every installation; the first one states them.
     let installation = named
@@ -1326,13 +1434,14 @@ async fn start_standalone_inner(
     // admitted against them. The coordinator's observation source is named by these,
     // so it has to exist before the coordinator does.
     let declared_host = {
-        let host = crate::standalone_config::host_policy(
+        let mut host = crate::standalone_config::host_policy(
             &named,
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
             &gpu_shape,
         );
+        models.write_into(&mut host);
         // Design §3: on a discrete host the probe is the discrete template,
         // sized for an empty checkpoint, on the GPU the picker would choose
         // first; its resolution states those zero weights.
@@ -1417,11 +1526,12 @@ async fn start_standalone_inner(
     // Initialize measures the one its profile names again for drift. Bounded,
     // reads files only, and a failure is `unmeasured`, never a refusal.
     let embedded = {
-        let (named, fingerprint, inventory, shape) = (
+        let (named, fingerprint, inventory, shape, models) = (
             named.clone(),
             environment_fingerprint.clone(),
             inventory.clone(),
             gpu_shape.clone(),
+            models.clone(),
         );
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
@@ -1430,6 +1540,7 @@ async fn start_standalone_inner(
                 capacity_bytes,
                 inventory,
                 shape,
+                models,
             )
         })
         .await
@@ -1455,6 +1566,31 @@ async fn start_standalone_inner(
             mllm_controller::checkpoint_digests::CheckpointDigests::new(
                 owner.clone(),
                 mllm_controller::checkpoint_digests::LocalDigests::new(checkpoints),
+            )
+            .spawn_until(supervision.cancel_signal()),
+        );
+    }
+    // ADR 0008 (owner decision 2026-09-25): declared remote sources are
+    // materialized by the embedded host into its sources store
+    // (`<state_dir>/models/sources` unless `host.model_sources.path` names
+    // another), exactly as an enrolled host does; activation and the
+    // checkpoint digest wait for the verified copy (ADR 0014 §7).
+    {
+        let root = models.policy.root(&models.models_root).to_path_buf();
+        let secrets = Some(state_dir.join("secrets"));
+        let store = match provider.model_source_origin() {
+            Some(origin) => mllm_agent::sources::SourceStore::with_loopback_origin(
+                &root,
+                models.policy.clone(),
+                secrets,
+                &origin,
+            ),
+            None => mllm_agent::sources::SourceStore::new(&root, models.policy.clone(), secrets),
+        };
+        supervision.supervise(
+            mllm_controller::model_sources::SourceMaterializer::new(
+                owner.clone(),
+                mllm_controller::model_sources::LocalSources::new(store),
             )
             .spawn_until(supervision.cancel_signal()),
         );

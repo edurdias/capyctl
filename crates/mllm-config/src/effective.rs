@@ -448,8 +448,9 @@ pub struct HostPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_inventory_digest: Option<String>,
     /// Absolute directory this host keeps model weights under. SPEC §7: a relative
-    /// local model path is resolved against it, so it is required rather than
-    /// defaulted — a guessed directory would resolve paths somewhere unnamed.
+    /// local model path is resolved against it. A published host document
+    /// always states it: the roles fill `~/models` (or `MLLM_MODELS_ROOT`,
+    /// `--models-root`) before publishing (owner decision 2026-09-25).
     pub model_store: PathBuf,
     pub domains: BTreeMap<String, DomainPolicy>,
     pub devices: BTreeMap<String, DevicePolicy>,
@@ -541,6 +542,17 @@ impl CudaNamespace {
 pub struct UnpinnableDevice;
 
 impl EffectiveDeployment {
+    /// The directory this deployment's checkpoint must be inside: the host's
+    /// model store for a local source, its sources store for a remote one
+    /// (ADR 0008; owner decision 2026-09-25 gives downloads a store of their
+    /// own). Whoever opens the checkpoint checks containment against it.
+    pub fn checkpoint_store(&self) -> &Path {
+        match self.model.source {
+            ModelSource::Local { .. } => &self.host.model_store,
+            _ => self.host.model_sources.root(&self.host.model_store),
+        }
+    }
+
     /// Discrete GPU design §7 (controller ruling): the namespace a launch's
     /// engine child is narrowed to. Where there is a choice of GPU (several
     /// devices) or the GPU is a discrete device domain, the selected GPU is
@@ -1021,7 +1033,11 @@ pub fn resolve_effective_with_checkpoint(
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
-    let model = core::normalize_model(d.model, Some(&host.model_store))?;
+    let model = core::normalize_model(
+        d.model,
+        Some(&host.model_store),
+        Some(host.model_sources.root(&host.model_store)),
+    )?;
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
     core::check_single_device(&d.devices, &host)?;

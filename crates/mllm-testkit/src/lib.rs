@@ -29,7 +29,7 @@ pub use fake_launcher::FakeLauncher;
 pub use lifecycle::FakeFault;
 pub use provider::{
     fake_bindings, fake_bindings_with_members, fake_installation, fake_provider,
-    fake_tools_factory, live_identity, spawn_fake_coordinator,
+    fake_tools_factory, live_identity, spawn_fake_coordinator, NO_NETWORK_ORIGIN,
 };
 pub use scripted_tool::ScriptedTool;
 

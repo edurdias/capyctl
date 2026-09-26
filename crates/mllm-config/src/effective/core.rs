@@ -161,9 +161,13 @@ pub(super) fn normalize_profile(
 /// That is deliberate: the operator writing the host file decides where weights
 /// may live, and confining paths to the store would stop a host from serving a
 /// checkpoint it already has elsewhere.
+/// `store` anchors a relative local path; a remote source resolves under
+/// `sources` (the host's sources store, owner decision 2026-09-25), which is
+/// the model store when the host names none.
 pub(super) fn normalize_model(
     raw: RawModel,
     store: Option<&Path>,
+    sources: Option<&Path>,
 ) -> Result<ModelIdentity, ConfigError> {
     let source = match (raw.path, raw.source) {
         (Some(_), Some(_)) => {
@@ -198,7 +202,8 @@ pub(super) fn normalize_model(
         (remote, Some(store)) => remote
             .store_key()
             .map(|key| {
-                store
+                sources
+                    .unwrap_or(store)
                     .join(key)
                     .to_str()
                     .map(str::to_owned)

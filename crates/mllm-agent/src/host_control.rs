@@ -67,8 +67,22 @@ impl HostControl {
 
     /// The document on disk, measured against the accepted set's inventory.
     async fn measured(&self) -> Result<ProfileSet, Value> {
-        let config =
+        let mut config =
             HostConfig::load_with_engines(&self.document, &self.engines).map_err(invalid)?;
+        // Owner decision 2026-09-25: the models directory and model-source
+        // policy were resolved at start (flags, environment, document,
+        // defaults) and change only with a restart, like every setting
+        // outside runtime_profiles.
+        for field in ["model_store", "model_sources"] {
+            match self.running.document.get(field) {
+                Some(value) => config.document[field] = value.clone(),
+                None => {
+                    if let Some(document) = config.document.as_object_mut() {
+                        document.remove(field);
+                    }
+                }
+            }
+        }
         // ADR 0018 §3: everything outside runtime_profiles needs a restart.
         if !only_profiles_differ(&self.running.document, &config.document) {
             return Err(refused(

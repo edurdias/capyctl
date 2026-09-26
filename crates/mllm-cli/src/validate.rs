@@ -257,7 +257,16 @@ fn resolve_for_acceptance(
 /// normalized.
 fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
     let engines = mllm_config::registration::engines_beside(path);
-    let config = mllm_config::remote_roles::HostConfig::load_with_engines(path, &engines)?;
+    // Owner decision 2026-09-25: the models directory and the model-source
+    // policy as the host role resolves them (without its run's flags).
+    let config = mllm_config::remote_roles::HostConfig::load_with_engines(path, &engines)?
+        .with_models(
+            &Default::default(),
+            &mllm_config::model_settings::ModelOverrides::from_process_env()?,
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        )?;
     let local = mllm_config::remote_resources::local_host_document(&config.document)?;
     mllm_config::effective::normalize_host_policy(&local)?;
     Ok((config.name, local))

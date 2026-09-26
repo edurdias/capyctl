@@ -410,14 +410,33 @@ pub fn https_host(url: &str) -> Option<String> {
     Some(authority.to_ascii_lowercase())
 }
 
-/// `allowed | denied` for one remote source kind.
+/// ADR 0008 (owner decision 2026-09-25): the ceiling on the bytes downloads
+/// may take in a host's sources store when its document states none: 500 GiB.
+pub const DEFAULT_SOURCES_MAX_BYTES: i64 = 500 << 30;
+
+/// `allowed | denied` for one remote source kind. `disabled` is accepted as
+/// another spelling of `denied`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSwitch {
-    Allowed,
-    /// Default: a host opts in to remote sources explicitly.
+    /// Default (owner decision 2026-09-25): every host, standalone or
+    /// enrolled, materializes a declared remote source unless it says not to.
     #[default]
+    Allowed,
+    #[serde(alias = "disabled")]
     Denied,
+}
+
+impl SourceSwitch {
+    /// The switch a flag or variable spells: `allowed`, or `disabled` (also
+    /// `denied`). Anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "allowed" => Some(Self::Allowed),
+            "disabled" | "denied" => Some(Self::Denied),
+            _ => None,
+        }
+    }
 }
 
 /// The host's `model_sources` block as written.
@@ -434,12 +453,19 @@ pub struct RawModelSources {
     pub allowed_hosts: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub huggingface_endpoint: Option<String>,
+    /// The directory downloads are kept under (`<path>/sources/...`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
-/// ADR 0008, SPEC §7: the host's policy for remote model sources. The model
+/// ADR 0008, SPEC §7: the host's policy for remote model sources. The sources
 /// store is a charged filesystem resource owner; `max_bytes` is its ceiling
 /// for materialized sources (verified copies plus reservations in flight).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+///
+/// Owner decision 2026-09-25: Hugging Face and HTTP sources are allowed by
+/// default on every host, with a 500 GiB ceiling; a host that states
+/// `denied` (or `disabled`) keeps them off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelSourcePolicy {
     pub huggingface: SourceSwitch,
     pub http: SourceSwitch,
@@ -449,11 +475,35 @@ pub struct ModelSourcePolicy {
     pub allowed_hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub huggingface_endpoint: Option<String>,
+    /// The absolute directory downloads live under (`<path>/sources/...`).
+    /// `None` keeps them in the model store, as before the sources store had
+    /// a directory of its own; the roles state `<state_dir>/models`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl Default for ModelSourcePolicy {
+    fn default() -> Self {
+        Self {
+            huggingface: SourceSwitch::Allowed,
+            http: SourceSwitch::Allowed,
+            max_bytes: Some(DEFAULT_SOURCES_MAX_BYTES),
+            allowed_hosts: Vec::new(),
+            huggingface_endpoint: None,
+            path: None,
+        }
+    }
 }
 
 impl ModelSourcePolicy {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The directory a remote source materializes under: [`Self::path`], or
+    /// the host's `model_store` when the policy names none.
+    pub fn root<'a>(&'a self, model_store: &'a std::path::Path) -> &'a std::path::Path {
+        self.path.as_deref().unwrap_or(model_store)
     }
 
     pub fn from_raw(raw: Option<RawModelSources>) -> Result<Self, ConfigError> {
@@ -464,7 +514,14 @@ impl ModelSourcePolicy {
             .max_bytes
             .as_deref()
             .map(crate::effective::parse_bytes)
-            .transpose()?;
+            .transpose()?
+            // Owner decision 2026-09-25: a host that states no ceiling gets
+            // the default one, so an allowed download is always bounded.
+            .or(Some(DEFAULT_SOURCES_MAX_BYTES));
+        let path = raw.path.map(std::path::PathBuf::from);
+        if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(invalid("model_sources.path", "must be absolute"));
+        }
         let policy = Self {
             huggingface: raw.huggingface.unwrap_or_default(),
             http: raw.http.unwrap_or_default(),
@@ -476,23 +533,10 @@ impl ModelSourcePolicy {
                 .map(|host| host.to_ascii_lowercase())
                 .collect(),
             huggingface_endpoint: raw.huggingface_endpoint,
+            path,
         };
-        let any_allowed =
-            policy.huggingface == SourceSwitch::Allowed || policy.http == SourceSwitch::Allowed;
-        match policy.max_bytes {
-            Some(bytes) if bytes <= 0 => {
-                return Err(invalid("model_sources.max_bytes", "must be positive"))
-            }
-            // The store is a charged resource owner: a host that allows a
-            // download states how much of it downloads may take.
-            None if any_allowed => {
-                return Err(ConfigError::new(
-                    ConfigErrorCode::MissingRequired,
-                    "model_sources.max_bytes",
-                    "a host that allows a remote source states the bytes it may take",
-                ))
-            }
-            _ => {}
+        if policy.max_bytes.is_some_and(|bytes| bytes <= 0) {
+            return Err(invalid("model_sources.max_bytes", "must be positive"));
         }
         for host in &policy.allowed_hosts {
             if host.is_empty()
@@ -526,6 +570,10 @@ impl ModelSourcePolicy {
             max_bytes: self.max_bytes.map(|bytes| format!("{bytes}B")),
             allowed_hosts: (!self.allowed_hosts.is_empty()).then(|| self.allowed_hosts.clone()),
             huggingface_endpoint: self.huggingface_endpoint.clone(),
+            path: self
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
         }
     }
 
@@ -538,8 +586,9 @@ impl ModelSourcePolicy {
     }
 
     /// ADR 0008: whether this host permits materializing `source`. A local
-    /// source is always permitted; a remote one needs the explicit opt-in for
-    /// its kind, and, where the host lists allowed hosts, a listed origin.
+    /// source is always permitted; a remote one needs its kind allowed (the
+    /// default since the owner decision of 2026-09-25) and, where the host
+    /// lists allowed hosts, a listed origin.
     pub fn permits(&self, source: &ModelSource) -> Result<(), ConfigError> {
         let denied = |detail: &str| {
             ConfigError::new(ConfigErrorCode::ModelSourceDenied, "model.source", detail)
@@ -825,10 +874,12 @@ mod tests {
         assert_eq!(ModelSource::Local { path: "x".into() }.store_key(), None);
     }
 
-    // T14: remote sources are denied unless the host opts in, and the origin
-    // must be listed when the host lists origins.
+    // T14 (ADR 0008, owner decision 2026-09-25): remote sources are allowed
+    // by default with a 500 GiB ceiling; an explicit `denied` (or its
+    // `disabled` spelling) wins over the default, and the origin must be
+    // listed when the host lists origins.
     #[test]
-    fn host_policy_denies_remote_sources_by_default() {
+    fn host_policy_allows_remote_sources_by_default() {
         let hf = ModelSource::HuggingFace {
             repo: "o/n".into(),
             revision: SHA.into(),
@@ -840,19 +891,37 @@ mod tests {
             sha256: "a".repeat(64),
             archive: Archive::None,
         };
-        let default = ModelSourcePolicy::default();
-        for source in [&hf, &http] {
-            let error = default.permits(source).unwrap_err();
-            assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied);
-        }
-        default
-            .permits(&ModelSource::Local { path: "x".into() })
-            .unwrap();
         let raw = |value: serde_json::Value| {
             ModelSourcePolicy::from_raw(Some(serde_json::from_value(value).unwrap()))
         };
-        let error = raw(json!({"huggingface": "allowed"})).unwrap_err();
-        assert_eq!(error.code, ConfigErrorCode::MissingRequired, "max_bytes");
+        for default in [
+            ModelSourcePolicy::default(),
+            ModelSourcePolicy::from_raw(None).unwrap(),
+            raw(json!({})).unwrap(),
+        ] {
+            default.permits(&hf).unwrap();
+            default.permits(&http).unwrap();
+            assert_eq!(default.max_bytes, Some(DEFAULT_SOURCES_MAX_BYTES));
+            assert_eq!(default.max_bytes, Some(500 << 30));
+            assert!(default.is_default());
+        }
+        // An allowed kind without a ceiling takes the default one.
+        let allowed = raw(json!({"huggingface": "allowed"})).unwrap();
+        assert_eq!(allowed.max_bytes, Some(DEFAULT_SOURCES_MAX_BYTES));
+        for spelling in ["denied", "disabled"] {
+            let off = raw(json!({"huggingface": spelling, "http": spelling})).unwrap();
+            for source in [&hf, &http] {
+                let error = off.permits(source).unwrap_err();
+                assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied);
+            }
+            assert!(!off.is_default());
+        }
+        let only_http = raw(json!({"huggingface": "disabled"})).unwrap();
+        assert!(only_http.permits(&hf).is_err());
+        only_http.permits(&http).unwrap();
+        ModelSourcePolicy::default()
+            .permits(&ModelSource::Local { path: "x".into() })
+            .unwrap();
         let policy =
             raw(json!({"huggingface": "allowed", "http": "allowed", "max_bytes": "1GiB"})).unwrap();
         policy.permits(&hf).unwrap();
@@ -868,10 +937,30 @@ mod tests {
             ConfigErrorCode::ModelSourceDenied
         );
         assert!(raw(json!({"huggingface_endpoint": "http://mirror"})).is_err());
+        assert!(raw(json!({"max_bytes": "0B"})).is_err());
         assert_eq!(
             ModelSourcePolicy::from_raw(Some(policy.to_raw())).unwrap(),
             policy
         );
+    }
+
+    // T14 (owner decision 2026-09-25): downloads live in their own store,
+    // `<path>/sources`; without a path they stay in the model store.
+    #[test]
+    fn the_sources_store_is_its_own_directory_when_stated() {
+        let raw = |value: serde_json::Value| {
+            ModelSourcePolicy::from_raw(Some(serde_json::from_value(value).unwrap()))
+        };
+        let store = std::path::Path::new("/models");
+        assert_eq!(ModelSourcePolicy::default().root(store), store);
+        let stated = raw(json!({"path": "/state/models"})).unwrap();
+        assert_eq!(stated.root(store), std::path::Path::new("/state/models"));
+        assert!(!stated.is_default());
+        assert_eq!(
+            ModelSourcePolicy::from_raw(Some(stated.to_raw())).unwrap(),
+            stated
+        );
+        assert!(raw(json!({"path": "relative/models"})).is_err());
     }
 
     #[test]

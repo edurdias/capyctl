@@ -49,7 +49,9 @@ pub struct EngineInstallation {
     /// shipped inside a checkpoint (Spec §3).
     pub trust_remote_code: bool,
     /// The directory the host keeps model weights under. Spec §7 resolves a
-    /// relative model path against it.
+    /// relative model path against it. Empty when the installation does not
+    /// name one: the role then resolves `model_store.path` or `~/models`
+    /// (owner decision 2026-09-25, `mllm_config::model_settings`).
     pub models_root: PathBuf,
     /// Where mllm's own guard middleware lives. It is not part of the frozen
     /// effective configuration: it is a property of this installation.
@@ -179,4 +181,12 @@ pub trait EngineProvider: Send + Sync {
     /// The process tools a launch is given, built per launch around the
     /// association that records its API identity (Spec §3).
     fn tools_factory(&self) -> ToolsFactory;
+
+    /// Test seam: a loopback `http://127.0.0.1:<port>` origin that serves
+    /// every model-source download instead of the network (ADR 0008). A
+    /// production provider names none.
+    #[doc(hidden)]
+    fn model_source_origin(&self) -> Option<String> {
+        None
+    }
 }

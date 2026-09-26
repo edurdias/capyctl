@@ -1099,13 +1099,14 @@ fn model_store_is_required_and_local_paths_resolve_against_it() {
     }
 }
 
-/// ADR 0008: a remote source resolves only on a host that opted in to its
-/// kind, only when pinned (a commit SHA, a SHA-256, HTTPS), and it resolves to
-/// its fixed directory in the host's model store. The resolver performs no
-/// fetch; the host materializes the directory before the first placement.
+/// ADR 0008: a remote source resolves only on a host whose policy allows its
+/// kind (the default since the owner decision of 2026-09-25), only when
+/// pinned (a commit SHA, a SHA-256, HTTPS), and it resolves to its fixed
+/// directory in the host's sources store. The resolver performs no fetch; the
+/// host materializes the directory before the first placement.
 // T14
 #[test]
-fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
+fn remote_sources_are_allowed_by_default_need_pins_and_resolve_into_the_store() {
     let sha = "0123456789abcdef0123456789abcdef01234567";
     let with_source = |source: serde_json::Value, policy: Option<serde_json::Value>| {
         let (mut deployment, mut host) = fixture();
@@ -1137,10 +1138,43 @@ fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
             format!("/srv/models/sources/http/{digest}"),
         ),
     ] {
-        // Denied by default: remote sources need the host's explicit opt-in.
+        // Owner decision 2026-09-25: allowed by default; an explicit
+        // `denied` (or `disabled`) keeps a host's sources off.
         let (deployment, host) = with_source(source.clone(), None);
-        let error = resolve_effective(&deployment, &host).expect_err("denied by default");
-        assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied, "{source}");
+        let effective = resolve_effective(&deployment, &host).expect("allowed by default");
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(expected.as_str())
+        );
+        for off in ["denied", "disabled"] {
+            let (deployment, host) = with_source(
+                source.clone(),
+                Some(serde_json::json!({"huggingface": off, "http": off})),
+            );
+            let error = resolve_effective(&deployment, &host).expect_err("explicitly off");
+            assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied, "{source}");
+        }
+        // A stated sources store holds the download instead of the model store.
+        let (deployment, host) = with_source(
+            source.clone(),
+            Some(serde_json::json!({"path": "/state/models"})),
+        );
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let relocated = expected.replace("/srv/models/", "/state/models/");
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(relocated.as_str())
+        );
+        assert_eq!(
+            effective.checkpoint_store(),
+            std::path::Path::new("/state/models")
+        );
+        let text = serde_json::to_string(&effective).unwrap();
+        assert_eq!(
+            mllm_config::effective::decode_effective_snapshot(&text).unwrap(),
+            effective,
+            "{source}"
+        );
 
         let (deployment, host) = with_source(source.clone(), Some(allowed.clone()));
         let effective = resolve_effective(&deployment, &host)

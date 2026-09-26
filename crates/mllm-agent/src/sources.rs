@@ -8,11 +8,12 @@
 //! source resolves to (`<store>/sources/...`), with the offline environment
 //! they always had.
 //!
-//! The model store is a charged filesystem resource owner (SPEC §7). Before a
-//! byte is written, the download's full size (from the Hugging Face listing or
-//! the response's length) is reserved against the host's
-//! `model_sources.max_bytes` ceiling and the filesystem's free space, and the
-//! reservation is persisted. It stays charged while the download runs and
+//! The sources store is a charged filesystem resource owner (SPEC §7). Before
+//! a byte is written, the download's full size (from the Hugging Face listing
+//! or the response's length) is reserved against the host's
+//! `model_sources.max_bytes` ceiling (500 GiB unless the host states one,
+//! owner decision 2026-09-25) and the filesystem's free space less
+//! [`FREE_SPACE_RESERVE`], and the reservation is persisted. It stays charged while the download runs and
 //! while partial files remain on disk; it is released only when the
 //! temporary directory is verifiably gone (SPEC §7.3: uncertainty retains
 //! accounting), or converted into the verified copy's charge on commit.
@@ -54,6 +55,10 @@ const STATE_DIR: &str = ".mllm";
 const MAX_LISTING_BYTES: usize = 16 << 20;
 /// Most files one source may select.
 const MAX_FILES: usize = 100_000;
+/// SPEC §7.3 (owner decision 2026-09-25): the free space a download must
+/// leave on the filesystem that holds the sources store, so a download never
+/// fills the disk the host (and its logs and state) runs from.
+pub const FREE_SPACE_RESERVE: u64 = 1 << 30;
 
 /// The closed failure categories a materialization reports (ADR 0008).
 pub use mllm_config::model_source::reason;
@@ -152,6 +157,8 @@ pub struct SourceStore {
     failures: Mutex<BTreeMap<String, SourceFailure>>,
     accounting: Mutex<()>,
     log: Mutex<LogSink>,
+    /// Test seam: the filesystem's free bytes, instead of `statvfs`.
+    free_override: Mutex<Option<u64>>,
 }
 
 /// Where progress and failure lines go.
@@ -229,7 +236,26 @@ impl SourceStore {
             failures: Mutex::default(),
             accounting: Mutex::default(),
             log: Mutex::new(Arc::new(|line| eprintln!("{line}"))),
+            free_override: Mutex::default(),
         })
+    }
+
+    /// Test seam: report `bytes` as the filesystem's free space (`None`
+    /// measures it again).
+    #[doc(hidden)]
+    pub fn set_free_bytes_for_test(&self, bytes: Option<u64>) {
+        if let Ok(mut free) = self.free_override.lock() {
+            *free = bytes;
+        }
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        match self.free_override.lock().ok().and_then(|free| *free) {
+            Some(bytes) => Some(bytes),
+            // The store may not exist before its first download: measure the
+            // filesystem it will be created on.
+            None => self.store.ancestors().find_map(free_bytes),
+        }
     }
 
     /// Replace where progress and failure lines go (tests capture them).
@@ -492,7 +518,11 @@ impl SourceStore {
         }
         let own = dir_bytes(&self.partial_dir(id));
         let needed = outstanding.saturating_add(bytes.saturating_sub(own));
-        if free_bytes(&self.store).is_some_and(|free| free < needed) {
+        // SPEC §7.3: the download and the free-space reserve must both fit.
+        if self
+            .free_bytes()
+            .is_some_and(|free| free < needed.saturating_add(FREE_SPACE_RESERVE))
+        {
             return Err(SourceFailure::new(reason::INSUFFICIENT_SPACE));
         }
         self.write_json(

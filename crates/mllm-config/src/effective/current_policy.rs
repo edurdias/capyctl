@@ -36,7 +36,7 @@ pub fn deployment_command_fingerprint(
     }
     // No host is in hand here, so nothing is resolved against a model store:
     // a command's identity must depend on the command alone.
-    let model = core::normalize_model(input.model, None)?;
+    let model = core::normalize_model(input.model, None, None)?;
     let request_deadline_ms = input
         .request_deadline
         .as_deref()

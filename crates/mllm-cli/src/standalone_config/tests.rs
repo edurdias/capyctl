@@ -1595,3 +1595,43 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
         assert!(text.contains(&kv.to_string()), "{text}");
     }
 }
+
+/// Owner decision 2026-09-25: `MLLM_MODELS_ROOT` is optional. Unset, the
+/// installation names no models directory (the role resolves `~/models`);
+/// set, it must be a directory, and a relative value is made absolute.
+// T03 T14
+#[test]
+fn the_models_root_variable_is_optional() {
+    let Some(_guard) = isolated("the_models_root_variable_is_optional") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    engine_env(dir.path(), true, false);
+    std::env::remove_var("MLLM_MODELS_ROOT");
+    let installation = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect("no models directory is needed to find the engine");
+    assert!(installation.models_root.as_os_str().is_empty());
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path().join("missing"));
+    let message = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect_err("a named directory must exist")
+        .to_string();
+    assert!(message.contains("MLLM_MODELS_ROOT"), "{message}");
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    assert_eq!(
+        crate::roles::EnvEngineProvider::new()
+            .installation()
+            .unwrap()
+            .models_root,
+        dir.path()
+    );
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_ENGINE_FINGERPRINT",
+    ] {
+        std::env::remove_var(name);
+    }
+}

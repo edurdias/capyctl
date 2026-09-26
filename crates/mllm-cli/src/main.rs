@@ -79,6 +79,7 @@ fn main() -> ExitCode {
             config.as_deref(),
             invocation.listen,
             invocation.no_inference_auth,
+            &invocation.model_overrides,
             format,
         );
     }
@@ -279,6 +280,7 @@ fn run_standalone(
     config: Option<&std::path::Path>,
     listen: Option<std::net::SocketAddr>,
     no_inference_auth: bool,
+    models: &roles::ModelOverrides,
     format: OutputFormat,
 ) -> ExitCode {
     let state_dir = default_state_dir();
@@ -298,6 +300,7 @@ fn run_standalone(
         config,
         listen,
         no_inference_auth,
+        models,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -324,6 +327,7 @@ async fn serve_standalone(
     config: Option<&std::path::Path>,
     listen: Option<std::net::SocketAddr>,
     no_inference_auth: bool,
+    models: &roles::ModelOverrides,
 ) -> Result<(), roles::StartError> {
     use mllm_cli::{exposure, shutdown};
     let bound = match config {
@@ -339,7 +343,9 @@ async fn serve_standalone(
     }
     let management_address = roles::standalone_management_address()?;
     let mut signals = shutdown::Signals::install()?;
-    let app = roles::start_standalone_from(state_dir, config).await?;
+    // Owner decision 2026-09-25: `--models-root`, `--model-sources` and
+    // `--model-sources-max` win over the environment and the document.
+    let app = roles::start_standalone_with_models(state_dir, config, models).await?;
     // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document.
     let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
     // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH > the document.

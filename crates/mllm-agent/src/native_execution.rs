@@ -198,7 +198,7 @@ impl NativeHostExecution {
             .and_then(|host| mllm_config::effective::normalize_host_policy(&host).ok())
             .map(|policy| {
                 crate::sources::SourceStore::new(
-                    &policy.model_store,
+                    policy.model_sources.root(&policy.model_store),
                     policy.model_sources.clone(),
                     Some(config.state_dir.join("secrets")),
                 )
@@ -529,9 +529,9 @@ impl NativeHostExecution {
         {
             return Err(JournalError::Unauthorized);
         }
+        // ADR 0008: a downloaded checkpoint is inside the sources store.
         let root = effective
-            .host
-            .model_store
+            .checkpoint_store()
             .canonicalize()
             .map_err(|_| JournalError::Unauthorized)?;
         let checkpoint = std::path::Path::new(
@@ -567,7 +567,7 @@ impl NativeHostExecution {
             .require_resolved_path()
             .map_err(|_| CheckpointError::InvalidRoot)?;
         let verified = self.checkpoints.verify(
-            &effective.host.model_store,
+            effective.checkpoint_store(),
             std::path::Path::new(checkpoint),
             &plan.checkpoint_digest,
         )?;
@@ -2320,7 +2320,7 @@ mod tests {
     }
 
     /// ADR 0008: MaterializeSource answers from this host's own policy and
-    /// store; a remote source is denied unless the host opts in; once
+    /// store; a remote source is denied where the host turned it off; once
     /// verified, the WE3 digest measures the materialized directory like any
     /// local checkpoint. Refusals never end the session.
     // T14 T34
@@ -2329,8 +2329,13 @@ mod tests {
         use sha2::Digest as _;
         let root = directory();
         let identity_dir = directory();
+        // Owner decision 2026-09-25: sources are allowed by default; this
+        // host turns them off explicitly, so nothing is fetched for it.
         let (executor, mut deployment, policy) =
-            checkpoint_fixture(root.path(), identity_dir.path());
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |host| {
+                host["model_sources"] =
+                    serde_json::json!({"huggingface": "disabled", "http": "disabled"});
+            });
         let weights = vec![3_u8; 5000];
         let sha = hex::encode(sha2::Sha256::digest(&weights));
         let served = weights.clone();
@@ -2368,7 +2373,7 @@ mod tests {
             mllm_protocol::execution::validate_result(&command, &result).unwrap();
             result.source.unwrap()
         };
-        // The fixture host states no model_sources: denied, nothing fetched.
+        // The fixture host turned model sources off: denied, nothing fetched.
         let denied = run(executor.clone(), command("s1", &policy)).await;
         assert_eq!(
             (denied.state.as_str(), denied.reason.as_str()),
