@@ -4,6 +4,66 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Discrete GPU live re-check after the fix wave — 2026-09-26 (branch `feat/discrete-gpu-network`)
+
+Live re-check of the rows the final review left owed, with the branch's
+release build (commits `9193a71..` the commit that records this section; the
+two fixes below are `da51752` and `513bade`). The 16 GB discrete-GPU laptop
+host ran the standalone role with vLLM 0.29.0 and SGLang 0.5.20 registered by
+`mllm engine add`, models Qwen3-4B-Instruct (A) and Qwen2.5-1.5B-Instruct (B),
+minimal deployment files; other programs held about 30 GiB of its 61 GiB of
+RAM throughout. Host A and host B each ran the same aarch64 build as a
+standalone role (engines registered by `mllm engine add`, ports by `--set`),
+vLLM and SGLang both on Qwen3-4B-Instruct with `residency: deep` and a 40 GiB
+memory request so the two cannot be resident together. Evidence is local and
+untracked (`target/live/dgpu2/` on the control-plane host). CPU and
+Fake-engine tests are not qualification; these rows are.
+
+| Row | Result |
+|---|---|
+| DG6 upgrade from 0.1.0-rc.4 | Pass. rc.4 from its release tarball made fresh state on the laptop host (its generated `unified` policy) and served a deployment. After the rc.4 role stopped (engine kept running), the branch build started on the same state: the listener notice once, the document moved to `0.0.0.0:8443` with `standalone.yaml.pre-0.1.0` beside it, "resource policy ... replaced (revision 2): domains [unified] are now [gpu0, system]; stopped with verified cleanup first", "re-sized ...". The rc.4 engine was stopped; the deployment came back as revision 2, stopped, and the first request started it cold (55.6 s, HTTP 200). On the machine's LAN address `/v1/models` gave 200 with the key and 401 without or with a wrong one. A second start printed no notice and re-attached the running engine. |
+| DG1 vLLM `host_backed`, observed free RAM | Pass. Every A↔B switch planned the victim a stop up front (`park_does_not_fit`, no failed park), because host RAM could not take the copy: about 29 GiB available less the 12.2 GiB reserve left about 17 GiB, and the other model's system charge (4 GiB process placeholder plus 1.5 × its weights) left less than the victim's copy (A 11.2 GiB, B 4.3 GiB). Cold switches 39–49 s. A alone: card 13 281 MiB in use; explicit park 5.3 s, card → 1 009 MiB (A's process 868 MiB), A's host memory 1.9 → 12.5 GiB, available RAM 29.4 → 18.5 GiB after the wake (vLLM keeps the pinned copy); wake 1.39 s (request included), same process. |
+| DG3 SGLang parking | Pass after a fix. The saver library check now warns (`mllm_saver_library_permissions`, `group_undetermined`, `warned`, in the engine log; visible only with `--debug-engine-logs`). Parks then reached the saver observation, and the busy scheduler answered in 0.9–1.6 s against the 1.5 s bound: a late answer after the release left the park `uncertain` (accounting kept), one before it refused the park. After the fix (below): B `deep` park 3.7 s, card 7 110 → 410 MiB, wake 10.5 s; B `host_backed` park 4.8 s, card 7 110 → 410 MiB, process host memory 2.0 → 5.1 GiB, wake 15.0 s; A `host_backed` park 6.9 s (card 11 506 → 494 MiB, host 2.0 → 9.9 GiB), wake 9.7 s; A `deep` switches with B: A parked (released: parked) and woke in 12.7–16.9 s, same processes. |
+| M12 retry after a failed launch | Pass. A vLLM deployment with a malformed engine argument: three requests in a row each started a new activation and each answered 500 `activation_failed` ("operation ... failed with code launch_failed") in 10.3 s, with a new operation id each time; none was 409. |
+| vLLM memory within its reservation | Pass. A ready: the ledger charges `gpu0` 14 220 787 655 B (13.24 GiB, request plus the 1.25 GiB context charge); the engine process holds 13 160 MiB (12.85 GiB), the card 13 281 MiB in all. |
+| Unified boot and UUID cross-check, host A and host B | Pass on both. The policy has one `unified` domain, `gpu0` maps to it, no device domain; `gpu0` carries `physical_gpu_uuid` equal to `nvidia-smi`'s UUID for the device at `0000000F:01:00.0` on each host. |
+| Unified switching vLLM ↔ SGLang, deep, host A | Pass. Every request answered 42, no refusal. Ready charge 41.25 GiB (40 GiB request plus 1.25 GiB context), parked 2.0 GiB, managed limit 60.84 GiB. Each switch parked the victim (`released: parked`) and reused the same two engine processes. vLLM park about 1.1 s and released 33.2 of the 38.6 GiB its Ready state took (86 %, MemAvailable); vLLM wake 6.6–7.1 s alone, 12.0 s while parking SGLang; SGLang wake 61.5 s (weights reloaded from disk). rc.4 on this host: park about 2 s, 80–82 % of 25.2 GiB, wake 8.8 s. |
+| Unified switching, host B | Pass, same shape. vLLM park about 1.1 s, released 32.7 of 38.1 GiB (86 %); vLLM wake 7.6–9.5 s; SGLang wake 59.4 s; same processes throughout; no refusal. |
+
+Fixes found live (each with a CPU regression test that failed before):
+
+- `da51752`: an SGLang saver read that misses its bound is read again. The
+  enrolled source uses the protocol's largest bound (2 s) and makes up to three
+  reads, each with a fresh request id; only a whole, bound answer is evidence.
+  Test `a_saver_read_that_misses_its_bound_is_read_again` (fixture `stall`
+  command). Live: the DG3 parks above.
+- `513bade`: a victim stopped because its parked footprint did not fit is
+  reported `released: stopped (no room to park)`. It was "host RAM full" even
+  for a `deep` SGLang victim whose residue did not fit on the card (seen live
+  in DG3). ADR 0019 and the install guide updated.
+
+Verification after both fixes: core suite 1112 passed, 0 failed; `mllm-agent`
+all targets 0 failed; Python runtime suite 283 passed plus the known
+`TMS_SOURCE_ARCHIVE` fixture error; clippy (workspace, warnings denied) and
+`cargo fmt --check` clean.
+
+Open, not fixed here:
+
+- The SGLang saver warning is written only to the engine log, which is empty
+  unless the role runs with `--debug-engine-logs`; an operator never sees it
+  by default.
+- On the laptop host the SGLang scheduler still answers saver reads in
+  0.7–2.0 s (it spins its main thread); the retry covers it, but a read that
+  misses three times leaves the park uncertain.
+- `status deployment` after a failed launch shows the instance's LAST ERROR as
+  `-` while LAST OPERATION says `initialize failed (launch_failed)`.
+
+Host state afterwards: the laptop GPU idle (113 MiB, no compute process), and
+the rc.4 and branch state roots, `~/.config/mllm` and the extracted rc.4
+tarball removed. Host A and host B: no mllm role, engine or GPU compute
+process, no tmux session; the state roots, `~/.config/mllm`, the build tree
+and binaries removed.
+
 ## Discrete GPU live rows DG1–DG7 — 2026-09-26 (branch `feat/discrete-gpu-network`)
 
 Live on the 16 GB discrete-GPU laptop host (one 16 GB card, 61 GiB of RAM of
@@ -87,22 +147,22 @@ owed:
   stored documents (one that names the old domain is listed with what to do),
   and a one-time notice says so. A hand-written host policy is never replaced;
   a changed shape is refused with the recorded and declared domains and the
-  recovery steps. ADR 0019 §10a. Owed live: DG6 upgrade from 0.1.0-rc.4.
+  recovery steps. ADR 0019 §10a. Live: pass (re-check section above).
 - **Planner and memory (I3, I4, M9).** The device domain is charged the
   request plus the engine's CUDA context and graphs (1.25 GiB placeholder;
   vLLM held 13.2 GiB against 12.0), so vLLM now needs a card of about 10 GiB
   or more; a smaller card boots and refuses each vLLM deployment. Park or
   stop is decided from the host's fresh observation as well as the ledger, so
   DG1's host_backed parks that host RAM cannot take are planned stops; a park
-  refused for memory is reported `stopped (host RAM full)`. Owed live: DG1
-  switching.
+  refused for memory is reported `stopped (host RAM full)` (now
+  `stopped (no room to park)`). Live: DG1 pass (re-check section above).
 - **One rule for every host shape (I5, owner rule 2026-09-26).** Resident
   crediting (parked owners, a park's own charge, `RssShmem`) and the
-  switch-park refusal are the same on unified and discrete hosts. Owed live:
-  one unified switching row on each lab host.
+  switch-park refusal are the same on unified and discrete hosts. Live: the
+  unified switching row passed on each lab host (re-check section above).
 - **SGLang saver permissions (I2).** A library that fails the owner-only rule
-  is observed with one warning in the engine log instead of refused. Owed
-  live: DG3 parking on the discrete-GPU laptop host.
+  is observed with one warning in the engine log instead of refused. Live:
+  DG3 parks after a further fix (re-check section above).
 - **Configuration and network (I1, I8, I9, I10, I11, I12, I13).** A
   read-only document keeps the new inference default while the migration is
   pending; the server takes `--management-listen` / `MLLM_MANAGEMENT_ADDR`,
@@ -121,8 +181,8 @@ owed:
   one activation; the flaky native vLLM tests take ports outside the ephemeral
   range; every CLI test runs against an isolated home.
 - **Not done here (I6).** The GB10 PCI/UUID cross-check has a fixture with
-  both collectors' formats; the unified standalone boot on each lab host is
-  still owed live.
+  both collectors' formats; live: the unified standalone boot on each lab
+  host published the matching UUID (re-check section above).
 
 ## Single-box benchmark through mllm — 2026-09-25 (branch `test/model-benchmark`)
 
