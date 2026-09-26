@@ -556,3 +556,30 @@ fn engine_commands_parse() {
         "list engines"
     );
 }
+
+// T01 (design §9): `--listen <addr:port>` narrows the inference bind of
+// `start standalone` and `start server`, and of no other command.
+#[test]
+fn listen_is_parsed_on_start_standalone_and_server() {
+    let i =
+        parse_invocation(["mllm", "start", "standalone", "--listen", "100.64.0.5:8443"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Standalone)));
+    assert_eq!(i.listen, Some("100.64.0.5:8443".parse().unwrap()));
+    let i = parse_invocation(["mllm", "start", "server", "--listen", "[::]:9443"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Server)));
+    assert_eq!(i.listen, Some("[::]:9443".parse().unwrap()));
+    assert_eq!(
+        parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .listen,
+        None
+    );
+    for bad in ["bad", "0.0.0.0:0", "224.0.0.1:8443", "0.0.0.0"] {
+        assert!(
+            parse_invocation(["mllm", "start", "standalone", "--listen", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(parse_invocation(["mllm", "start", "host", "--listen", "0.0.0.0:1"]).is_err());
+    assert!(parse_invocation(["mllm", "status", "--listen", "0.0.0.0:1"]).is_err());
+}

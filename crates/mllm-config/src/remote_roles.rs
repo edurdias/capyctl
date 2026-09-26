@@ -310,6 +310,19 @@ fn listener(v: &Value, name: &str, auth: &str, local: bool) -> Result<SocketAddr
     }
     Ok(addr)
 }
+/// No two listeners share a port on overlapping addresses (an unspecified
+/// address overlaps every address).
+fn distinct_listeners(all: &[SocketAddr]) -> Result<(), ConfigError> {
+    for (i, a) in all.iter().enumerate() {
+        if all[i + 1..].iter().any(|b| {
+            a.port() == b.port()
+                && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+        }) {
+            return Err(invalid("listeners"));
+        }
+    }
+    Ok(())
+}
 pub fn endpoint_name(address: &str) -> Result<String, ConfigError> {
     let authority = address
         .strip_prefix("https://")
@@ -340,7 +353,10 @@ impl ServerConfig {
             return Err(invalid("identity_dir"));
         }
         let management = listener(&v, "management", "token", true)?;
-        let inference = listener(&v, "inference", "api_key", true)?;
+        // Design §9 (owner decision 5): the inference listener is not forced
+        // to loopback; it keeps the API key and the router's allowlist
+        // (SPEC §13.3), and engines stay on loopback (ADR 0012).
+        let inference = listener(&v, "inference", "api_key", false)?;
         let bootstrap = listener(&v, "bootstrap", "server_tls", false)?;
         let control = listener(&v, "control", "mutual_tls", false)?;
         let listeners = v["listeners"]
@@ -349,15 +365,7 @@ impl ServerConfig {
         if listeners.len() != 4 {
             return Err(invalid("listeners"));
         }
-        let all = [management, inference, bootstrap, control];
-        for (i, a) in all.iter().enumerate() {
-            if all[i + 1..].iter().any(|b| {
-                a.port() == b.port()
-                    && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
-            }) {
-                return Err(invalid("listeners"));
-            }
-        }
+        distinct_listeners(&[management, inference, bootstrap, control])?;
         let bootstrap_address = text(&v["enrollment"], "bootstrap_address")?.to_owned();
         let control_address = text(&v["enrollment"], "control_address")?.to_owned();
         let certificate_name = endpoint_name(&bootstrap_address)?;
@@ -383,6 +391,17 @@ impl ServerConfig {
             timing_header: timing_header(&v)?,
         })
     }
+    /// Design §9: `--listen` replaces the inference bind for one run. The
+    /// address follows the document's rule
+    /// ([`crate::standalone::inference_address`]) and must not collide with
+    /// another listener.
+    pub fn with_inference(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
+        crate::standalone::inference_address(&address.to_string())
+            .ok_or_else(|| invalid("listeners"))?;
+        distinct_listeners(&[self.management, address, self.bootstrap, self.control])?;
+        self.inference = address;
+        Ok(self)
+    }
     pub fn template(root: &Path) -> String {
         // JSON is a strict YAML subset and quotes every generated path safely.
         serde_json::to_string_pretty(&json!({
@@ -390,7 +409,8 @@ impl ServerConfig {
             "state_dir":root,"identity_dir":root.join("identity"),
             "listeners":{
                 "management":{"bind":"127.0.0.1:7443","authentication":"token"},
-                "inference":{"bind":"127.0.0.1:8443","authentication":"api_key"},
+                // Design §9 (owner decision 5): as standalone.
+                "inference":{"bind":crate::standalone::DEFAULT_INFERENCE_BIND,"authentication":"api_key"},
                 "bootstrap":{"bind":"127.0.0.1:7444","authentication":"server_tls"},
                 "control":{"bind":"127.0.0.1:7445","authentication":"mutual_tls"}},
             "enrollment":{"bootstrap_address":"https://127.0.0.1:7444","control_address":"https://127.0.0.1:7445"}

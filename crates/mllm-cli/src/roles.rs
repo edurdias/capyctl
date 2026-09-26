@@ -155,6 +155,9 @@ pub struct App {
     /// not honoured (only the `server.tls` block an older generator wrote),
     /// reported by the role at boot so nobody believes them in force.
     config_notices: Vec<String>,
+    /// Design §9: the document's `server.listeners.inference.bind`, or the
+    /// `0.0.0.0:8443` default when it states none.
+    inference_bind: std::net::SocketAddr,
 }
 
 impl App {
@@ -171,6 +174,14 @@ impl App {
 
     pub fn router(&self) -> axum::Router {
         self.router.clone()
+    }
+
+    /// Design §9: the inference bind the standalone document states (default
+    /// `0.0.0.0:8443`). The listener binds it unless `--listen` or
+    /// `MLLM_STANDALONE_INFERENCE_ADDR` overrides it
+    /// ([`effective_inference_address`]).
+    pub fn inference_bind(&self) -> std::net::SocketAddr {
+        self.inference_bind
     }
 
     pub fn deps(&self) -> &mllm_router::RouterDeps {
@@ -224,10 +235,11 @@ impl App {
     }
 }
 
-/// The standalone listeners' loopback addresses (SPEC §16.5 defaults), each
-/// overridable for one run so two roles can share a machine. SPEC §15.2: a
-/// run-time override of an ordinary setting, never of the safety limit, so an
-/// address that is not loopback is refused.
+/// The standalone listeners' addresses, each overridable for one run so two
+/// roles can share a machine (SPEC §15.2: a run-time override of an ordinary
+/// setting). Management stays on loopback (SPEC §16.5), so a management
+/// address that is not loopback is refused. Inference follows the document's
+/// rule (design §9): any unicast address with a non-zero port.
 pub const INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
 pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
 
@@ -248,8 +260,47 @@ fn loopback_address(variable: &str, default: &str) -> Result<std::net::SocketAdd
         })
 }
 
-pub fn standalone_inference_address() -> Result<std::net::SocketAddr, StartError> {
-    loopback_address(INFERENCE_ADDR_ENV, "127.0.0.1:8443")
+/// Design §9: the run-time override of the inference bind, if any: `--listen`
+/// wins over `MLLM_STANDALONE_INFERENCE_ADDR`. Either must be a unicast
+/// address with a non-zero port ([`mllm_config::standalone::inference_address`]).
+/// Checked before the role boots, so a bad value refuses without side effects.
+pub fn inference_override(
+    listen: Option<std::net::SocketAddr>,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    use mllm_config::standalone::inference_address;
+    if let Some(address) = listen {
+        return inference_address(&address.to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                StartError::Setting(format!(
+                    "--listen {address} must have a non-zero port and not be multicast"
+                ))
+            });
+    }
+    let Some(value) = std::env::var_os(INFERENCE_ADDR_ENV) else {
+        return Ok(None);
+    };
+    value
+        .into_string()
+        .ok()
+        .and_then(|text| inference_address(&text))
+        .map(Some)
+        .ok_or_else(|| {
+            StartError::Setting(format!(
+                "{INFERENCE_ADDR_ENV} must be an address with a non-zero port that is not \
+                 multicast, e.g. 0.0.0.0:8443 or 127.0.0.1:8443"
+            ))
+        })
+}
+
+/// Design §9: the address the inference listener binds for this run.
+/// Precedence: `--listen` > `MLLM_STANDALONE_INFERENCE_ADDR` > the document's
+/// `listeners.inference.bind` (`document_bind`, default `0.0.0.0:8443`).
+pub fn effective_inference_address(
+    document_bind: std::net::SocketAddr,
+    listen: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, StartError> {
+    Ok(inference_override(listen)?.unwrap_or(document_bind))
 }
 
 pub fn standalone_management_address() -> Result<std::net::SocketAddr, StartError> {
@@ -1039,7 +1090,7 @@ async fn start_standalone_inner(
     );
     // SPEC §10 (W10): the switch drain bound, `server.switching.drain_timeout`
     // of the standalone document; 30 s when it names none.
-    let (switch_drain_timeout, timing_header, config_notices) = {
+    let (switch_drain_timeout, timing_header, config_notices, inference_bind) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
             LoadOutcome::Generated { config_path, .. } => config_path.clone(),
@@ -1066,6 +1117,10 @@ async fn start_standalone_inner(
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             ignored.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            // Design §9: validated by `check_honoured` above.
+            mllm_config::standalone::inference_bind(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
@@ -1491,6 +1546,7 @@ async fn start_standalone_inner(
         supervision,
         switcher,
         config_notices,
+        inference_bind,
     })
 }
 

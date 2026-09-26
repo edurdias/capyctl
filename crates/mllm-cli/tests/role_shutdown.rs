@@ -261,9 +261,16 @@ impl Installation {
     }
 
     fn start(&self, drain_secs: Option<u64>) -> Role {
+        self.start_with(drain_secs, &[]).0
+    }
+
+    /// As [`Self::start`], with extra `start standalone` arguments; also
+    /// returns the ready line.
+    fn start_with(&self, drain_secs: Option<u64>, extra: &[&str]) -> (Role, String) {
         let mut command = self.command();
         command
             .args(["start", "standalone"])
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(seconds) = drain_secs {
@@ -285,11 +292,11 @@ impl Installation {
             child,
             lines: received,
         };
-        role.expect_line(
+        let ready = role.expect_line(
             |line| line.starts_with("standalone ready"),
             Duration::from_secs(60),
         );
-        role
+        (role, ready)
     }
 }
 
@@ -720,7 +727,9 @@ fn a_writable_runtime_module_refuses_standalone_startup() {
     assert!(installation.launches().is_empty());
 }
 
-/// T03: a standalone listener override must stay on loopback (SPEC §16.5).
+/// T03: the management listener override must stay on loopback (SPEC §16.5);
+/// the inference override may name any unicast address (design §9) but never
+/// a multicast one.
 #[test]
 fn a_non_loopback_standalone_listener_is_refused() {
     let installation = Installation::new();
@@ -728,14 +737,42 @@ fn a_non_loopback_standalone_listener_is_refused() {
     // public port, and serve until the bound below fails the test.
     let out = output_within(
         installation.command().args(["start", "standalone"]).env(
-            "MLLM_STANDALONE_INFERENCE_ADDR",
+            "MLLM_STANDALONE_MANAGEMENT_ADDR",
             format!("0.0.0.0:{}", free_port()),
         ),
         REFUSAL_BOUND,
     );
     assert!(!out.status.success());
     let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("MLLM_STANDALONE_MANAGEMENT_ADDR"), "{said}");
+    let out = output_within(
+        installation.command().args(["start", "standalone"]).env(
+            "MLLM_STANDALONE_INFERENCE_ADDR",
+            format!("224.0.0.1:{}", free_port()),
+        ),
+        REFUSAL_BOUND,
+    );
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
     assert!(said.contains("MLLM_STANDALONE_INFERENCE_ADDR"), "{said}");
+}
+
+/// T01 T03 (design §9): `--listen` replaces the inference bind for one run and
+/// wins over `MLLM_STANDALONE_INFERENCE_ADDR`; the ready line names the address
+/// bound.
+#[test]
+fn listen_moves_the_standalone_inference_listener() {
+    let installation = Installation::new();
+    let listen = format!("127.0.0.1:{}", free_port());
+    let (role, ready) = installation.start_with(None, &["--listen", &listen]);
+    assert!(
+        ready.contains(&format!("inference listener {listen}")),
+        "{ready}"
+    );
+    std::net::TcpStream::connect(&listen).expect("the --listen address is served");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
 }
 
 /// T01: drain is action-first and names its resource; stopping a role

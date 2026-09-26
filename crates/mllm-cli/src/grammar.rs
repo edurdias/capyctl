@@ -5,6 +5,7 @@
 //! `&[OsString]` (argv including the program name).
 
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -481,7 +482,13 @@ enum DrainArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StartTarget {
-    Server,
+    Server {
+        /// Serve inference on this address for this run instead of the
+        /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
+        /// example 127.0.0.1:8443 or a Tailscale address.
+        #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
+        listen: Option<SocketAddr>,
+    },
     Host {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
@@ -491,6 +498,12 @@ enum StartTarget {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
         debug_engine_logs: bool,
+        /// Serve inference on this address for this run instead of the
+        /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
+        /// example 127.0.0.1:8443 or a Tailscale address. Wins over
+        /// MLLM_STANDALONE_INFERENCE_ADDR.
+        #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
+        listen: Option<SocketAddr>,
     },
     Deployment {
         deployment: String,
@@ -649,7 +662,7 @@ impl From<CliCommand> for Command {
     fn from(cli: CliCommand) -> Self {
         match cli {
             CliCommand::Start { target } => match target {
-                StartTarget::Server => Command::Start(Role::Server),
+                StartTarget::Server { .. } => Command::Start(Role::Server),
                 StartTarget::Host { .. } => Command::Start(Role::Host),
                 StartTarget::Standalone { .. } => Command::Start(Role::Standalone),
                 StartTarget::Deployment { deployment, .. } => Command::Lifecycle {
@@ -823,6 +836,9 @@ pub struct Invocation {
     pub evict: bool,
     /// SPEC §6.4: `--wait` on `start deployment` and `start instance`.
     pub wait: bool,
+    /// Design §9: `--listen <addr:port>` on `start standalone` and `start
+    /// server`: the inference bind for this run.
+    pub listen: Option<SocketAddr>,
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>
@@ -847,7 +863,8 @@ where
         &cli.command,
         CliCommand::Start {
             target: StartTarget::Standalone {
-                debug_engine_logs: true
+                debug_engine_logs: true,
+                ..
             } | StartTarget::Host {
                 debug_engine_logs: true
             }
@@ -871,6 +888,13 @@ where
             .as_deref()
             .map(parse_timeout)
             .transpose()?,
+        _ => None,
+    };
+    // Design §9: `--listen` on `start standalone` and `start server` only.
+    let listen = match &cli.command {
+        CliCommand::Start {
+            target: StartTarget::Server { listen } | StartTarget::Standalone { listen, .. },
+        } => *listen,
         _ => None,
     };
     let evict = matches!(
@@ -940,6 +964,17 @@ where
         initialize_timeout_ms,
         evict,
         wait,
+        listen,
+    })
+}
+
+/// Design §9: an inference address for `--listen`: a socket address with a
+/// non-zero port that is not multicast (the document's rule).
+fn parse_listen(text: &str) -> Result<SocketAddr, String> {
+    mllm_config::standalone::inference_address(text).ok_or_else(|| {
+        "must be an address and port such as 0.0.0.0:8443, 127.0.0.1:8443 or [::]:8443 \
+         (non-zero port, not multicast)"
+            .to_owned()
     })
 }
 

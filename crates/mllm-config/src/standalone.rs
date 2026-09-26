@@ -1,20 +1,22 @@
 //! SPEC §15.3: a standalone document is refused when it states a setting the
 //! standalone role does not honour.
 //!
-//! The standalone role serves both listeners over plain HTTP on loopback, keeps
-//! its state under the state root it was started with, and derives its embedded
-//! host's policy from the installation and capacity it observes
+//! The standalone role serves both listeners over plain HTTP, keeps its state
+//! under the state root it was started with, and derives its embedded host's
+//! policy from the installation and capacity it observes
 //! (`mllm-cli/src/standalone_config.rs`). A document that names another state
-//! directory, another listener address, TLS, a model store, a runtime profile or
-//! a numeric resource limit would otherwise be accepted and silently ignored, so
-//! an operator could believe a setting is in force that is not. Each such value
-//! is refused here with the path that names it.
+//! directory, another management address, TLS, a model store, a runtime profile
+//! or a numeric resource limit would otherwise be accepted and silently ignored,
+//! so an operator could believe a setting is in force that is not. Each such
+//! value is refused here with the path that names it.
 //!
 //! What is accepted is exactly what the role does: the per-role state
-//! directories under the state root, the two loopback listeners at their
-//! defaults with their fixed authentication, an `embedded` connection, `auto`
-//! resource values and no runtime profiles. A listener moves for one run only
-//! through `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
+//! directories under the state root, the management listener on loopback at its
+//! default, the inference listener at any unicast address with a port (design
+//! §9: `0.0.0.0:8443` by default, as for a server), each with its fixed
+//! authentication, an `embedded` connection, `auto` resource values and no
+//! runtime profiles. A listener moves for one run through `--listen` (inference
+//! only) or `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
 //! are labels and are not checked.
 //!
@@ -26,18 +28,52 @@
 //! is created once and never replaced. Any other `server.tls` value is an
 //! operator's statement and is refused.
 
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::error::{ConfigError, ConfigErrorCode};
 
-/// The standalone listeners, their loopback default addresses and the only
-/// authentication each supports (SPEC §16.5).
+/// Design §9 (owner decisions B and 5): the inference listener of a new
+/// standalone or server document serves every interface. The API key stays
+/// required (SPEC §13.3); the listener has no engine control path (ADR 0012).
+pub const DEFAULT_INFERENCE_BIND: &str = "0.0.0.0:8443";
+
+/// The standalone listeners, their default addresses and the only
+/// authentication each supports (SPEC §16.5). Management stays on loopback;
+/// inference defaults to [`DEFAULT_INFERENCE_BIND`] (design §9).
 pub const LISTENERS: &[(&str, &str, &str)] = &[
     ("management", "127.0.0.1:7443", "admin_token"),
-    ("inference", "127.0.0.1:8443", "api_key"),
+    ("inference", DEFAULT_INFERENCE_BIND, "api_key"),
 ];
+
+/// Design §9: the one rule for an inference address, whichever role, document,
+/// flag or variable states it: a socket address with a non-zero port that is
+/// not multicast. IPv6 (`[::]:8443`) is accepted.
+pub fn inference_address(text: &str) -> Option<SocketAddr> {
+    text.parse::<SocketAddr>()
+        .ok()
+        .filter(|address| address.port() != 0 && !address.ip().is_multicast())
+}
+
+/// Design §9: the inference address a standalone `document` binds:
+/// `server.listeners.inference.bind` when stated, else
+/// [`DEFAULT_INFERENCE_BIND`]. Refuses port 0, a multicast address and
+/// anything that is not a socket address.
+pub fn inference_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
+    const PATH: &str = "server.listeners.inference.bind";
+    let Some(bind) = document["server"]["listeners"]["inference"].get("bind") else {
+        return Ok(DEFAULT_INFERENCE_BIND.parse().expect("valid default"));
+    };
+    bind.as_str().and_then(inference_address).ok_or_else(|| {
+        refuse(
+            PATH,
+            "the inference listener binds an address with a non-zero port that is not \
+             multicast, e.g. 0.0.0.0:8443, 127.0.0.1:8443 or a Tailscale address",
+        )
+    })
+}
 
 /// A value of the document the role accepts but does not honour. It exists only
 /// for the exact shape an older generator wrote, and is reported so that nobody
@@ -61,7 +97,7 @@ impl std::fmt::Display for IgnoredSetting {
 }
 
 const TLS_REFUSAL: &str =
-    "standalone listeners serve plain HTTP on loopback; TLS is not supported, remove this block";
+    "standalone listeners serve plain HTTP; TLS is not supported, remove this block";
 
 /// SPEC §15.2 (R13): whether `tls` is exactly the block an older mllm generator
 /// wrote into the standalone default: `mode: managed` and `identity_dir` naming
@@ -166,7 +202,7 @@ pub fn check_honoured(
         ignored.push(IgnoredSetting {
             path: "server.tls".into(),
             reason: "an older mllm generated this block; the standalone listeners serve \
-                     plain HTTP on loopback. It has no effect and may be removed"
+                     plain HTTP. It has no effect and may be removed"
                 .into(),
         });
     }
@@ -181,7 +217,11 @@ pub fn check_honoured(
                     "standalone has only the `management` and `inference` listeners",
                 ));
             };
-            if let Some(bind) = listener.get("bind") {
+            if name == "inference" {
+                // Design §9: any unicast address, as for a server.
+                inference_bind(document)?;
+            } else if let Some(bind) = listener.get("bind") {
+                // SPEC §16.5: management stays on loopback at its default.
                 if bind.as_str() != Some(address) {
                     return Err(refuse(
                         &format!("{path}.bind"),
@@ -237,6 +277,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The generated shape before design §9 (inference on loopback), which
+    /// must keep validating; the current generator is tested in `defaults.rs`.
     fn generated(root: &str) -> Value {
         json!({
             "schema_version": 1, "kind": "standalone", "name": "local",
@@ -353,7 +395,15 @@ mod tests {
             ),
             (
                 "server.listeners.inference.bind",
-                Box::new(|d| d["server"]["listeners"]["inference"]["bind"] = json!("0.0.0.0:8443")),
+                Box::new(|d| {
+                    d["server"]["listeners"]["inference"]["bind"] = json!("224.0.0.1:8443")
+                }),
+            ),
+            (
+                "server.listeners.management.bind",
+                Box::new(|d| {
+                    d["server"]["listeners"]["management"]["bind"] = json!("0.0.0.0:7443")
+                }),
             ),
             (
                 "server.listeners.management.authentication",
@@ -392,5 +442,64 @@ mod tests {
             assert_eq!(error.path, path);
             assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
         }
+    }
+
+    fn check(document: &Value) -> Result<Vec<IgnoredSetting>, ConfigError> {
+        check_honoured(document, Path::new("/s/config"), Path::new("/s"))
+    }
+
+    // T03 (design §9): a document an older mllm generated, with inference on
+    // loopback, still validates and binds where it says (the one-time
+    // migration moves it before the bind is read).
+    #[test]
+    fn the_old_loopback_document_still_validates() {
+        let doc = generated("/s");
+        assert!(check(&doc).is_ok());
+        assert_eq!(inference_bind(&doc).unwrap().to_string(), "127.0.0.1:8443");
+    }
+
+    // T03 (design §9): a document that states no inference bind binds the
+    // default on every interface.
+    #[test]
+    fn an_unstated_inference_bind_is_the_all_interfaces_default() {
+        assert_eq!(DEFAULT_INFERENCE_BIND, "0.0.0.0:8443");
+        let bare = json!({"schema_version": 1, "kind": "standalone", "name": "x"});
+        assert_eq!(inference_bind(&bare).unwrap().to_string(), "0.0.0.0:8443");
+        let mut doc = generated("/s");
+        doc["server"]["listeners"]["inference"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bind");
+        assert_eq!(inference_bind(&doc).unwrap().to_string(), "0.0.0.0:8443");
+    }
+
+    // T03 T37 (design §9): the inference bind accepts any unicast address with
+    // a port; the management listener stays on loopback.
+    #[test]
+    fn bind_rules() {
+        for ok in [
+            "0.0.0.0:8443",
+            "100.64.0.5:8443",
+            "[::]:8443",
+            "127.0.0.1:9000",
+        ] {
+            let mut d = generated("/s");
+            d["server"]["listeners"]["inference"]["bind"] = ok.into();
+            assert!(check(&d).is_ok(), "{ok}");
+            assert_eq!(inference_bind(&d).unwrap(), ok.parse().unwrap(), "{ok}");
+        }
+        for bad in ["0.0.0.0:0", "224.0.0.1:8443", "[ff02::1]:8443", "nonsense"] {
+            let mut d = generated("/s");
+            d["server"]["listeners"]["inference"]["bind"] = bad.into();
+            let error = check(&d).unwrap_err();
+            assert_eq!(error.path, "server.listeners.inference.bind", "{bad}");
+            assert!(inference_bind(&d).is_err(), "{bad}");
+        }
+        let mut d = generated("/s");
+        d["server"]["listeners"]["inference"]["bind"] = json!(8443);
+        assert!(check(&d).is_err());
+        let mut d = generated("/s");
+        d["server"]["listeners"]["management"]["bind"] = "0.0.0.0:7443".into();
+        assert!(check(&d).is_err());
     }
 }

@@ -75,7 +75,7 @@ fn main() -> ExitCode {
         let config = mllm_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
             std::env::var(key).ok().filter(|value| !value.is_empty())
         });
-        return run_standalone(config.as_deref(), format);
+        return run_standalone(config.as_deref(), invocation.listen, format);
     }
     // ADR 0018: engine registration, on this machine, through its role's socket.
     if mllm_cli::engine::is_engine_command(&invocation.command) {
@@ -264,7 +264,11 @@ fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
 }
 
 /// Foreground standalone boot with authenticated management and inference.
-fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> ExitCode {
+fn run_standalone(
+    config: Option<&std::path::Path>,
+    listen: Option<std::net::SocketAddr>,
+    format: OutputFormat,
+) -> ExitCode {
     let state_dir = default_state_dir();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -277,7 +281,7 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
             return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
-    match runtime.block_on(serve_standalone(&state_dir, config)) {
+    match runtime.block_on(serve_standalone(&state_dir, config, listen)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err: StructuredError = err.into();
@@ -287,8 +291,10 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
     }
 }
 
-/// Boot the standalone graph and serve the inference listener
-/// (127.0.0.1:8443, SPEC §15.2) until the process is signalled.
+/// Boot the standalone graph and serve the inference listener (design §9:
+/// the document's bind, `0.0.0.0:8443` by default, unless `--listen` or
+/// `MLLM_STANDALONE_INFERENCE_ADDR` moves it for this run) until the process
+/// is signalled.
 ///
 /// SPEC §4.3 (owner decision P3): SIGTERM or SIGINT is a service restart.
 /// Inference admission closes (new requests get a retryable 503), admitted
@@ -299,6 +305,7 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
 async fn serve_standalone(
     state_dir: &std::path::Path,
     config: Option<&std::path::Path>,
+    listen: Option<std::net::SocketAddr>,
 ) -> Result<(), roles::StartError> {
     use mllm_cli::shutdown;
     let bound = match config {
@@ -306,10 +313,13 @@ async fn serve_standalone(
         None => shutdown::standalone_drain_bound(state_dir),
     }
     .map_err(roles::StartError::Setting)?;
-    let inference_address = roles::standalone_inference_address()?;
+    // Checked before the boot, so a bad override refuses without side effects.
+    roles::inference_override(listen)?;
     let management_address = roles::standalone_management_address()?;
     let mut signals = shutdown::Signals::install()?;
     let app = roles::start_standalone_from(state_dir, config).await?;
+    // Design §9: `--listen` > MLLM_STANDALONE_INFERENCE_ADDR > the document.
+    let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
         eprintln!("warning: {notice}");

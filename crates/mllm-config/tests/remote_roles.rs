@@ -7,7 +7,9 @@ fn role_templates_round_trip_without_engines() {
     let root = Path::new("/home/operator/.local/state/mllm");
     let server = ServerConfig::parse(&ServerConfig::template(root)).unwrap();
     assert!(server.management.ip().is_loopback());
-    assert!(server.inference.ip().is_loopback());
+    // Design §9 (owner decision 5): the server's generated inference
+    // listener serves every interface, with the API key.
+    assert_eq!(server.inference.to_string(), "0.0.0.0:8443");
     assert!(server.bootstrap.ip().is_loopback());
     assert!(server.control.ip().is_loopback());
     assert_eq!(server.state_dir, root);
@@ -309,4 +311,51 @@ fn a_remote_host_declares_device_domains() {
         refused.detail.starts_with("device_policy_mismatch"),
         "{refused:?}"
     );
+}
+
+// T03 T37 (design §9): the server's inference listener accepts any unicast
+// address with a port; management stays loopback-only.
+#[test]
+fn server_inference_bind_is_not_loopback_forced() {
+    let yaml = ServerConfig::template(Path::new("/home/operator/state"));
+    assert!(yaml.contains("\"0.0.0.0:8443\""), "{yaml}");
+    for ok in ["100.64.0.5:8443", "[::]:8443", "127.0.0.1:8443"] {
+        let doc = yaml.replace("0.0.0.0:8443", ok);
+        assert_eq!(
+            ServerConfig::parse(&doc).unwrap().inference,
+            ok.parse().unwrap(),
+            "{ok}"
+        );
+    }
+    for bad in ["0.0.0.0:0", "224.0.0.1:8443", "0.0.0.0:7443"] {
+        assert!(
+            ServerConfig::parse(&yaml.replace("0.0.0.0:8443", bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(ServerConfig::parse(&yaml.replace("127.0.0.1:7443", "0.0.0.0:7443")).is_err());
+}
+
+// T03 (design §9): `--listen` replaces the inference bind for one run and is
+// held to the same rules, including no collision with another listener.
+#[test]
+fn server_inference_override_keeps_the_listener_rules() {
+    let yaml = ServerConfig::template(Path::new("/home/operator/state"));
+    let server = ServerConfig::parse(&yaml).unwrap();
+    let moved = server
+        .clone()
+        .with_inference("100.64.0.5:9443".parse().unwrap())
+        .unwrap();
+    assert_eq!(moved.inference.to_string(), "100.64.0.5:9443");
+    for bad in [
+        "0.0.0.0:7443",
+        "127.0.0.1:7444",
+        "224.0.0.1:8443",
+        "0.0.0.0:0",
+    ] {
+        assert!(
+            server.clone().with_inference(bad.parse().unwrap()).is_err(),
+            "{bad}"
+        );
+    }
 }

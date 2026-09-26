@@ -185,6 +185,65 @@ async fn standalone_starts_from_a_document_an_older_generator_wrote() {
     );
 }
 
+/// T02 T37 (design §9): a new standalone installation binds inference on every
+/// interface (the API key stays required); the role reads it from its document.
+#[tokio::test]
+async fn standalone_binds_inference_on_every_interface_by_default() {
+    let dir = safe_state_dir();
+    let app = boot(dir.path()).await;
+    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
+    assert!(!app.api_key().is_empty());
+}
+
+/// T03 (design §9): the document's inference bind is the one the role binds,
+/// for example a tailnet address; the old loopback default is honoured as
+/// written until the one-time migration runs.
+#[tokio::test]
+async fn standalone_binds_the_inference_address_its_document_states() {
+    for bind in ["100.64.0.5:8443", "127.0.0.1:8443"] {
+        let dir = safe_state_dir();
+        let explicit = dir.path().join("explicit.yaml");
+        let text = legacy_generated(&dir.path().to_string_lossy())
+            .replace("\"127.0.0.1:8443\"", &format!("\"{bind}\""));
+        std::fs::write(&explicit, &text).unwrap();
+        let app = boot_configured(dir.path(), &explicit)
+            .await
+            .expect("a valid explicit document boots");
+        assert_eq!(app.inference_bind().to_string(), bind);
+    }
+}
+
+/// T03 (design §9): `--listen` wins over `MLLM_STANDALONE_INFERENCE_ADDR`,
+/// which wins over the document. Either may name any unicast address with a
+/// port; a multicast address or port 0 is refused.
+#[test]
+fn listen_beats_environment_beats_document() {
+    use mllm_cli::roles::{effective_inference_address, INFERENCE_ADDR_ENV};
+    use std::net::SocketAddr;
+    let doc: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+    std::env::remove_var(INFERENCE_ADDR_ENV);
+    assert_eq!(effective_inference_address(doc, None).unwrap(), doc);
+    std::env::set_var(INFERENCE_ADDR_ENV, "100.64.0.5:8443");
+    assert_eq!(
+        effective_inference_address(doc, None).unwrap().to_string(),
+        "100.64.0.5:8443"
+    );
+    assert_eq!(
+        effective_inference_address(doc, Some("127.0.0.1:1".parse().unwrap()))
+            .unwrap()
+            .to_string(),
+        "127.0.0.1:1"
+    );
+    for bad in ["224.0.0.1:8443", "0.0.0.0:0", "nonsense"] {
+        std::env::set_var(INFERENCE_ADDR_ENV, bad);
+        let error = effective_inference_address(doc, None).unwrap_err();
+        assert!(error.to_string().contains(INFERENCE_ADDR_ENV), "{error}");
+    }
+    std::env::remove_var(INFERENCE_ADDR_ENV);
+    assert!(effective_inference_address(doc, Some("0.0.0.0:0".parse().unwrap())).is_err());
+    assert!(effective_inference_address(doc, Some("224.0.0.1:1".parse().unwrap())).is_err());
+}
+
 /// T03 (SPEC §15.3): the current generated document reports nothing ignored.
 #[tokio::test]
 async fn standalone_reports_nothing_ignored_for_the_current_generated_document() {

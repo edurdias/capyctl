@@ -611,7 +611,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         );
     println!(
         "{}",
-        json!({"role":"server","management":config.management.to_string(),"state_dir":config.state_dir})
+        json!({"role":"server","management":config.management.to_string(),
+            "inference":config.inference.to_string(),"state_dir":config.state_dir})
     );
     // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
     let management_stopped = stopped.clone();
@@ -1042,11 +1043,20 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             }
             let source = read_config(&path)?;
             if *role == Role::Server {
-                serve_server(
-                    ServerConfig::parse(&source)
-                        .map_err(|_| error("Invalid server configuration"))?,
-                )
-                .await
+                let config = ServerConfig::parse(&source)
+                    .map_err(|_| error("Invalid server configuration"))?;
+                // Design §9: `--listen` replaces the inference bind for this
+                // run, under the document's rule.
+                let config = match invocation.listen {
+                    Some(address) => config.with_inference(address).map_err(|_| {
+                        error(&format!(
+                            "--listen {address} collides with another server listener \
+                             or is not a unicast address with a non-zero port"
+                        ))
+                    })?,
+                    None => config,
+                };
+                serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
                 // resolved by the same rule as `mllm engine`; the document
