@@ -12,6 +12,7 @@ from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass, field
 import hashlib
+import json
 import os
 import re
 import stat
@@ -174,14 +175,37 @@ def _chain(scheduler, build, weight_restore="disk_reload"):
     return args, adapter, saver, impl, hook, pool, wrapper, cdll
 
 
+# Permission problems already reported by this process, so the engine log
+# carries each once rather than once per observation.
+_WARNED = set()
+
+
+def _warn(problem):
+    """Write one fixed-word warning line to the engine's stderr (its log)."""
+    if problem in _WARNED:
+        return
+    _WARNED.add(problem)
+    try:
+        sys.stderr.write(json.dumps(dict(event="mllm_saver_library_permissions",
+                                         problem=problem, action="warned"),
+                                    separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _protected(info):
-    # Owner decision 2026-09-23: the service-reviewed saver build and the
-    # directories on the way to it follow the owner-only rule mllm applies to
-    # its own helpers; group write is the owner's only under its private group.
+    # SPEC §8.1, ADR 0008: the saver library lives in the engine's
+    # installation, and engine files get no permission rule; a changed file
+    # is caught by the digest below and by the installation's drift
+    # fingerprint. The owner-only rule mllm applies to its own helpers is
+    # therefore a warning here, never a refusal (decided 2026-09-25 after a
+    # group-writable SGLang environment refused every park, DG3). The
+    # warning names the closed problem only, never a path or an account.
     try:
         owner_only.check(info, owners=(0, os.getuid()))
-    except owner_only.OwnerOnlyError:
-        raise SaverBindingError("unsafe_library") from None
+    except owner_only.OwnerOnlyError as problem:
+        _warn(problem.problem)
 
 
 def _library(build, cdll, exports=_EXPORTS):

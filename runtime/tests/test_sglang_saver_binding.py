@@ -209,26 +209,43 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
             with self.assertRaises(self.binding.SaverBindingError):
                 self.observe(build=replace(self.build, **{key: value}))
 
-    def test_writable_loaded_backing_file_rejected(self):
+    # T21 T37 (SPEC §8.1, ADR 0008): the saver library is an engine file, and
+    # engine files get no permission rule. A writable library is observed
+    # with one warning in the engine log; the digest still binds the loaded
+    # inode, so a changed library is refused as a mismatch.
+    def test_writable_loaded_backing_file_is_observed_with_a_warning(self):
+        import io
+        self.binding._WARNED.clear()
         self.path.chmod(0o522)
         try:
-            with self.assertRaises(self.binding.SaverBindingError):
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+                self.assertEqual(self.observe().library.sha256, self.digest)
                 self.observe()
+            lines = [line for line in log.getvalue().splitlines() if line]
+            self.assertEqual(lines, ['{"event":"mllm_saver_library_permissions",'
+                                     '"problem":"writable_by_other","action":"warned"}'])
+            self.assertNotIn(str(self.path), log.getvalue())
         finally:
             self.path.chmod(0o500)
 
-    # T21 T37: owner decision 2026-09-23. The reviewed saver build follows the
-    # owner-only rule: group write is trusted only under the owner's private
-    # group; under a shared group it is refused.
-    def test_group_writable_library_follows_the_owner_only_rule(self):
+    # T21 T37: found live on the discrete-GPU laptop host (DG3): a
+    # group-writable SGLang environment whose account database cannot prove
+    # the group private refused every park (`unsafe_library`). Decided
+    # 2026-09-25: the permission check warns instead of refusing.
+    def test_group_writable_library_warns_instead_of_refusing(self):
+        import io
         from runtime import owner_only
+        self.binding._WARNED.clear()
         self.path.chmod(0o570)
         try:
             with mock.patch.object(owner_only, "system_private_group", return_value=True):
                 self.assertEqual(self.observe().library.sha256, self.digest)
-            with mock.patch.object(owner_only, "system_private_group", return_value=False):
-                with self.assertRaisesRegex(self.binding.SaverBindingError, "unsafe_library"):
-                    self.observe()
+            for verdict, problem in ((False, "writable_by_shared_group"),
+                                     (None, "group_undetermined")):
+                with mock.patch.object(owner_only, "system_private_group", return_value=verdict), \
+                        mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+                    self.assertEqual(self.observe().library.sha256, self.digest)
+                self.assertIn(f'"problem":"{problem}"', log.getvalue())
         finally:
             self.path.chmod(0o500)
 
