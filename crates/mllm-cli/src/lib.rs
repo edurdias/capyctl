@@ -3,6 +3,8 @@ mod client_journal;
 pub mod device_inventory;
 pub mod drain;
 pub mod engine;
+// Design §9: the inference authentication opt-out and its warning.
+pub mod exposure;
 pub mod grammar;
 pub mod host_observation;
 pub mod managed_runtime;

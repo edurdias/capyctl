@@ -489,6 +489,12 @@ enum StartTarget {
         /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
+        /// Serve inference without the API key for this run (design §9).
+        /// Every client that can reach the address can use the models; a
+        /// non-loopback address prints a warning. Wins over
+        /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
+        #[arg(long)]
+        no_inference_auth: bool,
     },
     Host {
         /// Retain full native engine logs in private files (may contain secrets).
@@ -505,6 +511,12 @@ enum StartTarget {
         /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
+        /// Serve inference without the API key for this run (design §9).
+        /// Every client that can reach the address can use the models; a
+        /// non-loopback address prints a warning. Wins over
+        /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
+        #[arg(long)]
+        no_inference_auth: bool,
     },
     Deployment {
         deployment: String,
@@ -840,6 +852,9 @@ pub struct Invocation {
     /// Design §9: `--listen <addr:port>` on `start standalone` and `start
     /// server`: the inference bind for this run.
     pub listen: Option<SocketAddr>,
+    /// Design §9: `--no-inference-auth` on `start standalone` and `start
+    /// server`: the inference key is off for this run.
+    pub no_inference_auth: bool,
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>
@@ -894,10 +909,23 @@ where
     // Design §9: `--listen` on `start standalone` and `start server` only.
     let listen = match &cli.command {
         CliCommand::Start {
-            target: StartTarget::Server { listen } | StartTarget::Standalone { listen, .. },
+            target: StartTarget::Server { listen, .. } | StartTarget::Standalone { listen, .. },
         } => *listen,
         _ => None,
     };
+    // Design §9: `--no-inference-auth` on the same two starts.
+    let no_inference_auth = matches!(
+        &cli.command,
+        CliCommand::Start {
+            target: StartTarget::Server {
+                no_inference_auth: true,
+                ..
+            } | StartTarget::Standalone {
+                no_inference_auth: true,
+                ..
+            },
+        }
+    );
     let evict = matches!(
         &cli.command,
         CliCommand::Start {
@@ -966,6 +994,7 @@ where
         evict,
         wait,
         listen,
+        no_inference_auth,
     })
 }
 

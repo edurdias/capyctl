@@ -161,6 +161,11 @@ pub struct App {
     inference_bind: std::net::SocketAddr,
     /// ADR 0019, design §9: what this start's one-time listener migration did.
     listener_migration: Migration,
+    /// Design §9: the document's `server.listeners.inference.authentication`
+    /// (`api_key` unless it states `none`).
+    inference_auth: mllm_config::standalone::InferenceAuth,
+    /// Design §9: the listener the role serves, reported to status.
+    inference_listener: Arc<mllm_management::inference_listener::InferenceListenerView>,
 }
 
 impl App {
@@ -191,6 +196,39 @@ impl App {
     /// loopback inference bind did (reported on stderr as it happened).
     pub fn listener_migration(&self) -> &Migration {
         &self.listener_migration
+    }
+
+    /// Design §9: the inference authentication the standalone document
+    /// states (`api_key` unless `none`). `--no-inference-auth` and
+    /// `MLLM_INFERENCE_AUTH` override it for one run
+    /// ([`crate::exposure::effective_inference_auth`]).
+    pub fn inference_auth(&self) -> mllm_config::standalone::InferenceAuth {
+        self.inference_auth
+    }
+
+    /// Design §9: the router to serve on `bind` with `auth` for this run, and
+    /// the listener recorded for status. With [`InferenceAuth::None`] the
+    /// router's key check is off (`RouterDeps.api_key: None`); with
+    /// [`InferenceAuth::ApiKey`] it is [`App::router`], which requires the
+    /// key on every route (SPEC §13.3, T37).
+    ///
+    /// [`InferenceAuth::None`]: mllm_config::standalone::InferenceAuth::None
+    /// [`InferenceAuth::ApiKey`]: mllm_config::standalone::InferenceAuth::ApiKey
+    pub fn inference_router(
+        &self,
+        bind: std::net::SocketAddr,
+        auth: mllm_config::standalone::InferenceAuth,
+    ) -> axum::Router {
+        use mllm_config::standalone::InferenceAuth;
+        self.inference_listener
+            .set(crate::exposure::listener_view(bind, auth));
+        match auth {
+            InferenceAuth::ApiKey => self.router.clone(),
+            InferenceAuth::None => mllm_router::serve_router(mllm_router::RouterDeps {
+                api_key: None,
+                ..self.deps.clone()
+            }),
+        }
     }
 
     pub fn deps(&self) -> &mllm_router::RouterDeps {
@@ -1134,25 +1172,24 @@ async fn start_standalone_inner(
     memory: crate::host_observation::MemoryReader,
     gpu: Arc<GpuSampler>,
 ) -> Result<App, StartError> {
-    // Fail-closed credentials (SPEC §15.2): the generated api key lives in
-    // the protected credentials file. The hardcoded fallback exists ONLY
-    // for a boot that generated the config (and its credentials) this run
-    // — an existing state dir missing its credentials refuses to serve
-    // instead of serving with a guessable key.
+    // Fail-closed credentials (SPEC §15.2, design §9): the generated api key
+    // lives in the protected credentials file. There is no constant fallback:
+    // credentials that cannot be read, even ones created by this boot, refuse
+    // to serve (MissingCredentials) instead of serving with a guessable key.
     //
     // SPEC §15.2 (R13): an explicit `--config` that is missing or invalid is an
     // error here; it is never replaced by a generated default.
     let outcome = resolve_startup(ConfigKind::Standalone, config, state_dir)?;
-    let mut created_this_boot = matches!(
-        outcome,
-        LoadOutcome::Generated {
-            created_identity: true,
-            ..
-        }
-    );
     // SPEC §10 (W10): the switch drain bound, `server.switching.drain_timeout`
     // of the standalone document; 30 s when it names none.
-    let (switch_drain_timeout, timing_header, config_notices, inference_bind, listener_migration) = {
+    let (
+        switch_drain_timeout,
+        timing_header,
+        config_notices,
+        inference_bind,
+        inference_auth,
+        listener_migration,
+    ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
             LoadOutcome::Generated { config_path, .. } => config_path.clone(),
@@ -1208,6 +1245,12 @@ async fn start_standalone_inner(
                     StartError::Deploy(format!("standalone configuration: {error}"))
                 })?,
             },
+            // Design §9: `server.listeners.inference.authentication`
+            // (`api_key` unless the document states `none`). The flag and
+            // MLLM_INFERENCE_AUTH are applied by the caller for this run.
+            mllm_config::standalone::inference_auth(&document, false).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             migration,
         )
     };
@@ -1224,14 +1267,10 @@ async fn start_standalone_inner(
             .join("credentials")
             .try_exists()?
     {
-        created_this_boot = mllm_config::defaults::create_standalone_credentials(state_dir)?;
+        mllm_config::defaults::create_standalone_credentials(state_dir)?;
     }
     let store = Rc::new(Store::open(&db_path)?);
-    let api_key = match read_api_key(state_dir) {
-        Some(k) => k,
-        None if created_this_boot => "mllm-local".to_string(),
-        None => return Err(StartError::MissingCredentials),
-    };
+    let api_key = read_api_key(state_dir)?;
 
     // Spec §8: what this host publishes about its engines is what it has. There
     // is no fallback installation: a host with none refuses to boot rather than
@@ -1515,10 +1554,20 @@ async fn start_standalone_inner(
     let retirements = Arc::new(mllm_management::engines::StoreRetirements::new(
         source.clone(),
     ));
+    // Design §9: the inference listener's bind and authentication, set when
+    // the caller serves it (`App::inference_router`), for status.
+    let inference_listener =
+        Arc::new(mllm_management::inference_listener::InferenceListenerView::default());
+    let inference_listener_view = mllm_management::inference_listener::inference_listener_router(
+        mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?,
+        inference_listener.clone(),
+    );
     let management = mllm_management::lifecycle_router(management_credentials, source)
         .merge(drain)
         .merge(installation_view)
-        .merge(latency_view);
+        .merge(latency_view)
+        .merge(inference_listener_view);
     let controller =
         Arc::new(CoordinatorLifecycle::new(coordinator.commands()).with_switcher(switcher.clone()));
     let deps = mllm_router::RouterDeps {
@@ -1636,18 +1685,65 @@ async fn start_standalone_inner(
         config_notices,
         listener_migration,
         inference_bind,
+        inference_auth,
+        inference_listener,
     })
 }
 
 /// Read the generated API key from the protected credentials file (F0's
 /// fail-closed generation; the key is printed never, only used).
-fn read_api_key(state_dir: &Path) -> Option<String> {
-    let creds = std::fs::read_to_string(state_dir.join("identity").join("credentials")).ok()?;
-    creds
-        .lines()
-        .find_map(|l| l.strip_prefix("api_key: ").map(str::to_string))
+///
+/// Design §9 (T37): there is no constant key. A file that is missing,
+/// unreadable or has no non-empty `api_key` line, including one this boot
+/// just created, is [`StartError::MissingCredentials`].
+fn read_api_key(state_dir: &Path) -> Result<String, StartError> {
+    std::fs::read_to_string(state_dir.join("identity").join("credentials"))
+        .ok()
+        .and_then(|creds| {
+            creds
+                .lines()
+                .find_map(|l| l.strip_prefix("api_key: ").map(str::to_string))
+        })
+        .filter(|key| !key.trim().is_empty())
+        .ok_or(StartError::MissingCredentials)
 }
 
 pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
     Err(StructuredError::not_yet_implemented(&command.label()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T37 (design §9): there is no constant key. Freshly created credentials
+    // that cannot be read back are a start failure; readable ones give the
+    // generated key.
+    #[test]
+    fn fresh_credentials_must_be_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_api_key(dir.path()),
+            Err(StartError::MissingCredentials)
+        ));
+        assert!(mllm_config::defaults::create_standalone_credentials(dir.path()).unwrap());
+        let path = dir.path().join("identity/credentials");
+        let key = read_api_key(dir.path()).expect("the generated key");
+        assert!(!key.is_empty());
+        assert_ne!(key, "mllm-local");
+        let text = std::fs::read_to_string(&path).unwrap();
+        for corrupt in [
+            text.lines()
+                .filter(|line| !line.starts_with("api_key: "))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+            text.replace(&key, ""),
+        ] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(matches!(
+                read_api_key(dir.path()),
+                Err(StartError::MissingCredentials)
+            ));
+        }
+    }
 }

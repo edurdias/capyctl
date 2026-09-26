@@ -12,9 +12,9 @@
 //!
 //! What is accepted is exactly what the role does: the per-role state
 //! directories under the state root, the management listener on loopback at its
-//! default, the inference listener at any unicast address with a port (design
-//! §9: `0.0.0.0:8443` by default, as for a server), each with its fixed
-//! authentication, an `embedded` connection, `auto` resource values and no
+//! default with its admin token, the inference listener at any unicast
+//! address with a port (design §9: `0.0.0.0:8443` by default, as for a
+//! server) with `api_key` or the explicit `none` authentication, an `embedded` connection, `auto` resource values and no
 //! runtime profiles. A listener moves for one run through `--listen` (inference
 //! only) or `MLLM_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
@@ -40,9 +40,10 @@ use crate::error::{ConfigError, ConfigErrorCode};
 /// required (SPEC §13.3); the listener has no engine control path (ADR 0012).
 pub const DEFAULT_INFERENCE_BIND: &str = "0.0.0.0:8443";
 
-/// The standalone listeners, their default addresses and the only
-/// authentication each supports (SPEC §16.5). Management stays on loopback;
-/// inference defaults to [`DEFAULT_INFERENCE_BIND`] (design §9).
+/// The standalone listeners, their default addresses and default
+/// authentication (SPEC §16.5). Management stays on loopback with its admin
+/// token; inference defaults to [`DEFAULT_INFERENCE_BIND`] and `api_key`, and
+/// may state `none` ([`InferenceAuth`], design §9).
 pub const LISTENERS: &[(&str, &str, &str)] = &[
     ("management", "127.0.0.1:7443", "admin_token"),
     ("inference", DEFAULT_INFERENCE_BIND, "api_key"),
@@ -72,6 +73,72 @@ pub fn inference_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
             "the inference listener binds an address with a non-zero port that is not \
              multicast, e.g. 0.0.0.0:8443, 127.0.0.1:8443 or a Tailscale address",
         )
+    })
+}
+
+/// Design §9 (owner decision B): whether the inference listener requires the
+/// API key. `api_key` is the default; `none` is the operator's explicit
+/// opt-out, stated as `listeners.inference.authentication: none`, the
+/// `--no-inference-auth` flag or `MLLM_INFERENCE_AUTH=none`. Management and
+/// the server's other listeners keep their fixed authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceAuth {
+    /// SPEC §13.3 (T37): every inference route requires the bearer key.
+    ApiKey,
+    /// The router's key check is off (design §9).
+    None,
+}
+
+impl InferenceAuth {
+    /// The document spelling: `api_key` or `none`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::None => "none",
+        }
+    }
+
+    /// Parse the document spelling; anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "api_key" => Some(Self::ApiKey),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Design §9: the `authentication` of an inference `listener` block: `api_key`
+/// when unstated, else `api_key` or `none`. `path` names the field in errors.
+pub fn listener_auth(listener: &Value, path: &str) -> Result<InferenceAuth, ConfigError> {
+    match listener.get("authentication") {
+        None => Ok(InferenceAuth::ApiKey),
+        Some(value) => value
+            .as_str()
+            .and_then(InferenceAuth::parse)
+            .ok_or_else(|| {
+                refuse(
+                    path,
+                    "the inference listener's authentication is `api_key` (the default) or `none`",
+                )
+            }),
+    }
+}
+
+/// Design §9: the inference authentication of a standalone `document`:
+/// `none` when `no_auth_flag` (`--no-inference-auth`) is set, else
+/// `server.listeners.inference.authentication` (default `api_key`).
+/// `MLLM_INFERENCE_AUTH` sits between the two; the role applies it
+/// (`mllm_cli::roles::effective_inference_auth`).
+pub fn inference_auth(document: &Value, no_auth_flag: bool) -> Result<InferenceAuth, ConfigError> {
+    let stated = listener_auth(
+        &document["server"]["listeners"]["inference"],
+        "server.listeners.inference.authentication",
+    )?;
+    Ok(if no_auth_flag {
+        InferenceAuth::None
+    } else {
+        stated
     })
 }
 
@@ -233,7 +300,10 @@ pub fn check_honoured(
                     ));
                 }
             }
-            if let Some(mode) = listener.get("authentication") {
+            if name == "inference" {
+                // Design §9: `api_key` (default) or the explicit `none`.
+                listener_auth(listener, &format!("{path}.authentication"))?;
+            } else if let Some(mode) = listener.get("authentication") {
                 if mode.as_str() != Some(authentication) {
                     return Err(refuse(
                         &format!("{path}.authentication"),
@@ -501,5 +571,35 @@ mod tests {
         let mut d = generated("/s");
         d["server"]["listeners"]["management"]["bind"] = "0.0.0.0:7443".into();
         assert!(check(&d).is_err());
+    }
+
+    // T03 T37 (design §9): `authentication: none` is accepted for inference
+    // only; `--no-inference-auth` turns the key off for one run.
+    #[test]
+    fn authentication_none_is_inference_only() {
+        let mut d = generated("/s");
+        assert_eq!(inference_auth(&d, false).unwrap(), InferenceAuth::ApiKey);
+        d["server"]["listeners"]["inference"]["authentication"] = "none".into();
+        assert!(check(&d).is_ok());
+        assert_eq!(inference_auth(&d, false).unwrap(), InferenceAuth::None);
+        assert_eq!(
+            inference_auth(&generated("/s"), true).unwrap(),
+            InferenceAuth::None
+        );
+        let bare = json!({"schema_version": 1, "kind": "standalone", "name": "x"});
+        assert_eq!(inference_auth(&bare, false).unwrap(), InferenceAuth::ApiKey);
+        d["server"]["listeners"]["management"]["authentication"] = "none".into();
+        let error = check(&d).unwrap_err();
+        assert_eq!(error.path, "server.listeners.management.authentication");
+        for bad in [json!("token"), json!("None"), json!(true)] {
+            let mut d = generated("/s");
+            d["server"]["listeners"]["inference"]["authentication"] = bad.clone();
+            let error = check(&d).unwrap_err();
+            assert_eq!(
+                error.path, "server.listeners.inference.authentication",
+                "{bad}"
+            );
+            assert!(inference_auth(&d, false).is_err(), "{bad}");
+        }
     }
 }

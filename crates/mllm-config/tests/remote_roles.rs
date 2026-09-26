@@ -359,3 +359,46 @@ fn server_inference_override_keeps_the_listener_rules() {
         );
     }
 }
+
+// T03 T37 (design §9): the server's inference listener accepts
+// `authentication: none`; every other listener keeps its fixed mode.
+#[test]
+fn server_inference_authentication_may_be_none() {
+    use mllm_config::standalone::InferenceAuth;
+    let yaml = ServerConfig::template(Path::new("/home/operator/state"));
+    assert_eq!(
+        ServerConfig::parse(&yaml).unwrap().inference_auth,
+        InferenceAuth::ApiKey
+    );
+    let open = yaml.replace(
+        "\"authentication\": \"api_key\"",
+        "\"authentication\": \"none\"",
+    );
+    assert_ne!(open, yaml);
+    assert_eq!(
+        ServerConfig::parse(&open).unwrap().inference_auth,
+        InferenceAuth::None
+    );
+    for (from, to) in [
+        (
+            "\"authentication\": \"api_key\"",
+            "\"authentication\": \"token\"",
+        ),
+        (
+            "\"authentication\": \"token\"",
+            "\"authentication\": \"none\"",
+        ),
+        (
+            "\"authentication\": \"server_tls\"",
+            "\"authentication\": \"none\"",
+        ),
+        (
+            "\"authentication\": \"mutual_tls\"",
+            "\"authentication\": \"none\"",
+        ),
+    ] {
+        let doc = yaml.replace(from, to);
+        assert_ne!(doc, yaml, "{from}");
+        assert!(ServerConfig::parse(&doc).is_err(), "{from} -> {to}");
+    }
+}

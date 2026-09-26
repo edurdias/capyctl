@@ -1058,6 +1058,52 @@ fn start_server_listen_environment_and_migration() {
     );
 }
 
+/// T37 (design §9): the server's inference authentication follows the same
+/// rule: `--no-inference-auth` on a non-loopback bind prints the warning
+/// once; the document's `authentication: none` on loopback says nothing.
+#[test]
+fn start_server_warns_only_for_an_exposed_unauthenticated_listener() {
+    let (_root, state, config) = server_installation("127.0.0.1:8443");
+    std::fs::create_dir_all(state.join("migrations")).unwrap();
+    std::fs::write(state.join("migrations/inference-bind-v1"), "").unwrap();
+    let banner = |line: &str| line.contains("\"role\":\"server\"");
+    let open = format!("0.0.0.0:{}", free_port());
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--listen",
+        &open,
+        "--no-inference-auth",
+    ]);
+    let (line, said) = run_until_ready(&mut command, banner);
+    assert_eq!(server_inference(&line), open);
+    assert_eq!(
+        said.matches(&format!(
+            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+        ))
+        .count(),
+        1,
+        "{said}"
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("\"api_key\"", "\"none\"")).unwrap();
+    let loopback = format!("127.0.0.1:{}", free_port());
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--listen",
+        &loopback,
+    ]);
+    let (_, said) = run_until_ready(&mut command, banner);
+    assert!(!said.contains("WARNING"), "{said}");
+}
+
 /// T01 T03 (design §9): `--listen` replaces the inference bind for one run and
 /// wins over `MLLM_INFERENCE_ADDR`; the ready line names the address
 /// bound.
@@ -1074,6 +1120,93 @@ fn listen_moves_the_standalone_inference_listener() {
     role.signal();
     let (status, _) = role.exit(Duration::from_secs(30));
     assert!(status.success(), "{status:?}");
+}
+
+/// T37 (design §9): `--no-inference-auth` on a non-loopback bind prints the
+/// warning once, before the listener serves; requests then need no key; and
+/// `mllm status` repeats it as `inference: unauthenticated on <addr>`.
+#[test]
+fn an_unauthenticated_exposed_listener_is_announced_and_shown_in_status() {
+    let installation = Installation::new();
+    let port = free_port();
+    let open = format!("0.0.0.0:{port}");
+    let mut command = installation.command();
+    command.args([
+        "start",
+        "standalone",
+        "--listen",
+        &open,
+        "--no-inference-auth",
+    ]);
+    let (role, _) = installation.start_command(None, &mut command);
+    let stderr = role.stderr.clone();
+    // No key is needed on this run.
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    std::io::Write::write_all(
+        &mut stream,
+        b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    deploy(&installation);
+    let out = installation.cli(&["status", "deployment", "w11-model"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        shown.contains(&format!("inference: unauthenticated on {open}")),
+        "{shown}"
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+    let said = stderr_of(&stderr);
+    assert_eq!(
+        said.matches(&format!(
+            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+        ))
+        .count(),
+        1,
+        "{said}"
+    );
+    assert!(
+        said.contains("Anyone who can reach this address can use your models and GPU."),
+        "{said}"
+    );
+}
+
+/// T37 (design §9): without a key on loopback, and with the key anywhere,
+/// the role says nothing; `MLLM_INFERENCE_AUTH` turns the key off as the
+/// flag does, and a malformed value refuses the start.
+#[test]
+fn a_loopback_or_keyed_listener_is_not_announced() {
+    let installation = Installation::new();
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let mut command = installation.command();
+    command.args(["start", "standalone", "--no-inference-auth"]);
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert!(!said.contains("WARNING"), "{said}");
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_INFERENCE_AUTH", "none");
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert!(!said.contains("WARNING"), "{said}");
+    let out = output_within(
+        installation
+            .command()
+            .args(["start", "standalone"])
+            .env("MLLM_INFERENCE_AUTH", "off"),
+        REFUSAL_BOUND,
+    );
+    assert!(!out.status.success());
+    let refused = String::from_utf8_lossy(&out.stderr);
+    assert!(refused.contains("MLLM_INFERENCE_AUTH"), "{refused}");
 }
 
 /// T01: drain is action-first and names its resource; stopping a role

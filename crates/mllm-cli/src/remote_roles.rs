@@ -517,7 +517,12 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             max_requests_per_deployment: 32,
             max_buffered_bytes_total: 64 * 1024 * 1024,
         },
-        api_key: Some(credentials.api_key.clone()),
+        // Design §9: the key check is off only when the operator chose
+        // `none` for this run (document, flag or variable).
+        api_key: match config.inference_auth {
+            crate::exposure::InferenceAuth::ApiKey => Some(credentials.api_key.clone()),
+            crate::exposure::InferenceAuth::None => None,
+        },
         inflight,
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
     });
@@ -551,10 +556,28 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                 owner,
                 sessions.clone(),
             ))
-            .merge(latency_view);
+            .merge(latency_view)
+            // Design §9: the inference listener's bind and authentication.
+            .merge(
+                mllm_management::inference_listener::inference_listener_router(
+                    management_credentials(&credentials)?,
+                    {
+                        let view = Arc::new(
+                            mllm_management::inference_listener::InferenceListenerView::default(),
+                        );
+                        view.set(crate::exposure::listener_view(
+                            config.inference,
+                            config.inference_auth,
+                        ));
+                        view
+                    },
+                ),
+            );
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|_| unavailable())?;
+    // Design §9: said out loud before the listener accepts connections.
+    crate::exposure::warn_if_exposed(config.inference, config.inference_auth);
     let inference_listener = tokio::net::TcpListener::bind(config.inference)
         .await
         .map_err(|_| unavailable())?;
@@ -1047,6 +1070,10 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // Design §9: a bad `--listen` or MLLM_INFERENCE_ADDR refuses
                 // before the document is touched.
                 crate::roles::inference_override(invocation.listen)?;
+                crate::exposure::effective_inference_auth(
+                    crate::exposure::InferenceAuth::ApiKey,
+                    invocation.no_inference_auth,
+                )?;
                 if let Some(warning) =
                     crate::roles::deprecated_inference_env_warning(invocation.listen)
                 {
@@ -1077,12 +1104,18 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // server listener.
                 let address =
                     crate::roles::effective_inference_address(document_bind, invocation.listen)?;
-                let config = config.with_inference(address).map_err(|_| {
+                let mut config = config.with_inference(address).map_err(|_| {
                     error(&format!(
                         "inference address {address} collides with another server listener \
                          or is not a unicast address with a non-zero port"
                     ))
                 })?;
+                // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH >
+                // the document, by the rule the standalone role uses.
+                config.inference_auth = crate::exposure::effective_inference_auth(
+                    config.inference_auth,
+                    invocation.no_inference_auth,
+                )?;
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,

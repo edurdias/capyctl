@@ -583,3 +583,22 @@ fn listen_is_parsed_on_start_standalone_and_server() {
     assert!(parse_invocation(["mllm", "start", "host", "--listen", "0.0.0.0:1"]).is_err());
     assert!(parse_invocation(["mllm", "status", "--listen", "0.0.0.0:1"]).is_err());
 }
+
+// T01 T37 (design §9): `--no-inference-auth` turns the inference key off for
+// one run of `start standalone` and `start server`, and of no other command.
+#[test]
+fn no_inference_auth_is_parsed_on_start_standalone_and_server() {
+    let i = parse_invocation(["mllm", "start", "standalone", "--no-inference-auth"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Standalone)));
+    assert!(i.no_inference_auth);
+    let i = parse_invocation(["mllm", "start", "server", "--no-inference-auth"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Server)));
+    assert!(i.no_inference_auth);
+    assert!(
+        !parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .no_inference_auth
+    );
+    assert!(parse_invocation(["mllm", "start", "host", "--no-inference-auth"]).is_err());
+    assert!(parse_invocation(["mllm", "status", "--no-inference-auth"]).is_err());
+}

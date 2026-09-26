@@ -246,6 +246,76 @@ async fn standalone_binds_inference_on_every_interface_by_default() {
     assert!(!app.api_key().is_empty());
 }
 
+/// Serve `router` on a free loopback port and return `GET /v1/models`'s
+/// status for each `Authorization` header.
+async fn models_status(router: axum::Router, headers: &[Option<String>]) -> Vec<u16> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = reqwest::Client::new();
+    let mut statuses = Vec::new();
+    for header in headers {
+        let mut request = client.get(format!("http://{address}/v1/models"));
+        if let Some(value) = header {
+            request = request.header("authorization", value);
+        }
+        statuses.push(request.send().await.unwrap().status().as_u16());
+    }
+    server.abort();
+    statuses
+}
+
+/// T37 (design §9): a fresh installation serves only its generated
+/// per-install key; the constant `mllm-local` key is never accepted.
+#[tokio::test]
+async fn a_fresh_installation_accepts_no_constant_key() {
+    use mllm_cli::exposure::InferenceAuth;
+    let dir = safe_state_dir();
+    let app = boot(dir.path()).await;
+    assert_eq!(app.inference_auth(), InferenceAuth::ApiKey);
+    let generated = std::fs::read_to_string(dir.path().join("identity/credentials"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("api_key: "))
+        .unwrap()
+        .to_owned();
+    assert_eq!(app.api_key(), generated);
+    let router = app.inference_router("0.0.0.0:8443".parse().unwrap(), InferenceAuth::ApiKey);
+    let statuses = models_status(
+        router,
+        &[
+            None,
+            Some("Bearer mllm-local".into()),
+            Some(format!("Bearer {generated}")),
+        ],
+    )
+    .await;
+    assert_eq!(statuses, [401, 401, 200]);
+    let _ = app.shutdown().await;
+}
+
+/// T03 T37 (design §9): `listeners.inference.authentication: none` in the
+/// document turns the key off; the router then serves without a key.
+#[tokio::test]
+async fn a_document_may_turn_inference_authentication_off() {
+    use mllm_cli::exposure::InferenceAuth;
+    let dir = safe_state_dir();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("authentication: api_key"), "{text}");
+    std::fs::write(
+        &path,
+        text.replace("authentication: api_key", "authentication: none"),
+    )
+    .unwrap();
+    let app = boot(dir.path()).await;
+    assert_eq!(app.inference_auth(), InferenceAuth::None);
+    let router = app.inference_router("127.0.0.1:8443".parse().unwrap(), InferenceAuth::None);
+    assert_eq!(models_status(router, &[None]).await, [200]);
+    let _ = app.shutdown().await;
+}
+
 /// T03 (design §9): the document's inference bind is the one the role binds,
 /// for example a tailnet address. After the one-time migration has run, the
 /// old loopback default is an operator's choice and is honoured as written.

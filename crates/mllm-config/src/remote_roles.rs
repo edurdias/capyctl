@@ -14,6 +14,10 @@ pub struct ServerConfig {
     pub identity_dir: PathBuf,
     pub management: SocketAddr,
     pub inference: SocketAddr,
+    /// Design §9: `listeners.inference.authentication`, `api_key` or the
+    /// explicit `none`. `--no-inference-auth` and `MLLM_INFERENCE_AUTH`
+    /// override it for one run.
+    pub inference_auth: crate::standalone::InferenceAuth,
     pub bootstrap: SocketAddr,
     pub control: SocketAddr,
     pub bootstrap_address: String,
@@ -354,9 +358,15 @@ impl ServerConfig {
         }
         let management = listener(&v, "management", "token", true)?;
         // Design §9 (owner decision 5): the inference listener is not forced
-        // to loopback; it keeps the API key and the router's allowlist
-        // (SPEC §13.3), and engines stay on loopback (ADR 0012).
-        let inference = listener(&v, "inference", "api_key", false)?;
+        // to loopback; it keeps the API key unless the document states the
+        // explicit `none` (design §9), and the router's allowlist (SPEC
+        // §13.3); engines stay on loopback (ADR 0012).
+        let inference_auth = crate::standalone::listener_auth(
+            &v["listeners"]["inference"],
+            "listeners.inference.authentication",
+        )
+        .map_err(|_| invalid("listeners"))?;
+        let inference = listener(&v, "inference", inference_auth.as_str(), false)?;
         let bootstrap = listener(&v, "bootstrap", "server_tls", false)?;
         let control = listener(&v, "control", "mutual_tls", false)?;
         let listeners = v["listeners"]
@@ -379,6 +389,7 @@ impl ServerConfig {
             identity_dir,
             management,
             inference,
+            inference_auth,
             bootstrap,
             control,
             bootstrap_address,

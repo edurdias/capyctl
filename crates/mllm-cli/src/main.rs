@@ -75,7 +75,12 @@ fn main() -> ExitCode {
         let config = mllm_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
             std::env::var(key).ok().filter(|value| !value.is_empty())
         });
-        return run_standalone(config.as_deref(), invocation.listen, format);
+        return run_standalone(
+            config.as_deref(),
+            invocation.listen,
+            invocation.no_inference_auth,
+            format,
+        );
     }
     // ADR 0018: engine registration, on this machine, through its role's socket.
     if mllm_cli::engine::is_engine_command(&invocation.command) {
@@ -254,10 +259,16 @@ fn emit(value: &serde_json::Value, view: Option<View>, names: &HostNames) {
 
 /// SPEC §9.1 / T21 / P4: in text mode, status and inspect views warn on stderr
 /// about every deployment or host installation exposing vLLM development
-/// controls. The JSON result on stdout is unchanged.
+/// controls, and (design §9) about an inference endpoint served on a
+/// non-loopback address without the API key. The JSON result on stdout is
+/// unchanged.
 fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
     if format == OutputFormat::Text {
         for notice in output::development_controls_notices(value) {
+            eprintln!("{notice}");
+        }
+        // Design §9: status repeats the unauthenticated-exposure warning.
+        if let Some(notice) = mllm_cli::exposure::status_notice(value) {
             eprintln!("{notice}");
         }
     }
@@ -267,6 +278,7 @@ fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
 fn run_standalone(
     config: Option<&std::path::Path>,
     listen: Option<std::net::SocketAddr>,
+    no_inference_auth: bool,
     format: OutputFormat,
 ) -> ExitCode {
     let state_dir = default_state_dir();
@@ -281,7 +293,12 @@ fn run_standalone(
             return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
-    match runtime.block_on(serve_standalone(&state_dir, config, listen)) {
+    match runtime.block_on(serve_standalone(
+        &state_dir,
+        config,
+        listen,
+        no_inference_auth,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err: StructuredError = err.into();
@@ -306,8 +323,9 @@ async fn serve_standalone(
     state_dir: &std::path::Path,
     config: Option<&std::path::Path>,
     listen: Option<std::net::SocketAddr>,
+    no_inference_auth: bool,
 ) -> Result<(), roles::StartError> {
-    use mllm_cli::shutdown;
+    use mllm_cli::{exposure, shutdown};
     let bound = match config {
         Some(document) => shutdown::standalone_drain_bound_in(document),
         None => shutdown::standalone_drain_bound(state_dir),
@@ -315,6 +333,7 @@ async fn serve_standalone(
     .map_err(roles::StartError::Setting)?;
     // Checked before the boot, so a bad override refuses without side effects.
     roles::inference_override(listen)?;
+    exposure::effective_inference_auth(exposure::InferenceAuth::ApiKey, no_inference_auth)?;
     if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
         eprintln!("{warning}");
     }
@@ -323,10 +342,15 @@ async fn serve_standalone(
     let app = roles::start_standalone_from(state_dir, config).await?;
     // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document.
     let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
+    // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH > the document.
+    let inference_auth =
+        exposure::effective_inference_auth(app.inference_auth(), no_inference_auth)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
         eprintln!("warning: {notice}");
     }
+    // Design §9: said out loud before the listener accepts connections.
+    exposure::warn_if_exposed(inference_address, inference_auth);
     let listener = tokio::net::TcpListener::bind(inference_address)
         .await
         .map_err(roles::StartError::from)?;
@@ -338,7 +362,7 @@ async fn serve_standalone(
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(
         listener,
-        admission.gate(app.router()),
+        admission.gate(app.inference_router(inference_address, inference_auth)),
         stopped.clone(),
     ));
     let mut control = tokio::spawn(shutdown::serve(

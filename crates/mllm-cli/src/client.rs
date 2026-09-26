@@ -1081,6 +1081,15 @@ pub async fn execute_with_start_options(
                     view["installation"] = body["installation"].clone();
                 }
             }
+            // Design §9: the inference listener's bind and authentication,
+            // so status repeats the start warning. A server that does not
+            // report one leaves the view as it was.
+            if let Ok((status, body)) = api.exchange(Method::GET, "/inference-listener", None).await
+            {
+                if status.is_success() && body["inference_listener"].is_object() {
+                    view["inference_listener"] = body["inference_listener"].clone();
+                }
+            }
             // SPEC §17 (M80): the deployment's latency distributions (router,
             // host ingress and engine tiers). A server without the view, or an
             // id the filter would refuse, leaves the view as it was.
