@@ -1105,7 +1105,27 @@ pub async fn execute_with_start_options(
             // not report one leaves the view as it was.
             if let Ok((status, body)) = api.exchange(Method::GET, "/installation", None).await {
                 if status.is_success() && body["installation"].is_object() {
-                    view["installation"] = body["installation"].clone();
+                    // Final review M10 (found live): the installation this
+                    // deployment runs on, matched by the executable its
+                    // effective configuration names, not the host's first.
+                    let executable = match view["id"].as_str() {
+                        Some(deployment_id) => api
+                            .exchange(
+                                Method::GET,
+                                &format!("/deployments/{deployment_id}/effective-config"),
+                                None,
+                            )
+                            .await
+                            .ok()
+                            .filter(|(status, _)| status.is_success())
+                            .and_then(|(_, effective)| {
+                                effective["effective"]["profile"]["executable"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                            }),
+                        None => None,
+                    };
+                    view["installation"] = installation_of(&body, executable.as_deref());
                 }
             }
             // Design §9: the inference listener's bind and authentication,
@@ -1160,6 +1180,22 @@ pub async fn execute_with_start_options(
             "Requested management view is not implemented",
         )),
     }
+}
+
+/// Final review M10: the installation a deployment runs on, from the
+/// embedded host's `/installation` view: the one whose executable its
+/// effective configuration names, else (an older server, or an unknown
+/// executable) the view's first installation as before.
+pub fn installation_of(view: &Value, executable: Option<&str>) -> Value {
+    executable
+        .and_then(|executable| {
+            view["installations"]
+                .as_array()?
+                .iter()
+                .find(|installation| installation["executable"].as_str() == Some(executable))
+                .cloned()
+        })
+        .unwrap_or_else(|| view["installation"].clone())
 }
 
 /// A deployment document from `--file`, bounded and strictly parsed, with

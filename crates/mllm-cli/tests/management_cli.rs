@@ -269,3 +269,30 @@ fn delete_with_stop_stops_waits_and_deletes(state: &std::path::Path, id: &str) {
         .unwrap();
     assert!(!gone.status.success());
 }
+
+// T08 (final review M10, found live on the discrete-GPU laptop host): status
+// showed the host's first installation for every deployment. It shows the one
+// whose executable the deployment's effective configuration names, and falls
+// back to the first only when the server reports no match.
+#[test]
+fn status_shows_the_installation_the_deployment_runs_on() {
+    let view = serde_json::json!({
+        "installation": {"profile": "local", "executable": "/opt/vllm/bin/vllm"},
+        "installations": [
+            {"profile": "local", "executable": "/opt/vllm/bin/vllm"},
+            {"profile": "sglang-main", "executable": "/opt/sglang/bin/python3"}
+        ]
+    });
+    assert_eq!(
+        mllm_cli::client::installation_of(&view, Some("/opt/sglang/bin/python3"))["profile"],
+        "sglang-main"
+    );
+    assert_eq!(
+        mllm_cli::client::installation_of(&view, Some("/elsewhere"))["profile"],
+        "local"
+    );
+    assert_eq!(
+        mllm_cli::client::installation_of(&view, None)["profile"],
+        "local"
+    );
+}

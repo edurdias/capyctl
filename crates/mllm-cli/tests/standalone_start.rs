@@ -1087,6 +1087,10 @@ async fn arrivals_during_one_activation_join_it() {
         request.await.unwrap().expect("every arrival is served");
     }
     let starts = app.store.operations_of_kind(&id, "initialize").unwrap();
-    assert_eq!(starts.len(), 1, "one activation for every arrival: {starts:?}");
+    assert_eq!(
+        starts.len(),
+        1,
+        "one activation for every arrival: {starts:?}"
+    );
     let _ = app.shutdown().await;
 }
