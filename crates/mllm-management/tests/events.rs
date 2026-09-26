@@ -766,6 +766,11 @@ async fn every_supported_kind_projects_only_known_fields_and_wide_integer_string
             "host_resource_policy_updated",
             "operation_id,previous_revision,current_revision,ledger_epoch,session_epoch",
         ),
+        // ADR 0019: a generated policy replaced for a changed machine shape.
+        (
+            "host_resource_policy_migrated",
+            "previous_revision,current_revision,ledger_epoch,session_epoch",
+        ),
     ];
     for (kind, fields) in cases {
         let source = fake(move |_, _| {
@@ -1073,6 +1078,11 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             serde_json::json!({"version":"1","operation_id":OP,
             "previous_revision":1,"current_revision":2,"ledger_epoch":2,"session_epoch":1}),
             (None, Some(OP.to_owned())),
+        ),
+        "host_resource_policy_migrated" => (
+            serde_json::json!({"version":"1","previous_revision":1,
+            "current_revision":2,"ledger_epoch":2,"session_epoch":1}),
+            (None, None),
         ),
         "installation_drift_flagged" => (
             serde_json::json!({"version":"1","host_id":"host-a",

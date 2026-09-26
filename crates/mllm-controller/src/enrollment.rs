@@ -62,8 +62,8 @@ impl EnrollmentAuthority {
         &self,
         host: &str,
         inventory: &mllm_protocol::pb::ReportInventory,
-    ) -> Result<(), EnrollmentError> {
-        crate::host_publication::publish(&self.state, host, inventory).map_err(|_| EnrollmentError)
+    ) -> Result<(), crate::host_publication::PublicationError> {
+        crate::host_publication::publish(&self.state, host, inventory)
     }
     /// ADR 0018 §3: a live re-publication from a reconciled session. `Err`
     /// is the operator-safe reason; the previous approved document stays.

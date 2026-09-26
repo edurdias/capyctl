@@ -83,6 +83,17 @@ pub enum ResourcePolicyError {
     CorruptStoredPolicy,
     #[error("legacy reservations require reconciliation")]
     NeedsReconciliation,
+    /// ADR 0019: a hand-written host policy whose domains differ from the
+    /// ones the server recorded for the host. mllm never replaces a policy it
+    /// did not generate, so the operator is told what differs and what to do.
+    #[error(
+        "the host's resource policy declares domains [{declared}], but the server recorded \
+         [{recorded}] for this host; mllm does not replace a hand-written policy. Restore the \
+         recorded domains in the host document, or stop every deployment on this host and \
+         enroll the machine again as a new host (`mllm revoke host`, then `mllm invite host` \
+         with a new name and `mllm join host`)"
+    )]
+    ShapeChanged { recorded: String, declared: String },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
 }
@@ -710,6 +721,25 @@ impl crate::Store {
         }
         if let Some(current) = read_selected_policy(&tx, &context.host_id)? {
             if current.context != context {
+                // ADR 0019: an enrolled host's policy is hand-written; name
+                // the difference rather than a bare revision conflict.
+                if let Some((host_id, _)) = remote {
+                    let prefix = crate::resource_namespace::ledger_key(host_id, "domain", "");
+                    let local_ids = |ids: &BTreeSet<String>| {
+                        ids.iter()
+                            .map(|id| id.strip_prefix(&prefix).unwrap_or(id).to_owned())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    if current.context.domain_ids != context.domain_ids
+                        || current.context.device_domains != context.device_domains
+                    {
+                        return Err(ResourcePolicyError::ShapeChanged {
+                            recorded: local_ids(&current.context.domain_ids),
+                            declared: local_ids(&context.domain_ids),
+                        });
+                    }
+                }
                 return Err(ResourcePolicyError::RevisionConflict);
             }
             validate_observations(
@@ -1056,5 +1086,7 @@ impl From<StoredReceipt> for ResourcePolicyUpdate {
     }
 }
 
+mod migration;
+pub use migration::{GeneratedPolicyMigration, PreviousPolicyCharge, ResolvedElsewhere};
 #[cfg(test)]
 mod tests;

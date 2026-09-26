@@ -292,6 +292,34 @@ Engine listeners stay on loopback with per-launch keys and mllm's key-guard midd
 the allowlisted inference routes. The router's constant-time key comparison, method and
 path allowlist, header stripping and queue bounds apply unchanged on every bind.
 
+### 10a. Upgrading a generated policy whose machine changed shape
+
+Decided 2026-09-25. Standalone generates its host's resource policy from the
+machine it observes. A release that reads the machine differently (0.1.0-rc.4 recorded a
+discrete-GPU machine as one `unified` domain) must not refuse to start. On the first start
+that observes a different shape (or another engine port range), the generated policy is
+replaced, under the accounting rules every other change follows:
+
+- every deployment still holding memory under the previous policy is stopped by the
+  ordinary Stop first; only its verified cleanup releases the charge. Nothing is released on
+  the observation alone. A Stop that cannot prove its engine gone within the drain bound
+  plus one minute keeps the reservation, and the start is refused naming the deployment
+  (the next start retries);
+- the policy, the host's ledger keys and the ledger epoch change in one transaction, journaled
+  as `host_resource_policy_migrated`;
+- each deployment resolved against the previous policy is accepted again from its stored
+  document as a new revision for the new shape; one that does not resolve there (for
+  example a file that names the `unified` domain) is listed with the instruction to deploy
+  it again;
+- the role prints one notice for the migration; the next start finds the policy current.
+
+No running engine is kept across the change: every frozen revision names the policy
+context it was resolved against, so an engine charged under the old context could no
+longer be parked or stopped through it. An enrolled host's policy is written by its
+operator and is never replaced: a changed shape is refused at publication with the recorded
+and declared domains and what to do (restore the recorded domains, or stop everything on the
+host and enroll the machine again as a new host).
+
 ### 11. Closed codes
 
 | Code | Where | Meaning | CLI exit |

@@ -88,6 +88,31 @@ pub async fn try_boot_discrete(
     try_boot_discrete_with_kv(state_dir, gpu, models_root, deep_park, None).await
 }
 
+/// As [`try_boot_discrete`], on the engine port range `ports`: a test that
+/// restarts the role passes the same range again (it is part of the
+/// generated policy).
+pub async fn try_boot_discrete_on(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    ports: (u16, u16),
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports,
+            deep_park: true,
+            members: None,
+            models_root: Some(models_root.to_path_buf()),
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+    )
+    .await
+}
+
 /// As [`try_boot_discrete`], with the KV cache the operator stated
 /// (`MLLM_KV_CACHE_BYTES`) when `kv_cache` is `Some`.
 pub async fn try_boot_discrete_with_kv(

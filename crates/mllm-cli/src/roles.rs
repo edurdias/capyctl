@@ -1806,6 +1806,22 @@ async fn start_standalone_inner(
         )
         .map_err(|_| StartError::Deploy("management configuration unavailable".into()))?,
     );
+    // ADR 0019 (upgrade of a generated policy): a machine whose shape changed
+    // since the stored policy was generated gets its policy replaced here,
+    // before it is published; charged engines are stopped with verified
+    // cleanup first and deployments are re-sized for the new shape.
+    let migration_notices = crate::policy_migration::migrate(
+        &coordinator.commands(),
+        configuration.as_ref(),
+        &HostMemoryObservation::with_domains(crate::host_observation::observed_domains(
+            &declared_host.domains,
+        ))
+        .with_memory_reader(memory.clone())
+        .with_gpu_sampler(gpu.clone()),
+        &declared_host,
+        switch_drain_timeout + Duration::from_secs(60),
+    )
+    .await?;
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
     // and the operator's `start --evict`, so both take the same host turns.
     let switcher = Arc::new(mllm_controller::switching::Switcher::new(
@@ -1934,6 +1950,7 @@ async fn start_standalone_inner(
     // role, no engines file) is reported and the role runs without it, so
     // `engine add` answers `agent_unreachable` and takes effect at start.
     let mut config_notices = config_notices;
+    config_notices.extend(migration_notices);
     match &engines {
         None => config_notices.push(
             "engine control socket not served: neither XDG_CONFIG_HOME nor HOME is set, \

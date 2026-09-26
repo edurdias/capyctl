@@ -1258,7 +1258,11 @@ impl AgentSessions {
                             After::Publish(inventory) => {
                                 // SPEC §§4.2, 13: a refused publication ends the session with a
                                 // named reason instead of a generic denial.
-                                self.authority.publish_inventory(&host, &inventory).map_err(|_| Status::failed_precondition("host inventory publication refused"))?;
+                                self.authority.publish_inventory(&host, &inventory).map_err(|refusal| Status::failed_precondition(match refusal.reason {
+                                    // ADR 0019: a changed hand-written policy says what to do.
+                                    Some(reason) => format!("host inventory publication refused: {reason}"),
+                                    None => "host inventory publication refused".to_owned(),
+                                }))?;
                                 let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }

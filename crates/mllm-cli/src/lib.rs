@@ -11,6 +11,7 @@ pub mod grammar;
 pub mod host_observation;
 pub mod managed_runtime;
 pub mod output;
+pub mod policy_migration;
 // SPEC §6.3, ADR 0008: `mllm prune sources`.
 pub mod prune;
 pub mod remote_roles;

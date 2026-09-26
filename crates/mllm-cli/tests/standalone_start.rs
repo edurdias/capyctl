@@ -857,3 +857,156 @@ async fn a_discrete_standalone_treats_a_remote_source_as_a_unified_one_does() {
         .expect("a remote source is accepted on a unified host");
     let _ = unified.shutdown().await;
 }
+
+/// ADR 0019 (upgrade of a generated policy), found live on the discrete-GPU
+/// laptop host: 0.1.0-rc.4 recorded that machine as one `unified` domain, and
+/// the upgraded standalone refused to start (`resource policy revision
+/// conflict`). The generated policy is replaced once, with a notice; a
+/// deployment whose stored document resolves on the new shape is re-sized for
+/// it, one that states the old domain is named with what to do; the second
+/// start is quiet.
+// T26 T13
+#[tokio::test]
+async fn an_upgraded_standalone_migrates_its_generated_policy_to_the_discrete_shape() {
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(2 << 30);
+    let ports = support::engine_ports();
+    // The first release saw no discrete card: one `unified` domain.
+    let app = support::try_boot_discrete_on(dir.path(), || None, store.path(), ports)
+        .await
+        .expect("the unified boot");
+    let name = app.host_document()["name"].as_str().unwrap().to_owned();
+    assert_eq!(
+        app.store
+            .resource_policy(&name)
+            .unwrap()
+            .unwrap()
+            .context
+            .domain_ids
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["unified"]
+    );
+    let templated = app
+        .deploy("templated", ModelSource::Local { path: "m".into() })
+        .expect("the unified template deploys");
+    let minimal = serde_json::json!({"name": "minimal", "engine": "local", "model": "m"});
+    let minimal = app
+        .controller
+        .create_configuration(
+            "standalone",
+            "minimal",
+            &serde_json::json!({ "config": minimal }).to_string(),
+            &app.host_document(),
+        )
+        .expect("a minimal document deploys")
+        .deployment_id;
+    let _ = app.shutdown().await;
+
+    let app = support::try_boot_discrete_on(dir.path(), discrete_card, store.path(), ports)
+        .await
+        .expect("the upgraded discrete boot migrates instead of refusing");
+    let policy = app.store.resource_policy(&name).unwrap().unwrap();
+    assert_eq!(
+        policy.context.domain_ids.iter().collect::<Vec<_>>(),
+        ["gpu0", "system"]
+    );
+    assert_eq!(policy.revision, 2);
+    let notices = app.config_notices().join("\n");
+    assert!(
+        notices.contains("resource policy mllm generated for it was replaced"),
+        "{notices}"
+    );
+    assert!(
+        notices.contains("[unified] are now [gpu0, system]"),
+        "{notices}"
+    );
+    assert!(
+        notices.contains("re-sized for this machine's resource policy: minimal"),
+        "{notices}"
+    );
+    assert!(notices.contains("mllm deploy --file"), "{notices}");
+    assert!(notices.contains("templated"), "{notices}");
+    let effective = app
+        .store
+        .effective_configuration(&minimal)
+        .unwrap()
+        .unwrap()
+        .effective;
+    assert_eq!(
+        effective["resources"]["ready"]["allocations"][0]["domain"], "gpu0",
+        "{effective}"
+    );
+    assert_eq!(app.store.current_revision(&templated).unwrap(), Some(1));
+    let _ = app.shutdown().await;
+
+    let app = support::try_boot_discrete_on(dir.path(), discrete_card, store.path(), ports)
+        .await
+        .expect("the next start");
+    let notices = app.config_notices().join("\n");
+    assert!(
+        !notices.contains("was replaced"),
+        "one-time notice: {notices}"
+    );
+    assert_eq!(
+        app.store.resource_policy(&name).unwrap().unwrap().revision,
+        2
+    );
+    let _ = app.shutdown().await;
+}
+
+/// ADR 0019, SPEC §7, §13.2: an engine left Ready under the previous
+/// generated policy holds memory the new shape cannot account for. The
+/// upgraded start stops it with the ordinary Stop (verified cleanup releases
+/// its charge) before it replaces the policy; nothing is released on the
+/// observation alone.
+// T26 T13 T33
+#[tokio::test]
+async fn an_engine_charged_under_the_previous_policy_is_stopped_before_the_migration() {
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(2 << 30);
+    let ports = support::engine_ports();
+    let app = support::try_boot_discrete_on(dir.path(), || None, store.path(), ports)
+        .await
+        .expect("the unified boot");
+    let id = app
+        .deploy("held", ModelSource::Local { path: "m".into() })
+        .unwrap();
+    let op = app
+        .controller
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.controller.wait_terminal(&op).await.unwrap(),
+        mllm_domain::LifecycleState::Ready
+    );
+    assert_eq!(app.store.resource_snapshot().unwrap().owners.len(), 1);
+    let _ = app.shutdown().await;
+
+    let app = support::try_boot_discrete_on(dir.path(), discrete_card, store.path(), ports)
+        .await
+        .expect("the upgraded boot stops the engine, then migrates");
+    let notices = app.config_notices().join("\n");
+    assert!(
+        notices.contains("stopped with verified cleanup first: held"),
+        "{notices}"
+    );
+    assert!(
+        app.store.resource_snapshot().unwrap().owners.is_empty(),
+        "released by the Stop's verified cleanup"
+    );
+    let name = app.host_document()["name"].as_str().unwrap().to_owned();
+    assert_eq!(
+        app.store
+            .resource_policy(&name)
+            .unwrap()
+            .unwrap()
+            .context
+            .domain_ids
+            .iter()
+            .collect::<Vec<_>>(),
+        ["gpu0", "system"]
+    );
+    let _ = app.shutdown().await;
+}

@@ -132,6 +132,16 @@ pub(crate) enum EventMetadata {
         ledger_epoch: u64,
         session_epoch: i64,
     },
+    /// ADR 0019: the embedded host's generated policy was replaced because
+    /// the machine it describes changed shape, after every owner charged
+    /// under the previous policy was released with verified cleanup.
+    #[serde(rename = "1")]
+    HostResourcePolicyMigrated {
+        previous_revision: i64,
+        current_revision: i64,
+        ledger_epoch: u64,
+        session_epoch: i64,
+    },
     /// ADR 0008 (owner decision 2026-09-23): a host reported that a launch
     /// measured one of its engine installations to a different fingerprint
     /// than the one registered at agent start. Evidence only; whether the
@@ -311,6 +321,7 @@ impl EventMetadata {
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
             Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
+            Self::HostResourcePolicyMigrated { .. } => "host_resource_policy_migrated",
             Self::InstallationDriftFlagged { .. } => "installation_drift_flagged",
             Self::HostRevoked { .. } => "host_revoked",
             Self::HostRecoveryInvited { .. } => "host_recovery_invited",
@@ -359,7 +370,8 @@ impl EventMetadata {
                 ..
             } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),
-            Self::HostResourcePolicyBootstrapped { .. } => (None, None),
+            Self::HostResourcePolicyBootstrapped { .. }
+            | Self::HostResourcePolicyMigrated { .. } => (None, None),
             Self::HostResourcePolicyUpdated { operation_id, .. } => {
                 (None, Some(operation_id.as_str()))
             }
