@@ -999,6 +999,20 @@ async fn serve_host(
     );
     let gates = ingress.clone();
     let router = admission.gate(ingress.router());
+    // Design §9 ("Where the key is"): ready, said as `start standalone` says
+    // it, naming the owner-only identity file and never its contents.
+    println!(
+        "host ready (state_dir {}; ingress listener {}; credentials {})",
+        config.state_dir.display(),
+        config
+            .ingress
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |settings| settings.bind.to_string()),
+        config
+            .identity_dir
+            .join(mllm_agent::enrollment::HOST_FILE)
+            .display()
+    );
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
             Some(listener) => crate::shutdown::serve(listener, router, stopped)

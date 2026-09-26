@@ -933,3 +933,67 @@ async fn a_stopped_sglang_launch_leaves_no_rendezvous_directory() {
     );
     assert!(fixture.root.path().join("state/rendezvous").is_dir());
 }
+
+/// SPEC §§4.2, 13 / ADR 0019: a new session's first inventory carries a
+/// device sample, even when the collector has not finished its first run.
+/// Publication refuses an unobserved device domain, so an inventory that
+/// raced the collector ended every fresh discrete host's first session.
+// T26 T33
+#[test]
+fn a_session_first_inventory_waits_for_the_device_sample() {
+    let fixture = Fixture::new("1GiB");
+    let mut config = fixture.config.clone();
+    config.document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "1GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    config.document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let path = fixture.root.path();
+    let journal = HostJournal::open(&private(&path.join("journal")), "controller", "host").unwrap();
+    let unknown = |domain: &str| pb::DomainObservation {
+        domain_id: domain.into(),
+        kind: "system".into(),
+        observed_bytes: -1,
+        capacity_bytes: -1,
+        available_bytes: -1,
+        ..Default::default()
+    };
+    let sample = mllm_agent::gpu_memory::parse_query_gpu(
+        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 1536, 14840\n",
+        mllm_protocol::now_unix_ms(),
+    );
+    // A collector slower than the session's connect.
+    let slow: Arc<mllm_agent::gpu_memory::GpuSampler> = Arc::new(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        sample.clone()
+    });
+    let execution = NativeHostExecution::new(
+        journal,
+        Ingress::new().unwrap(),
+        IngressIdentities::new(
+            IdentityDirectory::open(&private(&path.join("ingress-identity"))).unwrap(),
+        ),
+        config.clone(),
+        "host".into(),
+        "controller".into(),
+        config.runtime_dir.clone(),
+        private(&path.join("logs")),
+        pb::ReportInventory {
+            domains: vec![unknown("gpu0"), unknown("system")],
+            ..Default::default()
+        },
+    )
+    .with_gpu_sampler(slow);
+    let inventory = mllm_agent::session::SessionExecution::session_inventory(&*execution)
+        .expect("a system and a device domain are measured");
+    let gpu = inventory
+        .domains
+        .iter()
+        .find(|d| d.domain_id == "gpu0")
+        .unwrap();
+    assert_eq!(gpu.capacity_bytes, 16376 << 20, "{gpu:?}");
+    assert_eq!(gpu.available_bytes, 14840 << 20);
+}
