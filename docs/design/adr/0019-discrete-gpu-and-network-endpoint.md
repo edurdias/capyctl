@@ -323,8 +323,8 @@ replaced, under the accounting rules every other change follows:
   as `host_resource_policy_migrated`;
 - each deployment resolved against the previous policy is accepted again from its stored
   document as a new revision for the new shape; one that does not resolve there (for
-  example a file that names the `unified` domain) is listed with the instruction to deploy
-  it again;
+  example a file that names the `unified` domain), or that has no stored document, is listed
+  with the instruction to deploy it again;
 - the role prints one notice for the migration; the next start finds the policy current.
 
 No running engine is kept across the change: every frozen revision names the policy

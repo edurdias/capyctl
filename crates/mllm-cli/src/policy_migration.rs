@@ -205,8 +205,14 @@ fn resize(
             .deployments_resolved_elsewhere(host)
             .map_err(|error| failed(format!("resource policy migration: {error}")))?
     };
-    let (mut resized, mut refused) = (Vec::new(), Vec::new());
+    let (mut resized, mut refused, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for deployment in stale {
+        // Re-review: a revision without a stored document cannot be accepted
+        // again; it is named, never passed over silently.
+        let Some(config) = deployment.config else {
+            skipped.push(deployment.name);
+            continue;
+        };
         let key = format!(
             "policy-migration-resize-{}-{}",
             deployment.deployment_id, deployment.revision
@@ -216,7 +222,7 @@ fn resize(
             ConfigurationCommand::Replace {
                 deployment_id: deployment.deployment_id.clone(),
                 expected_revision: deployment.revision,
-                config_json: deployment.config.to_string(),
+                config_json: config.to_string(),
             },
         ) {
             Ok(_) => resized.push(deployment.name),
@@ -236,6 +242,14 @@ fn resize(
              machine as written, so they cannot start; deploy each again with a file for this \
              machine (`mllm deploy --file`): {}",
             refused.join(", ")
+        ));
+    }
+    if !skipped.is_empty() {
+        notices.push(format!(
+            "these deployments were sized for another memory shape and have no stored \
+             document to re-size them from, so they cannot start; deploy each again with a \
+             file for this machine (`mllm deploy --file`): {}",
+            skipped.join(", ")
         ));
     }
     Ok(notices)

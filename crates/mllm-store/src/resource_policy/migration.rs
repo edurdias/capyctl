@@ -64,8 +64,10 @@ pub struct ResolvedElsewhere {
     pub name: String,
     pub revision: i64,
     /// The stored deployment document (its instance count restored), to be
-    /// accepted again as a new revision against the current host.
-    pub config: serde_json::Value,
+    /// accepted again as a new revision against the current host; `None` for
+    /// a revision that has no stored document (accepted before documents
+    /// were kept), which cannot be re-sized and is named to the operator.
+    pub config: Option<serde_json::Value>,
 }
 
 /// A deployment row read for [`crate::Store::deployments_resolved_elsewhere`]:
@@ -267,18 +269,22 @@ impl crate::Store {
             {
                 continue;
             }
-            let Some(source) = source else {
-                continue;
-            };
-            let mut config: serde_json::Value = serde_json::from_str(&source)
-                .map_err(|_| ResourcePolicyError::CorruptStoredPolicy)?;
-            // ADR 0013 §2: the stored source is the per-host recipe, which
-            // drops the deployment-level instance count; restore it.
-            if let (Some(object), Some(count)) = (config.as_object_mut(), instances) {
-                if count > 1 {
-                    object.insert("instances".into(), count.into());
+            let config = match source {
+                None => None,
+                Some(source) => {
+                    let mut config: serde_json::Value = serde_json::from_str(&source)
+                        .map_err(|_| ResourcePolicyError::CorruptStoredPolicy)?;
+                    // ADR 0013 §2: the stored source is the per-host recipe,
+                    // which drops the deployment-level instance count;
+                    // restore it.
+                    if let (Some(object), Some(count)) = (config.as_object_mut(), instances) {
+                        if count > 1 {
+                            object.insert("instances".into(), count.into());
+                        }
+                    }
+                    Some(config)
                 }
-            }
+            };
             found.push(ResolvedElsewhere {
                 deployment_id,
                 name,

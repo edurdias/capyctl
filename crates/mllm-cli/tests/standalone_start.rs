@@ -906,7 +906,24 @@ async fn an_upgraded_standalone_migrates_its_generated_policy_to_the_discrete_sh
         )
         .expect("a minimal document deploys")
         .deployment_id;
+    // Re-review: a revision accepted before documents were kept has none.
+    let sourceless = app
+        .deploy("sourceless", ModelSource::Local { path: "m".into() })
+        .unwrap();
     let _ = app.shutdown().await;
+    // (The test crate has no SQLite binding; Python's does the one edit.)
+    let removed = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             c.execute('DELETE FROM managed_configuration_sources WHERE deployment_id=?', \
+             (sys.argv[2],)); c.commit()",
+        ])
+        .arg(dir.path().join("server/srv.sqlite3"))
+        .arg(&sourceless)
+        .status()
+        .unwrap();
+    assert!(removed.success());
 
     let app = support::try_boot_discrete_on(dir.path(), discrete_card, store.path(), ports)
         .await
@@ -932,6 +949,11 @@ async fn an_upgraded_standalone_migrates_its_generated_policy_to_the_discrete_sh
     );
     assert!(notices.contains("mllm deploy --file"), "{notices}");
     assert!(notices.contains("templated"), "{notices}");
+    assert!(
+        notices.contains("no stored document to re-size them from")
+            && notices.contains("sourceless"),
+        "{notices}"
+    );
     let effective = app
         .store
         .effective_configuration(&minimal)
