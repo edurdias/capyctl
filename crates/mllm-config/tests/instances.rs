@@ -179,7 +179,12 @@ fn an_unnamed_claim_never_takes_a_device_named_by_another_claim() {
     let host = json!({"resource_policy": {"devices": {"gpu0": {}, "gpu1": {}}}});
     let deployment = json!({"devices": [{"id": "gpu0"}, {}]});
     let assigned = mllm_config::instances::assign_devices(&deployment, &host).unwrap();
-    assert_eq!(assigned["devices"], json!([{"id": "gpu0"}, {"id": "gpu1"}]));
+    // The named claim takes the host's sharing for its device (the short pin
+    // form, final review I9); the host states none, so exclusive.
+    assert_eq!(
+        assigned["devices"],
+        json!([{"id": "gpu0", "sharing": "exclusive"}, {"id": "gpu1"}])
+    );
     // With only the named device on the host, the unnamed claim has none.
     let host = json!({"resource_policy": {"devices": {"gpu0": {}}}});
     assert!(mllm_config::instances::assign_devices(&deployment, &host).is_err());
