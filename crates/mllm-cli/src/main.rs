@@ -204,7 +204,18 @@ fn main() -> ExitCode {
     }
     // SPEC §14 / §15.3: offline validation; no runtime, state, or network.
     if let Command::Validate { file, host, sets } = &invocation.command {
-        return match mllm_cli::validate::validate_config_with(file, host.as_deref(), sets) {
+        // The state root a start would use, when this invocation names one.
+        let named_root = invocation.state_dir.clone().or_else(|| {
+            std::env::var_os("MLLM_STATE_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+        return match mllm_cli::validate::validate_config_at(
+            file,
+            host.as_deref(),
+            sets,
+            named_root.as_deref(),
+        ) {
             Ok(value) => {
                 println!("{value}");
                 ExitCode::SUCCESS

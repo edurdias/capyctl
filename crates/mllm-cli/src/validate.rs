@@ -42,6 +42,20 @@ pub fn validate_config_with(
     host: Option<&Path>,
     sets: &[String],
 ) -> Result<Value, StructuredError> {
+    validate_config_at(file, host, sets, None)
+}
+
+/// As [`validate_config_with`], with the state root a start would use when
+/// the invocation names one (`--state-dir` or `MLLM_STATE_DIR`). A standalone
+/// document's state directories are checked against it; without one, against
+/// the document's own `state_dir`, else the directory its `server.state_dir`
+/// names, else the document's directory.
+pub fn validate_config_at(
+    file: &Path,
+    host: Option<&Path>,
+    sets: &[String],
+    state_root: Option<&Path>,
+) -> Result<Value, StructuredError> {
     // Owner decision 2026-09-25: a `~/` model path means this user's home, as
     // `deploy model --file` reads it.
     let text = crate::deployment_file::with_home_expanded(&read(file)?);
@@ -71,6 +85,7 @@ pub fn validate_config_with(
             kind.as_str()
         )));
     }
+    let mut standalone_ignored: Vec<String> = Vec::new();
     let resolved_against = match kind {
         ConfigKind::Server => {
             mllm_config::remote_roles::ServerConfig::parse(&overridden(&text)?)
@@ -87,6 +102,36 @@ pub fn validate_config_with(
                 parse_strict(kind, &overridden(&text)?).map_err(|e| named(file, Some(kind), &e))?;
             mllm_config::remote_roles::drain_timeout(&document)
                 .map_err(|e| named(file, Some(kind), &e))?;
+            // Final review I10: the checks `start standalone` runs before any
+            // side effect (listeners, management on loopback, state
+            // directories, TLS, model and engine settings), so a document this
+            // command accepts is not refused by the start.
+            let config_dir = crate::engine::absolute(file.parent().unwrap_or(Path::new(".")));
+            let root = state_root.map(Path::to_path_buf).unwrap_or_else(|| {
+                let resolve = |dir: &str| {
+                    let dir = Path::new(dir);
+                    if dir.is_relative() {
+                        config_dir.join(dir)
+                    } else {
+                        dir.to_path_buf()
+                    }
+                };
+                document["state_dir"]
+                    .as_str()
+                    .map(resolve)
+                    .or_else(|| {
+                        document["server"]["state_dir"]
+                            .as_str()
+                            .map(resolve)
+                            .and_then(|dir| dir.parent().map(Path::to_path_buf))
+                    })
+                    .unwrap_or_else(|| config_dir.clone())
+            });
+            let ignored = mllm_config::standalone::check_honoured(&document, &config_dir, &root)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
+            if !ignored.is_empty() {
+                standalone_ignored = ignored.iter().map(ToString::to_string).collect();
+            }
             Value::Null
         }
         // ADR 0018 §2: `engines.yaml` validates like any other document kind.
@@ -205,7 +250,7 @@ pub fn validate_config_with(
                     );
                     let (effective, provisional) = resolve_for_acceptance(&source, &host_document)
                         .map_err(|e| named(file, Some(kind), &e))?;
-                    return Ok(json!({
+                    let mut out = json!({
                         "valid": true,
                         "kind": kind.as_str(),
                         "file": file.display().to_string(),
@@ -242,7 +287,11 @@ pub fn validate_config_with(
                             // again from its own copy at launch).
                             "context": mllm_config::context_fit::fit_for_effective(&effective),
                         },
-                    }));
+                    });
+                    if provisional {
+                        unknown_until_measured(&mut out["effective"], &effective);
+                    }
+                    return Ok(out);
                 }
             }
         }
@@ -256,7 +305,45 @@ pub fn validate_config_with(
     if !applied.is_empty() {
         out["overrides"] = Value::Array(applied);
     }
+    if !standalone_ignored.is_empty() {
+        out["ignored"] = json!(standalone_ignored);
+    }
     Ok(out)
+}
+
+/// Final review I10 (ADR 0014 §5, §7): a provisional resolution is sized
+/// with zero weights, a placeholder nothing may reserve. Offline validation
+/// does not know the weights, so every figure derived from them is reported
+/// as unknown rather than rendered from zero, and a residency mllm would
+/// choose from the weights (a `host_backed` copy of zero bytes) is not
+/// claimed. A declared value is still shown.
+fn unknown_until_measured(
+    view: &mut Value,
+    effective: &mllm_config::effective::EffectiveDeployment,
+) {
+    const UNKNOWN: &str = "unknown until the checkpoint is measured (after deploy)";
+    let provenance = serde_json::to_value(&effective.engine_config)
+        .ok()
+        .map(|config| config["provenance"].clone())
+        .unwrap_or(Value::Null);
+    // Provenance names only what mllm derived or defaulted.
+    let derived = |field: &str| provenance.get(field).is_some();
+    let memory = &mut view["memory"];
+    if derived("memory.request") {
+        memory["request_bytes"] = json!(UNKNOWN);
+    }
+    if derived("memory.startup") {
+        memory["startup_bytes"] = json!(UNKNOWN);
+    }
+    memory["weights_bytes"] = json!(UNKNOWN);
+    for field in ["resources", "startup", "context", "timeouts"] {
+        view[field] = json!(UNKNOWN);
+    }
+    // On a discrete host the tier is chosen from the weights (whether their
+    // host-RAM copy fits); elsewhere it does not depend on them.
+    if derived("residency") && effective.ready_device_allocation().is_some() {
+        view["residency"] = json!(UNKNOWN);
+    }
 }
 
 /// SPEC §15.3: the deploy checks that need the server's live state, which an
