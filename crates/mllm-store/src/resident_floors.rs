@@ -12,14 +12,17 @@
 //! recorded, beside the same availability sample, capped at the owner's
 //! reservation. Only a Ready owner with no lifecycle run in flight is
 //! credited: its footprint is settled, so the sample reflects it, and a
-//! parked or transitioning owner keeps its full charge. The candidate is
+//! transitioning owner keeps its full charge. A settled parked owner whose
+//! processes are sampled alive is credited what they hold on a discrete
+//! host's `device` and `distinct` domains; it keeps its full charge on a
+//! `unified` domain. The candidate is
 //! never credited. A domain whose floors would exceed the memory in use
 //! gets none (fail closed), as does anything without a sample.
 //!
 //! ADR 0019: a discrete host holds an engine's weights in a device domain and
 //! its host pages in a system domain, so each allocation of a footprint is
 //! credited from the figure sampled for its own domain's kind: GPU bytes on a
-//! `device` domain, anonymous pages on a `distinct` one, their sum on a
+//! `device` domain, anonymous and shared pages on a `distinct` one, their sum on a
 //! `unified` one. Skipping a multi-domain owner would bring back the double
 //! counting of M33 on every discrete host.
 use std::collections::BTreeMap;
@@ -80,7 +83,7 @@ pub(crate) fn resident_floors(
         .prepare(
             "SELECT b.deployment_id,b.instance_index,b.identities_json FROM runtime_bindings b
                JOIN deployment_instances i ON i.deployment_id=b.deployment_id AND i.instance_index=b.instance_index
-              WHERE b.state='live' AND i.observed_state='ready'
+              WHERE b.state='live' AND i.observed_state IN ('ready','parked')
                 AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id
                        AND r.instance_index=i.instance_index AND r.state IN ('queued','running','uncertain'))
               ORDER BY b.deployment_id,b.instance_index",
@@ -96,9 +99,16 @@ pub(crate) fn resident_floors(
         let Some(footprint) = scoped.owners.get(&owner) else {
             continue;
         };
-        if footprint.phase != ResourcePhase::Ready {
-            continue;
-        }
+        // Found live on a 16 GB discrete GPU: a parked engine's residue on
+        // the card and its host_backed copy in host RAM are in use too, and
+        // charging them again stopped every model parked beside a start. A
+        // settled park is credited on `device` and `distinct` domains only; a
+        // `unified` domain keeps the parked charge (ADR 0007 unchanged).
+        let parked = match footprint.phase {
+            ResourcePhase::Ready => false,
+            ResourcePhase::Parked => true,
+            _ => continue,
+        };
         let Ok(identities) = serde_json::from_str::<Vec<Identity>>(&identities) else {
             continue;
         };
@@ -120,6 +130,9 @@ pub(crate) fn resident_floors(
             let Some(&kind) = kinds.get(&allocation.domain) else {
                 continue;
             };
+            if parked && kind == DomainMemory::Unified {
+                continue;
+            }
             let resident = processes
                 .iter()
                 .try_fold(0_i64, |sum, p| sum.checked_add(credited_bytes(p, kind)));
@@ -146,4 +159,52 @@ pub(crate) fn resident_floors(
         }
     }
     Ok(floors)
+}
+
+/// A park's or a wake's own charge as a floor (found live on a 16 GB discrete
+/// GPU): the memory an owner holds is already in use, so the host's free
+/// memory does not cover it a second time. The M27 rule skips the free-memory
+/// check only when a transition adds nothing; a host_backed park adds the
+/// weights copy on the system domain while keeping its GPU charge, and without
+/// this its whole footprint was charged against the card's free memory again,
+/// as was a wake's parked residue. Each held allocation on a `device` or
+/// `distinct` domain is credited, capped at what the domain has in use beside
+/// the floors already credited there, so the transition is charged only what
+/// it adds. A `unified` domain is left exactly as it was (ADR 0007).
+pub(crate) fn credit_own_charge(
+    floors: &mut Vec<ResidentFloor>,
+    owner: &str,
+    held: &mllm_domain::resources::PhaseFootprint,
+    observations: &[MemoryObservation],
+    kinds: &BTreeMap<String, DomainMemory>,
+) {
+    for allocation in &held.allocations {
+        if !matches!(
+            kinds.get(&allocation.domain),
+            Some(DomainMemory::Device | DomainMemory::Distinct)
+        ) {
+            continue;
+        }
+        let Some(observation) = observations.iter().find(|o| o.domain == allocation.domain) else {
+            continue;
+        };
+        floors.retain(|f| !(f.owner == owner && f.domain == allocation.domain));
+        let credited = floors
+            .iter()
+            .filter(|f| f.domain == allocation.domain)
+            .try_fold(0_i64, |sum, f| sum.checked_add(f.bytes));
+        let in_use = observation.capacity_bytes - observation.available_bytes;
+        let Some(room) = credited.and_then(|c| in_use.checked_sub(c)) else {
+            continue;
+        };
+        let bytes = allocation.bytes.min(room);
+        if bytes > 0 {
+            floors.push(ResidentFloor {
+                owner: owner.to_owned(),
+                domain: allocation.domain.clone(),
+                bytes,
+                sampled_at_ms: observation.sampled_at_ms,
+            });
+        }
+    }
 }

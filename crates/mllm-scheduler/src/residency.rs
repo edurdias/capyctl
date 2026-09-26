@@ -226,10 +226,11 @@ pub fn admit_phase(
                 .unwrap_or(0)
         };
         validate_resident_total(o, resident_floors)?;
-        let mut remaining = candidate
+        let own = candidate
             .checked_sub(floor(owner))
             .ok_or(ResourceError::Invalid)?
             .max(0);
+        let mut remaining = own;
         let mut total = candidate;
         let mut kv = candidate_kv;
         let mut parked = if next.phase == ResourcePhase::Parked {
@@ -262,10 +263,15 @@ pub fn admit_phase(
         if l.host_kv_bytes.is_some_and(|x| kv > x) || l.parked_bytes.is_some_and(|x| parked > x) {
             return Err(ResourceError::CategoryLimit);
         }
-        if o.available_bytes
-            .checked_sub(remaining)
-            .ok_or(ResourceError::Invalid)?
-            < l.free_reserve_bytes
+        // Found live on a 16 GB discrete GPU: a candidate that adds nothing
+        // on this domain beyond what its own processes hold (a wake releasing
+        // its host copy) is not judged on free memory. Refusing it cannot
+        // restore the reserve; it only held the wake until its deadline.
+        if own > 0
+            && o.available_bytes
+                .checked_sub(remaining)
+                .ok_or(ResourceError::Invalid)?
+                < l.free_reserve_bytes
         {
             return Err(ResourceError::Insufficient);
         }

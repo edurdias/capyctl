@@ -1028,6 +1028,155 @@ fn a_park_that_increases_nothing_arms_when_free_memory_is_low() {
     assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Parked);
 }
 
+// T16 T26: found live on the 16 GB discrete-GPU laptop host. A host_backed
+// park grows the system domain by the weights copy and keeps its GPU charge
+// in the parking phase, so the M27 rule (nothing increases) did not apply and
+// the whole parking footprint was charged against free memory again: the
+// card's 12 GiB, already in use by the engine being parked, against 2.5 GiB
+// free. A park is charged only what it adds beyond what the owner holds.
+#[test]
+fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
+    // A discrete host's domains are never `unified`; the rule leaves a
+    // unified domain exactly as it was.
+    let lab = Lab::new(|host| {
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+    });
+    // Ready holds 8 GiB; parking needs 9 GiB (the fixture), 1 GiB more.
+    let a = lab.deploy("a", |_| {});
+    lab.ready(&a, 1_000, 10);
+    let park = lab.park(&a, "park-grows", 1_100);
+    let limits = lab.limits();
+    let arm = |available: i64, now: i64| {
+        let observation = vec![MemoryObservation {
+            domain: "unified".into(),
+            capacity_bytes: 64 << 30,
+            available_bytes: available,
+            sampled_at_ms: now,
+        }];
+        lab.store
+            .arm_residency(
+                &lab.session,
+                &park.step_id,
+                lab.context(&observation, &limits, now),
+            )
+            .unwrap()
+    };
+    // 16.5 GiB free less the 1 GiB it adds is below the 16 GiB reserve.
+    assert!(matches!(
+        arm((33 << 30) / 2, 1_200),
+        ResidencyArm::Blocked(_)
+    ));
+    // 17 GiB free: the added 1 GiB fits; its own 8 GiB is not charged again.
+    let context = new_context(arm(17 << 30, 1_300));
+    lab.complete(&context, ResidencyKind::Park, 10, 1_400);
+    assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Parked);
+    // A unified domain is unchanged: the same park still waits there.
+    let unified = Lab::new(|_| {});
+    let u = unified.deploy("u", |_| {});
+    unified.ready(&u, 1_000, 10);
+    let park = unified.park(&u, "park-unified", 1_100);
+    let limits = unified.limits();
+    let observation = vec![MemoryObservation {
+        domain: "unified".into(),
+        capacity_bytes: 64 << 30,
+        available_bytes: 17 << 30,
+        sampled_at_ms: 1_300,
+    }];
+    assert!(matches!(
+        unified
+            .store
+            .arm_residency(
+                &unified.session,
+                &park.step_id,
+                unified.context(&observation, &limits, 1_300),
+            )
+            .unwrap(),
+        ResidencyArm::Blocked(_)
+    ));
+}
+
+// T16 T26: found live on the 16 GB discrete-GPU laptop host. A switch
+// planned a host_backed park against the ledger, but host RAM (most of it held
+// by other programs) could not take the copy: the park waited at arm until
+// the switch's deadline and the waiting request failed after 10 minutes. A
+// switch park that host memory cannot take now is refused `parked_capacity`,
+// so the switch stops the victim instead (discrete GPU design §5: a copy that
+// does not fit host RAM is stopped rather than parked). An operator's park
+// still waits for memory.
+#[test]
+fn a_switch_park_that_host_memory_cannot_take_is_refused() {
+    let lab = Lab::new(|host| {
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+    });
+    let limits = lab.limits();
+    let low = |now: i64| {
+        vec![MemoryObservation {
+            domain: "unified".into(),
+            capacity_bytes: 64 << 30,
+            available_bytes: (33 << 30) / 2,
+            sampled_at_ms: now,
+        }]
+    };
+    let park_as = |principal: &str, name: &str| {
+        let fence = lab.deploy(name, |_| {});
+        lab.ready(&fence, 1_000, if name == "s" { 10 } else { 20 });
+        let park = lab
+            .store
+            .accept_park_command(
+                &lab.session,
+                principal,
+                &fence.deployment_id,
+                fence.revision,
+                &format!("park-{name}"),
+                1_100,
+                61_100,
+            )
+            .unwrap();
+        let observation = low(1_200);
+        lab.store
+            .arm_residency(
+                &lab.session,
+                &park.step_id,
+                lab.context(&observation, &limits, 1_200),
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        park_as("switch", "s"),
+        ResidencyArm::Refused("parked_capacity")
+    ));
+    assert!(matches!(park_as("operator", "o"), ResidencyArm::Blocked(_)));
+    // A unified host keeps waiting, as before.
+    let unified = Lab::new(|_| {});
+    let fence = unified.deploy("u", |_| {});
+    unified.ready(&fence, 1_000, 10);
+    let park = unified
+        .store
+        .accept_park_command(
+            &unified.session,
+            "switch",
+            &fence.deployment_id,
+            fence.revision,
+            "park-u",
+            1_100,
+            61_100,
+        )
+        .unwrap();
+    let observation = low(1_200);
+    let limits = unified.limits();
+    assert!(matches!(
+        unified
+            .store
+            .arm_residency(
+                &unified.session,
+                &park.step_id,
+                unified.context(&observation, &limits, 1_200),
+            )
+            .unwrap(),
+        ResidencyArm::Blocked(_)
+    ));
+}
+
 // T26 T27, ADR 0007: found live 2026-09-23 (matrix M33, host-a), a wake
 // beside a Ready engine was refused `insufficient resources` although both
 // fit the managed limit: the host's availability already excluded what the
@@ -1238,6 +1387,88 @@ fn a_two_domain_owner_is_credited_per_domain() {
     // So is a domain without an observation.
     let only_gpu = floors(&observations[..1], &residents, &kinds);
     assert_eq!(only_gpu.keys().collect::<Vec<_>>(), ["gpu0"]);
+}
+
+// T16 T26: found live on the 16 GB discrete-GPU laptop host. A parked vLLM
+// keeps a residue on the card (its CUDA context) and, when host_backed, its
+// weights copy in host RAM; both are in use and out of the host's free
+// memory, and charging the parked reservation again made every start beside
+// a parked model stop it instead. A parked owner whose park completed is
+// credited what its own processes hold on a `device` or `distinct` domain,
+// capped at its parked reservation; a `unified` domain is unchanged.
+#[test]
+fn a_parked_owner_is_credited_on_discrete_domains_only() {
+    use mllm_config::effective::DomainMemory;
+    use mllm_domain::resources::{Allocation, ProcessResident};
+    use std::collections::BTreeMap;
+    let lab = Lab::new(|_| {});
+    let s = lab.deploy("s", |_| {});
+    lab.ready(&s, 1_000, 20);
+    let park = lab.park(&s, "park-s", 1_100);
+    let context = new_context(lab.arm(&park.step_id, 1_200));
+    lab.complete(&context, ResidencyKind::Park, 20, 1_300);
+    assert_eq!(lab.instance(&s.deployment_id).0, "parked");
+    let mut ledger = lab.store.resource_snapshot().unwrap();
+    let owner = crate::instances::instance_owner_id(&s.deployment_id, 0);
+    ledger.owners.get_mut(&owner).unwrap().allocations = vec![
+        Allocation {
+            domain: "gpu0".into(),
+            bytes: 1 << 30,
+            host_kv_bytes: 0,
+        },
+        Allocation {
+            domain: "system".into(),
+            bytes: 12 << 30,
+            host_kv_bytes: 0,
+        },
+    ];
+    let observation = |domain: &str| MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: 64 << 30,
+        available_bytes: 32 << 30,
+        sampled_at_ms: 1_400,
+    };
+    let observations = vec![observation("gpu0"), observation("system")];
+    let residents = vec![ProcessResident {
+        pid: 21,
+        boot_id: "boot-1".into(),
+        start_ticks: 1,
+        bytes: (1600 << 20) + (10 << 30),
+        device_bytes: 1600 << 20,
+        host_bytes: 10 << 30,
+    }];
+    let discrete = BTreeMap::from([
+        ("gpu0".to_string(), DomainMemory::Device),
+        ("system".to_string(), DomainMemory::Distinct),
+    ]);
+    let floors = |kinds: &BTreeMap<String, DomainMemory>| {
+        crate::resident_floors::resident_floors(
+            &lab.store.conn,
+            &ledger,
+            "candidate",
+            &observations,
+            &residents,
+            kinds,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.domain, f.bytes))
+        .collect::<BTreeMap<_, _>>()
+    };
+    let credited = floors(&discrete);
+    // Capped at the 1 GiB parked reservation on the card; the sampled 10 GiB
+    // of host pages (the pinned copy included) on the system domain.
+    assert_eq!(credited["gpu0"], 1 << 30);
+    assert_eq!(credited["system"], 10 << 30);
+    // The same owner on unified domains is not credited (ADR 0007 unchanged).
+    let unified = BTreeMap::from([
+        ("gpu0".to_string(), DomainMemory::Unified),
+        ("system".to_string(), DomainMemory::Unified),
+    ]);
+    assert!(floors(&unified).is_empty());
+    // A wake in flight: no credit.
+    lab.wake(&s, WakeScope::OnDemand, "wake-s", 1_500).unwrap();
+    assert!(floors(&discrete).is_empty());
 }
 
 impl Lab {

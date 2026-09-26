@@ -1293,6 +1293,10 @@ impl crate::Store {
     }
 }
 
+/// The principal a request-driven switch releases its victims as
+/// (`mllm_controller::switching::SWITCH_PRINCIPAL`).
+const SWITCH_PRINCIPAL: &str = "switch";
+
 fn redact_reason(reason: &str) -> String {
     reason.chars().take(512).collect()
 }
@@ -1511,7 +1515,14 @@ fn fit(
         }
     }
     let mut victims: Vec<String> = Vec::new();
+    let mut observations = context.observations.to_vec();
+    let mut floors = context.resident_floors.to_vec();
     for target in targets {
+        let context = AdmissionContext {
+            observations: &observations,
+            resident_floors: &floors,
+            ..context
+        };
         // Found live 2026-09-23 (matrix M27): a transition that allocates
         // nothing beyond what the owner already holds (a park's parking and
         // parked phases) cannot need free memory. Its own charge is already in
@@ -1532,7 +1543,12 @@ fn fit(
         match mllm_scheduler::sequence::lru_parked_victims(&state, owner, target, &order, context) {
             Some(more) => {
                 for victim in more {
-                    state.owners.remove(&victim);
+                    mllm_scheduler::sequence::forecast_removal(
+                        &mut state,
+                        &mut observations,
+                        &mut floors,
+                        &victim,
+                    );
                     victims.push(victim);
                 }
             }
@@ -1658,18 +1674,6 @@ fn arm(
     // engine was refused because the memory that engine holds, already out of
     // the host's availability, was charged again. Ready engines are credited
     // what the host sampled for their own processes.
-    let floors = crate::resident_floors::resident_floors(
-        tx,
-        &ledger,
-        &owner,
-        context.observations,
-        residents,
-        &crate::resident_floors::domain_kinds(&policy.controls),
-    )?;
-    let context = AdmissionContext {
-        resident_floors: &floors,
-        ..context
-    };
     let (held, next, targets) = match p.kind {
         ResidencyKind::Park => (
             &f.ready,
@@ -1677,6 +1681,28 @@ fn arm(
             vec![f.parking.clone(), f.parked.clone()],
         ),
         ResidencyKind::Restore => (&f.parked, f.wake.clone(), vec![f.wake.clone()]),
+    };
+    let kinds = crate::resident_floors::domain_kinds(&policy.controls);
+    let mut floors = crate::resident_floors::resident_floors(
+        tx,
+        &ledger,
+        &owner,
+        context.observations,
+        residents,
+        &kinds,
+    )?;
+    // Discrete GPU design §5 (found live on a 16 GB card): a park or a wake
+    // is charged only what it adds beyond the owner's own charge.
+    crate::resident_floors::credit_own_charge(
+        &mut floors,
+        &owner,
+        held,
+        context.observations,
+        &kinds,
+    );
+    let context = AdmissionContext {
+        resident_floors: &floors,
+        ..context
     };
     if !ledger
         .owners
@@ -1714,9 +1740,24 @@ fn arm(
         // stays Ready and serves again. Anything else waits for capacity or
         // its deadline (it never evicts Ready work).
         Fit::Impossible(why) => {
-            let parked_set = p.kind == ResidencyKind::Park
-                && mllm_scheduler::residency::admit_phase(&scoped, &owner, &f.parking, context)
-                    .is_ok();
+            // Discrete GPU design §5 (found live on a 16 GB card): a switch
+            // victim whose copy host memory cannot take now is stopped rather
+            // than parked. Waiting only held the switch until its deadline,
+            // while the memory it waits for is the one the switch frees.
+            // A stale or unknown observation still waits, and a unified host
+            // keeps waiting as before.
+            let parking =
+                mllm_scheduler::residency::admit_phase(&scoped, &owner, &f.parking, context);
+            let switch_victim = p.principal == SWITCH_PRINCIPAL
+                && kinds
+                    .values()
+                    .any(|kind| *kind != mllm_config::effective::DomainMemory::Unified)
+                && matches!(
+                    parking,
+                    Err(mllm_domain::resources::ResourceError::Insufficient
+                        | mllm_domain::resources::ResourceError::CategoryLimit)
+                );
+            let parked_set = p.kind == ResidencyKind::Park && (switch_victim || parking.is_ok());
             return Ok(if parked_set {
                 fail(tx, s, &p, "parked_capacity", &why)?;
                 ResidencyArm::Refused("parked_capacity")
