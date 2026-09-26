@@ -72,7 +72,7 @@ Open, not fixed here:
   backend goes in each SGLang deployment's `extra_args` (`engine add --arg`
   is refused for SGLang).
 
-### Final review fix wave — 2026-09-26 (commits `9a39596..` the commit recording this)
+### Final review fix wave — 2026-09-26 (commits `6766cbd..8781ef0`)
 
 The whole-branch review (`2fbcc48`) found 1 critical and 14 important
 issues. Fixed on CPU, each with a regression test that failed before; CPU and
