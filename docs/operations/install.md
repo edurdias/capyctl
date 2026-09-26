@@ -841,10 +841,14 @@ The marker `<state dir>/migrations/inference-bind-v1` records that this ran, so
 it never runs again; any other address, and the authentication setting, are
 never touched. A document the role cannot rewrite (a read-only `/etc/mllm`,
 for example, or one where the address appears more than once) is left
-unchanged; the role serves on `0.0.0.0:8443` for that run only and prints
-`config_migration_failed` with the line to edit. Later starts follow the
-document again, so edit it: the system units mount `/etc` read-only, so a
-server whose document is `/etc/mllm/server.yaml` takes this path.
+unchanged; the role serves on `0.0.0.0:8443` and prints
+`config_migration_failed` with the line to edit. The migration then stays
+pending: every later start that still finds `127.0.0.1:8443` in the unchanged
+document serves on `0.0.0.0:8443` again and prints the warning, until the
+document states another address (or can be rewritten). The system units mount
+`/etc` read-only, so a server whose document is `/etc/mllm/server.yaml` takes
+this path; to keep it local, set another address there or start with
+`--listen 127.0.0.1:8443`.
 
 To narrow the address again, pick one:
 

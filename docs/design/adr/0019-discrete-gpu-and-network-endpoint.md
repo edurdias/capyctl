@@ -243,12 +243,13 @@ host keeps exactly its previous credit and needs the capability for nothing.
   comments and layout survive, writes a temporary file in the same directory, syncs it and
   renames it over the document, keeping the original beside it as `<file>.pre-0.1.0` with
   the same mode. If the value does not occur exactly once, or the write fails, the document
-  is left unchanged and the role serves on `0.0.0.0:8443` for that run only
-  (`config_migration_failed`, a warning, not an exit); later starts follow the
-  document. The marker
+  is left unchanged and the role serves on `0.0.0.0:8443`
+  (`config_migration_failed`, a warning, not an exit); the migration stays pending, so
+  every later start that finds the unchanged old default does the same until the document
+  states another address. The marker
   `<state_dir>/migrations/inference-bind-v1` is written on that first start whatever it
-  found, so the migration never runs twice and an operator who sets `127.0.0.1:8443` back
-  keeps it. Any other address is never migrated, and authentication is never changed. The
+  found (as pending when the document could not be rewritten), so a completed migration
+  never runs twice and an operator who sets `127.0.0.1:8443` back keeps it. Any other address is never migrated, and authentication is never changed. The
   start prints a one-time notice to stderr:
 
   ```

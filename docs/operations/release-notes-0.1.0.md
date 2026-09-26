@@ -23,9 +23,10 @@ the machine's Tailscale address. See docs/operations/network-access.md.
 - The fixed fallback key `mllm-local` is gone. If the credentials file cannot be
   read, standalone refuses to start instead of serving with a known key.
 - If the configuration file cannot be rewritten (for example a server document
-  in a read-only `/etc/mllm`), it is left unchanged, that start serves on
-  `0.0.0.0:8443` and prints `config_migration_failed`, and later starts follow
-  the file again: edit `listeners.inference.bind` there.
+  in a read-only `/etc/mllm`), it is left unchanged and every start that still
+  finds the old default serves on `0.0.0.0:8443` and prints
+  `config_migration_failed`; set `listeners.inference.bind` there (or start
+  with `--listen`) to choose another address.
 - Management stays on loopback with its admin token, and engines stay on
   loopback behind per-launch keys. mllm does not terminate TLS; for the internet,
   put a TLS reverse proxy in front (a Caddy example is in the network access

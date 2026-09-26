@@ -37,9 +37,22 @@ pub enum Migration {
 /// to `127.0.0.1:8443` afterwards (the notice tells them how) is then never
 /// migrated, and neither is one a fresh installation of this release set to
 /// loopback after its first start.
+///
+/// A start that could not rewrite the document ([`Migration::BindOnly`], for
+/// example a packaged server whose `/etc` is read-only) records the migration
+/// as pending, not done: the unchanged document still states the old default
+/// only because it could not be changed, so every later start binds the new
+/// default again (and retries the rewrite) until the document states
+/// something else. Found in the final review: the second start of such a
+/// server silently went back to loopback after the notice had said otherwise.
 pub fn migrate(document: &Path, state_dir: &Path, parsed_bind: Option<&str>) -> Migration {
     let marker = state_dir.join(MARKER);
-    if marker.exists() {
+    let pending = match fs::read_to_string(&marker) {
+        Ok(text) => text.starts_with(PENDING),
+        Err(_) if marker.exists() => false,
+        Err(_) => true,
+    };
+    if !pending {
         return Migration::NotNeeded;
     }
     let outcome = if parsed_bind == Some(OLD_DEFAULT) {
@@ -47,21 +60,29 @@ pub fn migrate(document: &Path, state_dir: &Path, parsed_bind: Option<&str>) -> 
     } else {
         Migration::NotNeeded
     };
-    // The marker is written whatever the outcome: the notice is one-time, and
-    // a BindOnly run already serves on the new default. A marker that cannot be
-    // written only means the check runs again at the next start.
+    // The notice is one-time for a rewrite; a BindOnly run leaves the
+    // migration pending so the next start binds the new default too. A
+    // marker that cannot be written only means the check runs again at the
+    // next start.
     if let Some(parent) = marker.parent() {
         let _ = fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(parent);
     }
-    let _ = fs::write(
-        &marker,
-        format!("inference bind migration ran; the new default is {NEW_DEFAULT}\n"),
-    );
+    let text = match &outcome {
+        Migration::BindOnly { .. } => format!(
+            "{PENDING}: the document still states {OLD_DEFAULT} and could not be rewritten; \
+             each start binds {NEW_DEFAULT}\n"
+        ),
+        _ => format!("inference bind migration ran; the new default is {NEW_DEFAULT}\n"),
+    };
+    let _ = fs::write(&marker, text);
     outcome
 }
+
+/// The first word of a marker whose migration could not rewrite the document.
+const PENDING: &str = "pending";
 
 fn rewrite(document: &Path) -> Result<Migration, String> {
     let text = fs::read_to_string(document).map_err(|e| format!("cannot read it: {e}"))?;
@@ -251,9 +272,51 @@ mod tests {
             said.contains("was not changed") && said.contains("edit listeners.inference.bind"),
             "{said}"
         );
-        // The notice is one-time for this outcome too.
+        // Nothing was rewritten, so the next start binds the new default
+        // again rather than silently returning to loopback.
         assert!(matches!(
             migrate(&doc, dir.path(), Some(OLD_DEFAULT)),
+            Migration::BindOnly { .. }
+        ));
+        // Once the operator states another address, it is theirs.
+        assert!(matches!(
+            migrate(&doc, dir.path(), Some("127.0.0.1:9000")),
+            Migration::NotNeeded
+        ));
+        assert!(matches!(
+            migrate(&doc, dir.path(), Some(OLD_DEFAULT)),
+            Migration::NotNeeded
+        ));
+    }
+
+    // T02 T03 (final review I1): a packaged server whose `/etc` is read-only
+    // cannot persist the rewrite. Every start keeps binding the new default
+    // (with the notice) instead of the second start silently returning to
+    // loopback; a later writable start completes the migration once.
+    #[test]
+    fn a_read_only_document_keeps_the_new_default_across_starts() {
+        let (dir, _) = setup(DOC);
+        let config = dir.path().join("etc");
+        fs::create_dir(&config).unwrap();
+        let doc = config.join("server.yaml");
+        fs::write(&doc, DOC).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o500)).unwrap();
+        for start in 0..3 {
+            let outcome = migrate(&doc, dir.path(), Some(OLD_DEFAULT));
+            assert!(
+                matches!(outcome, Migration::BindOnly { .. }),
+                "start {start}: {outcome:?}"
+            );
+            assert!(notice(&doc, &outcome).is_some());
+        }
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read_to_string(&doc).unwrap(), DOC);
+        assert!(matches!(
+            migrate(&doc, dir.path(), Some(OLD_DEFAULT)),
+            Migration::Rewritten { .. }
+        ));
+        assert!(matches!(
+            migrate(&doc, dir.path(), Some(NEW_DEFAULT)),
             Migration::NotNeeded
         ));
     }
