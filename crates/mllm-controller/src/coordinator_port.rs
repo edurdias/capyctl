@@ -282,8 +282,27 @@ impl CoordinatorLifecycle {
     /// instead of the router's: two arrivals that saw the same state produce the same
     /// key and collapse, while an arrival that saw a later generation is asking about
     /// a different runtime and gets its own operation.
-    fn activation_key(deployment: &str, revision: i64, generation: i64) -> String {
-        format!("auto-activate:{deployment}:{revision}:{generation}")
+    ///
+    /// Found live on a 16 GB discrete GPU: a failed launch leaves the
+    /// generation unchanged, so the key also names the deployment's latest
+    /// operation (as [`Self::wake_key`] does). Without it every later request
+    /// derived the failed attempt's key and was refused as a different command.
+    fn activation_key(
+        deployment: &str,
+        revision: i64,
+        generation: i64,
+        latest_operation: &str,
+    ) -> String {
+        format!("auto-activate:{deployment}:{revision}:{generation}:{latest_operation}")
+    }
+
+    /// The deployment's latest operation id, for [`Self::activation_key`].
+    fn latest_operation(&self, deployment: &str) -> Result<String, LifecycleFault> {
+        Ok(self
+            .commands
+            .read(|store| store.latest_operation(deployment))?
+            .map(|operation| operation.id)
+            .unwrap_or_default())
     }
 
     /// W5: a wake's idempotency key. A parked instance keeps its generation, so
@@ -534,7 +553,12 @@ impl CoordinatorLifecycle {
         row: &DeploymentRow,
         revision: i64,
     ) -> Result<Activation, LifecycleFault> {
-        let key = Self::activation_key(deployment, revision, row.current_generation);
+        let key = Self::activation_key(
+            deployment,
+            revision,
+            row.current_generation,
+            &self.latest_operation(deployment)?,
+        );
         // Owner decision Q5, ADR 0013 §4 (W5): a parked instance is restored in
         // place, on the host it parked on, before anything starts cold; a
         // restore in flight is joined (T15).
@@ -970,7 +994,12 @@ impl LifecyclePort for CoordinatorLifecycle {
                     .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
                 let key = format!(
                     "start:{}",
-                    Self::activation_key(deployment, revision, row.current_generation)
+                    Self::activation_key(
+                        deployment,
+                        revision,
+                        row.current_generation,
+                        &self.latest_operation(deployment)?
+                    )
                 );
                 let deadline = lifecycle_deadline(&self.commands, deployment, false)?;
                 // SPEC §6.3 (W5): "Restore if parked, initialize if stopped."
