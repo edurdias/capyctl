@@ -23,6 +23,11 @@ test('flags internal terms as whole words only', () => {
   assert.deepEqual(findInternalTerms('The ADR 0013 lease.'), ['adr', 'lease']);
 });
 
+test('the memory ledger is a defined user term; a bare ledger is not', () => {
+  assert.deepEqual(findInternalTerms('The memory ledger counts memory.'), []);
+  assert.deepEqual(findInternalTerms('The Memory ledger and the ledger.'), ['ledger']);
+});
+
 test('the landing page port check finds ports in text and code, not in styles', () => {
   assert.deepEqual(findPorts('<p>One OpenAI-compatible endpoint</p><style>.a{max-width:720px}</style>'), []);
   assert.deepEqual(findPorts('<div><code>:8443/v1</code></div>'), [':8443']);

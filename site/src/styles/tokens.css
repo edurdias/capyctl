@@ -102,3 +102,16 @@
   --sl-font: var(--mllm-font-sans);
   --sl-font-mono: var(--mllm-font-mono);
 }
+
+/* Inline diagrams on docs pages (docs/guide/*.svg): full column width, and
+   never wider than they read well. */
+figure.diagram {
+  margin: 1.5rem 0;
+}
+figure.diagram svg {
+  display: block;
+  width: 100%;
+  max-width: 34rem;
+  height: auto;
+  margin-inline: auto;
+}

@@ -22,8 +22,12 @@ export function findViolations(text, denylist) {
   return [...PHRASES, ...denylist.map((d) => d.toLowerCase())].filter((p) => p && lower.includes(p));
 }
 
+// Terms the docs define for users where they use them ("How it works"
+// defines the memory ledger), removed before the check.
+export const DEFINED_TERMS = ['memory ledger'];
+
 export function findInternalTerms(text) {
-  const lower = text.toLowerCase();
+  const lower = DEFINED_TERMS.reduce((t, d) => t.split(d).join(' '), text.toLowerCase());
   const escape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // A boundary on each side that ends in a letter or digit ("§6" still counts).
   const edge = (c) => (/[a-z0-9]/.test(c) ? '(?:$|[^a-z0-9])' : '');

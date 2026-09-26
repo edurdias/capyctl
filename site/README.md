@@ -21,6 +21,9 @@ Astro's telemetry is turned off in every script.
   lists them). Edit the file under `docs/`, never the generated copy under
   `src/content/docs/docs/`.
 - `docs/examples/*.yaml` are embedded verbatim on the configuration page.
+- An SVG image on a line of its own in a guide page (`docs/guide/*.svg`) is
+  embedded inline, so it takes the site's light and dark colours; on GitHub
+  the same line shows it as an image, with its own fallback colours.
 - The CLI reference is generated from the clap definition
   (`cargo run -p mllm-cli --example cli_reference`).
 - The landing page's `mllm list deployments` table is rendered by the CLI's

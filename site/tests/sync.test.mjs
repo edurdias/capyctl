@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { rewriteLink, expandIncludes, toStarlight, substitute } from '../scripts/lib/sync.mjs';
+import { rewriteLink, expandIncludes, toStarlight, substitute, inlineSvgs } from '../scripts/lib/sync.mjs';
 
 const REPO = 'https://github.com/example/mllm';
 const PAGES = [
@@ -56,7 +56,7 @@ test('every docs/examples file is embedded verbatim on the configuration page', 
   const page = { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration' };
   const out = toStarlight(read(page.source), page, [page], REPO, read);
   const files = readdirSync(new URL('docs/examples/', root)).filter((f) => f.endsWith('.yaml'));
-  assert.equal(files.length, 6);
+  assert.equal(files.length, 8);
   for (const f of files) assert.ok(out.includes(read(`docs/examples/${f}`)), f);
 });
 
@@ -80,4 +80,32 @@ test('links to pages and site paths get the base path', () => {
   assert.equal(rewriteLink('quickstart.md', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/quickstart/');
   assert.equal(rewriteLink('/docs/reference/cli/', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/reference/cli/');
   assert.equal(rewriteLink('../examples/host.yaml', 'docs/guide/index.md', PAGES, REPO, '/mllm'), `${REPO}/blob/main/docs/examples/host.yaml`);
+});
+
+test('an SVG image on its own line is embedded inline; code fences and inline images are left alone', () => {
+  const svg = '<?xml version="1.0"?>\n<svg role="img"><title>T</title>\n<rect/></svg>\n';
+  const md = 'A\n\n![T](how.svg)\n\n```md\n![T](how.svg)\n```\n\nSee ![x](how.svg) here.\n';
+  const out = inlineSvgs(md, 'docs/guide/how-it-works.md', (p) => { assert.equal(p, 'docs/guide/how.svg'); return svg; });
+  assert.equal(out, 'A\n\n<figure class="diagram">\n<svg role="img"><title>T</title>\n<rect/></svg>\n</figure>\n\n```md\n![T](how.svg)\n```\n\nSee ![x](how.svg) here.\n');
+});
+
+test('an inline SVG with a blank line is refused', () => {
+  assert.throws(() => inlineSvgs('![T](a.svg)\n', 'docs/guide/x.md', () => '<svg>\n\n</svg>'), /blank line/);
+});
+
+test('every diagram the guide shows is accessible and themed', () => {
+  const root = new URL('../../', import.meta.url);
+  for (const f of readdirSync(new URL('docs/guide/', root)).filter((x) => x.endsWith('.svg'))) {
+    const svg = readFileSync(new URL(`docs/guide/${f}`, root), 'utf8');
+    assert.match(svg, /^<svg [^>]*role="img"[^>]*aria-labelledby="(\S+) (\S+)"/, f);
+    const [, title, desc] = svg.match(/aria-labelledby="(\S+) (\S+)"/);
+    assert.match(svg, new RegExp(`<title id="${title}">[^<]+</title>`), f);
+    assert.match(svg, new RegExp(`<desc id="${desc}">[^<]+</desc>`), f);
+    // Website spec, Visual system: colours come from the theme, so the
+    // diagram follows light, dark and the toggle.
+    assert.doesNotMatch(svg.replace(/var\([^)]*\)/g, ''), /(fill|stroke):\s*#/, f);
+    // Readable on a phone: nothing drawn wider than a 360 px screen.
+    assert.match(svg, /viewBox="0 0 360 \d+"/, f);
+    assert.doesNotMatch(svg, /\n\s*\n/, f);
+  }
 });

@@ -26,26 +26,30 @@ const server = createServer((req, res) => {
   res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream' }).end(readFileSync(file));
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const url = `http://127.0.0.1:${server.address().port}${BASE}/`;
+// The landing page, and the docs page that carries the diagrams.
+const PAGES = ['/', '/docs/how-it-works/'];
 try {
   const chrome = await chromeLauncher.launch({ chromeFlags: ['--headless=new', '--no-sandbox'] });
   try {
-    const { lhr } = await lighthouse(url, {
-      port: chrome.port, onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
-    });
-    if (lhr.runtimeError) throw new Error(`lighthouse: ${lhr.runtimeError.code}: ${lhr.runtimeError.message}`);
-    const scores = Object.fromEntries(Object.values(lhr.categories).map((c) => [c.id, Math.round(c.score * 100)]));
-    console.log(scores);
-    const low = Object.entries(scores).filter(([, s]) => s < 95);
-    if (low.length) {
-      for (const cat of Object.values(lhr.categories)) {
-        for (const ref of cat.auditRefs) {
-          const a = lhr.audits[ref.id];
-          if (ref.weight > 0 && a.score !== null && a.score < 1) console.error(`${cat.id}: ${a.id} (${a.score})`);
+    for (const page of PAGES) {
+      const url = `http://127.0.0.1:${server.address().port}${BASE}${page}`;
+      const { lhr } = await lighthouse(url, {
+        port: chrome.port, onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+      });
+      if (lhr.runtimeError) throw new Error(`lighthouse: ${lhr.runtimeError.code}: ${lhr.runtimeError.message}`);
+      const scores = Object.fromEntries(Object.values(lhr.categories).map((c) => [c.id, Math.round(c.score * 100)]));
+      console.log(page, scores);
+      const low = Object.entries(scores).filter(([, s]) => s < 95);
+      if (low.length) {
+        for (const cat of Object.values(lhr.categories)) {
+          for (const ref of cat.auditRefs) {
+            const a = lhr.audits[ref.id];
+            if (ref.weight > 0 && a.score !== null && a.score < 1) console.error(`${page} ${cat.id}: ${a.id} (${a.score})`);
+          }
         }
+        console.error(`${page} below 95: ${low.map(([k, s]) => `${k} ${s}`).join(', ')}`);
+        process.exitCode = 1;
       }
-      console.error(`below 95: ${low.map(([k, s]) => `${k} ${s}`).join(', ')}`);
-      process.exitCode = 1;
     }
   } finally { await chrome.kill(); }
 } finally { server.close(); }

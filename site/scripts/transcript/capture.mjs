@@ -38,16 +38,31 @@ function privateDir(p) { mkdirSync(p, { recursive: true }); chmodSync(p, 0o700);
 for (let p = root; p !== dirname(p) && p.startsWith(homedir()) && p !== homedir(); p = dirname(p)) {
   if (existsSync(p)) chmodSync(p, 0o700);
 }
+// Engines outlive their role by design, and a client a timeout abandoned
+// keeps waiting: stop whatever an earlier run left under the sandbox, so its
+// ports are free.
+function killLeftovers() {
+  try { execFileSync('pkill', ['-f', `${root}/`]); } catch { /* none left */ }
+}
+killLeftovers();
 rmSync(root, { recursive: true, force: true });
 privateDir(root);
 
 function home(name) { return join(root, name); }
 
+// Each sandbox home listens on its own loopback ports, far from the defaults.
+const LISTEN = {
+  one: { MLLM_INFERENCE_ADDR: '127.0.0.1:18443', MLLM_MANAGEMENT_ADDR: '127.0.0.1:17443', MLLM_ENGINE_PORTS: '18100-18107' },
+  server: { MLLM_INFERENCE_ADDR: '127.0.0.1:38443', MLLM_MANAGEMENT_ADDR: '127.0.0.1:37443' },
+  'gpu-box': { MLLM_ENGINE_PORTS: '38100-38199' },
+};
+
+// `extra` adds variables; a null value leaves that variable out.
 function env(name, extra = {}) {
   const h = home(name);
-  return { HOME: h, PATH: `${h}/.local/bin:/usr/bin:/bin`, USER: process.env.USER ?? 'me', LANG: 'C.UTF-8', TERM: 'dumb',
-    MLLM_STANDALONE_INFERENCE_ADDR: '127.0.0.1:18443', MLLM_STANDALONE_MANAGEMENT_ADDR: '127.0.0.1:17443',
-    MLLM_STANDALONE_ENGINE_PORTS: '18100-18107', ...extra };
+  const all = { HOME: h, PATH: `${h}/.local/bin:/usr/bin:/bin`, USER: process.env.USER ?? 'me', LANG: 'C.UTF-8', TERM: 'dumb',
+    ...LISTEN[name], ...extra };
+  return Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
 }
 
 function makeHome(name) {
@@ -94,6 +109,10 @@ function checkpoint(h, dir) {
 function sanitize(text) {
   let t = text.split(root + '/server').join('/home/me').split(root + '/gpu-box').join('/home/me')
     .split(root + '/one').join('/home/me');
+  // The sandbox serves inference on loopback; a real start serves it on
+  // every interface, the default the guide shows.
+  t = t.replaceAll('inference listener 127.0.0.1:18443', 'inference listener 0.0.0.0:8443')
+    .replaceAll('"inference":"127.0.0.1:38443"', '"inference":"0.0.0.0:8443"');
   for (const [from, to] of Object.entries(PORTS)) t = t.replaceAll(`:${from}`, `:${to}`);
   t = t.replace(new RegExp(`\\b${hostname()}\\b`, 'g'), 'gpu-box');
   return realign(t);
@@ -150,7 +169,8 @@ function stop(child) { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* a
 // A file the guide shows, as a ```yaml title="<name>" block of a page.
 function guideBlock(page, name) {
   const text = readFileSync(join(here, '..', '..', '..', 'docs', 'guide', page), 'utf8');
-  const m = text.match(new RegExp('```yaml title="' + name.replace('.', '\\.') + '"\\n([\\s\\S]*?)```'));
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = text.match(new RegExp('```yaml title="' + escaped + '"\\n([\\s\\S]*?)```'));
   if (!m) throw new Error(`${page} shows no ${name}`);
   return m[1];
 }
@@ -158,8 +178,7 @@ function guideBlock(page, name) {
 // The deployment file is the one the guide shows.
 const guideFile = guideBlock('deploy.md', 'my-model.yaml');
 const deployment = (name, path, extra = '') => guideFile
-  .replaceAll('my-model', name).replaceAll('Qwen3-4B', path).replaceAll('qwen3-4b', path.toLowerCase())
-  .replace(`name: ${name}\n`, `name: ${name}\n${extra}`);
+  .replaceAll('my-model', name).replaceAll('Qwen3-4B', path) + extra;
 
 const KEY = "$(sed -n 's/^api_key: //p' ~/.local/state/mllm/identity/credentials)";
 const SERVER_KEY = `$(sed -n 's/.*"api_key": *"\\([^"]*\\)".*/\\1/p' ~/.local/state/mllm/identity/server-credentials.json)`;
@@ -177,21 +196,19 @@ async function oneMachine() {
   run('one', 'engine detect', 'mllm engine detect');
   run('one', 'engine add before start', 'mllm engine add ~/venvs/vllm');
   run('one', 'engine list before start', 'mllm engine list');
-  run('one', 'start standalone without MLLM_MODELS_ROOT', 'mllm start standalone');
-  const started = background('one', 'start standalone', 'MLLM_MODELS_ROOT=~/models mllm start standalone');
-  await started(6000);
+  const started = background('one', 'start standalone', 'mllm start standalone');
+  await started(8000);
+  run('one', 'config show', 'mllm config show', { MLLM_INFERENCE_ADDR: null, MLLM_MANAGEMENT_ADDR: null, MLLM_ENGINE_PORTS: null });
+  run('one', 'config show set', 'mllm config show --set server.switching.drain_timeout=45s', { MLLM_INFERENCE_ADDR: null, MLLM_MANAGEMENT_ADDR: null, MLLM_ENGINE_PORTS: null });
   run('one', 'engine add custom', 'mllm engine add ~/venvs/vllm-nightly --name vllm-nightly');
   run('one', 'engine list', 'mllm engine list');
   run('one', 'engine remove', 'mllm engine remove vllm-nightly');
-  run('one', 'engine list after remove', 'mllm engine list');
   run('one', 'validate', 'mllm validate config --file my-model.yaml');
-  run('one', 'deploy', 'mllm deploy model --file my-model.yaml');
-  await sleep(4000);
-  run('one', 'start deployment', 'mllm start deployment my-model --wait');
+  run('one', 'deploy and start', 'mllm deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
   run('one', 'list deployments', 'mllm list deployments');
   run('one', 'status', 'mllm status deployment my-model');
-  run('one', 'list json', 'mllm list deployments --format json');
-  run('one', 'models', `curl -s http://127.0.0.1:18443/v1/models -H "Authorization: Bearer $(sed -n 's/^api_key: //p' ~/.local/state/mllm/identity/credentials)"; echo`);
+  run('one', 'models', `curl -s http://127.0.0.1:18443/v1/models -H "Authorization: Bearer ${KEY}"; echo`);
+  run('one', 'models no key', `curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:18443/v1/models`);
   run('one', 'chat', curlChat(18443, 'my-model'));
   run('one', 'stream', curlChat(18443, 'my-model', true));
   const py = join(root, 'client.py');
@@ -226,9 +243,8 @@ print()
   run('one', 'wake by request', curlChat(18443, 'my-model'));
   run('one', 'list woken', 'mllm list deployments');
   run('one', 'deploy other', 'mllm deploy model --file other-model.yaml');
-  await sleep(4000);
   run('one', 'start evict', 'mllm start deployment other-model --evict');
-  await sleep(4000);
+  await sleep(6000);
   run('one', 'list after evict', 'mllm list deployments');
   run('one', 'switch back by request', curlChat(18443, 'my-model'));
   run('one', 'list switched', 'mllm list deployments');
@@ -236,13 +252,16 @@ print()
   await sleep(3000);
   run('one', 'list stopped', 'mllm list deployments');
   run('one', 'stopped request', curlChat(18443, 'other-model'));
-  run('one', 'start again', 'mllm start deployment other-model --evict --wait > /dev/null; mllm list deployments');
   run('one', 'delete', 'mllm delete deployment other-model --stop');
   run('one', 'list after delete', 'mllm list deployments');
-  writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B').replace('revision: "1"', 'revision: "2"').replace('qwen3-4b-1', 'qwen3-4b-2'));
+  run('one', 'stop my-model', 'mllm stop deployment my-model > /dev/null; echo exit $?');
+  await sleep(4000);
+  run('one', 'start my-model', 'mllm start deployment my-model --wait > /dev/null; echo exit $?');
+  writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B', 'residency: deep\n'));
   run('one', 'update', 'mllm deploy model --file my-model.yaml --revision 1');
-  await sleep(5000);
+  await sleep(6000);
   run('one', 'list after update', 'mllm list deployments');
+  run('one', 'delete my-model', 'mllm delete deployment my-model --stop > /dev/null; echo exit $?');
 }
 
 async function severalMachines() {
@@ -254,16 +273,18 @@ async function severalMachines() {
   // The server and host files are the ones the guide shows, moved onto
   // loopback ports and the sandbox home.
   writeFileSync(join(s, 'server.yaml'), guideBlock('several-machines.md', 'server.yaml')
-    .replaceAll('/home/me', s).replaceAll('127.0.0.1:7443', '127.0.0.1:37443').replaceAll('127.0.0.1:8443', '127.0.0.1:38443')
+    .replaceAll('/home/me', s).replaceAll('127.0.0.1:7443', '127.0.0.1:37443').replaceAll('0.0.0.0:8443', '127.0.0.1:38443')
     .replaceAll('100.64.0.10:7444', '127.0.0.1:37444').replaceAll('100.64.0.10:7445', '127.0.0.1:37445'));
   const server = background('server', 'start server', 'mllm start server --config ~/server.yaml');
   await server(6000);
   run('server', 'invite', 'mllm invite host gpu-box --output gpu-box.join --config ~/server.yaml');
   cpSync(join(s, 'gpu-box.join'), join(g, 'gpu-box.join'));
   run('gpu-box', 'init host', 'mllm init host --output host.yaml');
-  writeFileSync(join(g, 'host.yaml'), guideBlock('several-machines.md', 'host.yaml')
-    .replaceAll('/home/me', g).replaceAll('100.64.0.21:8444', '127.0.0.1:38444')
-    .replace('start: 8100', 'start: 38100').replace('end: 8199', 'end: 38199'));
+  const hostFile = (block) => guideBlock('several-machines.md', block)
+    .replaceAll('/home/me', g).replaceAll('100.64.0.21:8444', '127.0.0.1:38444');
+  writeFileSync(join(g, 'host-unified.yaml'), hostFile('host.yaml (unified memory)'));
+  run('gpu-box', 'validate unified host', 'mllm validate config --file ~/host-unified.yaml');
+  writeFileSync(join(g, 'host.yaml'), hostFile('host.yaml'));
   run('gpu-box', 'validate host', 'mllm validate config --file ~/host.yaml');
   run('gpu-box', 'join', 'mllm join host --join-file gpu-box.join --config ~/host.yaml');
   const host = background('gpu-box', 'start host', 'mllm start host --config ~/host.yaml');
@@ -272,11 +293,11 @@ async function severalMachines() {
   await sleep(2000);
   run('server', 'list hosts', 'mllm list hosts --config ~/server.yaml');
   run('server', 'list engines', 'mllm list engines --config ~/server.yaml');
-  writeFileSync(join(s, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B', 'host: gpu-box\n'));
-  run('server', 'deploy on host', 'mllm deploy model --file my-model.yaml --config ~/server.yaml');
-  await sleep(4000);
-  run('server', 'start on host', 'mllm start deployment my-model --wait --config ~/server.yaml > /dev/null; mllm list deployments --config ~/server.yaml');
+  writeFileSync(join(s, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B'));
+  run('server', 'deploy on host', 'mllm deploy model --file my-model.yaml --activate --wait --config ~/server.yaml > /dev/null; echo exit $?');
+  run('server', 'list on server', 'mllm list deployments --config ~/server.yaml');
   run('server', 'request on server', curlChat(38443, 'my-model', false, SERVER_KEY));
+  run('server', 'park on server', 'mllm park deployment my-model --config ~/server.yaml > /dev/null; sleep 3; mllm list deployments --config ~/server.yaml');
 }
 
 try {
@@ -287,4 +308,5 @@ try {
 } finally {
   for (const c of children) stop(c);
   await sleep(3000);
+  killLeftovers();
 }

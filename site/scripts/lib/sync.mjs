@@ -36,6 +36,28 @@ export function expandIncludes(md, sourcePath, read) {
   }).join('\n');
 }
 
+// An SVG image on a line of its own is embedded inline, so it takes the
+// site's theme colours; on GitHub the same line shows it as an image.
+const SVG_IMAGE = /^!\[[^\]]*\]\(([^)\s]+\.svg)\)$/;
+
+export function inlineSvgs(md, sourcePath, read) {
+  let open = null;
+  return md.split('\n').map((line) => {
+    const f = line.match(FENCE);
+    if (f) {
+      if (!open) open = f[1];
+      else if (line.startsWith(open) && line.trim() === open) open = null;
+      return line;
+    }
+    const m = !open && line.match(SVG_IMAGE);
+    if (!m) return line;
+    const repoPath = path.normalize(path.join(path.dirname(sourcePath), m[1]));
+    const svg = read(repoPath).replace(/^<\?xml[^>]*>\s*/, '').trim();
+    if (/\n\s*\n/.test(svg)) throw new Error(`${repoPath}: a blank line would end the inline SVG early`);
+    return `<figure class="diagram">\n${svg}\n</figure>`;
+  }).join('\n');
+}
+
 function rewriteOutsideFences(md, fn) {
   let open = null;
   return md.split('\n').map((line) => {
@@ -75,6 +97,7 @@ export function toStarlight(md, page, pages, repoUrl, read, { settings, banner, 
     body = body.slice(h1[0].length);
   }
   if (!title) throw new Error(`${page.source}: no title and no H1`);
+  body = inlineSvgs(body, page.source, read);
   body = rewriteOutsideFences(body, (href) => rewriteLink(href, page.source, pages, repoUrl, base));
   body = expandIncludes(body, page.source, read);
   const head = [`title: ${JSON.stringify(title)}`];
