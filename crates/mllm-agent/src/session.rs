@@ -38,6 +38,15 @@ pub trait SessionExecution: Send + Sync {
     fn inventory(&self) -> Option<pb::ReportInventory> {
         None
     }
+    /// The inventory a new session publishes first. Unlike [`Self::inventory`]
+    /// it may block, bounded, for a fresh device sample: it runs off the
+    /// session loop, before any heartbeat is due. Publication refuses an
+    /// unobserved or stale domain, so a first inventory that raced the GPU
+    /// collector ended every host's first session (found on a fresh
+    /// discrete-GPU host, 2026-09-26).
+    fn session_inventory(&self) -> Option<pb::ReportInventory> {
+        self.inventory()
+    }
     fn connected(&self, _session: u64) -> Result<(), SessionError> {
         Ok(())
     }
@@ -489,6 +498,36 @@ impl Drop for Fence {
         let _ = self.journal.disconnect(self.session);
     }
 }
+/// The inventory a new session publishes: the executor's (with a fresh
+/// device sample), else the accepted profile set's with its measured domains
+/// read again, else the startup snapshot. SPEC §§4.2, 13: publication refuses
+/// an observation older than the policy's TTL, and the startup snapshot is
+/// taken before the installations are measured, which on a real engine
+/// environment takes longer than that TTL.
+fn first_inventory(
+    execution: Option<&dyn SessionExecution>,
+    updates: Option<&ProfileUpdates>,
+    startup: pb::ReportInventory,
+) -> pb::ReportInventory {
+    if let Some(inventory) = execution.and_then(|e| e.session_inventory()) {
+        return inventory;
+    }
+    let Some(updates) = updates else {
+        return startup;
+    };
+    let set = updates.profiles.accepted();
+    let mut inventory = set.inventory.clone();
+    if let Ok(reading) = crate::memory::read_host_memory() {
+        let document = &set.config.document;
+        let gpu = (!crate::device_domains::device_domains(document).is_empty())
+            .then(crate::gpu_memory::sample)
+            .flatten();
+        inventory.domains =
+            crate::device_domains::startup_domains(document, &reading.memory, gpu.as_ref());
+    }
+    inventory
+}
+
 async fn connect_once(
     identity: &PendingEnrollment,
     journal: Arc<HostJournal>,
@@ -539,15 +578,13 @@ async fn connect_once(
     // made every reconnect fail publication (found live, U5 on host-a).
     // ADR 0018 §3: without a measured refresh, the accepted profile set's
     // inventory, so a reconnect publishes what the host now holds.
-    let mut inventory = execution
-        .as_ref()
-        .and_then(|e| e.inventory())
-        .or_else(|| {
-            updates
-                .as_ref()
-                .map(|u| u.profiles.accepted().inventory.clone())
-        })
-        .unwrap_or(startup_inventory);
+    let mut inventory = tokio::task::spawn_blocking({
+        let execution = execution.clone();
+        let updates = updates.clone();
+        move || first_inventory(execution.as_deref(), updates.as_deref(), startup_inventory)
+    })
+    .await
+    .map_err(end("inventory measurement failed"))?;
     inventory.envelope = Some(pb::Envelope {
         host_id: host.clone(),
         protocol_version: mllm_protocol::PROTOCOL_VERSION.into(),
@@ -1028,6 +1065,46 @@ mod tests {
                 matches!(refused_session(other.clone()), SessionEnd::Ended(_)),
                 "{other:?} stopped the reconnect loop"
             );
+        }
+    }
+
+    // T33 (SPEC §§4.2, 13): a host without an executor publishes its accepted
+    // set's inventory. Its measured domains are read again for every session,
+    // never sent as the startup snapshot, which is older than the policy's
+    // observation TTL once installations have been measured.
+    #[test]
+    fn a_session_without_an_executor_publishes_a_fresh_measurement() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut host = golden["input"]["host"].clone();
+        host["state_dir"] = "/home/operator/.local/state/mllm".into();
+        host["identity_dir"] = "/home/operator/.local/state/mllm/identity".into();
+        let config = mllm_config::remote_roles::HostConfig::parse(&host.to_string()).unwrap();
+        let reading = crate::memory::read_host_memory().unwrap().memory;
+        let stale = mllm_domain::resources::MemoryObservation {
+            sampled_at_ms: 1_000,
+            ..reading
+        };
+        let startup = pb::ReportInventory {
+            domains: crate::device_domains::startup_domains(&config.document, &stale, None),
+            ..Default::default()
+        };
+        assert!(!startup.domains.is_empty());
+        let updates = ProfileUpdates::new(crate::profiles::HostProfiles::new(
+            crate::profiles::ProfileSet::new(config, startup.clone()),
+        ));
+        let before = mllm_protocol::now_unix_ms();
+        let published = first_inventory(None, Some(&updates), startup);
+        assert_eq!(published.domains.len(), 1);
+        for domain in &published.domains {
+            assert!(
+                domain.observed_at_unix_ms >= before - 1_000,
+                "{} was published from the startup snapshot",
+                domain.domain_id
+            );
+            assert!(domain.capacity_bytes > 0);
         }
     }
 }

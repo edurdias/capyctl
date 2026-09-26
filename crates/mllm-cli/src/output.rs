@@ -45,6 +45,9 @@ impl ExitCode {
     /// ADR 0018 §7: a deploy named a runtime profile no allowed host
     /// publishes; nothing was stored.
     pub const PROFILE_NOT_PUBLISHED: Self = Self(24);
+    /// SPEC §6.4: a start refused while the deployment's stop is still
+    /// settling; retrying shortly, or `start --wait`, succeeds.
+    pub const STILL_STOPPING: Self = Self(25);
 }
 
 impl From<ExitCode> for u8 {
@@ -227,6 +230,7 @@ impl StructuredError {
             "agent_unreachable" => ExitCode::AGENT_UNREACHABLE,
             "not_interactive" => ExitCode::NOT_INTERACTIVE,
             "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
+            "still_stopping" => ExitCode::STILL_STOPPING,
             _ => ExitCode::UNSUPPORTED,
         }
     }
@@ -377,7 +381,7 @@ fn push_notice(subject: &str, controls: &serde_json::Value, notices: &mut Vec<St
             };
             notices.push(format!(
                 "warning: {subject} launches{scope} with vLLM development mode on (deep_park {deep_park} ({source}), sleep mode); \
-                 exposed controls: {}; mitigations in force: {}; not production-safe (SPEC §9.1)",
+                 exposed controls: {}; mitigations in force: {}; not production-safe; use it on isolated hosts only",
                 list("surface"),
                 list("mitigations"),
             ));
@@ -402,7 +406,7 @@ fn push_notice(subject: &str, controls: &serde_json::Value, notices: &mut Vec<St
             })
             .unwrap_or_default();
         notices.push(format!(
-            "note: {subject} serves {routes} without authentication on its {} listener ({}; accepted by owner decision)",
+            "note: {subject} serves {routes} without authentication on its {} listener ({}; a known and accepted limitation)",
             surfaces["listener"].as_str().unwrap_or("?"),
             surfaces["access"].as_str().unwrap_or("?"),
         ));

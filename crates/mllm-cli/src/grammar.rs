@@ -185,6 +185,26 @@ pub enum Command {
         name: String,
         drain: bool,
     },
+    /// Owner decision 2026-09-26: save a management API (its loopback address
+    /// and the admin token read from `key_file` or `MLLM_CONTEXT_KEY`) under
+    /// `name`, for client commands to use without `--config`.
+    ContextAdd {
+        name: String,
+        server: String,
+        key_file: Option<PathBuf>,
+    },
+    /// Make a saved context the current one.
+    ContextUse {
+        name: String,
+    },
+    /// The saved contexts, the current one marked.
+    ContextList,
+    /// Forget a saved context and its stored token.
+    ContextRemove {
+        name: String,
+    },
+    /// Which management API client commands use now, and why.
+    ContextShow,
 }
 
 impl Command {
@@ -264,6 +284,11 @@ impl Command {
             Command::EngineAdd { .. } => "engine add".into(),
             Command::EngineList => "engine list".into(),
             Command::EngineRemove { name, .. } => format!("engine remove {name}"),
+            Command::ContextAdd { name, .. } => format!("context add {name}"),
+            Command::ContextUse { name } => format!("context use {name}"),
+            Command::ContextList => "context list".into(),
+            Command::ContextRemove { name } => format!("context remove {name}"),
+            Command::ContextShow => "context show".into(),
         }
     }
 }
@@ -278,6 +303,8 @@ impl Command {
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// Where `init` and `invite` write their file. `--output json` also
+    /// prints JSON results, as `--format json` does.
     #[arg(long, global = true, value_name = "TARGET")]
     output: Option<String>,
     /// How a command that reads records prints them: an aligned table (the
@@ -294,6 +321,11 @@ struct Cli {
     /// $XDG_STATE_HOME/mllm, else ~/.local/state/mllm).
     #[arg(long, global = true, value_name = "DIR")]
     state_dir: Option<PathBuf>,
+    /// The saved management context a client command uses (see `mllm
+    /// context`). Wins over MLLM_CONTEXT and the current context; without
+    /// any, the server or standalone role running on this machine is used.
+    #[arg(long, global = true, value_name = "NAME")]
+    context: Option<String>,
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -415,6 +447,39 @@ enum CliCommand {
         #[command(subcommand)]
         action: EngineArgs,
     },
+    /// Save, pick, list and remove the management APIs client commands use
+    /// (`list`, `status`, `deploy`, `start`, `stop`, ...). Without a context,
+    /// they use the server or standalone role running on this machine.
+    Context {
+        #[command(subcommand)]
+        action: ContextArgs,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum ContextArgs {
+    /// Save a management API under a name. The address is a loopback one: a
+    /// role's own, or the local end of an SSH port forward to another
+    /// machine's management port. The admin token is read from --key-file (a
+    /// file holding the token, or a role's credentials file) or from
+    /// MLLM_CONTEXT_KEY, never from the command line, and stored owner-only.
+    Add {
+        name: String,
+        /// The management address, e.g. 127.0.0.1:7443.
+        #[arg(long, value_name = "ADDR")]
+        server: String,
+        /// The file holding the admin token.
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+    },
+    /// Make a saved context the current one.
+    Use { name: String },
+    /// The saved contexts; the current one is marked.
+    List,
+    /// Forget a saved context and its stored token.
+    Remove { name: String },
+    /// Which management API client commands use now, and why.
+    Show,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -1039,6 +1104,21 @@ impl From<CliCommand> for Command {
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },
             },
+            CliCommand::Context { action } => match action {
+                ContextArgs::Add {
+                    name,
+                    server,
+                    key_file,
+                } => Command::ContextAdd {
+                    name,
+                    server,
+                    key_file,
+                },
+                ContextArgs::Use { name } => Command::ContextUse { name },
+                ContextArgs::List => Command::ContextList,
+                ContextArgs::Remove { name } => Command::ContextRemove { name },
+                ContextArgs::Show => Command::ContextShow,
+            },
         }
     }
 }
@@ -1086,6 +1166,41 @@ pub struct Invocation {
     /// Owner decision 2026-09-25: `--management-listen` on `start
     /// standalone`.
     pub management_listen: Option<SocketAddr>,
+    /// Owner decision 2026-09-26: `--context <name>`, the saved management
+    /// context a client command uses.
+    pub context: Option<String>,
+}
+
+/// The command grammar. `--output` is accepted everywhere, but its help is
+/// shown only at the top level and on the commands that write a file with
+/// it (`init`, `invite`): each other subcommand gets a hidden copy, which
+/// clap then propagates instead of the visible one.
+fn cli_command() -> clap::Command {
+    let command = <Cli as clap::CommandFactory>::command();
+    let names: Vec<String> = command
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    names.into_iter().fold(command, |command, name| {
+        command.mut_subcommand(name.clone(), |sub| {
+            let output = clap::Arg::new("output")
+                .long("output")
+                .value_name("TARGET")
+                .global(true);
+            match name.as_str() {
+                "init" => sub.arg(output.value_name("FILE").help(
+                    "Where to write the generated document (default: the implicit \
+                     role document under the state directory)",
+                )),
+                "invite" => sub.arg(
+                    output
+                        .value_name("FILE")
+                        .help("Where to write the invitation; it is never printed"),
+                ),
+                _ => sub.arg(output.hide(true)),
+            }
+        })
+    })
 }
 
 /// Final review I13: the long `--help` text of `mllm` and of every
@@ -1098,7 +1213,7 @@ pub fn help_texts() -> Vec<(String, String)> {
             walk(sub, name, out);
         }
     }
-    let mut command = <Cli as clap::CommandFactory>::command();
+    let mut command = cli_command();
     command.build();
     let mut out = Vec::new();
     walk(&mut command, "mllm".into(), &mut out);
@@ -1110,7 +1225,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let mut cli = Cli::try_parse_from(args)?;
+    let matches = cli_command().try_get_matches_from(args)?;
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
     // SPEC §6.4 / §13: one request identity, one journal and one idempotency
     // key. ULID text is case-insensitive, so a retry typed in another case (or
     // any other spelling of the same value) is carried in canonical form.
@@ -1295,6 +1411,7 @@ where
         state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
         sets,
         management_listen,
+        context: cli.context,
     })
 }
 

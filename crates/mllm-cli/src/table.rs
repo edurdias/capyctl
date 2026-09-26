@@ -30,6 +30,8 @@ pub enum View {
     LocalEngines,
     /// `engine detect`
     Detected,
+    /// `context list`: the saved management contexts.
+    Contexts,
 }
 
 impl View {
@@ -45,6 +47,7 @@ impl View {
             Command::Status { .. } => Some(View::Status),
             Command::EngineList => Some(View::LocalEngines),
             Command::EngineDetect { .. } => Some(View::Detected),
+            Command::ContextList => Some(View::Contexts),
             _ => None,
         }
     }
@@ -79,6 +82,7 @@ pub fn render(view: View, value: &Value, names: &HostNames) -> String {
         View::Status => status(value, names),
         View::LocalEngines => local_engines(value),
         View::Detected => detected(value),
+        View::Contexts => contexts(value),
     }
 }
 
@@ -318,6 +322,26 @@ fn operation(op: &Value) -> String {
     out
 }
 
+/// An instance's LAST ERROR: the error it recorded (a placement refusal),
+/// else, when its latest operation failed, that failure's code and the first
+/// line of its message.
+fn last_error(instance: &Value) -> String {
+    if let Some(error) = instance["last_error"].as_str().filter(|e| !e.is_empty()) {
+        return clean(error);
+    }
+    let op = &instance["latest_operation"];
+    if op["state"] != "failed" {
+        return "-".into();
+    }
+    let message = op["reason"].as_str().and_then(|r| r.lines().next());
+    match (op["error_code"].as_str(), message) {
+        (Some(code), Some(message)) => clean(&format!("{code}: {message}")),
+        (Some(code), None) => clean(code),
+        (None, Some(message)) => clean(message),
+        (None, None) => "failed".into(),
+    }
+}
+
 fn status(value: &Value, names: &HostNames) -> String {
     let d = value;
     let startup = number(&d["startup"]["bytes"])
@@ -370,7 +394,7 @@ fn status(value: &Value, names: &HostNames) -> String {
                 text(&i["observed_state"]),
                 text(&i["lifecycle"]),
                 devices,
-                text(&i["last_error"]),
+                last_error(i),
             ]
         })
         .collect();
@@ -387,6 +411,23 @@ fn status(value: &Value, names: &HostNames) -> String {
         &instances,
     ));
     out
+}
+
+/// `context list`: one row per saved context, the current one marked `*`.
+fn contexts(value: &Value) -> String {
+    let rows: Vec<Vec<String>> = value["contexts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            vec![
+                if c["current"] == true { "*" } else { "" }.into(),
+                text(&c["name"]),
+                text(&c["server"]),
+            ]
+        })
+        .collect();
+    table(&["CURRENT", "NAME", "SERVER"], &rows)
 }
 
 fn engines(value: &Value) -> String {
@@ -634,6 +675,38 @@ mod tests {
         assert!(lines[4].contains("gpu-a"), "{out}");
         assert!(lines[4].ends_with("engine exited with code 1"), "{out}");
         assert!(!out.contains("tiers"), "latency stays in the JSON");
+    }
+
+    // T16: an instance whose launch failed shows the failure's code and
+    // message in LAST ERROR (the shape `status deployment` returns after a
+    // failed launch), not `-`.
+    #[test]
+    fn a_failed_launch_is_the_instance_last_error() {
+        let failed = json!({"error_code": "launch_failed",
+            "hint": "the engine exited before it was ready; check the deployment's engine_config",
+            "kind": "initialize", "state": "failed",
+            "reason": "launch failed: engine launch failed: the engine exited before readiness\nexit 1"});
+        let out = render(
+            View::Status,
+            &json!({"name": "toy", "kind": "model", "desired_state": "ready",
+                "observed_state": "failed", "ready_instances": 0, "desired_instances": 1,
+                "revision": "1", "latest_operation": failed,
+                "instances": [{"index": 0, "host_id": "01HOSTA", "observed_state": "failed",
+                    "lifecycle": "active", "devices": [{"id": "gpu0", "sharing": "shared"}],
+                    "last_error": null, "latest_operation": failed},
+                    {"index": 1, "host_id": "01HOSTA", "observed_state": "ready",
+                    "lifecycle": "active", "devices": [],
+                    "latest_operation": {"kind": "initialize", "state": "succeeded"}}]}),
+            &names(),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines[4].ends_with(
+                "launch_failed: launch failed: engine launch failed: the engine exited before readiness"
+            ),
+            "{out}"
+        );
+        assert!(lines[5].ends_with('-'), "{out}");
     }
 
     #[test]

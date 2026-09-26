@@ -110,7 +110,7 @@ pub fn legacy_engine_config(
                 if size != 1 {
                     return Err(refuse(format!(
                         "launch_settings.{field} is {size}: parallelism is reserved and \
-                         rendered from placement after ADR 0014 §3, and a multi-rank vLLM \
+                         rendered from placement by mllm, and a multi-rank vLLM \
                          launch has no mapping; stop the deployment and redeclare it"
                     )));
                 }
@@ -122,7 +122,7 @@ pub fn legacy_engine_config(
             {
                 return Err(refuse(
                     "launch_settings.cpu_offload_bytes is not zero: CPU offload is reserved \
-                     after ADR 0014 §3 and not offered to deployments",
+                     and not offered to deployments",
                 ));
             }
             if bytes(
@@ -132,7 +132,7 @@ pub fn legacy_engine_config(
             {
                 return Err(refuse(
                     "launch_settings.requested_budget.swap_space_bytes is not zero: swap \
-                     space is reserved after ADR 0014 §3 and not offered to deployments",
+                     space is reserved and not offered to deployments",
                 ));
             }
             let sleep = flag(settings, "enable_sleep_mode")?
@@ -143,7 +143,7 @@ pub fn legacy_engine_config(
             if residency.parks() && deep_park_enabled && !sleep {
                 return Err(refuse(
                     "launch_settings.enable_sleep_mode is false on a parking deployment: \
-                     sleep mode is derived from residency and deep parking after ADR 0014, \
+                     sleep mode is derived from residency and deep parking, \
                      and the running engine cannot be parked; stop it and redeclare the \
                      deployment with residency: restart_only",
                 ));
@@ -158,15 +158,15 @@ pub fn legacy_engine_config(
         Engine::Sglang => {
             if settings["recipe"].as_str() != Some(PINNED_SGLANG_RECIPE) {
                 return Err(refuse(
-                    "launch_settings.recipe is not the pinned SGLang recipe mllm accepted \
-                     before ADR 0014",
+                    "launch_settings.recipe is not the pinned SGLang recipe earlier \
+                     releases accepted",
                 ));
             }
             for field in ["tensor_parallel_size", "data_parallel_size"] {
                 if settings.get(field).is_some() && count(settings, field)? != 1 {
                     return Err(refuse(format!(
-                        "launch_settings.{field} is not 1: parallelism is reserved after \
-                         ADR 0014 §3"
+                        "launch_settings.{field} is not 1: parallelism is reserved \
+                         and rendered by mllm"
                     )));
                 }
             }
@@ -199,7 +199,7 @@ pub fn legacy_engine_config(
             {
                 return Err(refuse(
                     "launch_settings disagree with the park strategy derived from the \
-                     deployment's residency (ADR 0010)",
+                     deployment's residency",
                 ));
             }
             let prefill = flag(settings, "prefill_cuda_graphs")?.unwrap_or(false);

@@ -14,7 +14,8 @@ use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 use x509_parser::prelude::{FromDer, X509Certificate};
 const CA_FILE: &str = "controller-ca.json";
-const HOST_FILE: &str = "host-identity.json";
+/// The owner-only file holding the enrolled host's identity and key.
+pub const HOST_FILE: &str = "host-identity.json";
 #[derive(Debug, thiserror::Error)]
 #[error("identity enrollment failed")]
 pub struct EnrollmentError;

@@ -218,8 +218,8 @@ fn device_request_from_weights(
         ConfigError::new(
             ConfigErrorCode::NotMaterializable,
             "engine_config.memory.request",
-            "cannot size the device request: the checkpoint's weight size is not known yet \
-             (ADR 0014 §5, §7); it is sized once the checkpoint is measured",
+            "cannot size the device request: the checkpoint's weight size is not known yet; \
+             it is sized once the checkpoint is measured",
         )
     })?;
     // The standalone template's own arithmetic (`device_request`), so a
@@ -295,7 +295,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             ConfigErrorCode::MissingRequired,
             PATH,
             "declare memory.request or memory.kv_cache: an engine's own default takes all \
-             free memory, which SPEC §7.1 forbids (ADR 0014 §5)",
+             free memory, and mllm must know a deployment's memory before it starts",
         ));
     }
     for (path, value) in [
@@ -330,7 +330,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
                     ConfigErrorCode::NotMaterializable,
                     "engine_config.memory.request",
                     "cannot derive the memory request: the checkpoint's weight size is not \
-                     known yet (ADR 0014 §5, §7); declare memory.request",
+                     known yet; declare memory.request",
                 )
             })?;
             let kv = inputs
@@ -354,7 +354,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
                     ConfigErrorCode::NotMaterializable,
                     "engine_config.memory.kv_cache",
                     "cannot derive the KV cache: the checkpoint's weight size is not known \
-                     yet (ADR 0014 §5, §7); declare memory.kv_cache",
+                     yet; declare memory.kv_cache",
                 )
             })?;
             let kv = request
@@ -587,7 +587,7 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
                 ConfigErrorCode::NotMaterializable,
                 "engine_config.memory",
                 "cannot charge the host_backed weights copy: the checkpoint's weight size \
-                 is not known yet (ADR 0014 §5, §7)",
+                 is not known yet",
             )
         })?,
         _ => 0,
@@ -789,7 +789,7 @@ pub(super) fn normalize_engine_config(
         if raw.accept_extra_args != Some(true) {
             return Err(invalid(
                 "engine_config.extra_args",
-                "extra engine arguments need engine_config.accept_extra_args: true (ADR 0014 §6)",
+                "extra engine arguments need engine_config.accept_extra_args: true",
             ));
         }
         if inputs.security.extra_args == ExtraArgsPolicy::Denied {

@@ -4,6 +4,50 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## First-run UX, second pass, and management contexts — 2026-09-26 (branch `fix/first-run-ux-2`)
+
+Fixes from a first-run walk with the real binary, each with a regression test
+that failed first, plus the owner's 2026-09-26 decision on client contexts.
+CPU tests, fake installations and scripted management APIs only; none of this
+is qualification of an engine recipe. The host session fix was also checked
+by hand on this machine with fake engine environments (a server and five
+hosts, one declaring its discrete GPU as a device domain).
+
+- **`status` names a failed launch.** LAST ERROR falls back to the failed
+  latest operation's code and first message line instead of `-`.
+- **`start` right after `stop`.** `start --wait` waits, within the start's
+  window, for the stop to settle and then starts; a plain start refused
+  `runtime_retained` while stopping says so and exits 25 (`still_stopping`)
+  instead of 2.
+- **`start host`** prints a ready line like standalone's (state directory,
+  ingress listener, identity file). A fresh host's first control session was
+  refused ("host inventory publication refused") and reconnected: its first
+  inventory raced the GPU collector on a host declaring a device domain, so the
+  device was published unobserved. A host with no executor (no ingress) sent
+  the startup snapshot, older than the observation TTL once installations had
+  been measured, and was refused on every session. The first inventory of a
+  session now waits (bounded, off the session loop) for a device sample, and a
+  host with no executor measures its domains again per session.
+- **`init host`** leaves the models directory to the shared default
+  (`~/models`, downloads in `~/models/sources`, allowed) and writes the
+  resource policy standalone derives from the same machine, so the generated
+  document validates as written.
+- **Plain runtime wording.** Warnings and validation errors no longer cite
+  requirement sections or decision records; the wording gate now scans string
+  literals in the CLI and configuration crates.
+- **`--output` help** is shown at the top level and on `init` and `invite`
+  only; the flag still parses anywhere.
+- **Management contexts** (owner decision 2026-09-26). Client commands find
+  their management API without `--config`: `--context`/`--config` >
+  `MLLM_CONTEXT` > the current saved context > the role running on this
+  machine (credentials and recorded address under the state root; with both a
+  server and a standalone role recorded, the one that answers). `mllm context
+  add|use|list|remove|show`; tokens come from `--key-file` or
+  `MLLM_CONTEXT_KEY` and are stored owner-only. Needs owner attention: the
+  management API stays loopback-only (network guide, every release), so a
+  context's address must be loopback; another machine is reached through an
+  SSH port forward rather than a TLS management listener.
+
 ## Discrete GPU live re-check after the fix wave — 2026-09-26 (branch `feat/discrete-gpu-network`)
 
 Live re-check of the rows the final review left owed, with the branch's

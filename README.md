@@ -161,35 +161,38 @@ mllm init server --output server.yaml
 # edit server.yaml: listeners and enrollment addresses (docs/examples/server.yaml)
 mllm validate config --file server.yaml
 mllm start server --config server.yaml
-mllm invite host gpu-box --output gpu-box.join --config server.yaml
+mllm invite host gpu-box --output gpu-box.join
 ```
 
 Copy `gpu-box.join` to the GPU machine, then:
 
 ```bash
 mllm init host --output host.yaml
-# edit host.yaml: name, model store, resource policy and engine
-# installations (docs/examples/host.yaml)
+# host.yaml validates as written (limits derived from this machine, models
+# in ~/models); edit its name and ingress (docs/examples/host.yaml)
 mllm validate config --file host.yaml
 mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
 ```
 
-Back on the server machine, deploy through the server:
+Back on the server machine, deploy through the server. Client commands find
+the server (or standalone role) running on this machine by themselves; to
+manage it from another machine, save it as a context (`mllm context add`, see
+[`docs/operations/configuration.md`](docs/operations/configuration.md#management-contexts)).
 
 ```bash
-mllm list hosts --config server.yaml
-mllm deploy model --file deployment.yaml --activate --wait --config server.yaml
-mllm list deployments --config server.yaml
-mllm park deployment <name> --config server.yaml
+mllm list hosts
+mllm deploy model --file deployment.yaml --activate --wait
+mllm list deployments
+mllm park deployment <name>
 ```
 
 ```text
-$ mllm list hosts --config server.yaml
+$ mllm list hosts
 NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
 gpu-box   online   yes        0.1.0-rc.4   supported       88.3 GiB / 119.7 GiB    vllm,sglang
 
-$ mllm list deployments --config server.yaml
+$ mllm list deployments
 NAME           KIND    DESIRED   STATE    READY   REVISION   HOSTS
 qwen3-8b       model   ready     ready    1/1     1          gpu-box
 llama-3.1-8b   model   parked    parked   0/1     2          gpu-box

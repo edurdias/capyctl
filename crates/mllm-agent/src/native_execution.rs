@@ -1618,6 +1618,17 @@ impl SessionExecution for NativeHostExecution {
             .unwrap_or_default()
         }))
     }
+    fn session_inventory(&self) -> Option<pb::ReportInventory> {
+        // SPEC §§4.2, 13: a new session's first inventory waits (bounded) for
+        // a device sample, so it never publishes a declared device as
+        // unobserved only because the collector was still running. The
+        // sample becomes the cached reading `inventory` reports.
+        let declared = !device_domains(&self.profiles.accepted().config.document).is_empty();
+        if let Some(gpu) = self.gpu.as_ref().filter(|_| declared) {
+            let _ = gpu.fresh();
+        }
+        self.inventory()
+    }
     fn inventory(&self) -> Option<pb::ReportInventory> {
         // ADR 0018 §3: the accepted set describes what this host publishes.
         let set = self.profiles.accepted();

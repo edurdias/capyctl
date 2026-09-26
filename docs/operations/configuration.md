@@ -49,9 +49,53 @@ one of them overrides the document, the role uses it (its identity under
 `<state dir>/identity`) and prints one notice naming what it overrode.
 `join host` follows the same rule and takes `--set` like `start host`. A standalone document may state
 `server.state_dir` and `host.state_dir` only as `<state root>/server` and
-`<state root>/host`. Client commands (`mllm status`, `mllm deploy`, ...) find a
-standalone role's credentials under the state root, so they need the same
-`--state-dir` or `MLLM_STATE_DIR` as the role.
+`<state root>/host`. Client commands (`mllm status`, `mllm deploy`, ...) find
+the role running on this machine under the state root (see [Management
+contexts](#management-contexts)), so they need the same `--state-dir` or
+`MLLM_STATE_DIR` as the role, or a saved context.
+
+## Management contexts
+
+Client commands (`list`, `status`, `deploy`, `start`, `stop`, `park`, `delete`,
+`drain`, `revoke`, `invite`, ...) talk to a server's or a standalone role's
+management API. They find it without `--config`, first match wins:
+
+| Setting | YAML | Flag | Variable | Default |
+|---|---|---|---|---|
+| Management context | `current` in `~/.config/mllm/contexts.yaml` (`mllm context use <name>`) | `--context <name>` (or `--config <server or standalone document>`) | `MLLM_CONTEXT` | the role running on this machine |
+
+With no flag, variable or current context, a client command uses the role
+whose state is under the state root: the credentials it keeps there and the
+management address it recorded when it started. When both a server and a
+standalone role keep state there, the one that answers is used; when both or
+neither answer, the command is refused, naming both and how to pick one.
+`--context` and `--config` together are refused.
+
+A context names a management address and the admin token to use with it:
+
+```bash
+mllm context add lab --server 127.0.0.1:7443 --key-file ~/.local/state/mllm/identity/server-credentials.json
+mllm context use lab          # the current context
+mllm context list             # the current one is marked *
+mllm context show             # which API client commands use now, and why
+mllm context remove lab
+```
+
+`--key-file` names a file holding the token, a server's
+`server-credentials.json` or a standalone role's `identity/credentials`. The
+token may instead come from `MLLM_CONTEXT_KEY`; it is never a command-line
+value. `context add` stores a copy owner-only (0600) in
+`~/.config/mllm/contexts/<name>.key`, and `contexts.yaml` (also 0600) holds
+only names, addresses and key-file paths. The management API is served on
+loopback only, so a context's address is a loopback one. To manage another
+machine, forward its management port over SSH and save the forwarded
+address:
+
+```bash
+ssh -N -L 17443:127.0.0.1:7443 gpu-server &
+mllm context add gpu-server --server 127.0.0.1:17443 --key-file server-credentials.json
+mllm --context gpu-server list hosts
+```
 
 ## Listeners
 

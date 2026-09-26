@@ -87,13 +87,13 @@ pub enum FieldSpec {
 /// ADR 0014 §1: the host profile's engine tuning moved to the deployment.
 pub const LAUNCH_SETTINGS_MOVED: &str =
     "engine tuning moved from the host profile's `launch_settings` to the deployment's \
-     `engine_config` (ADR 0014 §1); the host keeps executable, environment, security \
+     `engine_config`; the host keeps executable, environment, security \
      and host-fixed `args` only";
 
 /// ADR 0008: a Hugging Face revision is itself the pinned commit.
 pub const LOCKED_COMMIT_MOVED: &str =
     "`locked_commit` is retired: `revision` must itself be the full commit SHA \
-     (ADR 0008 model sources accept pinned revisions only)";
+     (model sources accept pinned revisions only)";
 
 /// Empty allowlist for nested blocks with no F0 consumer yet: rejects
 /// every unknown key, accepts only empty mappings.

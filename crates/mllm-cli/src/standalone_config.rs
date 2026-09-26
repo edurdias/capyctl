@@ -129,7 +129,6 @@ pub fn host_policy(
     inventory: Option<&InventoryPublication>,
     shape: &HostShape,
 ) -> Value {
-    let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     // ADR 0018 §5: role-level fields (model store, ports, hardware
     // fingerprint) come from the first installation; every installation is
     // one profile. The provider never returns an empty list.
@@ -137,6 +136,40 @@ pub fn host_policy(
         .first()
         .expect("a standalone host publishes at least one installation")
         .installation;
+    let profiles: serde_json::Map<String, Value> = installations
+        .iter()
+        .map(|named| (named.profile.clone(), runtime_profile(&named.installation)))
+        .collect();
+    json!({
+        "schema_version": 1,
+        "kind": "host",
+        "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
+        "hardware_fingerprint": format!("standalone-{}", engine_name(first.engine)),
+        "environment_fingerprint": environment_fingerprint,
+        // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
+        // the native launch asserts against. Absent (null) when the host
+        // observed no inventory, which normalizes back to `None`.
+        "device_inventory_digest": inventory.map(|published| published.digest.clone()),
+        // Spec §7: a relative model path resolves against this, so the host states
+        // it rather than having a directory guessed for it.
+        "model_store": {"path": first.models_root.to_string_lossy()},
+        "runtime_profiles": profiles,
+        "resource_policy": resource_policy(capacity_bytes, inventory, shape, first.engine_ports),
+    })
+}
+
+/// The resource policy a host derives from what it observes: its memory
+/// capacity and GPU shape (the conservative fractions above), the engines'
+/// port range and the default queue. Standalone publishes it at every start;
+/// `init host` writes it into a new host document (standalone is a server
+/// plus one host, with the same defaults).
+pub fn resource_policy(
+    capacity_bytes: i64,
+    inventory: Option<&InventoryPublication>,
+    shape: &HostShape,
+    engine_ports: (u16, u16),
+) -> Value {
+    let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let (domains, devices) = match shape {
         HostShape::Unified | HostShape::NoGpu => {
             let mut gpu0 = json!({"domain": DOMAIN, "sharing": "shared"});
@@ -205,33 +238,15 @@ pub fn host_policy(
             (Value::Object(domains), Value::Object(devices))
         }
     };
-    let profiles: serde_json::Map<String, Value> = installations
-        .iter()
-        .map(|named| (named.profile.clone(), runtime_profile(&named.installation)))
-        .collect();
     json!({
-        "schema_version": 1,
-        "kind": "host",
-        "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
-        "hardware_fingerprint": format!("standalone-{}", engine_name(first.engine)),
-        "environment_fingerprint": environment_fingerprint,
-        // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
-        // the native launch asserts against. Absent (null) when the host
-        // observed no inventory, which normalizes back to `None`.
-        "device_inventory_digest": inventory.map(|published| published.digest.clone()),
-        // Spec §7: a relative model path resolves against this, so the host states
-        // it rather than having a directory guessed for it.
-        "model_store": {"path": first.models_root.to_string_lossy()},
-        "runtime_profiles": profiles,
-        "resource_policy": {
             "domains": domains,
             "devices": devices,
             "device_sharing": "shared",
             "max_parked": MAX_PARKED,
             "observation_ttl": "2s",
             "endpoint_port_range": {
-                "start": first.engine_ports.0,
-                "end": first.engine_ports.1
+                "start": engine_ports.0,
+                "end": engine_ports.1
             },
             "planner_max_states": 4096,
             "queue": {
@@ -241,7 +256,6 @@ pub fn host_policy(
                 "max_buffered_bytes_total": "64MiB",
                 "request_deadline": "1800s"
             }
-        }
     })
 }
 
