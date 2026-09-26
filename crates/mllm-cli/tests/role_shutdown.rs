@@ -1829,3 +1829,33 @@ fn a_standalone_start_takes_its_drain_bound_from_set_then_env_then_document() {
         .env("MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT", "6s");
     assert_eq!(bound_after(&mut command), json!(7));
 }
+
+/// T37 (design §9 "Where the key is", final review I11): each role's ready
+/// line names the owner-only credentials file that holds the API key, and
+/// never carries the key itself.
+#[test]
+fn the_ready_lines_name_the_credentials_file_never_the_key() {
+    let installation = Installation::new();
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    let (ready, _) = run_until_ready(&mut command, |line| line.starts_with("standalone ready"));
+    let credentials = installation.state().join("identity/credentials");
+    assert!(
+        ready.contains(&format!("credentials {}", credentials.display())),
+        "{ready}"
+    );
+    assert!(!ready.contains(&installation.api_key()), "{ready}");
+
+    let (_root, state, config) = server_installation(&format!("127.0.0.1:{}", free_port()));
+    let mut command = server_command(&state);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (banner, _) = run_until_ready(&mut command, |line| line.contains("\"role\":\"server\""));
+    let banner: Value = serde_json::from_str(&banner).unwrap();
+    let path = banner["credentials"]
+        .as_str()
+        .expect("the credentials path");
+    assert!(path.ends_with("server-credentials.json"), "{banner}");
+    let stored: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let key = stored["api_key"].as_str().unwrap();
+    assert!(!banner.to_string().contains(key), "{banner}");
+}

@@ -1339,6 +1339,12 @@ pub async fn start_standalone_configured_with_overrides(
     .await
 }
 
+/// Design §9: the owner-only file of a standalone state root that holds the
+/// API key and the admin token (`identity/credentials`).
+pub fn credentials_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("identity").join("credentials")
+}
+
 /// No generic override.
 fn no_overrides() -> SettingOverrides {
     SettingOverrides::none(ConfigKind::Standalone)

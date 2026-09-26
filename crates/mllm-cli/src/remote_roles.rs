@@ -635,8 +635,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         );
     println!(
         "{}",
+        // Design §9 ("Where the key is"): the owner-only file holding the
+        // API key and admin token, never the key itself.
         json!({"role":"server","management":config.management.to_string(),
-            "inference":config.inference.to_string(),"state_dir":config.state_dir})
+            "inference":config.inference.to_string(),"state_dir":config.state_dir,
+            "credentials":config.identity_dir.join("server-credentials.json")})
     );
     // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
     let management_stopped = stopped.clone();

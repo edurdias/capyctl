@@ -425,9 +425,12 @@ async fn serve_standalone(
         app.management_router(),
         stopped,
     ));
+    // Design §9 ("Where the key is"): the ready line names the owner-only
+    // credentials file that holds the API key, never the key.
     println!(
-        "standalone ready (state_dir {}; inference listener {inference_address})",
-        state_dir.display()
+        "standalone ready (state_dir {}; inference listener {inference_address}; credentials {})",
+        state_dir.display(),
+        roles::credentials_path(state_dir).display()
     );
     let failed = tokio::select! {
         _ = signals.recv() => None,
