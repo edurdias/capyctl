@@ -128,7 +128,8 @@ fn validate_shows_the_effective_context() {
     let dir = tempfile::tempdir().unwrap();
     let models = dir.path().join("models");
     std::fs::create_dir_all(models.join("toy")).unwrap();
-    // 512 KiB of bfloat16 KV per token: the 4 GiB grant holds 8192.
+    // 512 KiB of bfloat16 KV per token: the 4 GiB grant holds 8192, of
+    // which vLLM keeps one 16-token block (8176).
     std::fs::write(
         models.join("toy/config.json"),
         json!({
@@ -145,7 +146,7 @@ fn validate_shows_the_effective_context() {
     let mut doc = golden()["input"]["deployment"].clone();
     doc["model"]["path"] = json!(models.join("toy"));
     for (declared, expected) in [
-        (None, json!({"tokens": 8192, "source": "fitted"})),
+        (None, json!({"tokens": 8176, "source": "fitted"})),
         (Some(2048), json!({"tokens": 2048, "source": "declared"})),
     ] {
         if let Some(tokens) = declared {

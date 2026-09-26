@@ -79,16 +79,17 @@ fn sglang_context(effective: &EffectiveDeployment) -> Option<u32> {
     frozen.settings().common.context_length
 }
 
-// T14: the fitted value reaches vLLM's `--max-model-len`.
+// T14: the fitted value reaches vLLM's `--max-model-len`, one 16-token
+// block short of the grant (vLLM keeps a null block).
 #[test]
 fn vllm_renders_the_context_fitted_to_the_grant() {
     let (_store, effective) = resolved("vllm", Some(&dense()), |_, _| {});
-    assert_eq!(max_model_len(&vllm_argv(&effective)), Some("8192"));
+    assert_eq!(max_model_len(&vllm_argv(&effective)), Some("8176"));
     // An fp8 KV cache holds twice the tokens.
     let (_store, effective) = resolved("vllm", Some(&dense()), |d, _| {
         d["engine_config"]["kv_cache_dtype"] = json!("fp8");
     });
-    assert_eq!(max_model_len(&vllm_argv(&effective)), Some("16384"));
+    assert_eq!(max_model_len(&vllm_argv(&effective)), Some("16368"));
 }
 
 // T14: the fitted value reaches SGLang's `context_length` setting, which the
