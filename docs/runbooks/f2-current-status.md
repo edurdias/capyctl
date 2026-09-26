@@ -68,19 +68,61 @@ row above exercised the fix):
 
 Open, not fixed here:
 
-- The switch planner decides park or stop from the ledger only. On a host
-  whose other programs hold much of the RAM, host RAM refuses a planned park or
-  start at arm; it no longer stalls (refused or reclaimed), but `host_backed`
-  switching on this host always ends in a reclaim and a cold start.
-- `status deployment` shows the host's first registered installation, not the
-  deployment's (a vLLM deployment showed SGLang 0.5.20).
-- A request that arrives while the checkpoint digest is measured is answered 429
-  "no room could be made ... after 3 switch round(s)".
 - An SGLang profile takes no host-fixed arguments, so the Triton attention
   backend goes in each SGLang deployment's `extra_args` (`engine add --arg`
   is refused for SGLang).
-- A switch park refused for host RAM is reported `released: stopped`, not
-  `stopped (host RAM full)`.
+
+### Final review fix wave — 2026-09-26 (commits `9a39596..` the commit recording this)
+
+The whole-branch review (`2fbcc48`) found 1 critical and 14 important
+issues. Fixed on CPU, each with a regression test that failed before; CPU and
+Fake-engine tests are not qualification, so the live rows below are still
+owed:
+
+- **Upgrade of a generated policy (C1, the DG6 blocker).** Standalone replaces
+  its generated resource policy on the first start that observes another
+  machine shape: engines charged under the old policy are stopped by the
+  ordinary Stop first (only verified cleanup releases them), the policy, keys
+  and epoch change in one transaction, deployments are re-sized from their
+  stored documents (one that names the old domain is listed with what to do),
+  and a one-time notice says so. A hand-written host policy is never replaced;
+  a changed shape is refused with the recorded and declared domains and the
+  recovery steps. ADR 0019 §10a. Owed live: DG6 upgrade from 0.1.0-rc.4.
+- **Planner and memory (I3, I4, M9).** The device domain is charged the
+  request plus the engine's CUDA context and graphs (1.25 GiB placeholder;
+  vLLM held 13.2 GiB against 12.0), so vLLM now needs a card of about 10 GiB
+  or more; a smaller card boots and refuses each vLLM deployment. Park or
+  stop is decided from the host's fresh observation as well as the ledger, so
+  DG1's host_backed parks that host RAM cannot take are planned stops; a park
+  refused for memory is reported `stopped (host RAM full)`. Owed live: DG1
+  switching.
+- **One rule for every host shape (I5, owner rule 2026-09-26).** Resident
+  crediting (parked owners, a park's own charge, `RssShmem`) and the
+  switch-park refusal are the same on unified and discrete hosts. Owed live:
+  one unified switching row on each lab host.
+- **SGLang saver permissions (I2).** A library that fails the owner-only rule
+  is observed with one warning in the engine log instead of refused. Owed
+  live: DG3 parking on the discrete-GPU laptop host.
+- **Configuration and network (I1, I8, I9, I10, I11, I12, I13).** A
+  read-only document keeps the new inference default while the migration is
+  pending; the server takes `--management-listen` / `MLLM_MANAGEMENT_ADDR`,
+  clients find a role by its recorded management address, a disagreeing
+  state root is refused, `join host --set` works; `devices: [{id: gpu1}]`
+  parses; `validate config` runs the start's standalone checks and reports
+  unknown weights as unknown; ready lines name the credentials file; the
+  tarball ships the linked guides with a link check; help and shipped
+  documents carry no process wording (a gate enforces it).
+- **Heterogeneous GPUs (I7).** A GPU too small for a model is excluded for
+  that deployment; the host is refused only when no GPU fits. No multi-GPU
+  live row exists.
+- **Minor (M4, M10, M11, M12, M19) and tests (I14).** `device_unobserved` has
+  a hint; status names the deployment's installation; a request while the
+  checkpoint is measured is a retryable "starting"; concurrent arrivals join
+  one activation; the flaky native vLLM tests take ports outside the ephemeral
+  range; every CLI test runs against an isolated home.
+- **Not done here (I6).** The GB10 PCI/UUID cross-check has a fixture with
+  both collectors' formats; the unified standalone boot on each lab host is
+  still owed live.
 
 ## Single-box benchmark through mllm — 2026-09-25 (branch `test/model-benchmark`)
 
@@ -2778,16 +2820,11 @@ requires its own recipe and evidence under SPEC §11.
 
 ## Owner attention
 
-- **Upgrade of a standalone on a discrete-GPU machine (blocker, found
-  2026-09-26).** A 0.1.0-rc.4 standalone state on such a machine stored a
-  unified resource policy; this branch derives `system` + `gpu0` for the same
-  machine, and the start refuses the changed policy context
-  (`resource policy revision conflict`). Decide: keep an existing unified
-  policy until the operator resets it, migrate it when nothing is charged, or
-  refuse with a clear message and a reset procedure.
-- **SGLang parking on the discrete-GPU laptop host** needs its SGLang
-  environment's files made non-group-writable (`chmod -R g-w`), an engine
-  environment change left to the owner.
+- **Live rows owed by the final review fix wave (2026-09-26):** DG6 upgrade
+  from 0.1.0-rc.4 (policy migration), DG1 switching (observed-memory park or
+  stop), DG3 SGLang parking (saver permission warning), and one unified
+  switching row plus the unified standalone boot on each lab host (one
+  crediting rule; GB10 UUID cross-check).
 
 Two items from S1, 2026-09-18. `crates/mllm-cli/tests/live_interactive.rs`
 (the owner's, excluded from agent edits) uses `ParkPolicy::ExperimentalAllowed`,
