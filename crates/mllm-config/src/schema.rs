@@ -232,6 +232,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("deep_park", SCALAR),
         ("trust_remote_code", SCALAR),
         ("installation_drift", SCALAR),
+        // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit
+        // of the role's own installation, published as its `cuda_home`.
+        ("cuda_home", SCALAR),
     ]);
     const DOMAIN: FieldSpec = FieldSpec::Struct(&[
         ("managed_limit", BYTES),

@@ -18,6 +18,7 @@
 //! | installation drift | `local_engine.installation_drift` | `--installation-drift` | `MLLM_INSTALLATION_DRIFT` |
 //! | runtime directory | `runtime_dir` | `--runtime-dir` | `MLLM_RUNTIME_DIR` |
 //! | engine port range | `resource_policy.endpoint_port_range` | `--engine-ports` | `MLLM_ENGINE_PORTS` |
+//! | CUDA toolkit | `local_engine.cuda_home` | `--cuda-home` | `MLLM_CUDA_HOME` |
 //!
 //! The `local_engine` executables declare the role's unnamed installation:
 //! one of them is the runtime profile `local`, both are `local-vllm` and
@@ -44,6 +45,9 @@ pub const DEEP_PARK_ENV: &str = "MLLM_DEEP_PARK";
 pub const TRUST_REMOTE_CODE_ENV: &str = "MLLM_TRUST_REMOTE_CODE";
 pub const INSTALLATION_DRIFT_ENV: &str = "MLLM_INSTALLATION_DRIFT";
 pub const RUNTIME_DIR_ENV: &str = "MLLM_RUNTIME_DIR";
+/// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root of
+/// the role's own installation, published as its profile's `cuda_home`.
+pub const CUDA_HOME_ENV: &str = "MLLM_CUDA_HOME";
 /// The engines' loopback port range, `start-end`, for either role.
 pub const ENGINE_PORTS_ENV: &str = "MLLM_ENGINE_PORTS";
 /// The standalone-only name [`ENGINE_PORTS_ENV`] replaces. Still read, after
@@ -72,6 +76,7 @@ pub struct EngineOverrides {
     pub installation_drift: Option<InstallationDrift>,
     pub runtime_dir: Option<PathBuf>,
     pub engine_ports: Option<(u16, u16)>,
+    pub cuda_home: Option<PathBuf>,
 }
 
 impl EngineOverrides {
@@ -88,6 +93,7 @@ impl EngineOverrides {
             installation_drift: self.installation_drift.or(lower.installation_drift),
             runtime_dir: self.runtime_dir.or(lower.runtime_dir),
             engine_ports: self.engine_ports.or(lower.engine_ports),
+            cuda_home: self.cuda_home.or(lower.cuda_home),
         }
     }
 
@@ -130,6 +136,18 @@ impl EngineOverrides {
                 .transpose()?,
             runtime_dir: text(RUNTIME_DIR_ENV).map(PathBuf::from),
             engine_ports: ports,
+            cuda_home: text(CUDA_HOME_ENV)
+                .map(|value| {
+                    Some(PathBuf::from(&value))
+                        .filter(|path| path.is_absolute())
+                        .ok_or_else(|| {
+                            refuse(
+                                CUDA_HOME_ENV,
+                                format!("must be an absolute directory; got {value:?}"),
+                            )
+                        })
+                })
+                .transpose()?,
         })
     }
 
@@ -229,6 +247,7 @@ impl EngineOverrides {
                 .transpose()?,
             runtime_dir: path_of(block.get("runtime_dir"), "runtime_dir")?,
             engine_ports: ports,
+            cuda_home: path_of(local.get("cuda_home"), "local_engine.cuda_home")?,
         })
     }
 }
@@ -361,6 +380,9 @@ pub struct EngineSettings {
     pub runtime_dir: Option<PathBuf>,
     /// Stated, or `None`: [`DEFAULT_ENGINE_PORTS`].
     pub engine_ports: Option<(u16, u16)>,
+    /// Stated, or `None`: the engine PATH stays minimal (nothing is detected
+    /// for the role's own installation; `mllm engine add` detects one).
+    pub cuda_home: Option<PathBuf>,
 }
 
 /// Owner rule 2026-09-25: CLI flag > environment > YAML > default, setting by
@@ -382,6 +404,7 @@ pub fn resolve(
         installation_drift: merged.installation_drift.unwrap_or_default(),
         runtime_dir: merged.runtime_dir,
         engine_ports: merged.engine_ports,
+        cuda_home: merged.cuda_home,
     }
 }
 
@@ -484,7 +507,7 @@ pub fn apply_to_host(
                 deep_park: settings.deep_park,
                 installation_drift: settings.installation_drift,
                 args,
-                cuda_home: None,
+                cuda_home: settings.cuda_home.clone(),
             });
         profile["security"]["trust_remote_code"] = json!(settings.trust_remote_code);
         crate::registration::check_profile(name, &profile)?;
@@ -711,6 +734,22 @@ mod tests {
                     "None",
                 ],
             ),
+            (
+                "cuda_home",
+                EngineOverrides {
+                    cuda_home: Some("/flag/cuda".into()),
+                    ..Default::default()
+                },
+                vec![(CUDA_HOME_ENV, "/env/cuda")],
+                json!({"local_engine": {"cuda_home": "/yaml/cuda"}}),
+                |s| format!("{:?}", s.cuda_home),
+                [
+                    "Some(\"/flag/cuda\")",
+                    "Some(\"/env/cuda\")",
+                    "Some(\"/yaml/cuda\")",
+                    "None",
+                ],
+            ),
         ];
         for (name, flag, env, document, read, expected) in rows {
             let env = env_layer(&env).unwrap();
@@ -742,6 +781,7 @@ mod tests {
             (ENGINE_PORTS_ENV, "80-90"),
             (ENGINE_PORTS_ENV, "9000-8000"),
             (DEPRECATED_ENGINE_PORTS_ENV, "x"),
+            (CUDA_HOME_ENV, "relative/cuda"),
         ] {
             let error = env_layer(&[(key, value)]).unwrap_err();
             assert_eq!(error.path, key, "{key}={value:?}");
@@ -760,6 +800,10 @@ mod tests {
                 "local_engine.deep_park",
             ),
             (json!({"runtime_dir": "rel"}), "runtime_dir"),
+            (
+                json!({"local_engine": {"cuda_home": "cuda"}}),
+                "local_engine.cuda_home",
+            ),
             (
                 json!({"resource_policy": {"endpoint_port_range": {"start": 80, "end": 90}}}),
                 "resource_policy.endpoint_port_range",
@@ -809,6 +853,7 @@ mod tests {
                 engine_ports: Some((9000, 9099)),
                 runtime_dir: Some("/opt/mllm/runtime".into()),
                 args: Some(vec!["--enforce-eager".into()]),
+                cuda_home: Some("/usr/local/cuda-13.0".into()),
                 ..Default::default()
             },
             &EngineOverrides::default(),
@@ -822,6 +867,8 @@ mod tests {
         assert_eq!(profile["security"]["deep_park"], "disabled");
         assert_eq!(profile["security"]["trust_remote_code"], true);
         assert_eq!(profile["args"], json!(["--enforce-eager"]));
+        // SPEC §13.3 amendment: the stated CUDA toolkit is the profile's.
+        assert_eq!(profile["cuda_home"], "/usr/local/cuda-13.0");
         assert_eq!(document["runtime_dir"], "/opt/mllm/runtime");
         assert_eq!(
             document["resource_policy"]["endpoint_port_range"],

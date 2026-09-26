@@ -676,6 +676,8 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             "/opt/mllm/runtime",
             "--engine-ports",
             "9000-9099",
+            "--cuda-home",
+            "/usr/local/cuda-13.0",
             "--model-sources-path",
             "/data/downloads",
             "--hf-endpoint",
@@ -699,6 +701,7 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
                 installation_drift: Some(InstallationDrift::Refuse),
                 runtime_dir: Some("/opt/mllm/runtime".into()),
                 engine_ports: Some((9000, 9099)),
+                cuda_home: Some("/usr/local/cuda-13.0".into()),
             }
         );
         assert_eq!(

@@ -573,8 +573,10 @@ with them.
 **CUDA toolkit and compile jobs.** Engines compile some GPU kernels the first
 time they start. `mllm engine add` records the CUDA toolkit as the profile's
 `cuda_home`: `CUDA_HOME` if it holds `bin/nvcc`, otherwise `/usr/local/cuda`
-if that holds it. For the standalone environment installation, set
-`MLLM_CUDA_HOME`. The engine then gets `<cuda_home>/bin` on its PATH and
+if that holds it. For the role's own installation (`--vllm-bin`,
+`MLLM_VLLM_BIN` or `local_engine`, on a host or standalone), state it with
+`--cuda-home`, `MLLM_CUDA_HOME` or `local_engine.cuda_home`; nothing is
+detected for it. The engine then gets `<cuda_home>/bin` on its PATH and
 `CUDA_HOME` set; vLLM uses FlashInfer only when `nvcc` is found. Without
 `cuda_home`, the engine PATH has only the engine's own `bin` and the system
 directories.

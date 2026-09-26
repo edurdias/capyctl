@@ -19,6 +19,7 @@ identity_dir: /var/lib/mllm/host/identity
 # (docs/operations/configuration.md).
 # local_engine:
 #   vllm: /opt/vllm/bin/vllm
+#   cuda_home: /usr/local/cuda   # or --cuda-home, MLLM_CUDA_HOME
 hardware_fingerprint: example-hw-1
 environment_fingerprint: example-env-1
 # Relative model paths in deployments resolve under this directory.

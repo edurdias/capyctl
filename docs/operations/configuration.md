@@ -96,6 +96,7 @@ block.
 | When the installation's files change | `local_engine.installation_drift: warn\|refuse` | `--installation-drift warn\|refuse` | `MLLM_INSTALLATION_DRIFT` | `warn` | host, standalone |
 | mllm's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `MLLM_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
 | Engine port range (loopback) | `resource_policy.endpoint_port_range` (`start`, `end`) | `--engine-ports <start-end>` | `MLLM_ENGINE_PORTS` (`MLLM_STANDALONE_ENGINE_PORTS` still read, with a warning) | `8100-8199` | host, standalone |
+| CUDA toolkit for engine kernel builds | `local_engine.cuda_home` | `--cuda-home <dir>` | `MLLM_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
 
 A host generates no deployment of its own, so `--kv-cache` exists only on
 `start standalone`; on a host, `local_engine.kv_cache` is refused and each
@@ -155,7 +156,10 @@ mllm starts each engine with a closed environment. `MLLM_ENGINE_LOG`,
 `MLLM_EXTRA_APPROVALS`, `MLLM_RENDEZVOUS_DIR`, `MLLM_OBSERVATION_DIR`,
 `MLLM_VLLM_ADMIN_KEY`, `MLLM_ENGINE_API_KEY` and `MLLM_DEBUG_ENGINE_LOGS` are
 written by mllm for the engine process; setting them yourself has no effect.
-Other variables in mllm's own environment, such as `CUDA_HOME`, do not reach
-an engine, and mllm does not read `CUDA_HOME` itself.
+Other variables in mllm's own environment do not reach an engine. The CUDA
+toolkit is the exception by design: a profile's `cuda_home` (stated as above
+for the role's own installation, detected by `mllm engine add`, or written in
+`runtime_profiles`) puts `<cuda_home>/bin` on the engine's PATH and sets its
+`CUDA_HOME`.
 
 The installer has its own options; see [Install](install.md#installing-with-installsh).

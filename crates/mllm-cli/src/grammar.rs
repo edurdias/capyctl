@@ -556,6 +556,11 @@ struct RoleSettingsArgs {
     /// Wins over MLLM_ENGINE_PORTS and resource_policy.endpoint_port_range.
     #[arg(long, value_name = "START-END", value_parser = parse_engine_ports)]
     engine_ports: Option<(u16, u16)>,
+    /// The CUDA toolkit directory of the local engine (its bin/ joins the
+    /// engine PATH for JIT builds; default none). Wins over MLLM_CUDA_HOME
+    /// and local_engine.cuda_home.
+    #[arg(long, value_name = "DIR", value_parser = parse_engine_path)]
+    cuda_home: Option<PathBuf>,
 }
 
 impl RoleSettingsArgs {
@@ -584,6 +589,7 @@ impl RoleSettingsArgs {
             installation_drift: self.installation_drift,
             runtime_dir: self.runtime_dir.clone(),
             engine_ports: self.engine_ports,
+            cuda_home: self.cuda_home.clone(),
         }
     }
 }
