@@ -568,7 +568,7 @@ impl mllm_agent::session::SessionExecution for HungGpuHost {
     }
 }
 
-// T33 T26 (controller ruling, discrete GPU): device memory is sampled off the
+// T33 T26 (review decision, discrete GPU): device memory is sampled off the
 // session loop. A collector that hangs far longer than the heartbeat period
 // never delays a heartbeat (5 s of silence suspends the host); the device is
 // reported unobserved meanwhile instead of the loop waiting for it.

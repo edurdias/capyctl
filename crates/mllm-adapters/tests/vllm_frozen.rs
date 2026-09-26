@@ -253,7 +253,7 @@ fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
         )
     );
     // No UUID published for the selected GPU: its index pins it, never a
-    // pass-through of every GPU (controller ruling; see device_namespace.rs).
+    // pass-through of every GPU (review decision; see device_namespace.rs).
     assert_eq!(
         render(two, "gpu0"),
         (Some(CudaNamespace::PciIndex(0)), Some("0".to_string()))

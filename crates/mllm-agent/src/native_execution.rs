@@ -112,7 +112,7 @@ pub struct NativeHostExecution {
     /// runs only when the accepted policy declares a device domain, off the
     /// session loop, so a slow collector never delays a heartbeat.
     gpu: Option<Arc<crate::gpu_memory::CachedGpuSampler>>,
-    /// SPEC §13.2, §7.2 (controller ruling, discrete GPU design §4): the GPU
+    /// SPEC §13.2, §7.2 (review decision, discrete GPU design §4): the GPU
     /// sample each launch took just before the journal was locked, keyed by the
     /// command's canonical digest. A collector run is bounded at seconds, so it
     /// never runs under the journal's locks; the locked recheck reads this.
@@ -277,7 +277,7 @@ impl NativeHostExecution {
         }
     }
 
-    /// SPEC §13.2 (controller ruling): sample the GPU for `command` before the
+    /// SPEC §13.2 (review decision): sample the GPU for `command` before the
     /// journal is locked, so the locked recheck and the launch it admits read a
     /// sample taken moments ago without running the collector under the lock.
     /// A sample taken within the last second for the same command (its
@@ -520,7 +520,7 @@ impl NativeHostExecution {
             || effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != 1
-            // Discrete GPU design §7 (controller ruling): with a choice of
+            // Discrete GPU design §7 (review decision): with a choice of
             // GPU the launch pins the selected one; one it cannot pin (no
             // published UUID, no `gpuN` index) is refused before any effect.
             || effective.cuda_namespace().is_err()
@@ -902,7 +902,7 @@ impl NativeHostExecution {
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Result<(), LaunchError> {
-        // SPEC §13.2 (controller ruling): the durable attempt and the spawn
+        // SPEC §13.2 (review decision): the durable attempt and the spawn
         // recheck admission under the journal's locks; the GPU is sampled for
         // them now, before either lock is taken.
         let host = self.clone();
@@ -1095,7 +1095,7 @@ impl NativeHostExecution {
         {
             let host = self.clone();
             let admitted = command.clone();
-            // SPEC §13.2 (controller ruling): the GPU is sampled here, before
+            // SPEC §13.2 (review decision): the GPU is sampled here, before
             // the journal is locked; the locked recheck reads this sample.
             match tokio::task::spawn_blocking(move || {
                 host.pre_admit(&admitted)?;
@@ -2773,7 +2773,7 @@ mod tests {
         document["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
     }
 
-    /// ADR 0008 (controller ruling, discrete GPU design §5): the launch-time
+    /// ADR 0008 (review decision, discrete GPU design §5): the launch-time
     /// capability gate covers both parking tiers. A `host_backed` launch parks
     /// with SGLang's memory saver and weights CPU backup, or vLLM's sleep mode,
     /// which the probe's `deep_park` capability covers; a build the probe found

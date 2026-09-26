@@ -56,7 +56,7 @@ pub fn frozen_from_effective(
         .devices
         .get(&device.id)
         .and_then(|policy| policy.physical_gpu_uuid.clone());
-    // Discrete GPU design §7 (controller ruling): with a choice of GPU and no
+    // Discrete GPU design §7 (review decision): with a choice of GPU and no
     // published UUID, the selected GPU is pinned by its PCI-ordered index; one
     // that cannot be pinned either way is refused, never handed every GPU.
     let cuda_pci_index = match effective

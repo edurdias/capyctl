@@ -350,7 +350,7 @@ host and enroll the machine again as a new host).
 
 The design's error table listed `host_backed_unavailable` also for a build lacking the
 parking capability. The implementation reuses `capability_missing:deep_park` for that case
-(controller ruling, 2026-09-25): it avoids a new closed code across the probe, the parser
+(review decision, 2026-09-25): it avoids a new closed code across the probe, the parser
 and the protocol, at the cost of a less specific capability name in one refusal. The CLI
 maps each code to an existing exit (`StructuredError::closed_code`); no exit number is
 added.

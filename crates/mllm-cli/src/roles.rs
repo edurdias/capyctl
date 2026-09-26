@@ -618,7 +618,7 @@ fn device_totals(shape: &HostShape) -> std::collections::BTreeMap<u32, i64> {
 /// weights, so a local checkpoint that cannot be sized here (a path outside the
 /// store, a missing directory) is refused rather than given a guessed request.
 /// A Hugging Face or HTTP source is not on disk yet: `None`, and the request is
-/// sized once the download is measured (controller ruling, ADR 0014 §7).
+/// sized once the download is measured (review decision, ADR 0014 §7).
 fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<Option<i64>, StartError> {
     let ModelSource::Local { path } = source else {
         return Ok(None);
@@ -636,7 +636,7 @@ fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<Option
         })
 }
 
-/// Controller ruling (discrete GPU design §3): the KV cache the operator stated
+/// Review decision (discrete GPU design §3): the KV cache the operator stated
 /// with `MLLM_KV_CACHE_BYTES`, which a discrete template honours within the
 /// card or refuses. `None` when the installation carries the unified default.
 fn declared_kv_cache(installation: &EngineInstallation) -> Result<Option<i64>, StartError> {

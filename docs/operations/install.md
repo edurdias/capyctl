@@ -140,7 +140,7 @@ revoke and never exits with 14; the server unit does not either.
 
 ## Release contents
 
-A release (owner decision 2026-09-24: one self-contained binary, GitHub
+A release (decided 2026-09-24: one self-contained binary, GitHub
 Releases and `install.sh`; Homebrew is deferred) carries these assets:
 
 | Asset | Holds |
@@ -191,7 +191,7 @@ tarball and the installer locally.
 ## Installing with install.sh
 
 Release candidates are published as pre-releases on the GitHub Releases page
-of the private repository `edurdias/mllm` (owner decision
+of the private repository `edurdias/mllm` (decided
 2026-09-24; the repository opens later). Two things follow:
 
 - **You need a credential.** Run `gh auth login` first (preferred), or export

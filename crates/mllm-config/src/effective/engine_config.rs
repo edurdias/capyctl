@@ -181,7 +181,7 @@ struct RawSglangFields {
     tokenizer_workers: Option<u32>,
 }
 
-/// Controller ruling (discrete GPU design §3): how a memory request derived from
+/// Review decision (discrete GPU design §3): how a memory request derived from
 /// the checkpoint's weights is sized when the deployment's phases derive on a
 /// device domain (a discrete GPU). Absent everywhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,7 +813,7 @@ pub(super) fn normalize_engine_config(
         .map(parse_bytes)
         .transpose()?;
     let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
-    // Controller ruling (discrete GPU design §3): a request derived from the
+    // Review decision (discrete GPU design §3): a request derived from the
     // weights on a device domain is sized for the card, not with the unified
     // placeholder margin, which would not fit a small card.
     let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {

@@ -767,7 +767,7 @@ async fn a_model_larger_than_the_card_is_refused_at_deploy() {
     );
 }
 
-/// Controller ruling (design §3): the KV cache the operator stated with
+/// Review decision (design §3): the KV cache the operator stated with
 /// `MLLM_KV_CACHE_BYTES` is honoured on a discrete host when it fits the card
 /// with the checkpoint, and refused at deploy with the numbers and the
 /// variable when it does not; it is never silently replaced by the template's.
@@ -825,7 +825,7 @@ async fn a_discrete_standalone_honours_a_declared_kv_cache() {
     );
 }
 
-/// Controller ruling: a Hugging Face source is not refused on a discrete host
+/// Review decision: a Hugging Face source is not refused on a discrete host
 /// for being remote. Standalone decides it exactly as a unified host does, by
 /// the host's own `model_sources` policy (allowed by default since the owner
 /// decision of 2026-09-25); the sizing never refuses it. On a host that allows the source the

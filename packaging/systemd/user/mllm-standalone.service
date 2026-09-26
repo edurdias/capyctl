@@ -12,7 +12,7 @@
 # `shutdown.drain_timeout` of <state_dir>/config/standalone.yaml, and exits
 # without touching an engine.
 # The engines stay running in their own process groups and the next start
-# re-attaches them (crates/mllm-cli/src/shutdown.rs, owner decision P3). To
+# re-attaches them (crates/mllm-cli/src/shutdown.rs, decided 2026-09-22). To
 # stop the engines, drain explicitly BEFORE stopping the unit, as the service
 # user and with the same state directory:
 #

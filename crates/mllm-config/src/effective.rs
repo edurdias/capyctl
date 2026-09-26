@@ -518,7 +518,7 @@ pub struct DevicePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_gpu_uuid: Option<String>,
 }
-/// Discrete GPU design §7 (controller ruling): how an engine child's CUDA
+/// Discrete GPU design §7 (review decision): how an engine child's CUDA
 /// namespace is narrowed to the one GPU its launch selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CudaNamespace {
@@ -561,7 +561,7 @@ impl EffectiveDeployment {
         }
     }
 
-    /// Discrete GPU design §7 (controller ruling): the namespace a launch's
+    /// Discrete GPU design §7 (review decision): the namespace a launch's
     /// engine child is narrowed to. Where there is a choice of GPU (several
     /// devices) or the GPU is a discrete device domain, the selected GPU is
     /// always pinned: by the physical UUID the host published, else by its
@@ -1109,7 +1109,7 @@ pub fn resolve_effective_with_checkpoint(
         core::check_system_allocation(resources, &host)?;
     }
     // ADR 0014 §5: an explicit Ready phase states the memory request. On a
-    // discrete host (controller ruling, discrete GPU design §6) that is the
+    // discrete host (review decision, discrete GPU design §6) that is the
     // device allocation alone: the request sizes the engine on the card (vLLM's
     // utilization, SGLang's static fraction), and the system allocation beside
     // it is the engine process's host RAM, which the card does not hold.

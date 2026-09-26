@@ -954,7 +954,7 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
     std::fs::remove_file(&log).ok();
 }
 
-/// Discrete GPU design §7 (controller ruling): a GPU the host published no
+/// Discrete GPU design §7 (review decision): a GPU the host published no
 /// UUID for, on a host with a choice of GPU, is pinned by its index in PCI bus
 /// order; the child never inherits every GPU. A published UUID wins.
 // T27 T21

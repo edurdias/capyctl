@@ -1868,7 +1868,7 @@ async fn a_gpu_the_host_does_not_publish_refuses_the_launch() {
     assert!(fixture.record().is_none(), "no engine was started");
 }
 
-/// Discrete GPU design §7 (controller ruling): a host with two GPUs that
+/// Discrete GPU design §7 (review decision): a host with two GPUs that
 /// published no UUIDs still pins the chosen one, by its index in PCI bus
 /// order; the engine never inherits every GPU.
 // T27 T21
@@ -1901,7 +1901,7 @@ async fn the_chosen_gpu_without_a_uuid_is_pinned_by_its_pci_index() {
     assert_eq!(stopped.state, "completed");
 }
 
-/// Discrete GPU design §7 (controller ruling): with two GPUs, one the host
+/// Discrete GPU design §7 (review decision): with two GPUs, one the host
 /// names neither by a UUID nor by a `gpuN` index cannot be pinned, so the
 /// launch is refused `unauthorized` and nothing runs.
 // T27 T21
@@ -1949,7 +1949,7 @@ fn discrete_fixture() -> Fixture {
     fixture
 }
 
-/// SPEC §13.2, §7.2 (controller ruling, discrete GPU design §4, §6): the GPU
+/// SPEC §13.2, §7.2 (review decision, discrete GPU design §4, §6): the GPU
 /// collector is bounded at seconds, so a launch samples the card before the
 /// journal is locked and never while holding it; the locked rechecks read that
 /// sample. A slow sampler that looks at the journal from inside its own run

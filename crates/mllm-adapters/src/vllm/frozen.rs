@@ -182,7 +182,7 @@ pub fn plan_from_effective(
         api_key: None,
         engine_log: Some(engine_log),
         runtime_dir: Some(runtime_dir),
-        // Discrete GPU design §7 (controller ruling): with a choice of GPU the
+        // Discrete GPU design §7 (review decision): with a choice of GPU the
         // selected one is always pinned; one that cannot be is refused.
         cuda_namespace: effective
             .cuda_namespace()

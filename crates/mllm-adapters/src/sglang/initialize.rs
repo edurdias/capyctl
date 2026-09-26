@@ -197,7 +197,7 @@ pub(super) async fn initialize(
     if let Some(uuid) = device.physical_gpu_uuid.as_deref() {
         cmd.env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.into());
     } else if let Some(index) = device.cuda_pci_index {
-        // Discrete GPU design §7 (controller ruling): a host with a choice of
+        // Discrete GPU design §7 (review decision): a host with a choice of
         // GPU that published no UUID pins the selected one by its index, in
         // the PCI bus order `nvidia-smi` published it under.
         let namespace = mllm_config::effective::CudaNamespace::PciIndex(index);

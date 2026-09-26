@@ -580,8 +580,9 @@ struct RoleSettingsArgs {
     cuda_home: Option<PathBuf>,
 }
 
-/// Owner decision 2026-09-25: the generic override of any YAML setting of the
-/// role document, on the role starts.
+// Owner decision 2026-09-25: the generic override of any YAML setting of the
+// role document, on the role starts. (A `//` comment: a doc comment here
+// would become user-facing help text.)
 #[derive(Debug, Clone, PartialEq, Eq, Default, clap::Args)]
 struct SetArgs {
     /// Set any setting of the role document for this run, by its YAML path
@@ -625,6 +626,7 @@ impl RoleSettingsArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StartTarget {
+    /// Start the server role (the control plane for enrolled hosts).
     Server {
         /// Serve inference on this address for this run instead of the
         /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
@@ -632,7 +634,8 @@ enum StartTarget {
         /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
-        /// Serve inference without the API key for this run (design §9).
+        // Design §9.
+        /// Serve inference without the API key for this run.
         /// Every client that can reach the address can use the models; a
         /// non-loopback address prints a warning. Wins over
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
@@ -641,6 +644,7 @@ enum StartTarget {
         #[command(flatten)]
         overrides: SetArgs,
     },
+    /// Start the host role (runs engines for the server it joined).
     Host {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
@@ -650,6 +654,7 @@ enum StartTarget {
         #[command(flatten)]
         overrides: SetArgs,
     },
+    /// Start the standalone role (a server and one host in one process).
     Standalone {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
@@ -660,7 +665,8 @@ enum StartTarget {
         /// MLLM_INFERENCE_ADDR.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_listen)]
         listen: Option<SocketAddr>,
-        /// Serve inference without the API key for this run (design §9).
+        // Design §9.
+        /// Serve inference without the API key for this run.
         /// Every client that can reach the address can use the models; a
         /// non-loopback address prints a warning. Wins over
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
@@ -696,7 +702,8 @@ enum StartTarget {
         /// anything.
         #[arg(long)]
         evict: bool,
-        /// SPEC §6.4: wait until every instance of the deployment is ready.
+        // SPEC §6.4.
+        /// Wait until every instance of the deployment is ready.
         /// Exits 0 only then; a partial start is never a success. An instance
         /// not placed before the start's deadline exits 4
         /// (insufficient_resources), a failed launch 13 (operation_failed),
@@ -706,7 +713,8 @@ enum StartTarget {
         #[arg(long)]
         wait: bool,
     },
-    /// Owner decision Q7: start one instance, `<deployment>/<index>`.
+    // Owner decision Q7.
+    /// Start one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
         instance: (String, u32),
@@ -718,7 +726,8 @@ enum StartTarget {
         /// with the same switch plan a waiting request uses, and report them.
         #[arg(long)]
         evict: bool,
-        /// SPEC §6.4: wait for the start's operation to finish; a failure
+        // SPEC §6.4.
+        /// Wait for the start's operation to finish; a failure
         /// prints the reason and hint status shows for it.
         #[arg(long)]
         wait: bool,
@@ -730,7 +739,8 @@ enum StopTarget {
     Deployment {
         deployment: String,
     },
-    /// Owner decision Q7: stop one instance, `<deployment>/<index>`.
+    // Owner decision Q7.
+    /// Stop one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
         instance: (String, u32),
@@ -793,10 +803,10 @@ enum DeployArgs {
         /// deployment's `timeouts.initialize`; at most its request deadline.
         #[arg(long, value_name = "DURATION", requires = "activate")]
         initialize_timeout: Option<String>,
+        // SPEC §14 (an update is explicit and revision-aware), ADR 0013 §7.
         /// Revise the existing deployment the file names, replacing exactly
-        /// this revision (SPEC §14: an update is explicit and revision-aware).
-        /// A count-only change keeps running instances; any other change
-        /// stops and restarts them on the new revision (ADR 0013 §7).
+        /// this revision. A count-only change keeps running instances; any
+        /// other change stops and restarts them on the new revision.
         #[arg(long, value_name = "N", conflicts_with = "activate",
               value_parser = clap::value_parser!(i64).range(1..))]
         revision: Option<i64>,
@@ -1067,6 +1077,23 @@ pub struct Invocation {
     /// Owner decision 2026-09-25: `--management-listen` on `start
     /// standalone`.
     pub management_listen: Option<SocketAddr>,
+}
+
+/// Final review I13: the long `--help` text of `mllm` and of every
+/// subcommand, as `(command path, text)`, for the wording gate.
+pub fn help_texts() -> Vec<(String, String)> {
+    fn walk(command: &mut clap::Command, path: String, out: &mut Vec<(String, String)>) {
+        out.push((path.clone(), command.render_long_help().to_string()));
+        for sub in command.get_subcommands_mut() {
+            let name = format!("{path} {}", sub.get_name());
+            walk(sub, name, out);
+        }
+    }
+    let mut command = <Cli as clap::CommandFactory>::command();
+    command.build();
+    let mut out = Vec::new();
+    walk(&mut command, "mllm".into(), &mut out);
+    out
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>

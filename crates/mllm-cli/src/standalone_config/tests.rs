@@ -1497,7 +1497,7 @@ fn card_memory(weights_bytes: Option<i64>, kv_cache_bytes: Option<i64>) -> Templ
     }
 }
 
-// T26 (controller ruling): a Hugging Face or HTTP source works on a discrete
+// T26 (review decision): a Hugging Face or HTTP source works on a discrete
 // host. Its weights are known only once downloaded, so the template states the
 // KV cache alone and parks deep (a host-RAM copy cannot be sized yet): the
 // revision is accepted provisional and sized from the checkpoint once the
@@ -1579,7 +1579,7 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
     assert_eq!(doc["residency"], "restart_only");
 }
 
-// T26 (controller ruling): an operator's MLLM_KV_CACHE_BYTES is honoured on a
+// T26 (review decision): an operator's MLLM_KV_CACHE_BYTES is honoured on a
 // discrete host within the card, and refused with the numbers and the variable
 // when it cannot fit, never silently replaced by the template's own KV cache.
 #[test]

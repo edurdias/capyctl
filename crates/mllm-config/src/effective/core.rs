@@ -466,7 +466,7 @@ pub(super) fn check_single_device(
     Ok(())
 }
 
-/// Controller ruling (discrete GPU design §3): the device domain a deployment
+/// Review decision (discrete GPU design §3): the device domain a deployment
 /// without explicit resources derives its phases on, when it is a discrete
 /// GPU's. `None` on a unified host or when the selected devices do not name
 /// exactly one device domain (derivation refuses that shape on its own).

@@ -396,7 +396,7 @@ pub enum TemplateMemory {
         device_total: i64,
         /// ADR 0014 §5: the sum of the checkpoint's weight-file sizes. `None`
         /// for a Hugging Face or HTTP source, whose weights are known only once
-        /// downloaded (controller ruling): the template then states the KV
+        /// downloaded (review decision): the template then states the KV
         /// cache alone and resolution sizes the request once the checkpoint
         /// digest measures the weights (ADR 0014 §7).
         weights_bytes: Option<i64>,
@@ -404,7 +404,7 @@ pub enum TemplateMemory {
         /// `parked_limit` and `managed_limit`.
         system_parked_limit: i64,
         /// The KV cache the operator stated (`MLLM_KV_CACHE_BYTES`), honoured
-        /// within the card or refused (controller ruling). `None`: sized from
+        /// within the card or refused (review decision). `None`: sized from
         /// the card.
         kv_cache_bytes: Option<i64>,
     },
@@ -421,7 +421,7 @@ pub enum TemplateError {
          manages; use a smaller or quantized checkpoint"
     )]
     InsufficientDeviceMemory { request: i64, limit: i64 },
-    /// Controller ruling: the KV cache the operator stated cannot fit the card
+    /// Review decision: the KV cache the operator stated cannot fit the card
     /// with the checkpoint's weights (or alone), so it is refused rather than
     /// silently replaced.
     #[error(
@@ -571,7 +571,7 @@ fn discrete_document(
         },
     };
     let Some(weights_bytes) = sizing.weights_bytes else {
-        // Controller ruling: a Hugging Face or HTTP source. Its weights are
+        // Review decision: a Hugging Face or HTTP source. Its weights are
         // known only once downloaded, so the template states the KV cache alone
         // and resolution sizes the request (and the startup peak) from the
         // weights the checkpoint digest measures: acceptance freezes the
@@ -603,7 +603,7 @@ fn discrete_document(
     );
     // Spec §3: a request the device domain can never hold is refused at
     // deploy, with the numbers, before anything is stored. A KV cache the
-    // operator stated is named in the refusal (controller ruling).
+    // operator stated is named in the refusal (review decision).
     // ADR 0019: the device domain is charged the request and the engine's
     // CUDA context and graphs, so the template refuses what resolution would.
     let charged =

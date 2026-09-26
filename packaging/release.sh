@@ -16,7 +16,7 @@
 #                            per OS/architecture supplies every role). mllm's
 #                            Python runtime helpers are compiled into it and
 #                            written to <state_dir>/runtime at role start
-#                            (owner decision 2026-09-24; SPEC §3.3).
+#                            (decided 2026-09-24; SPEC §3.3).
 #   packaging/systemd/       system and user service units (SPEC §4.3)
 #   docs/examples/           example role and deployment documents
 #   docs/operations/install.md

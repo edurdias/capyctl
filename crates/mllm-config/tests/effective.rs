@@ -1540,7 +1540,7 @@ fn deployment_with_resources(domain: &str) -> serde_json::Value {
 
 /// The fixture deployment with explicit resources on a discrete host: the card
 /// holds 12 GiB when Ready (room for the 8 GiB checkpoint and the 4 GiB KV
-/// cache, controller ruling: the request is the device allocation), and host
+/// cache, review decision: the request is the device allocation), and host
 /// RAM holds `system` in every phase.
 fn deployment_with_discrete_resources(system: &str) -> serde_json::Value {
     let mut d = deployment_with_resources("gpu0");
@@ -1708,7 +1708,7 @@ fn explicit_resources_naming_both_domains_resolve() {
     resolve(&d, &discrete_host()).expect("both domains named");
 }
 
-// T26 (controller ruling): explicit resources on a discrete host size the engine
+// T26 (review decision): explicit resources on a discrete host size the engine
 // from the device allocation alone. The memory request is what the engine may
 // use on the card (vLLM's utilization, SGLang's static fraction); the system
 // allocation beside it is host RAM the engine process holds, and adding it
@@ -1739,7 +1739,7 @@ fn explicit_discrete_resources_size_the_engine_from_the_device_allocation() {
     );
 }
 
-// T26 (controller ruling): a deployment that states only its KV cache on a
+// T26 (review decision): a deployment that states only its KV cache on a
 // discrete host (a Hugging Face or HTTP source, whose weights are known only
 // once downloaded) is not materializable until the checkpoint digest measures
 // the weights, which is what lets acceptance freeze it provisional (ADR 0014

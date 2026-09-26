@@ -41,7 +41,7 @@ pub struct EngineInstallation {
     /// (`MLLM_KV_CACHE_BYTES`) rather than taking the unified default. A
     /// discrete host sizes its template's KV cache from the card unless the
     /// operator stated one, which it then honours within the card or refuses
-    /// (controller ruling, discrete GPU design §3).
+    /// (review decision, discrete GPU design §3).
     pub kv_cache_declared: bool,
     /// Whether the deep-park controls may be called on this engine (SPEC §9.1, T21).
     pub deep_park: bool,
