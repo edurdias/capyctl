@@ -670,6 +670,31 @@ async fn an_enrolled_sglang_parks_and_a_restarted_host_restores_it() {
     assert_eq!(std::fs::read_dir(&venv.observation).unwrap().count(), 0);
 }
 
+/// T20: a saver read that misses its bound is read again, never guessed.
+/// Found live 2026-09-26 on a discrete-GPU laptop: a busy SGLang scheduler
+/// answered in 1.0-1.6 s against the 1.5 s bound, so one late answer left a
+/// park uncertain. A read has no effect, so a fresh read (new request id) is
+/// safe; the answer still has to be a whole, bound observation.
+// T20
+#[test]
+fn a_saver_read_that_misses_its_bound_is_read_again() {
+    let venv = venv();
+    let mut enrolled = enroll(&venv, "admin-key");
+    let scope = SaverScope {
+        binding_id: BINDING.into(),
+        incarnation: INCARNATION.into(),
+        members: Some(enrolled_group(&enrolled)),
+        admin_key: "admin-key".into(),
+        executable: venv.executable.clone(),
+    };
+    let saver = super::super::EnrolledSaver::new(venv.observation.clone());
+    enrolled.send("stall");
+    let Ok(mapped) = saver.mapped(&scope) else {
+        panic!("a late read is read again");
+    };
+    assert_eq!(mapped.weight_bytes + mapped.kv_bytes, 8192);
+}
+
 /// T22 T20: the enrolled source refuses what it cannot bind to this launch
 /// before any engine call: no record (the launch enrolled nothing), another
 /// credential, a scheduler outside the recorded group, or a saver library
