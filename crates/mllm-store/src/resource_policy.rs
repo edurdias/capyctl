@@ -592,16 +592,22 @@ impl crate::Store {
         let local = ResourceContext::from_host(host);
         let mut scoped = host.clone();
         scoped.name = host_id.into();
-        scoped.domains = host
-            .domains
-            .iter()
-            .map(|(id, p)| {
-                (
-                    crate::resource_namespace::ledger_key(host_id, "domain", id),
-                    p.clone(),
-                )
-            })
-            .collect();
+        scoped.domains =
+            host.domains
+                .iter()
+                .map(|(id, p)| {
+                    let mut policy = p.clone();
+                    // ADR 0019: a device domain's device is scoped like the
+                    // device map's keys, so the pair still names each other.
+                    policy.device = p.device.as_deref().map(|device| {
+                        crate::resource_namespace::ledger_key(host_id, "device", device)
+                    });
+                    (
+                        crate::resource_namespace::ledger_key(host_id, "domain", id),
+                        policy,
+                    )
+                })
+                .collect();
         scoped.devices = host
             .devices
             .iter()

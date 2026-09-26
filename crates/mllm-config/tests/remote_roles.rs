@@ -267,3 +267,46 @@ fn switching_drain_timeout_defaults_and_is_bounded() {
     server["switching"] = serde_json::json!({"window": "1s"});
     assert!(ServerConfig::parse(&server.to_string()).is_err());
 }
+
+// T26 T03 (ADR 0019, discrete GPU design §2): a remote host declares the same
+// discrete shape standalone derives: host RAM in a `distinct` system domain
+// and each GPU its own `device` domain naming its device. The strict host
+// schema accepts it and its policy resolves; the domain rules still refuse a
+// device domain that names no device.
+#[test]
+fn a_remote_host_declares_device_domains() {
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/effective-vllm-golden.json")).unwrap();
+    let mut host = golden["input"]["host"].clone();
+    host["state_dir"] = serde_json::json!("/home/operator/.local/state/mllm");
+    host["identity_dir"] = serde_json::json!("/home/operator/.local/state/mllm/identity");
+    host["resource_policy"]["domains"] = serde_json::json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1528MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] =
+        serde_json::json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let config = HostConfig::parse(&host.to_string()).expect("a discrete host document parses");
+    let local = mllm_config::remote_resources::local_host_document(&config.document).unwrap();
+    let policy = mllm_config::effective::normalize_host_policy(&local).unwrap();
+    assert_eq!(policy.domains["gpu0"].device.as_deref(), Some("gpu0"));
+    // Scoped for the server's ledger, the domain and its device still match.
+    let scoped =
+        mllm_config::remote_resources::scope_host_document("host-a", &config.document).unwrap();
+    mllm_config::effective::normalize_host_policy(&scoped)
+        .expect("the scoped device domain still names its own device");
+
+    host["resource_policy"]["domains"]["gpu0"]
+        .as_object_mut()
+        .unwrap()
+        .remove("device");
+    let config = HostConfig::parse(&host.to_string()).unwrap();
+    let local = mllm_config::remote_resources::local_host_document(&config.document).unwrap();
+    let refused = mllm_config::effective::normalize_host_policy(&local).unwrap_err();
+    assert!(
+        refused.detail.starts_with("device_policy_mismatch"),
+        "{refused:?}"
+    );
+}

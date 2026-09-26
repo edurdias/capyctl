@@ -214,6 +214,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("host_kv_limit", BYTES),
         ("parked_limit", BYTES),
         ("memory", SCALAR),
+        // ADR 0019: the device a `device` domain's memory belongs to.
+        ("device", SCALAR),
     ]);
     const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[
         ("domain", SCALAR),
