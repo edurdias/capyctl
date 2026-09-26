@@ -33,6 +33,23 @@ pub fn eligible(inventory: &ReportInventory) -> bool {
             })
     })
 }
+/// ADR 0019: whether the approved policy `inventory` carries declares a
+/// device memory domain. A document without a resolvable policy declares none.
+pub fn declares_device_domains(inventory: &ReportInventory) -> bool {
+    mllm_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
+        .ok()
+        .filter(|config| config.document.get("resource_policy").is_some())
+        .and_then(|config| {
+            mllm_config::remote_resources::local_host_document(&config.document).ok()
+        })
+        .and_then(|local| mllm_config::effective::normalize_host_policy(&local).ok())
+        .is_some_and(|policy| {
+            policy
+                .domains
+                .values()
+                .any(|d| d.memory == mllm_config::effective::DomainMemory::Device)
+        })
+}
 pub fn publish(
     state: &SharedCoordinatorState,
     host_id: &str,
@@ -68,9 +85,18 @@ pub fn publish(
         let policy =
             mllm_config::effective::normalize_host_policy(&local).map_err(|_| PublicationError)?;
         let mut observations = Vec::new();
-        for domain in policy.domains.keys() {
+        for (domain, declared) in &policy.domains {
             let mut matches = inventory.domains.iter().filter(|d| &d.domain_id == domain);
             let observation = matches.next().ok_or(PublicationError)?;
+            // ADR 0019: a `device` observation is the GPU of a device domain
+            // the approved policy declares, and names that domain's device.
+            let device_kind = observation.kind == "device";
+            if device_kind
+                && (declared.memory != mllm_config::effective::DomainMemory::Device
+                    || declared.device.as_deref() != Some(observation.device_id.as_str()))
+            {
+                return Err(PublicationError);
+            }
             if matches.next().is_some()
                 || observation.capacity_bytes <= 0
                 || observation.available_bytes < 0

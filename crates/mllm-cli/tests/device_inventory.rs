@@ -352,3 +352,77 @@ fn a_sampled_single_device_publishes_gpu0_identically() {
         UUID
     );
 }
+
+// T26 (design §1, carried must-do): on a unified host (GB10) whose one device
+// `nvidia-smi` reports at another PCI address, or under another UUID, than the
+// inventory collector, no UUID is published, but the host is not broken: the
+// digest is still published, its policy still resolves a deployment, and a
+// vLLM launch keeps the agent's own device namespace (a lone unified device
+// is never pinned), exactly as on a host that published no UUID.
+#[test]
+fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() {
+    let single = || {
+        Ok(inventory_json(serde_json::json!([
+            {"physical_gpu_uuid": UUID, "pci_address": "000f:01:00.0",
+             "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2e12"}
+        ])))
+    };
+    let integrated = |uuid: &str, bus: &str| GpuDevice {
+        index: 0,
+        uuid: uuid.into(),
+        pci_bus_id: bus.into(),
+        name: "GB10".into(),
+        memory: None,
+    };
+    for disagreeing in [
+        integrated(UUID, "00000000:01:00.0"),
+        integrated(OTHER_UUID, "0000000F:01:00.0"),
+    ] {
+        let observed = sample(vec![disagreeing]);
+        assert_eq!(
+            mllm_agent::gpu_memory::shape(Some(&observed)),
+            Ok(HostShape::Unified)
+        );
+        let published = collect_with(Path::new("/any"), Some(&observed), &|_root| single())
+            .expect("the inventory itself is well formed");
+        assert_eq!(published.digest, DIGEST);
+        assert!(published.physical_gpu_uuids.is_empty(), "{observed:?}");
+        let host = standalone_config::host_policy(
+            &named(&installation()),
+            "env-1",
+            1 << 40,
+            Some(&published),
+            &HostShape::Unified,
+        );
+        assert_eq!(host["device_inventory_digest"], DIGEST);
+        assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());
+        let mut vllm = installation();
+        vllm.engine = Engine::Vllm;
+        let effective = mllm_config::effective::resolve_effective(
+            &standalone_config::deployment_document(
+                "m",
+                "m",
+                &mllm_config::effective::ModelSource::Local {
+                    path: "/srv/models/m".into(),
+                },
+                Engine::Vllm,
+                &mllm_cli::standalone_config::TemplateMemory::Unified {
+                    capacity_bytes: 1 << 40,
+                },
+                standalone_config::DEFAULT_REQUEST_DEADLINE,
+                true,
+                "local",
+            )
+            .expect("the unified template"),
+            &standalone_config::host_policy(
+                &named(&vllm),
+                "env-1",
+                1 << 40,
+                Some(&published),
+                &HostShape::Unified,
+            ),
+        )
+        .expect("the host without a UUID still resolves");
+        assert_eq!(effective.cuda_namespace(), Ok(None));
+    }
+}

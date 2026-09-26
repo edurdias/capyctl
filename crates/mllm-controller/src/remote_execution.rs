@@ -34,6 +34,11 @@ pub struct RemoteLaunchBinding {
     pub launch_command_id: String,
     pub plan: SingleLaunchPlan,
     pub ingress_gate_key: [u8; 32],
+    /// ADR 0019 (discrete GPU design §8): the launch's footprint names a
+    /// device memory domain. Every command of it then needs the host's
+    /// `device_memory_domains`; a host without it is refused typed before
+    /// anything is sent.
+    pub device_memory: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
@@ -289,6 +294,9 @@ impl RemoteEngine {
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
+        if b.device_memory {
+            needs.push(capabilities::DEVICE_MEMORY_DOMAINS);
+        }
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -450,6 +458,9 @@ impl EngineAdapter for RemoteEngine {
         .is_some()
         {
             needs.push(capabilities::MODEL_SOURCES);
+        }
+        if b.device_memory {
+            needs.push(capabilities::DEVICE_MEMORY_DOMAINS);
         }
         self.sessions
             .preflight(&b.host_id, &needs, true)
@@ -934,6 +945,8 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 plan,
                 ingress_gate_key: key,
                 instance_index,
+                // ADR 0019: the Ready footprint is charged to a device domain.
+                device_memory: work.effective().ready_device_allocation().is_some(),
             },
             self.readiness.clone(),
         ))
@@ -968,6 +981,7 @@ mod tests {
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
+            device_memory: false,
         }
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {

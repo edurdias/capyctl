@@ -1656,6 +1656,10 @@ impl SessionExecution for NativeHostExecution {
                 boot_id: p.boot_id,
                 start_ticks: p.start_ticks,
                 resident_bytes: p.bytes,
+                // ADR 0019 (`device_memory_domains`): the split figures, so
+                // the server credits each domain with its own memory.
+                device_bytes: p.device_bytes,
+                host_bytes: p.host_bytes,
             })
             .collect();
         if !device.is_empty() {
@@ -1715,24 +1719,10 @@ fn device_total(sample: Option<&crate::gpu_memory::GpuSample>, index: u32) -> Op
 }
 
 fn device_domains(document: &serde_json::Value) -> std::collections::BTreeMap<String, Option<u32>> {
-    mllm_config::remote_resources::local_host_document(document)
-        .ok()
-        .and_then(|host| mllm_config::effective::normalize_host_policy(&host).ok())
-        .map(|policy| {
-            policy
-                .domains
-                .into_iter()
-                .filter(|(_, d)| d.memory == mllm_config::effective::DomainMemory::Device)
-                .map(|(id, d)| {
-                    let index = d
-                        .device
-                        .as_deref()
-                        .and_then(crate::gpu_memory::device_index);
-                    (id, index)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::device_domains::device_domains(document)
+        .into_iter()
+        .map(|(id, domain)| (id, domain.index))
+        .collect()
 }
 
 #[cfg(test)]

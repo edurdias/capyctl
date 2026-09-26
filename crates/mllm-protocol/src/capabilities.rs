@@ -58,6 +58,15 @@ pub const INSTALLATION_FINGERPRINT: &str = "installation_fingerprint";
 /// server sends its two messages only to a host that declared it, and a host
 /// sends its two only to a server whose SessionReady lists it.
 pub const LIVE_PROFILE_UPDATE: &str = "live_profile_update";
+/// ADR 0019 (discrete GPU design §8): the host observes a discrete GPU's
+/// memory as its own `device` domain. One capability covers the three
+/// additions a discrete host needs: `DomainObservation.kind = "device"` with
+/// its `device_id`, the split `ProcessResidency.device_bytes` / `host_bytes`,
+/// and launches whose footprint and chosen GPU name a device domain. The
+/// server places such a launch only on a host that declared it; any other
+/// host is refused `host_capability_missing:device_memory_domains` before
+/// anything is sent. A unified host needs it for nothing.
+pub const DEVICE_MEMORY_DOMAINS: &str = "device_memory_domains";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -95,6 +104,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (PROCESS_RESIDENCY, Direction::HostToServer),
     (INSTALLATION_FINGERPRINT, Direction::HostToServer),
     (LIVE_PROFILE_UPDATE, Direction::ServerToHost),
+    (DEVICE_MEMORY_DOMAINS, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.

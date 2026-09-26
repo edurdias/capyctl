@@ -680,6 +680,28 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
 /// dispatch is suspended before it closes ingress anyway.
 const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
+/// Discrete GPU design §2: the start-time check of a host's declared device
+/// domains against the GPUs it observes (`device_policy_mismatch`, exit 2).
+fn check_host_device_policy(
+    document: &Value,
+    shape: &mllm_agent::gpu_memory::HostShape,
+) -> Result<(), StructuredError> {
+    let local = mllm_config::remote_resources::local_host_document(document).map_err(|e| {
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    })?;
+    let policy = mllm_config::effective::normalize_host_policy(&local).map_err(|e| {
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    })?;
+    mllm_agent::device_domains::check_device_policy(&policy, shape)
+        .map_err(|message| error(&message))
+}
+
 /// `document` is the host.yaml `config` was loaded from, merged with
 /// `engines` (the role's engines.yaml); the control handler re-reads both
 /// (ADR 0018 §3).
@@ -692,6 +714,19 @@ async fn serve_host(
     // the embedded runtime, refreshed before anything can launch from it.
     if !config.runtime_dir_declared {
         crate::managed_runtime::prepare_for_role(&config.runtime_dir)?;
+    }
+    // ADR 0019 (discrete GPU design §2): a host that declares a device domain
+    // checks the declaration against the GPUs it observes (a bounded sample,
+    // off the async thread) before anything else, and refuses to start on a
+    // mismatch. A unified or RAM-only host never runs the collector.
+    let discrete = !mllm_agent::device_domains::device_domains(&config.document).is_empty();
+    if discrete {
+        let sample = tokio::task::spawn_blocking(mllm_agent::gpu_memory::sample)
+            .await
+            .map_err(|_| unavailable())?;
+        let shape =
+            mllm_agent::gpu_memory::shape(sample.as_ref()).map_err(|e| error(&e.to_string()))?;
+        check_host_device_policy(&config.document, &shape)?;
     }
     let storage = IdentityDirectory::open(&config.identity_dir)
         .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
@@ -725,46 +760,17 @@ async fn serve_host(
     let memory = mllm_agent::memory::read_host_memory()
         .map_err(|_| error("Host memory inventory unavailable"))?
         .memory;
-    let declared = config.document["resource_policy"]["domains"].as_object();
-    let domains = if let Some(declared) = declared {
-        declared
-            .iter()
-            .map(|(name, policy)| {
-                // The supported GB10 preparation has one unified physical pool.
-                // Multiple/distinct pools require their own observers, never copied capacity.
-                let supported = declared.len() == 1 && policy["memory"] == "unified";
-                pb::DomainObservation {
-                    residents: vec![],
-                    domain_id: name.clone(),
-                    kind: "system".into(),
-                    observed_bytes: if supported {
-                        memory.available_bytes
-                    } else {
-                        -1
-                    },
-                    observed_at_unix: memory.sampled_at_ms / 1000,
-                    capacity_bytes: if supported { memory.capacity_bytes } else { -1 },
-                    available_bytes: if supported {
-                        memory.available_bytes
-                    } else {
-                        -1
-                    },
-                    observed_at_unix_ms: memory.sampled_at_ms,
-                }
-            })
-            .collect()
+    // SPEC §7.2 / ADR 0019: the device domains are published from a sample
+    // taken beside the memory reading, so both are fresh at publication.
+    let gpu = if discrete {
+        tokio::task::spawn_blocking(mllm_agent::gpu_memory::sample)
+            .await
+            .map_err(|_| unavailable())?
     } else {
-        vec![pb::DomainObservation {
-            residents: vec![],
-            domain_id: "system".into(),
-            kind: "system".into(),
-            observed_bytes: memory.available_bytes,
-            observed_at_unix: memory.sampled_at_ms / 1000,
-            capacity_bytes: memory.capacity_bytes,
-            available_bytes: memory.available_bytes,
-            observed_at_unix_ms: memory.sampled_at_ms,
-        }]
+        None
     };
+    let domains =
+        mllm_agent::device_domains::startup_domains(&config.document, &memory, gpu.as_ref());
     // ADR 0008 (owner decision 2026-09-23): registration measures each
     // installation (engine package version and a digest over its files);
     // later drift is flagged against this. Unmeasurable is never a refusal.

@@ -84,6 +84,7 @@ async fn enrolled(
     let sampled = mllm_protocol::now_unix_ms() + lead_ms;
     let inventory = pb::ReportInventory {
         domains: vec![pb::DomainObservation {
+            device_id: String::new(),
             residents: vec![],
             domain_id: "unified".into(),
             kind: "system".into(),

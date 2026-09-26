@@ -84,6 +84,7 @@ async fn an_enrolled_host_publishes_vllm_profiles_beside_sglang() {
     let config = mllm_config::remote_roles::HostConfig::parse(&document.to_string()).unwrap();
     let inventory = pb::ReportInventory {
         domains: vec![pb::DomainObservation {
+            device_id: String::new(),
             residents: vec![],
             domain_id: "unified".into(),
             kind: "system".into(),
