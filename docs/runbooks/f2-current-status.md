@@ -1,5 +1,26 @@
 # Current implementation and launch status
 
+## Inventory collector trust check — 2026-09-27
+
+The shared boot collector now checks the runtime tree and its ancestors using
+the existing native-launch integrity rules before running Python. Both remote
+and standalone roles pass the selected runtime directory directly. Isolated
+Python imports use that directory, including custom directory names, without
+ambient package or site hooks. An unsafe runtime publishes no inventory.
+
+Two regression tests cover refusal before execution for writable modules,
+helpers, directories and ancestors or a symlink, plus successful isolated
+collection from a trusted custom directory. All 12 inventory tests pass, and
+the actual collector ran successfully under isolated Python on the control
+host. These checks are not native-engine qualification; the selected-recipe
+evidence below remains the live record.
+
+The core suite passed 1113 distinct tests (1114 reported) and the workspace
+suite passed 2257 distinct tests (2258 reported), with zero failures. Clippy
+with warnings denied across the core crates and CLI, formatting and diff
+checks pass. The release assets must be rebuilt from the merged fix before
+publication.
+
 ## 0.1.0 installed-binary guide validation — 2026-09-27
 
 Selected-recipe guide validation is complete with the limitation below. It

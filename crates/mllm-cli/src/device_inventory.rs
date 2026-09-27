@@ -23,9 +23,13 @@ use serde_json::Value;
 /// shape — publishing nothing — is the answer, not an unbounded wait.
 const BOUND: Duration = Duration::from_secs(30);
 
-/// The collector module, run with the interpreter's `-m` from the checkout
-/// that owns the `runtime` package.
-const MODULE: &str = "runtime.sglang_device";
+/// Bind the runtime namespace to the verified directory, including custom
+/// directory names, without importing a package from the ambient search path.
+const COLLECTOR: &str = "import runpy, sys, types\n\
+    runtime = types.ModuleType('runtime')\n\
+    runtime.__path__ = [sys.argv[1]]\n\
+    sys.modules['runtime'] = runtime\n\
+    runpy.run_module('runtime.sglang_device', run_name='__main__')";
 
 /// What a boot publishes about the host's NVIDIA devices.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,36 +53,45 @@ pub struct InventoryPublication {
     pub physical_gpu_uuids: BTreeMap<u32, String>,
 }
 
-/// The live publication: `python3 -m runtime.sglang_device` inside
-/// `runtime_root`. Every failure is closed and silent — no output, a non-zero
-/// exit, a malformed document, or the bound expiring all publish nothing.
+/// Run the collector from the verified `runtime_dir` with isolated Python
+/// imports. Every failure is closed and silent — unsafe paths, no output, a
+/// non-zero exit, malformed output, or timeout all publish nothing.
 ///
 /// `sample` is the boot's one `nvidia-smi` sample, which the device UUIDs are
 /// corroborated against and keyed by (see
 /// [`InventoryPublication::physical_gpu_uuids`]).
-pub fn collect(runtime_root: &Path, sample: Option<&GpuSample>) -> Option<InventoryPublication> {
-    collect_with(runtime_root, sample, &run_collector)
+pub fn collect(runtime_dir: &Path, sample: Option<&GpuSample>) -> Option<InventoryPublication> {
+    collect_with(runtime_dir, sample, &run_collector)
 }
 
 /// The seam a test stubs instead of running Python.
 pub fn collect_with(
-    runtime_root: &Path,
+    runtime_dir: &Path,
     sample: Option<&GpuSample>,
     run: &dyn Fn(&Path) -> std::io::Result<String>,
 ) -> Option<InventoryPublication> {
-    publication(&run(runtime_root).ok()?, sample)
+    publication(&run(runtime_dir).ok()?, sample)
 }
 
 /// Runs the collector and returns its stdout, bounded.
-fn run_collector(runtime_root: &Path) -> std::io::Result<String> {
-    // SPEC §9.1 / T21: no bytecode is written into mllm's runtime tree, whose
-    // integrity check refuses any it finds.
+fn run_collector(runtime_dir: &Path) -> std::io::Result<String> {
+    // SPEC §13.3 / T21 T37: check the tree and its ancestors before any Python
+    // executes, using the same trust rules as native launch admission.
+    mllm_adapters::sglang::SglangLaunch::validate_wrapper_path(
+        &runtime_dir.join("sglang_device.py"),
+    )
+    .map_err(std::io::Error::other)?;
+    mllm_agent::runtime_integrity::verify(runtime_dir, &["sglang_device.py"])
+        .map_err(std::io::Error::other)?;
+    // Ignore Python environment/site hooks and never create cached bytecode.
     let mut child = Command::new("python3")
+        .arg("-I")
+        .arg("-S")
         .arg("-B")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .arg("-m")
-        .arg(MODULE)
-        .current_dir(runtime_root)
+        .arg("-c")
+        .arg(COLLECTOR)
+        .arg(runtime_dir)
+        .current_dir(runtime_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

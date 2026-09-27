@@ -845,14 +845,10 @@ async fn serve_host(
     // SPEC §3 / T22: fresh physical placement evidence is required on remote
     // hosts too, including unified-memory hosts. A failed collector publishes
     // nothing; native entrypoint denials remain closed.
-    let runtime_root = config
-        .runtime_dir
-        .parent()
-        .unwrap_or(&config.runtime_dir)
-        .to_owned();
+    let runtime_dir = config.runtime_dir.clone();
     let (boot_gpu, device_inventory) = tokio::task::spawn_blocking(move || {
         let sample = mllm_agent::gpu_memory::sample();
-        let inventory = crate::device_inventory::collect(&runtime_root, sample.as_ref());
+        let inventory = crate::device_inventory::collect(&runtime_dir, sample.as_ref());
         (sample, inventory)
     })
     .await

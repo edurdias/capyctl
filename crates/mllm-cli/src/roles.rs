@@ -1722,13 +1722,8 @@ async fn start_standalone_in(
     // overruns its bound, publishes nothing, and an SGLang deployment then
     // fails placement honestly at the native gate instead of the host
     // claiming placement it cannot corroborate.
-    let inventory = crate::device_inventory::collect(
-        installation
-            .runtime_dir
-            .parent()
-            .unwrap_or(&installation.runtime_dir),
-        gpu_sample.as_ref(),
-    );
+    let inventory =
+        crate::device_inventory::collect(&installation.runtime_dir, gpu_sample.as_ref());
 
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,
