@@ -80,7 +80,7 @@ with the same key.
 
 That's it: one model behind an OpenAI-compatible endpoint.
 
-## Next
+## See also
 
 - [Make a request](requests.md): streaming, the Python client, other machines.
 - [Parking and switching](parking.md): more models than your GPU holds.
