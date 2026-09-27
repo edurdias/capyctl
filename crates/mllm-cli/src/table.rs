@@ -282,6 +282,14 @@ fn ready(deployment: &Value) -> String {
     )
 }
 
+// Owner decision 2026-09-26: KIND is always "model" today and DESIRED is
+// operator intent, not what is happening; both stay out of the table. STATE
+// alone is the store's already-derived `observed_state` (SPEC §§6.1, 6.4;
+// see the comment on `OBSERVED_STATE` in mllm-store's snapshot query), which
+// reads the desired/observed combination for us: a crash reads `failed`, a
+// stop in flight reads `stopping`, a park in flight reads `parking`, and so
+// on, never a bare `stopped` that could mean either intent or failure.
+// `--format json` is unchanged: both fields stay in the JSON result.
 fn deployments(value: &Value, names: &HostNames) -> String {
     let rows: Vec<Vec<String>> = value
         .as_array()
@@ -290,8 +298,6 @@ fn deployments(value: &Value, names: &HostNames) -> String {
         .map(|d| {
             vec![
                 text(&d["name"]),
-                text(&d["kind"]),
-                text(&d["desired_state"]),
                 text(&d["observed_state"]),
                 ready(d),
                 text(&d["revision"]),
@@ -299,12 +305,7 @@ fn deployments(value: &Value, names: &HostNames) -> String {
             ]
         })
         .collect();
-    table(
-        &[
-            "NAME", "KIND", "DESIRED", "STATE", "READY", "REVISION", "HOSTS",
-        ],
-        &rows,
-    )
+    table(&["NAME", "STATE", "READY", "REVISION", "HOSTS"], &rows)
 }
 
 fn operation(op: &Value) -> String {
@@ -346,11 +347,12 @@ fn status(value: &Value, names: &HostNames) -> String {
     let initialize = number(&d["timeouts"]["initialize_ms"])
         .map(seconds)
         .unwrap_or_else(|| "-".into());
+    // See the comment on `deployments` above: KIND and DESIRED stay out of
+    // the table, and STATE (the derived `observed_state`) says on its own
+    // whether an instance is stopped by intent, still starting, or failed.
     let mut out = table(
         &[
             "NAME",
-            "KIND",
-            "DESIRED",
             "STATE",
             "READY",
             "REVISION",
@@ -360,8 +362,6 @@ fn status(value: &Value, names: &HostNames) -> String {
         ],
         &[vec![
             text(&d["name"]),
-            text(&d["kind"]),
-            text(&d["desired_state"]),
             text(&d["observed_state"]),
             ready(d),
             text(&d["revision"]),
@@ -539,7 +539,7 @@ mod tests {
     fn an_empty_result_prints_the_headers_only() {
         assert_eq!(
             render(View::Deployments, &json!([]), &HostNames::new()),
-            "NAME   KIND   DESIRED   STATE   READY   REVISION   HOSTS\n"
+            "NAME   STATE   READY   REVISION   HOSTS\n"
         );
         let hosts = render(View::Hosts, &json!({"hosts": []}), &HostNames::new());
         assert_eq!(hosts.lines().count(), 1);
@@ -573,10 +573,43 @@ mod tests {
             &names,
         );
         let row = out.lines().nth(1).unwrap();
-        assert!(row.starts_with("chat   model"), "{out}");
+        assert!(row.starts_with("chat   ready"), "{out}");
         assert!(row.ends_with("gpu-a,01HOSTC"), "{out}");
         assert!(row.contains("2/2"), "{out}");
         assert!(!out.contains("01HOSTA"), "{out}");
+    }
+
+    // Owner decision 2026-09-26: KIND (always "model") and DESIRED (operator
+    // intent, not what is happening) are out of the table; STATE is the
+    // store's already-derived `observed_state`, which must still say plainly
+    // whether a deployment is stopped by intent, mid-transition, or failed,
+    // with no DESIRED column to lean on.
+    #[test]
+    fn state_alone_distinguishes_stopped_failed_and_stopping_with_no_kind_or_desired_column() {
+        let state = |observed: &str| {
+            let out = render(
+                View::Deployments,
+                &json!([{"name": "d", "kind": "model", "desired_state": "ready",
+                    "observed_state": observed, "ready_instances": 0, "desired_instances": 1,
+                    "revision": "1", "instances": []}]),
+                &HostNames::new(),
+            );
+            let row = out.lines().nth(1).unwrap().to_owned();
+            row.split_whitespace().nth(1).unwrap().to_owned()
+        };
+        assert_eq!(state("stopped"), "stopped");
+        assert_eq!(state("failed"), "failed");
+        assert_eq!(state("stopping"), "stopping");
+        assert_eq!(state("parked"), "parked");
+        let out = render(
+            View::Deployments,
+            &json!([{"name": "d", "kind": "model", "desired_state": "ready",
+                "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+                "revision": "1", "instances": []}]),
+            &HostNames::new(),
+        );
+        assert!(!out.contains("KIND"), "{out}");
+        assert!(!out.contains("DESIRED"), "{out}");
     }
 
     #[test]
@@ -639,10 +672,7 @@ mod tests {
             &names(),
         );
         let lines: Vec<&str> = out.lines().collect();
-        assert!(
-            lines[0].starts_with("NAME   KIND    DESIRED   STATE"),
-            "{out}"
-        );
+        assert!(lines[0].starts_with("NAME   STATE"), "{out}");
         assert!(lines[1].contains("20.0 GiB"), "{out}");
         assert!(lines[1].contains("900s"), "{out}");
         assert!(
