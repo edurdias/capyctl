@@ -52,7 +52,7 @@ fn record_views_print_tables_and_json_on_request(state: &std::path::Path, id: &s
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(lines.len(), 2, "{table}");
     assert!(
-        lines[0].starts_with("NAME        KIND")
+        lines[0].starts_with("NAME        STATE")
             && lines[0].contains("   READY   REVISION   HOSTS"),
         "{table}"
     );
@@ -77,7 +77,7 @@ fn record_views_print_tables_and_json_on_request(state: &std::path::Path, id: &s
     }
     let status = stdout(state, &["status", "deployment", id]);
     let lines: Vec<&str> = status.lines().collect();
-    assert!(lines[0].starts_with("NAME        KIND"), "{status}");
+    assert!(lines[0].starts_with("NAME        STATE"), "{status}");
     assert!(lines[1].starts_with("cli-model   "), "{status}");
     assert_eq!(lines[2], "", "{status}");
     assert!(lines[3].starts_with("INSTANCE   HOST"), "{status}");
