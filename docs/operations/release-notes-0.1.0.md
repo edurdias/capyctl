@@ -1,88 +1,74 @@
-# mllm 0.1.0 release notes (draft)
+# mllm 0.1.0
 
-Draft text for the owner to copy into the GitHub release. mllm never publishes a
-release itself.
+The first release of mllm, a model manager for vLLM and SGLang on your own
+NVIDIA GPUs. mllm runs your inference engines, parks the models nobody is using
+so their memory is freed, and wakes or switches to the one a request asks for,
+behind one OpenAI-compatible endpoint.
 
-## Network access
+## Install
 
-### Inference is reachable from other machines
+```bash
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh
+mllm --version
+```
 
-The inference endpoint now listens on all interfaces, `0.0.0.0:8443`, and still
-requires the API key. An existing configuration that used the old default
-(`127.0.0.1:8443`) is updated once at the first start, with a copy of the old file
-kept as `<file>.pre-0.1.0` and a notice printed. To keep inference on this
-machine only, start with `--listen 127.0.0.1:8443` or set
-`listeners.inference.bind` in the configuration; to limit it to your tailnet, use
-the machine's Tailscale address. See docs/operations/network-access.md.
+One binary for Linux on x86-64 or ARM64. The installer checks every download
+against the release's `SHA256SUMS`. Add `-s -- --version v0.1.0` to pin this
+release. Bring your own vLLM or SGLang environment; mllm does not install
+engines or drivers.
 
-- The same address can be set with `MLLM_INFERENCE_ADDR`, for both the server and
-  standalone (`MLLM_STANDALONE_INFERENCE_ADDR` still works, with a warning).
-- The key can be turned off only explicitly: `listeners.inference.authentication:
-  none`, `--no-inference-auth` or `MLLM_INFERENCE_AUTH=none`. On an address other
-  machines can reach, the start prints a warning and `mllm status` repeats it.
-- The fixed fallback key `mllm-local` is gone. If the credentials file cannot be
-  read, standalone refuses to start instead of serving with a known key.
-- If the configuration file cannot be rewritten (for example a server document
-  in a read-only `/etc/mllm`), it is left unchanged and every start that still
-  finds the old default serves on `0.0.0.0:8443` and prints
-  `config_migration_failed`; set `listeners.inference.bind` there (or start
-  with `--listen`) to choose another address.
-- Management stays on loopback with its admin token, and engines stay on
-  loopback behind per-launch keys. mllm does not terminate TLS; for the internet,
-  put a TLS reverse proxy in front (a Caddy example is in the network access
-  guide).
+## What is in 0.1.0
 
-## Discrete NVIDIA GPUs
+- **One machine or several.** Run everything on one GPU machine (standalone),
+  or run a server with several GPU hosts that join it over mutual TLS.
+- **vLLM and SGLang.** Register an existing engine environment with
+  `mllm engine add <venv>`; a deployment file needs only `name`, `engine` and
+  `model`.
+- **Parking and switching.** Idle models are parked to free GPU memory and
+  woken on the next request. On a discrete card a model can park its weights in
+  host RAM, which wakes much faster than reloading from disk.
+- **Unified-memory and discrete GPUs.** On a discrete card, mllm counts the
+  card's memory apart from host RAM and picks a GPU with room on a machine with
+  several. One GPU per model in this release.
+- **Models from a directory or Hugging Face.** Models live in `~/models`;
+  `model: {hf: <org>/<name>}` downloads into `~/models/sources`.
+- **OpenAI-compatible API.** `/v1/models` and `/v1/chat/completions`, with
+  streaming and tool calls. The endpoint listens on `0.0.0.0:8443` and requires
+  the API key; `--listen` limits it to one address.
+- **Settings in one place.** Every setting can come from the YAML document, a
+  flag or an environment variable; `mllm config show` prints each value and
+  where it came from.
+- **systemd units** for the standalone, server and host roles.
 
-mllm now runs on machines whose GPU has its own memory, such as GeForce and RTX
-cards, as well as on unified-memory machines like the GB10.
+## Known limits
 
-- **Device memory is accounted.** Each GPU's memory is its own domain, read from
-  `nvidia-smi`, next to host RAM. Every deployment is charged on both, so mllm
-  parks or stops a model before a second one would overfill the card, and the
-  launch check reads the card's real free memory. A GPU without a fresh reading
-  takes no new work (`device_unobserved`).
-- **Host-RAM parking.** A new `host_backed` residency parks a model by copying
-  its weights to pinned host RAM and wakes it by copying them back, much faster
-  than reloading from disk. It is the default on a discrete GPU when the copy fits
-  the host-RAM parked limit, otherwise `deep`. vLLM uses sleep level 1, SGLang
-  its weights CPU backup. When the copy no longer fits, the model is stopped
-  instead of parked, and the switch record says so. SGLang ModelOpt (NVFP4)
-  checkpoints cannot park yet; deploy them `restart_only`.
-- **mllm picks the GPU.** On a machine with several GPUs, each model goes on the
-  GPU with room, evicting only on that GPU when needed. Pin one with
-  `devices: [{id: gpu1}]` (the GPU's sharing is the host's unless stated). One GPU per model in 0.1.0: a
-  deployment naming two GPUs, or tensor parallelism, is refused
-  (`multi_gpu_unsupported`).
-- **Sizing from the checkpoint.** A deployment that states no memory asks the card
-  for its weights plus 10 % and a KV cache of up to 4 GiB; a vLLM deployment
-  asks for at least 75 % of the card. A model too large for the card is refused at
-  deploy (`insufficient_device_memory`).
-- **Upgrading a discrete-GPU machine** from a release candidate: the first
-  start of standalone replaces the resource policy it generated (one unified
-  pool) with `system` and `gpuN` domains. It stops the engines the earlier
-  release started, re-sizes their deployments as a new revision and prints
-  both; the next request for each starts it cold. This happens once.
-  Unified-memory machines are not affected.
-- **SGLang parking** warns instead of refusing when it cannot prove the
-  engine's memory-saver library private (for example group-writable files on
-  a machine whose groups come from a directory service). The warning is in the
-  engine log, visible only with `--debug-engine-logs`.
-- **Enrolled hosts** report device memory through a new capability,
-  `device_memory_domains`; upgrade the server first, then the hosts. Unified
-  hosts are unaffected.
+- Models that span several GPUs (tensor parallelism) are not supported yet.
+- No web UI; everything goes through the CLI and the management API.
+- Parking uses the engines' development controls. mllm keeps them on loopback
+  behind a per-launch key, but they are not production-hardened; a host can opt
+  out with `--deep-park off`.
+- SGLang ModelOpt (NVFP4) checkpoints cannot park yet; deploy them
+  `restart_only`.
+- mllm does not terminate TLS. Put a TLS reverse proxy in front before exposing
+  the endpoint to the internet.
 
-Tests on CPU and with a fake engine pin the accounting and configuration; they
-are not evidence that a native engine recipe works on a given card.
+## Upgrading from a release candidate
 
-## Other defaults in 0.1.0
+The first start of 0.1.0 changes two things once:
 
-- A deployment file needs only `name`, `engine` and `model`; mllm fills in the
-  rest.
-- Models live in `~/models` unless configured otherwise, and Hugging Face and HTTP
-  downloads are allowed by default into `~/models/sources`, capped at 500 GiB with
-  1 GiB of disk kept free.
-- Every setting can be stated in the YAML document, with a flag, or with an
-  environment variable, and any document setting with `--set path=value` or
-  `MLLM_SET__PATH=value`; `mllm config show` prints each effective value and
-  where it came from. See docs/operations/configuration.md.
+- An inference endpoint on the old default `127.0.0.1:8443` moves to
+  `0.0.0.0:8443`, still with the API key. The old configuration file is kept as
+  `<file>.pre-0.1.0` and a notice is printed. Start with
+  `--listen 127.0.0.1:8443` to keep it on the machine.
+- On a discrete card, standalone replaces its single memory pool with separate
+  host-RAM and GPU domains. It stops the engines the earlier release started
+  and re-sizes their deployments; the next request starts each one cold.
+
+Upgrade the server before the hosts. The fixed fallback key `mllm-local` is
+gone: if the credentials file cannot be read, standalone refuses to start.
+
+## Documentation
+
+- Getting started: https://edurdias.github.io/mllm/
+- Operations (services, upgrades, rollback): `docs/operations/install.md` in
+  the release archive.

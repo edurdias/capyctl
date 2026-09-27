@@ -231,7 +231,7 @@ EOF
     fresh_home
     if out=$(run "$shell" ${token:+GITHUB_TOKEN=$token} -- --repo o/r 2>&1); then
       fail "$label no --version with only pre-releases: installed anyway"
-    elif grep -qF "skips pre-releases" <<<"$out" && grep -qF -- "--version v0.1.0-rc" <<<"$out" &&
+    elif grep -qF "skips pre-releases" <<<"$out" && grep -qF -- "--version v0.1.0" <<<"$out" &&
       { [ -n "$token" ] || grep -qF "gh auth login" <<<"$out"; } && [ ! -e "$home/.local/bin/mllm" ]; then
       pass "$label no --version with only pre-releases names the cause${token:+ (token)}"
     else
