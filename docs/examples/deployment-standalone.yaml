@@ -1,0 +1,27 @@
+# A deployment for `mllm start standalone` with the engine in MLLM_VLLM_BIN.
+# Deploy it with `mllm deploy model --file deployment-standalone.yaml --activate`.
+schema_version: 1
+kind: deployment
+name: my-model
+# The `model` name clients send in their OpenAI requests.
+routes: ["my-model"]
+# `local` is the engine standalone found in MLLM_VLLM_BIN or MLLM_SGLANG_BIN.
+runtime_profile: local
+runtime_profile_revision: 1
+recipe: standard
+# `deep` frees the model's GPU memory while it is parked.
+residency: deep
+recovery: reconcile
+model:
+  # A checkpoint directory under the models directory (~/models by default).
+  path: Qwen3-4B
+  # Labels for this copy of the weights; change them when the files change.
+  content_fingerprint: "qwen3-4b-1"
+  revision: "1"
+devices:
+  - id: gpu0
+    sharing: shared
+engine_config:
+  memory:
+    # GPU memory the model may use while it runs: weights plus KV cache.
+    request: "12GiB"

@@ -270,14 +270,36 @@ as the start would, checks the result the same way, and writes nothing.
 
 ```text
 $ mllm config show --set server.switching.drain_timeout=45s
-standalone (document ~/.local/state/mllm/config/standalone.yaml)
-SETTING                            VALUE          SOURCE
-host.local_engine.deep_park        on             default
-host.local_engine.vllm             /opt/vllm/...  env
-server.listeners.inference.bind    0.0.0.0:8443   yaml
-server.switching.drain_timeout     45s            set
-shutdown.drain_timeout             30s            default
-...
+standalone (document /home/me/.local/state/mllm/config/standalone.yaml)
+SETTING                                            VALUE                               SOURCE
+host.connection                                    embedded                            yaml
+host.local_engine.deep_park                        on                                  default
+host.local_engine.installation_drift               warn                                default
+host.local_engine.trust_remote_code                false                               default
+host.model_sources.http                            allowed                             default
+host.model_sources.huggingface                     allowed                             default
+host.model_sources.huggingface_endpoint            https://huggingface.co              default
+host.model_sources.max_bytes                       500GiB                              default
+host.model_store.path                              /home/me/models                     default
+host.name                                          local                               yaml
+host.resource_policy.allowed_devices               auto                                yaml
+host.resource_policy.endpoint_port_range.end       8199                                default
+host.resource_policy.endpoint_port_range.start     8100                                default
+host.resource_policy.memory.accounting             auto                                yaml
+host.resource_policy.memory.system.free_reserve    auto                                yaml
+host.resource_policy.memory.system.managed_limit   auto                                yaml
+host.state_dir                                     /home/me/.local/state/mllm/host     yaml
+name                                               local                               yaml
+server.listeners.inference.authentication          api_key                             yaml
+server.listeners.inference.bind                    0.0.0.0:8443                        yaml
+server.listeners.management.authentication         admin_token                         yaml
+server.listeners.management.bind                   127.0.0.1:7443                      yaml
+server.name                                        local                               yaml
+server.observability.timing_header                 false                               default
+server.state_dir                                   /home/me/.local/state/mllm/server   yaml
+server.switching.drain_timeout                     45s                                 set
+shutdown.drain_timeout                             30s                                 default
+state_dir                                          /home/me/.local/state/mllm          default
 ```
 
 `--format json` (or `--json`) prints the same as
@@ -285,6 +307,12 @@ shutdown.drain_timeout             30s            default
 role start takes (`--deep-park`, `--listen`, ...) are not options of `config
 show`; their variables are read from the environment, and `--set` stands in
 for them.
+
+`config show` does not ask a running role. It shows what a start with the
+same document, the same environment and the same `--set` options would use,
+so a role started with `--set`, a named flag or a unit's `.env` file shows
+those values only when `config show` is given the same `--set` options or
+variables.
 
 ## Command options that are not settings
 

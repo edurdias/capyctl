@@ -8,7 +8,7 @@ memory is released, and wakes or switches to the one a request asks for. It
 puts one OpenAI-compatible endpoint in front of every machine you enroll, and
 it decides where each model runs while tracking the memory it hands out.
 Engines listen on loopback only; hosts talk to the server over gRPC with
-mutual TLS.
+mutual TLS. [How it works](docs/guide/how-it-works.md) has a picture.
 
 ## Status
 
@@ -17,13 +17,14 @@ GitHub pre-releases; expect breaking changes before 0.1.0.
 
 What works in the release candidates:
 
-- vLLM and SGLang engines, one GPU per model, on unified-memory machines
-  (GB10) and on discrete NVIDIA cards, where mllm accounts the card's memory
-  separately and picks the GPU on a multi-GPU machine.
+- vLLM and SGLang engines, one GPU per model, on unified-memory machines and
+  on discrete NVIDIA cards, where mllm counts the card's memory apart from
+  host RAM and picks the GPU on a machine with several.
 - One machine (standalone) or a server with several GPU hosts.
-- Parking, waking and switching models under a memory budget.
+- Parking, waking and switching models under a memory budget; on a discrete
+  card, parking into host RAM.
 - An OpenAI-compatible API (`/v1/models`, `/v1/chat/completions`), with
-  streaming and tool calls.
+  streaming and tool calls, on the network with an API key.
 - Linux on x86-64 and ARM64, NVIDIA GPUs.
 
 Not there yet:
@@ -32,59 +33,55 @@ Not there yet:
   but parked until after 0.1.0.
 - No web UI; everything goes through the CLI and the management API.
 - Other GPU vendors and operating systems are not supported.
-- Deep parking relies on engine development controls. mllm keeps them on
-  loopback behind a per-launch key, but they are not production-hardened;
-  a host can opt out (see SPEC §9.1 and ADR 0012).
+- Parking relies on engine development controls. mllm keeps them on loopback
+  behind a per-launch key, but they are not production-hardened; a host can
+  opt out (`--deep-park off`, see the
+  [settings reference](docs/operations/configuration.md#engine-installation)).
 
-mllm does not install engines, drivers or model weights. Bring your own vLLM
-or SGLang environment and your own checkpoints.
+mllm does not install engines or GPU drivers. Bring your own vLLM or SGLang
+environment; models come from a directory or from Hugging Face.
 
 ## Install
 
 A release is one self-contained binary per architecture (Linux x86-64 and
-ARM64); mllm's Python runtime helpers are compiled into it. The repository is
-private for now, so use a logged-in `gh` (`gh auth login`) or set
-`GITHUB_TOKEN`. Release candidates are pre-releases, which GitHub's "latest
-release" skips, so always pass `--version`:
+ARM64). While only release candidates exist, name the one to install:
 
 ```bash
-gh release download v0.1.0-rc.4 -R edurdias/mllm -p install.sh
-sh install.sh --version v0.1.0-rc.4         # installs ~/.local/bin/mllm
-# sudo sh install.sh --system ...           # /usr/local/bin/mllm
-# add --systemd <server|host|standalone> to install that role's unit
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v0.1.0-rc.4
+mllm --version
 ```
 
 The installer checks every download against the release's `SHA256SUMS` and
-refuses on a mismatch. See
-[`docs/operations/install.md`](docs/operations/install.md) for services,
-upgrades and rollback.
+refuses on a mismatch. While the repository is private, it falls back to a
+logged-in `gh` or to `GITHUB_TOKEN`. See [`docs/guide/install.md`](docs/guide/install.md)
+to get started, and [`docs/operations/install.md`](docs/operations/install.md)
+for services, upgrades and rollback. Building from source needs stable Rust
+and `protoc` (`sudo apt install protobuf-compiler`), on ARM64 too:
+`cargo build --release --locked -p mllm-cli`.
 
 ## Quickstart: one machine
 
-Standalone runs the server and one host in a single process. It uses one
-engine installation, vLLM or SGLang, named by a variable (as here), by
-`--vllm-bin` / `--sglang-bin`, or by `host.local_engine` in its document; every
-setting works those three ways (see
-[`docs/operations/configuration.md`](docs/operations/configuration.md)):
+Standalone runs the server and one host in a single process. Register the
+engine you have, then start:
 
 ```bash
-export MLLM_VLLM_BIN=/path/to/venv/bin/vllm   # or MLLM_SGLANG_BIN
-mllm start standalone                          # inference on 0.0.0.0:8443, key required
+mllm engine add ~/venvs/vllm   # a vLLM or SGLang environment
+mllm start standalone          # inference on 0.0.0.0:8443, API key required
 ```
 
-The first start writes its role document and credentials under
-`~/.local/state/mllm`. Models live in `~/models` (created on first start);
-name another directory with `--models-root`, `MLLM_MODELS_ROOT` or
-`host.model_store.path`. A deployment may also name a Hugging Face or HTTP
-source: mllm downloads it into `~/models/sources`, checking free disk space
-first and capping all downloads at 500 GiB (`--model-sources disabled` or
-`MLLM_MODEL_SOURCES=disabled` turns downloads off; `--model-sources-max` or
-`MLLM_MODEL_SOURCES_MAX` changes the cap). In another shell, write a
-deployment document. Three fields are enough:
+The first start writes its configuration and an API key under
+`~/.local/state/mllm`, and reads the GPU. Models live in `~/models`. Every
+setting can be given in the YAML document, as a flag or as an environment
+variable (a flag wins over a variable, which wins over the document);
+`--set path=value` changes any setting for one run, and `mllm config show`
+prints each value and where it came from
+([`docs/operations/configuration.md`](docs/operations/configuration.md)).
+
+In another shell, write a deployment. Three fields are enough:
 
 ```yaml
-name: qwen3-4b
-engine: vllm                 # or sglang
+name: my-model
+engine: vllm                 # or sglang, or a name from `mllm engine list`
 model: Qwen3-4B              # a directory under ~/models, an absolute path,
                              # or {hf: Qwen/Qwen3-4B-Instruct-2507}
 ```
@@ -92,50 +89,32 @@ model: Qwen3-4B              # a directory under ~/models, an absolute path,
 mllm fills in the rest: the route is the name, the engine's memory is sized
 from the checkpoint and the GPU, the GPU is picked, and the park tier follows
 the hardware. A Hugging Face repository is pinned to the commit it names when
-you deploy. Every other field of
+you deploy, then downloaded into `~/models/sources` (500 GiB cap for all
+downloads). Every other field of
 [`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml)
-may be added to override a default. Then deploy it and check on it:
+may be added to override a default.
 
 ```bash
-mllm validate config --file deployment.yaml   # shows the defaults it fills in
-mllm deploy model --file deployment.yaml --activate --wait
+mllm deploy model --file my-model.yaml --activate --wait
 mllm list deployments
-mllm status deployment <name>
 ```
-
-The first `--activate` of a new checkpoint waits while the host measures its
-digest (bounded by the deployment's Initialize timeout), then starts it; a
-plain `deploy model` returns at once and names the `start deployment <name>
---wait` that starts it. `validate config` checks a document offline; given
-`--host host.yaml` it also runs the per-host checks `deploy` runs (runtime
-profile, including one `mllm engine add` registered beside that document,
-placement, devices, resources and timeouts), and its `requires_server` field
-lists the checks only a running server can make.
-
-Commands that read records (`list`, `status`, `engine list`, `engine detect`)
-print an aligned table, whether or not the output is a terminal:
 
 ```text
-$ mllm list deployments
 NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-qwen3-8b   model   ready     ready   1/1     1          workstation
+my-model   model   ready     ready   1/1     1          gpu-box
 ```
 
-For scripts, `--format json` (or `--json`) prints the full JSON result
-instead, including the detail a table leaves out, and makes errors JSON too:
+Commands that read records (`list`, `status`, `engine list`, `engine detect`,
+`config show`) print an aligned table. For scripts, `--format json` (or
+`--json`) prints the full JSON result instead, and makes errors JSON too.
 
-```bash
-mllm list deployments --format json | jq -r '.[].name'
-```
-
-Send a request to the route the deployment names. The inference API key is in
-the credentials file the first start wrote:
+Send a request with the API key:
 
 ```bash
 KEY=$(sed -n 's/^api_key: //p' ~/.local/state/mllm/identity/credentials)
 curl http://127.0.0.1:8443/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model": "<route>", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "my-model", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 From another machine, use this machine's name or Tailscale address instead
@@ -143,9 +122,9 @@ of `127.0.0.1`. To keep inference on this machine only, start with
 `--listen 127.0.0.1:8443`; to narrow it to a tailnet or put it behind a TLS
 proxy, see [`docs/operations/network-access.md`](docs/operations/network-access.md).
 
-`mllm stop deployment <name>` stops the model and releases its memory;
-`mllm start deployment <name>` brings it back. `mllm delete deployment <name> --stop`
-stops and removes it.
+`mllm park deployment my-model` frees its GPU memory and the next request
+wakes it; `mllm stop deployment my-model` stops it;
+`mllm delete deployment my-model --stop` removes it.
 
 ## Several machines
 
@@ -173,6 +152,7 @@ mllm init host --output host.yaml
 mllm validate config --file host.yaml
 mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
+mllm engine add ~/venvs/vllm   # in another shell
 ```
 
 Back on the server machine, deploy through the server. A command run on a
@@ -192,7 +172,7 @@ mllm park deployment <name>
 ```text
 $ mllm list hosts
 NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.0-rc.4   supported       88.3 GiB / 119.7 GiB    vllm,sglang
+gpu-box   online   yes        0.1.0-rc.4   supported       46.5 GiB / 77.2 GiB     vllm
 
 $ mllm list deployments
 NAME           KIND    DESIRED   STATE    READY   REVISION   HOSTS
@@ -200,8 +180,8 @@ qwen3-8b       model   ready     ready    1/1     1          gpu-box
 llama-3.1-8b   model   parked    parked   0/1     2          gpu-box
 ```
 
-A parked deployment releases GPU memory (its weights and KV cache with
-`residency: deep`) and wakes on the next request for its route. When a request needs a model and
+A parked deployment releases its GPU memory and wakes on the next request for
+its route. When a request needs a model and
 there is no room, mllm parks or stops an idle one to make space.
 
 Upgrade the server first, then the hosts one at a time.
@@ -212,10 +192,14 @@ Upgrade the server first, then the hosts one at a time.
   services, upgrades, rollback and exit codes.
 - [`docs/operations/configuration.md`](docs/operations/configuration.md):
   every setting, with its YAML field, flag and environment variable, and the
-  one precedence rule (flag, then variable, then YAML, then default).
+  one precedence rule (`--set`, then `MLLM_SET__…`, then the named flag, then
+  the named variable, then YAML, then the default).
+- [`docs/operations/network-access.md`](docs/operations/network-access.md):
+  the inference endpoint on your network, its API key, and a TLS proxy.
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `mllm validate config` accepts
   them; they show the schema and are not tested engine recipes.
+- [`site/`](site/): the project website, built from these documents.
 - [`docs/SPEC.md`](docs/SPEC.md): the authoritative requirements and
   architecture.
 - [`docs/design/adr/`](docs/design/adr/): architecture decision records.

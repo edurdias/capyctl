@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.astro/
+.npm-cache/
+src/content/docs/docs/
+voice-denylist.local.txt
+src/generated/
+public/install.sh

@@ -1,0 +1,20 @@
+---
+import { href } from '../../../site.config.mjs';
+---
+<section>
+  <h2>How it works</h2>
+  <figure class="flow">
+    <div class="node">Your apps</div>
+    <div class="edge" aria-hidden="true">↓</div>
+    <div class="node">One OpenAI-compatible endpoint</div>
+    <div class="edge" aria-hidden="true">↓</div>
+    <div class="node strong">mllm server<small>router · scheduler · memory ledger</small></div>
+    <div class="edge"><span aria-hidden="true">↓</span> gRPC over mutual TLS</div>
+    <div class="hosts">
+      <div class="node">gpu-box<small>coding-small · vLLM · ready</small><small>vision-small · SGLang · <span class="state-parked">parked</span></small></div>
+      <div class="node">workstation<small>chat-large · vLLM · ready</small></div>
+    </div>
+    <figcaption>Engines listen on loopback only. The server decides where each model runs and tracks the GPU memory it hands out.</figcaption>
+  </figure>
+  <p><a href={href('/docs/how-it-works/')}>How it works in detail</a></p>
+</section>

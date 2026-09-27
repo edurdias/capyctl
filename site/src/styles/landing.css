@@ -1,0 +1,39 @@
+/* Website spec, Visual system: one column, ~720px text, 1px rules, phone first. */
+*, *::before, *::after { box-sizing: border-box; }
+html { color-scheme: light dark; }
+:root[data-theme='light'] { color-scheme: light; }
+:root[data-theme='dark'] { color-scheme: dark; }
+body { margin: 0; background: var(--mllm-bg); color: var(--mllm-text); font: 16px/1.6 var(--mllm-font-sans); }
+main, .bar { max-width: 720px; margin: 0 auto; padding: 0 16px; }
+.bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding-block: 16px; color: var(--mllm-muted); }
+.bar nav { display: flex; gap: 16px; align-items: center; }
+footer.bar { justify-content: center; border-top: 1px solid var(--mllm-rule); }
+a { color: var(--mllm-accent-text); }
+.wordmark { font-weight: 700; font-size: 1.25rem; color: var(--mllm-text); text-decoration: none; }
+section { padding-block: 40px; border-top: 1px solid var(--mllm-rule); }
+section.hero { border-top: 0; padding-top: 24px; }
+h1 { font-size: clamp(1.75rem, 6vw, 2.5rem); line-height: 1.15; margin: 0 0 12px; }
+h2 { font-size: 1.375rem; margin: 0 0 12px; }
+.lede, .note, small { color: var(--mllm-muted); }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; }
+.button { display: inline-block; padding: 10px 18px; min-height: 44px; border-radius: 6px; background: var(--mllm-button-bg); color: var(--mllm-button-text); text-decoration: none; font-weight: 600; }
+.button.secondary { background: transparent; color: var(--mllm-text); border: 1px solid var(--mllm-rule); }
+.theme { min-width: 44px; min-height: 44px; background: none; border: 1px solid var(--mllm-rule); border-radius: 6px; color: var(--mllm-text); cursor: pointer; }
+.terminal { background: var(--mllm-code-bg); color: var(--mllm-code-text); font: 14px/1.5 var(--mllm-font-mono); padding: 16px; border-radius: 8px; overflow-x: auto; max-width: 100%; }
+.prompt { color: var(--mllm-code-muted); user-select: none; }
+.terminal .state-parked { color: var(--mllm-code-accent); }
+.state-parked { color: var(--mllm-accent-text); }
+.flow { margin: 0; display: grid; gap: 4px; justify-items: center; text-align: center; }
+.node { border: 1px solid var(--mllm-rule); border-radius: 6px; padding: 8px 12px; background: var(--mllm-surface); width: 100%; max-width: 420px; }
+.node.strong { border-color: var(--mllm-accent); }
+.node small { display: block; }
+.edge { color: var(--mllm-muted); font-size: 0.875rem; }
+.hosts { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); width: 100%; }
+figcaption { margin-top: 12px; color: var(--mllm-muted); }
+.scroll { overflow-x: auto; }
+.preview { margin: 0; padding: 8px 16px; text-align: center; background: var(--mllm-surface); color: var(--mllm-text); border-bottom: 1px solid var(--mllm-accent); }
+/* Review item 6: the real table is 69 columns; it scrolls inside its box and
+   its text is never changed, but a smaller size shows more of it on a phone. */
+@media (max-width: 480px) { .terminal { font-size: 12px; } }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; vertical-align: top; padding: 8px; border-top: 1px solid var(--mllm-rule); }

@@ -1,7 +1,7 @@
 # mllm host role document (`mllm start host --config host.yaml`) for a
 # discrete-GPU host (one 24 GB NVIDIA card; device memory is its own domain).
 # Host RAM is the `system` domain and the card's memory is the `gpu0` domain;
-# every deployment is charged on both (ADR 0019).
+# every deployment is charged on both.
 # Parsed by the product: `mllm validate config --file docs/examples/host-discrete.yaml`.
 # An illustration of the schema, not a tested engine recipe: executables,
 # fingerprints and limits are placeholders for the host's own values.

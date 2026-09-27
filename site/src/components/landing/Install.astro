@@ -1,0 +1,13 @@
+---
+// Website spec, Landing page 6 and Open decisions 2: one install command,
+// from the MLLM_INSTALL_URL build setting (scripts/lib/settings.mjs).
+import { INSTALL_COMMAND, href } from '../../../site.config.mjs';
+---
+<section>
+  <h2>Install</h2>
+  <pre class="terminal" tabindex="0"><code><span class="prompt">$ </span>{INSTALL_COMMAND}
+<span class="prompt">$ </span>mllm engine add ~/venvs/vllm
+<span class="prompt">$ </span>mllm start standalone
+<span class="prompt">$ </span>mllm deploy model --file my-model.yaml --activate --wait</code></pre>
+  <p>One static binary. Bring your own engine; weights come from a directory or Hugging Face. <a href={href('/docs/one-machine/')}>Run on one machine</a></p>
+</section>

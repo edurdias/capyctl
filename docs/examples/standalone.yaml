@@ -1,16 +1,15 @@
 # mllm standalone role document: an embedded server and host on one machine,
-# with authenticated listeners. `mllm start standalone` generates
-# this shape under its state directory when none exists. The engine
-# installation is named here (`host.local_engine`), by a flag (--vllm-bin) or
-# by a variable (MLLM_VLLM_BIN); a flag wins over a variable, which wins over
-# this file (docs/operations/configuration.md lists every setting). Inference
-# listens on all interfaces and requires the API key; management stays on
-# loopback (ADR 0019, docs/operations/network-access.md). The listeners serve
-# plain HTTP, so there is no `tls` block (SPEC §16.5): use a private network
-# or a TLS reverse proxy. Models live in ~/models unless
-# `host.model_store.path` (or --models-root, MLLM_MODELS_ROOT) names another
-# directory; Hugging Face and HTTP downloads are allowed with a 500 GiB cap
-# unless `host.model_sources` says otherwise.
+# with authenticated listeners. `mllm start standalone` generates this shape
+# under its state directory when none exists. The engine installation is
+# named here (`host.local_engine`), by a flag (--vllm-bin) or by a variable
+# (MLLM_VLLM_BIN); a flag wins over a variable, which wins over this file
+# (docs/operations/configuration.md lists every setting). Inference listens on
+# all interfaces and requires the API key; management stays on loopback
+# (docs/operations/network-access.md). The listeners serve plain HTTP, so
+# there is no `tls` block: use a private network or a TLS reverse proxy.
+# Models live in ~/models unless `host.model_store.path` (or --models-root,
+# MLLM_MODELS_ROOT) names another directory; Hugging Face and HTTP downloads
+# are allowed with a 500 GiB cap unless `host.model_sources` says otherwise.
 # Parsed by the product: `mllm validate config --file docs/examples/standalone.yaml`.
 schema_version: 1
 kind: standalone

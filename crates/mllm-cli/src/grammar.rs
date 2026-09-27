@@ -26,7 +26,9 @@ pub enum Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub enum InitTarget {
+    /// Write a starter server configuration.
     Server,
+    /// Write a starter host configuration.
     Host,
 }
 
@@ -272,7 +274,7 @@ impl Command {
 #[command(
     name = "mllm",
     version,
-    about = "mllm control-plane CLI",
+    about = "Run vLLM and SGLang models on your own GPUs",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -292,6 +294,8 @@ struct Cli {
     /// Short for `--format json`.
     #[arg(long, global = true, conflicts_with = "format")]
     json: bool,
+    /// A ULID that names this change. Running the command again with the
+    /// same id continues the same change instead of starting a new one.
     #[arg(long, global = true, value_name = "ID")]
     request_id: Option<String>,
     /// The state root: where implicit role documents, standalone state and
@@ -308,36 +312,39 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum CliCommand {
+    /// Start the server, a host, standalone, or a deployment.
     Start {
         #[command(subcommand)]
         target: StartTarget,
     },
+    /// Write a starter configuration file for a server or a host.
     Init {
         #[command(subcommand)]
         target: InitTarget,
     },
-    /// Create a short-lived, single-use host invitation. With `--recover`,
-    /// the invitation lets a revoked host (named by name or id) re-enroll
-    /// under its same identity; its old certificate stays revoked.
+    /// Create a single-use invitation file that lets a GPU machine join the
+    /// server. With `--recover`, let a revoked host rejoin as itself.
     Invite {
         resource: HostWord,
         /// The host: a new host's name, or with `--recover` a revoked host's
         /// name or id. The same as `--name`.
         #[arg(conflicts_with = "name", required_unless_present = "name")]
         host: Option<String>,
+        /// The host's name (instead of the positional argument).
         #[arg(long)]
         name: Option<String>,
+        /// Create a recovery invitation for a revoked host.
         #[arg(long)]
         recover: bool,
     },
-    /// Enroll this host with an invitation file. With `--recover`, redeem a
-    /// recovery invitation: the host keeps its state and journal (or starts
-    /// with fresh identity files if they were lost) and gets a new
-    /// certificate for its same host id.
+    /// Join this machine to a server with an invitation file. With
+    /// `--recover`, rejoin a revoked host as itself; its state is kept.
     Join {
         resource: HostWord,
+        /// The invitation file from `mllm invite host`.
         #[arg(long)]
         join_file: PathBuf,
+        /// Redeem a recovery invitation.
         #[arg(long)]
         recover: bool,
         // Final review I8: the host document's `--set` overrides, as
@@ -345,77 +352,89 @@ enum CliCommand {
         #[command(flatten)]
         overrides: SetArgs,
     },
+    /// List hosts, deployments or engines as a table.
     List {
         #[command(subcommand)]
         resource: ListArgs,
     },
+    /// Print the full JSON record of a host or a deployment.
     Inspect {
         #[command(subcommand)]
         resource: InspectArgs,
     },
+    /// Check a host. Not available in this release.
     Doctor {
         resource: HostWord,
+        /// A host, by name or id.
         host: String,
     },
+    /// Create a deployment from a YAML file, or update one.
     Deploy {
         #[command(subcommand)]
         resource: DeployArgs,
     },
+    /// Show a deployment's state and its instances.
     Status {
         #[command(subcommand)]
         resource: StatusArgs,
     },
+    /// Park a deployment: free its GPU memory and keep it ready to wake. The
+    /// next request for it wakes it.
     Park {
         resource: DeploymentWord,
+        /// A deployment, by name or id.
         deployment: String,
     },
+    /// Stop a deployment's engines, or one instance. The deployment is kept.
     Stop {
         #[command(subcommand)]
         target: StopTarget,
     },
+    /// Start a deployment, check it answers, then park it, so its first
+    /// request only has to wake it.
     Preinitialize {
         resource: DeploymentWord,
+        /// A deployment, by name or id.
         deployment: String,
     },
-    /// Remove a deployment and its routes after verified cleanup. Model files
-    /// and caches on hosts are never touched.
+    /// Delete a deployment and its routes once its engines are confirmed
+    /// stopped. Model files and caches on hosts are never touched.
     Delete {
         #[command(subcommand)]
         resource: DeleteArgs,
     },
+    /// Check a configuration file without starting anything.
     Validate {
         #[command(subcommand)]
         resource: ValidateArgs,
     },
-    /// The effective configuration of a role.
+    /// Show the settings a role would run with and where each came from.
     Config {
         #[command(subcommand)]
         action: ConfigArgs,
     },
-    /// Stop every engine on a host with verified cleanup; its deployments stay
-    /// eligible for on-demand activation. Signalling a role never does this.
+    /// Stop every engine on a host and keep its deployments; they start again
+    /// when a request needs them. Stopping the mllm service does not do this.
     Drain {
         #[command(subcommand)]
         resource: DrainArgs,
     },
-    /// Revoke an enrolled host's identity. Its control session closes at once,
-    /// it can no longer reconnect, take commands or placements, and dispatch
-    /// to its engines closes. The host role is told so and exits (code 14). Engines it runs are not stopped and their
-    /// accounting is kept until an operator settles them with evidence. The
-    /// host comes back only through `invite host <name|id> --recover` and
-    /// `join host --recover`, under the same identity with a new certificate.
+    /// Disconnect a host for good. Its mllm process exits with code 14; its
+    /// engines keep running but get no more requests, and their GPU memory
+    /// stays counted as used. Bring it back with `invite host --recover` and
+    /// `join host --recover`.
     Revoke {
         #[command(subcommand)]
         resource: RevokeArgs,
     },
-    /// Remove materialized model sources that no deployment references, from
-    /// this machine's model store. Deleting a deployment never does this.
+    /// Remove downloaded model copies that no deployment uses from this
+    /// machine's model store. Deleting a deployment never does this.
     Prune {
         #[command(subcommand)]
         resource: PruneArgs,
     },
-    /// Register vLLM and SGLang installations on this machine as runtime
-    /// profiles, list them, or remove one. Acts on this machine's role.
+    /// Register, list or remove the vLLM and SGLang installations on this
+    /// machine. Each one becomes a runtime profile deployments can name.
     Engine {
         #[command(subcommand)]
         action: EngineArgs,
@@ -444,7 +463,8 @@ enum EngineArgs {
         /// What a launch does when the installation changed since registration.
         #[arg(long, value_enum, default_value_t = DriftChoice::Warn)]
         drift: DriftChoice,
-        /// A host-fixed engine argument (repeatable).
+        /// An engine argument added to every launch with this profile
+        /// (repeatable).
         #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -452,6 +472,7 @@ enum EngineArgs {
     List,
     /// Remove a runtime profile.
     Remove {
+        /// The profile name.
         name: String,
         /// Stop the deployments on this machine that use it first.
         #[arg(long)]
@@ -461,10 +482,9 @@ enum EngineArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum PruneArgs {
-    /// Copies under `<model store>/sources` that no existing deployment
-    /// declares. The referenced set comes from the server's management API
-    /// (or `--referenced-file`); without it nothing is removed. Lists only,
-    /// unless `--apply` is given. A download in progress is never touched.
+    /// List the copies under `<model store>/sources` that no deployment
+    /// uses; remove them with `--apply`. A download in progress is never
+    /// touched.
     Sources {
         /// The host document naming the model store to prune.
         #[arg(long, value_name = "FILE")]
@@ -481,20 +501,23 @@ enum PruneArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum RevokeArgs {
-    /// An enrolled host, by name or id. Revoking a revoked host changes
-    /// nothing and reports it (`newly_revoked: false`).
-    Host { host: String },
+    /// Revoke a host. Revoking it again changes nothing.
+    Host {
+        /// A host, by name or id.
+        host: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum DeleteArgs {
-    /// A deployment, by name or id. Refused while any instance still holds a
-    /// runtime, reservation, lease or open operation, unless `--stop` is given.
+    /// Delete a deployment. Refused while any of its engines may still be
+    /// running or starting, unless `--stop` is given.
     Deployment {
+        /// A deployment, by name or id.
         deployment: String,
-        /// Stop every instance first, wait for verified cleanup, then delete.
-        /// Reports `pending` with the Stops' operation ids when cleanup cannot
-        /// be proven yet; rerun with the same --request-id to resume.
+        /// Stop it first, wait until its engines are confirmed gone, then
+        /// delete. If that cannot be confirmed yet it reports `pending`; run
+        /// it again with the same `--request-id` to continue.
         #[arg(long)]
         stop: bool,
     },
@@ -502,15 +525,16 @@ enum DeleteArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum DrainArgs {
-    /// An enrolled host, by name or id, through the server's management API.
+    /// Drain a host through the server.
     Host {
+        /// A host, by name or id.
         host: String,
-        /// Wait for the Stops of an offline host until it reconnects, up to
-        /// the drain window, instead of returning with them pending.
+        /// For an offline host, wait until it reconnects and its engines stop,
+        /// instead of returning at once.
         #[arg(long)]
         wait: bool,
     },
-    /// The standalone role's embedded host, through its management API.
+    /// Drain the engines of the standalone instance on this machine.
     Standalone,
 }
 
@@ -635,7 +659,7 @@ impl RoleSettingsArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StartTarget {
-    /// Start the server role (the control plane for enrolled hosts).
+    /// Start the server.
     Server {
         /// Serve inference on this address for this run instead of the
         /// document's `listeners.inference.bind` (default 0.0.0.0:8443), for
@@ -658,7 +682,7 @@ enum StartTarget {
         #[command(flatten)]
         overrides: SetArgs,
     },
-    /// Start the host role (runs engines for the server it joined).
+    /// Start a host on this GPU machine.
     Host {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
@@ -668,7 +692,7 @@ enum StartTarget {
         #[command(flatten)]
         overrides: SetArgs,
     },
-    /// Start the standalone role (a server and one host in one process).
+    /// Start the server and one host together on this machine.
     Standalone {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
@@ -700,49 +724,41 @@ enum StartTarget {
         #[command(flatten)]
         overrides: SetArgs,
     },
+    /// Start a deployment's engines.
     Deployment {
+        /// A deployment, by name or id.
         deployment: String,
-        /// Bound this start's Initialize instead of the deployment's
-        /// `timeouts.initialize` (for example `20m`); at most its request deadline.
+        /// How long the engine may take to load (for example `20m`), instead
+        /// of the deployment's `timeouts.initialize`.
         #[arg(long, value_name = "DURATION")]
         initialize_timeout: Option<String>,
-        /// Make room for every instance of the deployment by releasing other
-        /// engines with the same switch plan a waiting request uses (drain
-        /// within the switch drain timeout, then park or stop), and report
-        /// them. The whole start is planned first and only what placement
-        /// needs is released; if any instance cannot be placed even with
-        /// eviction, nothing is released and the start is refused
-        /// (capacity_blocked, exit code 4). Without it a start never evicts
-        /// anything.
+        /// Make room by parking or stopping idle deployments, and report which.
+        /// If it cannot fit even then, nothing is touched and the start fails
+        /// with exit code 4. Without it a start never evicts anything.
         #[arg(long)]
         evict: bool,
-        // SPEC §6.4.
-        /// Wait until every instance of the deployment is ready.
-        /// Exits 0 only then; a partial start is never a success. An instance
-        /// not placed before the start's deadline exits 4
-        /// (insufficient_resources), a failed launch 13 (operation_failed),
-        /// any other wait expiry 10 (activation_timeout); no allowed host
-        /// eligible for placement exits 15 (host_ineligible). The failure
-        /// prints the reason status shows.
+        // SPEC §6.4: a partial start is never a success.
+        /// Wait until every instance is ready; exit 0 only then. Exits 4 when
+        /// there is no room, 13 when the launch fails, 10 on timeout and 15
+        /// when no host can take it, with the reason.
         #[arg(long)]
         wait: bool,
     },
-    // Owner decision Q7.
+    // Owner decision Q7 (kept out of the help text, which users read).
     /// Start one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
         instance: (String, u32),
-        /// Bound this start's Initialize instead of the deployment's
-        /// `timeouts.initialize`; at most its request deadline.
+        /// How long the engine may take to load, instead of the deployment's
+        /// `timeouts.initialize`.
         #[arg(long, value_name = "DURATION")]
         initialize_timeout: Option<String>,
-        /// Make room for this instance by releasing other engines on one host
-        /// with the same switch plan a waiting request uses, and report them.
+        /// Make room on its host by parking or stopping idle deployments, and
+        /// report which.
         #[arg(long)]
         evict: bool,
-        // SPEC §6.4.
-        /// Wait for the start's operation to finish; a failure
-        /// prints the reason and hint status shows for it.
+        // SPEC §6.4: wait for the start's operation.
+        /// Wait for the start to finish; on failure print the reason.
         #[arg(long)]
         wait: bool,
     },
@@ -750,10 +766,12 @@ enum StartTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StopTarget {
+    /// Stop every engine of a deployment.
     Deployment {
+        /// A deployment, by name or id.
         deployment: String,
     },
-    // Owner decision Q7.
+    // Owner decision Q7 (kept out of the help text, which users read).
     /// Stop one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
@@ -781,24 +799,35 @@ fn parse_instance(value: &str) -> Result<(String, u32), String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 enum ListArgs {
+    /// Hosts joined to the server and whether they are connected.
     Hosts,
+    /// Deployments, their state and the hosts they run on.
     Deployments,
+    /// Every host's registered engines.
     Engines,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum InspectArgs {
+    /// A host's full record.
     Host {
+        /// A host, by name or id.
         host: String,
     },
+    /// A deployment's full record.
     Deployment {
+        /// A deployment, by name or id.
         deployment: String,
+        /// Include the configuration as resolved for launch.
         #[arg(long)]
         effective_config: bool,
     },
+    /// A role's configuration. Not available in this release.
     Config {
+        /// The role: server, host or standalone.
         #[arg(long)]
         role: Option<String>,
+        /// Show it with defaults filled in.
         #[arg(long)]
         effective: bool,
     },
@@ -806,21 +835,27 @@ enum InspectArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum DeployArgs {
+    /// Deploy a model from a deployment file.
     Model {
+        /// The deployment file (YAML).
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
+        /// Start it as soon as it is accepted.
         #[arg(long)]
         activate: bool,
+        /// With `--activate`: wait until it is ready.
         #[arg(long)]
         wait: bool,
-        /// With `--activate`: bound the start's Initialize instead of the
-        /// deployment's `timeouts.initialize`; at most its request deadline.
+        /// With `--activate`: how long the engine may take to load, instead of
+        /// the deployment's `timeouts.initialize`.
         #[arg(long, value_name = "DURATION", requires = "activate")]
         initialize_timeout: Option<String>,
-        // SPEC §14 (an update is explicit and revision-aware), ADR 0013 §7.
-        /// Revise the existing deployment the file names, replacing exactly
-        /// this revision. A count-only change keeps running instances; any
-        /// other change stops and restarts them on the new revision.
+        // SPEC §14: an update is explicit and revision-aware; ADR 0013 §7
+        // decides which changes restart instances.
+        /// Update the existing deployment the file names. N is its current
+        /// revision, as `mllm list deployments` shows it. Changing only the
+        /// instance count keeps running instances; any other change restarts
+        /// them.
         #[arg(long, value_name = "N", conflicts_with = "activate",
               value_parser = clap::value_parser!(i64).range(1..))]
         revision: Option<i64>,
@@ -835,8 +870,11 @@ enum DeployArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StatusArgs {
+    /// A deployment's state and its instances.
     Deployment {
+        /// A deployment, by name or id.
         deployment: String,
+        /// Keep printing updates. Not available in this release.
         #[arg(long)]
         watch: bool,
     },
@@ -844,7 +882,9 @@ enum StatusArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum ValidateArgs {
+    /// Check one server, host, standalone or deployment file.
     Config {
+        /// The file to check.
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
         /// The host document a deployment file is resolved against.
@@ -1456,4 +1496,10 @@ where
     T: Into<OsString> + Clone,
 {
     parse_invocation(args).map(|inv| inv.command)
+}
+
+/// Website spec, Docs: the clap definition the CLI reference is generated
+/// from. The same `Cli` the binary parses with, so the reference cannot drift.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
 }

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 396" width="360" height="396" class="hms" role="img" aria-labelledby="hms-title hms-desc">
+<title id="hms-title">Where a model's memory goes when it is ready, parked or stopped</title>
+<desc id="hms-desc">Four states, each with a bar for GPU memory and one for host RAM. Ready: the GPU holds the weights and the KV cache, and host RAM holds the engine process; it answers at once. Parked in host RAM: the GPU is almost empty, and host RAM holds the engine process and a copy of the weights; a wake copies them back in seconds. Parked deep: the GPU is almost empty and the weights are dropped; a wake reloads them from disk. Stopped: no engine and no memory; the next start is a full start. A switch parks the idle model and wakes the one a request asks for.</desc>
+<style>
+.hms{--hms-ink:var(--sl-color-white,#1c1917);--hms-muted:var(--sl-color-gray-3,#57534e);--hms-line:var(--sl-color-gray-4,#78716c);--hms-box:var(--sl-color-gray-6,#f5f5f4);--hms-bg:var(--sl-color-black,#ffffff);--hms-hot:var(--sl-color-accent-low,#ffedd5);--hms-accent:var(--sl-color-accent,#c2410c);--hms-proc:var(--sl-color-gray-5,#d6d3d1);max-width:100%;height:auto;font-family:var(--sl-font,system-ui,sans-serif)}
+@media (prefers-color-scheme:dark){.hms{--hms-ink:var(--sl-color-white,#fafaf9);--hms-muted:var(--sl-color-gray-3,#a8a29e);--hms-line:var(--sl-color-gray-4,#78716c);--hms-box:var(--sl-color-gray-6,#292524);--hms-bg:var(--sl-color-black,#1c1917);--hms-hot:var(--sl-color-accent-low,#431407);--hms-accent:var(--sl-color-accent,#fb923c);--hms-proc:var(--sl-color-gray-5,#44403c)}}
+.hms text{fill:var(--hms-ink);font-size:12px}
+.hms .hms-m{fill:var(--hms-muted);font-size:10.5px}
+.hms .hms-s{font-size:10.5px}
+.hms .hms-b{font-weight:600}
+.hms .hms-empty{fill:var(--hms-bg);stroke:var(--hms-line);stroke-width:1}
+.hms .hms-w{fill:var(--hms-hot);stroke:var(--hms-accent);stroke-width:1}
+.hms .hms-kv{fill:var(--hms-box);stroke:var(--hms-accent);stroke-width:1;stroke-dasharray:3 2}
+.hms .hms-p{fill:var(--hms-proc)}
+.hms .hms-arrow{stroke:var(--hms-accent);stroke-width:1.5;fill:none;marker-end:url(#hms-head)}
+.hms .hms-head{fill:var(--hms-accent)}
+</style>
+<defs><marker id="hms-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="hms-head" d="M0 0L10 5L0 10z"/></marker></defs>
+<text class="hms-b" x="10" y="20">Ready</text><text class="hms-m" x="60" y="20">answers at once</text>
+<text class="hms-m" x="10" y="43">GPU</text><rect class="hms-empty" x="46" y="30" width="304" height="20" rx="3"/>
+<rect class="hms-w" x="46" y="30" width="150" height="20" rx="3"/><text class="hms-s" x="54" y="44">weights</text>
+<rect class="hms-kv" x="196" y="30" width="96" height="20"/><text class="hms-s" x="204" y="44">KV cache</text>
+<text class="hms-m" x="10" y="69">RAM</text><rect class="hms-empty" x="46" y="56" width="304" height="20" rx="3"/>
+<rect class="hms-p" x="46" y="56" width="60" height="20" rx="3"/><text class="hms-s" x="52" y="70">engine</text>
+<text class="hms-b" x="10" y="112">Parked in host RAM</text><text class="hms-m" x="130" y="112">wake copies back, seconds</text>
+<text class="hms-m" x="10" y="135">GPU</text><rect class="hms-empty" x="46" y="122" width="304" height="20" rx="3"/>
+<rect class="hms-p" x="46" y="122" width="12" height="20" rx="3"/><text class="hms-m" x="66" y="136">freed</text>
+<text class="hms-m" x="10" y="161">RAM</text><rect class="hms-empty" x="46" y="148" width="304" height="20" rx="3"/>
+<rect class="hms-p" x="46" y="148" width="60" height="20" rx="3"/><text class="hms-s" x="52" y="162">engine</text>
+<rect class="hms-w" x="106" y="148" width="150" height="20"/><text class="hms-s" x="114" y="162">weights copy</text>
+<text class="hms-b" x="10" y="204">Parked, deep</text><text class="hms-m" x="92" y="204">wake reloads from disk</text>
+<text class="hms-m" x="10" y="227">GPU</text><rect class="hms-empty" x="46" y="214" width="304" height="20" rx="3"/>
+<rect class="hms-p" x="46" y="214" width="12" height="20" rx="3"/><text class="hms-m" x="66" y="228">freed</text>
+<text class="hms-m" x="10" y="253">RAM</text><rect class="hms-empty" x="46" y="240" width="304" height="20" rx="3"/>
+<rect class="hms-p" x="46" y="240" width="60" height="20" rx="3"/><text class="hms-s" x="52" y="254">engine</text>
+<text class="hms-b" x="10" y="296">Stopped</text><text class="hms-m" x="68" y="296">no engine; the next start is a full start</text>
+<text class="hms-m" x="10" y="319">GPU</text><rect class="hms-empty" x="46" y="306" width="304" height="20" rx="3"/>
+<text class="hms-m" x="10" y="345">RAM</text><rect class="hms-empty" x="46" y="332" width="304" height="20" rx="3"/>
+<text class="hms-b" x="10" y="382">Switch</text>
+<text class="hms-s" x="62" y="382">park A</text><path class="hms-arrow" d="M104 378H134"/>
+<text class="hms-s" x="140" y="382">wake B</text><path class="hms-arrow" d="M184 378H214"/>
+<text class="hms-s" x="220" y="382">answer B's request</text>
+</svg>
