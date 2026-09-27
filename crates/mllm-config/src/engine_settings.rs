@@ -552,6 +552,32 @@ pub fn carry_start_settings(running: &Value, reloaded: &mut Value) {
         }
         (None, _) => {}
     }
+    // SPEC §3 / ADR 0018 §3: boot-observed placement facts are not written
+    // into host.yaml. Keep them when adding an engine live. Explicit changes
+    // remain visible to the profiles-only comparison and require a restart.
+    if object
+        .get("device_inventory_digest")
+        .is_none_or(Value::is_null)
+    {
+        if let Some(digest) = running.get("device_inventory_digest") {
+            object.insert("device_inventory_digest".into(), digest.clone());
+        }
+    }
+    if let Some(devices) = object
+        .get_mut("resource_policy")
+        .and_then(|policy| policy.get_mut("devices"))
+        .and_then(Value::as_object_mut)
+    {
+        for (id, device) in devices {
+            if device["physical_gpu_uuid"].is_null() {
+                if let Some(uuid) =
+                    running["resource_policy"]["devices"][id].get("physical_gpu_uuid")
+                {
+                    device["physical_gpu_uuid"] = uuid.clone();
+                }
+            }
+        }
+    }
     // The start-time `local_engine` profiles, unless the document now
     // declares one of that name itself.
     let Some(running_profiles) = running["runtime_profiles"].as_object() else {

@@ -1,4 +1,4 @@
-//! Publication of the host's NVIDIA device inventory at standalone boot.
+//! Publication of the host's NVIDIA device inventory at role boot.
 //!
 //! SPEC §3: the versioned inventory digest (`mllm-nvidia-inventory-v1`,
 //! computed by `runtime/sglang_device.py`) is a host fact, published at boot
@@ -218,4 +218,26 @@ pub fn is_physical_uuid(value: &str) -> bool {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
         })
+}
+
+/// SPEC §3 / T22: a remote host publishes the same freshly observed placement
+/// evidence as standalone. Explicit policy pins are never replaced; the native
+/// gate must still corroborate them. The enrolled name is not a kernel hostname.
+pub fn publish_host(document: &mut Value, inventory: Option<&InventoryPublication>) {
+    let Some(inventory) = inventory else {
+        return;
+    };
+    if document["device_inventory_digest"].is_null() {
+        document["device_inventory_digest"] = Value::String(inventory.digest.clone());
+    }
+    let Some(devices) = document["resource_policy"]["devices"].as_object_mut() else {
+        return;
+    };
+    for (index, uuid) in &inventory.physical_gpu_uuids {
+        if let Some(device) = devices.get_mut(&format!("gpu{index}")) {
+            if device["physical_gpu_uuid"].is_null() {
+                device["physical_gpu_uuid"] = Value::String(uuid.clone());
+            }
+        }
+    }
 }

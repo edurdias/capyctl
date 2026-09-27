@@ -197,6 +197,10 @@ impl Lab {
     /// golden fixture, with `instances` instances (10 GiB cold, 8 GiB Ready
     /// each), and return its id.
     fn deploy(&self, name: &str, instances: u32) -> String {
+        self.deploy_with_digest(name, instances, false)
+    }
+
+    fn deploy_with_digest(&self, name: &str, instances: u32, provisional: bool) -> String {
         let source: Value = serde_json::from_str(include_str!(
             "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
         ))
@@ -213,6 +217,10 @@ impl Lab {
         deployment["name"] = json!(name);
         deployment["routes"] = json!([name]);
         deployment["instances"] = json!(instances);
+        if provisional {
+            deployment.as_object_mut().unwrap().remove("resources");
+            deployment["engine_config"] = json!({"memory": {"kv_cache": "4GiB"}});
+        }
         let o = self.owner.lock().unwrap();
         o.store()
             .create_stopped_managed_configuration(
@@ -529,5 +537,32 @@ async fn a_start_with_no_eligible_host_reports_host_ineligible() {
         assert!(message.contains("no allowed host is eligible"), "{message}");
     }
     assert!(lab.switch_events().is_empty(), "{:?}", lab.switch_events());
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T10 T14 T16: SPEC §6.4 / ADR 0014 §7. A start waiting for checkpoint
+// sizing must not release a serving victim before reporting that refusal.
+#[tokio::test]
+async fn a_pending_checkpoint_evicts_nothing() {
+    let lab = lab().await;
+    let (status, body) = send(&lab, action(&lab.a, "start-a", start(false))).await;
+    assert_eq!(status, 202, "{body}");
+    lab.until("A ready", |l| l.instance(&l.a, 0).0 == "ready")
+        .await;
+    let pending = lab.deploy_with_digest("pending", 1, true);
+    for (path, key) in [
+        (pending.clone(), "pending-deployment"),
+        (format!("{pending}/instances/0"), "pending-instance"),
+    ] {
+        let (status, body) = send(&lab, action(&path, key, start(true))).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"]["code"], "checkpoint_digest_pending", "{body}");
+        assert_eq!(
+            lab.instance(&lab.a, 0),
+            ("ready".into(), true),
+            "A was evicted"
+        );
+        assert!(lab.switch_events().is_empty(), "{:?}", lab.switch_events());
+    }
     lab.worker.shutdown().await.unwrap();
 }

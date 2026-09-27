@@ -1,8 +1,88 @@
-# F2 continuation status
+# Current implementation and launch status
 
-F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge is
-claimed. The current user instruction is one consolidated review at the end,
-not per task. Focused TDD and integration verification continue throughout.
+## 0.1.0 installed-binary guide validation — 2026-09-27
+
+Selected-recipe guide validation is complete with the limitation below. It
+began at merged commit `bca166c`; the fixes and evidence are in the commit
+containing this entry. The full release remains an unpublished draft. Public installation remains pending the repository
+transition, owner publication and site deployment. The historical F2 records
+below are retained as evidence; their branch and pending-work statements apply
+to their dated entries.
+
+Both release architectures built from `bca166c` with clean BUILDINFO records.
+Each architecture produced identical archives on repeated builds, passed the
+42 installer checks, checksum and embedded-runtime checks, and the private
+name/path scan. The control host passed strict packaging verification; the ARM
+host skipped ShellCheck because it is absent there (the same scripts passed it
+on the control host). The public installer URL still returns 404 before launch.
+
+The guide walk found these changes:
+
+- An immediate `start --evict` after deploying a checkpoint whose sizing is
+  pending stopped a serving victim and then refused the target start. The
+  preflight now reuses the store's checkpoint and source admission checks
+  before eviction. A regression test reproduced the stop before the fix and
+  verifies both deployment and instance starts leave the victim serving.
+- A fresh remote host omitted the device inventory digest and physical GPU
+  UUID required by SGLang, so the downloaded checkpoint was refused at the
+  native placement gate. Remote startup now collects the same physical
+  evidence as standalone and keeps it across engine registration. Explicit
+  policy pins are preserved. An enrolled alias may differ from the kernel
+  hostname: the frozen inventory digest still binds the physical host, boot
+  and devices, and the namespace and UUID checks remain mandatory. Tests
+  reject a different physical host even when the logical alias matches.
+- `park` returns when accepted; the guide now distinguishes `parking` from
+  completion. The switch example uses `--evict --wait`, which waits for
+  checkpoint measurement and readiness, and distinguishes a pressure stop
+  from an operator stop.
+- Plain `scp` copied an invitation with mode 0644 and enrollment refused it.
+  The guide now preserves permissions and explicitly sets the invitation to
+  0600 on the receiving host.
+
+Live evidence is local and untracked under `target/live/release-010/` in the
+validation checkout. The installed baseline binary passed standalone vLLM
+chat, streaming, key rejection and host-backed park/wake, and remote vLLM chat,
+streaming and deep park/wake through the server. Both remote hosts enrolled
+and published their existing vLLM and SGLang installations. The second host
+materialized and verified the guide's Hugging Face source (8,060,917,568 bytes,
+revision `cdbee75f17c01a7cc42f958dc650907174af0554`). With the host-inventory fix,
+SGLang served chat and streaming, parked deep, and answered correctly after a
+59.76-second wake while retaining the same two GPU processes. Adding another
+engine live preserved the placement evidence. An authenticated request from
+another machine reached the server; the same request without a key returned
+401. These are selected-recipe checks, not a claim about every model or engine
+build.
+
+The optional small SGLang checkpoint served and parked on the discrete GPU,
+but wake became uncertain on two attempts. Its answer to the adapter's probe
+prompt was `OK.` rather than the required exact `OK`; the adapter's strict
+probe remains unchanged. This recipe is not validated for wake. Reservations
+and closed dispatch were retained, and an explicit stop verified cleanup.
+The guide's larger checkpoint passed on the remote host as recorded above.
+
+The patched installed x86-64 binary also passed the live eviction regression:
+a pending checkpoint start was refused, the serving model retained the same
+GPU process, no switch began, and the next inference request answered correctly.
+
+The eviction regression and all eight switch-management tests pass. The core
+suite passed 1113 distinct tests (1114 reported, including the nested owned-state
+summary), with zero failures. These CPU and Fake-engine tests are not native
+engine qualification. The final workspace suite passed 2255 distinct tests
+(2256 reported), with zero failures. All 111 focused Python placement, entry,
+composition and startup-gate tests pass. Clippy with warnings denied (the core
+crates plus CLI, config and agent), formatting, site publishing checks with the
+private-name scan, and both updated packages' installer/content checks pass.
+
+All test deployments were stopped with verified cleanup and deleted from the
+remote server. No test role or GPU compute process remains on any of the three
+machines. The control host's pre-existing identity state was restored; generated
+validation state and logs were archived locally, not deleted. The downloaded
+model remains in the second host's model store.
+
+Next: review the unpublished draft, run the sanitized-history transition, rebuild
+from the rewritten release commit, and have the owner publish. The public
+installer and Pages deployment must then be checked against that public release.
+Multi-host tensor/pipeline parallelism remains deferred.
 
 ## A command uses the role on its machine; saved contexts removed — 2026-09-26 (branch `chore/remove-contexts`)
 

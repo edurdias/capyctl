@@ -427,3 +427,70 @@ fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() 
         assert_eq!(effective.cuda_namespace(), Ok(None));
     }
 }
+
+// T14 T22 T37: remote hosts fill missing placement evidence without changing
+// their enrolled name, other devices, or explicit administrator pins.
+#[test]
+fn remote_host_publication_preserves_aliases_and_explicit_pins() {
+    let publication = mllm_cli::device_inventory::InventoryPublication {
+        host_id: "kernel-host".into(),
+        digest: DIGEST.into(),
+        physical_gpu_uuids: BTreeMap::from([(0, UUID.into())]),
+    };
+    let mut host = serde_json::json!({
+        "name": "gpu-box",
+        "resource_policy": {"devices": {"gpu0": {"memory_domain": "unified"}, "gpu1": {"memory_domain": "unified"}}}
+    });
+    let original = host.clone();
+    mllm_cli::device_inventory::publish_host(&mut host, None);
+    assert_eq!(host, original, "failed observation cannot invent evidence");
+    mllm_cli::device_inventory::publish_host(&mut host, Some(&publication));
+    assert_eq!(host["name"], "gpu-box");
+    assert_eq!(host["device_inventory_digest"], DIGEST);
+    assert_eq!(
+        host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"],
+        UUID
+    );
+    assert!(host["resource_policy"]["devices"]["gpu1"]
+        .get("physical_gpu_uuid")
+        .is_none());
+    host["device_inventory_digest"] = serde_json::json!("explicit-pin");
+    host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"] =
+        serde_json::json!("explicit-uuid");
+    let pinned = host.clone();
+    mllm_cli::device_inventory::publish_host(&mut host, Some(&publication));
+    assert_eq!(
+        host, pinned,
+        "pins must be checked, never silently replaced"
+    );
+}
+
+// T14 T22: adding an engine must not discard the boot's placement evidence.
+// A changed explicit pin must still reach the profiles-only rejection.
+#[test]
+fn engine_reload_retains_boot_evidence_and_exposes_explicit_pin_changes() {
+    let original = serde_json::json!({
+        "name": "gpu-box", "runtime_profiles": {},
+        "resource_policy": {"devices": {"gpu0": {"memory_domain": "unified"}}}
+    });
+    let mut running = original.clone();
+    mllm_cli::device_inventory::publish_host(
+        &mut running,
+        Some(&mllm_cli::device_inventory::InventoryPublication {
+            host_id: "kernel-host".into(),
+            digest: DIGEST.into(),
+            physical_gpu_uuids: BTreeMap::from([(0, UUID.into())]),
+        }),
+    );
+    let mut reloaded = original;
+    reloaded["runtime_profiles"] = serde_json::json!({"sglang": {"engine": "sglang"}});
+    mllm_config::engine_settings::carry_start_settings(&running, &mut reloaded);
+    assert!(mllm_config::registration::only_profiles_differ(
+        &running, &reloaded
+    ));
+    reloaded["device_inventory_digest"] = serde_json::json!("changed-pin");
+    mllm_config::engine_settings::carry_start_settings(&running, &mut reloaded);
+    assert!(!mllm_config::registration::only_profiles_differ(
+        &running, &reloaded
+    ));
+}

@@ -2,7 +2,7 @@
 
 A GPU holds one or two models at a time. mllm keeps the others parked: the
 engine stays up but gives back its GPU memory. A request for a parked model
-wakes it, which is much faster than starting it from scratch.
+wakes it. The time depends on the engine, model and parking tier.
 
 A deployment parks unless it says `residency: restart_only`, as long as its
 engine supports parking: `mllm engine list` shows `DEEP PARK enabled`.
@@ -29,6 +29,9 @@ mllm park deployment my-model
 mllm list deployments
 ```
 
+Parking runs in the background. The first status query may show `parking`;
+run `mllm list deployments` again until it shows `parked`:
+
 ```text
 NAME       STATE    READY   REVISION   HOSTS
 my-model   parked   0/1     1          gpu-box
@@ -49,15 +52,16 @@ Starting a second model with `--evict` allows that and names what it parked:
 
 ```bash
 mllm deploy model --file other-model.yaml
-mllm start deployment other-model --evict
+mllm start deployment other-model --evict --wait
 ```
 
-```text
-Request identity: 01M3G1GYCCN6XJJ8BG2SBE8EJ7 (reuse --request-id 01M3G1GYCCN6XJJ8BG2SBE8EJ7 to recover this command)
-{"api_version":"1","deployment_id":"01M3G1GYBSHR0B1HZ0NSN8SHAV","joined":false,"operation_id":"01M3G1H0EYSMZWGXKK46RWXBEH","revision":"1","switch_id":"01M3G1GYJ3RZYHBGNPVX44RGHR","victims":["01M3G1GRJFFPV3RMHA70FGS1N2/0"]}
-```
+`--wait` waits for the checkpoint measurement, then for the model to be ready.
+Without it, a newly deployed checkpoint can still be awaiting measurement and
+the start is refused. When the start releases another model, its receipt includes
+`victims` (the deployment and instance IDs) and `switch_id`.
 
-`victims` names what it parked: instance 0 of `my-model`.
+After the start succeeds, check the states. When there is room to keep the first
+model parked, the result looks like this:
 
 ```bash
 mllm list deployments
@@ -91,7 +95,7 @@ stops the idle model instead and says so:
 |---|---|---|---|
 | GPU memory | freed | freed | freed |
 | Host RAM | engine and a copy of the weights | engine | none |
-| A request | wakes it | wakes it | is refused (`deployment_stopped`) |
+| A request | wakes it | wakes it | starts it after a pressure stop; refused after an operator stop |
 | Back to ready | seconds | a reload from disk | a full start |
 
 `mllm stop deployment other-model` stops it; `mllm start deployment other-model --wait`

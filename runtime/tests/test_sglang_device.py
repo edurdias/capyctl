@@ -94,6 +94,19 @@ class DeviceTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(observation.hardware_fingerprint, "hardware-v1")
         self.assertEqual(observation.binding_id, self.public["binding_id"])
 
+    # T14 T22 T37: the enrolled name may differ from the kernel hostname;
+    # the frozen inventory digest still binds the physical host and boot.
+    def test_enrolled_alias_uses_the_verified_physical_inventory(self):
+        self.public["device"]["host_id"] = "gpu-box"
+        policy = replace(self.policy(), host_id="gpu-box")
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": UUID}, clear=True):
+            observed = self.observe(policy)
+            self.assertEqual(observed.host_id, "gpu-box")
+            changed = device._collect_inventory(self.proc, self.sys, "other-host", "aarch64")
+            with mock.patch.object(device, "collect_inventory", return_value=changed):
+                with self.assertRaises(device.DeviceObservationError):
+                    device.observe_placement(self.build(), policy)
+
     def test_absent_ordinal_partial_or_multiple_namespace_denied_without_mutation(self):
         for namespace in (None, "", "0", "GPU-09631200", UUID + ",0", " " + UUID):
             env = {} if namespace is None else {"CUDA_VISIBLE_DEVICES": namespace}
