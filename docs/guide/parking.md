@@ -30,16 +30,16 @@ mllm list deployments
 ```
 
 ```text
-NAME       KIND    DESIRED   STATE    READY   REVISION   HOSTS
-my-model   model   ready     parked   0/1     1          gpu-box
+NAME       STATE    READY   REVISION   HOSTS
+my-model   parked   0/1     1          gpu-box
 ```
 
 Send a request for `my-model` ([Make a request](requests.md)). mllm wakes the
 model and answers; the first answer takes longer. Afterwards:
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-my-model   model   ready     ready   1/1     1          gpu-box
+NAME       STATE   READY   REVISION   HOSTS
+my-model   ready   1/1     1          gpu-box
 ```
 
 ## Switch between models
@@ -64,9 +64,9 @@ mllm list deployments
 ```
 
 ```text
-NAME          KIND    DESIRED   STATE    READY   REVISION   HOSTS
-my-model      model   ready     parked   0/1     1          gpu-box
-other-model   model   ready     ready    1/1     1          gpu-box
+NAME          STATE    READY   REVISION   HOSTS
+my-model      parked   0/1     1          gpu-box
+other-model   ready    1/1     1          gpu-box
 ```
 
 Without `--evict`, a start never parks anything; it waits for memory instead.
@@ -75,9 +75,9 @@ A request switches the same way. Ask for `my-model` now and mllm parks
 `other-model`, wakes `my-model` and answers:
 
 ```text
-NAME          KIND    DESIRED   STATE    READY   REVISION   HOSTS
-my-model      model   ready     ready    1/1     1          gpu-box
-other-model   model   ready     parked   0/1     1          gpu-box
+NAME          STATE    READY   REVISION   HOSTS
+my-model      ready    1/1     1          gpu-box
+other-model   parked   0/1     1          gpu-box
 ```
 
 mllm waits for requests in progress to finish before it parks a model; it

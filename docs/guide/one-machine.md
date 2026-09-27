@@ -55,8 +55,8 @@ mllm list deployments
 ```
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-my-model   model   ready     ready   1/1     1          gpu-box
+NAME       STATE   READY   REVISION   HOSTS
+my-model   ready   1/1     1          gpu-box
 ```
 
 The first start of a new checkpoint takes longer: mllm reads the files once

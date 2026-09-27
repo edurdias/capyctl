@@ -93,8 +93,8 @@ mllm list deployments
 ```
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-my-model   model   ready     ready   1/1     1          gpu-box
+NAME       STATE   READY   REVISION   HOSTS
+my-model   ready   1/1     1          gpu-box
 ```
 
 ```bash
@@ -102,8 +102,8 @@ mllm status deployment my-model
 ```
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
-my-model   model   ready     ready   1/1     1          17.2 GiB   130s         initialize succeeded
+NAME       STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+my-model   ready   1/1     1          17.2 GiB   130s         initialize succeeded
 
 INSTANCE   HOST      STATE   LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   ready   active      gpu0      -
@@ -113,8 +113,8 @@ INSTANCE   HOST      STATE   LIFECYCLE   DEVICES   LAST ERROR
 `LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
 
 ```text
-NAME           KIND    DESIRED   STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
-broken-model   model   ready     failed   0/1     1          17.2 GiB   130s         initialize failed (launch_failed)
+NAME           STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+broken-model   failed   0/1     1          17.2 GiB   130s         initialize failed (launch_failed)
 
 INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   failed   active      gpu0      launch_failed: launch failed: engine launch failed: the engine exited before readiness
@@ -176,8 +176,8 @@ A change restarts the model's engine; changing only the instance count does
 not. Afterwards:
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-my-model   model   ready     ready   1/1     2          gpu-box
+NAME       STATE   READY   REVISION   HOSTS
+my-model   ready   1/1     2          gpu-box
 ```
 
 Next: [Make a request](requests.md).
