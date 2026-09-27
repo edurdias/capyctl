@@ -3,12 +3,13 @@
 //! SPEC §3: the NVIDIA inventory digest and the selected device's physical
 //! UUID are host facts published at boot, and they are the two prerequisites
 //! the SGLang placement gate needs (the host document the launch is qualified
-//! against must carry them). The Python collector itself is stubbed here —
-//! `collect_with` takes the seam the boot uses — so these tests are about the
-//! closed parse and what the published table states, never about a real GPU.
+//! against must carry them). Most tests stub the Python collector; the runtime
+//! trust tests execute a small fixture instead. These test closed publication
+//! and safe collection, never a real GPU.
 //! Nothing here qualifies a native engine recipe (SPEC §18).
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, GpuSample, HostShape};
@@ -19,6 +20,106 @@ use mllm_controller::EngineInstallation;
 
 const DIGEST: &str = "2124d5550ed2316a62493cd335399bea795ffa074e07207c8b1d2f3a729387dd";
 const UUID: &str = "GPU-09631200-fdff-a345-295f-a1a6f84b2f84";
+
+fn collector_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = inventory_json(serde_json::json!([{"physical_gpu_uuid": UUID}]));
+    std::fs::write(
+        runtime.join("sglang_device.py"),
+        format!(
+            "from pathlib import Path\nPath(__file__).with_name('executed').touch()\nprint({output:?})\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        runtime.join("sglang_device.py"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    (root, runtime)
+}
+
+// T21 T37: refuse unsafe collector code before it can run at role boot.
+#[test]
+fn unsafe_inventory_runtime_never_executes() {
+    use std::os::unix::fs::symlink;
+    for unsafe_part in ["module", "helper", "runtime", "ancestor", "symlink"] {
+        let (root, runtime) = collector_fixture();
+        let module = runtime.join("sglang_device.py");
+        let helper = runtime.join("helper.py");
+        let path = match unsafe_part {
+            "module" => &module,
+            "helper" => {
+                std::fs::write(&helper, "# helper\n").unwrap();
+                &helper
+            }
+            "runtime" => &runtime,
+            "ancestor" => root.path(),
+            "symlink" => {
+                let original = root.path().join("collector.py");
+                std::fs::rename(&module, &original).unwrap();
+                symlink(original, &module).unwrap();
+                &module
+            }
+            _ => unreachable!(),
+        };
+        if unsafe_part != "symlink" {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        assert!(
+            mllm_cli::device_inventory::collect(&runtime, None).is_none(),
+            "accepted unsafe {unsafe_part}"
+        );
+        assert!(
+            !runtime.join("executed").exists(),
+            "ran unsafe {unsafe_part}"
+        );
+        assert!(!root.path().join("executed").exists(), "ran symlink target");
+    }
+}
+
+// T21 T37: use exactly the verified directory with isolated Python imports.
+#[test]
+fn trusted_inventory_runtime_uses_isolated_imports_and_relative_helpers() {
+    let (root, runtime) = collector_fixture();
+    let selected = root.path().join("custom-runtime");
+    std::fs::rename(&runtime, &selected).unwrap();
+    std::fs::write(
+        selected.join("helper.py"),
+        format!(
+            "output = {:?}\n",
+            inventory_json(serde_json::json!([{"physical_gpu_uuid": UUID}]))
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        selected.join("helper.py"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::write(
+        selected.join("sglang_device.py"),
+        "import sys\nassert sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode\nfrom .helper import output\nprint(output)\n",
+    )
+    .unwrap();
+    let poison = "from pathlib import Path\nPath(__file__).with_name('wrong-import').touch()\nraise RuntimeError('wrong import')\n";
+    std::fs::write(root.path().join("runtime.py"), poison).unwrap();
+    std::fs::write(root.path().join("sitecustomize.py"), poison).unwrap();
+    mllm_adapters::sglang::SglangLaunch::validate_wrapper_path(&selected.join("sglang_device.py"))
+        .expect("fixture path is trusted");
+    mllm_agent::runtime_integrity::verify(&selected, &["sglang_device.py"])
+        .expect("fixture runtime is trusted");
+    let published = mllm_cli::device_inventory::collect(&selected, None)
+        .expect("a trusted custom runtime must collect successfully");
+    assert_eq!(published.digest, DIGEST);
+    assert_eq!(published.physical_gpu_uuids[&0], UUID);
+    assert!(!root.path().join("wrong-import").exists());
+    assert!(!selected.join("__pycache__").exists());
+}
 
 fn inventory_json(devices: serde_json::Value) -> String {
     serde_json::json!({
