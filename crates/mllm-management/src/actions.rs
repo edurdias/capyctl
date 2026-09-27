@@ -509,6 +509,14 @@ impl OwnedActionSource {
         if !exists {
             return Err(ConfigurationFailure::NotFound);
         }
+        // SPEC §6.4 / ADR 0014 §7: provisional sizing and unavailable
+        // checkpoints refuse the start before any serving victim is released.
+        self.commands
+            .read(|store| {
+                Ok(store.check_start_materialization(deployment, command.expected_revision))
+            })
+            .map_err(|_| ConfigurationFailure::Internal)?
+            .map_err(|error| command_failure(CoordinatorCommandError::Lifecycle(error)))?;
         Ok(false)
     }
 

@@ -214,8 +214,10 @@ def observe_placement(spec, trusted_mapping):
         if type(uuid) is not str or not _UUID.fullmatch(uuid):
             raise ValueError()
         before = collect_inventory()
-        if (before.host_id != trusted_mapping.host_id
-                or before.digest != trusted_mapping.inventory_digest
+        # SPEC §3 / T22: host_id in the launch is the enrolled logical name.
+        # The inventory digest already binds the kernel hostname, boot and
+        # physical devices. An alias must not replace that physical proof.
+        if (before.digest != trusted_mapping.inventory_digest
                 or uuid not in {d.physical_gpu_uuid for d in before.devices}
                 or os.environ.get("CUDA_VISIBLE_DEVICES") != uuid):
             raise ValueError()

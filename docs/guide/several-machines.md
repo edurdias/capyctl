@@ -75,7 +75,13 @@ mllm invite host gpu-box --output gpu-box.join
 {"host_name":"gpu-box","invitation_file":"gpu-box.join"}
 ```
 
-Copy `gpu-box.join` to the GPU machine, for example with `scp`. It works once.
+Copy `gpu-box.join` to the GPU machine, for example with `scp -p` to preserve
+its permissions. It contains a one-use enrollment secret; on the GPU machine,
+ensure only your user can read or write it:
+
+```bash
+chmod 600 gpu-box.join
+```
 
 ## 3. Join and start the host
 

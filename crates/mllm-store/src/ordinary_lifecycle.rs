@@ -690,6 +690,19 @@ fn residency_name(residency: mllm_config::effective::Residency) -> &'static str 
 }
 
 impl crate::Store {
+    /// SPEC §6.4, ADR 0014 §7 and ADR 0008: check the target's checkpoint
+    /// before releasing switch victims. Acceptance repeats these checks in
+    /// its transaction; this read-only preflight grants no start authority.
+    pub fn check_start_materialization(
+        &self,
+        deployment: &str,
+        revision: i64,
+    ) -> Result<(), LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        crate::checkpoint_digests::admit_start(&tx, deployment, revision)?;
+        crate::model_sources::admit_start(&tx, deployment, revision)
+    }
+
     /// Clock-aware administrative start; only an actual Fake catalog
     /// and its verified source cleanup authorize a fresh managed binding.
     pub fn accept_start(

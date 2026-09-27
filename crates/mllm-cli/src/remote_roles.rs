@@ -833,7 +833,7 @@ fn load_host(
 /// `engines` (the role's engines.yaml); the control handler re-reads both
 /// (ADR 0018 §3).
 async fn serve_host(
-    config: HostConfig,
+    mut config: HostConfig,
     document: PathBuf,
     engines: PathBuf,
 ) -> Result<Value, StructuredError> {
@@ -842,17 +842,30 @@ async fn serve_host(
     if !config.runtime_dir_declared {
         crate::managed_runtime::prepare_for_role(&config.runtime_dir)?;
     }
+    // SPEC §3 / T22: fresh physical placement evidence is required on remote
+    // hosts too, including unified-memory hosts. A failed collector publishes
+    // nothing; native entrypoint denials remain closed.
+    let runtime_root = config
+        .runtime_dir
+        .parent()
+        .unwrap_or(&config.runtime_dir)
+        .to_owned();
+    let (boot_gpu, device_inventory) = tokio::task::spawn_blocking(move || {
+        let sample = mllm_agent::gpu_memory::sample();
+        let inventory = crate::device_inventory::collect(&runtime_root, sample.as_ref());
+        (sample, inventory)
+    })
+    .await
+    .map_err(|_| unavailable())?;
+    crate::device_inventory::publish_host(&mut config.document, device_inventory.as_ref());
     // ADR 0019 (discrete GPU design §2): a host that declares a device domain
     // checks the declaration against the GPUs it observes (a bounded sample,
     // off the async thread) before anything else, and refuses to start on a
-    // mismatch. A unified or RAM-only host never runs the collector.
+    // mismatch. Unified hosts still publish the placement inventory above.
     let discrete = !mllm_agent::device_domains::device_domains(&config.document).is_empty();
     if discrete {
-        let sample = tokio::task::spawn_blocking(mllm_agent::gpu_memory::sample)
-            .await
-            .map_err(|_| unavailable())?;
         let shape =
-            mllm_agent::gpu_memory::shape(sample.as_ref()).map_err(|e| error(&e.to_string()))?;
+            mllm_agent::gpu_memory::shape(boot_gpu.as_ref()).map_err(|e| error(&e.to_string()))?;
         check_host_device_policy(&config.document, &shape)?;
     }
     let storage = IdentityDirectory::open(&config.identity_dir)
