@@ -8,8 +8,8 @@ discrete card or a unified-memory machine; the steps are the same.
 curl -fsSL https://edurdias.github.io/mllm/install.sh | sh
 ```
 
-While mllm has only release candidates, name the one to install; the
-installer stops and says so otherwise:
+To install a particular release, name it (optional; without it you get the
+latest release):
 
 ```bash
 curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<version>

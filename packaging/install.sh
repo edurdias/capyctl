@@ -160,7 +160,7 @@ curl_get() { # $1 url, $2 output, [$3 accept header]
 # GitHub's "latest release" is the newest published release that is not a
 # pre-release; drafts and pre-releases (every 0.x release candidate) never
 # qualify, so without --version they cannot be found.
-no_latest="GitHub's latest release skips pre-releases and drafts, so while $repo has only pre-releases (release candidates) name one with --version, for example --version v0.1.0-rc.4"
+no_latest="GitHub's latest release skips pre-releases and drafts, so while $repo has only pre-releases (release candidates) name one with --version, for example --version v0.1.0"
 if [ -z "$version" ]; then
   if [ -n "${MLLM_INSTALL_BASE_URL:-}" ]; then
     die "--version is required with MLLM_INSTALL_BASE_URL"

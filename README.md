@@ -12,10 +12,10 @@ mutual TLS. [How it works](docs/guide/how-it-works.md) has a picture.
 
 ## Status
 
-0.1.0 is at the release-candidate stage. Release candidates are published as
-GitHub pre-releases; expect breaking changes before 0.1.0.
+0.1.0 is the first release. It is early software: expect rough edges and
+breaking changes between minor versions while the version starts with 0.
 
-What works in the release candidates:
+What works in 0.1.0:
 
 - vLLM and SGLang engines, one GPU per model, on unified-memory machines and
   on discrete NVIDIA cards, where mllm counts the card's memory apart from
@@ -44,16 +44,16 @@ environment; models come from a directory or from Hugging Face.
 ## Install
 
 A release is one self-contained binary per architecture (Linux x86-64 and
-ARM64). While only release candidates exist, name the one to install:
+ARM64). Install the latest release:
 
 ```bash
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v0.1.0-rc.4
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh
 mllm --version
 ```
 
 The installer checks every download against the release's `SHA256SUMS` and
-refuses on a mismatch. While the repository is private, it falls back to a
-logged-in `gh` or to `GITHUB_TOKEN`. See [`docs/guide/install.md`](docs/guide/install.md)
+refuses on a mismatch. To install a particular release, add
+`-s -- --version v0.1.0`. See [`docs/guide/install.md`](docs/guide/install.md)
 to get started, and [`docs/operations/install.md`](docs/operations/install.md)
 for services, upgrades and rollback. Building from source needs stable Rust
 and `protoc` (`sudo apt install protobuf-compiler`), on ARM64 too:
@@ -100,8 +100,8 @@ mllm list deployments
 ```
 
 ```text
-NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
-my-model   model   ready     ready   1/1     1          gpu-box
+NAME       STATE   READY   REVISION   HOSTS
+my-model   ready   1/1     1          gpu-box
 ```
 
 Commands that read records (`list`, `status`, `engine list`, `engine detect`,
@@ -171,13 +171,13 @@ mllm park deployment <name>
 
 ```text
 $ mllm list hosts
-NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.0-rc.4   supported       46.5 GiB / 77.2 GiB     vllm
+NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
+gpu-box   online   yes        0.1.0     supported       46.5 GiB / 77.2 GiB     vllm
 
 $ mllm list deployments
-NAME           KIND    DESIRED   STATE    READY   REVISION   HOSTS
-qwen3-8b       model   ready     ready    1/1     1          gpu-box
-llama-3.1-8b   model   parked    parked   0/1     2          gpu-box
+NAME           STATE    READY   REVISION   HOSTS
+qwen3-8b       ready    1/1     1          gpu-box
+llama-3.1-8b   parked   0/1     2          gpu-box
 ```
 
 A parked deployment releases its GPU memory and wakes on the next request for

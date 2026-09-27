@@ -163,8 +163,8 @@ mllm list engines
 ```
 
 ```text
-NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.0-rc.4   supported       46.8 GiB / 77.2 GiB     vllm
+NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
+gpu-box   online   yes        0.1.0     supported       46.8 GiB / 77.2 GiB     vllm
 HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
 gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 ```

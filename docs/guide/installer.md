@@ -17,7 +17,7 @@ curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<ver
 ## Run standalone as a service
 
 ```bash
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<version> --systemd standalone
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --systemd standalone
 mllm engine add ~/venvs/vllm
 systemctl --user enable --now mllm-standalone
 loginctl enable-linger "$USER"    # keep it running after you log out

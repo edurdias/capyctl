@@ -202,10 +202,10 @@ curl -fsSL https://edurdias.github.io/mllm/install.sh | sudo sh -s -- --system -
 
 A downloaded copy takes the same options: `sh install.sh --version <version>`.
 
-**Release candidates.** GitHub's "latest release" never resolves to a
-pre-release or a draft, so while only release candidates exist, pass
-`--version` (for example `--version v0.1.0-rc.4`; the leading `v` is optional).
-Without it the installer stops and says so.
+**Choosing a release.** `--version` is optional (for example
+`--version v0.1.0`; the leading `v` is optional). GitHub's "latest release"
+never resolves to a pre-release or a draft, so a release candidate is
+installed only by naming it.
 
 **Private repository.** The public download needs no credential. While the
 repository is private, log in with `gh auth login` first, or export
