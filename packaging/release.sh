@@ -89,14 +89,18 @@ case "$(uname -s)" in
 esac
 name="mllm-${version}-${os}-${arch}"
 target_dir=${CARGO_TARGET_DIR:-target}
+mkdir -p "$target_dir"
+target_dir=$(cd "$target_dir" && pwd)
+export CARGO_TARGET_DIR="$target_dir"
 
 # Remap the builder's absolute paths to fixed, portable stand-ins. Order
 # matters: rustc applies the last matching --remap-path-prefix rule, so the
 # broad $HOME rule goes first and the paths nested under it (cargo home,
-# toolchain, checkout) go after so they take precedence over it.
+# toolchain, checkout, build cache) go after so they take precedence over it.
+# The build cache may be outside the checkout; generated Rust lives there.
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 toolchain_dir=$(rustc --print sysroot)
-remap_flags="--remap-path-prefix=$HOME=/home --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$toolchain_dir=/rustc --remap-path-prefix=$root=/mllm"
+remap_flags="--remap-path-prefix=$HOME=/home --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$toolchain_dir=/rustc --remap-path-prefix=$root=/mllm --remap-path-prefix=$target_dir=/mllm/target"
 if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
   sep=$(printf '\x1f')
   encoded=$(printf '%s' "$remap_flags" | tr ' ' "$sep")
