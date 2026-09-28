@@ -333,15 +333,22 @@ fi
 
 # --- 5. no builder paths or machine names leaked -----------------------------
 cargo_home_check=${CARGO_HOME:-$HOME/.cargo}
+target_dir_check=$(realpath -m "${CARGO_TARGET_DIR:-$root/target}")
+# A broad HOME remap can conceal the username while leaking the cache's
+# remaining private path. Check that partially remapped form too.
+target_home_remap=$target_dir_check
+case "$target_dir_check" in
+  "$HOME"/*) target_home_remap="/home/${target_dir_check#"$HOME"/}" ;;
+esac
 bin_leaks=()
-for pattern in "$HOME" "$cargo_home_check" "$root"; do
+for pattern in "$HOME" "$cargo_home_check" "$root" "$target_dir_check" "$target_home_remap"; do
   [ -n "$pattern" ] || continue
   if strings "$pkg/bin/mllm" | grep -qF -- "$pattern"; then
     bin_leaks+=("$pattern")
   fi
 done
 if [ "${#bin_leaks[@]}" -eq 0 ]; then
-  pass "bin/mllm has no builder \$HOME, \$CARGO_HOME or checkout path"
+  pass "bin/mllm has no builder \$HOME, \$CARGO_HOME or checkout/build-cache path"
 else
   fail "bin/mllm leaks a builder path: ${bin_leaks[*]}"
 fi
