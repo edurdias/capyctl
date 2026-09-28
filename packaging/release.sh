@@ -20,6 +20,7 @@
 #   packaging/systemd/       system and user service units (SPEC §4.3)
 #   docs/examples/           example role and deployment documents
 #   docs/operations/install.md
+#   LICENSE                  Apache-2.0 license
 #   BUILDINFO                version, commit, target, toolchain, build time,
 #                            embedded runtime manifest digest
 #   SHA256SUMS               digest of every file above
@@ -139,7 +140,7 @@ copy_tracked() {
 # The operator guides ship together: install.md links configuration.md and
 # network-access.md, and the units point at configuration.md (final review
 # I12); scripts/verify-packaging.sh checks every relative link resolves.
-copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md \
+copy_tracked 0644 LICENSE packaging/systemd docs/examples docs/operations/install.md \
   docs/operations/configuration.md docs/operations/network-access.md \
   docs/operations/release-notes-0.1.0.md
 

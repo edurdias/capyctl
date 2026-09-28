@@ -205,7 +205,7 @@ expected="$work/expected"
 actual="$work/actual"
 {
   printf '%s\n' bin/mllm BUILDINFO SHA256SUMS
-  git ls-files -- packaging/systemd docs/examples docs/operations/install.md \
+  git ls-files -- LICENSE packaging/systemd docs/examples docs/operations/install.md \
     docs/operations/configuration.md docs/operations/network-access.md \
     docs/operations/release-notes-0.1.0.md
 } >"$work/files"

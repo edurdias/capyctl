@@ -214,5 +214,4 @@ verification a change must pass, and the documentation rules.
 
 ## License
 
-Apache-2.0 (see [ADR 0006](docs/design/adr/0006-license.md)). The `LICENSE`
-file is added before the repository is published.
+Licensed under [Apache-2.0](LICENSE); see [ADR 0006](docs/design/adr/0006-license.md).
