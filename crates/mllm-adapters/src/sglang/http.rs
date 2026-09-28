@@ -256,9 +256,11 @@ impl ControlHttp {
                 json!({"model_path":self.checkpoint,"load_format":"auto","abort_all_requests":false,"is_async":false,"keep_pause":false,"recapture_cuda_graph":false,"flush_cache":true}),
             ),
             RuntimeAction::InvalidateCache => ("/flush_cache?timeout=0", Value::Null),
+            // SPEC §8.3: ask for the exact usability marker without inviting
+            // punctuation (Qwen2.5-1.5B otherwise answers "OK.").
             RuntimeAction::Probe => (
                 "/v1/chat/completions",
-                json!({"model":self.model,"messages":[{"role":"user","content":"Reply with exactly OK."}],"temperature":0,"max_tokens":8,"stream":false}),
+                json!({"model":self.model,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false}),
             ),
             _ => return Err(RuntimeError::Unsupported),
         };

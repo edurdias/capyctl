@@ -313,6 +313,7 @@ async fn release_sends_exact_tags_once_with_admin_key_and_rejects_duplicate() {
     assert_eq!(requests[0].authorization, "Bearer admin-secret");
 }
 
+// T16
 #[tokio::test]
 async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
     let f = Fixture::new().await;
@@ -342,7 +343,7 @@ async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
     assert_eq!(requests[3].authorization, "Bearer inference-secret");
     assert_eq!(
         requests[3].body,
-        json!({"model":MODEL,"messages":[{"role":"user","content":"Reply with exactly OK."}],"temperature":0,"max_tokens":8,"stream":false})
+        json!({"model":MODEL,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false})
     );
     assert!(requests[..3]
         .iter()

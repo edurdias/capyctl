@@ -1,5 +1,32 @@
 # Current implementation and launch status
 
+## SGLang exact-marker prompt — 2026-09-27
+
+The wake probe now explicitly requests the two letters `OK` without punctuation.
+The exact response check, eight-token budget, temperature, restoration checks
+and uncertainty accounting are unchanged. No new setting or fallback is added.
+
+A controlled native test on Qwen2.5-1.5B-Instruct with SGLang 0.5.20 and
+host-backed residency reproduced the old prompt's `OK.` response before parking
+and in the actual wake probe. That wake stayed uncertain with dispatch closed
+and its reservation retained. In a diagnostic build of `1d32d4e`, changing only
+the prompt's wording (plus response classification instrumentation) produced
+exact `OK` and passed three consecutive park/wake cycles. The same GPU process
+released memory to 966 MiB while parked and recovered to about 7.5 GiB after
+wake. Eighteen routed before/after samples consistently distinguished the two
+prompts. All test deployments and roles were stopped with verified cleanup.
+
+All 25 SGLang control tests pass, including strict rejection of `OK.` and other
+incorrect markers. The core suite passed 1113 distinct tests (1114 reported),
+and the workspace suite passed 2257 distinct tests (2258 reported), with zero
+failures. Clippy with warnings denied across the core crates, formatting and
+diff checks pass. CPU and Fake-engine tests are not native recipe qualification.
+
+This is evidence for that selected recipe, not every SGLang model or build.
+The diagnostic evidence is local and untracked under
+`target/live/sglang-probe-review/`. Release assets still need this prompt change
+before the installed baseline's small-model limitation below is resolved.
+
 ## Inventory collector trust check — 2026-09-27
 
 The shared boot collector now checks the runtime tree and its ancestors using
@@ -77,8 +104,8 @@ build.
 The optional small SGLang checkpoint served and parked on the discrete GPU,
 but wake became uncertain on two attempts. Its answer to the adapter's probe
 prompt was `OK.` rather than the required exact `OK`; the adapter's strict
-probe remains unchanged. This recipe is not validated for wake. Reservations
-and closed dispatch were retained, and an explicit stop verified cleanup.
+probe remains unchanged. This installed baseline recipe is not validated for wake.
+Reservations and closed dispatch were retained, and an explicit stop verified cleanup.
 The guide's larger checkpoint passed on the remote host as recorded above.
 
 The patched installed x86-64 binary also passed the live eviction regression:
