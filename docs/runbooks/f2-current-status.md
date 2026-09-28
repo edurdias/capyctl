@@ -1,5 +1,26 @@
 # Current implementation and launch status
 
+## External build-cache path removal — 2026-09-27
+
+The release scan caught a generated Rust source path from a shared build cache
+outside the rewritten checkout. The broad home-directory remap had removed the
+username but retained the rest of that private path. Packaging now canonicalizes
+and explicitly remaps `CARGO_TARGET_DIR` to the portable build prefix, including
+when the cache is outside the checkout.
+
+The packaging verifier checks both the original cache path and its partially
+home-remapped form. Its binary and symbol scans now consume complete command
+output: an early-closing quiet grep could otherwise make a real match appear
+absent under `pipefail`. The previously leaking archive is rejected by the new
+check; the rebuilt package passes strict packaging verification, all 42
+installer checks and the independent privacy scan with zero findings.
+
+Application code is unchanged. The rewritten application's additional native
+run passed five park/wake cycles and all 55 observations in 35–45 ms. Its
+deployment and role were stopped with verified cleanup. The final release
+must incorporate this packaging fix and rebuild both architectures before
+publication. The new repository is still private and no release is published.
+
 ## Release license and history gate — 2026-09-27
 
 The Apache-2.0 license selected in ADR 0006 is now present in `LICENSE`, shipped
