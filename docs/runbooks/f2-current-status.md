@@ -1,5 +1,22 @@
 # Current implementation and launch status
 
+## Public release destination — 2026-09-27
+
+The owner selected `edurdias/mllm` for the public release. The source repository
+remains private; the new sanitized repository will be created directly at the
+selected destination, so the previous same-namespace repository rename sequence
+is no longer needed. The installer defaults to that repository, and the site
+and installation guides use `https://edurdias.github.io/mllm/`.
+
+Before rewriting history, update the local sanitization rules to preserve the
+approved public repository slug and URLs while still stripping private paths
+and machine identifiers. The older blanket owner-name replacement must not
+rewrite the new destination. Rebuild both release architectures from the
+rewritten release commit, prepare the release draft, and verify public
+installation and Pages after publication. The SGLang timeout fix and its
+installed-release live pass remain pending. This destination change does not
+publish a release or create the public repository.
+
 ## Installed-release timeout investigation — 2026-09-27
 
 Both release architectures were rebuilt from merged `c4e132c` with clean
