@@ -1,5 +1,56 @@
 # Current implementation and launch status
 
+## Installed-release timeout investigation — 2026-09-27
+
+Both release architectures were rebuilt from merged `c4e132c` with clean
+BUILDINFO records. Their archives matched the previous build byte for byte;
+packaging and the 42 installer checks passed. Strict packaging verification
+passed on the control host; the ARM host skipped unavailable ShellCheck.
+The installed binaries on all three machines contain the exact-marker fix.
+Publication and the sanitized-history transition remain pending.
+
+A fresh installed-binary run of Qwen2.5-1.5B-Instruct on SGLang 0.5.20 with
+host-backed residency passed its first wake but failed its second: three native
+observations exceeded the two-second receive deadline. A fresh diagnostic run
+with private engine logging reproduced this on wake three. Dispatch stayed
+closed and the reservation remained accounted for. This is separate from the
+previous exact-marker prompt failure; the timeout prevented the resume call.
+
+The scheduler snapshot itself took 33–40 ms, with no wait for the safe-point
+hook. Successful transport calls took 100–1132 ms (median 600 ms), much of it
+before requesting the snapshot or after receiving it. One failed connection
+had already stored a valid snapshot but could not return it in time. The
+scheduler was consuming a CPU core while otherwise idle. Its busy event loop
+and the observation transport share the scheduler process's Python threads.
+
+Two controlled diagnostic runtime copies kept the installed binary, engine
+installation, model, effective recipe, deadlines and authentication unchanged:
+
+- Reducing Python's thread-switch interval to 1 ms did not resolve the delay:
+  successful calls had a median of 778 ms and parking failed on cycle four.
+- Yielding for 1 ms after each scheduler observation hook passed five consecutive
+  park/wake cycles. All 55 observations completed in 34–49 ms (median 39 ms),
+  with snapshot work taking 33–43 ms and at most 1 ms before requesting it.
+
+This supports scheduler-loop starvation of the observation transport as the
+cause on this recipe. The always-yield diagnostic is not a production change
+or a general performance qualification. Next is a narrowly scoped yield while
+an observation is active, preserving all custody, authentication, deadline and
+accounting rules, followed by regression checks and another installed-release
+live pass. Do not increase the timeout on this evidence alone.
+
+The diagnostic deployments were deleted with verified stop, their roles were
+stopped, and no local GPU compute process remained. No engine environment,
+driver or network configuration changed. Local, untracked evidence is under
+`target/live/release-fresh-c4e132c/`, `target/live/sglang-timeout/`,
+`target/live/sglang-fairness/` and `target/live/sglang-yield/`.
+An earlier interrupted test's uncertain ledger was retained after its orphaned
+processes were stopped from verified ownership evidence; it was not rewritten.
+CPU and Fake-engine tests are not native recipe qualification.
+
+The new custom-engine model test and multi-host model placement remain deferred
+until the project release work is complete.
+
 ## SGLang exact-marker prompt — 2026-09-27
 
 The wake probe now explicitly requests the two letters `OK` without punctuation.
@@ -24,8 +75,8 @@ diff checks pass. CPU and Fake-engine tests are not native recipe qualification.
 
 This is evidence for that selected recipe, not every SGLang model or build.
 The diagnostic evidence is local and untracked under
-`target/live/sglang-probe-review/`. Release assets still need this prompt change
-before the installed baseline's small-model limitation below is resolved.
+`target/live/sglang-probe-review/`. Release assets now contain this prompt change; the newer installed-release
+timeout investigation above records the remaining small-model limitation.
 
 ## Inventory collector trust check — 2026-09-27
 
