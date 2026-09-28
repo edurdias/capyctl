@@ -10,6 +10,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from runtime import sglang_saver_binding as saver
 from test_sglang_observation_transport import BridgeFixture
@@ -73,6 +74,31 @@ class ObservationServerTests(unittest.TestCase):
         server.close()
         self.assertFalse(self.path.exists())
 
+    def test_transport_activity_covers_custody_and_clears_after_success_or_denial(self):
+        # T20/T21/T22: fairness spans authentication too, without trusting the peer.
+        server = self.server()
+        self.addCleanup(server.close)
+        checks = []
+        cleared = threading.Event()
+        original_clear = self.bridge.transport_active.clear
+        def clear():
+            original_clear()
+            cleared.set()
+        original = server._custody.check
+        def check():
+            checks.append(self.bridge.transport_active.is_set())
+            return original()
+        with mock.patch.object(server._custody, "check", check), mock.patch.object(
+                self.bridge.transport_active, "clear", clear):
+            self.assertEqual(self.read(self.request())["status"], "observed")
+            self.assertTrue(cleared.wait(2))
+            cleared.clear()
+            self.assertFalse(self.bridge.transport_active.is_set())
+            self.assertIsNone(self.read(self.request()))  # Replay denied.
+            self.assertTrue(cleared.wait(2))
+            self.assertFalse(self.bridge.transport_active.is_set())
+        self.assertEqual(checks, [True, True])
+
     def test_existing_paths_and_unprotected_parent_are_never_repaired(self):
         self.path.write_text("retain me")
         with self.assertRaises(self.module.ObservationServerError):
@@ -97,7 +123,9 @@ class ObservationServerTests(unittest.TestCase):
         self.addCleanup(server.close)
         client = self.request()
         self.assertTrue(self.bridge.requested.wait(2))
+        self.assertTrue(self.bridge.transport_active.is_set())
         server.close()
+        self.assertFalse(self.bridge.transport_active.is_set())
         value = self.read(client)
         self.assertTrue(value is None or value["status"] == "uncertain")
         self.assertIsNone(self.bridge.pending)
@@ -137,6 +165,7 @@ class ObservationServerTests(unittest.TestCase):
             os.chmod(self.directory.name, 0o755)
             self.assertIsNone(self.read(self.request()))
             self.assertEqual(self.bridge.calls, [])
+            self.assertFalse(self.bridge.transport_active.is_set())
             with self.assertRaises(self.module.ObservationServerError):
                 server.close()
         finally:

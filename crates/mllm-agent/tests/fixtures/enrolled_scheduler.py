@@ -38,6 +38,9 @@ def group(tag):
 
 
 class Bridge:
+    def __init__(self):
+        self.transport_active = threading.Event()
+
     def request(self, request_id, *, timeout_ms):
         with lock:
             groups = (group("kv_cache"), group("weights"))
