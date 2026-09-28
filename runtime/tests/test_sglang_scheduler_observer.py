@@ -69,6 +69,24 @@ class SchedulerBridgeTests(unittest.TestCase):
         self.assertLessEqual(result.started_ns, result.finished_ns)
         self.assertFalse(hasattr(result, "quiesced"))
 
+    def test_yields_only_while_transport_is_active_including_after_snapshot(self):
+        # T20/T22: service the observer without slowing ordinary scheduler ticks.
+        bridge = self.install()
+        with mock.patch.object(self.module.time, "sleep") as sleep:
+            self.scheduler.process_input_requests([])
+            sleep.assert_not_called()
+            bridge.transport_active.set()
+            self.scheduler.process_input_requests([])  # Before authentication/request.
+            sleep.assert_called_once_with(0.001)
+            bridge.request("one", timeout_ms=1000)
+            self.scheduler.process_input_requests([])
+            self.assertEqual(bridge.poll("one").status, "observed")
+            self.scheduler.process_input_requests([])  # Reply still in flight.
+            self.assertEqual(sleep.call_count, 3)
+            bridge.transport_active.clear()
+            self.scheduler.process_input_requests([])
+            self.assertEqual(sleep.call_count, 3)
+
     def test_no_request_has_no_observation_and_one_slot_is_bounded(self):
         bridge = self.install()
         self.scheduler.process_input_requests([])

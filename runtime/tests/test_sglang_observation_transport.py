@@ -27,6 +27,7 @@ class BridgeFixture:
         self.wait = False
         self.mutate = lambda value: value
         self.requested = threading.Event()
+        self.transport_active = threading.Event()
         self.observation = saver.SchedulerSaverObservation(owner,
             saver.LoadedSaverLibrary("a" * 64, 1, 2, 3, 4, 5), "preload",
             SaverObservation((AllocationAggregate(0, "weights", 1, 1, 0, 4096, 4096, 0, 0),),

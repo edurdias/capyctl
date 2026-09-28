@@ -151,6 +151,7 @@ The listener never removes a replaced path and never adopts an existing socket.
             server._custody = custody
             server._listener = listener
             server._transport = transport
+            server._bridge = bridge
             server._stop = threading.Event()
             server._lock = threading.Lock()
             server._active = None
@@ -183,12 +184,16 @@ The listener never removes a replaced path and never adopts an existing socket.
                         break
                     self._active = connection
                 try:
+                    # SPEC §9.2: allow the scheduler to yield during all of the
+                    # transport's work, not just the safe-point snapshot.
+                    self._bridge.transport_active.set()
                     connection.set_inheritable(False)
                     self._custody.check()
                     if _process_identity(os.getpid()) != self._owner:
                         raise ObservationServerError()
                     self._transport.serve(connection)
                 finally:
+                    self._bridge.transport_active.clear()
                     connection.close()
                     with self._lock:
                         self._active = None

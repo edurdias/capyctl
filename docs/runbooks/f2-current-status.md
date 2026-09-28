@@ -1,5 +1,38 @@
 # Current implementation and launch status
 
+## SGLang observation fairness fix — 2026-09-27
+
+The scheduler now yields for 1 ms only while its native observation listener
+handles an accepted connection. This covers custody, authentication and reply
+transport as well as the snapshot. Ordinary scheduler ticks do not sleep.
+The listener clears the signal after success, rejection, disconnection or
+custody failure. Authentication, two-second observation deadlines, restoration
+checks and conservative accounting are unchanged.
+
+A clean installed release built from `d7d7fec` passed five consecutive
+host-backed park/wake cycles with Qwen2.5-1.5B-Instruct and SGLang 0.5.20.
+All 55 observations succeeded in 35–63 ms (median 40 ms); wakes took
+1.898–2.110 seconds. The same GPU process survived all cycles, held 966 MiB
+while parked, and returned to about 7.5 GiB after waking. The deployment was
+deleted with verified stop, the role was stopped, and no local GPU compute
+process remained. Evidence is local and untracked under
+`target/live/sglang-fixed/` and `target/live/sglang-fairness-release/`.
+
+All 301 Python runtime tests pass with the pinned saver-source fixture.
+The core suite passed 1113 distinct tests (1114 reported) and the workspace
+suite passed 2257 distinct tests (2258 reported), with zero failures. Clippy
+with warnings denied across the core crates, formatting, strict packaging
+verification, 42 installer checks and the site publishing checks pass.
+CPU and Fake-engine tests are not native recipe qualification; the native
+result above applies to the selected recipe. Review found no remaining
+correctness or security issue in this scoped change.
+
+The site workflow now explicitly waits for a public repository before building
+and deploying Pages, matching its documented release sequence. Next: rewrite
+history with the stronger privacy gate into the new release repository, verify
+the rewritten tree, rebuild both architectures from its commit, and prepare
+the release. The earlier timeout investigation below is resolved by this fix.
+
 ## Public release destination — 2026-09-27
 
 The owner selected `edurdias/mllm` for the public release. The source repository

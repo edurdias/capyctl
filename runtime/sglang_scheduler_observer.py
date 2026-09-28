@@ -11,7 +11,9 @@ reads queue emptiness nor derives readiness, weights/cache validity or quiescenc
 One bounded saver observation is attempted per requested tick. File/proc reads
 inside the saver binding are size bounded, not hard wall-clock bounded; an OS
 stall cannot be interrupted here. Deadlines discard late results. The scheduler
-never waits for a bridge lock, transport, requester, or result consumer.
+never waits for a bridge lock or for transport/requester completion. While an
+accepted observation connection is active, it yields for 1 ms per tick to let
+the transport thread finish its checks and reply. Ordinary ticks do not sleep.
 """
 from dataclasses import dataclass
 import re
@@ -99,6 +101,8 @@ labels, not durable replay fences; a future transport must enforce its own epoch
         self._thread = threading.get_ident()
         self._lock = threading.Lock()
         self._slot = None
+        # Scheduling hint only; neither authentication nor observation evidence.
+        self.transport_active = threading.Event()
         # Diagnostic timings of the latest request (monotonic ns and counts),
         # replaced whole, never read by the scheduler: see `timing`.
         self._timing = None
@@ -268,6 +272,11 @@ defaults read the patched saver's snapshot export.
             bridge._tick(dispatch_failed=True)
             raise
         bridge._tick()
+        # SPEC §9.2 / T20 T22: a busy scheduler must let the observer perform
+        # custody/authentication and return its snapshot within the deadline.
+        # Cover the whole connection, including before and after the slot.
+        if bridge.transport_active.is_set():
+            time.sleep(0.001)
         return result
 
     scheduler.process_input_requests = types.MethodType(process_input_requests, scheduler)
