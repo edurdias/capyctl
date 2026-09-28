@@ -234,6 +234,7 @@ mv -f "$bin_dir/.mllm.new.$$" "$bin_dir/mllm"
 rm -rf "$share_dir/packaging" "$share_dir/docs"
 cp -R "$pkg/packaging" "$pkg/docs" "$share_dir/"
 cp "$pkg/BUILDINFO" "$share_dir/BUILDINFO"
+if [ -f "$pkg/LICENSE" ]; then cp "$pkg/LICENSE" "$share_dir/LICENSE"; fi
 printf '%s\n' "$bin_dir/mllm" >"$record.tmp"
 if [ -f "$record" ]; then
   grep -x "$unit_dir/mllm-.*\\.service" "$record" >>"$record.tmp" || true

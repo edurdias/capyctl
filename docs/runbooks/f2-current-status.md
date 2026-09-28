@@ -1,5 +1,23 @@
 # Current implementation and launch status
 
+## Release license and history gate — 2026-09-27
+
+The Apache-2.0 license selected in ADR 0006 is now present in `LICENSE`, shipped
+in release archives, and retained by the installer. The installer still accepts
+older archives without it. The README links the license directly. Strict
+packaging verification, all 42 installer checks and the site publishing checks
+pass for this change; the previously recorded runtime verification is unchanged.
+
+The local history scanner now fails on prohibited names and machine-specific
+paths across every retained blob, tree filename, commit/tag message, attribution
+header and ref name. It preserves the approved public repository URLs, human
+author identities and generic test paths. Scanner fixtures cover old content
+that is absent from the current tree, annotated tags and branch names. A first
+rewrite of all 715 main-branch commits passed with zero prohibited references
+across 10,177 objects. The final rewrite must include this license addition
+before either release architecture is built. Old development branches and
+release-candidate tags will not be copied into the new release repository.
+
 ## SGLang observation fairness fix — 2026-09-27
 
 The scheduler now yields for 1 ms only while its native observation listener

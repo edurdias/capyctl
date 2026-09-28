@@ -54,6 +54,7 @@ else
   mkdir -p "$pkg/packaging"
   cp -R "$root/packaging/systemd" "$pkg/packaging/"
   cp "$root/docs/operations/install.md" "$pkg/docs/operations/"
+  cp "$root/LICENSE" "$pkg/LICENSE"
   printf 'name: mllm\nversion: %s\n' "$version" >"$pkg/BUILDINFO"
   (cd "$pkg" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum) >"$work/sums"
   mv "$work/sums" "$pkg/SHA256SUMS"
@@ -118,6 +119,7 @@ for shell in "${shells[@]}"; do
     grep -q "^Documentation=file://$home/.local/share/mllm/docs/operations/install.md" "$unit" 2>/dev/null ||
       problems+=("unit Documentation does not point at the installed guide")
     [ -f "$home/.local/share/mllm/docs/operations/install.md" ] || problems+=("guide not installed")
+    [ -f "$home/.local/share/mllm/LICENSE" ] || problems+=("license not installed")
     [ -f "$home/.local/share/mllm/packaging/systemd/system/mllm-server.service" ] || problems+=("units not kept")
     grep -qx -- '--user daemon-reload' "$log" || problems+=("no systemctl --user daemon-reload")
     grep -q 'enable\|start' "$log" && problems+=("the unit was enabled or started")
