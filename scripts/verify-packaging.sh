@@ -322,7 +322,7 @@ else
   fail "bin/mllm does not embed BUILDINFO's runtime manifest '$manifest'"
 fi
 if command -v readelf >/dev/null; then
-  if readelf -S "$pkg/bin/mllm" | grep -q '\.symtab'; then
+  if readelf -S "$pkg/bin/mllm" | grep '\.symtab' >/dev/null; then
     fail "bin/mllm is not stripped"
   else
     pass "bin/mllm is stripped"
@@ -340,10 +340,11 @@ target_home_remap=$target_dir_check
 case "$target_dir_check" in
   "$HOME"/*) target_home_remap="/home/${target_dir_check#"$HOME"/}" ;;
 esac
+# Consume the full pipe: grep -q can SIGPIPE strings and make pipefail hide a hit.
 bin_leaks=()
 for pattern in "$HOME" "$cargo_home_check" "$root" "$target_dir_check" "$target_home_remap"; do
   [ -n "$pattern" ] || continue
-  if strings "$pkg/bin/mllm" | grep -qF -- "$pattern"; then
+  if strings "$pkg/bin/mllm" | grep -F -- "$pattern" >/dev/null; then
     bin_leaks+=("$pattern")
   fi
 done
@@ -391,7 +392,7 @@ if [ -f "$denylist_file" ]; then
 
     binary_hits=()
     for pattern in "${denylist[@]}"; do
-      strings "$pkg/bin/mllm" | grep -qiF -- "$pattern" && binary_hits+=("$pattern")
+      strings "$pkg/bin/mllm" | grep -iF -- "$pattern" >/dev/null && binary_hits+=("$pattern")
     done
     if [ "${#binary_hits[@]}" -eq 0 ]; then
       pass "bin/mllm matches no private-denylist pattern"
