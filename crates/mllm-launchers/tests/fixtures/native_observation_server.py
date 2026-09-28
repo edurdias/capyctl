@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import threading
 
 sys.path.insert(0, sys.argv[1])
 from runtime.sglang_observation_transport import _process_identity, observation_key
@@ -21,6 +22,7 @@ key = observation_key(sys.argv[4], "binding", "incarnation") if keyed else None
 class SyntheticBridge:
     def __init__(self):
         self.calls = 0
+        self.transport_active = threading.Event()
 
     def request(self, request_id, *, timeout_ms):
         self.calls += 1
