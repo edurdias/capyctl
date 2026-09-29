@@ -72,8 +72,11 @@ distinct test total excludes that duplicate.
 **CPU and Fake-engine tests are not qualification.** Passing tests never establish
 that a native engine recipe works. Say so explicitly in any status claim.
 
-There is no CI while GitHub Actions minutes are exhausted: local verification is
-the evidence for a pull request. Work on a branch and open a PR against `main`;
+GitHub Actions runs CPU checks and site checks once the repository is public;
+all workflows skip execution while it is private. Local verification remains
+required when hosted checks have not run. The manual release workflow builds
+and verifies both Linux architectures and uploads artifacts; it never publishes.
+See `docs/operations/releasing.md`. Work on a branch and open a PR against `main`;
 never push to `main` directly. Never publish a GitHub release; the owner publishes.
 
 ## Hard constraints

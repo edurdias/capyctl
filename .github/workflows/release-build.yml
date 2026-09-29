@@ -1,0 +1,98 @@
+# This workflow prepares downloadable artifacts only. The owner publishes releases.
+name: Release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      rust_version:
+        description: Exact Rust version for both architectures (major.minor.patch)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.repository.private == false
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      RUST_VERSION: ${{ inputs.rust_version }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate toolchain and architecture
+        shell: bash
+        run: |
+          [[ "$RUST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Use an exact Rust version.' >&2; exit 1; }
+          test "$(uname -m)" = "$RELEASE_ARCH"
+      - name: Install packaging prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential protobuf-compiler pkg-config libssl-dev python3 shellcheck binutils systemd
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+      - name: Build twice and compare archive bytes
+        run: |
+          packaging/release.sh dist
+          packaging/release.sh "$RUNNER_TEMP/repeat"
+          for archive in dist/mllm-*.tar.gz; do
+            cmp "$archive" "$RUNNER_TEMP/repeat/$(basename "$archive")"
+          done
+      - name: Verify package and installer
+        # The maintainer-only privacy inputs are absent on hosted runners.
+        # Their explicit SKIP reports must be reviewed separately before publication.
+        run: scripts/verify-packaging.sh dist/mllm-*.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Record scope
+        run: |
+          printf 'Commit: `%s`\n\nRust: `%s`\n\nCPU packaging checks do not qualify native engine recipes.\n' "$GITHUB_SHA" "$RUST_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: downloaded
+      - name: Assemble release assets and checksums
+        run: |
+          cmp downloaded/release-x86_64/install.sh downloaded/release-aarch64/install.sh
+          mkdir dist
+          cp downloaded/release-x86_64/install.sh dist/
+          cp downloaded/release-*/*.tar.gz downloaded/release-*/*.tar.gz.sha256 dist/
+          test "$(find dist -name '*.tar.gz' | wc -l)" -eq 2
+          packaging/release.sh --sums dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

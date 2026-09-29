@@ -1,0 +1,25 @@
+name: Question or documentation feedback
+description: Ask about usage or suggest a documentation correction.
+title: "[Question] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Keep API keys, enrollment material, private prompts and machine identifiers out of your question. Use the security policy for vulnerability reports.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question or documentation problem
+      description: Describe your goal or link the page that needs clarification.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant commands and redacted errors, if any.
+  - type: input
+    id: version
+    attributes:
+      label: mllm version and relevant environment
+      description: Include the engine/version and setup when relevant.

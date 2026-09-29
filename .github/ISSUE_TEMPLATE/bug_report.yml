@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible problem in mllm.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities, use [private security reporting](https://github.com/edurdias/mllm/security/advisories/new); do not share exploit details here. Remove API keys, enrollment material, private data and machine identifiers from all evidence.
+  - type: input
+    id: version
+    attributes:
+      label: mllm version
+      description: Output of mllm --version, or commit if built from source.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, architecture, GPU and memory, driver, engine/version, model and standalone or server/host setup. Use generic host names.
+    validations:
+      required: true
+  - type: dropdown
+    id: execution
+    attributes:
+      label: Where did this happen?
+      options:
+        - Native engine
+        - CPU or Fake-engine test
+        - Installer, CLI or documentation
+        - Other or unsure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal commands and redacted configuration needed to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include relevant errors or a small redacted log excerpt. Do not attach a state directory or ledger.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Frequency, workaround, regression version or related issues.

@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose a use case or improvement.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the use case and who benefits. Remove private data and host identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the outcome you would like, with a small example if useful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or current workaround
+      description: What do you do today, and where does it fall short?
+  - type: textarea
+    id: context
+    attributes:
+      label: Constraints and context
+      description: Relevant hardware, engines, model sizes or related issues. Implementation ideas are optional.
