@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Reporting and support guide
+    url: https://github.com/edurdias/mllm/blob/main/SUPPORT.md
+    about: Read what to include in a report and how to redact private information.
+  - name: Security vulnerability
+    url: https://github.com/edurdias/mllm/security/policy
+    about: Read the private reporting instructions; do not disclose vulnerabilities in a public issue.

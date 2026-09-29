@@ -208,9 +208,10 @@ Upgrade the server first, then the hosts one at a time.
 
 ## Contributing
 
-Read [`AGENTS.md`](AGENTS.md) first. It is the working agreement for human and
-coding-agent contributors: which documents are authoritative, the
-verification a change must pass, and the documentation rules.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and pull requests.
+Use [SUPPORT.md](SUPPORT.md) for questions, bug reports and feature feedback, and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting. Everyone
+participating follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
