@@ -24,7 +24,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       PYTHONDONTWRITEBYTECODE: "1"
-      TMS_SOURCE_ARCHIVE: ${{ runner.temp }}/torch_memory_saver-0.0.9.post1.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,6 +48,8 @@ jobs:
           -p mllm-management -p harness --all-targets --locked -- -D warnings
       - name: Fetch and verify CPU fixture source
         run: |
+          TMS_SOURCE_ARCHIVE="$RUNNER_TEMP/torch_memory_saver-0.0.9.post1.tar.gz"
+          echo "TMS_SOURCE_ARCHIVE=$TMS_SOURCE_ARCHIVE" >> "$GITHUB_ENV"
           curl --fail --location --retry 3 --output "$TMS_SOURCE_ARCHIVE" \
             https://files.pythonhosted.org/packages/81/fd/42aad783d433fd69dc108b1b2ee5860fcf33e20e5440b899bc004ff97d70/torch_memory_saver-0.0.9.post1.tar.gz
           printf '%s  %s\n' 25fd4b691ed3242c3a18b2bef0dbe9de84d2e7068b96a37686a923d55c274f43 "$TMS_SOURCE_ARCHIVE" | sha256sum --check -
