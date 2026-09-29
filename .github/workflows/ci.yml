@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    # Keep automatic checks off while the repository is private.
+    if: github.event.repository.private == false
+    name: CPU checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONDONTWRITEBYTECODE: "1"
+      TMS_SOURCE_ARCHIVE: ${{ runner.temp }}/torch_memory_saver-0.0.9.post1.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build and fixture prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential protobuf-compiler pkg-config libssl-dev python3 curl patch shellcheck
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Authoritative core suite
+        run: >-
+          cargo test -p mllm-adapters -p mllm-store -p mllm-controller
+          -p mllm-management -p harness --all-targets --no-fail-fast --locked
+          -- --test-threads=4
+      - name: Workspace suite
+        run: cargo test --workspace --all-targets --locked
+      - name: Core Clippy
+        run: >-
+          cargo clippy -p mllm-adapters -p mllm-store -p mllm-controller
+          -p mllm-management -p harness --all-targets --locked -- -D warnings
+      - name: Fetch and verify CPU fixture source
+        run: |
+          curl --fail --location --retry 3 --output "$TMS_SOURCE_ARCHIVE" \
+            https://files.pythonhosted.org/packages/81/fd/42aad783d433fd69dc108b1b2ee5860fcf33e20e5440b899bc004ff97d70/torch_memory_saver-0.0.9.post1.tar.gz
+          printf '%s  %s\n' 25fd4b691ed3242c3a18b2bef0dbe9de84d2e7068b96a37686a923d55c274f43 "$TMS_SOURCE_ARCHIVE" | sha256sum --check -
+      - name: Runtime CPU tests
+        run: python3 -m unittest discover -s runtime/tests -p 'test_*.py' -v
+      - name: Packaging shell checks
+        run: shellcheck packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh
+      - name: Installer fixtures
+        run: scripts/test-install.sh
+      - name: Record scope
+        run: echo 'CPU and Fake-engine tests are not native engine recipe qualification.' >> "$GITHUB_STEP_SUMMARY"
