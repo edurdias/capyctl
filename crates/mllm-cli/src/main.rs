@@ -31,6 +31,9 @@ fn main() -> ExitCode {
         role,
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     );
+    if role {
+        mllm_cli::role_text::install(format);
+    }
     let view = table::View::of(&invocation.command);
     let context = mllm_cli::views::Context {
         names: &HostNames::default(),
@@ -50,7 +53,15 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::remote_roles::execute(&invocation, &state_root)) {
             Ok(value) => {
-                emit(&invocation.command, &value, format, &context);
+                // ADR 0021: a role's shutdown summary is role output.
+                if matches!(
+                    invocation.command,
+                    Command::Start(Role::Server | Role::Host)
+                ) {
+                    print!("{}", mllm_cli::role_text::stopped(&value));
+                } else {
+                    emit(&invocation.command, &value, format, &context);
+                }
                 warn_development_controls(&value, format);
                 ExitCode::SUCCESS
             }
@@ -457,10 +468,15 @@ async fn serve_standalone(
     ));
     // Design §9 ("Where the key is"): the ready line names the owner-only
     // credentials file that holds the API key, never the key.
-    println!(
-        "standalone ready (state_dir {}; inference listener {inference_address}; credentials {})",
-        state_dir.display(),
-        roles::credentials_path(state_dir).display()
+    print!(
+        "{}",
+        mllm_cli::role_text::banner(&serde_json::json!({
+            "role": "standalone", "ready": true, "version": env!("CARGO_PKG_VERSION"),
+            "inference": inference_address.to_string(),
+            "inference_auth": if matches!(inference_auth, exposure::InferenceAuth::None) { "none" } else { "api_key" },
+            "management": management_address.to_string(),
+            "state_dir": state_dir, "credentials": roles::credentials_path(state_dir),
+        }))
     );
     let failed = tokio::select! {
         _ = signals.recv() => None,
@@ -485,9 +501,9 @@ async fn serve_standalone(
     inference.abort();
     control.abort();
     let worker = app.shutdown().await;
-    println!(
+    print!(
         "{}",
-        serde_json::json!({
+        mllm_cli::role_text::stopped(&serde_json::json!({
             "role": "standalone",
             "stopped": true,
             "engines": "retained",
@@ -495,7 +511,7 @@ async fn serve_standalone(
             "drain_bound_secs": bound.as_secs(),
             "shutdown_ms": shutdown::elapsed_ms(started),
             "worker": format!("{worker:?}"),
-        })
+        }))
     );
     Ok(())
 }

@@ -280,7 +280,7 @@ impl Installation {
         }
         let role = Role::spawn(command);
         let ready = role.expect_line(
-            |line| line.starts_with("standalone ready"),
+            |line| line.contains("\"role\":\"standalone\""),
             Duration::from_secs(60),
         );
         (role, ready)
@@ -374,7 +374,7 @@ impl Role {
             .lines
             .try_iter()
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .find(|value| value["role"] == "standalone")
+            .find(|value| value["role"] == "standalone" && value["stopped"] == true)
             .unwrap_or(Value::Null);
         (status, report)
     }
@@ -939,7 +939,7 @@ fn a_loopback_standalone_document_is_never_rewritten() {
         .replace("0.0.0.0:8443", "127.0.0.1:8443");
     std::fs::write(&path, &previous).unwrap();
 
-    let standalone = |line: &str| line.starts_with("standalone ready");
+    let standalone = |line: &str| line.contains("\"role\":\"standalone\"");
     for _ in 0..2 {
         let mut command = installation.command();
         command.args(["start", "standalone"]);
@@ -968,15 +968,11 @@ fn the_standalone_inference_address_follows_flag_then_environment_then_document(
     let environment = format!("127.0.0.1:{}", free_port());
     let flag = format!("127.0.0.1:{}", free_port());
     let alias = format!("127.0.0.1:{}", free_port());
-    let standalone = |line: &str| line.starts_with("standalone ready");
+    let standalone = |line: &str| line.contains("\"role\":\"standalone\"");
     let bound = |line: &str| {
-        line.rsplit("inference listener ")
-            .next()
+        serde_json::from_str::<Value>(line).unwrap()["inference"]
+            .as_str()
             .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .trim_end_matches(')')
             .to_owned()
     };
 
@@ -1182,7 +1178,7 @@ fn listen_moves_the_standalone_inference_listener() {
     let listen = format!("127.0.0.1:{}", free_port());
     let (role, ready) = installation.start_with(None, &["--listen", &listen]);
     assert!(
-        ready.contains(&format!("inference listener {listen}")),
+        ready.contains(&format!("\"inference\":\"{listen}\"")),
         "{ready}"
     );
     std::net::TcpStream::connect(&listen).expect("the --listen address is served");
@@ -1255,7 +1251,7 @@ fn an_unauthenticated_exposed_listener_is_announced_and_shown_in_status() {
 #[test]
 fn a_loopback_or_keyed_listener_is_not_announced() {
     let installation = Installation::new();
-    let standalone = |line: &str| line.starts_with("standalone ready");
+    let standalone = |line: &str| line.contains("\"role\":\"standalone\"");
     let mut command = installation.command();
     command.args(["start", "standalone", "--no-inference-auth"]);
     let (_, said) = run_until_ready(&mut command, standalone);
@@ -1765,7 +1761,7 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
 #[test]
 fn a_standalone_start_takes_its_drain_bound_from_set_then_env_then_document() {
     let installation = Installation::new();
-    let standalone = |line: &str| line.starts_with("standalone ready");
+    let standalone = |line: &str| line.contains("\"role\":\"standalone\"");
     let bound_after = |command: &mut Command| {
         let role = Role::spawn(command);
         role.expect_line(standalone, Duration::from_secs(60));
@@ -1797,10 +1793,12 @@ fn the_ready_lines_name_the_credentials_file_never_the_key() {
     let installation = Installation::new();
     let mut command = installation.command();
     command.args(["start", "standalone"]);
-    let (ready, _) = run_until_ready(&mut command, |line| line.starts_with("standalone ready"));
+    let (ready, _) = run_until_ready(&mut command, |line| {
+        line.contains("\"role\":\"standalone\"")
+    });
     let credentials = installation.state().join("identity/credentials");
     assert!(
-        ready.contains(&format!("credentials {}", credentials.display())),
+        ready.contains(&format!("\"credentials\":\"{}\"", credentials.display())),
         "{ready}"
     );
     assert!(!ready.contains(&installation.api_key()), "{ready}");
@@ -1937,7 +1935,7 @@ fn a_client_finds_a_standalone_started_with_management_listen() {
     command.args(["start", "standalone", "--management-listen", &other]);
     let role = Role::spawn(&mut command);
     role.expect_line(
-        |line| line.starts_with("standalone ready"),
+        |line| line.contains("\"role\":\"standalone\""),
         Duration::from_secs(60),
     );
     let listed = installation
@@ -1997,18 +1995,21 @@ async fn start_host_prints_a_ready_line_and_its_first_session_is_accepted() {
     );
     let host = roles.start("host");
     let ready = host.expect_line(
-        |line| line.starts_with("host ready"),
+        |line| line.contains("\"role\":\"host\""),
         Duration::from_secs(30),
     );
     let document: Value =
         serde_json::from_slice(&std::fs::read(&roles.host_config).unwrap()).unwrap();
     let state_dir = document["state_dir"].as_str().unwrap();
     let ingress = document["ingress"]["bind"].as_str().unwrap();
-    assert!(ready.contains(&format!("state_dir {state_dir}")), "{ready}");
+    assert!(
+        ready.contains(&format!("\"state_dir\":\"{state_dir}\"")),
+        "{ready}"
+    );
     assert!(ready.contains(ingress), "{ready}");
     assert!(
         ready.contains(&format!(
-            "credentials {}/host-identity.json",
+            "\"credentials\":\"{}/host-identity.json\"",
             document["identity_dir"].as_str().unwrap()
         )),
         "{ready}"
@@ -2044,4 +2045,25 @@ fn start_server_names_a_listener_address_in_use() {
         "{said}"
     );
     drop(held);
+}
+
+// T02 (ADR 0021): a role prints text with `--format text` even when piped,
+// and JSON lines when piped without it.
+#[test]
+fn a_role_prints_text_when_asked_and_json_when_piped() {
+    let installation = Installation::new();
+    let mut command = installation.command();
+    command.args(["start", "standalone", "--format", "text"]);
+    let (line, _) = run_until_ready(&mut command, |line| {
+        line.starts_with("mllm ") && line.ends_with(" standalone ready")
+    });
+    assert!(line.contains("standalone ready"), "{line}");
+
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    let (line, _) = run_until_ready(&mut command, |line| {
+        line.contains("\"role\":\"standalone\"")
+    });
+    let banner: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(banner["ready"], true);
 }

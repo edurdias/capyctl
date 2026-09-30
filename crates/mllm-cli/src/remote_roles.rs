@@ -757,13 +757,18 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             TcpListenerStream::new(control_listener),
             stopping(stopped.clone()),
         );
-    println!(
+    // Design §9 ("Where the key is"): the owner-only file holding the API key
+    // and admin token, never the key itself.
+    print!(
         "{}",
-        // Design §9 ("Where the key is"): the owner-only file holding the
-        // API key and admin token, never the key itself.
-        json!({"role":"server","management":config.management.to_string(),
-            "inference":config.inference.to_string(),"state_dir":config.state_dir,
-            "credentials":config.identity_dir.join("server-credentials.json")})
+        crate::role_text::banner(&json!({"role":"server","ready":true,
+            "version":env!("CARGO_PKG_VERSION"),
+            "management":config.management.to_string(),
+            "inference":config.inference.to_string(),
+            "bootstrap":config.bootstrap.to_string(),
+            "control":config.control.to_string(),
+            "state_dir":config.state_dir,
+            "credentials":config.identity_dir.join("server-credentials.json")}))
     );
     // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
     let management_stopped = stopped.clone();
@@ -1113,17 +1118,13 @@ async fn serve_host(
     let router = admission.gate(ingress.router());
     // Design §9 ("Where the key is"): ready, said as `start standalone` says
     // it, naming the owner-only identity file and never its contents.
-    println!(
-        "host ready (state_dir {}; ingress listener {}; credentials {})",
-        config.state_dir.display(),
-        config
-            .ingress
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), |settings| settings.bind.to_string()),
-        config
-            .identity_dir
-            .join(mllm_agent::enrollment::HOST_FILE)
-            .display()
+    print!(
+        "{}",
+        crate::role_text::banner(&json!({"role": "host", "ready": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "state_dir": config.state_dir,
+            "ingress": config.ingress.as_ref().map(|settings| settings.bind.to_string()),
+            "credentials": config.identity_dir.join(mllm_agent::enrollment::HOST_FILE)}))
     );
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
