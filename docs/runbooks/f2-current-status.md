@@ -1,5 +1,14 @@
 # Current implementation and launch status
 
+## Terminal output — 2026-09-29
+
+ADR 0021 is implemented: commands print tables or a summary with key-value
+details unless `--json` is given, and roles print text on a terminal and one
+JSON object per line to the journal, files and pipes. JSON results and event
+fields are unchanged; tests and the live harness ask for JSON where they
+parse it. The guides show output from a real run. CPU and Fake-engine tests
+are not qualification.
+
 ## 0.1.0 release check and first-run fixes — 2026-09-29
 
 The readiness pull request (CI, release build, community files) merged at

@@ -63,6 +63,19 @@ Every other field is in [Configuration files](configuration.md).
 mllm deploy model --file my-model.yaml --activate --wait
 ```
 
+```text
+Request identity: 01M3R78B47ANFBFVFY40HATPYJ (reuse --request-id 01M3R78B47ANFBFVFY40HATPYJ to recover this command)
+Waiting for the checkpoint digest of my-model to be measured (at most 900s)
+Deployed my-model: ready
+
+  Revision    1
+  Hosts       gpu-box
+  Ready       1/1
+  Startup     28.5 GiB
+  Context     26752 tokens
+  Operation   initialize succeeded
+```
+
 This saves the deployment, starts it and returns when the model answers. The
 first time mllm sees a checkpoint it reads the files once to fingerprint
 them, so the first start takes longer.
@@ -75,8 +88,12 @@ mllm deploy model --file other-model.yaml
 ```
 
 ```text
-Request identity: 01M3G1GYBCV1NDBHBFMMVFVTC8 (reuse --request-id 01M3G1GYBCV1NDBHBFMMVFVTC8 to recover this command)
-{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3G1GYBSHR0B1HZ0NSN8SHAV","joined":false,"notice":"the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment","operation_id":"01M3G1GYBSGCYJSVXBJKW8A797","revision":"1"}
+Request identity: 01M3R7A6Y7JQV9A5X404JZC93X (reuse --request-id 01M3R7A6Y7JQV9A5X404JZC93X to recover this command)
+Deployment other-model created (revision 1)
+
+  Deployment ID       01M3R7A6YJW402N962HH17A66W
+  Operation           01M3R7A6YJFV3HDFWQNZTWQTN0
+  Checkpoint digest   being measured
 the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment
 ```
 
@@ -103,11 +120,34 @@ mllm status deployment my-model
 
 ```text
 NAME       STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
-my-model   ready   1/1     1          17.2 GiB   130s         initialize succeeded
+my-model   ready   1/1     1          28.5 GiB   210s         initialize succeeded
 
 INSTANCE   HOST      STATE   LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   ready   active      gpu0      -
 ```
+
+To take a model off the GPU without stopping it, park it. The deployment shows
+`parking` and then `parked` while its memory is freed:
+
+```bash
+mllm park deployment my-model
+```
+
+```text
+Request identity: 01M3R7ADN3J81JRNH2RDCVD12W (reuse --request-id 01M3R7ADN3J81JRNH2RDCVD12W to recover this command)
+Park requested for my-model
+
+  Operation   01M3R7ADNMD6JTTDDFJ9DKFXVQ
+```
+
+```text
+NAME       STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+my-model   parked   0/1     1          28.5 GiB   210s         park succeeded
+
+INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
+0          gpu-box   parked   active      gpu0      -
+```
+
 
 `STARTUP` is the memory mllm set aside to start the model. When a start fails,
 `LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
@@ -123,7 +163,7 @@ INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 [Exit codes and errors](errors.md#troubleshooting) says where to look next. While parking is
 on, these commands also print a warning that the engine runs with its sleep
 controls enabled. Those controls listen on loopback only. Add
-`--format json` to any list or status command for the full record.
+`--json` to any list or status command for the full record.
 
 ## Stop, start, delete
 
@@ -133,29 +173,41 @@ mllm start deployment my-model --wait       # starts it again
 mllm delete deployment my-model --stop      # stops it and removes it
 ```
 
+```text
+Request identity: 01M3R7BZ886JYFSRCB9K915YSJ (reuse --request-id 01M3R7BZ886JYFSRCB9K915YSJ to recover this command)
+Stop requested for my-model
+
+  Operation   01M3R7BZ8SSE6F0WGNSV09WNHV
+```
+
 `stop` returns once the stop is accepted, while the engine is still going
 away. A `start` right after it is refused, exit status 25, and nothing is
 started:
 
 ```text
 $ mllm start deployment my-model
-Request identity: 01M3G1N0Y60S71RYDD2GXYHX6A (reuse --request-id 01M3G1N0Y60S71RYDD2GXYHX6A to recover this command)
+Request identity: 01M3R7BZ98AKHFBBTZXBCCX1BC (reuse --request-id 01M3R7BZ98AKHFBBTZXBCCX1BC to recover this command)
 error [still_stopping]: my-model is still stopping; nothing was started. Retry in a moment, or run `mllm start deployment my-model --wait`, which waits for the stop to finish and then starts
 ```
 
 With `--wait`, `start` waits for the stop to finish, starts the model and
-returns when it answers, printing the deployment's record:
+returns when it answers:
 
 ```text
 $ mllm start deployment my-model --wait
-Request identity: 01M3G1N10C2WRXX2C7EA9SKBVX (reuse --request-id 01M3G1N10C2WRXX2C7EA9SKBVX to recover this command)
-Waiting for the stop of my-model to finish (at most 130s)
+Request identity: 01M3R7BZA67CC0V5C8F8BFF7BR (reuse --request-id 01M3R7BZA67CC0V5C8F8BFF7BR to recover this command)
+Waiting for the stop of my-model to finish (at most 160s)
+Started my-model: ready
+
+  Ready       1/1
+  Hosts       gpu-box
+  Operation   initialize succeeded
 ```
 
 A request for a stopped deployment is refused; it does not start it:
 
 ```text
-{"code":"deployment_stopped","message":"deployment 01M3G1GYBSHR0B1HZ0NSN8SHAV was stopped by an operator; inference does not start it; start it with `mllm start deployment 01M3G1GYBSHR0B1HZ0NSN8SHAV`"}
+{"code":"deployment_stopped","message":"deployment 01M3R7A6YJW402N962HH17A66W was stopped by an operator; inference does not start it; start it with `mllm start deployment 01M3R7A6YJW402N962HH17A66W`"}
 ```
 
 Deleting never touches the model files.
@@ -168,8 +220,12 @@ mllm deploy model --file my-model.yaml --revision 1
 ```
 
 ```text
-Request identity: 01M3G1HC5ZC1Z26JGCH1XGXWNE (reuse --request-id 01M3G1HC5ZC1Z26JGCH1XGXWNE to recover this command)
-{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3G1GRJFFPV3RMHA70FGS1N2","joined":false,"operation_id":"01M3G1HC72X39XABS4YS1RJXY3","revision":"2"}
+Request identity: 01M3R7DDQH4E287PVNR4CBR38Y (reuse --request-id 01M3R7DDQH4E287PVNR4CBR38Y to recover this command)
+Deployment my-model updated (revision 2)
+
+  Deployment ID       01M3R7A6YJW402N962HH17A66W
+  Operation           01M3R7DDR0S1GTBW8DGQ55SPMG
+  Checkpoint digest   being measured
 ```
 
 A change restarts the model's engine; changing only the instance count does

@@ -69,6 +69,15 @@ mllm engine add ~/venvs/vllm   # a vLLM or SGLang environment
 mllm start standalone          # inference on 0.0.0.0:8443, API key required
 ```
 
+```text
+mllm 0.1.0 standalone ready
+
+  Inference     0.0.0.0:8443 (API key required)
+  Management    127.0.0.1:7443
+  State         /home/me/.local/state/mllm
+  Credentials   /home/me/.local/state/mllm/identity/credentials
+```
+
 The first start writes its configuration and an API key under
 `~/.local/state/mllm`, and reads the GPU. Models live in `~/models`. Every
 setting can be given in the YAML document, as a flag or as an environment
@@ -100,13 +109,26 @@ mllm list deployments
 ```
 
 ```text
+Request identity: 01M3R78B47ANFBFVFY40HATPYJ (reuse --request-id 01M3R78B47ANFBFVFY40HATPYJ to recover this command)
+Waiting for the checkpoint digest of my-model to be measured (at most 900s)
+Deployed my-model: ready
+
+  Revision    1
+  Hosts       gpu-box
+  Ready       1/1
+  Startup     28.5 GiB
+  Context     26752 tokens
+  Operation   initialize succeeded
+
 NAME       STATE   READY   REVISION   HOSTS
 my-model   ready   1/1     1          gpu-box
 ```
 
-Commands that read records (`list`, `status`, `engine list`, `engine detect`,
-`config show`) print an aligned table. For scripts, `--format json` (or
-`--json`) prints the full JSON result instead, and makes errors JSON too.
+Commands print text: a table for `list`, `status`, `engine list`,
+`engine detect` and `config show`, and a short summary for commands that change
+something. On a terminal, `mllm start` prints text too. For scripts,
+`--json` (or `--format json`) prints the full JSON result instead, and makes
+errors JSON too; a role's output is JSON whenever it is not a terminal.
 
 Send a request with the API key:
 

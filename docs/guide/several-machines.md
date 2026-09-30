@@ -18,7 +18,9 @@ mllm init server --output server.yaml
 ```
 
 ```text
-{"config":"server.yaml","initialized":true,"state_dir":"/home/me/.local/state/mllm"}
+Wrote server.yaml
+
+  State directory   /home/me/.local/state/mllm
 ```
 
 Edit `server.yaml` so hosts can reach it. Set the `bootstrap` and `control`
@@ -56,7 +58,14 @@ mllm start server --config ~/server.yaml
 ```
 
 ```text
-{"credentials":"/home/me/.local/state/mllm/identity/server-credentials.json","inference":"0.0.0.0:8443","management":"127.0.0.1:7443","role":"server","state_dir":"/home/me/.local/state/mllm"}
+mllm 0.1.0 server ready
+
+  Inference     0.0.0.0:8443 (API key required)
+  Management    127.0.0.1:7443
+  Bootstrap     100.64.0.10:7444
+  Control       100.64.0.10:7445
+  State         /home/me/.local/state/mllm
+  Credentials   /home/me/.local/state/mllm/identity/server-credentials.json
 ```
 
 Leave it running. The `--config` here is the only one the server needs: the
@@ -72,7 +81,9 @@ mllm invite host gpu-box --output gpu-box.join
 ```
 
 ```text
-{"host_name":"gpu-box","invitation_file":"gpu-box.join"}
+Invitation for gpu-box written to gpu-box.join
+
+Keep it private; it can be used once.
 ```
 
 Copy `gpu-box.join` to the GPU machine, for example with `scp -p` to preserve
@@ -92,7 +103,10 @@ mllm init host --output host.yaml
 ```
 
 ```text
-{"config":"host.yaml","initialized":true,"runtime_dir":"/home/me/.local/state/mllm/runtime","state_dir":"/home/me/.local/state/mllm"}
+Wrote host.yaml
+
+  State directory     /home/me/.local/state/mllm
+  Runtime directory   /home/me/.local/state/mllm/runtime
 ```
 
 mllm sets the memory limits in the file from this machine's memory and GPUs,
@@ -121,8 +135,10 @@ mllm join host --join-file gpu-box.join --config ~/host.yaml
 ```
 
 ```text
-{"file":"/home/me/host.yaml","kind":"host","resolved_against":null,"valid":true}
-{"enrolled":true,"host_id":"01M3G1HYN6KDZ3BRD8VJNNM11Q"}
+/home/me/host.yaml is a valid host document
+Joined the server
+
+  Host ID   01M3R7FJRKN5AQMC4EMYSG7KSK
 ```
 
 ```bash
@@ -130,7 +146,11 @@ mllm start host --config ~/host.yaml
 ```
 
 ```text
-host ready (state_dir /home/me/.local/state/mllm; ingress listener 100.64.0.21:8444; credentials /home/me/.local/state/mllm/identity/host-identity.json)
+mllm 0.1.0 host ready
+
+  Ingress       100.64.0.21:8444
+  State         /home/me/.local/state/mllm
+  Credentials   /home/me/.local/state/mllm/identity/host-identity.json
 ```
 
 The host prints `host ready` once it is up. Leave it
@@ -146,7 +166,13 @@ mllm engine add ~/venvs/vllm
 ```
 
 ```text
-{"cuda_home":"/usr/local/cuda","custom":false,"deep_park":"enabled","deep_park_probe":"available","engine":"vllm","engines_file":"/home/me/engines.yaml","executable":"/home/me/venvs/vllm/bin/vllm","fingerprint":{"digest":"sha256:75e6dea2b0a0bb2a620d8ac4c492c5cb89d9fb0debaa09c3504bfcd6c7adae57","version":"0.29.0"},"profile":"vllm","published":"published","revision":1,"version":"0.29.0"}
+Registered vllm (vllm 0.29.0)
+
+  Executable     /home/me/venvs/vllm/bin/vllm
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/engines.yaml (revision 1)
+  Published      yes
 ```
 
 The host records the file it was started with, so `mllm engine add` on this
@@ -182,6 +208,21 @@ machine with room; add `host: gpu-box` to choose one. On the server:
 
 ```bash
 mllm deploy model --file my-model.yaml --activate --wait
+```
+
+```text
+Request identity: 01M3R7GSP8ZQY0YGNTHDVJBSGN (reuse --request-id 01M3R7GSP8ZQY0YGNTHDVJBSGN to recover this command)
+Waiting for the checkpoint digest of my-model to be measured (at most 900s)
+Deployed my-model: ready
+
+  Revision    1
+  Hosts       01M3R7FJRKN5AQMC4EMYSG7KSK
+  Ready       1/1
+  Startup     28.5 GiB
+  Operation   initialize succeeded
+```
+
+```bash
 mllm list deployments
 ```
 
