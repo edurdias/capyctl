@@ -77,7 +77,7 @@ lines (`Waiting for …`, `Request identity: …`) and errors go to stderr.
 | `delete` | `Deleted <name>` (or `Delete requested for <name>`) | Operation, when present |
 | `init server`, `init host` | `Wrote <config>` | State directory; Runtime directory (host) |
 | `invite host` | `Invitation for <host> written to <file>` | a second line: `Keep it private; it can be used once.` |
-| `join host` | `Joined the server as <host>` | Host ID |
+| `join host` | `Joined the server` | Host ID |
 | `validate config` | `<file> is a valid <kind> document` | Resolved against, when present |
 | `engine add` | `Registered <profile> (<engine> <version>)` | Executable; Deep park; CUDA; Engines file (revision); Published `yes` or `when mllm starts` |
 | `engine remove` | `Removed <profile>` | Engines file (revision); Published |
@@ -141,9 +141,10 @@ start. Library code never prints directly; every current `eprintln!` and
   The server adds its bootstrap and control listeners; a host adds its
   ingress and host ID.
 - **Events**, one line each, prefixed with local time `HH:MM:SS`:
-  `15:04:11 switch my-model: planned; wakes on gpu-box after releasing small`,
-  `15:04:13 switch my-model: completed; ready`,
-  `15:04:14 request my-model -> gpu-box instance 0` (from `router_selection`).
+  `15:04:11 switch 01M3QRK1AP7M: planned; instance 0 wakes on gpu-box after releasing 1 instance(s)`,
+  `15:04:13 switch 01M3QRK1AP7M: completed; the waiting instance is READY and its dispatch is open`,
+  `15:04:14 request 01M3QRCJJ0MX -> gpu-box instance 0` (from `router_selection`; events carry
+  deployment IDs, shown by their first 12 characters).
 - **Notices**: `notice: …`, `warning: …`, as today.
 - **Shutdown**: `mllm standalone stopped: drained, 0 requests in flight;
   engines kept running`.
