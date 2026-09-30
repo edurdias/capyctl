@@ -149,7 +149,10 @@ pub(super) async fn initialize(
         crate::engine_env::mem_available_bytes(),
         crate::engine_env::cpu_count(),
     );
-    eprintln!("{limits} (binding {})", context.binding_id);
+    mllm_domain::role_log::notice(
+        mllm_domain::role_log::Level::Notice,
+        &format!("{limits} (binding {})", context.binding_id),
+    );
     cmd.env.extend(toolchain);
     // SPEC §9.1 / T21: neither the entry nor any engine child writes bytecode
     // beside mllm's checked runtime source.

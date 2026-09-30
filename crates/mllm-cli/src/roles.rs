@@ -344,6 +344,13 @@ pub fn management_override(
 
 /// The warning a role prints once at start when the deprecated
 /// `MLLM_STANDALONE_MANAGEMENT_ADDR` is set, or `None`.
+/// Print a role warning that may carry the legacy `warning: ` prefix; the sink
+/// adds its own.
+pub fn role_warning(line: &str) {
+    let text = line.strip_prefix("warning: ").unwrap_or(line);
+    mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, text);
+}
+
 pub fn deprecated_management_env_warning(flag: Option<std::net::SocketAddr>) -> Option<String> {
     std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV)?;
     let ignored = flag.is_some() || std::env::var_os(MANAGEMENT_ADDR_ENV).is_some();
@@ -455,10 +462,13 @@ pub fn record_management_address(state_dir: &Path, address: std::net::SocketAddr
         std::fs::rename(&temporary, &path)
     })();
     if let Err(error) = written {
-        eprintln!(
-            "warning: could not record the management address in {} ({error}); clients \
-             find it through MLLM_MANAGEMENT_ADDR or the role document",
-            path.display()
+        mllm_domain::role_log::notice(
+            mllm_domain::role_log::Level::Warning,
+            &format!(
+                "could not record the management address in {} ({error}); clients \
+                 find it through MLLM_MANAGEMENT_ADDR or the role document",
+                path.display()
+            ),
         );
     }
 }

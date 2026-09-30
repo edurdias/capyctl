@@ -265,10 +265,13 @@ fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Opt
     if winner == crate::engine::absolute(document_state_dir) {
         return None;
     }
-    eprintln!(
-        "notice: state directory {} from {source} overrides the document's state_dir {}",
-        winner.display(),
-        document_state_dir.display()
+    mllm_domain::role_log::notice(
+        mllm_domain::role_log::Level::Notice,
+        &format!(
+            "state directory {} from {source} overrides the document's state_dir {}",
+            winner.display(),
+            document_state_dir.display()
+        ),
     );
     Some(winner)
 }
@@ -1100,7 +1103,10 @@ async fn serve_host(
             Some(tokio::spawn(server.serve(handler, uid, control_shutdown)))
         }
         Err(failure) => {
-            eprintln!("host control socket unavailable: {failure}");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                &format!("host control socket unavailable: {failure}"),
+            );
             None
         }
     };
@@ -1295,7 +1301,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(warning) =
                     crate::roles::deprecated_inference_env_warning(invocation.listen)
                 {
-                    eprintln!("{warning}");
+                    crate::roles::role_warning(&warning);
                 }
                 let invalid = |e: mllm_config::ConfigError| {
                     error(&format!(
@@ -1362,7 +1368,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 for warning in mllm_config::engine_settings::deprecation_warnings(&|key| {
                     std::env::var(key).ok()
                 }) {
-                    eprintln!("{warning}");
+                    crate::roles::role_warning(&warning);
                 }
                 let mut host = load_host(
                     &path,

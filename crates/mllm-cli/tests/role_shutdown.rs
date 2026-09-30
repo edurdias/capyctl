@@ -951,6 +951,31 @@ fn a_loopback_standalone_document_is_never_rewritten() {
     assert!(!path.with_file_name("standalone.yaml.pre-0.1.0").exists());
 }
 
+/// T02 (ADR 0021): every line a role writes while piped is one JSON object.
+/// The deprecated inference variable makes the role print a notice.
+#[test]
+fn a_piped_role_writes_only_json_lines() {
+    let installation = Installation::new();
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env_remove("MLLM_INFERENCE_ADDR")
+        .env(
+            "MLLM_STANDALONE_INFERENCE_ADDR",
+            format!("127.0.0.1:{}", free_port()),
+        );
+    let (_, stderr) = run_until_ready(&mut command, |line| {
+        line.contains("\"role\":\"standalone\"")
+    });
+    assert!(stderr.contains("deprecated"), "{stderr}");
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "not a JSON line: {line}"
+        );
+    }
+}
+
 /// T03 (design §9, owner rule): the standalone inference address is set three
 /// ways, `--listen` > `MLLM_INFERENCE_ADDR` > the document's
 /// `server.listeners.inference.bind`; the deprecated
@@ -1147,7 +1172,7 @@ fn start_server_warns_only_for_an_exposed_unauthenticated_listener() {
     assert_eq!(server_inference(&line), open);
     assert_eq!(
         said.matches(&format!(
-            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+            "the inference endpoint on {open} accepts requests without an API key."
         ))
         .count(),
         1,
@@ -1233,7 +1258,7 @@ fn an_unauthenticated_exposed_listener_is_announced_and_shown_in_status() {
     let said = stderr_of(&stderr);
     assert_eq!(
         said.matches(&format!(
-            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+            "the inference endpoint on {open} accepts requests without an API key."
         ))
         .count(),
         1,

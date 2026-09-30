@@ -113,7 +113,10 @@ impl Signals {
     /// running and owned.
     pub async fn forced(&mut self) {
         self.recv().await;
-        eprintln!("second signal: cancelling in-flight requests now; engines are retained");
+        mllm_domain::role_log::notice(
+            mllm_domain::role_log::Level::Notice,
+            "second signal: cancelling in-flight requests now; engines are retained",
+        );
     }
 }
 

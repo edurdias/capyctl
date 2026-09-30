@@ -2747,9 +2747,8 @@ fn log_blocked_residency(step_id: &str, why: &str) {
         seen.clear();
     }
     if seen.insert((step_id.to_owned(), why.to_owned())) {
-        eprintln!(
-            "{}",
-            serde_json::json!({"event": "residency_blocked", "step": step_id, "reason": why})
+        mllm_domain::role_log::event(
+            serde_json::json!({"event": "residency_blocked", "step": step_id, "reason": why}),
         );
     }
 }

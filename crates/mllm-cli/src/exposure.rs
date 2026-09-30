@@ -54,7 +54,8 @@ pub fn exposure_warning(bind: SocketAddr, auth: InferenceAuth) -> Option<String>
 /// log) before the listener accepts connections.
 pub fn warn_if_exposed(bind: SocketAddr, auth: InferenceAuth) {
     if let Some(warning) = exposure_warning(bind, auth) {
-        eprintln!("{warning}");
+        let text = warning.strip_prefix("WARNING: ").unwrap_or(&warning);
+        mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, text);
     }
 }
 

@@ -45,7 +45,10 @@ fn main() -> ExitCode {
         std::env::remove_var("MLLM_DEBUG_ENGINE_LOGS");
         if invocation.debug_engine_logs {
             std::env::set_var("MLLM_DEBUG_ENGINE_LOGS", "1");
-            eprintln!("Full engine logs enabled in private log files; they may contain secrets.");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                "Full engine logs enabled in private log files; they may contain secrets.",
+            );
         }
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -78,7 +81,10 @@ fn main() -> ExitCode {
         std::env::remove_var("MLLM_DEBUG_ENGINE_LOGS");
         if invocation.debug_engine_logs {
             std::env::set_var("MLLM_DEBUG_ENGINE_LOGS", "1");
-            eprintln!("Full engine logs enabled in private log files; they may contain secrets.");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                "Full engine logs enabled in private log files; they may contain secrets.",
+            );
         }
         // SPEC §15.2 (R13): `--config` names the role document; without it the
         // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
@@ -413,20 +419,20 @@ async fn serve_standalone(
     roles::inference_override(listen)?;
     exposure::effective_inference_auth(exposure::InferenceAuth::ApiKey, no_inference_auth)?;
     if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     // Owner rule 2026-09-25: a deprecated variable name is warned about once.
     for warning in
         mllm_config::engine_settings::deprecation_warnings(&|key| std::env::var(key).ok())
     {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     // Owner decision 2026-09-25: `--management-listen` >
     // MLLM_MANAGEMENT_ADDR (or its deprecated alias) > the document, checked
     // before the boot so a bad override refuses without side effects.
     let management_override = roles::management_override(invocation.management_listen)?;
     if let Some(warning) = roles::deprecated_management_env_warning(invocation.management_listen) {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     let mut signals = shutdown::Signals::install()?;
     // Owner decision 2026-09-25: `--models-root`, `--model-sources` and
@@ -442,7 +448,7 @@ async fn serve_standalone(
         exposure::effective_inference_auth(app.inference_auth(), no_inference_auth)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
-        eprintln!("warning: {notice}");
+        mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, notice);
     }
     // Design §9: said out loud before the listener accepts connections.
     exposure::warn_if_exposed(inference_address, inference_auth);

@@ -426,7 +426,10 @@ pub async fn run_session_with_updates(
             // SPEC §4.1, ADR 0016: nothing is stopped or signalled here; the
             // session's fence has journaled the disconnect like any other end.
             Err(SessionEnd::Revoked) => return Err(HostRevoked),
-            Err(reason) => eprintln!("host control session ended: {reason}; reconnecting"),
+            Err(reason) => mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                &format!("host control session ended: {reason}; reconnecting"),
+            ),
         }
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),

@@ -342,10 +342,13 @@ pub fn record_document(state_root: &Path, role: &str, named: Option<&Path>) {
         std::fs::rename(&temporary, &path)
     })();
     if let Err(error) = written {
-        eprintln!(
-            "warning: could not record the {role} document in {} ({error}); commands run \
-             without --config will not find it",
-            path.display()
+        mllm_domain::role_log::notice(
+            mllm_domain::role_log::Level::Warning,
+            &format!(
+                "could not record the {role} document in {} ({error}); commands run \
+                 without --config will not find it",
+                path.display()
+            ),
         );
     }
 }

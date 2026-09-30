@@ -125,9 +125,8 @@ impl EnrolledSaver {
 /// name, never a path, key or engine output). Found live 2026-09-23: an SGLang
 /// park refused as unchanged left no trace of which precondition failed.
 fn unavailable(stage: &'static str) -> SaverUnavailable {
-    eprintln!(
-        "{}",
-        serde_json::json!({"event": "saver_observation_unavailable", "stage": stage})
+    mllm_domain::role_log::event(
+        serde_json::json!({"event": "saver_observation_unavailable", "stage": stage}),
     );
     SaverUnavailable
 }

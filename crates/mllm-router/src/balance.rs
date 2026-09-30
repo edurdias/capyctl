@@ -383,20 +383,17 @@ impl Plan {
             None => Route::Whole { offered: false },
             Some(instances) => {
                 let ranking = deps.inflight.instances.choose(deployment, &instances);
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "router_selection",
-                        "deployment": deployment,
-                        "chosen": ranking.order.first().map(|c| c.generation),
-                        "candidates": ranking.order.iter().map(Scored::log).collect::<Vec<_>>(),
-                        "skipped": ranking.skipped.iter().map(|s| serde_json::json!({
-                            "instance": s.instance_index,
-                            "generation": s.generation,
-                            "reason": s.reason,
-                        })).collect::<Vec<_>>(),
-                    })
-                );
+                mllm_domain::role_log::event(serde_json::json!({
+                    "event": "router_selection",
+                    "deployment": deployment,
+                    "chosen": ranking.order.first().map(|c| c.generation),
+                    "candidates": ranking.order.iter().map(Scored::log).collect::<Vec<_>>(),
+                    "skipped": ranking.skipped.iter().map(|s| serde_json::json!({
+                        "instance": s.instance_index,
+                        "generation": s.generation,
+                        "reason": s.reason,
+                    })).collect::<Vec<_>>(),
+                }));
                 let last = if ranking.skipped.is_empty() {
                     None
                 } else {
@@ -545,16 +542,13 @@ impl Plan {
     /// answer, if no other offer succeeds, says so.
     pub fn refused(&mut self, generation: Option<i64>, reason: &str) {
         if let Some(generation) = generation {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "router_failover",
-                    "deployment": self.deployment,
-                    "generation": generation,
-                    "reason": "not_accepted",
-                    "detail": reason,
-                })
-            );
+            mllm_domain::role_log::event(serde_json::json!({
+                "event": "router_failover",
+                "deployment": self.deployment,
+                "generation": generation,
+                "reason": "not_accepted",
+                "detail": reason,
+            }));
         }
         let code = if reason.contains("shutting down") {
             "shutting_down"
@@ -573,16 +567,13 @@ impl Plan {
 }
 
 fn failover(deployment: &str, candidate: &Scored, reason: &str) {
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "event": "router_failover",
-            "deployment": deployment,
-            "generation": candidate.generation,
-            "instance": candidate.instance_index,
-            "reason": reason,
-        })
-    );
+    mllm_domain::role_log::event(serde_json::json!({
+        "event": "router_failover",
+        "deployment": deployment,
+        "generation": candidate.generation,
+        "instance": candidate.instance_index,
+        "reason": reason,
+    }));
 }
 
 #[cfg(test)]

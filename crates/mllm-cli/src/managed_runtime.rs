@@ -15,7 +15,7 @@ use crate::output::StructuredError;
 pub fn prepare(dir: &Path) -> Result<Materialized, MaterializeError> {
     let outcome = materialize(dir)?;
     if let Some(notice) = outcome.notice(dir) {
-        eprintln!("warning: {notice}");
+        mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &notice);
     }
     Ok(outcome)
 }

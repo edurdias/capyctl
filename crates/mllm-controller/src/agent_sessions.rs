@@ -865,7 +865,7 @@ impl AgentSessions {
         let Some(observed) = controller_time(result.observed_at_unix_ms, received_at)
             .filter(|observed| received_at - observed <= 2_000)
         else {
-            eprintln!("host {host} control session {session}: ignored a result whose observation is not fresh");
+            mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {session}: ignored a result whose observation is not fresh"));
             return Ok(());
         };
         result.observed_at_unix_ms = observed;
@@ -1071,10 +1071,8 @@ impl AgentSessions {
                             if silence >= policy.suspend_after && !silent {
                                 silent = true;
                                 self.set_unresponsive(&host, &id, true).map_err(|status| *status)?;
-                                eprintln!(
-                                    "host {host} control session {id}: no heartbeat for {} ms; dispatch suspended, accounting kept",
-                                    silence.as_millis()
-                                );
+                                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {id}: no heartbeat for {} ms; dispatch suspended, accounting kept",
+                                    silence.as_millis()));
                                 let hook = self.unresponsive_hook.lock().ok().and_then(|hook| hook.clone());
                                 if let Some(hook) = hook {
                                     let named = host.clone();
@@ -1096,7 +1094,7 @@ impl AgentSessions {
                             // session before dispatch reopens (same as reconnect).
                             silent = false;
                             self.set_unresponsive(&host, &id, false).map_err(|status| *status)?;
-                            eprintln!("host {host} control session {id}: heartbeats resumed; readiness must be re-proven before dispatch reopens");
+                            mllm_domain::role_log::notice(mllm_domain::role_log::Level::Notice, &format!("host {host} control session {id}: heartbeats resumed; readiness must be re-proven before dispatch reopens"));
                         }
                         let mut draining = false;
                         let mut exited = None;
@@ -1404,7 +1402,7 @@ impl AgentSessions {
                             let (heartbeat_interval_ms, heartbeat_lost_after_ms) = if heartbeats {
                                 (millis(policy.interval), millis(policy.lost_after))
                             } else {
-                                eprintln!("host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost");
+                                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost"));
                                 (0, 0)
                             };
                             send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms, capabilities: capabilities::server_capabilities() })) }).await.map_err(|status| *status)?;
@@ -1430,9 +1428,12 @@ impl AgentSessions {
         if let Err(status) = result {
             // SPEC §13: the end of a session retains every claim. The reason is
             // a fixed status phrase for the operator, never command payloads.
-            eprintln!(
-                "host {host} control session {id} ended: {}",
-                status.message()
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!(
+                    "host {host} control session {id} ended: {}",
+                    status.message()
+                ),
             );
             let _ = outgoing.try_send(Err(status));
         }
@@ -1542,17 +1543,23 @@ impl AgentControl for AgentSessions {
             .record_host_version(&connect.host_id, &record)
             .is_err()
         {
-            eprintln!(
-                "host {} control session: its version could not be recorded",
-                connect.host_id
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!(
+                    "host {} control session: its version could not be recorded",
+                    connect.host_id
+                ),
             );
         }
         if skew.state == version::Compatibility::Refused {
             // ADR 0017: a newer host is refused with the policy's sentence;
             // the host logs it and keeps reconnecting with its backoff.
-            eprintln!(
-                "host {} control session refused: {}",
-                connect.host_id, skew.reason
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!(
+                    "host {} control session refused: {}",
+                    connect.host_id, skew.reason
+                ),
             );
             return Err(Status::failed_precondition(format!(
                 "{}: {}",
@@ -1561,7 +1568,10 @@ impl AgentControl for AgentSessions {
             )));
         }
         if !skew.reason.is_empty() {
-            eprintln!("host {} control session: {}", connect.host_id, skew.reason);
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!("host {} control session: {}", connect.host_id, skew.reason),
+            );
         }
         let drain_only = skew.state.drain_only();
         let missing: Vec<String> = capabilities::CATALOGUE
