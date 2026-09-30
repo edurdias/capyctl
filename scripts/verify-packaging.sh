@@ -56,13 +56,21 @@ done
 shellcheck_bin=${SHELLCHECK:-$(command -v shellcheck || true)}
 if [ -n "$shellcheck_bin" ]; then
   if "$shellcheck_bin" packaging/release.sh packaging/install.sh scripts/verify-packaging.sh \
-    scripts/check-release-clean.sh scripts/test-install.sh; then
+    scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh; then
     pass "shellcheck"
   else
     fail "shellcheck"
   fi
 else
   skip "shellcheck not found (set SHELLCHECK)"
+fi
+
+# ADR 0022: no tracked file names the old project name outside the history set.
+if scripts/check-name.sh >"$work/check-name.log" 2>&1; then
+  pass "no tracked file names the old project name (ADR 0022)"
+else
+  fail "tracked files still name the old project name:"
+  cat "$work/check-name.log" >&2
 fi
 
 # --- 2. static unit checks ---------------------------------------------------

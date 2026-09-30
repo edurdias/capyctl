@@ -35,6 +35,8 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Formatting
         run: cargo fmt --all --check
+      - name: Name check
+        run: scripts/check-name.sh
       - name: Authoritative core suite
         run: >-
           cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller
@@ -56,7 +58,7 @@ jobs:
       - name: Runtime CPU tests
         run: python3 -m unittest discover -s runtime/tests -p 'test_*.py' -v
       - name: Packaging shell checks
-        run: shellcheck packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh
+        run: shellcheck packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh
       - name: Installer fixtures
         run: scripts/test-install.sh
       - name: Record scope
