@@ -698,7 +698,7 @@ fn a_request_derived_from_checkpoint_weights_round_trips() {
 }
 
 /// T14 / ADR 0014 §4: defaults and derivations snapshot and re-derive; a
-/// snapshot cannot claim an capyctl default it did not get.
+/// snapshot cannot claim a capyctl default it did not get.
 // T14
 #[test]
 fn engine_config_snapshots_revalidate_and_cannot_be_forged() {

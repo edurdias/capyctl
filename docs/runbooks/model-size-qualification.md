@@ -230,6 +230,6 @@ Genuine 4B/27B parked switching is not yet qualified. The current role wiring
 binds one checkpoint and adapter, and the existing A/B switch stops the old
 engine. Per-deployment checkpoint/port bindings and real memory reservations
 are prerequisites; see [F1 open items](../design/milestones/f1-open-items.md).
-A direct two-vLLM-process demonstration must not be reported as an capyctl
+A direct two-vLLM-process demonstration must not be reported as a capyctl
 SwitchEngine qualification. Image requests, cold-storage reloads, memory
 pressure, and tail latency are also outside the completed evidence above.

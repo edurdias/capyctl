@@ -313,7 +313,7 @@ CREATE TABLE deployment_attempts(
 );
 "#;
 
-/// ADR 0011: qualification is not an capyctl concept. The tables that held candidate
+/// ADR 0011: qualification is not a capyctl concept. The tables that held candidate
 /// runs, their catalog, evidence, probes, budgets and parked-status records are
 /// dropped in foreign-key order. Nothing wrote them outside tests; a v12 store from
 /// this branch has no rows in them. State directories older than 2026-09-16 must

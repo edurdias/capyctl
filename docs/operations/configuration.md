@@ -68,7 +68,7 @@ set each time. The role document is, first match wins:
 - **On a standalone machine**, they use the standalone role's.
 - **On a host machine**, `capyctl engine` and `capyctl config show` use the host's
   document. A host has no management API, so a command that needs the server is
-  refused with "This machine is an capyctl host; run this command on the server".
+  refused with "This machine is a capyctl host; run this command on the server".
 
 The role is found under the state root from what it records there: a server's
 or standalone role's credentials, the management address it serves on, and,

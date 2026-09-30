@@ -438,7 +438,7 @@ pub(crate) enum DecodedBinding {
     V1,
 }
 
-/// ADR 0011: the only binding an capyctl store writes is version 1. Anything else is
+/// ADR 0011: the only binding a capyctl store writes is version 1. Anything else is
 /// not a binding this store produced.
 pub(crate) fn decode_binding(json: &str) -> Result<DecodedBinding, LifecycleError> {
     if json.len() > MAX_DTO_BYTES {

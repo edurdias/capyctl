@@ -1352,7 +1352,7 @@ pub(super) fn command_lookup(
 }
 
 impl crate::Store {
-    /// ADR 0011: the only cleanup an capyctl store completes is an ordinary one.
+    /// ADR 0011: the only cleanup a capyctl store completes is an ordinary one.
     pub fn complete_cleanup(
         &self,
         s: &CoordinatorSession,

@@ -228,7 +228,7 @@ fn reached(output: &Output) -> String {
     value["hosts"][0]["name"].as_str().unwrap_or("").to_owned()
 }
 
-const HOST_REFUSAL: &str = "This machine is an capyctl host; run this command on the server";
+const HOST_REFUSAL: &str = "This machine is a capyctl host; run this command on the server";
 
 // T01: on a standalone machine a client command uses the standalone role with
 // no flag; on the server machine, the server.

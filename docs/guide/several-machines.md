@@ -185,7 +185,7 @@ machine, says so:
 
 ```text
 $ capyctl list deployments
-error [invalid_config]: This machine is an capyctl host; run this command on the server. A host has no management API: deployments, hosts and invitations are managed where the server (or a standalone role) runs
+error [invalid_config]: This machine is a capyctl host; run this command on the server. A host has no management API: deployments, hosts and invitations are managed where the server (or a standalone role) runs
 ```
 
 Repeat steps 2 to 4 for each GPU machine. On the server:

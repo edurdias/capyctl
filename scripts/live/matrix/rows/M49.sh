@@ -54,9 +54,9 @@ roles_exit() { # after roles.sh down: each role logged exit 0 and none is runnin
   tail -n 1 "$LRD/server.log" | grep -aq '^# .* exit 0$' || { echo "FINDING: server did not log exit 0"; rc=1; }
   for host in "${MATRIX_HOSTS[@]}"; do
     rsh "$host" "tail -n 3 $RRD/host.log | grep -a '^# .* exit ' ; tail -n 1 $RRD/host.log | grep -aq '^# .* exit 0\$' || { echo 'FINDING: host role did not log exit 0'; exit 1; }; \
-pgrep -af 'capyctl[ ]start' && { echo 'FINDING: an capyctl role still runs'; exit 1; }; true" || rc=1
+pgrep -af 'capyctl[ ]start' && { echo 'FINDING: a capyctl role still runs'; exit 1; }; true" || rc=1
   done
-  pgrep -af 'capyctl[ ]start' && { echo "FINDING: an capyctl role still runs on control-host"; rc=1; }
+  pgrep -af 'capyctl[ ]start' && { echo "FINDING: a capyctl role still runs on control-host"; rc=1; }
   return "$rc"
 }
 

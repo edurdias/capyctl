@@ -1,5 +1,5 @@
 //! ADR 0018 §2 (owner decision 2026-09-25): engine registration writes only
-//! `engines.yaml`, an capyctl-owned file beside the role's configuration file.
+//! `engines.yaml`, a capyctl-owned file beside the role's configuration file.
 //! The host or standalone document is never rewritten; the role merges the
 //! two at load, and a profile name declared in both is refused. Writes hold
 //! `engines.yaml.lock`, go through a temporary file, sync and rename, and

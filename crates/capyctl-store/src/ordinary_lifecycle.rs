@@ -913,7 +913,7 @@ impl crate::Store {
     /// Records one spawn attempt and its conservative grant atomically. Only `New`
     /// may lead to a later send.
     ///
-    /// ADR 0011: the only armed step an capyctl store knows is an ordinary initialize.
+    /// ADR 0011: the only armed step a capyctl store knows is an ordinary initialize.
     pub fn arm_step(
         &self,
         s: &CoordinatorSession,

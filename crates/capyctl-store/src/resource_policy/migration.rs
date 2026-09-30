@@ -1,4 +1,4 @@
-//! Migration of an capyctl-generated resource policy whose machine shape changed.
+//! Migration of a capyctl-generated resource policy whose machine shape changed.
 //!
 //! ADR 0019 (upgrade of a generated policy): standalone generates its host's
 //! resource policy from the machine it observes at boot. A release that reads

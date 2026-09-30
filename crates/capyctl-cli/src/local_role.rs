@@ -48,7 +48,7 @@ fn invalid(message: impl Into<String>) -> StructuredError {
 /// The refusal for a server command run where only a host runs.
 fn host_refusal() -> StructuredError {
     invalid(
-        "This machine is an capyctl host; run this command on the server. A host has no \
+        "This machine is a capyctl host; run this command on the server. A host has no \
          management API: deployments, hosts and invitations are managed where the server \
          (or a standalone role) runs",
     )
