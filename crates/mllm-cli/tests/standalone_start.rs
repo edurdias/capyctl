@@ -164,23 +164,17 @@ fn legacy_generated(state: &str) -> String {
 
 /// T03 (SPEC §15.2, R13): an installation whose `standalone.yaml` an older mllm
 /// generated still starts. Its `server.tls` block is reported as ignored and
-/// kept. T02 (ADR 0019, design §9): the only change the role makes to the file
-/// is the one-time move of the old loopback inference default, with the
-/// original kept beside it; the role then binds `0.0.0.0:8443`, and a second
-/// start changes nothing.
+/// kept. The role never rewrites the document (owner decision 2026-09-29): its
+/// loopback inference bind is honoured as written, and no backup appears.
 #[tokio::test]
 async fn standalone_starts_from_a_document_an_older_generator_wrote() {
-    use mllm_config::listener_migration::{Migration, MARKER};
     let dir = safe_state_dir();
     let (path, _) =
         mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
     let legacy = legacy_generated(&dir.path().to_string_lossy());
     std::fs::write(&path, &legacy).unwrap();
 
-    // A restart passes the same engine port range, as an unchanged
-    // environment would.
-    let ports = support::engine_ports();
-    let app = support::try_boot_on(dir.path(), ports).await.unwrap();
+    let app = boot(dir.path()).await;
 
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
@@ -188,53 +182,7 @@ async fn standalone_starts_from_a_document_an_older_generator_wrote() {
         notices[0].contains("server.tls") && notices[0].contains("ignored"),
         "{notices:?}"
     );
-    let backup = path.with_file_name("standalone.yaml.pre-0.1.0");
-    assert_eq!(
-        app.listener_migration(),
-        &Migration::Rewritten {
-            backup: backup.clone()
-        }
-    );
-    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        legacy.replace("\"127.0.0.1:8443\"", "\"0.0.0.0:8443\""),
-        "only the inference bind changes"
-    );
-    assert_eq!(std::fs::read_to_string(&backup).unwrap(), legacy);
-    assert!(dir.path().join(MARKER).exists());
-    let _ = app.shutdown().await;
-
-    let app = support::try_boot_on(dir.path(), ports).await.unwrap();
-    assert_eq!(app.listener_migration(), &Migration::NotNeeded);
-    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
-    let _ = app.shutdown().await;
-}
-
-/// T02 (design §9, `config_migration_failed`): a legacy document that cannot
-/// be rewritten unambiguously is left byte for byte as it was, and the role
-/// still binds `0.0.0.0:8443` for this run; the API key stays required.
-#[tokio::test]
-async fn an_ambiguous_legacy_document_binds_the_new_default_without_a_rewrite() {
-    use mllm_config::listener_migration::Migration;
-    let dir = safe_state_dir();
-    let (path, _) =
-        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
-    let legacy = format!(
-        "# inference was 127.0.0.1:8443\n{}",
-        legacy_generated(&dir.path().to_string_lossy())
-    );
-    std::fs::write(&path, &legacy).unwrap();
-
-    let app = boot(dir.path()).await;
-
-    assert!(
-        matches!(app.listener_migration(), Migration::BindOnly { .. }),
-        "{:?}",
-        app.listener_migration()
-    );
-    assert_eq!(app.inference_bind().to_string(), "0.0.0.0:8443");
-    assert!(!app.api_key().is_empty());
+    assert_eq!(app.inference_bind().to_string(), "127.0.0.1:8443");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
     assert!(!path.with_file_name("standalone.yaml.pre-0.1.0").exists());
     let _ = app.shutdown().await;
@@ -321,16 +269,12 @@ async fn a_document_may_turn_inference_authentication_off() {
 }
 
 /// T03 (design §9): the document's inference bind is the one the role binds,
-/// for example a tailnet address. After the one-time migration has run, the
-/// old loopback default is an operator's choice and is honoured as written.
+/// for example a tailnet address or loopback, on the first start of fresh
+/// state as on any other (owner decision 2026-09-29).
 #[tokio::test]
 async fn standalone_binds_the_inference_address_its_document_states() {
-    use mllm_config::listener_migration::MARKER;
     for bind in ["100.64.0.5:8443", "127.0.0.1:8443"] {
         let dir = safe_state_dir();
-        let marker = dir.path().join(MARKER);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "").unwrap();
         let explicit = dir.path().join("explicit.yaml");
         let text = legacy_generated(&dir.path().to_string_lossy())
             .replace("\"127.0.0.1:8443\"", &format!("\"{bind}\""));
@@ -433,8 +377,6 @@ fn assert_untouched(state: &std::path::Path) {
         "config/standalone.yaml",
         "identity/credentials",
         "server/srv.sqlite3",
-        // ADR 0019: a refused document is never migrated.
-        mllm_config::listener_migration::MARKER,
     ] {
         assert!(!state.join(leaf).exists(), "{leaf} was created");
     }
@@ -526,13 +468,8 @@ async fn standalone_honours_a_valid_explicit_document() {
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("server.tls"), "{notices:?}");
-    // ADR 0019, design §9: an explicit document goes through the same
-    // one-time migration; nothing but the inference bind changes.
-    assert_eq!(
-        std::fs::read_to_string(&explicit).unwrap(),
-        text.replace("\"127.0.0.1:8443\"", "\"0.0.0.0:8443\""),
-        "only the inference bind is rewritten"
-    );
+    // Owner decision 2026-09-29: the role never rewrites the document.
+    assert_eq!(std::fs::read_to_string(&explicit).unwrap(), text);
     assert!(
         !dir.path().join("config/standalone.yaml").exists(),
         "no implicit document is generated beside an explicit one"

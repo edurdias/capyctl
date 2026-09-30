@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
-use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 pub use mllm_config::model_settings::ModelOverrides;
 use mllm_config::schema::ConfigKind;
 pub use mllm_config::setting_overrides::SettingOverrides;
@@ -165,8 +164,6 @@ pub struct App {
     /// Owner decision 2026-09-25: the document's
     /// `server.listeners.management.bind`, or `127.0.0.1:7443`.
     management_bind: std::net::SocketAddr,
-    /// ADR 0019, design §9: what this start's one-time listener migration did.
-    listener_migration: Migration,
     /// Design §9: the document's `server.listeners.inference.authentication`
     /// (`api_key` unless it states `none`).
     inference_auth: mllm_config::standalone::InferenceAuth,
@@ -203,12 +200,6 @@ impl App {
     /// `MLLM_MANAGEMENT_ADDR` overrides it ([`management_override`]).
     pub fn management_bind(&self) -> std::net::SocketAddr {
         self.management_bind
-    }
-
-    /// ADR 0019, design §9: what this start's one-time migration of the old
-    /// loopback inference bind did (reported on stderr as it happened).
-    pub fn listener_migration(&self) -> &Migration {
-        &self.listener_migration
     }
 
     /// Design §9: the inference authentication the standalone document
@@ -1443,30 +1434,6 @@ fn no_overrides() -> SettingOverrides {
     SettingOverrides::none(ConfigKind::Standalone)
 }
 
-/// ADR 0019, design §9: run the one-time migration of the role `document`
-/// under `state_dir` and report it on stderr, which is the role's log: the
-/// notice on the start that migrated, and `config_migration_failed` when the
-/// document could not be rewritten (the role then binds 0.0.0.0:8443 for this
-/// run). Shared by the standalone and server roles.
-pub fn listener_migration(
-    document: &Path,
-    state_dir: &Path,
-    parsed_bind: Option<&str>,
-) -> Migration {
-    let outcome = mllm_config::listener_migration::migrate(document, state_dir, parsed_bind);
-    if let Migration::BindOnly { reason } = &outcome {
-        eprintln!(
-            "warning: config_migration_failed: {} was not rewritten ({reason}); \
-             inference binds {NEW_INFERENCE_DEFAULT} for this run",
-            document.display()
-        );
-    }
-    if let Some(notice) = mllm_config::listener_migration::notice(document, &outcome) {
-        eprintln!("{notice}");
-    }
-    outcome
-}
-
 /// Owner decision 2026-09-25: the embedded host's models directory and
 /// model-source policy, resolved by the shared rule
 /// (`mllm_config::model_settings`): flag > environment > `host:` block of the
@@ -1566,7 +1533,6 @@ async fn start_standalone_in(
         inference_bind,
         management_bind,
         inference_auth,
-        listener_migration,
         stated_host,
     ) = {
         let path = match &outcome {
@@ -1585,11 +1551,8 @@ async fn start_standalone_in(
             };
             // Owner decision 2026-09-25: the generic overrides are applied to
             // the document before it is validated, exactly as if it stated
-            // them. The one-time listener migration reads the file's own bind.
+            // them.
             let raw = mllm_config::parse_document(&text).map_err(invalid)?;
-            let file_bind = raw["server"]["listeners"]["inference"]["bind"]
-                .as_str()
-                .map(str::to_owned);
             let document = overrides.apply_and_validate(raw).map_err(invalid)?;
             // SPEC §15.3: a value this role would silently ignore (another state
             // directory or listener, TLS, a model store, profiles, numeric limits)
@@ -1602,17 +1565,9 @@ async fn start_standalone_in(
                 &absolute(state_dir),
             )
             .map_err(invalid)?;
-            Ok((document, ignored, file_bind))
+            Ok((document, ignored))
         };
-        let (mut document, mut ignored, file_bind) = load()?;
-        // ADR 0019, design §9: a document still stating the old loopback
-        // default is migrated to 0.0.0.0:8443 once, after it has been accepted
-        // and before its listeners are read. A refused document is never
-        // touched.
-        let migration = listener_migration(&path, state_dir, file_bind.as_deref());
-        if matches!(migration, Migration::Rewritten { .. }) {
-            (document, ignored, _) = load()?;
-        }
+        let (document, ignored) = load()?;
         (
             mllm_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
                 |error| StartError::Deploy(format!("standalone configuration: {error}")),
@@ -1622,18 +1577,11 @@ async fn start_standalone_in(
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             ignored.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            // Design §9: validated by `check_honoured` above. A document the
-            // migration could not rewrite still serves on the new default.
-            match migration {
-                Migration::BindOnly { .. }
-                    if overrides.get("server.listeners.inference.bind").is_none() =>
-                {
-                    NEW_INFERENCE_DEFAULT.parse().expect("valid default")
-                }
-                _ => mllm_config::standalone::inference_bind(&document).map_err(|error| {
-                    StartError::Deploy(format!("standalone configuration: {error}"))
-                })?,
-            },
+            // Design §9: validated by `check_honoured` above. An explicit bind
+            // is always honoured (owner decision 2026-09-29).
+            mllm_config::standalone::inference_bind(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             // Owner decision 2026-09-25: validated by `check_honoured` above.
             mllm_config::standalone::management_bind(&document).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
@@ -1644,7 +1592,6 @@ async fn start_standalone_in(
             mllm_config::standalone::inference_auth(&document, false).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
-            migration,
             // Owner decision 2026-09-25: `host.model_store` and
             // `host.model_sources`, validated by `check_honoured` above.
             document["host"].clone(),
@@ -2096,7 +2043,6 @@ async fn start_standalone_in(
         supervision,
         switcher,
         config_notices,
-        listener_migration,
         inference_bind,
         management_bind,
         inference_auth,

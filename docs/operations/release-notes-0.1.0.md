@@ -54,12 +54,12 @@ engines or drivers.
 
 ## Upgrading from a release candidate
 
-The first start of 0.1.0 changes two things once:
+Two things to know when upgrading:
 
-- An inference endpoint on the old default `127.0.0.1:8443` moves to
-  `0.0.0.0:8443`, still with the API key. The old configuration file is kept as
-  `<file>.pre-0.1.0` and a notice is printed. Start with
-  `--listen 127.0.0.1:8443` to keep it on the machine.
+- The inference endpoint of an existing configuration file does not move: a
+  file an earlier release generated keeps `127.0.0.1:8443`. New files use
+  `0.0.0.0:8443` with the API key. Set the bind or start with
+  `--listen 0.0.0.0:8443` to serve the network.
 - On a discrete card, standalone replaces its single memory pool with separate
   host-RAM and GPU domains. It stops the engines the earlier release started
   and re-sizes their deployments; the next request starts each one cold.

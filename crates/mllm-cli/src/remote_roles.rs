@@ -9,7 +9,6 @@ use mllm_agent::{
     identity_storage::IdentityDirectory,
     journal::HostJournal,
 };
-use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 use mllm_config::remote_roles::{HostConfig, ServerConfig};
 use mllm_controller::{
     agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
@@ -1241,35 +1240,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(dir) = &state_dir {
                     config = config.with_state_dir(dir.clone());
                 }
-                // ADR 0019, design §9: the old loopback default moves to
-                // 0.0.0.0:8443 once, after the document has been accepted.
-                // The migration reads the file's own bind, not an override.
-                let file_bind = mllm_config::parse_document(&source)
-                    .ok()
-                    .and_then(|document| {
-                        document["listeners"]["inference"]["bind"]
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                let document_bind = match crate::roles::listener_migration(
-                    &path,
-                    &config.state_dir,
-                    file_bind.as_deref(),
-                ) {
-                    Migration::Rewritten { .. } => {
-                        config = parse(&read_config(&path)?)?;
-                        if let Some(dir) = &state_dir {
-                            config = config.with_state_dir(dir.clone());
-                        }
-                        config.inference
-                    }
-                    Migration::BindOnly { .. }
-                        if overrides.get("listeners.inference.bind").is_none() =>
-                    {
-                        NEW_INFERENCE_DEFAULT.parse().expect("valid default")
-                    }
-                    Migration::BindOnly { .. } | Migration::NotNeeded => config.inference,
-                };
+                let document_bind = config.inference;
                 // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document,
                 // by the rule the standalone role uses, and never onto another
                 // server listener.

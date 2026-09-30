@@ -869,33 +869,14 @@ acting on it.
 
 ### Upgrading to 0.1.0
 
-The inference endpoint now listens on all interfaces, `0.0.0.0:8443`, and
-still requires the API key. At the first start of 0.1.0, a server or
-standalone document whose inference bind is exactly `127.0.0.1:8443` (the
-default earlier releases generated) is updated once to `0.0.0.0:8443`. The
-original is kept beside it as `<file>.pre-0.1.0`, with the same mode, and the
-start prints:
+Newly generated documents put the inference endpoint on all interfaces,
+`0.0.0.0:8443`, with the API key required. mllm never rewrites an existing
+document: one an earlier release generated keeps `127.0.0.1:8443` until you
+change it. To open it to the network, set `listeners.inference.bind` (under
+`server:` in standalone) to `0.0.0.0:8443` or start with
+`--listen 0.0.0.0:8443`.
 
-```
-NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
-The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
-To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
-```
-
-The marker `<state dir>/migrations/inference-bind-v1` records that this ran, so
-it never runs again; any other address, and the authentication setting, are
-never touched. A document the role cannot rewrite (a read-only `/etc/mllm`,
-for example, or one where the address appears more than once) is left
-unchanged; the role serves on `0.0.0.0:8443` and prints
-`config_migration_failed` with the line to edit. The migration then stays
-pending: every later start that still finds `127.0.0.1:8443` in the unchanged
-document serves on `0.0.0.0:8443` again and prints the warning, until the
-document states another address (or can be rewritten). The system units mount
-`/etc` read-only, so a server whose document is `/etc/mllm/server.yaml` takes
-this path; to keep it local, set another address there or start with
-`--listen 127.0.0.1:8443`.
-
-To narrow the address again, pick one:
+To set the address, pick one:
 
 - keep inference on the machine: `--listen 127.0.0.1:8443`, or
   `MLLM_INFERENCE_ADDR=127.0.0.1:8443` in the unit's `.env` file, or

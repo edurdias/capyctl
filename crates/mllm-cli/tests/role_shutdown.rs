@@ -922,15 +922,13 @@ fn run_until_ready(command: &mut Command, ready: impl Fn(&str) -> bool) -> (Stri
     (line, stderr_of(&stderr))
 }
 
-/// T02 (ADR 0019, design §9): a standalone installation whose document the
-/// previous generator wrote (inference on `127.0.0.1:8443`) is migrated on its
-/// first start: the notice is printed once on stderr, the document states
-/// `0.0.0.0:8443` with the original kept beside it, and the next start prints
-/// nothing. The runs here listen on a loopback port through
-/// `MLLM_INFERENCE_ADDR`, so the test never serves on every interface; the
+/// T02 (design §9, owner decision 2026-09-29): a standalone document stating
+/// loopback inference (`127.0.0.1:8443`, as the previous generator wrote) is
+/// never rewritten: no notice, no backup, the same bytes after two starts. The
+/// runs here listen on a loopback port through `MLLM_INFERENCE_ADDR`; the
 /// document's effective bind is checked in `standalone_start.rs`.
 #[test]
-fn the_old_loopback_standalone_document_is_migrated_once() {
+fn a_loopback_standalone_document_is_never_rewritten() {
     let installation = Installation::new();
     let (path, _) =
         mllm_config::generate_default(mllm_config::ConfigKind::Standalone, &installation.state())
@@ -941,35 +939,15 @@ fn the_old_loopback_standalone_document_is_migrated_once() {
     std::fs::write(&path, &previous).unwrap();
 
     let standalone = |line: &str| line.starts_with("standalone ready");
-    let mut command = installation.command();
-    command.args(["start", "standalone"]);
-    let (_, said) = run_until_ready(&mut command, standalone);
-    assert_eq!(
-        said.matches("NOTICE: mllm 0.1.0 serves inference on all interfaces")
-            .count(),
-        1,
-        "{said}"
-    );
-    assert!(
-        said.contains(&format!("Configuration updated: {}", path.display())),
-        "{said}"
-    );
-    assert!(!said.contains("config_migration_failed"), "{said}");
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        previous.replace("127.0.0.1:8443", "0.0.0.0:8443")
-    );
-    let backup = path.with_file_name("standalone.yaml.pre-0.1.0");
-    assert_eq!(std::fs::read_to_string(backup).unwrap(), previous);
-    assert!(installation
-        .state()
-        .join("migrations/inference-bind-v1")
-        .exists());
-
-    let mut command = installation.command();
-    command.args(["start", "standalone"]);
-    let (_, said) = run_until_ready(&mut command, standalone);
-    assert!(!said.contains("NOTICE"), "{said}");
+    for _ in 0..2 {
+        let mut command = installation.command();
+        command.args(["start", "standalone"]);
+        let (_, said) = run_until_ready(&mut command, standalone);
+        assert!(!said.contains("NOTICE"), "{said}");
+        assert!(!said.contains("Configuration updated"), "{said}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    }
+    assert!(!path.with_file_name("standalone.yaml.pre-0.1.0").exists());
 }
 
 /// T03 (design §9, owner rule): the standalone inference address is set three
@@ -1094,14 +1072,13 @@ fn server_inference(banner: &str) -> String {
         .to_owned()
 }
 
-/// T01 T02 T03 (ADR 0019, design §9, owner rule): `mllm start server --listen`
-/// moves the server's inference listener for one run; the address follows
+/// T01 T02 T03 (design §9, owner rule): `mllm start server --listen` moves
+/// the server's inference listener for one run; the address follows
 /// `--listen` > `MLLM_INFERENCE_ADDR` > the document, as for standalone. A
-/// server document stating the old loopback default is migrated once, with
-/// the notice; loopback set back afterwards is kept. Every run listens on a
-/// loopback port.
+/// server document stating loopback is honoured as written and never
+/// rewritten (owner decision 2026-09-29). Every run listens on a loopback port.
 #[test]
-fn start_server_listen_environment_and_migration() {
+fn start_server_listen_environment_and_document() {
     let (_root, state, config) = server_installation("127.0.0.1:8443");
     let original = std::fs::read_to_string(&config).unwrap();
     let banner = |line: &str| line.contains("\"role\":\"server\"");
@@ -1113,52 +1090,31 @@ fn start_server_listen_environment_and_migration() {
     let flag = format!("127.0.0.1:{}", free_port());
     let environment = format!("127.0.0.1:{}", free_port());
 
-    // First start: --listen wins over the environment; the document migrates.
+    // --listen wins over the environment; the document is not touched.
     let mut command = start(&state);
     command
         .args(["--listen", &flag])
         .env("MLLM_INFERENCE_ADDR", &environment);
     let (line, said) = run_until_ready(&mut command, banner);
     assert_eq!(server_inference(&line), flag);
-    assert_eq!(
-        said.matches("NOTICE: mllm 0.1.0 serves inference on all interfaces")
-            .count(),
-        1,
-        "{said}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&config).unwrap(),
-        original.replace("127.0.0.1:8443", "0.0.0.0:8443")
-    );
-    assert_eq!(
-        std::fs::read_to_string(config.with_file_name("server.yaml.pre-0.1.0")).unwrap(),
-        original
-    );
-    assert!(state.join("migrations/inference-bind-v1").exists());
+    assert!(!said.contains("NOTICE"), "{said}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    assert!(!config.with_file_name("server.yaml.pre-0.1.0").exists());
 
-    // The environment wins over the document; no second notice.
+    // The environment wins over the document.
     let mut command = start(&state);
     command.env("MLLM_INFERENCE_ADDR", &environment);
     let (line, said) = run_until_ready(&mut command, banner);
     assert_eq!(server_inference(&line), environment);
     assert!(!said.contains("NOTICE"), "{said}");
 
-    // The operator narrows the document back to loopback: it is kept and bound.
+    // Without either, the document's loopback bind is the one bound.
     let document = format!("127.0.0.1:{}", free_port());
     std::fs::write(&config, original.replace("127.0.0.1:8443", &document)).unwrap();
     let (line, said) = run_until_ready(&mut start(&state), banner);
     assert_eq!(server_inference(&line), document);
     assert!(!said.contains("NOTICE"), "{said}");
     std::fs::write(&config, &original).unwrap();
-    let mut command = start(&state);
-    command.env("MLLM_INFERENCE_ADDR", &environment);
-    let (_, said) = run_until_ready(&mut command, banner);
-    assert!(!said.contains("NOTICE"), "{said}");
-    assert_eq!(
-        std::fs::read_to_string(&config).unwrap(),
-        original,
-        "never migrated twice"
-    );
 
     // The deprecated standalone name also moves the server, with a warning.
     let alias = format!("127.0.0.1:{}", free_port());
@@ -1178,8 +1134,6 @@ fn start_server_listen_environment_and_migration() {
 #[test]
 fn start_server_warns_only_for_an_exposed_unauthenticated_listener() {
     let (_root, state, config) = server_installation("127.0.0.1:8443");
-    std::fs::create_dir_all(state.join("migrations")).unwrap();
-    std::fs::write(state.join("migrations/inference-bind-v1"), "").unwrap();
     let banner = |line: &str| line.contains("\"role\":\"server\"");
     let open = format!("0.0.0.0:{}", free_port());
     let mut command = server_command(&state);
