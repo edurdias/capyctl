@@ -465,6 +465,7 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
         file.to_str().unwrap(),
         "--activate",
         "--wait",
+        "--json",
     ]);
     assert!(
         out.status.success(),
@@ -716,7 +717,7 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     let role = installation.start(None);
     served_within(&installation, Duration::from_secs(20)).await;
     assert_eq!(installation.launches(), vec![engine]);
-    let drained = installation.cli(&["drain", "standalone"]);
+    let drained = installation.cli(&["drain", "standalone", "--json"]);
     assert!(
         drained.status.success(),
         "drain: {}",
@@ -774,7 +775,7 @@ async fn drain_stops_a_deployment_whose_request_deadline_is_shorter_than_the_dra
     let request_id = ulid::Ulid::new().to_string();
     let request_id = request_id.as_str();
     let drain = || {
-        let out = installation.cli(&["drain", "standalone", "--request-id", request_id]);
+        let out = installation.cli(&["drain", "standalone", "--request-id", request_id, "--json"]);
         assert!(
             out.status.success(),
             "drain: {}",
@@ -1639,6 +1640,7 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
         file.to_str().unwrap(),
         "--activate",
         "--wait",
+        "--json",
     ]);
     assert!(
         out.status.success(),
@@ -1719,7 +1721,7 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
     assert_eq!(roles.launches(), vec![engine], "adopted, not relaunched");
 
     // SPEC §4.3: the explicit drain of the host, by name, through the server.
-    let out = roles.manage(&["drain", "host", "w11-host"]);
+    let out = roles.manage(&["drain", "host", "w11-host", "--json"]);
     assert!(
         out.status.success(),
         "drain: {}",

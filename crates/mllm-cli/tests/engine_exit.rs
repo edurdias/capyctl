@@ -375,6 +375,7 @@ impl Installation {
             file.to_str().unwrap(),
             "--activate",
             "--wait",
+            "--json",
         ]);
         assert!(
             out.status.success(),
@@ -774,6 +775,7 @@ async fn a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand() {
         file.to_str().unwrap(),
         "--activate",
         "--wait",
+        "--json",
     ]);
     assert!(
         out.status.success(),

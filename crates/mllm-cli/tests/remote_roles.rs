@@ -99,7 +99,13 @@ fn the_host_runtime_is_managed_unless_the_document_declares_one() {
     let config = temp.path().join("host.yaml");
     let out = cli(
         &state,
-        &["init", "host", "--output", config.to_str().unwrap()],
+        &[
+            "init",
+            "host",
+            "--output",
+            config.to_str().unwrap(),
+            "--json",
+        ],
     );
     assert!(
         out.status.success(),
