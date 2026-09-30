@@ -12,7 +12,7 @@ starts. Phase 2: --stream streaming and --nonstream non-streaming requests (plus
 --short short non-streaming requests), interleaved and run --concurrency at a
 time, round-robin across the given routes. Every request is one evidence record;
 the summary reports status counts, SSE framing, latency percentiles and the
-answering host headers seen. The API key comes from MLLM_API_KEY only.
+answering host headers seen. The API key comes from CAPYCTL_API_KEY only.
 """
 
 import argparse
@@ -120,7 +120,7 @@ def main():
     for kind, items in sorted(by_kind.items()):
         statuses = collections.Counter(str(item.get("status")) for item in items)
         hosts = collections.Counter(
-            "|".join(f"{k}={v}" for k, v in sorted(item.get("headers", {}).items()) if k.startswith("x-mllm")) or "-"
+            "|".join(f"{k}={v}" for k, v in sorted(item.get("headers", {}).items()) if k.startswith("x-capyctl")) or "-"
             for item in items)
         latencies = [item["elapsed_s"] for item in items if item.get("status") == 200]
         streams = [item for item in items if item.get("stream")]
@@ -129,7 +129,7 @@ def main():
             "status": dict(statuses),
             "models": dict(collections.Counter(str(item.get("model")) for item in items)),
             "routes": dict(collections.Counter(item["route"] for item in items)),
-            "mllm_headers": dict(hosts),
+            "capyctl_headers": dict(hosts),
             "sse_well_formed": sum(1 for item in streams if item.get("sse_well_formed")),
             "sse_total": len(streams),
             "latency_p50_s": percentile(latencies, 0.5),

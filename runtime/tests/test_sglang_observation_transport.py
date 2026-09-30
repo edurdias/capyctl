@@ -419,12 +419,12 @@ class ObservationTransportTests(unittest.TestCase):
     # so a restarted host (any PID of the service UID) can observe; exactly one
     # of the enrolled peer or the key is accepted at construction.
     def test_key_mode_authenticates_requests_by_proof_not_peer_pid(self):
-        # The same vectors crates/mllm-adapters/src/sglang/observation.rs computes.
+        # The same vectors crates/capyctl-adapters/src/sglang/observation.rs computes.
         vector = self.module.observation_key("admin", "binding", "incarnation")
         self.assertEqual(vector.hex(),
-                         "57fccc735da4dbf27df1429ffdd32592821c41c56fa440fe7ed32aa97411581e")
+                         "b8554e55164b83355eeb71802ce34e3bb258d3ce4d65435d2fb9277913ae85e0")
         self.assertEqual(self.module.request_proof(vector, "binding", "incarnation", "r-1"),
-                         "ed01f094bf1dbca00b9ab32be46c29cc89768bbd5aed1cd0b4f567f1d89fadf3")
+                         "1ee4a2715d328a008eb2388c4af021426bac79190b9c6c4977dde11ce9655904")
         key = self.module.observation_key("admin-key", "binding-1", "incarnation-1")
         self.assertEqual(len(key), 32)
         self.assertNotEqual(key, self.module.observation_key("admin-key", "binding-1", "other"))
@@ -455,7 +455,7 @@ class ObservationTransportTests(unittest.TestCase):
         with redirect_stderr(stream):
             run()
         return [json.loads(line) for line in stream.getvalue().splitlines()
-                if '"mllm_observation_served"' in line]
+                if '"capyctl_observation_served"' in line]
 
     def test_each_connection_reports_where_it_stopped_and_what_the_scheduler_did(self):
         # Found live 2026-09-24 (rc.2, M28 sa-14): a scheduler that never

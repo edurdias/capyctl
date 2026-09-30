@@ -15,9 +15,9 @@
 #   roles.sh fixtures [gen_deployment args]   all <v|s><a|b>-<model> fixtures for this run
 #
 # Hosts: a or b (HOST_A, HOST_B from hosts.local.env). DRY_RUN=1 prints the plan only.
-# Host document options (2026-09-25 benchmark): MLLM_HF_MAX_BYTES=<size> allows
-# Hugging Face model sources; MLLM_APPROVE_SPECULATION=1 approves the speculative
-# options; MLLM_HOST_CUDA_HOME=<dir> sets the profiles' cuda_home (gen_host_doc.py).
+# Host document options (2026-09-25 benchmark): CAPYCTL_HF_MAX_BYTES=<size> allows
+# Hugging Face model sources; CAPYCTL_APPROVE_SPECULATION=1 approves the speculative
+# options; CAPYCTL_HOST_CUDA_HOME=<dir> sets the profiles' cuda_home (gen_host_doc.py).
 . "$(dirname "$0")/lib.sh"
 
 usage() { sed -n '2,19p' "$0"; exit 2; }
@@ -29,7 +29,7 @@ preflight() {
   for host in "${MATRIX_HOSTS[@]}"; do
     rsh "$host" "if pgrep -af '$ENGINE_PGREP' | grep -vE 'pgrep|tailscaled|bash -c'; then echo 'an engine is running; refusing' >&2; exit 3; fi; \
 if tmux ls 2>/dev/null | grep -q '^mx-'; then echo 'a matrix tmux session exists; refusing' >&2; exit 3; fi; \
-test -x $REMOTE_TREE/target/release/mllm; cd $REMOTE_TREE && test \"\$($TREE_DIGEST_SH)\" = '$want'; \
+test -x $REMOTE_TREE/target/release/capyctl; cd $REMOTE_TREE && test \"\$($TREE_DIGEST_SH)\" = '$want'; \
 echo \"\$(hostname) clock \$(date +%s%3N) boot \$(cat /proc/sys/kernel/random/boot_id)\"; grep MemAvailable /proc/meminfo"
     echo "control-host clock $(now_ms)"
   done
@@ -42,15 +42,15 @@ server_init() {
   fi
   load_run
   x install -d -m 700 "$LRD"
-  # A named binary (MLLM_LOCAL_BIN: an installed release, or ENG4's rc.3 server)
+  # A named binary (CAPYCTL_LOCAL_BIN: an installed release, or ENG4's rc.3 server)
   # is run as it is; only the run's own copy is replaced by the snapshot build
   # (found live 2026-09-25: ENG4's rc.3 server binary was overwritten).
-  if [ -z "${MLLM_LOCAL_BIN:-}" ]; then x install -m 755 "$LIVE/build/release/mllm" "$MLLM"; fi
-  x env "MLLM_STATE_DIR=$LRD/server" "$MLLM" init server --output "$SERVER_CFG"
+  if [ -z "${CAPYCTL_LOCAL_BIN:-}" ]; then x install -m 755 "$LIVE/build/release/capyctl" "$CAPYCTL"; fi
+  x env "CAPYCTL_STATE_DIR=$LRD/server" "$CAPYCTL" init server --output "$SERVER_CFG"
   # Bootstrap and control listen on control-host's Tailscale address; management and
   # inference stay on loopback (ServerConfig::parse refuses anything else).
-  # MLLM_TIMING_HEADER=1 turns on `observability.timing_header` (M80, SPEC 17).
-  x python3 - "$SERVER_CFG" "$SERVER_IP" "${MLLM_TIMING_HEADER:-0}" <<'PY'
+  # CAPYCTL_TIMING_HEADER=1 turns on `observability.timing_header` (M80, SPEC 17).
+  x python3 - "$SERVER_CFG" "$SERVER_IP" "${CAPYCTL_TIMING_HEADER:-0}" <<'PY'
 import json, os, sys
 path, ip, timing = sys.argv[1], sys.argv[2], sys.argv[3]
 doc = json.load(open(path))
@@ -69,7 +69,7 @@ PY
 server_up() {
   load_run
   x tmux new-session -d -s "mx-srv-$RUN" "$MATRIX_DIR/role_exec.sh" "$LRD/server.pid" "$LRD/server.log" \
-    "$MLLM" start server --config "$SERVER_CFG"
+    "$CAPYCTL" start server --config "$SERVER_CFG"
   local i
   for i in $(seq 1 60); do
     dry && break
@@ -92,10 +92,10 @@ server_down() {
 host_init() {
   local host=$1 policy=${2:-normal} device sgv vv
   load_run
-  rsh "$host" "[ -d $RRD ] || mkdir -p -m 700 $RRD; MLLM_STATE_DIR=$RRD/host $RBIN init host --output $RRD/host.yaml"
+  rsh "$host" "[ -d $RRD ] || mkdir -p -m 700 $RRD; CAPYCTL_STATE_DIR=$RRD/host $RBIN init host --output $RRD/host.yaml"
   # -B: the probe imports runtime modules, and a written __pycache__ makes the
   # host refuse every launch `runtime_integrity` (found live 2026-09-24).
-  device=$(rsh_out "$host" '{"schema":"mllm-nvidia-inventory-v1","host_id":"'"$host"'","digest":"0000000000000000000000000000000000000000000000000000000000000000","devices":[{"physical_gpu_uuid":"GPU-00000000-0000-0000-0000-000000000000"}]}' \
+  device=$(rsh_out "$host" '{"schema":"capyctl-nvidia-inventory-v1","host_id":"'"$host"'","digest":"0000000000000000000000000000000000000000000000000000000000000000","devices":[{"physical_gpu_uuid":"GPU-00000000-0000-0000-0000-000000000000"}]}' \
     "cd $REMOTE_TREE && PYTHONDONTWRITEBYTECODE=1 python3 -B -m runtime.sglang_device")
   sgv=$(rsh_out "$host" 0.5.20 "$SGLANG_VENV/bin/python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null | tail -1")
   vv=$(rsh_out "$host" 0.29.0 "$(vllm_venv "$host")/bin/python3 -c 'import importlib.metadata as m; print(m.version(\"vllm\"))'")
@@ -121,8 +121,8 @@ host_doc() {
     --run-root "$RRD" --policy "$policy" --sglang-version "$sgv" --vllm-version "$vv" \
     --vllm-venv "$(vllm_venv "$host")" --sglang-venv "$SGLANG_VENV" --remote-tree "$REMOTE_TREE" \
     --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" ${NO_PROFILES:+--no-profiles} \
-    ${MLLM_HF_MAX_BYTES:+--hf-max-bytes "$MLLM_HF_MAX_BYTES"} ${MLLM_APPROVE_SPECULATION:+--approve-speculation} \
-    ${MLLM_HOST_CUDA_HOME:+--cuda-home "$MLLM_HOST_CUDA_HOME"} --out "$doc"
+    ${CAPYCTL_HF_MAX_BYTES:+--hf-max-bytes "$CAPYCTL_HF_MAX_BYTES"} ${CAPYCTL_APPROVE_SPECULATION:+--approve-speculation} \
+    ${CAPYCTL_HOST_CUDA_HOME:+--cuda-home "$CAPYCTL_HOST_CUDA_HOME"} --out "$doc"
   rcopy "$doc" "$host:$RRD/host.yaml"
   rsh "$host" "chmod 600 $RRD/host.yaml"
   save_run_var "POLICY_$(host_short "$host")" "$policy"
@@ -136,7 +136,7 @@ host_doc_bare() { # ADR 0018: a host document with no runtime profiles
 enroll() {
   local host=$1 out id
   load_run
-  x "$MLLM" invite host --name "$host" --config "$SERVER_CFG" --output "$LRD/$host.join"
+  x "$CAPYCTL" invite host --name "$host" --config "$SERVER_CFG" --output "$LRD/$host.join"
   rcopy "$LRD/$host.join" "$host:$RRD/$host.join"
   # The host must not be running (identity lock); the join file path is absolute.
   out=$(rsh_out "$host" '{"host_id":"01DRYRUNHOSTID'"$(host_short "$host")"'0000000000","enrolled":true}' \

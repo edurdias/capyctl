@@ -11,7 +11,7 @@ evidence for any row.
 The machines come from `hosts.local.env` in this directory, which is gitignored. Copy
 `hosts.example.env` to `hosts.local.env` and set `HOST_A`, `HOST_B`, `CONTROL_HOST`, their
 addresses, `REMOTE_HOME` and the engine environments. Every script sources it through
-`lib.sh` and stops with an error when it is missing or incomplete; `MLLM_MATRIX_HOSTS_ENV`
+`lib.sh` and stops with an error when it is missing or incomplete; `CAPYCTL_MATRIX_HOSTS_ENV`
 selects another file. Fixture tags name the host by its code: `a` for `HOST_A`, `b` for
 `HOST_B` (`va-4` is vLLM q4 on host A). Host arguments to `roles.sh` and the ENG rows take
 the code `a` or `b` (or the configured name).
@@ -20,7 +20,7 @@ the code `a` or `b` (or the configured name).
 
 ```bash
 M=scripts/live/matrix
-$M/sync.sh all                  # snapshot, rsync to both ~/mllm-f2, check digests, build, check runtime
+$M/sync.sh all                  # snapshot, rsync to both ~/capyctl-f2, check digests, build, check runtime
 $M/roles.sh up normal           # server + both hosts enrolled and online; writes fixtures
 $M/e0.sh static      target/live/matrix/E0-static
 $M/e0.sh checkpoints target/live/matrix/E0-checkpoints   # slow; payload digests, equality across hosts only
@@ -37,7 +37,7 @@ $M/run_row.sh ENG1 --tag a -- a va-4 sa-4   # ADR 0018: engine add on a systemd 
 $M/run_row.sh ENG1 --tag b -- b vb-4 sb-4
 $M/run_row.sh ENG3 --tag a -- a va-4         # remove refused in use, then --drain
 $M/run_row.sh ENG2 --no-e0 -- a                # standalone, both engines, environment profiles
-$M/run_row.sh ENG4 --no-e0 -- b                # rc.3 fallbacks; needs MLLM_RC3_LOCAL/MLLM_RC3_REMOTE
+$M/run_row.sh ENG4 --no-e0 -- b                # rc.3 fallbacks; needs CAPYCTL_RC3_LOCAL/CAPYCTL_RC3_REMOTE
 $M/roles.sh down
 ```
 
@@ -65,15 +65,15 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 | `infer.py`, `loadgen.py`, `matrixhttp.py` | Routed requests with markers and SSE framing checks. `loadgen.py` runs concurrent streaming and non-streaming load, with long-prompt skew for M57 |
 | `fault.sh`, `signal_owned.py`, `memhog.py`, `role_exec.sh` | D6 faults. Signals go only to (pid, start ticks, boot id) identities, never by name. Allocations are at most 40 GiB and 1800 s, with a trap and `timeout` |
 | `run_row.sh`, `rowlib.sh`, `rows/M01.sh`, `rows/M05.sh`, `rows/M16.sh` | Row runner. Evidence goes to `target/live/matrix/<row>[-tag]/`, and an earlier directory for the same row is archived first. `SCRATCH_ROWS=<dir>` runs `<dir>/<ROW>.sh` in place of `rows/<ROW>.sh` when it exists. `rowlib.sh` also holds the shared checks: `variant` (a per-row fixture variant), `refused`, `wait_operation`, `host_idle`, `cleanup_check` and `closure_check` |
-| `rows/M80.sh`, `bench.py`, `bench_report.py`, `test_bench.py` | M80 performance benchmark through the shipped router (after the current live phase, owner 2026-09-23). `bench.py run` drives streaming cells and records per-chunk arrival times; `once` times one request to its first token (cold start, wake, switch); `promdelta` windows an engine `/metrics` scrape; `latencydelta` windows the server's mllm latency view (router phases, host ingress times and engine histograms marked `source: engine`, read through `status deployment --format json`) and `report` splits the path overhead into client to router, router, router to ingress and ingress to engine. With the server's `observability.timing_header` on, each response also carries its own router timings (`x-mllm-timing` header, and an SSE comment on streams) and `run` summarizes them per cell. `bench_report.py` folds every `M80-*` directory into one table. `test_bench.py` checks the parsing and arithmetic against a fake streaming server; it is not evidence |
+| `rows/M80.sh`, `bench.py`, `bench_report.py`, `test_bench.py` | M80 performance benchmark through the shipped router (after the current live phase, owner 2026-09-23). `bench.py run` drives streaming cells and records per-chunk arrival times; `once` times one request to its first token (cold start, wake, switch); `promdelta` windows an engine `/metrics` scrape; `latencydelta` windows the server's capyctl latency view (router phases, host ingress times and engine histograms marked `source: engine`, read through `status deployment --format json`) and `report` splits the path overhead into client to router, router, router to ingress and ingress to engine. With the server's `observability.timing_header` on, each response also carries its own router timings (`x-capyctl-timing` header, and an SSE comment on streams) and `run` summarizes them per cell. `bench_report.py` folds every `M80-*` directory into one table. `test_bench.py` checks the parsing and arithmetic against a fake streaming server; it is not evidence |
 | `rows/M48.sh`, `soak.py`, `rows/M49.sh` | Phase G soak (2026-09-24). M48 deploys q4 and q14 fixtures of both engines on both hosts plus the two-instance replica route `qwen3-4b`, with host B on the tight policy, and runs `soak.py`: a seeded random walk (`SOAK_SEED`, `SOAK_STEPS`, resumable on the deployments it left with `SOAK_RESUME=1 SOAK_FROM_STEP=…` and a new `--tag`) over inference, tool calls, start (with and without `--evict`), stop, park, wake on request, request-driven switching on the tight host (two of its three single-instance deployments Ready, then a request for the third), count-only revisions, instance stop and start, `delete --stop` and redeploy, `drain host`, agent SIGTERM and restart, engine SIGKILL and a short agent SIGSTOP. After every step it waits for the deployments to settle and checks the invariants listed in its docstring (ledger limits, leases, I1 on an 8-token prefix plus one recorded checkpoint digest per model, orphan and GPU processes, state and ledger agreement, identities ended or kept, age of uncertain state). Evidence: `M48/soak/{steps.jsonl,violations.jsonl,summary-*.json,steps/}`. Run it with `KEEP_FAILED=1` so M49 cleans the soak state: `delete --stop` everything, an empty ledger, clean hosts without bytecode, MemAvailable near the pre-soak baseline, then `roles.sh down` with each role logging exit 0 (`role_exec.sh`) |
 | `rows/M53.sh`, `rows/M53D.sh`, `rows/M66.sh`, `rows/SGLMO.sh` | Failure and removal rows (2026-09-24). M53: a switch to a target whose engine refuses an argument fails closed with the incumbent intact; the failed target then stops, starts and fails again, and `delete deployment --stop` removes it. M53D: `delete deployment --stop` on a failed launch leaves no residue. M66: `delete deployment --stop` during a stream that outlasts the drain bound (`M66_PROMPT` overrides the prompt). SGLMO: an SGLang modelopt deployment with `residency: deep` is refused `capability_missing:deep_park` with its `restart_only` hint, and the `restart_only` variant serves and stops clean. M53D and M66 judge cleanup after the delete with `residue_check`: the ledger snapshot holds nothing for the deleted id except its tombstone |
 | `rows/M38.sh`, `rows/M73.sh`, `rows/M74.sh`, `rows/M75.sh`, `proc_probe.py` | The engine gates that replaced `live_vllm.rs`, `live_sglang.rs` and an earlier host-specific wrapper script (owner decision 2026-09-22): launch failures and recovery (M38), one lifecycle with argv, access and memory checks (M73), the `timeouts.initialize` deadline (M74) and no-engine refusal (M75). `proc_probe.py` reads an owned process's argv (credential values redacted) and named, non-secret environment variables |
-| `rows/ENG1.sh`, `rows/ENG2.sh`, `rows/ENG3.sh`, `rows/ENG4.sh` | ADR 0018 engine registration rows, written and first run live 2026-09-25 (results in the status runbook). ENG1: `engine detect`/`add` of the existing vLLM and SGLang venvs on a host running under a transient systemd user unit (`roles.sh host-doc-bare`, `host-up-systemd`), `host.yaml` unchanged, both new profiles serve and stop clean. ENG2: standalone with `MLLM_VLLM_BIN` and `MLLM_SGLANG_BIN` both set publishes `local-vllm`/`local-sglang`; `engine remove` on one is refused (environment profile); a deployment on each serves; a registered `vllm-reg` serves with a stated context length, and the row records what a deployment without one does. ENG3 (sources ENG1.sh): `engine remove` of a profile in use is refused `profile_in_use`, then `--drain` stops the deployment through the ordinary path and removes it only on stop evidence; a start afterwards is refused, and `engine add` republishes it. ENG4 (sources ENG1.sh): the rc.3 version-skew fallbacks — a new CLI against an rc.3 agent (`agent_unreachable`, `engines.yaml` written but never read by the old agent) and a new agent against an rc.3 server (`published=restart_required`), gated on `MLLM_RC3_LOCAL`/`MLLM_RC3_REMOTE` naming existing rc.3 binaries. Only the existing engine venvs named in `hosts.local.env` are used; no venv is created |
+| `rows/ENG1.sh`, `rows/ENG2.sh`, `rows/ENG3.sh`, `rows/ENG4.sh` | ADR 0018 engine registration rows, written and first run live 2026-09-25 (results in the status runbook). ENG1: `engine detect`/`add` of the existing vLLM and SGLang venvs on a host running under a transient systemd user unit (`roles.sh host-doc-bare`, `host-up-systemd`), `host.yaml` unchanged, both new profiles serve and stop clean. ENG2: standalone with `CAPYCTL_VLLM_BIN` and `CAPYCTL_SGLANG_BIN` both set publishes `local-vllm`/`local-sglang`; `engine remove` on one is refused (environment profile); a deployment on each serves; a registered `vllm-reg` serves with a stated context length, and the row records what a deployment without one does. ENG3 (sources ENG1.sh): `engine remove` of a profile in use is refused `profile_in_use`, then `--drain` stops the deployment through the ordinary path and removes it only on stop evidence; a start afterwards is refused, and `engine add` republishes it. ENG4 (sources ENG1.sh): the rc.3 version-skew fallbacks — a new CLI against an rc.3 agent (`agent_unreachable`, `engines.yaml` written but never read by the old agent) and a new agent against an rc.3 server (`published=restart_required`), gated on `CAPYCTL_RC3_LOCAL`/`CAPYCTL_RC3_REMOTE` naming existing rc.3 binaries. Only the existing engine venvs named in `hosts.local.env` are used; no venv is created |
 
 ## Rules the harness keeps
 
-- **Secrets.** The API key is read from `server-credentials.json` into `MLLM_API_KEY` only.
+- **Secrets.** The API key is read from `server-credentials.json` into `CAPYCTL_API_KEY` only.
   The CLI reads the admin token itself. Invitation files are copied with `scp` and never
   printed. Engine-secret tables and binding payloads are never selected.
 - **Faults.** Engine PIDs come from `runtime_bindings.identities_json` for the deployment on
@@ -91,9 +91,9 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
   never declared as a fixture's `content_fingerprint` (a declared mismatch is refused
   `checkpoint_mismatch` at first placement). Fixtures keep the placeholder fingerprint and the
   host measures and records the real digest.
-- **A second worktree.** `MLLM_REMOTE_TREE=$REMOTE_HOME/mllm-soak` syncs, builds and runs from its
+- **A second worktree.** `CAPYCTL_REMOTE_TREE=$REMOTE_HOME/capyctl-soak` syncs, builds and runs from its
   own tree on the hosts, so two worktrees never replace each other's binary.
-- **A per-host binary (ADR 0018, row ENG4).** `MLLM_REMOTE_BIN_a` / `MLLM_REMOTE_BIN_b`
+- **A per-host binary (ADR 0018, row ENG4).** `CAPYCTL_REMOTE_BIN_a` / `CAPYCTL_REMOTE_BIN_b`
   override `RBIN` for host A / host B only (`rbin <host>` in `lib.sh`), so one host can
   run an older or newer agent than the rest of the run. `host_up` and `host_up_systemd` (the
   commands that launch the binary) use it; stopping a role never names it.
@@ -114,22 +114,22 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 - SGLang fixtures are `deep`, because the matrix hosts keep deep parking on (ADR 0012) and
   the rows exercise park and wake. A `restart_only` SGLang deployment is valid (SPEC §6.2):
   it launches without the memory saver and its park is refused `unchanged`. A host with
-  `MLLM_DEEP_PARK=off` refuses `deep` deployments, so these fixtures do not apply there.
+  `CAPYCTL_DEEP_PARK=off` refuses `deep` deployments, so these fixtures do not apply there.
 - The remote login shell must be bash, because `rsh` sends `bash -lc $'…'`.
-- `MATRIX_LOCAL_RSH=1` with `MLLM_REMOTE_HOME=<scratch>` runs the "remote" scripts on this
+- `MATRIX_LOCAL_RSH=1` with `CAPYCTL_REMOTE_HOME=<scratch>` runs the "remote" scripts on this
   machine against fake venvs and models. It exists only to rehearse the harness.
 
 ## Discrete-GPU rows (DG1-DG7)
 
 `discrete_gpu.sh` runs on the discrete-GPU machine itself, against a standalone role of the
-binary under test (`target/release/mllm` unless `MLLM_BIN` names another). It reads only the
+binary under test (`target/release/capyctl` unless `CAPYCTL_BIN` names another). It reads only the
 `DGPU_*` values of `hosts.local.env` and keeps its state in `DGPU_STATE` (default
-`~/mllm-dgpu-live`, whose ancestors must be owner-only) and its evidence in
+`~/capyctl-dgpu-live`, whose ancestors must be owner-only) and its evidence in
 `target/live/dgpu/`.
 
 ```bash
 M=scripts/live/matrix
-$M/discrete_gpu.sh prepare   # mllm engine add for both environments (idempotent)
+$M/discrete_gpu.sh prepare   # capyctl engine add for both environments (idempotent)
 $M/discrete_gpu.sh dg1       # vLLM host_backed: A cold, B (A released), A, B, then A parked and woken
 $M/discrete_gpu.sh dg2       # the same with residency deep
 $M/discrete_gpu.sh dg3       # SGLang, both tiers

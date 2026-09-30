@@ -6,6 +6,8 @@ import { href } from '../../../site.config.mjs';
 const lines = heroSegments(table);
 ---
 <section class="hero">
+  <p class="brand"><img src={href('/brand/capyctl-logo.png')} alt="CapyCTL" width="480" height="320" /></p>
+  <p class="tagline">Control what runs next</p>
   <h1>A model manager for vLLM and SGLang on your own GPUs.</h1>
   <p class="lede">Park, wake and switch models on machines that can't hold them all. One OpenAI-compatible endpoint across every box on your network.</p>
   <p class="actions"><a class="button" href={href('/docs/install/')}>Install</a><a class="button secondary" href={href('/docs/')}>Docs</a></p>

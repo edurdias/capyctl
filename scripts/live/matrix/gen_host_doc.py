@@ -80,7 +80,7 @@ def main():
 
     with open(args.device_json) as handle:
         device = json.load(handle)
-    if device.get("schema") != "mllm-nvidia-inventory-v1":
+    if device.get("schema") != "capyctl-nvidia-inventory-v1":
         sys.exit("device observation has an unexpected schema")
     host = device["host_id"]
     devices = device.get("devices") or []

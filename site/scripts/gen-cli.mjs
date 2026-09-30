@@ -6,7 +6,7 @@ import { cliPage } from './lib/cli-page.mjs';
 import { PREVIEW, PREVIEW_NOTE } from '../site.config.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const raw = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '-p', 'mllm-cli', '--example', 'cli_reference'], {
+const raw = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '-p', 'capyctl-cli', '--example', 'cli_reference'], {
   cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
 });
 const file = join(repo, 'site', 'src', 'content', 'docs', 'docs', 'reference', 'cli.md');

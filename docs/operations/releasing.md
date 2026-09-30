@@ -24,7 +24,7 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
    `scripts/private-denylist.txt` and `scripts/live/matrix/hosts.local.env`:
 
    ```bash
-   MLLM_VERIFY_STRICT=1 scripts/verify-packaging.sh <dir>/mllm-*.tar.gz
+   CAPYCTL_VERIFY_STRICT=1 scripts/verify-packaging.sh <dir>/capyctl-*.tar.gz
    ```
 
    Every check must pass with no `SKIP` lines.

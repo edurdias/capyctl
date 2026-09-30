@@ -15,7 +15,7 @@ models_list() {
   python3 - <<'PY'
 import http.client, json, os
 c = http.client.HTTPConnection("127.0.0.1", 8443, timeout=15)
-c.request("GET", "/v1/models", headers={"Authorization": "Bearer " + os.environ["MLLM_API_KEY"]})
+c.request("GET", "/v1/models", headers={"Authorization": "Bearer " + os.environ["CAPYCTL_API_KEY"]})
 r = c.getresponse(); body = r.read()
 print(json.dumps({"status": r.status, "ids": [m["id"] for m in json.loads(body).get("data", [])]}))
 PY

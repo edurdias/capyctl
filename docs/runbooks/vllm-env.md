@@ -1,7 +1,7 @@
 # unified-memory host — vLLM Environment Contract (operator-executed)
 
-**mllm installs nothing** (SPEC §4.2 / T07): the operator executes the steps below on
-the host. mllm observes the result via `mllm doctor host` and freezes the live recipe
+**capyctl installs nothing** (SPEC §4.2 / T07): the operator executes the steps below on
+the host. capyctl observes the result via `capyctl doctor host` and freezes the live recipe
 only from reported reality (F1 design §8). Fill the `<CAPTURED>` values from doctor
 output; never guess them.
 
@@ -9,14 +9,14 @@ output; never guess them.
 
 ```bash
 # On the host, as the operator:
-python3 -m venv ~/mllm-vllm-venv   # /opt requires root on the lab host; user-writable venv (recorded deviation)
-~/mllm-vllm-venv/bin/pip install --upgrade pip
-~/mllm-vllm-venv/bin/pip install vllm==<PINNED_VERSION>   # pin set at first doctor capture
-~/mllm-vllm-venv/bin/vllm --version                        # record this output as the fingerprint
+python3 -m venv ~/capyctl-vllm-venv   # /opt requires root on the lab host; user-writable venv (recorded deviation)
+~/capyctl-vllm-venv/bin/pip install --upgrade pip
+~/capyctl-vllm-venv/bin/pip install vllm==<PINNED_VERSION>   # pin set at first doctor capture
+~/capyctl-vllm-venv/bin/vllm --version                        # record this output as the fingerprint
 ```
 
 `<PINNED_VERSION>` is chosen at the first live session: install the current stable
-release that builds for aarch64/unified-memory host, run `mllm doctor host`, and record the exact
+release that builds for aarch64/unified-memory host, run `capyctl doctor host`, and record the exact
 version in this file before any deploy test. If sleep mode misbehaves on the unified-memory host
 platform, revise the pin (F1 design §8 step 4 — park/reload is core functionality).
 
@@ -29,7 +29,7 @@ mkdir -p /srv/models
 # (Qwen3-4B/8B class), BF16, sized to exercise ledger headroom on 128 GiB unified.
 ```
 
-## 3. mllm runtime profile
+## 3. capyctl runtime profile
 
 ```yaml
 # host.yaml (excerpt) — added after the install, fingerprinted by doctor.
@@ -38,7 +38,7 @@ runtime_profiles:
     adapter: vllm
     launch:
       type: exec
-      command: ["/home/<user>/mllm-vllm-venv/bin/vllm", "serve"]
+      command: ["/home/<user>/capyctl-vllm-venv/bin/vllm", "serve"]
       argument_contract: native
 ```
 
@@ -54,7 +54,7 @@ binding and the ingress gate do not erase this warning. Production qualification
 requires a separately reviewed control path.
 
 Qualified lab pin (2026-09-12): vLLM **0.29.0**, uv-managed Python 3.12.14 in
-`~/mllm-vllm-venv2`, Qwen/Qwen3-4B-Instruct-2507 BF16 in
+`~/capyctl-vllm-venv2`, Qwen/Qwen3-4B-Instruct-2507 BF16 in
 `~/models/qwen3-4b-instruct`. Both `host-a` and `host-b` use this recipe.
 The launch uses 16 GiB explicit KV cache and a 4096-token maximum context.
 The opt-in deep-park lab profile additionally uses
@@ -72,7 +72,7 @@ the superseded 64 GiB memory recipe are in `qualification-f1.md`.
 ## 5. Doctor capture (recipe freeze)
 
 ```bash
-mllm doctor host <host-name>   # fingerprints + memory observations
+capyctl doctor host <host-name>   # fingerprints + memory observations
 ```
 
 Record: vLLM fingerprint, checkpoint revision, observed `memory.system` bytes. The

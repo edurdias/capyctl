@@ -107,7 +107,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         construct(spec, self.placement(), constructor).revalidate()
         return captured
 
-    # T14 T22: reserved settings are rendered by mllm from binding and grant.
+    # T14 T22: reserved settings are rendered by capyctl from binding and grant.
     def test_reserved_subset_is_rendered_from_binding_placement_and_grant(self):
         kwargs = self.seen(self.build())
         expected = {
@@ -315,7 +315,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         for selected, expected in ((None, "error"), ("0", "error"), ("true", "error"), ("1", "debug")):
             with self.subTest(selected=selected), mock.patch.dict(os.environ, {}, clear=True):
                 if selected is not None:
-                    os.environ["MLLM_DEBUG_ENGINE_LOGS"] = selected
+                    os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = selected
                 result = construct(self.build(), self.placement())
                 self.assertEqual(result._native.log_level, expected)
                 self.assertEqual(result._native.log_level_http, expected)

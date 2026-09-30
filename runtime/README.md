@@ -10,11 +10,11 @@ custom, patched or group-writable build is not refused for being one.
 
 Instead the host agent records each installation's fingerprint at registration
 (the engine package's version and a `sha256:` digest over its files; see
-`crates/mllm-agent/src/installation.rs`) and flags drift when a later launch
+`crates/capyctl-agent/src/installation.rs`) and flags drift when a later launch
 measures something else. Drift refuses a launch only under the installation's
 host policy `security.installation_drift: refuse`; the default is `warn`.
 
-`engine_capabilities.py` probes, by shape, the internals mllm hooks: the module
+`engine_capabilities.py` probes, by shape, the internals capyctl hooks: the module
 imports, the attribute or method is callable, the record declares the field,
 the router serves the route, the metrics module names the gauge. Capabilities
 are `core`, `deep_park`, `metrics` and (SGLang) `observation`. A missing one
@@ -39,24 +39,24 @@ correctly.
 
 ## Shipped inside the binary
 
-Every `runtime/*.py` here (never `runtime/tests`) is compiled into the `mllm`
-binary with a manifest of SHA-256 digests (`crates/mllm-agent/build.rs`;
+Every `runtime/*.py` here (never `runtime/tests`) is compiled into the `capyctl`
+binary with a manifest of SHA-256 digests (`crates/capyctl-agent/build.rs`;
 SPEC §3.3, ADR 0001, owner decision 2026-09-24). A host without a declared
-`runtime_dir`, and standalone without `MLLM_RUNTIME_DIR`, write them to the
+`runtime_dir`, and standalone without `CAPYCTL_RUNTIME_DIR`, write them to the
 managed `<state_dir>/runtime` at `init` and every start, refreshing it after an
-upgrade and restoring it if it was changed; a directory without mllm's marker
-is refused, never overwritten (`crates/mllm-agent/src/embedded_runtime.rs`).
+upgrade and restoring it if it was changed; a directory without capyctl's marker
+is refused, never overwritten (`crates/capyctl-agent/src/embedded_runtime.rs`).
 A new module added here ships with the next build; an untracked one makes
 `packaging/release.sh` refuse the tree as dirty.
 
-## Owner-only rule for mllm's own helpers
+## Owner-only rule for capyctl's own helpers
 
-`owner_only.py` mirrors `crates/mllm-adapters/src/owner_only.rs`: a file or
-directory mllm put there itself is trusted when owned by root or the service
+`owner_only.py` mirrors `crates/capyctl-adapters/src/owner_only.rs`: a file or
+directory capyctl put there itself is trusted when owned by root or the service
 user, never writable by other, and group-writable only through the owning
 user's private group. It governs this directory's modules, the protected entry
 path, the reviewed saver library the scheduler binding reads, and the
-observation listener's ancestor directories. mllm's private state stays strict:
+observation listener's ancestor directories. capyctl's private state stays strict:
 the listener's own 0700 directory and 0600 socket admit no group write.
 
 ## Native startup output and external plugins
@@ -77,7 +77,7 @@ context manager and must never run in the controlling service process. Report
 only fixed exit/status categories externally; native output is discarded by default.
 
 For development, the operator may explicitly run
-`mllm start standalone --debug-engine-logs`. This enables native debug verbosity
+`capyctl start standalone --debug-engine-logs`. This enables native debug verbosity
 and retains full output in the launcher's private engine log files. Those files
 may contain credentials or other sensitive data; they are not copied into
 management errors or journals. The flag is process-local and is not persisted.
@@ -124,7 +124,7 @@ cleanup or proof of memory release. Root/service UID and descriptor custody rema
 trusted assumptions; the listener is not a sandbox against either.
 
 Production enrollment (SPEC §9.2). A memory-saver launch whose host supplies a
-private observation directory (`MLLM_OBSERVATION_DIR`, 0700) is started with
+private observation directory (`CAPYCTL_OBSERVATION_DIR`, 0700) is started with
 `sglang_observation_enrollment.run_enrolled_scheduler` as SGLang's scheduler
 process target. In the scheduler process, after the Scheduler is built and
 before its event loop, it installs the bridge with the SGLang 0.5.20 and
@@ -139,7 +139,7 @@ again. Key mode replaces the enrolled controller PID with a per-launch key
 derived from the admin credential, so a restarted host still observes the
 launch it owns. Any enrollment failure leaves the engine serving without an
 observation, and the host refuses Park unchanged. The host side is
-`crates/mllm-agent/src/native_execution/saver_source.rs`.
+`crates/capyctl-agent/src/native_execution/saver_source.rs`.
 
 The Rust `NativeObservationClient` interoperability fixture now uses this actual
 listener and transport with synthetic saver facts in an isolated CPU Python
@@ -153,7 +153,7 @@ ADR 0014 §7 (WE3) retired the pinned checkpoint preflight
 (`checkpoint_manifest.py`, `checkpoint_preflight.py`). Checkpoint identity is
 now a `sha256:` digest over a canonical manifest of every file in the
 checkpoint (relative path, size and SHA-256), measured in Rust by the host that
-holds it (`crates/mllm-agent/src/checkpoint.rs`), recorded by the server when
+holds it (`crates/capyctl-agent/src/checkpoint.rs`), recorded by the server when
 the deployment is accepted, and re-verified by the host before every launch and
 wake, for both engines. Nothing in this directory checks checkpoint files.
 

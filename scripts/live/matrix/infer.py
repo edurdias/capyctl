@@ -7,7 +7,7 @@ usage: infer.py --route R --prompt TEXT [--stream] [--max-tokens 32]
 Records status, served `model`, answer, response headers (credential headers
 dropped), timing and a client marker sent as x-request-id. HTTP 200 alone is not
 evidence: with --expect the exit status is non-zero unless the answer contains
-the expected marker. The API key is read from MLLM_API_KEY only.
+the expected marker. The API key is read from CAPYCTL_API_KEY only.
 """
 
 import argparse

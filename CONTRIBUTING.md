@@ -1,4 +1,4 @@
-# Contributing to mllm
+# Contributing to CapyCTL
 
 Bug reports, documentation fixes, tests and focused code changes are welcome.
 For questions and feedback, start with [SUPPORT.md](SUPPORT.md). Report suspected
@@ -27,11 +27,11 @@ repository root:
 
 ```bash
 rustup component add rustfmt clippy
-cargo build --locked -p mllm-cli
-cargo run --locked -p mllm-cli -- --help
+cargo build --locked -p capyctl-cli
+cargo run --locked -p capyctl-cli -- --help
 ```
 
-See the [installation guide](docs/operations/install.md) for running mllm with
+See the [installation guide](docs/operations/install.md) for running CapyCTL with
 your own engine. Development checks must not change drivers or shared engine
 environments.
 
@@ -41,7 +41,7 @@ Run these checks from the repository root before submitting code:
 
 ```bash
 cargo fmt --all --check
-cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management \
+cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller -p capyctl-management \
   -p harness --all-targets --no-fail-fast --locked -- --test-threads=4
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -76,7 +76,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s runtime/tests -p 'test
 A missing fixture is an unmet prerequisite, not a passing full runtime suite.
 
 For installer changes run `scripts/test-install.sh`. For packaging changes run
-`MLLM_VERIFY_STRICT=1 scripts/verify-packaging.sh`; this additionally needs
+`CAPYCTL_VERIFY_STRICT=1 scripts/verify-packaging.sh`; this additionally needs
 ShellCheck, `systemd-analyze` and the tools used by
 [the release script](packaging/release.sh). For website changes use Node as
 specified in `site/.nvmrc`, then run:

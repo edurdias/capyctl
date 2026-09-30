@@ -123,7 +123,7 @@ action still requires its independent trusted clock checks.
 Inference returns the original HTTP202 operation acceptance envelope, not a
 completion or response body. A bounded owned queue retains accepted work after
 caller loss. Only a New durable grant may send; retries never replay uncertain
-backend inference. The Fake program uses exactly `MLLM_ALPHA_71` and `MLLM_BETA_29`
+backend inference. The Fake program uses exactly `CAPYCTL_ALPHA_71` and `CAPYCTL_BETA_29`
 in nonstreaming and streaming modes with max_tokens16. These are not the separate
 native F2C corpus or qualification counts. Full candidate grants remain unchanged,
 ordinary gates stay closed, and inference itself cannot promote. Public result reads and

@@ -18,7 +18,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ.setdefault("MLLM_API_KEY", "fake-key-for-tests")
+os.environ.setdefault("CAPYCTL_API_KEY", "fake-key-for-tests")
 import bench  # noqa: E402
 
 TIMING = {"deployment": "d", "engine": "vllm", "instance": 0, "generation": 3, "queue_wait_ms": 0.0,
@@ -38,8 +38,8 @@ class FakeRouter(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
-        self.send_header("x-mllm-timing", json.dumps({"selection_ms": 0.2}))
-        self.send_header("x-mllm-instance", "0")
+        self.send_header("x-capyctl-timing", json.dumps({"selection_ms": 0.2}))
+        self.send_header("x-capyctl-instance", "0")
         self.end_headers()
         events = [{"choices": [{"delta": {"role": "assistant"}}]}]
         events += [{"choices": [{"delta": {"content": f"w{i} "}}]} for i in range(body["max_tokens"])]
@@ -49,7 +49,7 @@ class FakeRouter(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
             self.wfile.flush()
         if self.timing_comment:
-            self.wfile.write(b": x-mllm-timing " + json.dumps(TIMING).encode() + b"\n\n")
+            self.wfile.write(b": x-capyctl-timing " + json.dumps(TIMING).encode() + b"\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
 
 
@@ -59,10 +59,10 @@ def view(router_first_content, ingress_first_byte, engine_ttft, count):
         return {"name": name, "tier": tier, "source": source, "count": count, "sum_seconds": mean * count,
                 "buckets": [{"le": 0.05, "count": count}]}
     return {"id": "d", "latency": [{"instance": 0, "generation": 3, "engine": "vllm", "host_id": "h", "series": [
-        series("router_time_to_first_content", "router", "mllm", router_first_content),
-        series("router_upstream_first_byte", "router", "mllm", ingress_first_byte + 0.004),
-        series("router_pre_forward", "router", "mllm", 0.002),
-        series("ingress_time_to_first_byte", "ingress", "mllm", ingress_first_byte),
+        series("router_time_to_first_content", "router", "capyctl", router_first_content),
+        series("router_upstream_first_byte", "router", "capyctl", ingress_first_byte + 0.004),
+        series("router_pre_forward", "router", "capyctl", 0.002),
+        series("ingress_time_to_first_byte", "ingress", "capyctl", ingress_first_byte),
         series("engine_time_to_first_token", "engine", "engine", engine_ttft),
     ]}]}
 
@@ -83,15 +83,15 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(rec["status"], 200)
         self.assertEqual(rec["sse_malformed"], 0)
         self.assertTrue(rec["sse_done"])
-        self.assertEqual(rec["mllm_timing"]["total_ms"], 61.0)
+        self.assertEqual(rec["capyctl_timing"]["total_ms"], 61.0)
         m = bench.derive(rec, 100)
         self.assertTrue(m["ok"])
         self.assertEqual(m["completion_tokens"], 4)
-        summary = bench.mllm_timing_summary([rec, rec])
+        summary = bench.capyctl_timing_summary([rec, rec])
         self.assertAlmostEqual(summary["time_to_first_content_s"]["p50"], 0.031)
         self.assertEqual(summary["time_to_first_content_s"]["n"], 2)
         cell = bench.summarize_cell([dict(rec, words=90, t_send_unix_ms=rec["t_send_unix_ms"])], 1.0)
-        self.assertEqual(cell["answering"], ["x-mllm-instance=0"], "per-request timing is not an answering id")
+        self.assertEqual(cell["answering"], ["x-capyctl-instance=0"], "per-request timing is not an answering id")
 
     def test_stream_without_comment_is_unchanged(self):
         FakeRouter.timing_comment = False
@@ -99,9 +99,9 @@ class BenchTests(unittest.TestCase):
             rec = bench.stream_chat("m", "hi", max_tokens=2, ignore_eos=False, base=self.base, timeout=10)
         finally:
             FakeRouter.timing_comment = True
-        self.assertNotIn("mllm_timing", rec)
+        self.assertNotIn("capyctl_timing", rec)
         self.assertTrue(bench.derive(rec, 10)["ok"])
-        self.assertEqual(bench.mllm_timing_summary([rec]), {})
+        self.assertEqual(bench.capyctl_timing_summary([rec]), {})
 
     def test_latency_window_and_path_overhead(self):
         before = view(0.020, 0.010, 0.008, 2)
@@ -130,7 +130,7 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(bench.latencydelta(before, api), series)
         self.assertEqual(bench.latencydelta({}, {}), {})
 
-    def test_report_includes_the_mllm_side(self):
+    def test_report_includes_the_capyctl_side(self):
         with tempfile.TemporaryDirectory() as evid:
             os.makedirs(os.path.join(evid, "cells"))
             os.makedirs(os.path.join(evid, "latency"))
@@ -143,9 +143,9 @@ class BenchTests(unittest.TestCase):
             bench.write_json(os.path.join(evid, "latency", "L128-C1.after.json"), view(0.01, 0.01, 0.005, 3))
             out = subprocess.run([sys.executable, os.path.join(HERE, "bench.py"), "report", "--evid", evid,
                                   "--fixture", "va-4"], capture_output=True, text=True, check=True).stdout
-            self.assertIn("Path overhead from the mllm latency view", out)
+            self.assertIn("Path overhead from the capyctl latency view", out)
             report = bench.read_json(os.path.join(evid, "bench.json"))
-            side = report["cells"][0]["mllm_side"]
+            side = report["cells"][0]["capyctl_side"]
             self.assertEqual(side["overhead"]["engine_ttft_source"], "engine")
             self.assertEqual(side["series"]["engine_time_to_first_token"]["count"], 2)
 

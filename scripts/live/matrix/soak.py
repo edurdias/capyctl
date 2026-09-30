@@ -5,7 +5,7 @@
 
 rows/M48.sh writes the plan (deployments, fixture files, host policies) and runs
 this with the run's settings in the environment (RUN, LRD, SERVER_CFG, SERVER_DB,
-MLLM, EVID, RUNSTATE, RRD, REMOTE_TREE, HOST_ID_a, HOST_ID_b, MLLM_API_KEY).
+CAPYCTL, EVID, RUNSTATE, RRD, REMOTE_TREE, HOST_ID_a, HOST_ID_b, CAPYCTL_API_KEY).
 
 Each step picks one operation with a random generator derived from (seed, step),
 so a step's choice is reproducible given the observed state, and a walk that
@@ -61,7 +61,7 @@ sys.path.insert(0, HERE)
 import matrixhttp  # noqa: E402
 
 ENV = os.environ
-MLLM = ENV.get("MLLM", "")
+CAPYCTL = ENV.get("CAPYCTL", "")
 SERVER_CFG = ENV.get("SERVER_CFG", "")
 SERVER_DB = ENV.get("SERVER_DB", "")
 EVID = ENV.get("EVID", "")
@@ -114,7 +114,7 @@ def host_name(hid):
 
 def cli(*args, timeout=1800):
     """One CLI call against the run's server; returns (rc, parsed-or-text, stderr)."""
-    cmd = [MLLM, *args, "--config", SERVER_CFG]
+    cmd = [CAPYCTL, *args, "--config", SERVER_CFG]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -248,7 +248,7 @@ pyc = [p for p in glob.glob(req["runtime"] + "/**/__pycache__", recursive=True)]
       [p for p in glob.glob(req["runtime"] + "/**/*.pyc", recursive=True)]
 print(json.dumps({"boot": boot, "identities": idents, "agent": agent, "engine_procs": len(engine),
                   "orphans": orphans, "gpu": gpu, "mem_available_kb": mem,
-                  "rendezvous": glob.glob("/tmp/mllm-rdzv-*") + glob.glob(req["rrd"] + "/host/rendezvous/*"),
+                  "rendezvous": glob.glob("/tmp/capyctl-rdzv-*") + glob.glob(req["rrd"] + "/host/rendezvous/*"),
                   "bytecode": pyc[:10]}))
 '''
 

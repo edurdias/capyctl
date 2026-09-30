@@ -16,7 +16,7 @@ residency, or qualification of anything.
 ADR 0008 (owner decision 2026-09-23): the pinned SGLang source audit is gone.
 Installation files get no hard-coded hashes and no permission rule here; the
 installation's fingerprint is recorded at registration and drift is flagged by
-the host, and the internals mllm hooks are probed by shape after the guarded
+the host, and the internals capyctl hooks are probed by shape after the guarded
 import (engine_capabilities.py), refusing only the dependent feature.
 """
 

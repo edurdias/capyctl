@@ -154,7 +154,7 @@ Local audit artifacts: `.context/model-qualification/` (gitignored).
 `.context/model-qualification/baseline-4b/`.
 14B raw host evidence: `<temporary-directory>`; local copy:
 `.context/model-qualification/qwen3-14b/`.
-The tracked test is `crates/mllm-cli/tests/live_spark.rs`, staged on host-a as
+The tracked test is `crates/capyctl-cli/tests/live_spark.rs`, staged on host-a as
 `live_model_qual.rs` to preserve its prior qualification tests.
 
 ## Switching boundary
@@ -162,7 +162,7 @@ The tracked test is `crates/mllm-cli/tests/live_spark.rs`, staged on host-a as
 ### Follow-up: 4B concurrent post-wake correctness failure
 
 An interactive 4B lab later exercised eight simultaneous distinct marker
-requests through mllm. While Ready, all eight returned correct answers (median
+requests through capyctl. While Ready, all eight returned correct answers (median
 0.210s). After parking, the same eight requests shared exactly one reload and
 all returned HTTP 200 (median 7.025s), but only one answer was correct; seven
 returned identical unrelated text. Engine PID remained unchanged and the
@@ -194,7 +194,7 @@ requires an acknowledged post-reload prefix-cache reset before clearing its
 parked flag. No installed vLLM code was changed.
 
 Same Qwen3-4B model, eight simultaneous distinct marker requests, max_tokens16,
-temperature0, non-streaming, through the real mllm router on host-a:
+temperature0, non-streaming, through the real capyctl router on host-a:
 
 | Burst | Original correctness | Fixed correctness | Original median | Fixed median |
 | --- | --- | --- | --- | --- |
@@ -230,6 +230,6 @@ Genuine 4B/27B parked switching is not yet qualified. The current role wiring
 binds one checkpoint and adapter, and the existing A/B switch stops the old
 engine. Per-deployment checkpoint/port bindings and real memory reservations
 are prerequisites; see [F1 open items](../design/milestones/f1-open-items.md).
-A direct two-vLLM-process demonstration must not be reported as an mllm
+A direct two-vLLM-process demonstration must not be reported as a capyctl
 SwitchEngine qualification. Image requests, cold-storage reloads, memory
 pressure, and tail latency are also outside the completed evidence above.

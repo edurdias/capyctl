@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { rewriteLink, expandIncludes, toStarlight, substitute, inlineSvgs } from '../scripts/lib/sync.mjs';
 
-const REPO = 'https://github.com/example/mllm';
+const REPO = 'https://github.com/example/capyctl';
 const PAGES = [
   { source: 'docs/guide/index.md', slug: 'docs', title: 'Overview' },
   { source: 'docs/operations/install.md', slug: 'docs/install' },
@@ -17,7 +17,7 @@ test('link to another synced page becomes its site route, keeping the hash', () 
 
 test('link to a repository file that is not a page goes to GitHub', () => {
   assert.equal(rewriteLink('../examples/server.yaml', 'docs/operations/install.md', PAGES, REPO), `${REPO}/blob/main/docs/examples/server.yaml`);
-  assert.equal(rewriteLink('../../crates/mllm-cli/src/output.rs', 'docs/guide/errors.md', PAGES, REPO), `${REPO}/blob/main/crates/mllm-cli/src/output.rs`);
+  assert.equal(rewriteLink('../../crates/capyctl-cli/src/output.rs', 'docs/guide/errors.md', PAGES, REPO), `${REPO}/blob/main/crates/capyctl-cli/src/output.rs`);
 });
 
 test('external, absolute-site and hash-only links are unchanged', () => {
@@ -77,9 +77,9 @@ test('a preview build puts a banner on every synced page', () => {
 });
 
 test('links to pages and site paths get the base path', () => {
-  assert.equal(rewriteLink('quickstart.md', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/quickstart/');
-  assert.equal(rewriteLink('/docs/reference/cli/', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/reference/cli/');
-  assert.equal(rewriteLink('../examples/host.yaml', 'docs/guide/index.md', PAGES, REPO, '/mllm'), `${REPO}/blob/main/docs/examples/host.yaml`);
+  assert.equal(rewriteLink('quickstart.md', 'docs/guide/index.md', PAGES, REPO, '/capyctl'), '/capyctl/docs/quickstart/');
+  assert.equal(rewriteLink('/docs/reference/cli/', 'docs/guide/index.md', PAGES, REPO, '/capyctl'), '/capyctl/docs/reference/cli/');
+  assert.equal(rewriteLink('../examples/host.yaml', 'docs/guide/index.md', PAGES, REPO, '/capyctl'), `${REPO}/blob/main/docs/examples/host.yaml`);
 });
 
 test('an SVG image on its own line is embedded inline; code fences and inline images are left alone', () => {

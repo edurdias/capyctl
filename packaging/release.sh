@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Build the mllm release tarball for the current architecture.
+# Build the capyctl release tarball for the current architecture.
 #
 #   packaging/release.sh [OUT_DIR]        (default OUT_DIR: dist/)
 #   packaging/release.sh --sums OUT_DIR   (re)write OUT_DIR/SHA256SUMS only
 #
-# Produces OUT_DIR/mllm-<version>-linux-<arch>.tar.gz and its .sha256, copies
+# Produces OUT_DIR/capyctl-<version>-linux-<arch>.tar.gz and its .sha256, copies
 # packaging/install.sh beside it, and rewrites OUT_DIR/SHA256SUMS over every
-# mllm-*.tar.gz and install.sh in OUT_DIR. Build each architecture into its
+# capyctl-*.tar.gz and install.sh in OUT_DIR. Build each architecture into its
 # own directory, gather the tarballs into one, and run `--sums` there: that
 # SHA256SUMS is the release asset install.sh verifies against.
 #
-# The archive unpacks into one directory, mllm-<version>-linux-<arch>/:
+# The archive unpacks into one directory, capyctl-<version>-linux-<arch>/:
 #
-#   bin/mllm                 stripped release binary (ADR 0001: one executable
-#                            per OS/architecture supplies every role). mllm's
+#   bin/capyctl                 stripped release binary (ADR 0001: one executable
+#                            per OS/architecture supplies every role). capyctl's
 #                            Python runtime helpers are compiled into it and
 #                            written to <state_dir>/runtime at role start
 #                            (decided 2026-09-24; SPEC §3.3).
@@ -38,7 +38,7 @@
 # in the environment is kept; the remap flags are appended.
 #
 # The build must pass scripts/check-release-clean.sh (no test engine in the
-# shipped binary). A dirty worktree is refused unless MLLM_RELEASE_ALLOW_DIRTY=1,
+# shipped binary). A dirty worktree is refused unless CAPYCTL_RELEASE_ALLOW_DIRTY=1,
 # in which case BUILDINFO records it. An untracked file under runtime/ counts
 # as dirty: the build embeds every runtime/*.py it finds. Honours
 # CARGO_TARGET_DIR.
@@ -49,7 +49,7 @@ cd "$root"
 
 # The release-level checksum file: every tarball and the installer.
 write_sums() {
-  (cd "$1" && find . -maxdepth 1 -type f \( -name 'mllm-*.tar.gz' -o -name install.sh \) -printf '%P\n' |
+  (cd "$1" && find . -maxdepth 1 -type f \( -name 'capyctl-*.tar.gz' -o -name install.sh \) -printf '%P\n' |
     LC_ALL=C sort | xargs -r -d '\n' sha256sum) >"$1/SHA256SUMS.tmp"
   mv "$1/SHA256SUMS.tmp" "$1/SHA256SUMS"
 }
@@ -69,8 +69,8 @@ dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ] ||
   [ -n "$(git status --porcelain --untracked-files=all --ignored=no -- runtime)" ]; then
   dirty=true
-  if [ "${MLLM_RELEASE_ALLOW_DIRTY:-0}" != 1 ]; then
-    echo "worktree has uncommitted changes; commit them or set MLLM_RELEASE_ALLOW_DIRTY=1" >&2
+  if [ "${CAPYCTL_RELEASE_ALLOW_DIRTY:-0}" != 1 ]; then
+    echo "worktree has uncommitted changes; commit them or set CAPYCTL_RELEASE_ALLOW_DIRTY=1" >&2
     exit 1
   fi
 fi
@@ -87,7 +87,7 @@ case "$(uname -s)" in
   Linux) os=linux ;;
   *) echo "unsupported build OS: $(uname -s)" >&2; exit 1 ;;
 esac
-name="mllm-${version}-${os}-${arch}"
+name="capyctl-${version}-${os}-${arch}"
 target_dir=${CARGO_TARGET_DIR:-target}
 mkdir -p "$target_dir"
 target_dir=$(cd "$target_dir" && pwd)
@@ -100,7 +100,7 @@ export CARGO_TARGET_DIR="$target_dir"
 # The build cache may be outside the checkout; generated Rust lives there.
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 toolchain_dir=$(rustc --print sysroot)
-remap_flags="--remap-path-prefix=$HOME=/home --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$toolchain_dir=/rustc --remap-path-prefix=$root=/mllm --remap-path-prefix=$target_dir=/mllm/target"
+remap_flags="--remap-path-prefix=$HOME=/home --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$toolchain_dir=/rustc --remap-path-prefix=$root=/capyctl --remap-path-prefix=$target_dir=/capyctl/target"
 if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
   sep=$(printf '\x1f')
   encoded=$(printf '%s' "$remap_flags" | tr ' ' "$sep")
@@ -113,18 +113,18 @@ fi
 
 # Release build from the lockfile, then the shipped-binary check (it rebuilds
 # with the same profile, which is a no-op here).
-cargo build --release --locked --bin mllm
+cargo build --release --locked --bin capyctl
 scripts/check-release-clean.sh
 
-stage=$(mktemp -d "${TMPDIR:-/tmp}/mllm-release.XXXXXX")
+stage=$(mktemp -d "${TMPDIR:-/tmp}/capyctl-release.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 pkg="$stage/$name"
 umask 022
 mkdir -p "$pkg/bin"
 
-install -m 0755 "$target_dir/release/mllm" "$pkg/bin/mllm"
-strip --strip-all "$pkg/bin/mllm"
-if ! "$pkg/bin/mllm" --version >/dev/null; then
+install -m 0755 "$target_dir/release/capyctl" "$pkg/bin/capyctl"
+strip --strip-all "$pkg/bin/capyctl"
+if ! "$pkg/bin/capyctl" --version >/dev/null; then
   echo "stripped binary does not run" >&2
   exit 1
 fi
@@ -139,8 +139,8 @@ copy_tracked() {
 }
 
 # The runtime helpers are not shipped as files: they are compiled into
-# bin/mllm (crates/mllm-agent/build.rs) and materialized owner-only at role
-# start (crates/mllm-agent/src/embedded_runtime.rs).
+# bin/capyctl (crates/capyctl-agent/build.rs) and materialized owner-only at role
+# start (crates/capyctl-agent/src/embedded_runtime.rs).
 # The operator guides ship together: install.md links configuration.md and
 # network-access.md, and the units point at configuration.md (final review
 # I12); scripts/verify-packaging.sh checks every relative link resolves.
@@ -154,7 +154,7 @@ if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l
 fi
 
 toolchain=$(rustc --version)
-# The same digest crates/mllm-agent/build.rs embeds: sha256 over
+# The same digest crates/capyctl-agent/build.rs embeds: sha256 over
 # "<sha256>  <name>" lines of the shipped runtime/*.py, sorted by name.
 runtime_manifest=$(git ls-files -- 'runtime/*.py' ':(exclude)runtime/tests' | grep -v '/.*/' |
   LC_ALL=C sort | while IFS= read -r path; do
@@ -162,7 +162,7 @@ runtime_manifest=$(git ls-files -- 'runtime/*.py' ':(exclude)runtime/tests' | gr
   done | sha256sum | cut -c1-64)
 build_time=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 cat >"$pkg/BUILDINFO" <<EOF
-name: mllm
+name: capyctl
 version: $version
 commit: $commit
 dirty: $dirty

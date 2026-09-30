@@ -1,11 +1,11 @@
-# A deployment for `mllm start standalone` with the engine in MLLM_VLLM_BIN.
-# Deploy it with `mllm deploy model --file deployment-standalone.yaml --activate`.
+# A deployment for `capyctl start standalone` with the engine in CAPYCTL_VLLM_BIN.
+# Deploy it with `capyctl deploy model --file deployment-standalone.yaml --activate`.
 schema_version: 1
 kind: deployment
 name: my-model
 # The `model` name clients send in their OpenAI requests.
 routes: ["my-model"]
-# `local` is the engine standalone found in MLLM_VLLM_BIN or MLLM_SGLANG_BIN.
+# `local` is the engine standalone found in CAPYCTL_VLLM_BIN or CAPYCTL_SGLANG_BIN.
 runtime_profile: local
 runtime_profile_revision: 1
 recipe: standard

@@ -132,7 +132,7 @@ def check_values(values, weight_restore):
 
     The memory saver is on. The weights CPU backup is the `host_backed` tier's
     mechanism, so it is present exactly when the launch declared `cpu_backup`;
-    the draft-model backup is never used by mllm. `values` maps the ServerArgs
+    the draft-model backup is never used by capyctl. `values` maps the ServerArgs
     field names to their values (a lookup that misses reads as absent).
     """
     if weight_restore not in WEIGHT_RESTORES:
@@ -186,7 +186,7 @@ def _warn(problem):
         return
     _WARNED.add(problem)
     try:
-        sys.stderr.write(json.dumps(dict(event="mllm_saver_library_permissions",
+        sys.stderr.write(json.dumps(dict(event="capyctl_saver_library_permissions",
                                          problem=problem, action="warned"),
                                     separators=(",", ":")) + "\n")
         sys.stderr.flush()
@@ -198,7 +198,7 @@ def _protected(info):
     # SPEC §8.1, ADR 0008: the saver library lives in the engine's
     # installation, and engine files get no permission rule; a changed file
     # is caught by the digest below and by the installation's drift
-    # fingerprint. The owner-only rule mllm applies to its own helpers is
+    # fingerprint. The owner-only rule capyctl applies to its own helpers is
     # therefore a warning here, never a refusal (decided 2026-09-25 after a
     # group-writable SGLang environment refused every park, DG3). The
     # warning names the closed problem only, never a path or an account.

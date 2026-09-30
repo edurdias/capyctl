@@ -8,7 +8,7 @@ Sends <count> non-streaming requests the engine rejects as invalid
 streaming request. The owner's rule (2026-09-24): a complete engine 400, 413 or
 422 with a JSON body is completion evidence, so each answer must be a 400
 `engine_rejected` and a streamed rejection must not end as a successful stream.
-Prints status counts and bounded samples. The API key is read from MLLM_API_KEY
+Prints status counts and bounded samples. The API key is read from CAPYCTL_API_KEY
 only and never recorded. Standard library only.
 """
 

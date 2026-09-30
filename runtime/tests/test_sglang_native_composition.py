@@ -173,7 +173,7 @@ class CompositionTests(LaunchFixture, unittest.TestCase):
 class EnrollmentTests(unittest.TestCase):
     def setUp(self):
         # /tmp is not a protected installation ancestor; service home only.
-        self.directory = tempfile.TemporaryDirectory(prefix="mllm-compose-obs-", dir=Path.home())
+        self.directory = tempfile.TemporaryDirectory(prefix="capyctl-compose-obs-", dir=Path.home())
         self.addCleanup(self.directory.cleanup)
         os.chmod(self.directory.name, 0o700)
         self.identity = saver.current_process_identity()

@@ -1,6 +1,6 @@
-# mllm deployment with two instances spread over two hosts. Each instance is a
-# whole engine on one host; mllm does not split one engine across hosts.
-# Parsed by the product: `mllm validate config --file docs/examples/deployment-multinode.yaml
+# capyctl deployment with two instances spread over two hosts. Each instance is a
+# whole engine on one host; capyctl does not split one engine across hosts.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-multinode.yaml
 # --host docs/examples/host.yaml` also resolves it against that host.
 # An illustration of the schema, not a tested engine recipe.
 schema_version: 1

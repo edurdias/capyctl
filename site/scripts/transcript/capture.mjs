@@ -1,15 +1,15 @@
-// Runs every command the guide shows against a built `mllm` and prints the
+// Runs every command the guide shows against a built `capyctl` and prints the
 // transcript the guide's output blocks are copied from.
 //
-//   node scripts/transcript/capture.mjs <path/to/mllm> [sandbox-dir]
+//   node scripts/transcript/capture.mjs <path/to/capyctl> [sandbox-dir]
 //
 // The engine is scripts/transcript/fake-vllm.py, a stand-in that answers
-// mllm's HTTP calls and loads nothing, so this runs on a machine without an
-// engine. It shows what mllm prints; it is not a test of any engine.
+// capyctl's HTTP calls and loads nothing, so this runs on a machine without an
+// engine. It shows what capyctl prints; it is not a test of any engine.
 //
 // Everything runs in private sandbox homes under [sandbox-dir] (default
-// ~/.cache/mllm-site-docs/capture), with a cleared environment. Listeners
-// use ports far from the defaults so a running mllm is never touched. The
+// ~/.cache/capyctl-site-docs/capture), with a cleared environment. Listeners
+// use ports far from the defaults so a running capyctl is never touched. The
 // printed transcript replaces sandbox paths with /home/me, the machine's
 // host name with gpu-box and the sandbox ports with the defaults, then
 // realigns tables so the columns stay as the CLI lays them out.
@@ -21,9 +21,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const [binArg, rootArg] = process.argv.slice(2);
-if (!binArg) { console.error('usage: capture.mjs <path/to/mllm> [sandbox-dir]'); process.exit(2); }
+if (!binArg) { console.error('usage: capture.mjs <path/to/capyctl> [sandbox-dir]'); process.exit(2); }
 const bin = resolve(binArg);
-const root = resolve(rootArg ?? join(homedir(), '.cache', 'mllm-site-docs', 'capture'));
+const root = resolve(rootArg ?? join(homedir(), '.cache', 'capyctl-site-docs', 'capture'));
 
 // Sandbox ports -> the defaults the guide shows.
 const PORTS = { 18443: 8443, 17443: 7443, 37443: 7443, 38443: 8443, 37444: 7444, 37445: 7445, 38444: 8444 };
@@ -52,9 +52,9 @@ function home(name) { return join(root, name); }
 
 // Each sandbox home listens on its own loopback ports, far from the defaults.
 const LISTEN = {
-  one: { MLLM_INFERENCE_ADDR: '127.0.0.1:18443', MLLM_MANAGEMENT_ADDR: '127.0.0.1:17443', MLLM_ENGINE_PORTS: '18100-18107' },
-  server: { MLLM_INFERENCE_ADDR: '127.0.0.1:38443', MLLM_MANAGEMENT_ADDR: '127.0.0.1:37443' },
-  'gpu-box': { MLLM_ENGINE_PORTS: '38100-38199' },
+  one: { CAPYCTL_INFERENCE_ADDR: '127.0.0.1:18443', CAPYCTL_MANAGEMENT_ADDR: '127.0.0.1:17443', CAPYCTL_ENGINE_PORTS: '18100-18107' },
+  server: { CAPYCTL_INFERENCE_ADDR: '127.0.0.1:38443', CAPYCTL_MANAGEMENT_ADDR: '127.0.0.1:37443' },
+  'gpu-box': { CAPYCTL_ENGINE_PORTS: '38100-38199' },
 };
 
 // `extra` adds variables; a null value leaves that variable out.
@@ -69,8 +69,8 @@ function makeHome(name) {
   const h = home(name);
   privateDir(h);
   for (const d of ['.local', '.local/bin', '.local/state', '.config', 'models', 'venvs']) privateDir(join(h, d));
-  cpSync(bin, join(h, '.local/bin/mllm'));
-  chmodSync(join(h, '.local/bin/mllm'), 0o755);
+  cpSync(bin, join(h, '.local/bin/capyctl'));
+  chmodSync(join(h, '.local/bin/capyctl'), 0o755);
   return h;
 }
 
@@ -87,7 +87,7 @@ function fakeVllm(h, dir, version) {
   const fake = join(v, 'lib/fake_vllm.py');
   writeFileSync(fake, readFileSync(join(here, 'fake-vllm.py'), 'utf8').replace('VERSION = "0.29.0"', `VERSION = "${version}"`));
   writeFileSync(join(v, 'bin/vllm'), `#!/bin/sh\nexec /usr/bin/python3 ${fake} "$@"\n`, { mode: 0o755 });
-  const probe = JSON.stringify({ schema: 'mllm/engine-capabilities/v1', engine: 'vllm', capabilities: { core: [], deep_park: [], metrics: [] } });
+  const probe = JSON.stringify({ schema: 'capyctl/engine-capabilities/v1', engine: 'vllm', capabilities: { core: [], deep_park: [], metrics: [] } });
   writeFileSync(join(v, 'bin/python3'), `#!/bin/sh
 if [ "$1" = "-B" ]; then shift; fi
 case "$1" in
@@ -182,8 +182,8 @@ const guideFile = guideBlock('deploy.md', 'my-model.yaml');
 const deployment = (name, path, extra = '') => guideFile
   .replaceAll('my-model', name).replaceAll('Qwen3-4B', path) + extra;
 
-const KEY = "$(sed -n 's/^api_key: //p' ~/.local/state/mllm/identity/credentials)";
-const SERVER_KEY = `$(sed -n 's/.*"api_key": *"\\([^"]*\\)".*/\\1/p' ~/.local/state/mllm/identity/server-credentials.json)`;
+const KEY = "$(sed -n 's/^api_key: //p' ~/.local/state/capyctl/identity/credentials)";
+const SERVER_KEY = `$(sed -n 's/.*"api_key": *"\\([^"]*\\)".*/\\1/p' ~/.local/state/capyctl/identity/server-credentials.json)`;
 const curlChat = (port, model, stream = false, key = KEY) => `curl -s http://127.0.0.1:${port}/v1/chat/completions -H "Authorization: Bearer ${key}" -H 'Content-Type: application/json' -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello"}]${stream ? ', "stream": true' : ''}}'; echo`;
 
 async function oneMachine() {
@@ -195,20 +195,20 @@ async function oneMachine() {
   writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B'));
   writeFileSync(join(h, 'other-model.yaml'), deployment('other-model', 'Llama-3.1-8B'));
 
-  run('one', 'engine detect', 'mllm engine detect');
-  run('one', 'engine add before start', 'mllm engine add ~/venvs/vllm');
-  run('one', 'engine list before start', 'mllm engine list');
-  const started = background('one', 'start standalone', 'mllm start standalone');
+  run('one', 'engine detect', 'capyctl engine detect');
+  run('one', 'engine add before start', 'capyctl engine add ~/venvs/vllm');
+  run('one', 'engine list before start', 'capyctl engine list');
+  const started = background('one', 'start standalone', 'capyctl start standalone');
   await started(8000);
-  run('one', 'config show', 'mllm config show', { MLLM_INFERENCE_ADDR: null, MLLM_MANAGEMENT_ADDR: null, MLLM_ENGINE_PORTS: null });
-  run('one', 'config show set', 'mllm config show --set server.switching.drain_timeout=45s', { MLLM_INFERENCE_ADDR: null, MLLM_MANAGEMENT_ADDR: null, MLLM_ENGINE_PORTS: null });
-  run('one', 'engine add custom', 'mllm engine add ~/venvs/vllm-nightly --name vllm-nightly');
-  run('one', 'engine list', 'mllm engine list');
-  run('one', 'engine remove', 'mllm engine remove vllm-nightly');
-  run('one', 'validate', 'mllm validate config --file my-model.yaml');
-  run('one', 'deploy and start', 'mllm deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
-  run('one', 'list deployments', 'mllm list deployments');
-  run('one', 'status', 'mllm status deployment my-model');
+  run('one', 'config show', 'capyctl config show', { CAPYCTL_INFERENCE_ADDR: null, CAPYCTL_MANAGEMENT_ADDR: null, CAPYCTL_ENGINE_PORTS: null });
+  run('one', 'config show set', 'capyctl config show --set server.switching.drain_timeout=45s', { CAPYCTL_INFERENCE_ADDR: null, CAPYCTL_MANAGEMENT_ADDR: null, CAPYCTL_ENGINE_PORTS: null });
+  run('one', 'engine add custom', 'capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly');
+  run('one', 'engine list', 'capyctl engine list');
+  run('one', 'engine remove', 'capyctl engine remove vllm-nightly');
+  run('one', 'validate', 'capyctl validate config --file my-model.yaml');
+  run('one', 'deploy and start', 'capyctl deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
+  run('one', 'list deployments', 'capyctl list deployments');
+  run('one', 'status', 'capyctl status deployment my-model');
   run('one', 'models', `curl -s http://127.0.0.1:18443/v1/models -H "Authorization: Bearer ${KEY}"; echo`);
   run('one', 'models no key', `curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:18443/v1/models`);
   run('one', 'chat', curlChat(18443, 'my-model'));
@@ -218,7 +218,7 @@ async function oneMachine() {
 from pathlib import Path
 
 key = next(line.split(": ", 1)[1] for line in
-           (Path.home() / ".local/state/mllm/identity/credentials").read_text().splitlines()
+           (Path.home() / ".local/state/capyctl/identity/credentials").read_text().splitlines()
            if line.startswith("api_key: "))
 client = OpenAI(base_url="http://127.0.0.1:18443/v1", api_key=key)
 
@@ -236,44 +236,44 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 print()
 `);
-  const client = join(homedir(), '.cache', 'mllm-site-docs', 'client-venv', 'bin', 'python');
+  const client = join(homedir(), '.cache', 'capyctl-site-docs', 'client-venv', 'bin', 'python');
   if (existsSync(client)) run('one', 'python', `${client} ${py}`);
   // Parking and switching.
-  run('one', 'park', 'mllm park deployment my-model');
+  run('one', 'park', 'capyctl park deployment my-model');
   await sleep(3000);
-  run('one', 'list parked', 'mllm list deployments');
+  run('one', 'list parked', 'capyctl list deployments');
   run('one', 'wake by request', curlChat(18443, 'my-model'));
-  run('one', 'list woken', 'mllm list deployments');
-  run('one', 'deploy other', 'mllm deploy model --file other-model.yaml');
-  run('one', 'start evict', 'mllm start deployment other-model --evict');
+  run('one', 'list woken', 'capyctl list deployments');
+  run('one', 'deploy other', 'capyctl deploy model --file other-model.yaml');
+  run('one', 'start evict', 'capyctl start deployment other-model --evict');
   await sleep(6000);
-  run('one', 'list after evict', 'mllm list deployments');
+  run('one', 'list after evict', 'capyctl list deployments');
   run('one', 'switch back by request', curlChat(18443, 'my-model'));
-  run('one', 'list switched', 'mllm list deployments');
-  run('one', 'stop', 'mllm stop deployment other-model');
+  run('one', 'list switched', 'capyctl list deployments');
+  run('one', 'stop', 'capyctl stop deployment other-model');
   await sleep(3000);
-  run('one', 'list stopped', 'mllm list deployments');
+  run('one', 'list stopped', 'capyctl list deployments');
   run('one', 'stopped request', curlChat(18443, 'other-model'));
-  run('one', 'delete', 'mllm delete deployment other-model --stop');
-  run('one', 'list after delete', 'mllm list deployments');
+  run('one', 'delete', 'capyctl delete deployment other-model --stop');
+  run('one', 'list after delete', 'capyctl list deployments');
   // A start right after a stop: refused while the stop finishes (exit 25);
   // with --wait it waits for the stop, then starts.
-  run('one', 'stop my-model', 'mllm stop deployment my-model');
-  run('one', 'start right after stop', 'mllm start deployment my-model; echo exit $?');
-  run('one', 'start my-model', 'mllm start deployment my-model --wait');
+  run('one', 'stop my-model', 'capyctl stop deployment my-model');
+  run('one', 'start right after stop', 'capyctl start deployment my-model; echo exit $?');
+  run('one', 'start my-model', 'capyctl start deployment my-model --wait');
   writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B', 'residency: deep\n'));
-  run('one', 'update', 'mllm deploy model --file my-model.yaml --revision 1');
+  run('one', 'update', 'capyctl deploy model --file my-model.yaml --revision 1');
   await sleep(6000);
-  run('one', 'list after update', 'mllm list deployments');
-  run('one', 'delete my-model', 'mllm delete deployment my-model --stop > /dev/null; echo exit $?');
+  run('one', 'list after update', 'capyctl list deployments');
+  run('one', 'delete my-model', 'capyctl delete deployment my-model --stop > /dev/null; echo exit $?');
   // A launch that fails: an engine whose process exits before it is ready.
   fakeVllm(h, 'vllm-broken', '0.29.0');
   writeFileSync(join(h, 'venvs/vllm-broken/bin/python3'), readFileSync(join(h, 'venvs/vllm-broken/bin/python3'), 'utf8')
     .replace(/exec \/usr\/bin\/python3 [^\n]*"\$@";;/, 'echo "engine failed" >&2; exit 1;;'));
-  run('one', 'engine add broken', 'mllm engine add ~/venvs/vllm-broken --name vllm-broken > /dev/null; echo exit $?');
+  run('one', 'engine add broken', 'capyctl engine add ~/venvs/vllm-broken --name vllm-broken > /dev/null; echo exit $?');
   writeFileSync(join(h, 'broken-model.yaml'), deployment('broken-model', 'Qwen3-4B').replace('engine: vllm', 'engine: vllm-broken'));
-  run('one', 'deploy broken', 'mllm deploy model --file broken-model.yaml --activate --wait > /dev/null; echo exit $?');
-  run('one', 'status broken', 'mllm status deployment broken-model');
+  run('one', 'deploy broken', 'capyctl deploy model --file broken-model.yaml --activate --wait > /dev/null; echo exit $?');
+  run('one', 'status broken', 'capyctl status deployment broken-model');
 }
 
 async function severalMachines() {
@@ -281,17 +281,17 @@ async function severalMachines() {
   const g = makeHome('gpu-box');
   fakeVllm(g, 'vllm', '0.29.0');
   checkpoint(g, 'Qwen3-4B');
-  run('server', 'init server', 'mllm init server --output server.yaml');
+  run('server', 'init server', 'capyctl init server --output server.yaml');
   // The server file is the one the guide shows, moved onto loopback ports
   // and the sandbox home.
   writeFileSync(join(s, 'server.yaml'), guideBlock('several-machines.md', 'server.yaml')
     .replaceAll('/home/me', s).replaceAll('127.0.0.1:7443', '127.0.0.1:37443').replaceAll('0.0.0.0:8443', '127.0.0.1:38443')
     .replaceAll('100.64.0.10:7444', '127.0.0.1:37444').replaceAll('100.64.0.10:7445', '127.0.0.1:37445'));
-  const server = background('server', 'start server', 'mllm start server --config ~/server.yaml');
+  const server = background('server', 'start server', 'capyctl start server --config ~/server.yaml');
   await server(6000);
-  run('server', 'invite', 'mllm invite host gpu-box --output gpu-box.join');
+  run('server', 'invite', 'capyctl invite host gpu-box --output gpu-box.join');
   cpSync(join(s, 'gpu-box.join'), join(g, 'gpu-box.join'));
-  run('gpu-box', 'init host', 'mllm init host --output host.yaml');
+  run('gpu-box', 'init host', 'capyctl init host --output host.yaml');
   // The two edits the guide asks for: the name and the ingress, moved onto
   // a loopback port.
   const doc = JSON.parse(readFileSync(join(g, 'host.yaml'), 'utf8'));
@@ -300,20 +300,20 @@ async function severalMachines() {
   doc.ingress.address = 'http://127.0.0.1:38444';
   doc.ingress.bind = '127.0.0.1:38444';
   writeFileSync(join(g, 'host.yaml'), JSON.stringify(doc, null, 2) + '\n');
-  run('gpu-box', 'validate host', 'mllm validate config --file ~/host.yaml');
-  run('gpu-box', 'join', 'mllm join host --join-file gpu-box.join --config ~/host.yaml');
-  const host = background('gpu-box', 'start host', 'mllm start host --config ~/host.yaml');
+  run('gpu-box', 'validate host', 'capyctl validate config --file ~/host.yaml');
+  run('gpu-box', 'join', 'capyctl join host --join-file gpu-box.join --config ~/host.yaml');
+  const host = background('gpu-box', 'start host', 'capyctl start host --config ~/host.yaml');
   await host(8000);
-  run('gpu-box', 'engine add on host', 'mllm engine add ~/venvs/vllm');
-  run('gpu-box', 'server command on host', 'mllm list deployments');
+  run('gpu-box', 'engine add on host', 'capyctl engine add ~/venvs/vllm');
+  run('gpu-box', 'server command on host', 'capyctl list deployments');
   await sleep(2000);
-  run('server', 'list hosts', 'mllm list hosts');
-  run('server', 'list engines', 'mllm list engines');
+  run('server', 'list hosts', 'capyctl list hosts');
+  run('server', 'list engines', 'capyctl list engines');
   writeFileSync(join(s, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B'));
-  run('server', 'deploy on host', 'mllm deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
-  run('server', 'list on server', 'mllm list deployments');
+  run('server', 'deploy on host', 'capyctl deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
+  run('server', 'list on server', 'capyctl list deployments');
   run('server', 'request on server', curlChat(38443, 'my-model', false, SERVER_KEY));
-  run('server', 'park on server', 'mllm park deployment my-model > /dev/null; sleep 3; mllm list deployments');
+  run('server', 'park on server', 'capyctl park deployment my-model > /dev/null; sleep 3; capyctl list deployments');
 }
 
 try {

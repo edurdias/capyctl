@@ -191,7 +191,7 @@ class DeviceTests(LaunchFixture, unittest.TestCase):
         with mock.patch.object(device, "collect_inventory", self.collect):
             device.publish_inventory(stream)
         published = json.loads(stream.getvalue())
-        self.assertEqual(published["schema"], "mllm-nvidia-inventory-v1")
+        self.assertEqual(published["schema"], "capyctl-nvidia-inventory-v1")
         self.assertEqual(published["digest"], inventory.digest)
         self.assertEqual(
             published["devices"],

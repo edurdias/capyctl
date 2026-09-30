@@ -1,9 +1,9 @@
-# The smallest mllm deployment (`mllm deploy model --file deployment-minimal.yaml`).
-# Parsed by the product: `mllm validate config --file docs/examples/deployment-minimal.yaml`
+# The smallest capyctl deployment (`capyctl deploy model --file deployment-minimal.yaml`).
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-minimal.yaml`
 # shows the document with every default filled; `--host docs/examples/host.yaml`
 # also shows what that host fills in.
 #
-# Everything else is chosen by mllm: the route is the name, the recipe is
+# Everything else is chosen by capyctl: the route is the name, the recipe is
 # `standard`, the host's `vllm` engine at its published revision, its GPU, the
 # park tier its hardware supports, and memory sized from the checkpoint and the
 # GPU. Any field of `deployment-single.yaml` may be added to override a default.

@@ -1,7 +1,7 @@
-"""Launch-time capability probes for the engine internals mllm hooks (ADR 0008).
+"""Launch-time capability probes for the engine internals capyctl hooks (ADR 0008).
 
 Owner decision 2026-09-23: engine installation files get no hard-coded hashes
-and no permission rule. Instead, each internal API mllm depends on is probed at
+and no permission rule. Instead, each internal API capyctl depends on is probed at
 launch by its shape: the module imports, the attribute or method exists and is
 callable, the record declares the field, the router serves the route, the
 metrics module names the gauge. A missing capability refuses only the feature
@@ -49,7 +49,7 @@ import os
 import sys
 
 
-SCHEMA = "mllm/engine-capabilities/v1"
+SCHEMA = "capyctl/engine-capabilities/v1"
 ENGINES = {
     "sglang": ("core", "deep_park", "metrics", "observation"),
     "vllm": ("core", "deep_park", "metrics"),
@@ -57,23 +57,23 @@ ENGINES = {
 _MAX_SOURCE = 4 * 1024 * 1024
 
 # SGLang routes the adapter drives for a deep park and wake
-# (crates/mllm-adapters/src/sglang/http.rs).
+# (crates/capyctl-adapters/src/sglang/http.rs).
 SGLANG_DEEP_ROUTES = ("/release_memory_occupation", "/resume_memory_occupation",
                       "/update_weights_from_disk", "/flush_cache")
 # The ServerArgs fields a deep launch renders (ADR 0010: residency decides).
 SGLANG_DEEP_FIELDS = ("enable_memory_saver", "enable_weights_cpu_backup")
-# Load gauges the host agent scrapes (crates/mllm-agent/src/load.rs).
+# Load gauges the host agent scrapes (crates/capyctl-agent/src/load.rs).
 SGLANG_GAUGES = ("sglang:num_running_reqs", "sglang:num_queue_reqs", "sglang:token_usage")
 VLLM_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting",
                "vllm:kv_cache_usage_perc")
-# vLLM development routes the adapter drives (crates/mllm-adapters/src/vllm/residency.rs).
+# vLLM development routes the adapter drives (crates/capyctl-adapters/src/vllm/residency.rs).
 VLLM_DEEP_ROUTES = (
     ("vllm.entrypoints.serve.dev.sleep.api_router", ("/sleep", "/wake_up", "/is_sleeping")),
     ("vllm.entrypoints.serve.dev.rpc.api_router", ("/collective_rpc",)),
     ("vllm.entrypoints.serve.dev.cache.api_router", ("/reset_prefix_cache",)),
 )
-# vLLM parser destinations deep parking renders: sleep mode and mllm's guard
-# middleware (mllm_vllm_guard.RequireEngineKey), and the eager load strategy.
+# vLLM parser destinations deep parking renders: sleep mode and capyctl's guard
+# middleware (capyctl_vllm_guard.RequireEngineKey), and the eager load strategy.
 VLLM_DEEP_DESTINATIONS = ("enable_sleep_mode", "middleware", "safetensors_load_strategy")
 
 

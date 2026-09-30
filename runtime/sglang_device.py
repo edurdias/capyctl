@@ -134,7 +134,7 @@ def _collect_inventory(proc, sysfs, host, architecture):
             raise ValueError()
         if _read(proc / "sys/kernel/random/boot_id") != boot:
             raise ValueError()
-        material = {"schema": "mllm-nvidia-inventory-v1", "host": host,
+        material = {"schema": "capyctl-nvidia-inventory-v1", "host": host,
                     "architecture": architecture, "boot_id": boot,
                     "devices": [[d.physical_gpu_uuid, d.pci_address, d.device_minor,
                                  d.vendor_id, d.device_id] for d in devices]}
@@ -169,7 +169,7 @@ def publish_inventory(stream):
     inventory = collect_inventory()
     json.dump(
         {
-            "schema": "mllm-nvidia-inventory-v1",
+            "schema": "capyctl-nvidia-inventory-v1",
             "host_id": inventory.host_id,
             "digest": inventory.digest,
             "devices": [

@@ -1,5 +1,5 @@
-# mllm deployment on one host (`mllm deploy model --file deployment-single.yaml`).
-# Parsed by the product: `mllm validate config --file docs/examples/deployment-single.yaml
+# capyctl deployment on one host (`capyctl deploy model --file deployment-single.yaml`).
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-single.yaml
 # --host docs/examples/host.yaml` also resolves it against that host.
 # An illustration of the schema, not a tested engine recipe.
 schema_version: 1

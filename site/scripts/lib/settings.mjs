@@ -2,12 +2,12 @@
 // the site is served by GitHub Pages under a path, and it serves the
 // installer itself. Each URL is one build setting whose default is the
 // production value. A value set empty or to a placeholder makes a preview
-// build (with a visible banner); a publish build (MLLM_PUBLISH=1) refuses it.
+// build (with a visible banner); a publish build (CAPYCTL_PUBLISH=1) refuses it.
 
 export const DEFAULTS = {
-  MLLM_REPO_URL: 'https://github.com/edurdias/mllm',
-  MLLM_INSTALL_URL: 'https://edurdias.github.io/mllm/install.sh',
-  MLLM_SITE_URL: 'https://edurdias.github.io/mllm',
+  CAPYCTL_REPO_URL: 'https://github.com/edurdias/capyctl',
+  CAPYCTL_INSTALL_URL: 'https://edurdias.github.io/capyctl/install.sh',
+  CAPYCTL_SITE_URL: 'https://edurdias.github.io/capyctl',
 };
 
 export const isPlaceholder = (url) =>
@@ -21,16 +21,16 @@ const parse = (url) => { try { return new URL(url); } catch { return null; } };
 export function resolveSettings(env, installerRepo) {
   const raw = Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, k in env ? env[k].trim() : v]));
   const placeholders = Object.keys(raw).filter((k) => isPlaceholder(raw[k]) || !parse(raw[k]));
-  const fallback = (k) => (placeholders.includes(k) ? 'https://mllm.invalid' : raw[k]);
-  const site = new URL(trim(fallback('MLLM_SITE_URL')));
+  const fallback = (k) => (placeholders.includes(k) ? 'https://capyctl.invalid' : raw[k]);
+  const site = new URL(trim(fallback('CAPYCTL_SITE_URL')));
   const settings = {
-    repoUrl: trim(fallback('MLLM_REPO_URL')),
-    installUrl: raw.MLLM_INSTALL_URL || 'https://mllm.invalid/install.sh',
+    repoUrl: trim(fallback('CAPYCTL_REPO_URL')),
+    installUrl: raw.CAPYCTL_INSTALL_URL || 'https://capyctl.invalid/install.sh',
     siteUrl: trim(site.href),
     // Astro's `site` is the origin and `base` the path the site is served under.
     siteOrigin: site.origin,
     base: trim(site.pathname),
-    publish: env.MLLM_PUBLISH === '1',
+    publish: env.CAPYCTL_PUBLISH === '1',
     placeholders,
     preview: placeholders.length > 0,
   };
@@ -43,8 +43,8 @@ export function resolveSettings(env, installerRepo) {
     }
     // Review item 3: the site runs the installer without --repo, so the
     // installer's own default must be the repository the site links to.
-    if (!placeholders.includes('MLLM_REPO_URL') && installerRepo !== settings.repoSlug) {
-      problems.push(`packaging/install.sh downloads from ${installerRepo}, but MLLM_REPO_URL is ${settings.repoSlug}`);
+    if (!placeholders.includes('CAPYCTL_REPO_URL') && installerRepo !== settings.repoSlug) {
+      problems.push(`packaging/install.sh downloads from ${installerRepo}, but CAPYCTL_REPO_URL is ${settings.repoSlug}`);
     }
     if (problems.length) throw new Error(`publish build refused:\n- ${problems.join('\n- ')}`);
   }

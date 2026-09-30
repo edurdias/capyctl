@@ -1,8 +1,8 @@
-# Single-box benchmark through mllm — 2026-09-25
+# Single-box benchmark through capyctl — 2026-09-25
 
 Owner-approved experiment (2026-09-25). Five models, each on one GB10 host at a
 time, single user, 256 prompt tokens and 256 generated tokens, on vLLM and on
-SGLang, deployed by mllm and requested through the mllm router. Each engine runs
+SGLang, deployed by capyctl and requested through the capyctl router. Each engine runs
 a baseline (no speculation) and the best drafter it supports.
 
 **This is not qualification.** It measures one request shape on one host class.
@@ -26,12 +26,12 @@ not a like-for-like target.
 | Qwen3.8-27B NVFP4 | 10.4 | 27.6 (DFlash2) | 10.7 | 27.1 (DFlash2) | 33.4 |
 
 Every run, in full. TTFT and TTLT are measured at the client through the router;
-rates at p10 are the slow tail. mllm overhead is the client mean minus the
+rates at p10 are the slow tail. capyctl overhead is the client mean minus the
 engine's own mean for the same requests (Method). Memory is the drop in host
 `MemAvailable` from before deploy to Ready. Startup is `deploy --activate
 --wait`.
 
-| Model | Engine | Run | TTFT ms p50 / p90 | TTLT s p50 / p90 | Prefill tok/s p50 / p10 | Decode tok/s p50 / p10 | mllm overhead ms TTFT / e2e | Memory GiB | Startup s | Post tok/s |
+| Model | Engine | Run | TTFT ms p50 / p90 | TTLT s p50 / p90 | Prefill tok/s p50 / p10 | Decode tok/s p50 / p10 | capyctl overhead ms TTFT / e2e | Memory GiB | Startup s | Post tok/s |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | MiniCPM5-2B BF16 | vLLM | baseline | 79 / 135 | 7.13 / 7.17 | 3258 / 1901 | **36.1** / 36.1 | 60 / 47 | 16.5 | 57 | 100.8 |
 |  | vLLM | DSpark | 71 / 85 | 3.07 / 4.08 | 3623 / 3043 | **85.6** / 63.8 | 37 / 47 | 17.7 | 69 |  |
@@ -69,7 +69,7 @@ Readings:
   model both could serve. vLLM prefills faster at this size (lower TTFT);
   SGLang's Qwen3.6 baseline is faster on decode (84.6 against 76.5) with the
   Marlin MoE runner.
-- The mllm path adds about 25–85 ms at first token and 25–55 ms at stream end
+- The capyctl path adds about 25–85 ms at first token and 25–55 ms at stream end
   (one outlier: 87 ms for SGLang's Gemma assistant run). Most of it is the
   router-to-host hop over Tailscale (about 15 ms per request, TCP connect floor
   14.5 ms) plus the router's own 3–4 ms; the rest is SSE relay and the gap
@@ -86,12 +86,12 @@ Readings:
 - **Hosts.** Two identical GB10 hosts (128 GB unified memory, aarch64, sm_121,
   driver 580.173.02, CUDA 13.0, kernel 6.17). vLLM ran on host A and SGLang on
   host B, in parallel, one deployment per host at a time. The control-plane host
-  ran the mllm server, the router and the load generator.
+  ran the capyctl server, the router and the load generator.
 - **Engines.** Existing environments, unchanged: vLLM 0.29.0 (torch 2.13.0,
   FlashInfer 0.6.18, transformers 5.17.0) on host A; SGLang 0.5.20 (torch
   2.13.0, FlashInfer 0.6.18, sglang-kernel 0.4.7, transformers 5.12.1) on host B.
   No custom engine build was needed (see "Custom builds").
-- **mllm.** `main` at `a1298c4` plus the fixes on this branch (see "Product
+- **capyctl.** `main` at `a1298c4` plus the fixes on this branch (see "Product
   fixes"); the branch merged later `main` (`be780b9`) after the run, and the
   live binaries predate that merge. Built from a snapshot of the worktree and run as a server plus two
   enrolled hosts by the live matrix harness (`scripts/live/matrix`). The server
@@ -125,10 +125,10 @@ Readings:
   wall time of `deploy --activate --wait`, including checkpoint digest
   measurement, engine start, weight load, compile or graph capture and
   readiness.
-- **mllm overhead.** Client mean minus the engine's own mean from the same
+- **capyctl overhead.** Client mean minus the engine's own mean from the same
   requests: SGLang's `/metrics` histograms (scraped on loopback before and after
   the cell), and for vLLM (which keys `/metrics`) the engine histograms the host
-  agent forwards in the mllm latency view. "TTFT" compares time to first token;
+  agent forwards in the capyctl latency view. "TTFT" compares time to first token;
   "e2e" compares client stream end with the engine's end-to-end latency. The
   latency view splits the path: client to router about 1 ms, router pre-forward
   about 3 to 4 ms, router to host ingress about 15 ms (Tailscale; TCP connect
@@ -166,7 +166,7 @@ Qwen3.6 48 GiB (52), Ling 92 GiB (94–95, with a declared startup peak equal to
 the request), Gemma 4 E2B 32 GiB (34), Qwen3.8-27B 40 GiB (46–48); KV cache
 8 GiB (6 GiB for Ling).
 
-## Hugging Face download through mllm (first live use)
+## Hugging Face download through capyctl (first live use)
 
 Every checkpoint except the local Qwen3.8-27B NVFP4 came from a pinned
 `model.source: {type: huggingface, repo, revision}` materialized by the host into
@@ -181,7 +181,7 @@ Hugging Face token and none was needed (every repository here is public). What
 was observed:
 
 - 17 sources (8 on host A, 9 on host B; about 123 GB per host) downloaded
-  concurrently from 12:53 UTC. The link, not mllm, set the pace: both hosts sit
+  concurrently from 12:53 UTC. The link, not capyctl, set the pace: both hosts sit
   on Wi-Fi at about 9 MB/s aggregate each (a single `curl` of the same file got
   1.2 MB/s from a host and 2.8 MB/s from the control-plane host). Small drafters
   verified within minutes; MiniCPM5 (5 GB) at 13:50–13:55; Gemma 4 E2B (10 GB)
@@ -189,7 +189,7 @@ was observed:
   int4 (77 GB) at 17:29 (host A) and 17:30 (host B).
 - Resume works: each host role was restarted three times mid-download (binary
   fixes and a host-document change). Partial files and reservations stayed in
-  `sources/.mllm/`, and every download continued from where it stopped. Right
+  `sources/.capyctl/`, and every download continued from where it stopped. Right
   after a restart, `status` showed `bytes_done: 0` for a few seconds before the
   host's first progress answer; cosmetic.
 - Status reports `pending`, `downloading` with bytes done and total, and
@@ -199,7 +199,7 @@ was observed:
   host again (product fix 3 below).
 - There is no "download only" verb: to fetch a drafter, a deployment naming it is
   created and never activated. The copies stay after `delete deployment`
-  (SPEC §6.3); `mllm prune sources` is the explicit reclaim.
+  (SPEC §6.3); `capyctl prune sources` is the explicit reclaim.
 - The store layout is `sources/huggingface/<owner>--<name>@<sha>`, not
   `~/models/<name>`. Drafter paths in `extra_args` name the store path.
 - During the run, the first deploy of a new source with `--activate --wait`
@@ -224,13 +224,13 @@ run, so they were not run live.
      fixed it. Live: Qwen3.8-27B NVFP4 on vLLM failed before, served after.
    - Owner decision: that was replaced by an optional runtime-profile field,
      `cuda_home` (SPEC §13.3 amendment), in `engines.yaml`, `host.yaml` or
-     `MLLM_CUDA_HOME` for the standalone environment installation. mllm
+     `CAPYCTL_CUDA_HOME` for the standalone environment installation. capyctl
      prepends `<cuda_home>/bin` after the engine's own `bin` and sets
-     `CUDA_HOME`; without it the PATH stays minimal. `mllm engine add` detects
+     `CUDA_HOME`; without it the PATH stays minimal. `capyctl engine add` detects
      it: `CUDA_HOME` if it holds `bin/nvcc`, else `/usr/local/cuda` if it does.
-     The harness passes it with `MLLM_HOST_CUDA_HOME`.
+     The harness passes it with `CAPYCTL_HOST_CUDA_HOME`.
 2. **vLLM `--speculative-config` could never be approved**
-   (`crates/mllm-config/src/engine_policy.rs`, `runtime/extra_args_policy.py`).
+   (`crates/capyctl-config/src/engine_policy.rs`, `runtime/extra_args_policy.py`).
    It was classed as a filesystem path, and its value is a JSON object, so every
    vLLM speculative deployment was refused at deploy time ("names a path outside
    the host's security.approved_paths") and would have been refused again at
@@ -240,13 +240,13 @@ run, so they were not run live.
    `prompt_lookup_min`, `draft_sample_method`, `moe_backend`), scalar values,
    and the draft `model` inside an approved directory. Live: every vLLM
    drafter run below. The owner accepted it as ADR 0014 Amendment A3.
-3. **A verified source copy was not reused** (`crates/mllm-store/src/model_sources.rs`).
+3. **A verified source copy was not reused** (`crates/capyctl-store/src/model_sources.rs`).
    A new deployment of a model already verified on its host started `pending`,
    so `deploy --activate` was refused `model_source_pending` until the next
    supervisor round trip. A revision now starts verified when a deployment that
    still exists holds the same store key verified on the same host. Live: every
    `-bn` benchmark deployment after 13:57 UTC.
-4. **JIT compile parallelism is bounded** (owner decision). mllm sets
+4. **JIT compile parallelism is bounded** (owner decision). capyctl sets
    `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)`
    and `FLASHINFER_NVCC_THREADS=1` in both engines' environments, and logs the
    choice at launch. A profile's `env` may override either one with a positive
@@ -255,7 +255,7 @@ run, so they were not run live.
      and `tvm_ffi`.
    - `FLASHINFER_NVCC_THREADS` sets the threads inside each FlashInfer `nvcc`;
      1 is FlashInfer's own default.
-   - vLLM's `NVCC_THREADS` applies only when vLLM itself is built, so mllm does
+   - vLLM's `NVCC_THREADS` applies only when vLLM itself is built, so capyctl does
      not set it.
 5. **`deploy --activate --wait` waits for a downloading source** (owner
    decision). `deploy model --activate` and `start --wait` already waited for a
@@ -286,7 +286,7 @@ M80.
   (an unquantized MoE) on the same model. The kernel OOM killer took the user
   session with the host role and its tmux; the hosts stayed up and nothing was
   rebooted. The runs switched to the prebuilt Marlin runner (SGLang) and
-  `moe_backend: triton` for the vLLM draft. mllm could not bound JIT
+  `moe_backend: triton` for the vLLM draft. capyctl could not bound JIT
   parallelism then; product fix 4 now sets `MAX_JOBS` from free memory. It was
   not re-run live.
 - **Engine and recipe findings, each fixed in the fixture:** SGLang refuses
@@ -329,13 +329,13 @@ Gemma 4 assistant and Qwen3.5-family MTP; SGLang 0.5.20 ships
 `bailing_moe_v3` with its configuration, DSpark (`Qwen3DSparkModel`,
 `LingDSparkModel`), DFlash, NEXTN and the Gemma 4 assistant. The one model a
 stock engine could not load (Ling on vLLM) needs checkpoint code, not a newer
-build. No new environment was created, so `mllm engine add` was not exercised
+build. No new environment was created, so `capyctl engine add` was not exercised
 live in this run.
 
 ## Evidence
 
 Local to the control-plane host, under `target/live/bench/`: one `M80-<fixture>/`
 directory per run (fixture, `records.jsonl` with per-chunk arrival times,
-`cells/`, engine `/metrics` scrapes, mllm latency views, page-cache samples, E0
+`cells/`, engine `/metrics` scrapes, capyctl latency views, page-cache samples, E0
 snapshots, cleanup checks, `bench.json`, `summary.md`), `table.json` (the table
 above), and the sync, role and download logs. Run `matrix-20260925T125244Z`.

@@ -9,13 +9,13 @@
 
 ## 1. Outcome and scope
 
-F2 delivers the single-host mllm contract for both vLLM and SGLang through one
+F2 delivers the single-host capyctl contract for both vLLM and SGLang through one
 controller, scheduler, management API, and inference router. Different models can
 use different engine-specific recipes on the same hardware. The same checkpoint
 can also have separate deployments and route names for different recipes.
 
 When capacity allows, both engines remain ready and serve overlapping requests on
-the same GPU. When their active footprints cannot coexist, mllm retains initialized
+the same GPU. When their active footprints cannot coexist, capyctl retains initialized
 runtimes and sequences parking and waking. Both deployments may be parked at once.
 Ordinary switching must not require a cold process restart.
 
@@ -55,12 +55,12 @@ the existing code already satisfies them.
 
 | Baseline evidence | F2 requirement |
 |---|---|
-| `mllm-controller/src/operations.rs`: synthetic activation estimate and admission against an empty ledger | Real observations, complete retained-owner ledger, phase budgets, atomic reservation transitions, verified release |
-| `mllm-router/src/switch.rs`: other ready deployments are treated as exclusive pool occupants | Fit-based coexistence and one coordinated transition planner |
-| `mllm-cli/src/roles.rs`: single adapter wiring; router forwarders selected by profile kind | Deployment-bound runtimes, private endpoints, credentials, recipes, and forwarding |
-| `mllm-router/src/chat.rs`: routed activation calls the controller separately from the switch coordinator | Administrative and request-driven activation share coordination, generation checks, and admission gates |
+| `capyctl-controller/src/operations.rs`: synthetic activation estimate and admission against an empty ledger | Real observations, complete retained-owner ledger, phase budgets, atomic reservation transitions, verified release |
+| `capyctl-router/src/switch.rs`: other ready deployments are treated as exclusive pool occupants | Fit-based coexistence and one coordinated transition planner |
+| `capyctl-cli/src/roles.rs`: single adapter wiring; router forwarders selected by profile kind | Deployment-bound runtimes, private endpoints, credentials, recipes, and forwarding |
+| `capyctl-router/src/chat.rs`: routed activation calls the controller separately from the switch coordinator | Administrative and request-driven activation share coordination, generation checks, and admission gates |
 | F1 carryovers: CLI dispatch, credentials, log bounds, argument validation, failed-state cleanup | Normal management surface and safe lifecycle/launch behavior |
-| `mllm-config/src/schema.rs`: several required configuration blocks only accept empty objects | Strict usable profile, deployment, resource, and policy schemas with effective-value inspection |
+| `capyctl-config/src/schema.rs`: several required configuration blocks only accept empty objects | Strict usable profile, deployment, resource, and policy schemas with effective-value inspection |
 | F1 evidence: reproduced 4B workload passed 32/32 exact routed responses | Preserve that regression; add post-restore streaming and mixed-engine proof rather than extrapolating it |
 
 Paths in this table are relative to `crates/`. Per-deployment port allocation moves
@@ -101,7 +101,7 @@ a profile cannot mutate a running deployment or silently reuse qualification.
 Each managed deployment has its own adapter binding, process ownership identity,
 private endpoint and credential references. Parked processes retain their endpoint
 allocation. Credentials are not exposed in status, events, recorded command lines,
-or logs. Launch arguments are validated against mllm-owned settings; log retention
+or logs. Launch arguments are validated against capyctl-owned settings; log retention
 is bounded. Engine administrative controls are never public inference passthroughs.
 Retaining only the API server PID is insufficient: worker ownership and start
 identities must also establish that the initialized engine runtime survived parking.
@@ -235,7 +235,7 @@ prerequisites, authentication, and acknowledgements must be checked against the
 pinned build during planning/qualification; endpoint availability alone is not
 evidence that parking is safe or weights are restored.
 
-Capability qualification was withdrawn by ADR 0011: mllm guards the host and the
+Capability qualification was withdrawn by ADR 0011: capyctl guards the host and the
 user owns the recipe. Security permission remains a separate check. F2 closes on
 declared-tier parking verified live on authorized hardware, not on a proof step per
 deployment.

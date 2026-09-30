@@ -1,9 +1,9 @@
-"""The owner-only rule for mllm's own runtime helpers (Python mirror).
+"""The owner-only rule for capyctl's own runtime helpers (Python mirror).
 
-Owner decisions 2026-09-22 and 2026-09-23: mllm's own helper files and the
+Owner decisions 2026-09-22 and 2026-09-23: capyctl's own helper files and the
 directories on the way to them are trusted when owned by root or the service
 user, never other-writable, and group-writable only through the owner's
-private group. mllm's private state stays strict. CPU fixtures only.
+private group. capyctl's private state stays strict. CPU fixtures only.
 """
 
 import os

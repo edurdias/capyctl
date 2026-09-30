@@ -50,7 +50,7 @@ def extract_source(archive, destination):
 class NativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mllm-tms-observer-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="capyctl-tms-observer-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.build = Path(cls.temporary.name)
         source = extract_source(os.environ.get("TMS_SOURCE_ARCHIVE"), cls.build)
@@ -314,12 +314,12 @@ class ReaderTests(unittest.TestCase):
 
 class SourcePrerequisiteTests(unittest.TestCase):
     def test_missing_archive_is_a_failure(self):
-        with tempfile.TemporaryDirectory(prefix="mllm-tms-prerequisite-") as directory:
+        with tempfile.TemporaryDirectory(prefix="capyctl-tms-prerequisite-") as directory:
             with self.assertRaisesRegex(AssertionError, "Prerequisite"):
                 extract_source(None, Path(directory))
 
     def test_wrong_hash_rejected_before_extraction(self):
-        with tempfile.TemporaryDirectory(prefix="mllm-tms-prerequisite-") as directory:
+        with tempfile.TemporaryDirectory(prefix="capyctl-tms-prerequisite-") as directory:
             archive = Path(directory) / "not-source.tar.gz"
             archive.write_bytes(b"not the pinned source")
             destination = Path(directory) / "uncreated"
@@ -332,7 +332,7 @@ class SourcePrerequisiteTests(unittest.TestCase):
                            ("torch_memory_saver-0.0.9.post1/link", tarfile.SYMTYPE),
                            ("torch_memory_saver-0.0.9.post1/hard", tarfile.LNKTYPE),
                            ("torch_memory_saver-0.0.9.post1/fifo", tarfile.FIFOTYPE)):
-            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="mllm-tms-prerequisite-") as directory:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="capyctl-tms-prerequisite-") as directory:
                 stream = io.BytesIO()
                 with tarfile.open(fileobj=stream, mode="w:gz") as archive:
                     member = tarfile.TarInfo(name)

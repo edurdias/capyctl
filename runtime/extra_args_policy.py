@@ -1,6 +1,6 @@
 """Launch-time gate on deployment extra arguments (ADR 0014 §8, SPEC §8.2).
 
-The deploy-time check (`crates/mllm-config/src/engine_policy.rs`) sees only the
+The deploy-time check (`crates/capyctl-config/src/engine_policy.rs`) sees only the
 spelling a deployment wrote. The engines' parsers expand any unambiguous
 abbreviation and accept aliases, so `--engine-info` reaches SGLang's
 `engine_info_bootstrap_port` and `--master-ad` reaches vLLM's `master_addr`.
@@ -14,7 +14,7 @@ This gate therefore decides on the destination the installed parser resolved:
 - anything else is ordinary and passes.
 
 The host's approvals reach the entry as one closed JSON document in the
-`MLLM_EXTRA_APPROVALS` environment variable, rendered by the adapter from the
+`CAPYCTL_EXTRA_APPROVALS` environment variable, rendered by the adapter from the
 approved profile. Its absence approves nothing. Standard library only; no
 engine import. Refusals name the destination class, never a value.
 """
@@ -22,7 +22,7 @@ engine import. Refusals name the destination class, never a value.
 import json
 import os
 
-ENV = "MLLM_EXTRA_APPROVALS"
+ENV = "CAPYCTL_EXTRA_APPROVALS"
 
 CODE = "code"
 PATH = "path"

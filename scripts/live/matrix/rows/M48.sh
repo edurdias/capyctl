@@ -108,7 +108,7 @@ row_main() {
     [ "$rc" = 0 ] || return 1
   fi
   dry && return 0
-  export LRD SERVER_CFG SERVER_DB MLLM EVID RUNSTATE RRD REMOTE_TREE HOST_ID_a HOST_ID_b MLLM_API_KEY
+  export LRD SERVER_CFG SERVER_DB CAPYCTL EVID RUNSTATE RRD REMOTE_TREE HOST_ID_a HOST_ID_b CAPYCTL_API_KEY
   step check-0 python3 "$MATRIX_DIR/soak.py" --plan "$EVID/plan.json" --seed "$seed" --check-only || true
   python3 "$MATRIX_DIR/soak.py" --plan "$EVID/plan.json" --seed "$seed" --steps "$steps" --from-step "$from" \
     --max-hours "${SOAK_MAX_HOURS:-8}" 2>&1 | tee -a "$EVID/soak.out"

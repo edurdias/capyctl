@@ -5,7 +5,7 @@
 //! `Ready` means only that this pressure check passes at this observation. It
 //! does not grant admission, establish host identity, or prove owner attribution.
 //! Any error latches for the whole run; a later good sample cannot resume it.
-use mllm_agent::memory::HostMemorySample;
+use capyctl_agent::memory::HostMemorySample;
 
 const GIB: i64 = 1 << 30;
 const MAX_AGE_MS: u64 = 2_000;

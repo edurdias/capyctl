@@ -7,7 +7,7 @@ const deployments = JSON.parse(readFileSync(new URL('../src/data/hero-deployment
 const hosts = JSON.parse(readFileSync(new URL('../src/data/hero-hosts.json', import.meta.url), 'utf8'));
 
 test('the command shown is the real CLI with its default table output', () => {
-  assert.equal(HERO_COMMAND, 'mllm list deployments');
+  assert.equal(HERO_COMMAND, 'capyctl list deployments');
 });
 
 test('fixture: two ready models and one parked, generic names, on two generic hosts', () => {
@@ -33,6 +33,6 @@ test('a parked model is still wanted: DESIRED ready, STATE parked', () => {
 
 test('heroOutput reads the block back as a browser shows it', async () => {
   const { heroOutput } = await import('../scripts/lib/hero-page.mjs');
-  const html = '<pre class="terminal" tabindex="0" aria-label="Example terminal output"><code><span class="prompt">$ </span>mllm list deployments\nNAME   STATE\na&amp;b   <span class="state-parked">parked</span>\n</code></pre>';
-  assert.deepEqual(heroOutput(html), { command: '$ mllm list deployments', output: 'NAME   STATE\na&b   parked\n' });
+  const html = '<pre class="terminal" tabindex="0" aria-label="Example terminal output"><code><span class="prompt">$ </span>capyctl list deployments\nNAME   STATE\na&amp;b   <span class="state-parked">parked</span>\n</code></pre>';
+  assert.deepEqual(heroOutput(html), { command: '$ capyctl list deployments', output: 'NAME   STATE\na&b   parked\n' });
 });

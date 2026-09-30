@@ -55,7 +55,7 @@ class name, never its message, arguments or any native text."""
         code = getattr(error, "code", None)
         if type(code) is not str or re.fullmatch(r"[a-z_]{1,32}", code) is None:
             code = None
-        sys.stderr.write('{"event":"mllm_saver_observation_failed","stage":"%s","error":%s,"code":%s}\n'
+        sys.stderr.write('{"event":"capyctl_saver_observation_failed","stage":"%s","error":%s,"code":%s}\n'
                          % (stage, '"%s"' % kind if kind else "null", '"%s"' % code if code else "null"))
         sys.stderr.flush()
     except Exception:

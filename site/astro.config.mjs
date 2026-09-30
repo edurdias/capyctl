@@ -4,7 +4,7 @@ import starlightLinksValidator from 'starlight-links-validator';
 import { BASE, REPO_URL, SITE_ORIGIN } from './site.config.mjs';
 
 export default defineConfig({
-  // Website spec, Open decisions 1: MLLM_SITE_URL (scripts/lib/settings.mjs),
+  // Website spec, Open decisions 1: CAPYCTL_SITE_URL (scripts/lib/settings.mjs),
   // split into the origin and the path GitHub Pages serves the site under.
   site: SITE_ORIGIN,
   base: BASE || '/',
@@ -13,7 +13,7 @@ export default defineConfig({
   prefetch: false,
   integrations: [
     starlight({
-      title: 'mllm',
+      title: 'capyctl',
       description: 'A model manager for vLLM and SGLang on your own GPUs.',
       social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
       // Website spec, Visual system: code blocks are dark in both themes.

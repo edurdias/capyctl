@@ -1,5 +1,26 @@
 # Current implementation and launch status
 
+## Rename to CapyCTL — 2026-09-30
+
+ADR 0022: the project, binary and repository are CapyCTL (`capyctl`), with no
+aliases for the old names. Crates, variables, paths, units, archives, the
+installer, the site and the docs use the new name; earlier entries below keep
+the old one. `scripts/check-name.sh` keeps it out of everything else (file
+contents and paths) and runs in packaging verification and CI.
+
+State written by earlier releases is not reused and earlier roles cannot talk
+to 0.1.0 roles; the 0.1.0 release notes give the clean-up steps. The live
+rows that drive a previous release (DG6 migration, ENG4) refuse to run until
+a previous capyctl release exists.
+
+Local checks on the renamed tree: formatting, Clippy with warnings denied,
+core suite 1115 passed / 0 failed, workspace 2285 / 0, Python runtime 301 OK,
+packaging with no SKIP lines (`capyctl-0.1.0-linux-x86_64.tar.gz`), installer
+tests and the site check. Live on a laptop (release build, fresh state):
+`capyctl --version`, `engine add`, the text banner and stop summary in a
+terminal, the JSON banner when redirected, and `list hosts`. CPU and
+Fake-engine tests are not qualification.
+
 ## Terminal output — 2026-09-29
 
 ADR 0021 is implemented: commands print tables or a summary with key-value

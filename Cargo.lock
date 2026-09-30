@@ -295,6 +295,279 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "capyctl-adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "capyctl-config",
+ "capyctl-domain",
+ "capyctl-testkit",
+ "futures",
+ "harness",
+ "hex",
+ "nix",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "capyctl-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "capyctl-adapters",
+ "capyctl-config",
+ "capyctl-domain",
+ "capyctl-launchers",
+ "capyctl-protocol",
+ "capyctl-scheduler",
+ "futures",
+ "hex",
+ "libc",
+ "prost",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "ulid",
+ "x509-parser",
+]
+
+[[package]]
+name = "capyctl-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "capyctl-adapters",
+ "capyctl-agent",
+ "capyctl-config",
+ "capyctl-controller",
+ "capyctl-domain",
+ "capyctl-launchers",
+ "capyctl-management",
+ "capyctl-protocol",
+ "capyctl-router",
+ "capyctl-store",
+ "capyctl-testkit",
+ "clap",
+ "clap-markdown",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "ulid",
+]
+
+[[package]]
+name = "capyctl-config"
+version = "0.1.0"
+dependencies = [
+ "capyctl-domain",
+ "hex",
+ "libc",
+ "regex",
+ "saphyr-parser",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "capyctl-controller"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "capyctl-adapters",
+ "capyctl-agent",
+ "capyctl-config",
+ "capyctl-domain",
+ "capyctl-launchers",
+ "capyctl-protocol",
+ "capyctl-scheduler",
+ "capyctl-store",
+ "capyctl-testkit",
+ "futures",
+ "hex",
+ "rand_core 0.6.4",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "ulid",
+]
+
+[[package]]
+name = "capyctl-domain"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
+]
+
+[[package]]
+name = "capyctl-launchers"
+version = "0.1.0"
+dependencies = [
+ "capyctl-adapters",
+ "capyctl-domain",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "capyctl-management"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "capyctl-adapters",
+ "capyctl-agent",
+ "capyctl-config",
+ "capyctl-controller",
+ "capyctl-domain",
+ "capyctl-protocol",
+ "capyctl-scheduler",
+ "capyctl-store",
+ "capyctl-testkit",
+ "futures",
+ "http-body-util",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower",
+ "ulid",
+]
+
+[[package]]
+name = "capyctl-protocol"
+version = "0.1.0"
+dependencies = [
+ "capyctl-config",
+ "capyctl-domain",
+ "prost",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "capyctl-router"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "capyctl-adapters",
+ "capyctl-controller",
+ "capyctl-domain",
+ "capyctl-protocol",
+ "capyctl-store",
+ "capyctl-testkit",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "capyctl-scheduler"
+version = "0.1.0"
+dependencies = [
+ "capyctl-domain",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "capyctl-store"
+version = "0.1.0"
+dependencies = [
+ "capyctl-config",
+ "capyctl-domain",
+ "capyctl-scheduler",
+ "chacha20poly1305",
+ "hex",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "ulid",
+]
+
+[[package]]
+name = "capyctl-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capyctl-adapters",
+ "capyctl-config",
+ "capyctl-controller",
+ "capyctl-domain",
+ "capyctl-scheduler",
+ "capyctl-store",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,10 +1000,10 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "capyctl-adapters",
+ "capyctl-agent",
+ "capyctl-testkit",
  "libc",
- "mllm-adapters",
- "mllm-agent",
- "mllm-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -1142,279 +1415,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mllm-adapters"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "futures",
- "harness",
- "hex",
- "mllm-config",
- "mllm-domain",
- "mllm-testkit",
- "nix",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "mllm-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "futures",
- "hex",
- "libc",
- "mllm-adapters",
- "mllm-config",
- "mllm-domain",
- "mllm-launchers",
- "mllm-protocol",
- "mllm-scheduler",
- "prost",
- "rcgen",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "tonic",
- "ulid",
- "x509-parser",
-]
-
-[[package]]
-name = "mllm-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "clap",
- "clap-markdown",
- "libc",
- "mllm-adapters",
- "mllm-agent",
- "mllm-config",
- "mllm-controller",
- "mllm-domain",
- "mllm-launchers",
- "mllm-management",
- "mllm-protocol",
- "mllm-router",
- "mllm-store",
- "mllm-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "ulid",
-]
-
-[[package]]
-name = "mllm-config"
-version = "0.1.0"
-dependencies = [
- "hex",
- "libc",
- "mllm-domain",
- "regex",
- "saphyr-parser",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "mllm-controller"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "futures",
- "hex",
- "mllm-adapters",
- "mllm-agent",
- "mllm-config",
- "mllm-domain",
- "mllm-launchers",
- "mllm-protocol",
- "mllm-scheduler",
- "mllm-store",
- "mllm-testkit",
- "rand_core 0.6.4",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "ulid",
-]
-
-[[package]]
-name = "mllm-domain"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
- "thiserror",
- "ulid",
-]
-
-[[package]]
-name = "mllm-launchers"
-version = "0.1.0"
-dependencies = [
- "mllm-adapters",
- "mllm-domain",
- "nix",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "mllm-management"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures",
- "http-body-util",
- "libc",
- "mllm-adapters",
- "mllm-agent",
- "mllm-config",
- "mllm-controller",
- "mllm-domain",
- "mllm-protocol",
- "mllm-scheduler",
- "mllm-store",
- "mllm-testkit",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "tokio",
- "tower",
- "ulid",
-]
-
-[[package]]
-name = "mllm-protocol"
-version = "0.1.0"
-dependencies = [
- "mllm-config",
- "mllm-domain",
- "prost",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
-name = "mllm-router"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "axum",
- "futures",
- "mllm-adapters",
- "mllm-controller",
- "mllm-domain",
- "mllm-protocol",
- "mllm-store",
- "mllm-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "subtle",
- "thiserror",
- "tokio",
- "tower",
-]
-
-[[package]]
-name = "mllm-scheduler"
-version = "0.1.0"
-dependencies = [
- "mllm-domain",
- "proptest",
- "thiserror",
-]
-
-[[package]]
-name = "mllm-store"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "hex",
- "mllm-config",
- "mllm-domain",
- "mllm-scheduler",
- "rand_core 0.6.4",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "ulid",
-]
-
-[[package]]
-name = "mllm-testkit"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "mllm-adapters",
- "mllm-config",
- "mllm-controller",
- "mllm-domain",
- "mllm-scheduler",
- "mllm-store",
- "rusqlite",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

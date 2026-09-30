@@ -1,9 +1,9 @@
 """A stand-in for `vllm` used only to capture the documentation's command
-output on a machine without an engine. It answers the HTTP surface mllm
+output on a machine without an engine. It answers the HTTP surface capyctl
 drives (health, models, streaming chat, sleep and wake) and loads nothing.
 
 This is not qualification of any engine recipe: passing through it shows
-only what mllm's own commands print.
+only what capyctl's own commands print.
 """
 import json
 import sys
@@ -28,7 +28,7 @@ def serve(argv):
     model = argv[0] if argv and not argv[0].startswith("-") else arg(argv, "--model", "model")
     served = arg(argv, "--served-model-name", model)
     state = {"sleeping": False}
-    # A real engine runs a worker process in its process group; mllm records
+    # A real engine runs a worker process in its process group; capyctl records
     # the whole group, so the stand-in keeps one idle child beside it.
     import subprocess
     subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(3600)"])

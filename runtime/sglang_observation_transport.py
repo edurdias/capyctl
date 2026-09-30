@@ -88,14 +88,14 @@ def _process_identity(pid):
     return identity
 
 
-_KEY_LABEL = b"mllm-sglang-observation-key-v1\0"
-_PROOF_LABEL = b"mllm-sglang-observation-request-v2\0"
+_KEY_LABEL = b"capyctl-sglang-observation-key-v1\0"
+_PROOF_LABEL = b"capyctl-sglang-observation-request-v2\0"
 
 
 def observation_key(admin_key, binding_id, incarnation_id):
     """The per-launch observation key, derived from the launch's admin credential.
 
-    Mirrors `observation_key` in crates/mllm-launchers/src/native_observation.rs.
+    Mirrors `observation_key` in crates/capyctl-launchers/src/native_observation.rs.
     """
     if type(admin_key) is not str or not 0 < len(admin_key) <= 4096 or not admin_key.isascii():
         raise _Denied()
@@ -230,7 +230,7 @@ and the engine side left no trace of why no frame came.
 """
     try:
         import sys
-        fields = dict(event="mllm_observation_served", outcome=outcome, stage=stage,
+        fields = dict(event="capyctl_observation_served", outcome=outcome, stage=stage,
                       frame=frame, elapsed_ms=elapsed_ms, timeout_ms=timeout_ms,
                       request_ms=request_ms, result_ms=result_ms)
         if type(timing) is dict:

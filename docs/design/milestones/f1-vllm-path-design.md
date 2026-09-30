@@ -36,13 +36,13 @@ Six slices in dependency order; each leaves a coherent tested product.
 | Slice | Deliverable | Tests |
 |---|---|---|
 | G1 — vLLM adapter + launch contract | Real `vllm` adapter over the OpenAI-compatible HTTP API; native-argument launch contract; Spark environment-contract doc; real `doctor host` fingerprinting | Adapter conformance on the fake + contract tests; T07, T12, T14 (render-plan conflicts, fingerprint rules; live fingerprint evidence via the §8 sequence) |
-| G2 — Router | Real `mllm-router`: `/v1/models` + streaming/non-streaming `/v1/chat/completions`, admission, queue bounds, cancellation accounting | T17, T19 (simulator) |
+| G2 — Router | Real `capyctl-router`: `/v1/models` + streaming/non-streaming `/v1/chat/completions`, admission, queue bounds, cancellation accounting | T17, T19 (simulator) |
 | G3 — Durable operations on real adapters | start/park/stop/preinitialize/undeploy via controller + real launcher (process groups, signals, exit status); admin-stop vs idle-stop; generation machinery; reservation persistence | T10, T12, T18 (late dispatch needs the generation machinery G3 delivers); generation/reservation coverage |
 | G4 — Attachment | `attach model` with ownership ≠ reachability | T11 |
 | G5 — Switching + fairness | A→B activation, one wake, bounded non-resetting window, drain → quiescence → release evidence; two profiles alternate | T15, T16, T17, T19 |
 | G6 — Experimental deep-park + Spark qualification | Policy gate end-to-end; isolated `vllm-sleep` profile; Spark environment contract, doctor capture, restart-only live qualification, then experimental park/reload | T20, T21; live-tier T16/T20/T21 evidence |
 
-## 3. vLLM adapter (`mllm-adapters/src/vllm/`)
+## 3. vLLM adapter (`capyctl-adapters/src/vllm/`)
 
 Implements the F0 `EngineAdapter` trait over vLLM's OpenAI-compatible HTTP API. All
 engine-specific endpoints and launch parameters stay inside the adapter (SPEC §9).
@@ -89,7 +89,7 @@ plus the adapter-rendered engine-native argument tail. Rules carried from F0 + h
 - Internal failures (store/I-O/runtime boot) exit with a distinct internal code, not 2 or
   5 (F0 deferral absorbed in G1).
 
-## 5. Router (`mllm-router`)
+## 5. Router (`capyctl-router`)
 
 **Surfaces**: `GET /v1/models` (lists configured enabled public IDs; never wakes) and
 streaming (SSE) + non-streaming `POST /v1/chat/completions`. Nothing else in F1.
@@ -150,12 +150,12 @@ appropriate.
   usage is never reclaimable capacity (SPEC §5.2).
 - No external supervisor integration configured → status marks restart guarantees
   unavailable.
-- Direct external clients may bypass mllm's in-flight counts; no drain-based lifecycle
+- Direct external clients may bypass capyctl's in-flight counts; no drain-based lifecycle
   operation on attached deployments without exclusive admission control (SPEC §5.2).
 
 ## 7. Deep-park gate (T20, T21)
 
-mllm's purpose is running multiple models on shared hardware: models are loaded and
+capyctl's purpose is running multiple models on shared hardware: models are loaded and
 parked/offloaded to disk, then loaded/activated on demand, using each engine's own
 capabilities — vLLM's sleep/awake path where available, full restart where not; SGLang
 the same. Park/reload is core F1 functionality. The security gate below exists because
@@ -197,7 +197,7 @@ simulator-tier only.
 
 ## 8. Spark environment contract and qualification sequence
 
-New runbook: `docs/runbooks/vllm-env.md`. The operator executes the install; mllm
+New runbook: `docs/runbooks/vllm-env.md`. The operator executes the install; capyctl
 installs nothing (T07). The contract pins:
 
 - A dedicated venv path with a pinned vLLM release (pip/uv install performed by the
@@ -211,7 +211,7 @@ installs nothing (T07). The contract pins:
 Qualification sequence, each step gated:
 
 1. Operator runs the environment contract (install + download).
-2. `mllm doctor host` (now real in F1) captures build fingerprints and memory
+2. `capyctl doctor host` (now real in F1) captures build fingerprints and memory
    observations; the live recipe is frozen only from reported reality.
 3. **Restart-only live qualification first**: deploy → READY → serve → stop → re-deploy;
    A→B→A switching across the two restart-only profiles (stock + stock-alt) on the
@@ -222,7 +222,7 @@ Qualification sequence, each step gated:
    "first working vLLM path."
 4. **Park/reload under the opt-in profile** — park/reload is core F1 functionality, not
    an optional experiment (owner decision: "the framework will have the park/reload
-   feature otherwise there is no reason to build this thing"). mllm's purpose is running
+   feature otherwise there is no reason to build this thing"). capyctl's purpose is running
    multiple models on shared hardware by loading them and parking/offloading them to
    disk, then loading/activating on demand, using each engine's own capabilities: for
    vLLM the sleep/awake path (level 2, weights restored from the checkpoint on wake);

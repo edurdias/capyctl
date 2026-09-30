@@ -1,14 +1,14 @@
-"""The owner-only rule for mllm's own runtime files and directories.
+"""The owner-only rule for capyctl's own runtime files and directories.
 
-Python mirror of `crates/mllm-adapters/src/owner_only.rs` (owner decisions
-2026-09-22 and 2026-09-23). A file or directory mllm put there itself is
+Python mirror of `crates/capyctl-adapters/src/owner_only.rs` (owner decisions
+2026-09-22 and 2026-09-23). A file or directory capyctl put there itself is
 trusted when it is owned by an accepted owner (root or the service user),
 never writable by other, and writable by group only when that group is the
 owning user's private group: a private group adds no writer. A group whose
 membership cannot be established is refused.
 
-This rule is for mllm's own helpers and the directories on the way to them.
-mllm's private state (identity, credentials, locks, observation sockets and
+This rule is for capyctl's own helpers and the directories on the way to them.
+capyctl's private state (identity, credentials, locks, observation sockets and
 their 0700 directory) stays strict: no group write at all. Engine installation
 files get no permission rule (ADR 0008): drift is flagged from the
 installation's fingerprint and internals are probed by shape instead.

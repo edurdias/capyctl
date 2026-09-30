@@ -33,7 +33,7 @@ static() {
       echo "snapshot_commit $(cat "$SNAPSHOT/commit" 2>/dev/null || echo none)"
       echo "dirty_files $(cat "$SNAPSHOT/dirty-count" 2>/dev/null || echo unknown)"
       echo "cargo_lock $(cat "$SNAPSHOT/cargo-lock.sha256" 2>/dev/null || echo unknown)"
-      echo "binary_control-host $(sha256sum "$MLLM" | cut -c1-64)"
+      echo "binary_control-host $(sha256sum "$CAPYCTL" | cut -c1-64)"
       echo "run $RUN"
     } >"$dir/static.control-host.txt"
   fi
@@ -47,7 +47,7 @@ echo sglang_version \$($SGLANG_VENV/bin/python3 -c 'import sglang; print(sglang.
 echo sglang_env \$($(venv_digest "$SGLANG_VENV")); \
 echo vllm_version \$($vv/bin/python3 -c 'import importlib.metadata as m; print(m.version(\"vllm\"))'); \
 echo vllm_venv $vv; echo vllm_env \$($(venv_digest "$vv")); \
-python3 $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime sglang_entry.py vllm_entry.py mllm_vllm_guard.py pinned_file_observation.py" \
+python3 $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime sglang_entry.py vllm_entry.py capyctl_vllm_guard.py pinned_file_observation.py" \
       >"$( dry && echo /dev/null || echo "$dir/static.$host.txt")" || { echo "static: runtime check refused on $host" >&2; rc=1; }
   done
   return "$rc"
@@ -76,7 +76,7 @@ print(json.dumps(result["_equal_across_hosts"]))
 PY
   # Kept as E0 evidence only (payload-digests.json), never as $RUNSTATE/checkpoints.json:
   # this is a payload digest, not the product's checkpoint manifest digest
-  # (mllm-agent checkpoint.rs), so a fixture that declared it as content_fingerprint
+  # (capyctl-agent checkpoint.rs), so a fixture that declared it as content_fingerprint
   # was refused at first placement (found live by the M48 soak, 2026-09-24).
   mkdir -p "$RUNSTATE" && cp "$dir/checkpoints.json" "$RUNSTATE/payload-digests.json"
 }

@@ -1,0 +1,12 @@
+[package]
+name = "capyctl-scheduler"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+capyctl-domain = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

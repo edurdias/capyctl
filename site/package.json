@@ -1,5 +1,5 @@
 {
-  "name": "mllm-site",
+  "name": "capyctl-site",
   "private": true,
   "type": "module",
   "engines": {

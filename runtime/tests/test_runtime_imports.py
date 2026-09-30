@@ -1,4 +1,4 @@
-"""Where mllm's runtime helpers import from (SPEC §9.1 / T21, T37).
+"""Where capyctl's runtime helpers import from (SPEC §9.1 / T21, T37).
 
 The entries run under `python -I -S`, which leaves the script's directory off
 sys.path. They must then import their siblings from the runtime directory the

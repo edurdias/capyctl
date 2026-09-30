@@ -31,11 +31,11 @@ import os
 import stat
 
 # Environment the protected entry sets for its spawned children (validated there).
-ENV_DIR = "MLLM_OBSERVATION_DIR"
-ENV_SCOPE = "MLLM_OBSERVATION_SCOPE"
+ENV_DIR = "CAPYCTL_OBSERVATION_DIR"
+ENV_SCOPE = "CAPYCTL_OBSERVATION_SCOPE"
 # ADR 0019: the launch's declared weight restore, which decides whether the
 # saver's weights region may hold a CPU backup (`cpu_backup`, host_backed).
-ENV_RESTORE = "MLLM_OBSERVATION_WEIGHT_RESTORE"
+ENV_RESTORE = "CAPYCTL_OBSERVATION_WEIGHT_RESTORE"
 WEIGHT_RESTORES = ("disk_reload", "cpu_backup")
 
 # The live listener, retained for the scheduler process lifetime.

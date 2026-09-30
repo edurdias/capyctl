@@ -1,8 +1,8 @@
 # F0 Foundation Implementation Plan
 
-**Goal:** Build the mllm F0 foundation — an 11-crate Rust workspace with the lifecycle state machine, strict config, transactional SQLite store, resource ledger, engine-adapter/launcher contracts, fake-engine harness, and the action-first CLI — such that T01–T04, T08, T09, T26, T27 pass without GPUs and the exit gate runs a full fake-engine lifecycle.
+**Goal:** Build the capyctl F0 foundation — an 11-crate Rust workspace with the lifecycle state machine, strict config, transactional SQLite store, resource ledger, engine-adapter/launcher contracts, fake-engine harness, and the action-first CLI — such that T01–T04, T08, T09, T26, T27 pass without GPUs and the exit gate runs a full fake-engine lifecycle.
 
-**Architecture:** One binary, 11 workspace crates, hard module boundaries (`mllm-domain` is pure; the fake adapter sits beside future real adapters behind one trait). Server + embedded host share contracts via in-process calls; the gRPC proto is frozen but exercised only by a wire-level round-trip test. All state lives in per-user SQLite under owner-only permissions.
+**Architecture:** One binary, 11 workspace crates, hard module boundaries (`capyctl-domain` is pure; the fake adapter sits beside future real adapters behind one trait). Server + embedded host share contracts via in-process calls; the gRPC proto is frozen but exercised only by a wire-level round-trip test. All state lives in per-user SQLite under owner-only permissions.
 
 **Tech Stack:** Rust (stable, edition 2021), tokio, tonic + prost (gRPC), rusqlite (bundled SQLite), saphyr-parser/yaml-rust2 (strict YAML), clap 4, serde, ulid, proptest, tempfile.
 
@@ -10,10 +10,10 @@
 
 ## Global Constraints
 
-- Language: Rust, stable toolchain; no Python server runtime. One binary (`mllm`) for all roles.
+- Language: Rust, stable toolchain; no Python server runtime. One binary (`capyctl`) for all roles.
 - Persistence: embedded SQLite via `rusqlite` (feature `bundled`); server store + agent journal; forward-only migrations; no external broker.
-- Transport: gRPC package `mllm.management.v1`; field numbers per Appendix A of the design doc; additive evolution only.
-- Config: versioned strict YAML; reject unknown mllm fields, duplicate keys, invalid units, missing required fields; explicit missing/invalid config fails — generation only for implicit-missing cases.
+- Transport: gRPC package `capyctl.management.v1`; field numbers per Appendix A of the design doc; additive evolution only.
+- Config: versioned strict YAML; reject unknown capyctl fields, duplicate keys, invalid units, missing required fields; explicit missing/invalid config fails — generation only for implicit-missing cases.
 - `auto` v1 constants: `managed_limit = min(75% × observed, observed − 8 GiB)`, `free_reserve = max(8 GiB, 10% × observed)`; observation TTL 60 s; clock-skew tolerance 30 s; all persisted with provenance.
 - Idempotency key = `SHA-256(server context id, deployment name, canonical manifest bytes)`; key/content mismatch → conflict error.
 - Permissions: state dirs 0700, files 0600, at creation.
@@ -28,17 +28,17 @@
 Cargo.toml                    # workspace root, shared profile
 rust-toolchain.toml           # channel = stable
 crates/
-  mllm-domain/src/{lib.rs, lifecycle.rs, identity.rs, error.rs}
-  mllm-store/src/{lib.rs, schema.rs, deployments.rs, migrations.rs}
-  mllm-scheduler/src/{lib.rs, ledger.rs, admission.rs, auto.rs}
-  mllm-protocol/{proto/mllm/management/v1/management.proto, build.rs, src/lib.rs}
-  mllm-config/src/{lib.rs, schema.rs, strict_yaml.rs, defaults.rs}
-  mllm-adapters/src/{lib.rs, traits.rs, fake/{mod.rs, engine.rs, launcher.rs}}
-  mllm-launchers/src/{lib.rs, exec.rs}
-  mllm-agent/src/{lib.rs, supervision.rs}
-  mllm-controller/src/{lib.rs, operations.rs}
-  mllm-router/src/lib.rs      # F0: placeholder module (F1 fills it)
-  mllm-cli/src/{main.rs, grammar.rs, output.rs, roles.rs}
+  capyctl-domain/src/{lib.rs, lifecycle.rs, identity.rs, error.rs}
+  capyctl-store/src/{lib.rs, schema.rs, deployments.rs, migrations.rs}
+  capyctl-scheduler/src/{lib.rs, ledger.rs, admission.rs, auto.rs}
+  capyctl-protocol/{proto/capyctl/management/v1/management.proto, build.rs, src/lib.rs}
+  capyctl-config/src/{lib.rs, schema.rs, strict_yaml.rs, defaults.rs}
+  capyctl-adapters/src/{lib.rs, traits.rs, fake/{mod.rs, engine.rs, launcher.rs}}
+  capyctl-launchers/src/{lib.rs, exec.rs}
+  capyctl-agent/src/{lib.rs, supervision.rs}
+  capyctl-controller/src/{lib.rs, operations.rs}
+  capyctl-router/src/lib.rs      # F0: placeholder module (F1 fills it)
+  capyctl-cli/src/{main.rs, grammar.rs, output.rs, roles.rs}
 tests/harness/src/{lib.rs}    # conformance-suite runner (dev crate)
 ```
 
@@ -48,11 +48,11 @@ tests/harness/src/{lib.rs}    # conformance-suite runner (dev crate)
 
 **Files:**
 - Create: `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`
-- Create: `crates/<each-of-11>/Cargo.toml` and `crates/<each-of-11>/src/lib.rs` (empty `// placeholder removed at task N` — only `mllm-domain` gets real content in Task 2)
+- Create: `crates/<each-of-11>/Cargo.toml` and `crates/<each-of-11>/src/lib.rs` (empty `// placeholder removed at task N` — only `capyctl-domain` gets real content in Task 2)
 - Create: `tests/harness/Cargo.toml`, `tests/harness/src/lib.rs` (empty test harness crate, dev-dependency of others later)
 
 **Interfaces:**
-- Produces: workspace named `mllm`; crates named exactly `mllm-domain`, `mllm-store`, `mllm-scheduler`, `mllm-protocol`, `mllm-controller`, `mllm-router`, `mllm-agent`, `mllm-adapters`, `mllm-launchers`, `mllm-config`, `mllm-cli`. All later tasks consume these names.
+- Produces: workspace named `capyctl`; crates named exactly `capyctl-domain`, `capyctl-store`, `capyctl-scheduler`, `capyctl-protocol`, `capyctl-controller`, `capyctl-router`, `capyctl-agent`, `capyctl-adapters`, `capyctl-launchers`, `capyctl-config`, `capyctl-cli`. All later tasks consume these names.
 
 - [ ] **Step 1: Write workspace root**
 
@@ -61,10 +61,10 @@ tests/harness/src/{lib.rs}    # conformance-suite runner (dev crate)
 [workspace]
 resolver = "2"
 members = [
-  "crates/mllm-domain", "crates/mllm-store", "crates/mllm-scheduler",
-  "crates/mllm-protocol", "crates/mllm-controller", "crates/mllm-router",
-  "crates/mllm-agent", "crates/mllm-adapters", "crates/mllm-launchers",
-  "crates/mllm-config", "crates/mllm-cli", "tests/harness",
+  "crates/capyctl-domain", "crates/capyctl-store", "crates/capyctl-scheduler",
+  "crates/capyctl-protocol", "crates/capyctl-controller", "crates/capyctl-router",
+  "crates/capyctl-agent", "crates/capyctl-adapters", "crates/capyctl-launchers",
+  "crates/capyctl-config", "crates/capyctl-cli", "tests/harness",
 ]
 
 [workspace.package]
@@ -86,12 +86,12 @@ thiserror = "2"
 proptest = "1"
 tempfile = "3"
 hex = "0.4"
-mllm-domain = { path = "crates/mllm-domain" }
-mllm-store = { path = "crates/mllm-store" }
-mllm-scheduler = { path = "crates/mllm-scheduler" }
-mllm-protocol = { path = "crates/mllm-protocol" }
-mllm-config = { path = "crates/mllm-config" }
-mllm-adapters = { path = "crates/mllm-adapters" }
+capyctl-domain = { path = "crates/capyctl-domain" }
+capyctl-store = { path = "crates/capyctl-store" }
+capyctl-scheduler = { path = "crates/capyctl-scheduler" }
+capyctl-protocol = { path = "crates/capyctl-protocol" }
+capyctl-config = { path = "crates/capyctl-config" }
+capyctl-adapters = { path = "crates/capyctl-adapters" }
 
 [profile.dev]
 debug = 1
@@ -108,11 +108,11 @@ channel = "stable"
 *.sqlite3*
 ```
 
-Each member `Cargo.toml` (example for `mllm-domain`; others identical minus deps):
+Each member `Cargo.toml` (example for `capyctl-domain`; others identical minus deps):
 
 ```toml
 [package]
-name = "mllm-domain"
+name = "capyctl-domain"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -121,7 +121,7 @@ license.workspace = true
 thiserror = { workspace = true }
 ```
 
-`mllm-cli` additionally declares `[[bin]] name = "mllm" path = "src/main.rs"`.
+`capyctl-cli` additionally declares `[[bin]] name = "capyctl" path = "src/main.rs"`.
 
 - [ ] **Step 2: Verify it compiles**
 
@@ -137,10 +137,10 @@ git commit -m "feat: scaffold 11-crate workspace with pinned shared deps"
 
 ---
 
-### Task 2: Lifecycle state machine (`mllm-domain`)
+### Task 2: Lifecycle state machine (`capyctl-domain`)
 
 **Files:**
-- Create: `crates/mllm-domain/src/lib.rs`, `crates/mllm-domain/src/lifecycle.rs`, `crates/mllm-domain/src/identity.rs`, `crates/mllm-domain/src/error.rs`
+- Create: `crates/capyctl-domain/src/lib.rs`, `crates/capyctl-domain/src/lifecycle.rs`, `crates/capyctl-domain/src/identity.rs`, `crates/capyctl-domain/src/error.rs`
 - Test: same files (`#[cfg(test)]` modules; proptest for transition table)
 
 **Interfaces:**
@@ -165,7 +165,7 @@ pub struct StaleGenerationError;         // returned when observed < expected
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-// crates/mllm-domain/src/lifecycle.rs
+// crates/capyctl-domain/src/lifecycle.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,13 +222,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p mllm-domain`
+Run: `cargo test -p capyctl-domain`
 Expected: FAIL — `LifecycleState`, `can_transition_to` not defined.
 
 - [ ] **Step 3: Implement the transition table**
 
 ```rust
-// crates/mllm-domain/src/lifecycle.rs
+// crates/capyctl-domain/src/lifecycle.rs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LifecycleState {
     Stopped, Starting, Ready, Draining, Parking, Parked,
@@ -275,13 +275,13 @@ fn table() -> &'static Vec<(LifecycleState, LifecycleState)> {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p mllm-domain`
+Run: `cargo test -p capyctl-domain`
 Expected: PASS (including proptest).
 
 - [ ] **Step 5: Identity types + stale-generation rejection (failing test first)**
 
 ```rust
-// crates/mllm-domain/src/identity.rs
+// crates/capyctl-domain/src/identity.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,7 +313,7 @@ mod tests {
 }
 ```
 
-Run: `cargo test -p mllm-domain` → FAIL (types undefined). Implement:
+Run: `cargo test -p capyctl-domain` → FAIL (types undefined). Implement:
 
 ```rust
 pub struct DeploymentId(pub ulid::Ulid);
@@ -343,17 +343,17 @@ impl GenerationMonitor {
 
 - [ ] **Step 5b: Run and commit**
 
-Run: `cargo test -p mllm-domain` → PASS.
+Run: `cargo test -p capyctl-domain` → PASS.
 ```bash
-git add crates/mllm-domain && git commit -m "feat(domain): lifecycle state machine, identities, generation rejection"
+git add crates/capyctl-domain && git commit -m "feat(domain): lifecycle state machine, identities, generation rejection"
 ```
 
 ---
 
-### Task 3: Strict config schema and validation (`mllm-config`)
+### Task 3: Strict config schema and validation (`capyctl-config`)
 
 **Files:**
-- Create: `crates/mllm-config/src/{lib.rs, strict_yaml.rs, schema.rs, error.rs}`
+- Create: `crates/capyctl-config/src/{lib.rs, strict_yaml.rs, schema.rs, error.rs}`
 - Test: `#[cfg(test)]` modules + fixture YAML strings inline
 
 **Interfaces:**
@@ -374,7 +374,7 @@ pub fn validate(text: &str, expected: ConfigKind) -> Result<(), ConfigError>;
 - [ ] **Step 1: Failing tests (T03 shapes)**
 
 ```rust
-// crates/mllm-config/src/strict_yaml.rs
+// crates/capyctl-config/src/strict_yaml.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mllm_field_rejected() {
+    fn unknown_capyctl_field_rejected() {
         let y = "schema_version: 1\nkind: server\nname: a\nfrobnicate: true\n";
         assert!(matches!(validate(y, ConfigKind::Server),
             Err(ConfigError { code: ConfigErrorCode::UnknownField, .. })));
@@ -417,31 +417,31 @@ mod tests {
 }
 ```
 
-Run: `cargo test -p mllm-config` → FAIL.
+Run: `cargo test -p capyctl-config` → FAIL.
 
 - [ ] **Step 2: Implement the saphyr-based strict loader**
 
 Mechanics: parse with `saphyr_parser` event stream; track mapping-key sets per node path; any repeat → `DuplicateKey`. Then a hand-written allowlist walk per `ConfigKind` (field sets from SPEC §16): known-field check → `UnknownField`; required-field check → `MissingRequired`; unit parser for `"64MiB"`/`"15m"` style scalars (regex `^(\d+(?:\.\d+)?)\s?(B|KiB|MiB|GiB|TiB|s|m|h|ms)$`) → `InvalidUnit`; `kind` must match `ConfigKind` → `SchemaVersion` mismatch is `InvalidUnit`-class diagnostic. Convert to `serde_json::Value` for the normalized view.
 
-Add to `mllm-config/Cargo.toml`: `saphyr-parser = "0.13"`, `serde = { workspace = true }`, `serde_json = "1"`, `regex = "1"`, `thiserror = { workspace = true }`.
+Add to `capyctl-config/Cargo.toml`: `saphyr-parser = "0.13"`, `serde = { workspace = true }`, `serde_json = "1"`, `regex = "1"`, `thiserror = { workspace = true }`.
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p mllm-config` → PASS.
+Run: `cargo test -p capyctl-config` → PASS.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/mllm-config && git commit -m "feat(config): strict YAML parse with duplicate-key and field validation"
+git add crates/capyctl-config && git commit -m "feat(config): strict YAML parse with duplicate-key and field validation"
 ```
 
 ---
 
-### Task 4: No-config behavior and atomic generation (`mllm-config`)
+### Task 4: No-config behavior and atomic generation (`capyctl-config`)
 
 **Files:**
-- Create: `crates/mllm-config/src/defaults.rs`
-- Test: `#[cfg(test)]` in `defaults.rs` + `crates/mllm-config/tests/noconfig.rs` (T02, T04)
+- Create: `crates/capyctl-config/src/defaults.rs`
+- Test: `#[cfg(test)]` in `defaults.rs` + `crates/capyctl-config/tests/noconfig.rs` (T02, T04)
 
 **Interfaces:**
 - Consumes: Task 3 `parse_strict`/`validate`.
@@ -457,7 +457,7 @@ pub fn generate_default(kind: ConfigKind, state_dir: &Path) -> Result<(PathBuf, 
 - [ ] **Step 1: Failing tests (T02, T04)**
 
 ```rust
-// crates/mllm-config/tests/noconfig.rs
+// crates/capyctl-config/tests/noconfig.rs
 mod common;
 use common::*;
 
@@ -491,32 +491,32 @@ fn concurrent_starts_do_not_clobber() {
 }
 ```
 
-Run: `cargo test -p mllm-config` → FAIL.
+Run: `cargo test -p capyctl-config` → FAIL.
 
 - [ ] **Step 2: Implement**
 
-`generate_default` renders the standalone shape of SPEC §16.5 (bind `127.0.0.1`, `authentication: admin_token`/`api_key`, relative paths resolved against the config file) with an admin token + API key written to `state_dir/identity/credentials` (0600). Creation: write to `tempfile::NamedTempFile::new_in(parent)`, `fs::rename` (atomic on Linux), `set_permissions(0600)` before rename; state dir created `0700`. Concurrent clobber safety: rename over an existing file is atomic on Linux; the winner is deterministic and the credential is generated once by first-committer — implement via `OpenOptions::new().create_new(true)` on a marker file before rename. Invalid *existing* implicit config → `ConfigError { code: InvalidUnit-class }` (no reset). Explicit path missing → error; explicit path invalid → error. Never execute engines; `resolve_startup` never touches `mllm-adapters`.
+`generate_default` renders the standalone shape of SPEC §16.5 (bind `127.0.0.1`, `authentication: admin_token`/`api_key`, relative paths resolved against the config file) with an admin token + API key written to `state_dir/identity/credentials` (0600). Creation: write to `tempfile::NamedTempFile::new_in(parent)`, `fs::rename` (atomic on Linux), `set_permissions(0600)` before rename; state dir created `0700`. Concurrent clobber safety: rename over an existing file is atomic on Linux; the winner is deterministic and the credential is generated once by first-committer — implement via `OpenOptions::new().create_new(true)` on a marker file before rename. Invalid *existing* implicit config → `ConfigError { code: InvalidUnit-class }` (no reset). Explicit path missing → error; explicit path invalid → error. Never execute engines; `resolve_startup` never touches `capyctl-adapters`.
 
 - [ ] **Step 2b: Run tests**
 
-Run: `cargo test -p mllm-config` → PASS.
+Run: `cargo test -p capyctl-config` → PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/mllm-config && git commit -m "feat(config): no-config startup matrix with atomic owner-protected generation (T02/T04)"
+git add crates/capyctl-config && git commit -m "feat(config): no-config startup matrix with atomic owner-protected generation (T02/T04)"
 ```
 
 ---
 
-### Task 5: Store schema, migrations, transactional acceptance (`mllm-store`)
+### Task 5: Store schema, migrations, transactional acceptance (`capyctl-store`)
 
 **Files:**
-- Create: `crates/mllm-store/src/{lib.rs, schema.rs, migrations.rs, deployments.rs}`
-- Test: `#[cfg(test)]` in each; T08/T09 cases in `crates/mllm-store/tests/acceptance.rs`
+- Create: `crates/capyctl-store/src/{lib.rs, schema.rs, migrations.rs, deployments.rs}`
+- Test: `#[cfg(test)]` in each; T08/T09 cases in `crates/capyctl-store/tests/acceptance.rs`
 
 **Interfaces:**
-- Consumes: `mllm-domain::{DeploymentId, OperationId, Generation}`.
+- Consumes: `capyctl-domain::{DeploymentId, OperationId, Generation}`.
 - Produces:
 
 ```rust
@@ -539,9 +539,9 @@ pub enum StoreError { Conflict, IdempotencyConflict, StaleGeneration, Sql(rusqli
 - [ ] **Step 1: Failing tests (T08, T09)**
 
 ```rust
-// crates/mllm-store/tests/acceptance.rs
-use mllm_domain::{DeploymentId, OperationId};
-use mllm_store::{AcceptDeployment, Store};
+// crates/capyctl-store/tests/acceptance.rs
+use capyctl_domain::{DeploymentId, OperationId};
+use capyctl_store::{AcceptDeployment, Store};
 
 fn req(name: &str, key: &str) -> AcceptDeployment { /* fixed helper: build with fresh ids */ }
 
@@ -579,7 +579,7 @@ fn same_key_different_content_is_conflict() {
 }
 ```
 
-Run: `cargo test -p mllm-store` → FAIL.
+Run: `cargo test -p capyctl-store` → FAIL.
 
 - [ ] **Step 2: Implement schema + acceptance**
 
@@ -600,25 +600,25 @@ fn store_file_is_owner_only() {
 
 - [ ] **Step 2c: Backup documentation**
 
-Create `crates/mllm-store/docs/backups.md`: the `sqlite3 .backup`-style consistent-copy procedure, written owner-only (0600) into the same protected state directory as the live store, inheriting the no-secrets/no-inference-bodies content rule; retention/rotation explicitly deferred to a later milestone.
+Create `crates/capyctl-store/docs/backups.md`: the `sqlite3 .backup`-style consistent-copy procedure, written owner-only (0600) into the same protected state directory as the live store, inheriting the no-secrets/no-inference-bodies content rule; retention/rotation explicitly deferred to a later milestone.
 
 - [ ] **Step 3: Run and commit**
 
-Run: `cargo test -p mllm-store` → PASS.
+Run: `cargo test -p capyctl-store` → PASS.
 ```bash
-git add crates/mllm-store && git commit -m "feat(store): transactional acceptance, migrations, derived idempotency, owner-only files"
+git add crates/capyctl-store && git commit -m "feat(store): transactional acceptance, migrations, derived idempotency, owner-only files"
 ```
 
 ---
 
-### Task 6: Resource ledger — domains, charging, admission (`mllm-scheduler`)
+### Task 6: Resource ledger — domains, charging, admission (`capyctl-scheduler`)
 
 **Files:**
-- Create: `crates/mllm-scheduler/src/{lib.rs, ledger.rs, admission.rs}`
+- Create: `crates/capyctl-scheduler/src/{lib.rs, ledger.rs, admission.rs}`
 - Test: `#[cfg(test)]` modules (T26, T27, sub-limit, transition peak, staleness)
 
 **Interfaces:**
-- Consumes: `mllm-domain::OwnerAccountId`.
+- Consumes: `capyctl-domain::OwnerAccountId`.
 - Produces:
 
 ```rust
@@ -645,7 +645,7 @@ pub struct Candidate { pub owner: OwnerAccountId, pub domain: String,
 - [ ] **Step 1: Failing tests (T26, T27, sub-limit, peak, stale)**
 
 ```rust
-// crates/mllm-scheduler/src/admission.rs
+// crates/capyctl-scheduler/src/admission.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,7 +765,7 @@ mod tests {
 }
 ```
 
-Run: `cargo test -p mllm-scheduler` → FAIL.
+Run: `cargo test -p capyctl-scheduler` → FAIL.
 
 - [ ] **Step 2: Implement**
 
@@ -789,20 +789,20 @@ Category tagging: `Reservation` gains `category: Option<Category>` (`HostKv`, `P
 
 - [ ] **Step 2b: Run**
 
-Run: `cargo test -p mllm-scheduler` → PASS.
+Run: `cargo test -p capyctl-scheduler` → PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/mllm-scheduler && git commit -m "feat(scheduler): ledger with union charging, sub-limits, transition-peak and freshness checks"
+git add crates/capyctl-scheduler && git commit -m "feat(scheduler): ledger with union charging, sub-limits, transition-peak and freshness checks"
 ```
 
 ---
 
-### Task 7: `auto` resolution with provenance (`mllm-scheduler`)
+### Task 7: `auto` resolution with provenance (`capyctl-scheduler`)
 
 **Files:**
-- Create: `crates/mllm-scheduler/src/auto.rs`
+- Create: `crates/capyctl-scheduler/src/auto.rs`
 - Test: `#[cfg(test)]` in `auto.rs`
 
 **Interfaces:**
@@ -847,10 +847,10 @@ One function, `fn resolve_auto(observed: i64) -> Result<ResolvedAuto, Diagnostic
 
 ---
 
-### Task 8: Adapter, launcher, agent traits (`mllm-adapters`)
+### Task 8: Adapter, launcher, agent traits (`capyctl-adapters`)
 
 **Files:**
-- Create: `crates/mllm-adapters/src/{lib.rs, traits.rs}`
+- Create: `crates/capyctl-adapters/src/{lib.rs, traits.rs}`
 - Test: `#[cfg(test)]` compile-time trait-usage tests (mock impls)
 
 **Interfaces:**
@@ -894,12 +894,12 @@ The remaining payload types (`MemberRef`, `EngineState`, `PlanInput`, `RenderedC
 
 ---
 
-### Task 9: Fake engine harness (`mllm-adapters::fake`)
+### Task 9: Fake engine harness (`capyctl-adapters::fake`)
 
 **Files:**
-- Create: `crates/mllm-adapters/src/fake/{mod.rs, engine.rs, launcher.rs}`
+- Create: `crates/capyctl-adapters/src/fake/{mod.rs, engine.rs, launcher.rs}`
 - Create: `tests/harness/src/lib.rs` (conformance suite entry)
-- Test: `crates/mllm-adapters/tests/fake_scenarios.rs`
+- Test: `crates/capyctl-adapters/tests/fake_scenarios.rs`
 
 **Interfaces:**
 - Consumes: Task 8 traits.
@@ -928,7 +928,7 @@ Helpers used below, defined at the top of the test file as trivial fixtures:
 `fn member() -> MemberRef` (a `MemberRef { deployment_id, member_id }` pair), `fn req(id: &str) -> RequestRef`, `fn cmd() -> RenderedCommand`, `const BUFFER_RESIDUE: i64` (the fake engine's retained-buffer byte count at level 2).
 
 ```rust
-// crates/mllm-adapters/tests/fake_scenarios.rs
+// crates/capyctl-adapters/tests/fake_scenarios.rs
 #[tokio::test]
 async fn slow_startup_liveness_is_not_readiness() {
     let e = FakeEngine::new().with_startup_delay(Duration::from_millis(50));
@@ -993,30 +993,30 @@ async fn crash_at_phase_is_reported() {
 ```
 
 - [ ] **Step 2: Implement the simulator** (state machine over `Phase`, `Mutex` knobs, deterministic virtual clock via `tokio::time`).
-- [ ] **Step 3: Run** `cargo test -p mllm-adapters` → PASS.
+- [ ] **Step 3: Run** `cargo test -p capyctl-adapters` → PASS.
 - [ ] **Step 4: Commit** `feat(adapters): fake engine with slow start, sleep levels, ambiguous outcomes, pid reuse`.
 
 ---
 
-### Task 10: gRPC proto freeze + wire round-trip (`mllm-protocol`)
+### Task 10: gRPC proto freeze + wire round-trip (`capyctl-protocol`)
 
 **Files:**
-- Create: `crates/mllm-protocol/proto/mllm/management/v1/management.proto` (Appendix A of the design verbatim — Envelope wired into all commands/reports, fields 1..n frozen), `crates/mllm-protocol/build.rs`, `crates/mllm-protocol/src/lib.rs`
-- Test: `crates/mllm-protocol/tests/wire_roundtrip.rs`
+- Create: `crates/capyctl-protocol/proto/capyctl/management/v1/management.proto` (Appendix A of the design verbatim — Envelope wired into all commands/reports, fields 1..n frozen), `crates/capyctl-protocol/build.rs`, `crates/capyctl-protocol/src/lib.rs`
+- Test: `crates/capyctl-protocol/tests/wire_roundtrip.rs`
 
 **Interfaces:**
-- Produces: generated types `mllm_protocol::pb::*`; `AgentControl` server/client; `PROTOCOL_VERSION = "1"`.
+- Produces: generated types `capyctl_protocol::pb::*`; `AgentControl` server/client; `PROTOCOL_VERSION = "1"`.
 
 - [ ] **Step 1: Transcribe the proto** from the design's Appendix A exactly (all `Envelope envelope = N;` fields included). `build.rs` uses `tonic-prost-build` (workspace dep) with `protoc` from system or `protobuf-src` — prefer system `protoc`; record in the task output if unavailable.
 
 - [ ] **Step 2: Compile test**
 
-Run: `cargo build -p mllm-protocol` → PASS.
+Run: `cargo build -p capyctl-protocol` → PASS.
 
 - [ ] **Step 3: Failing wire round-trip test**
 
 ```rust
-// crates/mllm-protocol/tests/wire_roundtrip.rs
+// crates/capyctl-protocol/tests/wire_roundtrip.rs
 #[tokio::test]
 async fn agent_control_roundtrip_over_real_channel() {
     // Start an in-process tonic server implementing AgentControl::session that
@@ -1037,7 +1037,7 @@ async fn agent_control_roundtrip_over_real_channel() {
 }
 ```
 
-Run: `cargo test -p mllm-protocol` → PASS.
+Run: `cargo test -p capyctl-protocol` → PASS.
 
 - [ ] **Step 4: Version-check + clock-skew tests + commit**
 
@@ -1054,15 +1054,15 @@ async fn deadline_enforced_with_skew_tolerance() {
     assert!(!deadline_ok(now - 45_000));
 }
 ```
-Commit: `feat(protocol): freeze mllm.management.v1 proto with Envelope wiring, wire round-trip, skew tolerance`.
+Commit: `feat(protocol): freeze capyctl.management.v1 proto with Envelope wiring, wire round-trip, skew tolerance`.
 
 ---
 
-### Task 11: CLI grammar, exit codes, structured output (`mllm-cli`)
+### Task 11: CLI grammar, exit codes, structured output (`capyctl-cli`)
 
 **Files:**
-- Create: `crates/mllm-cli/src/{main.rs, grammar.rs, output.rs, roles.rs}`
-- Test: `crates/mllm-cli/tests/grammar.rs` (T01), `crates/mllm-cli/tests/errors.rs`
+- Create: `crates/capyctl-cli/src/{main.rs, grammar.rs, output.rs, roles.rs}`
+- Test: `crates/capyctl-cli/tests/grammar.rs` (T01), `crates/capyctl-cli/tests/errors.rs`
 
 **Interfaces:**
 - Consumes: Tasks 3–7 outputs.
@@ -1083,14 +1083,14 @@ pub struct ExitCode(pub i32);  // mapping fn: error -> exit code per design §7 
 ```rust
 #[test]
 fn action_first_grammar() {
-    assert!(matches!(parse(["mllm", "start", "server"]),
+    assert!(matches!(parse(["capyctl", "start", "server"]),
         Ok(Command::Start(Role::Server))));
-    assert!(matches!(parse(["mllm", "deploy", "model"]),
+    assert!(matches!(parse(["capyctl", "deploy", "model"]),
         Ok(Command::Deploy{activate: false, wait: false, ..})));
-    assert!(matches!(parse(["mllm", "stop", "deployment", "dep_x"]),
+    assert!(matches!(parse(["capyctl", "stop", "deployment", "dep_x"]),
         Ok(Command::Lifecycle{action: LifecycleAction::Stop, deployment} if deployment == "dep_x")));
-    assert!(parse(["mllm", "server", "run"]).is_err(), "legacy grammar rejected");
-    assert!(parse(["mllm", "start", "power-on", "host-1"]).is_err(),
+    assert!(parse(["capyctl", "server", "run"]).is_err(), "legacy grammar rejected");
+    assert!(parse(["capyctl", "start", "power-on", "host-1"]).is_err(),
         "start targets roles, not remote machines");
 }
 
@@ -1108,10 +1108,10 @@ Run → FAIL; implement clap derive with subcommand tree `start|init|invite|join
 ### Task 12: Standalone wiring — full lifecycle exit gate
 
 **Files:**
-- Create: `crates/mllm-controller/src/{operations.rs, lib.rs}` (operation engine: submit → persist → run against fake participants)
-- Create: `crates/mllm-agent/src/lib.rs` (embedded host: supervision loop over fake launcher/adapter)
-- Modify: `crates/mllm-cli/src/roles.rs` (`start standalone` boots embedded server+host)
-- Test: `crates/mllm-cli/tests/standalone_lifecycle.rs`
+- Create: `crates/capyctl-controller/src/{operations.rs, lib.rs}` (operation engine: submit → persist → run against fake participants)
+- Create: `crates/capyctl-agent/src/lib.rs` (embedded host: supervision loop over fake launcher/adapter)
+- Modify: `crates/capyctl-cli/src/roles.rs` (`start standalone` boots embedded server+host)
+- Test: `crates/capyctl-cli/tests/standalone_lifecycle.rs`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -1146,7 +1146,7 @@ Run → FAIL. Implement the minimal operation engine (per design §5: submit tra
 - [ ] **Step 2: Commit**
 
 ```bash
-git add crates/mllm-controller crates/mllm-agent crates/mllm-cli
+git add crates/capyctl-controller crates/capyctl-agent crates/capyctl-cli
 git commit -m "feat(controller): standalone embedded lifecycle over fake engine (F0 exit gate)"
 ```
 
@@ -1160,7 +1160,7 @@ git commit -m "feat(controller): standalone embedded lifecycle over fake engine 
 
 **Interfaces:** none new.
 
-- [ ] **Step 1: Write the audit table** (T01 → `mllm-cli/tests/grammar.rs`, T02 → `mllm-config/tests/noconfig.rs`, T03 → `strict_yaml` tests, T04 → concurrent-init test, T08/T09 → `mllm-store/tests/acceptance.rs`, T26/T27 → `mllm-scheduler` tests; plus fake-engine scenario suite and wire round-trip).
+- [ ] **Step 1: Write the audit table** (T01 → `capyctl-cli/tests/grammar.rs`, T02 → `capyctl-config/tests/noconfig.rs`, T03 → `strict_yaml` tests, T04 → concurrent-init test, T08/T09 → `capyctl-store/tests/acceptance.rs`, T26/T27 → `capyctl-scheduler` tests; plus fake-engine scenario suite and wire round-trip).
 - [ ] **Step 2: Full suite green** — `cargo test -w --workspace` (unit + integration) — and `cargo clippy -w -- -D warnings` clean.
 - [ ] **Step 3: Commit** `test(mapping): F0 exit-gate coverage audit — all targeted spec ids claimed`.
 

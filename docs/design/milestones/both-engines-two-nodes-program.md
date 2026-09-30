@@ -21,7 +21,7 @@ plus F3 and F4.
 
 ## 2. Sub-projects
 
-### S3a — Ordinary SGLang launch path, mllm side
+### S3a — Ordinary SGLang launch path, capyctl side
 
 The Rust half of "SGLang launches like vLLM".
 
@@ -80,9 +80,9 @@ Depends on: S3a and S3b (SGLang must launch before it can park).
 
 ### F3 — Remote control
 
-- `mllm start server` on `control-host`: REST management + coordinator + store +
+- `capyctl start server` on `control-host`: REST management + coordinator + store +
   gRPC `AgentControl` server.
-- `mllm start host` on each spark: thin agent, outbound session, local launcher
+- `capyctl start host` on each spark: thin agent, outbound session, local launcher
   execution, local journal.
 - `invite` / `join` enrollment, persisted host identity, reconnect without a new
   host record, revocation, stale-command rejection, orphan reconciliation.

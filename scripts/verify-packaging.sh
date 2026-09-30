@@ -15,20 +15,20 @@
 #    runtime is compiled into the binary; no bytecode, no symlinks);
 #    SHA256SUMS and the .sha256 must verify; the binary must be stripped,
 #    report BUILDINFO's version and carry BUILDINFO's runtime manifest.
-# 5. No builder-identifying paths in bin/mllm (the builder's $HOME,
+# 5. No builder-identifying paths in bin/capyctl (the builder's $HOME,
 #    $CARGO_HOME or the checkout path), no lab host identifiers (when known;
 #    see scripts/live/matrix/hosts.local.env), and no match of any pattern
 #    from the untracked private denylist (scripts/private-denylist.txt; see
-#    scripts/README.md) in bin/mllm's strings or in the tracked runtime/*.py
+#    scripts/README.md) in bin/capyctl's strings or in the tracked runtime/*.py
 #    sources that build.rs embeds into it. Absent denylist: skipped, not
 #    failed.
 # 6. packaging/install.sh against a file:// release holding that tarball
 #    (scripts/test-install.sh).
 #
 # A missing optional tool (shellcheck, systemd-analyze) is reported as
-# SKIPPED; set MLLM_VERIFY_STRICT=1 to fail instead. SHELLCHECK names the
+# SKIPPED; set CAPYCTL_VERIFY_STRICT=1 to fail instead. SHELLCHECK names the
 # ShellCheck binary when it is not on PATH. The tarball build accepts a dirty
-# worktree (MLLM_RELEASE_ALLOW_DIRTY=1) because this checks packaging, not a
+# worktree (CAPYCTL_RELEASE_ALLOW_DIRTY=1) because this checks packaging, not a
 # publishable release. Run from anywhere inside the repository.
 set -euo pipefail
 
@@ -41,14 +41,14 @@ fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 pass() { echo "ok:   $*"; }
 skip() { echo "SKIP: $*" >&2; skipped+=("$*"); }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/mllm-verify-packaging.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/capyctl-verify-packaging.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 roles=(server host standalone)
 units=()
 for kind in system user; do
   for role in "${roles[@]}"; do
-    units+=("packaging/systemd/$kind/mllm-$role.service")
+    units+=("packaging/systemd/$kind/capyctl-$role.service")
   done
 done
 
@@ -56,13 +56,21 @@ done
 shellcheck_bin=${SHELLCHECK:-$(command -v shellcheck || true)}
 if [ -n "$shellcheck_bin" ]; then
   if "$shellcheck_bin" packaging/release.sh packaging/install.sh scripts/verify-packaging.sh \
-    scripts/check-release-clean.sh scripts/test-install.sh; then
+    scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh; then
     pass "shellcheck"
   else
     fail "shellcheck"
   fi
 else
   skip "shellcheck not found (set SHELLCHECK)"
+fi
+
+# ADR 0022: no tracked file names the old project name outside the history set.
+if scripts/check-name.sh >"$work/check-name.log" 2>&1; then
+  pass "no tracked file names the old project name (ADR 0022)"
+else
+  fail "tracked files still name the old project name:"
+  cat "$work/check-name.log" >&2
 fi
 
 # --- 2. static unit checks ---------------------------------------------------
@@ -102,11 +110,11 @@ for unit in "${units[@]}"; do
     continue
   fi
   role=$(basename "$unit" .service)
-  role=${role#mllm-}
+  role=${role#capyctl-}
   problems=()
   [ "$(service_value "$unit" Type)" = simple ] || problems+=("Type is not simple")
   [ "$(service_value "$unit" Restart)" = on-failure ] || problems+=("Restart is not on-failure")
-  # Exit codes that never heal by restarting (crates/mllm-cli/src/output.rs):
+  # Exit codes that never heal by restarting (crates/capyctl-cli/src/output.rs):
   # 2 invalid config, 3 unauthorized, 5 unsupported, and for a host, 14 (the
   # controller revoked it; SPEC §4.1, ADR 0016).
   prevent=" $(service_value "$unit" RestartPreventExitStatus) "
@@ -123,8 +131,8 @@ for unit in "${units[@]}"; do
   [ -z "$(service_value "$unit" ExecStop)" ] || problems+=("has an ExecStop (a stop must never drain)")
   start=$(service_value "$unit" ExecStart)
   case "$start" in
-    *"/bin/mllm start $role"*) ;;
-    *) problems+=("ExecStart does not run 'mllm start $role'") ;;
+    *"/bin/capyctl start $role"*) ;;
+    *) problems+=("ExecStart does not run 'capyctl start $role'") ;;
   esac
   if [ "$role" != standalone ]; then
     case "$start" in
@@ -159,7 +167,7 @@ if [ $# -ge 1 ]; then
   tarball=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
   reproducible=unchecked
 else
-  export MLLM_RELEASE_ALLOW_DIRTY=1
+  export CAPYCTL_RELEASE_ALLOW_DIRTY=1
   tarball=$(packaging/release.sh "$work/out1" | tail -n 1)
   second=$(packaging/release.sh "$work/out2" | tail -n 1)
   if cmp -s "$tarball" "$second"; then
@@ -179,16 +187,16 @@ if command -v systemd-analyze >/dev/null; then
   for kind in system user; do
     mkdir -p "$work/units-$kind"
     for role in "${roles[@]}"; do
-      sed -e "s#^ExecStart=[^ ]*/bin/mllm #ExecStart=$pkg/bin/mllm #" \
-        "packaging/systemd/$kind/mllm-$role.service" >"$work/units-$kind/mllm-$role.service"
+      sed -e "s#^ExecStart=[^ ]*/bin/capyctl #ExecStart=$pkg/bin/capyctl #" \
+        "packaging/systemd/$kind/capyctl-$role.service" >"$work/units-$kind/capyctl-$role.service"
     done
     flags=()
     [ "$kind" = user ] && flags+=(--user)
     # Only diagnostics about these units count; the host's own units may warn.
-    if output=$(cd "$work/units-$kind" && systemd-analyze "${flags[@]}" verify --man=no ./mllm-*.service 2>&1); then
+    if output=$(cd "$work/units-$kind" && systemd-analyze "${flags[@]}" verify --man=no ./capyctl-*.service 2>&1); then
       :
     fi
-    ours=$(grep -E '(^|/)mllm-(server|host|standalone)\.service' <<<"$output" || true)
+    ours=$(grep -E '(^|/)capyctl-(server|host|standalone)\.service' <<<"$output" || true)
     if [ -z "$ours" ]; then
       pass "systemd-analyze verify ($kind units)"
     else
@@ -204,7 +212,7 @@ fi
 expected="$work/expected"
 actual="$work/actual"
 {
-  printf '%s\n' bin/mllm BUILDINFO SHA256SUMS
+  printf '%s\n' bin/capyctl BUILDINFO SHA256SUMS
   git ls-files -- LICENSE packaging/systemd docs/examples docs/operations/install.md \
     docs/operations/configuration.md docs/operations/network-access.md \
     docs/operations/release-notes-0.1.0.md
@@ -253,8 +261,8 @@ else
   printf '%s' "$link_problems" >&2
 fi
 
-for unit in system/mllm-server system/mllm-host system/mllm-standalone \
-  user/mllm-server user/mllm-host user/mllm-standalone; do
+for unit in system/capyctl-server system/capyctl-host system/capyctl-standalone \
+  user/capyctl-server user/capyctl-host user/capyctl-standalone; do
   grep -qx "$name/packaging/systemd/$unit.service" "$actual" ||
     fail "tarball lacks packaging/systemd/$unit.service (is it tracked by git?)"
 done
@@ -267,8 +275,8 @@ mode_problems=$(tar --numeric-owner -tvzf "$tarball" | awk -v pkg="$name/" '
     if (owner != "0/0") print "owner " owner ": " path
     if (perms ~ /^l/ || perms ~ /^h/) print "link: " path
     if (path ~ /__pycache__|\.py[co]$/) print "bytecode: " path
-    if (rel ~ /^runtime(\/|$)/) print "runtime file shipped (it is embedded in bin/mllm): " path
-    if (rel == "bin/mllm") {
+    if (rel ~ /^runtime(\/|$)/) print "runtime file shipped (it is embedded in bin/capyctl): " path
+    if (rel == "bin/capyctl") {
       want = "-rwxr-xr-x"
     } else {
       want = (perms ~ /^d/) ? "drwxr-xr-x" : "-rw-r--r--"
@@ -309,23 +317,23 @@ else
 fi
 
 version=$(sed -n 's/^version: //p' "$pkg/BUILDINFO")
-if [ "$("$pkg/bin/mllm" --version)" = "mllm $version" ]; then
-  pass "bin/mllm --version reports $version"
+if [ "$("$pkg/bin/capyctl" --version)" = "capyctl $version" ]; then
+  pass "bin/capyctl --version reports $version"
 else
-  fail "bin/mllm --version does not report BUILDINFO version $version"
+  fail "bin/capyctl --version does not report BUILDINFO version $version"
 fi
 # SPEC §3.3 / ADR 0001: the runtime the binary embeds is the tracked one.
 manifest=$(sed -n 's/^runtime_manifest: //p' "$pkg/BUILDINFO")
-if [ -n "$manifest" ] && grep -qaF "$manifest" "$pkg/bin/mllm"; then
-  pass "bin/mllm embeds runtime manifest $manifest"
+if [ -n "$manifest" ] && grep -qaF "$manifest" "$pkg/bin/capyctl"; then
+  pass "bin/capyctl embeds runtime manifest $manifest"
 else
-  fail "bin/mllm does not embed BUILDINFO's runtime manifest '$manifest'"
+  fail "bin/capyctl does not embed BUILDINFO's runtime manifest '$manifest'"
 fi
 if command -v readelf >/dev/null; then
-  if readelf -S "$pkg/bin/mllm" | grep '\.symtab' >/dev/null; then
-    fail "bin/mllm is not stripped"
+  if readelf -S "$pkg/bin/capyctl" | grep '\.symtab' >/dev/null; then
+    fail "bin/capyctl is not stripped"
   else
-    pass "bin/mllm is stripped"
+    pass "bin/capyctl is stripped"
   fi
 else
   skip "readelf not found; strip not checked"
@@ -344,17 +352,17 @@ esac
 bin_leaks=()
 for pattern in "$HOME" "$cargo_home_check" "$root" "$target_dir_check" "$target_home_remap"; do
   [ -n "$pattern" ] || continue
-  if strings "$pkg/bin/mllm" | grep -F -- "$pattern" >/dev/null; then
+  if strings "$pkg/bin/capyctl" | grep -F -- "$pattern" >/dev/null; then
     bin_leaks+=("$pattern")
   fi
 done
 if [ "${#bin_leaks[@]}" -eq 0 ]; then
-  pass "bin/mllm has no builder \$HOME, \$CARGO_HOME or checkout/build-cache path"
+  pass "bin/capyctl has no builder \$HOME, \$CARGO_HOME or checkout/build-cache path"
 else
-  fail "bin/mllm leaks a builder path: ${bin_leaks[*]}"
+  fail "bin/capyctl leaks a builder path: ${bin_leaks[*]}"
 fi
 
-# runtime/*.py is not shipped as files (it is compiled into bin/mllm; see the
+# runtime/*.py is not shipped as files (it is compiled into bin/capyctl; see the
 # owner/mode check above), so its tracked sources are checked directly against
 # the private denylist below, and, when the lab's host names are known
 # (scripts/live/matrix/hosts.local.env, gitignored, absent outside the lab),
@@ -392,12 +400,12 @@ if [ -f "$denylist_file" ]; then
 
     binary_hits=()
     for pattern in "${denylist[@]}"; do
-      strings "$pkg/bin/mllm" | grep -iF -- "$pattern" >/dev/null && binary_hits+=("$pattern")
+      strings "$pkg/bin/capyctl" | grep -iF -- "$pattern" >/dev/null && binary_hits+=("$pattern")
     done
     if [ "${#binary_hits[@]}" -eq 0 ]; then
-      pass "bin/mllm matches no private-denylist pattern"
+      pass "bin/capyctl matches no private-denylist pattern"
     else
-      fail "bin/mllm matches the private denylist: ${binary_hits[*]}"
+      fail "bin/capyctl matches the private denylist: ${binary_hits[*]}"
     fi
   fi
 else
@@ -438,8 +446,8 @@ echo
 echo "reproducible: $reproducible"
 if [ "${#skipped[@]}" -gt 0 ]; then
   echo "skipped: ${#skipped[@]}"
-  if [ "${MLLM_VERIFY_STRICT:-0}" = 1 ]; then
-    fail "skipped checks under MLLM_VERIFY_STRICT=1"
+  if [ "${CAPYCTL_VERIFY_STRICT:-0}" = 1 ]; then
+    fail "skipped checks under CAPYCTL_VERIFY_STRICT=1"
   fi
 fi
 if [ "$failures" -gt 0 ]; then

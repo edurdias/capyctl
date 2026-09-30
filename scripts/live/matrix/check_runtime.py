@@ -2,10 +2,10 @@
 """Verify a host runtime directory before any engine launch (plan unit W2).
 
 The protected SGLang and vLLM entries refuse a wrapper that others can write,
-or whose ancestors others can write; Phase B found mllm_vllm_guard.py at 0664.
+or whose ancestors others can write; Phase B found capyctl_vllm_guard.py at 0664.
 This check fails before a launch does. Standard library only; read-only.
 
-It also mirrors the host's runtime integrity check (crates/mllm-agent/src/
+It also mirrors the host's runtime integrity check (crates/capyctl-agent/src/
 runtime_integrity.rs, SPEC 9.1 / T21): nothing importable other than `.py`
 source may sit anywhere in the tree, so a `__pycache__` directory or a cached
 `.pyc` is refused here too (found live 2026-09-24: the device probe wrote

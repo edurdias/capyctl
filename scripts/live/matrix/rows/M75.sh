@@ -13,14 +13,14 @@
 # no engine process is spawned. The row needs no server and touches no running
 # role; the state directory is removed afterwards.
 
-M75_ENV_UNSET="-u MLLM_VLLM_BIN -u MLLM_SGLANG_BIN -u MLLM_MODELS_ROOT -u MLLM_ENGINE_FINGERPRINT -u MLLM_ENGINE_PATH"
+M75_ENV_UNSET="-u CAPYCTL_VLLM_BIN -u CAPYCTL_SGLANG_BIN -u CAPYCTL_MODELS_ROOT -u CAPYCTL_ENGINE_FINGERPRINT -u CAPYCTL_ENGINE_PATH"
 
 no_engine_boot() { # no_engine_boot <host>
   local host=$1 dir=$RRD/m75-standalone
   # The refusal is the expected outcome, so the exit status is printed rather
   # than propagated; timeout bounds a boot that wrongly succeeds.
   rsh "$host" "rm -rf $dir && mkdir -m 700 $dir && \
-env $M75_ENV_UNSET MLLM_STATE_DIR=$dir timeout --signal=TERM --kill-after=10 60 $RBIN start standalone --output json 2>&1; \
+env $M75_ENV_UNSET CAPYCTL_STATE_DIR=$dir timeout --signal=TERM --kill-after=10 60 $RBIN start standalone --output json 2>&1; \
 echo \"exit=\$?\"; rm -rf $dir" | tee "$( dry && echo /dev/null || echo "$EVID/no-engine-$host.txt")"
   dry && return 0
   python3 - "$EVID/no-engine-$host.txt" <<'PY'

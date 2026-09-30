@@ -1,4 +1,4 @@
-// Owner feedback 2026-09-25: every `mllm` command the guide and the landing
+// Owner feedback 2026-09-25: every `capyctl` command the guide and the landing
 // page show must exist in the CLI built from this tree: each subcommand and
 // each long option is looked up in that binary's own `--help`.
 import { execFileSync } from 'node:child_process';
@@ -9,12 +9,12 @@ import { checkInvocation, invocations, pageCommands } from './lib/commands.mjs';
 import { HERO_COMMAND } from '../src/data/hero.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const build = execFileSync('cargo', ['build', '--quiet', '--locked', '--offline', '-p', 'mllm-cli', '--bin', 'mllm', '--message-format=json'], {
+const build = execFileSync('cargo', ['build', '--quiet', '--locked', '--offline', '-p', 'capyctl-cli', '--bin', 'capyctl', '--message-format=json'], {
   cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 64 << 20,
 });
 const bin = build.split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  .find((m) => m.reason === 'compiler-artifact' && m.target?.name === 'mllm' && m.executable)?.executable;
-if (!bin) throw new Error('cargo did not report the mllm binary');
+  .find((m) => m.reason === 'compiler-artifact' && m.target?.name === 'capyctl' && m.executable)?.executable;
+if (!bin) throw new Error('cargo did not report the capyctl binary');
 
 const cache = new Map();
 const help = (path) => {
@@ -39,4 +39,4 @@ for (const args of invocations(HERO_COMMAND)) commands.push({ source: 'site/src/
 
 const problems = commands.flatMap(({ source, args }) => checkInvocation(args, help).map((p) => `${source}: ${p}`));
 if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
-console.log(`commands: ${commands.length} shown commands exist in mllm --help`);
+console.log(`commands: ${commands.length} shown commands exist in capyctl --help`);
