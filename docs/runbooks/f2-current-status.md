@@ -1,5 +1,49 @@
 # Current implementation and launch status
 
+## 0.1.0 release check and first-run fixes — 2026-09-29
+
+The readiness pull request (CI, release build, community files) merged at
+`ca95932`. Before the merge, the CI workflow failed validation because
+`runner.temp` is not available in job-level `env`; the fixture path is now set
+in its step, and actionlint passes over every workflow. The site's name check
+had never run: `site/voice-denylist.local.txt` was absent. With a local copy of
+the private denylist it passes.
+
+`v0.1.0` was built from `ca95932` with Rust 1.98.1 on both architectures
+(x86_64 on a maintainer laptop, aarch64 on host A). Each archive was
+byte-identical to a repeat packaging run. The x86_64 strict packaging check
+passed with no SKIP lines. The aarch64 packaging and installer checks passed on
+host A, and its binary had no private-denylist or lab-host match in a local scan.
+
+Installed-binary live check from those archives, through `install.sh`:
+
+- One machine (laptop RTX 4090, standalone): vLLM 0.29 Qwen3-4B deployed in
+  52 s, served, parked to 1009 MiB and woke on request in 3.0 s. An SGLang
+  0.5.20 Qwen2.5-1.5B deployment switched with it both ways. SGLang's first
+  request took 96.9 s (a one-time kernel build), then 0.16–0.26 s.
+- Several machines (laptop server, SGLang on host A, vLLM on host B): both
+  deployments served through the server, a request without the key got 401,
+  both parked in 2 s, and they woke on request in 48.0 s (SGLang) and 8.6 s
+  (vLLM).
+
+All roles stopped with a drained shutdown, and every GPU was left idle.
+
+The check found first-run problems, fixed before 0.1.0:
+
+- The one-time listener migration widened an explicit `127.0.0.1:8443` bind on
+  fresh state to `0.0.0.0:8443`. The owner removed the migration (2026-09-29):
+  a stated bind is always honoured (SPEC §15.1, ADR 0019).
+- An identity directory under `/tmp` was refused with "unsafe or already in
+  use". The message now names the path and the failing check.
+- A listener whose port was taken exited with a generic
+  `management_unavailable`. It now names the listener, the address and the cause.
+- A join file copied as 0644 was refused without naming it. The message now
+  gives the path and the `chmod 600` to run.
+- The requests guide now warns that an engine's first request can be slow.
+
+The fixes change the binary, so both architectures are rebuilt and checked
+again before the draft. CPU and Fake-engine tests are not qualification.
+
 ## External build-cache path removal — 2026-09-27
 
 The release scan caught a generated Rust source path from a shared build cache
