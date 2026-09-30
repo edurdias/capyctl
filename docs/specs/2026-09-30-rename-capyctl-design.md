@@ -38,7 +38,7 @@ with it.
 
 ## History set (not renamed)
 
-`docs/plans/`, `docs/specs/` (other than this file), the existing entries of
+`docs/plans/`, `docs/specs/` (this file included), the existing entries of
 `docs/runbooks/f2-current-status.md`, and ADRs 0001–0021 record the past and
 keep their text. ADR 0022 records the rename and maps the old names to the
 new ones so those records stay readable. Git history is not rewritten.
@@ -64,7 +64,10 @@ changes are part of this change.
    start fresh; the same for `/etc` and `/var/lib`, and reinstall the units).
 4. A leftover check (`scripts/check-name.sh`, run by
    `scripts/verify-packaging.sh` and by CI) fails when `mllm` appears in any
-   tracked file outside the history set, matched case-insensitively.
+   tracked file outside the history set, matched case-insensitively. Its
+allowlist is the history set plus the two places that must name the old
+name: ADR 0022 and the upgrade note in the 0.1.0 release notes. The list
+lives in the script, one path per line.
 
 Machine-local, untracked files (`scripts/private-denylist.txt`,
 `scripts/live/matrix/hosts.local.env`, `site/voice-denylist.local.txt`) are
