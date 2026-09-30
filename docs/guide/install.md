@@ -31,13 +31,12 @@ keep serving through the restart. With
 [several machines](several-machines.md), upgrade the server first, then the
 GPU machines one at a time.
 
-Upgrading from an earlier release candidate to 0.1.0 changes two things once,
-at the first start:
+Two things to know when upgrading from an earlier release candidate to 0.1.0:
 
-- The endpoint moves from `127.0.0.1:8443` to `0.0.0.0:8443`, still with the
-  API key. mllm rewrites that line of its configuration file, keeps the old
-  file as `<file>.pre-0.1.0`, and prints a notice. To keep it on the machine,
-  start with `--listen 127.0.0.1:8443`.
+- Nothing about the endpoint changes by itself. New configuration files
+  listen on `0.0.0.0:8443` with the API key, but a file an earlier release
+  generated keeps `127.0.0.1:8443`. To open it to the network, set
+  `0.0.0.0:8443` in the file or start with `--listen 0.0.0.0:8443`.
 - On a discrete card, mllm now counts the card's memory apart from host RAM.
   The first start stops the engines the earlier release started, re-sizes
   each deployment for the card (its revision goes up by one) and prints which

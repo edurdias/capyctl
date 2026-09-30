@@ -408,11 +408,11 @@ async fn serve_standalone(
     exposure::warn_if_exposed(inference_address, inference_auth);
     let listener = tokio::net::TcpListener::bind(inference_address)
         .await
-        .map_err(roles::StartError::from)?;
+        .map_err(|e| roles::listen_failed("inference", inference_address, e))?;
     // SPEC §16.5: management has its own loopback listener and credential.
     let management = tokio::net::TcpListener::bind(management_address)
         .await
-        .map_err(roles::StartError::from)?;
+        .map_err(|e| roles::listen_failed("management", management_address, e))?;
     roles::record_management_address(state_dir, management_address);
     let admission = shutdown::Admission::new();
     let (stop, stopped) = tokio::sync::watch::channel(false);

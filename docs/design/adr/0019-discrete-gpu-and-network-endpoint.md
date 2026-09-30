@@ -4,8 +4,8 @@
 the same day).
 **Amends:** `SPEC.md` §6.2 (`host_backed` is supported, and the default, where device memory is
 distinct from host RAM), §7.2 (a `device` domain per GPU beside a `distinct` system domain),
-§13.3 (the inference listener may be reachable from the network, behind its key), §15.1 (one
-sanctioned rewrite of an administrator document), §15.2 (listener defaults), §16.2 (a
+§13.3 (the inference listener may be reachable from the network, behind its key), §15.1 (a
+sanctioned rewrite of an administrator document, withdrawn on 2026-09-29), §15.2 (listener defaults), §16.2 (a
 discrete-host resource policy), §16.5 (the generated inference bind), and §20 T26 and T37.
 **Related:** ADR 0007 (phase-aware admission, resident credit), ADR 0010 (declared park tiers),
 ADR 0012 (deep parking default-on, engine listener protections), ADR 0013 (instances and
@@ -250,26 +250,12 @@ host keeps exactly its previous credit and needs the capability for nothing.
   roles; `MLLM_STANDALONE_INFERENCE_ADDR` is still read, with a deprecation warning), then
   `listeners.inference.bind` (`server.listeners.inference.bind` in standalone), then the
   default. `--set` and `MLLM_SET__…` apply on top, as for any setting.
-- **One-time migration.** On the first start of this release, a server or standalone
-  document whose inference bind is exactly `127.0.0.1:8443` (the old generated default) is
-  rewritten to `0.0.0.0:8443`. The rewrite replaces that value's single occurrence, so
-  comments and layout survive, writes a temporary file in the same directory, syncs it and
-  renames it over the document, keeping the original beside it as `<file>.pre-0.1.0` with
-  the same mode. If the value does not occur exactly once, or the write fails, the document
-  is left unchanged and the role serves on `0.0.0.0:8443`
-  (`config_migration_failed`, a warning, not an exit); the migration stays pending, so
-  every later start that finds the unchanged old default does the same until the document
-  states another address. The marker
-  `<state_dir>/migrations/inference-bind-v1` is written on that first start whatever it
-  found (as pending when the document could not be rewritten), so a completed migration
-  never runs twice and an operator who sets `127.0.0.1:8443` back keeps it. Any other address is never migrated, and authentication is never changed. The
-  start prints a one-time notice to stderr:
-
-  ```
-  NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
-  The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
-  To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
-  ```
+- **One-time migration (removed before 0.1.0).** This release first rewrote a document
+  stating `127.0.0.1:8443` to `0.0.0.0:8443` on its first start. The owner removed that
+  migration on 2026-09-29, before the first public release: fresh state could not tell an
+  earlier generator's default from an operator's explicit choice, so an operator who set
+  loopback before the first start had it widened. A stated inference bind is now always
+  honoured, and `0.0.0.0:8443` is only the default of newly generated documents.
 
 - **TLS.** The inference listener serves plain HTTP. That is acceptable on loopback and
   over Tailscale, which encrypts the path; beyond a private network a TLS reverse proxy in
@@ -347,7 +333,6 @@ host and enroll the machine again as a new host).
 | `host_backed_unavailable` | resolution | `host_backed` on a unified domain, or a copy larger than the system domain's parked room | 5 |
 | `capability_missing:deep_park` | launch | a `host_backed` (or `deep`) launch on a build whose probe lacks parking, or an SGLang ModelOpt checkpoint | launch refusal |
 | `host_capability_missing:device_memory_domains` | placement | an older host cannot report device memory or take a GPU choice | placement refusal |
-| `config_migration_failed` | start | the listener migration could not rewrite the document; the role serves on `0.0.0.0:8443` and says so | warning, no exit |
 
 The design's error table listed `host_backed_unavailable` also for a build lacking the
 parking capability. The implementation reuses `capability_missing:deep_park` for that case

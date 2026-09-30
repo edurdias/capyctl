@@ -272,6 +272,47 @@ fn validate_leaf(meta: &Metadata, uid: u32, allow_empty: bool) -> Result<(), Sto
         Ok(())
     }
 }
+/// Why [`IdentityDirectory::open`] refused `path`, in words an operator can act
+/// on. The checks are the ones `validate_directory` applies, run again only to
+/// name the first that fails; the refusal itself never depends on this text.
+pub fn describe_refusal(path: &Path, error: &StorageError) -> String {
+    let shown = path.display();
+    match error {
+        StorageError::Busy => format!("{shown} is in use by another mllm process"),
+        StorageError::Invalid => {
+            let uid = unsafe { libc::geteuid() };
+            match fs::symlink_metadata(path) {
+                Err(_) => return format!("{shown} does not exist"),
+                Ok(meta) if !meta.is_dir() => return format!("{shown} is not a directory"),
+                Ok(meta) if meta.uid() != uid => {
+                    return format!("{shown} is owned by another user")
+                }
+                Ok(meta) if meta.mode() & 0o7777 != 0o700 => {
+                    return format!(
+                        "{shown} has mode {:04o}; it must be 0700",
+                        meta.mode() & 0o7777
+                    )
+                }
+                Ok(_) => {}
+            }
+            for ancestor in path.ancestors().skip(1) {
+                if let Ok(meta) = fs::symlink_metadata(ancestor) {
+                    if ![0, uid].contains(&meta.uid()) || meta.mode() & 0o022 != 0 {
+                        return format!(
+                            "{} (a parent of {shown}) can be written by other users; \
+                             use a directory whose parents only you or root can write, \
+                             for example under your home directory",
+                            ancestor.display()
+                        );
+                    }
+                }
+            }
+            format!("{shown} is not a canonical path or holds an unsafe entry")
+        }
+        other => format!("{shown}: {other}"),
+    }
+}
+
 fn validate_directory(path: &Path, uid: u32) -> Result<(), StorageError> {
     let text = path.to_str().ok_or(StorageError::Invalid)?;
     if !path.is_absolute()

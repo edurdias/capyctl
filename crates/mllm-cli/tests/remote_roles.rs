@@ -211,6 +211,44 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
     let stderr = String::from_utf8_lossy(&joined.stderr);
     assert!(stderr.contains("Invalid join invitation"), "{stderr}");
 }
+// T04 (U5 live): an invitation copied with a wider mode (scp under umask 022
+// gives 0644) is refused with its path and the command that fixes it.
+#[test]
+fn join_names_an_invitation_with_a_wide_mode() {
+    let temp = root();
+    let state = temp.path().join("host-state");
+    let config = temp.path().join("host.yaml");
+    assert!(cli(
+        &state,
+        &["init", "host", "--output", config.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let invitation = temp.path().join("host.join");
+    fs::write(&invitation, b"not an invitation").unwrap();
+    fs::set_permissions(&invitation, fs::Permissions::from_mode(0o644)).unwrap();
+    let joined = cli(
+        &state,
+        &[
+            "join",
+            "host",
+            "--join-file",
+            invitation.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ],
+    );
+    assert!(!joined.status.success());
+    let stderr = String::from_utf8_lossy(&joined.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Unsafe or incomplete private file {}: it has mode 0644; run `chmod 600 {}`",
+            invitation.display(),
+            invitation.display()
+        )),
+        "{stderr}"
+    );
+}
 // T03: invalid explicit config never generates state or falls back. SPEC
 // §15.2 (R13): the standalone role honours `--config` the same way; a missing
 // explicit document exits as invalid configuration (2).

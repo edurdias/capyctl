@@ -160,20 +160,8 @@ Open only port 443 to the internet, never 8443.
 
 ## Upgrading from an earlier release
 
-A server or standalone document whose inference bind is exactly
-`127.0.0.1:8443` (the old generated default) is changed once, at the first start
-of 0.1.0, to `0.0.0.0:8443`. A copy of the old file is kept as
-`<file>.pre-0.1.0`, and the start prints:
-
-```
-NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
-The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
-To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
-```
-
-It happens once: the marker `<state dir>/migrations/inference-bind-v1` records
-it, so setting `127.0.0.1:8443` back afterwards is kept. Any other address,
-and the authentication setting, are never changed. If the document cannot be
-rewritten (read-only, or the address appears more than once in it), it is left
-as it is, the role serves on `0.0.0.0:8443` for that run only, and the notice
-says which line to edit; later starts follow the document again.
+mllm never rewrites your configuration. A document an earlier release
+generated keeps its `127.0.0.1:8443` inference bind, so inference stays on the
+machine until you change it. To serve the network, set the bind to
+`0.0.0.0:8443` (or the machine's Tailscale address) or start with
+`--listen 0.0.0.0:8443`. Newly generated documents already use `0.0.0.0:8443`.

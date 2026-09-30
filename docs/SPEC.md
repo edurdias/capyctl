@@ -579,7 +579,7 @@ The engines file is mllm-owned operational state, not administrator YAML: mllm w
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-One sanctioned rewrite: the one-time migration of the old loopback inference default (ADR 0019). A server or standalone document whose inference bind is exactly `127.0.0.1:8443` is rewritten once to `0.0.0.0:8443`, atomically, with the original kept as `<file>.pre-0.1.0`, a marker under the state directory and a notice; no other value is changed and it never runs twice.
+mllm never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
 
 ### 15.2 No-config behavior
 

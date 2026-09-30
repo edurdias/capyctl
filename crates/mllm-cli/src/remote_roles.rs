@@ -9,7 +9,6 @@ use mllm_agent::{
     identity_storage::IdentityDirectory,
     journal::HostJournal,
 };
-use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 use mllm_config::remote_roles::{HostConfig, ServerConfig};
 use mllm_controller::{
     agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
@@ -54,6 +53,40 @@ pub fn host_revoked(host: &str) -> StructuredError {
         message: format!(
             "Host {host} is revoked; its engines keep running. To recover the same identity, run `mllm invite host {host} --recover --output FILE` on the server for a new recovery invitation, then `mllm join host --join-file FILE --recover` on this host, and start the host again"
         ),
+    }
+}
+/// SPEC §13.1: identity storage refuses an unsafe or busy directory; the
+/// message names the path and the check that failed so the operator can act.
+fn identity_refused(
+    what: &str,
+    path: &Path,
+    refusal: &mllm_agent::identity_storage::StorageError,
+    hint: &str,
+) -> StructuredError {
+    error(&format!(
+        "{what} refused: {}{hint}",
+        mllm_agent::identity_storage::describe_refusal(path, refusal)
+    ))
+}
+/// A listener that cannot bind names itself, its address and the reason, so
+/// a port another process holds is not reported as a generic failure.
+fn listen_failed(
+    listener: &str,
+    address: std::net::SocketAddr,
+    failure: &std::io::Error,
+) -> StructuredError {
+    let reason = match failure.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            "the address is already in use (another mllm role or program listens there)".to_owned()
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            "the address does not belong to this machine".to_owned()
+        }
+        _ => failure.to_string(),
+    };
+    StructuredError {
+        code: "management_unavailable",
+        message: format!("Cannot listen on {address} for the {listener} listener: {reason}"),
     }
 }
 fn unavailable() -> StructuredError {
@@ -129,23 +162,44 @@ fn private_read(path: &Path) -> Result<Vec<u8>, StructuredError> {
             || ![0, unsafe { libc::geteuid() }].contains(&m.uid())
             || m.mode() & 0o022 != 0
         {
-            return Err(error("Unsafe private file directory"));
+            return Err(error(&format!(
+                "Unsafe private file directory: {} (holding {}) can be written by other users",
+                ancestor.display(),
+                path.display()
+            )));
         }
     }
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|_| unavailable())?;
+        .map_err(|e| StructuredError {
+            code: "management_unavailable",
+            message: format!("Cannot open private file {}: {e}", path.display()),
+        })?;
     let m = file.metadata().map_err(|_| unavailable())?;
-    if !m.is_file()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o7777 != 0o600
-        || m.nlink() != 1
-        || m.len() == 0
-        || m.len() > 131072
-    {
-        return Err(error("Unsafe or incomplete private file"));
+    let refusal = if !m.is_file() {
+        Some("it is not a regular file".to_owned())
+    } else if m.uid() != unsafe { libc::geteuid() } {
+        Some("it is owned by another user".to_owned())
+    } else if m.mode() & 0o7777 != 0o600 {
+        Some(format!(
+            "it has mode {:04o}; run `chmod 600 {}`",
+            m.mode() & 0o7777,
+            path.display()
+        ))
+    } else if m.nlink() != 1 {
+        Some("it has more than one hard link".to_owned())
+    } else if m.len() == 0 || m.len() > 131072 {
+        Some("it is empty or larger than 128 KiB".to_owned())
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        return Err(error(&format!(
+            "Unsafe or incomplete private file {}: {reason}",
+            path.display()
+        )));
     }
     let mut bytes = Vec::new();
     (&mut file)
@@ -271,7 +325,7 @@ fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, Str
     private_dir(root)?;
     private_dir(&root.join("identity"))?;
     let storage = IdentityDirectory::open(&root.join("identity"))
-        .map_err(|_| error("Role identity is unsafe or already in use"))?;
+        .map_err(|e| identity_refused("Role identity", &root.join("identity"), &e, ""))?;
     if role == InitTarget::Server {
         if storage
             .read_bundle("server-credentials.json")
@@ -382,8 +436,14 @@ pub(crate) fn wait_limits(
 }
 
 async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
-    let storage = IdentityDirectory::open(&config.identity_dir)
-        .map_err(|_| error("Server identity is missing, unsafe or already in use"))?;
+    let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+        identity_refused(
+            "Server identity",
+            &config.identity_dir,
+            &e,
+            "; run init server first",
+        )
+    })?;
     let credentials = load_credentials(&config)?;
     let ca = enrollment::load_controller_ca(&storage)
         .map_err(|_| error("Server CA is missing or invalid; explicit recovery is required"))?;
@@ -638,19 +698,19 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             );
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("management", config.management, &e))?;
     crate::roles::record_management_address(&config.state_dir, config.management);
     // Design §9: said out loud before the listener accepts connections.
     crate::exposure::warn_if_exposed(config.inference, config.inference_auth);
     let inference_listener = tokio::net::TcpListener::bind(config.inference)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("inference", config.inference, &e))?;
     let bootstrap_listener = tokio::net::TcpListener::bind(config.bootstrap)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("bootstrap", config.bootstrap, &e))?;
     let control_listener = tokio::net::TcpListener::bind(config.control)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("control", config.control, &e))?;
     let identity = Identity::from_pem(certificate.pem, key.private_key_pem());
     // SPEC §4.3 (owner decision P3): a signal is a service restart. Inference
     // admission closes first, admitted streams finish within the bound, then
@@ -864,8 +924,14 @@ async fn serve_host(
             mllm_agent::gpu_memory::shape(boot_gpu.as_ref()).map_err(|e| error(&e.to_string()))?;
         check_host_device_policy(&config.document, &shape)?;
     }
-    let storage = IdentityDirectory::open(&config.identity_dir)
-        .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
+    let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+        identity_refused(
+            "Host identity",
+            &config.identity_dir,
+            &e,
+            "; run join host before startup",
+        )
+    })?;
     let identity = PendingEnrollment::load(&storage).map_err(|_| {
         error(
             "Host is not enrolled or its identity needs recovery; run join host with an invitation",
@@ -944,8 +1010,15 @@ async fn serve_host(
         // SPEC §8.2 / T21: per-launch SGLang file rendezvous directories,
         // removed on gone evidence (0700, this service user).
         private_dir(&config.state_dir.join("rendezvous"))?;
-        let private = IdentityDirectory::open(&config.state_dir.join("ingress-identity"))
-            .map_err(|_| unavailable())?;
+        let private =
+            IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|e| {
+                identity_refused(
+                    "Ingress identity",
+                    &config.state_dir.join("ingress-identity"),
+                    &e,
+                    "",
+                )
+            })?;
         let identities = mllm_agent::ingress_identity::IngressIdentities::new(private);
         let execution = mllm_agent::native_execution::NativeHostExecution::new(
             journal.clone(),
@@ -974,7 +1047,7 @@ async fn serve_host(
         .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia());
         let listener = tokio::net::TcpListener::bind(settings.bind)
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|e| listen_failed("ingress", settings.bind, &e))?;
         (Some(execution), Some(listener))
     } else {
         (None, None)
@@ -1241,35 +1314,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(dir) = &state_dir {
                     config = config.with_state_dir(dir.clone());
                 }
-                // ADR 0019, design §9: the old loopback default moves to
-                // 0.0.0.0:8443 once, after the document has been accepted.
-                // The migration reads the file's own bind, not an override.
-                let file_bind = mllm_config::parse_document(&source)
-                    .ok()
-                    .and_then(|document| {
-                        document["listeners"]["inference"]["bind"]
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                let document_bind = match crate::roles::listener_migration(
-                    &path,
-                    &config.state_dir,
-                    file_bind.as_deref(),
-                ) {
-                    Migration::Rewritten { .. } => {
-                        config = parse(&read_config(&path)?)?;
-                        if let Some(dir) = &state_dir {
-                            config = config.with_state_dir(dir.clone());
-                        }
-                        config.inference
-                    }
-                    Migration::BindOnly { .. }
-                        if overrides.get("listeners.inference.bind").is_none() =>
-                    {
-                        NEW_INFERENCE_DEFAULT.parse().expect("valid default")
-                    }
-                    Migration::BindOnly { .. } | Migration::NotNeeded => config.inference,
-                };
+                let document_bind = config.inference;
                 // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document,
                 // by the rule the standalone role uses, and never onto another
                 // server listener.
@@ -1385,8 +1430,13 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }
                 _ => {}
             }
-            let storage = IdentityDirectory::open(&config.identity_dir).map_err(|_| {
-                error("Host identity is unsafe or already in use; stop the host role first")
+            let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+                identity_refused(
+                    "Host identity",
+                    &config.identity_dir,
+                    &e,
+                    "; stop the host role first",
+                )
             })?;
             let mut pending = if *recover {
                 PendingEnrollment::prepare_recovery(&storage, &invitation).map_err(|_| {
