@@ -1873,7 +1873,7 @@ async fn start_standalone_in(
     );
     let configuration = Arc::new(
         mllm_management::configuration::SharedConfigurationSource::new_shared(
-            owner,
+            owner.clone(),
             embedded.shared_document(),
             "standalone",
         )
@@ -1923,6 +1923,57 @@ async fn start_standalone_in(
             .map_err(|_| StartError::MissingCredentials)?,
         embedded.installations(),
     );
+    // SPEC §4.2: the same host and engine inventory a server serves, for the
+    // one embedded host: its published document (so `engine add` shows at
+    // once) and its memory as observed now (one `/proc` read, plus a bounded
+    // GPU sample on a discrete-GPU host).
+    let hosts_view = mllm_management::hosts::standalone_hosts_router(
+        mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?,
+        owner,
+        mllm_management::hosts::StandaloneHost {
+            host_id: declared_host.name.clone(),
+            document: {
+                let embedded = embedded.clone();
+                Arc::new(move || embedded.document())
+            },
+            installations: embedded.installations(),
+            domains: {
+                let observed = crate::host_observation::observed_domains(&declared_host.domains);
+                let (memory, gpu) = (memory.clone(), gpu.clone());
+                let host = declared_host.name.clone();
+                Arc::new(move || {
+                    let (observed, memory, gpu, host) =
+                        (observed.clone(), memory.clone(), gpu.clone(), host.clone());
+                    Box::pin(async move {
+                        let kinds = observed.clone();
+                        let Ok(observations) = HostMemoryObservation::with_domains(observed)
+                            .with_memory_reader(memory)
+                            .with_gpu_sampler(gpu)
+                            .observe(host)
+                            .await
+                        else {
+                            return Vec::new();
+                        };
+                        observations
+                            .into_iter()
+                            .map(|o| {
+                                let device = kinds.iter().any(|d| {
+                                    matches!(d, crate::host_observation::ObservedDomain::Device { domain, .. } if *domain == o.domain)
+                                });
+                                serde_json::json!({
+                                    "domain_id": o.domain,
+                                    "kind": if device { "device" } else { "host" },
+                                    "capacity_bytes": o.capacity_bytes,
+                                    "available_bytes": o.available_bytes,
+                                })
+                            })
+                            .collect()
+                    })
+                })
+            },
+        },
+    );
     // SPEC §17 (M80): the router's per-request latency distributions. The
     // embedded engine has no host ingress or load report, so only the router
     // tier is measured here.
@@ -1954,6 +2005,7 @@ async fn start_standalone_in(
     let management = mllm_management::lifecycle_router(management_credentials, source)
         .merge(drain)
         .merge(installation_view)
+        .merge(hosts_view)
         .merge(latency_view)
         .merge(inference_listener_view);
     let controller =

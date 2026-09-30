@@ -387,6 +387,98 @@ async fn the_engines_listing_shows_published_profiles() {
     setup.worker.shutdown().await.unwrap();
 }
 
+// T07 T21, SPEC §4.2: a standalone role serves its one embedded host at the
+// server's inventory routes, in the server's shapes, with the same
+// authentication and the same refusal of a query string.
+#[tokio::test]
+async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
+    let setup = setup().await;
+    let id = setup.id.clone();
+    start(&setup, &id).await;
+    place_on_lab(&setup.dir, &setup.owner, &id);
+    let mut document: Value = serde_json::from_str(include_str!(
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut host = document["input"]["host"].take();
+    host["name"] = json!("lab");
+    host["runtime_profiles"]["local"]["build_fingerprint"] = json!("0.29.0+patched");
+    let published = host.clone();
+    let router = mllm_management::hosts::standalone_hosts_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        setup.owner.clone(),
+        mllm_management::hosts::StandaloneHost {
+            host_id: "lab".into(),
+            document: Arc::new(move || published.clone()),
+            installations: mllm_controller::installation_gate::EmbeddedInstallations::new(),
+            domains: Arc::new(|| {
+                Box::pin(async {
+                    vec![json!({"domain_id": "system", "kind": "host",
+                        "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
+                })
+            }),
+        },
+    );
+    let get = |uri: &str, token: Option<&str>| {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        router.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+    let (status, _) = body(get("/management/v1/hosts", None).await.unwrap()).await;
+    assert_eq!(status, 401);
+    let (status, _) = body(
+        get("/management/v1/engines?x=1", Some(MANAGEMENT))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    let (status, hosts) = body(get("/management/v1/hosts", Some(MANAGEMENT)).await.unwrap()).await;
+    assert_eq!(status, 200, "{hosts}");
+    assert_eq!(hosts["api_version"], "1");
+    let row = &hosts["hosts"][0];
+    assert_eq!(hosts["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(row["host_id"], "lab");
+    assert_eq!(row["name"], "lab");
+    assert_eq!(row["revoked"], false);
+    assert_eq!(row["online"], true);
+    assert_eq!(row["eligible"], true);
+    assert_eq!(row["compatibility"], "supported");
+    assert_eq!(
+        row["binary_version"],
+        mllm_controller::agent_sessions::SERVER_VERSION
+    );
+    // Derived from the document (deep parking is on by default), as on a server.
+    assert_eq!(row["development_controls"]["state"], "exposed");
+    assert_eq!(row["session"]["profiles"][0]["name"], "local");
+    assert_eq!(
+        row["session"]["domains"][0]["available_bytes"],
+        32_i64 << 30
+    );
+
+    let (status, listing) = body(
+        get("/management/v1/engines", Some(MANAGEMENT))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "{listing}");
+    let row = &listing["engines"][0];
+    assert_eq!(row["host"], "lab");
+    assert_eq!(row["profile"], "local");
+    assert_eq!(row["engine"], "vllm");
+    assert_eq!(row["version"], "0.29.0+patched");
+    assert_eq!(row["custom"], true);
+    assert_eq!(row["online"], true);
+    assert_eq!(row["published"], "published");
+    assert_eq!(row["retiring"], false);
+    assert_eq!(row["deployments"].as_array().unwrap().len(), 1);
+    setup.worker.shutdown().await.unwrap();
+}
+
 // T16 T32 (review decision I1): a retried remove, under a new request key
 // and without drain, resumes the draining retirement rather than being refused
 // as a conflict or cancelling it; its poll follows the standing retirement to
