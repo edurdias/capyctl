@@ -142,7 +142,7 @@ fn clean(text: &str) -> String {
 }
 
 /// A scalar cell: strings as they are, numbers as written, `-` for absent.
-fn text(value: &Value) -> String {
+pub(crate) fn text(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),
         Value::String(s) if s.is_empty() => "-".into(),
@@ -257,7 +257,7 @@ fn hosts(value: &Value) -> String {
 }
 
 /// The distinct hosts a deployment's instances are placed on, by name.
-fn instance_hosts(deployment: &Value, names: &HostNames) -> String {
+pub(crate) fn instance_hosts(deployment: &Value, names: &HostNames) -> String {
     let mut seen: Vec<String> = Vec::new();
     for instance in deployment["instances"].as_array().into_iter().flatten() {
         if let Some(id) = instance["host_id"].as_str() {
@@ -274,7 +274,7 @@ fn instance_hosts(deployment: &Value, names: &HostNames) -> String {
     }
 }
 
-fn ready(deployment: &Value) -> String {
+pub(crate) fn ready(deployment: &Value) -> String {
     format!(
         "{}/{}",
         number(&deployment["ready_instances"]).unwrap_or(0),
@@ -308,7 +308,7 @@ fn deployments(value: &Value, names: &HostNames) -> String {
     table(&["NAME", "STATE", "READY", "REVISION", "HOSTS"], &rows)
 }
 
-fn operation(op: &Value) -> String {
+pub(crate) fn operation(op: &Value) -> String {
     if !op.is_object() {
         return "-".into();
     }

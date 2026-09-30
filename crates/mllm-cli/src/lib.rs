@@ -30,3 +30,4 @@ pub mod standalone_engines;
 // Owner decision 2026-09-25: table output for record views.
 pub mod table;
 pub mod validate;
+pub mod views;
