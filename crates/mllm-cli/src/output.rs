@@ -265,6 +265,24 @@ impl OutputFormat {
             _ => None,
         }
     }
+
+    /// ADR 0021: `--format` (or `--output json`) wins. Otherwise a command
+    /// prints text, and a role prints text only when stderr is a terminal,
+    /// so the journal, files and pipes get JSON lines.
+    pub fn resolve(
+        format: Option<&str>,
+        output: Option<&str>,
+        role: bool,
+        stderr_is_terminal: bool,
+    ) -> OutputFormat {
+        match (format, output) {
+            (Some("json"), _) => OutputFormat::Json,
+            (Some(_), _) => OutputFormat::Text,
+            (None, Some("json")) => OutputFormat::Json,
+            _ if role && !stderr_is_terminal => OutputFormat::Json,
+            _ => OutputFormat::Text,
+        }
+    }
 }
 
 pub fn print_error(err: &StructuredError, format: OutputFormat) {
@@ -431,4 +449,27 @@ pub fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::OutputFormat;
+
+    // T02 (ADR 0021): commands never detect; roles follow stderr unless told.
+    #[test]
+    fn resolve_follows_the_format_rule() {
+        use OutputFormat::{Json, Text};
+        assert_eq!(OutputFormat::resolve(None, None, false, false), Text);
+        assert_eq!(OutputFormat::resolve(None, None, false, true), Text);
+        assert_eq!(OutputFormat::resolve(Some("json"), None, false, true), Json);
+        assert_eq!(OutputFormat::resolve(None, Some("json"), false, true), Json);
+        assert_eq!(
+            OutputFormat::resolve(Some("table"), None, false, false),
+            Text
+        );
+        assert_eq!(OutputFormat::resolve(None, None, true, true), Text);
+        assert_eq!(OutputFormat::resolve(None, None, true, false), Json);
+        assert_eq!(OutputFormat::resolve(Some("text"), None, true, false), Text);
+        assert_eq!(OutputFormat::resolve(Some("json"), None, true, true), Json);
+    }
 }
