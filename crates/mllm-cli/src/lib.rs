@@ -2,6 +2,7 @@ pub mod client;
 // Owner decision 2026-09-25: the minimal deployment file as the CLI reads it.
 mod client_journal;
 pub mod deployment_file;
+pub mod detail;
 pub mod device_inventory;
 pub mod drain;
 pub mod engine;
