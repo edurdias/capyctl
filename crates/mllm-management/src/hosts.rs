@@ -323,8 +323,31 @@ async fn standalone_hosts(State(state): State<Arc<StandaloneState>>) -> Response
         return error(StatusCode::TOO_MANY_REQUESTS, "queue_full", true);
     };
     let document = (state.host.document)();
-    let domains = (state.host.domains)().await;
+    let now_ms = mllm_protocol::now_unix_ms();
+    let domains: Vec<_> = (state.host.domains)()
+        .await
+        .into_iter()
+        .map(|mut domain| {
+            // Server domains carry when they were observed; standalone samples now.
+            if let Some(map) = domain.as_object_mut() {
+                map.insert("observed_at_unix_ms".into(), now_ms.into());
+                map.insert("observed_at_unix".into(), (now_ms / 1000).into());
+            }
+            domain
+        })
+        .collect();
     let views = state.host.installations.views();
+    // Owner decision 4: a drain of the embedded host that has not settled.
+    let (owner, host_id) = (state.owner.clone(), state.host.host_id.clone());
+    let drain_pending = tokio::task::spawn_blocking(move || {
+        owner
+            .lock()
+            .ok()
+            .and_then(|owner| owner.store().host_drain_pending(&host_id).ok())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
     let profiles: Vec<_> = document["runtime_profiles"]
         .as_object()
         .into_iter()
@@ -334,9 +357,15 @@ async fn standalone_hosts(State(state): State<Arc<StandaloneState>>) -> Response
             serde_json::json!({
                 "name": name,
                 "build_fingerprint": profile["build_fingerprint"],
-                "installation": installation.map(|v| serde_json::json!({
-                    "version": v["version"], "digest": v["digest"], "state": v["state"],
-                })),
+                "eligibility": "eligible",
+                "installation": serde_json::json!({
+                    "version": installation.map_or(&serde_json::Value::Null, |v| &v["version"]),
+                    "digest": installation.map_or(&serde_json::Value::Null, |v| &v["digest"]),
+                    "state": installation.map_or(&serde_json::Value::Null, |v| &v["state"]),
+                    "capabilities_missing": installation
+                        .and_then(|v| v["capabilities_missing"].as_array().cloned())
+                        .unwrap_or_default(),
+                }),
             })
         })
         .collect();
@@ -345,8 +374,10 @@ async fn standalone_hosts(State(state): State<Arc<StandaloneState>>) -> Response
         "api_version": "1",
         "server_version": mllm_controller::agent_sessions::SERVER_VERSION,
         "hosts": [{
-            "host_id": id, "name": id, "revoked": false, "online": true, "eligible": true,
-            "session": {"profiles": profiles, "domains": domains},
+            "host_id": id, "name": id, "revoked": false, "online": true, "eligible": !drain_pending,
+            "session": {"profiles": profiles, "domains": domains, "reconciled": true,
+                "drain_pending": drain_pending},
+            "capabilities": mllm_protocol::capabilities::agent_capabilities(),
             "binary_version": mllm_controller::agent_sessions::SERVER_VERSION,
             "compatibility": "supported", "compatibility_reason": null,
             "development_controls": development_controls(Some(&document)),
@@ -397,7 +428,11 @@ async fn standalone_engines(State(state): State<Arc<StandaloneState>>) -> Respon
                         "version": v["version"], "digest": v["digest"], "state": v["state"],
                     })
                 }),
-                deep_park_missing: false,
+                deep_park_missing: installation.is_some_and(|v| {
+                    v["capabilities_missing"]
+                        .as_array()
+                        .is_some_and(|m| m.iter().any(|c| c == "deep_park"))
+                }),
                 retiring,
                 deployments,
             }));

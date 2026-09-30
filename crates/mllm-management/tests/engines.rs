@@ -458,6 +458,21 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
         row["session"]["domains"][0]["available_bytes"],
         32_i64 << 30
     );
+    // Server parity: the binary's capabilities, profile eligibility and the
+    // installation's missing capabilities, reconciled, drain and observed time.
+    assert!(row["capabilities"]
+        .as_array()
+        .is_some_and(|c| !c.is_empty()));
+    assert_eq!(row["session"]["profiles"][0]["eligibility"], "eligible");
+    assert_eq!(
+        row["session"]["profiles"][0]["installation"]["capabilities_missing"],
+        json!([])
+    );
+    assert_eq!(row["session"]["reconciled"], true);
+    assert_eq!(row["session"]["drain_pending"], false);
+    assert!(row["session"]["domains"][0]["observed_at_unix_ms"]
+        .as_i64()
+        .is_some_and(|t| t > 0));
 
     let (status, listing) = body(
         get("/management/v1/engines", Some(MANAGEMENT))
@@ -475,7 +490,25 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
     assert_eq!(row["online"], true);
     assert_eq!(row["published"], "published");
     assert_eq!(row["retiring"], false);
+    assert_eq!(row["deep_park_probe"], "not_reported_missing");
     assert_eq!(row["deployments"].as_array().unwrap().len(), 1);
+
+    // T16 T07 T21: a standing profile retirement reads `retiring` on standalone.
+    setup
+        .owner
+        .lock()
+        .unwrap()
+        .store()
+        .begin_profile_retirement("lab", "local", "lab:req-1", 1, 2, true)
+        .unwrap();
+    let (status, listing) = body(
+        get("/management/v1/engines", Some(MANAGEMENT))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "{listing}");
+    assert_eq!(listing["engines"][0]["retiring"], true);
     setup.worker.shutdown().await.unwrap();
 }
 
