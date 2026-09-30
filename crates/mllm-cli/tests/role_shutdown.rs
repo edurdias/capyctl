@@ -2020,3 +2020,26 @@ async fn start_host_prints_a_ready_line_and_its_first_session_is_accepted() {
     server.signal();
     server.exit(Duration::from_secs(30));
 }
+
+/// T02 (design §9): a server whose inference address another process holds
+/// exits and names the listener, the address and the cause, instead of the
+/// generic `management_unavailable` message.
+#[test]
+fn start_server_names_a_listener_address_in_use() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = held.local_addr().unwrap().to_string();
+    let (_root, state, config) = server_installation(&address);
+    let out = server_command(&state)
+        .args(["start", "server", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!(
+            "Cannot listen on {address} for the inference listener: the address is already in use"
+        )),
+        "{said}"
+    );
+    drop(held);
+}

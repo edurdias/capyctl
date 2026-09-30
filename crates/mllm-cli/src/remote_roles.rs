@@ -68,6 +68,27 @@ fn identity_refused(
         mllm_agent::identity_storage::describe_refusal(path, refusal)
     ))
 }
+/// A listener that cannot bind names itself, its address and the reason, so
+/// a port another process holds is not reported as a generic failure.
+fn listen_failed(
+    listener: &str,
+    address: std::net::SocketAddr,
+    failure: &std::io::Error,
+) -> StructuredError {
+    let reason = match failure.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            "the address is already in use (another mllm role or program listens there)".to_owned()
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            "the address does not belong to this machine".to_owned()
+        }
+        _ => failure.to_string(),
+    };
+    StructuredError {
+        code: "management_unavailable",
+        message: format!("Cannot listen on {address} for the {listener} listener: {reason}"),
+    }
+}
 fn unavailable() -> StructuredError {
     StructuredError {
         code: "management_unavailable",
@@ -656,19 +677,19 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             );
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("management", config.management, &e))?;
     crate::roles::record_management_address(&config.state_dir, config.management);
     // Design §9: said out loud before the listener accepts connections.
     crate::exposure::warn_if_exposed(config.inference, config.inference_auth);
     let inference_listener = tokio::net::TcpListener::bind(config.inference)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("inference", config.inference, &e))?;
     let bootstrap_listener = tokio::net::TcpListener::bind(config.bootstrap)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("bootstrap", config.bootstrap, &e))?;
     let control_listener = tokio::net::TcpListener::bind(config.control)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|e| listen_failed("control", config.control, &e))?;
     let identity = Identity::from_pem(certificate.pem, key.private_key_pem());
     // SPEC §4.3 (owner decision P3): a signal is a service restart. Inference
     // admission closes first, admitted streams finish within the bound, then
@@ -1005,7 +1026,7 @@ async fn serve_host(
         .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia());
         let listener = tokio::net::TcpListener::bind(settings.bind)
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|e| listen_failed("ingress", settings.bind, &e))?;
         (Some(execution), Some(listener))
     } else {
         (None, None)

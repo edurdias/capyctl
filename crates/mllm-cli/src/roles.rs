@@ -605,6 +605,25 @@ impl App {
     }
 }
 
+/// A standalone listener that cannot bind names itself and its address; the
+/// error keeps its kind, so the exit code is unchanged.
+pub fn listen_failed(
+    listener: &str,
+    address: std::net::SocketAddr,
+    failure: std::io::Error,
+) -> StartError {
+    let hint = match failure.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            " (another mllm role or program listens there; stop it or choose another address)"
+        }
+        _ => "",
+    };
+    StartError::Io(std::io::Error::new(
+        failure.kind(),
+        format!("cannot listen on {address} for the {listener} listener: {failure}{hint}"),
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
     #[error("config: {0}")]
