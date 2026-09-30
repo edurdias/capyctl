@@ -21,6 +21,8 @@ The audience reads mllm in a terminal first.
   print tables; `inspect` prints the full record in the same detail style.
 - Roles print text when stderr is a terminal and JSON otherwise (journal,
   files, pipes); an explicit `--format` wins. Services therefore log JSON.
+- `--output json` still means JSON, and `table` stays a hidden synonym of
+  `text`.
 - JSON output keeps its fields and bytes; role JSON events keep their fields.
 - Role output goes through one sink in `mllm-domain`; library code does not
   print.

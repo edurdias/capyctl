@@ -140,6 +140,10 @@ Park requested for my-model
   Operation   01M3R7ADNMD6JTTDDFJ9DKFXVQ
 ```
 
+```bash
+mllm status deployment my-model
+```
+
 ```text
 NAME       STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
 my-model   parked   0/1     1          28.5 GiB   210s         park succeeded
@@ -147,7 +151,6 @@ my-model   parked   0/1     1          28.5 GiB   210s         park succeeded
 INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   parked   active      gpu0      -
 ```
-
 
 `STARTUP` is the memory mllm set aside to start the model. When a start fails,
 `LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:

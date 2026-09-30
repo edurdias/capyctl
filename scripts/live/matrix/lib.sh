@@ -183,14 +183,6 @@ cli_format_probe() {
   esac
 }
 
-# The flag that selects JSON on $MLLM, for direct invocations: `"$MLLM" list
-# hosts "$(cli_format_flag)" json`.
-cli_format_flag() {
-  if dry; then echo --format; return 0; fi
-  cli_format_probe
-  echo "$CLI_FORMAT_FLAG"
-}
-
 # The CLI against the run's server. Output is the caller's to redirect.
 cli() {
   local args=() arg

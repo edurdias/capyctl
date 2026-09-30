@@ -70,7 +70,7 @@ lines (`Waiting for …`, `Request identity: …`) and errors go to stderr.
 | Command | Summary | Details |
 |---|---|---|
 | `deploy` (no `--wait`) | `Deployment <name> created (revision <n>)`, or `updated` for a new revision; `joined` results say `Deployment <name> revision <n> already accepted` | Operation; Checkpoint digest (`being measured` while pending) |
-| `deploy --wait`, `start deployment --wait` | `Deployed <name>: <state>` | Revision; Hosts; Ready `<ready>/<desired>`; Startup (GiB); Context (tokens); Operation (`<kind> <state>`) |
+| `deploy --wait` | `Deployed <name>: <state>` | Revision; Hosts; Ready `<ready>/<desired>`; Startup (GiB); Context (tokens); Operation (`<kind> <state>`) |
 | `start`, `park`, `stop`, `preinitialize` (no `--wait`) | `<Verb> requested for <name>`; `Joined the <verb> already in progress for <name>` when `joined` | Operation |
 | the same with `--wait` | `Started <name>` / `Parked <name>` / `Stopped <name>` / `Preinitialized <name>`, followed by `: <state>` | Ready; Hosts; Operation |
 | instance lifecycle (`--instance`) | as above, naming `instance <i> of <name>` | as above |
