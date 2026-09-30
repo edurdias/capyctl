@@ -28,6 +28,8 @@ Prose says CapyCTL; commands, paths and code say `capyctl`.
 
 Plans, specs, earlier status entries and ADRs 0001–0021 keep the old name;
 read `mllm` there as `capyctl` using the table above. Git history is not
-rewritten. Existing state under the old paths is not migrated: move it or
-start fresh (see the 0.1.0 release notes). `scripts/check-name.sh` keeps the
+rewritten. State written under the old names cannot be reused (persisted
+markers and digests carry the product name), and roles of the two names
+cannot talk to each other: 0.1.0 starts fresh, and every role is upgraded
+together (see the 0.1.0 release notes). `scripts/check-name.sh` keeps the
 old name out of everything else.

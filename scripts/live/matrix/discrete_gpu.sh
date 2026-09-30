@@ -258,6 +258,11 @@ dg6_network() {
 # loopback default; the first start of this build moves it to all interfaces
 # once, with a notice and a backup beside the document.
 dg6_migration() {
+  # ADR 0022: no previous release is named capyctl yet, and an earlier release
+  # binary reads none of the CAPYCTL_* isolation variables, so it would write
+  # into its real default state. Refuse until a previous capyctl release exists.
+  echo "dg6 migration: not applicable until a previous capyctl release exists (ADR 0022)" | tee -a "$LIVE/dg6.log"
+  return 0
   local old=${DGPU_PREVIOUS_BIN:?set DGPU_PREVIOUS_BIN to a previous release binary}
   local mig=${STATE}-migration pid
   [ ! -e "$mig" ] || die "$mig exists; remove it first"

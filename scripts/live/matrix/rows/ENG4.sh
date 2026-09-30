@@ -1,4 +1,9 @@
 # shellcheck shell=bash
+# ADR 0022: not applicable until a previous capyctl release exists. The rc.3
+# binaries this row drives use the old protocol and variable names, so the
+# expected outcomes below cannot occur against this build.
+echo "ENG4: not applicable until a previous capyctl release exists (ADR 0022)" >&2
+return 2 2>/dev/null || exit 2
 # ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
 #   CAPYCTL_RC3_LOCAL=~/rc3/capyctl CAPYCTL_RC3_REMOTE=~/rc3/capyctl run_row.sh ENG4 --no-e0 -- b

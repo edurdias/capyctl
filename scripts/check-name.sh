@@ -19,6 +19,12 @@ pattern=$(printf '^%s|' "${allowed[@]}")
 pattern=${pattern%|}
 
 hits=$(git grep -n -i -I 'mllm' -- . | grep -Ev "$pattern" || true)
+# A tracked path may name it too, even with nothing inside.
+paths=$(git ls-files | grep -i 'mllm' | grep -Ev "$pattern" || true)
+if [ -n "$paths" ]; then
+  hits=$(printf '%s\n%s' "$hits" "${paths//$'\n'/$': (path)\n'}: (path)")
+  hits=${hits#$'\n'}
+fi
 if [ -n "$hits" ]; then
   head -n 50 <<<"$hits" >&2
   echo "check-name: $(wc -l <<<"$hits") line(s) still name the old project name" >&2

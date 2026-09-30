@@ -59,14 +59,27 @@ engines or drivers.
 
 Three things to know when upgrading:
 
-- The project is now CapyCTL. The binary is `capyctl`, variables start with
+- The project is now CapyCTL: the binary is `capyctl`, variables start with
   `CAPYCTL_`, and the services are `capyctl-server`, `capyctl-host` and
-  `capyctl-standalone`. Nothing reads the old `mllm` names. To keep existing
-  state, stop the old services and move `~/.local/state/mllm` to
-  `~/.local/state/capyctl` and `~/.config/mllm` to `~/.config/capyctl` (for a
-  system install, `/etc/mllm` to `/etc/capyctl` and `/var/lib/mllm` to
-  `/var/lib/capyctl`, owned by a `capyctl` user), then install the new units;
-  or start fresh.
+  `capyctl-standalone`. Nothing reads the old `mllm` names, and state an
+  earlier release wrote cannot be reused, so 0.1.0 starts fresh:
+  1. Stop every deployment with the old binary (`mllm stop deployment <name>`),
+     so no engine it started keeps running.
+  2. Stop and disable the old services: `systemctl --user disable --now
+     mllm-server mllm-host mllm-standalone` (without `--user` for a system
+     install), then delete their unit files from `~/.config/systemd/user` or
+     `/etc/systemd/system`.
+  3. Remove the old binary and shared files: `~/.local/bin/mllm` and
+     `~/.local/share/mllm`, or `/usr/local/bin/mllm` and
+     `/usr/local/share/mllm`. Old state (`~/.local/state/mllm`,
+     `~/.config/mllm`, `/etc/mllm`, `/var/lib/mllm`) is no longer read; keep
+     it for reference or delete it. Downloaded models in `~/models` stay
+     usable; their download records in `~/models/sources/.mllm` do not.
+  4. Install 0.1.0 and set it up as a new installation (for a system install,
+     create the `capyctl` service user as in the
+     [installation guide](install.md#first-installation-system-service)).
+     Upgrade the server and every host together: a 0.1.0 server and an
+     earlier host cannot talk to each other.
 - The inference endpoint of an existing configuration file does not move: a
   file an earlier release generated keeps `127.0.0.1:8443`. New files use
   `0.0.0.0:8443` with the API key. Set the bind or start with
