@@ -658,7 +658,7 @@ mllm uses engines you install yourself. Register them on the machine that runs t
     mllm engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     mllm engine list
     mllm engine remove vllm [--drain]
-    mllm list engines                      # on the server: every host's engines
+    mllm list engines                      # every host's engines on a server; this machine's on standalone
 
 `detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
 `~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly

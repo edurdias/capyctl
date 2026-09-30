@@ -91,7 +91,7 @@ vllm-nightly   engines.yaml   vllm     0.30.0rc1   yes      enabled     publishe
 ```
 
 `PUBLISHED` shows whether the running mllm uses it (`unknown` while mllm is
-not running). On a server, `mllm list engines` lists every host's engines.
+not running). `mllm list engines` lists the engines of every host on a server, and of this machine on a standalone.
 
 ```bash
 mllm engine remove vllm-nightly

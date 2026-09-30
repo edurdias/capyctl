@@ -1318,6 +1318,7 @@ dependencies = [
  "mllm-config",
  "mllm-controller",
  "mllm-domain",
+ "mllm-protocol",
  "mllm-scheduler",
  "mllm-store",
  "mllm-testkit",

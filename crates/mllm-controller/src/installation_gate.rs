@@ -92,6 +92,8 @@ impl EmbeddedInstallation {
             "version": profile.installation_version,
             "digest": profile.installation_digest,
             "state": profile.installation_state,
+            // ADR 0008: what the launch-time probe found missing (deep_park).
+            "capabilities_missing": profile.capabilities_missing,
         });
         if !profile.installation_observed_digest.is_empty() {
             view["observed_digest"] = profile.installation_observed_digest.into();
