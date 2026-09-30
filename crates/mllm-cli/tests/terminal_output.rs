@@ -52,7 +52,7 @@ fn init_prints_text_when_piped_and_json_on_request() {
     assert_eq!(String::from_utf8(json.stdout).unwrap().lines().count(), 1);
 }
 
-// T02 (ADR 0021): a notice prints once, on stderr, in text mode.
+// T02 (ADR 0021): validate prints one sentence.
 #[test]
 fn validate_prints_a_sentence() {
     let dir = state();
@@ -71,4 +71,35 @@ fn validate_prints_a_sentence() {
         String::from_utf8(out.stdout).unwrap(),
         format!("{} is a valid host document\n", file.display())
     );
+}
+
+// T02 (ADR 0021): a notice from shared code, printed by a command, is text on
+// stderr when piped too, never a JSON object.
+#[test]
+fn command_notices_are_text_not_json() {
+    let dir = state();
+    let file = dir.path().join("host.yaml");
+    assert!(run(
+        dir.path(),
+        &["init", "host", "--output", file.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let other = dir.path().join("other");
+    let out = run(
+        dir.path(),
+        &[
+            "join",
+            "host",
+            "--config",
+            file.to_str().unwrap(),
+            "--state-dir",
+            other.to_str().unwrap(),
+            "--join-file",
+            dir.path().join("missing.join").to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(first.starts_with("notice: "), "{stderr}");
 }

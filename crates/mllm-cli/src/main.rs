@@ -31,9 +31,8 @@ fn main() -> ExitCode {
         role,
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     );
-    if role {
-        mllm_cli::role_text::install(format);
-    }
+    // Notices from shared code (join, init, engine add) follow the same rule.
+    mllm_cli::role_text::install(format);
     let view = table::View::of(&invocation.command);
     let context = mllm_cli::views::Context {
         names: &HostNames::default(),
@@ -276,11 +275,18 @@ fn main() -> ExitCode {
             invocation.wait,
         )) {
             Ok(value) => {
-                let names = match view {
-                    Some(view) if view.needs_host_names() => runtime.block_on(
-                        mllm_cli::client::host_names(&state_root, invocation.config.as_deref()),
-                    ),
-                    _ => Default::default(),
+                // Text only: JSON never shows names. `--wait` results carry a
+                // deployment whose instances name hosts by id.
+                let wants_names = format == OutputFormat::Text
+                    && (view.is_some_and(|view| view.needs_host_names())
+                        || value["deployment"].is_object());
+                let names = if wants_names {
+                    runtime.block_on(mllm_cli::client::host_names(
+                        &state_root,
+                        invocation.config.as_deref(),
+                    ))
+                } else {
+                    Default::default()
                 };
                 let context = mllm_cli::views::Context {
                     names: &names,
