@@ -132,7 +132,13 @@ fn command(state: &Path) -> Command {
 }
 
 fn cli(state: &Path, args: &[&str]) -> std::process::Output {
-    command(state).args(args).output().unwrap()
+    let mut command = command(state);
+    command.args(args);
+    // `--format` and `--json` conflict; a caller that names a format keeps it.
+    if !args.contains(&"--format") {
+        command.arg("--json");
+    }
+    command.output().unwrap()
 }
 
 fn stdout_json(out: &std::process::Output) -> Value {
@@ -288,6 +294,13 @@ impl Cluster {
         let mut all = args.to_vec();
         all.extend(["--config", self.server_config.to_str().unwrap()]);
         cli(&self.server_state, &all)
+    }
+
+    /// Runs a server command without `--json`, for tests of the text view.
+    fn manage_text(&self, args: &[&str]) -> std::process::Output {
+        let mut all = args.to_vec();
+        all.extend(["--config", self.server_config.to_str().unwrap()]);
+        command(&self.server_state).args(all).output().unwrap()
     }
 
     fn manage_json(&self, args: &[&str]) -> Value {
@@ -593,7 +606,7 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     assert_eq!(listed["hosts"][0]["revoked"], true);
     // Owner decision 2026-09-25: `list hosts` prints a table by default,
     // naming the host and its standing.
-    let table = cluster.manage(&["list", "hosts"]);
+    let table = cluster.manage_text(&["list", "hosts"]);
     assert!(table.status.success());
     let table = String::from_utf8(table.stdout).unwrap();
     let lines: Vec<&str> = table.lines().collect();

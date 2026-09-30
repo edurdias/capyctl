@@ -458,7 +458,13 @@ fn command(state: &Path) -> Command {
 }
 
 fn cli(state: &Path, args: &[&str]) -> std::process::Output {
-    command(state).args(args).output().unwrap()
+    let mut command = command(state);
+    command.args(args);
+    // `--format` and `--json` conflict; a caller that names a format keeps it.
+    if !args.contains(&"--format") {
+        command.arg("--json");
+    }
+    command.output().unwrap()
 }
 
 /// One chat completion through the server's router.

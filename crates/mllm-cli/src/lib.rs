@@ -2,6 +2,7 @@ pub mod client;
 // Owner decision 2026-09-25: the minimal deployment file as the CLI reads it.
 mod client_journal;
 pub mod deployment_file;
+pub mod detail;
 pub mod device_inventory;
 pub mod drain;
 pub mod engine;
@@ -19,6 +20,7 @@ pub mod policy_migration;
 pub mod prune;
 pub mod remote_roles;
 pub mod revoke;
+pub mod role_text;
 pub mod roles;
 // Owner decision 2026-09-25: the generic `--set` / `MLLM_SET__…` overrides.
 pub mod settings;
@@ -29,3 +31,4 @@ pub mod standalone_engines;
 // Owner decision 2026-09-25: table output for record views.
 pub mod table;
 pub mod validate;
+pub mod views;

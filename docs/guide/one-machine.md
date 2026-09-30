@@ -13,11 +13,18 @@ mllm engine add ~/venvs/vllm
 ```
 
 ```text
+Registered vllm (vllm 0.29.0)
+
+  Executable     /home/me/venvs/vllm/bin/vllm
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/mllm/engines.yaml (revision 1)
+  Published      when mllm starts
 saved to /home/me/.config/mllm/engines.yaml (revision 1); start mllm (`mllm start standalone`) to use it
 ```
 
-The line comes after a JSON record of the engine. mllm is not running yet, so
-it saves the engine for the first start. More in [Add an engine](engines.md).
+mllm is not running yet, so it saves the engine for the first start. More in
+[Add an engine](engines.md).
 
 ## 2. Start
 
@@ -26,8 +33,17 @@ mllm start standalone
 ```
 
 ```text
-standalone ready (state_dir /home/me/.local/state/mllm; inference listener 0.0.0.0:8443; credentials /home/me/.local/state/mllm/identity/credentials)
+mllm 0.1.0 standalone ready
+
+  Inference     0.0.0.0:8443 (API key required)
+  Management    127.0.0.1:7443
+  State         /home/me/.local/state/mllm
+  Credentials   /home/me/.local/state/mllm/identity/credentials
 ```
+
+On a terminal mllm prints this text. Started as a service, or with its output
+piped to a file, it prints one JSON object per line instead; add `--format
+text` or `--format json` to choose.
 
 mllm reads your GPU, creates `~/models` if it is missing, and writes an API key
 to the credentials file. The endpoint listens on port 8443 of every interface
@@ -51,6 +67,22 @@ the details.
 
 ```bash
 mllm deploy model --file my-model.yaml --activate --wait
+```
+
+```text
+Request identity: 01M3R78B47ANFBFVFY40HATPYJ (reuse --request-id 01M3R78B47ANFBFVFY40HATPYJ to recover this command)
+Waiting for the checkpoint digest of my-model to be measured (at most 900s)
+Deployed my-model: ready
+
+  Revision    1
+  Hosts       gpu-box
+  Ready       1/1
+  Startup     28.5 GiB
+  Context     26752 tokens
+  Operation   initialize succeeded
+```
+
+```bash
 mllm list deployments
 ```
 

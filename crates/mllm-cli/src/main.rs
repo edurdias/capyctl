@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use mllm_cli::grammar::{self, CliError, Command, Role};
 use mllm_cli::output::{self, OutputFormat, StructuredError};
 use mllm_cli::roles;
-use mllm_cli::table::{self, HostNames, View};
+use mllm_cli::table::{self, HostNames};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -20,28 +20,34 @@ fn main() -> ExitCode {
     // Owner rule 2026-09-25: the state root, `--state-dir` > `MLLM_STATE_DIR`
     // > the per-user default, resolved once for every command.
     let state_root = state_root(&invocation);
-    // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
-    // `--output json` was (and still is): JSON results and JSON errors.
-    let format = match invocation.format.as_deref() {
-        Some("json") => OutputFormat::Json,
-        _ => invocation
-            .output
-            .as_deref()
-            .and_then(OutputFormat::from_flag)
-            .unwrap_or_default(),
+    // ADR 0021: one format rule for commands and roles.
+    let role = matches!(
+        invocation.command,
+        Command::Start(Role::Server | Role::Host | Role::Standalone)
+    );
+    let format = OutputFormat::resolve(
+        invocation.format.as_deref(),
+        invocation.output.as_deref(),
+        role,
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
+    // Notices from shared code (join, init, engine add) follow the same rule.
+    mllm_cli::role_text::install(format);
+    let view = table::View::of(&invocation.command);
+    let context = mllm_cli::views::Context {
+        names: &HostNames::default(),
+        deployment_name: deployment_name(&invocation.command),
     };
-    let json_records = match invocation.format.as_deref() {
-        Some(explicit) => explicit == "json",
-        None => invocation.output.as_deref() == Some("json"),
-    };
-    let view = View::of(&invocation.command).filter(|_| !json_records);
     if mllm_cli::remote_roles::supports(&invocation.command) {
         // SPEC §13.3: only a local startup flag enables full native output.
         // Clear inherited permission before creating runtime threads.
         std::env::remove_var("MLLM_DEBUG_ENGINE_LOGS");
         if invocation.debug_engine_logs {
             std::env::set_var("MLLM_DEBUG_ENGINE_LOGS", "1");
-            eprintln!("Full engine logs enabled in private log files; they may contain secrets.");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                "Full engine logs enabled in private log files; they may contain secrets.",
+            );
         }
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -49,7 +55,15 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::remote_roles::execute(&invocation, &state_root)) {
             Ok(value) => {
-                emit(&value, view, &Default::default());
+                // ADR 0021: a role's shutdown summary is role output.
+                if matches!(
+                    invocation.command,
+                    Command::Start(Role::Server | Role::Host)
+                ) {
+                    print!("{}", mllm_cli::role_text::stopped(&value));
+                } else {
+                    emit(&invocation.command, &value, format, &context);
+                }
                 warn_development_controls(&value, format);
                 ExitCode::SUCCESS
             }
@@ -66,7 +80,10 @@ fn main() -> ExitCode {
         std::env::remove_var("MLLM_DEBUG_ENGINE_LOGS");
         if invocation.debug_engine_logs {
             std::env::set_var("MLLM_DEBUG_ENGINE_LOGS", "1");
-            eprintln!("Full engine logs enabled in private log files; they may contain secrets.");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                "Full engine logs enabled in private log files; they may contain secrets.",
+            );
         }
         // SPEC §15.2 (R13): `--config` names the role document; without it the
         // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
@@ -110,14 +127,10 @@ fn main() -> ExitCode {
             &state_root,
         )) {
             Ok(value) => {
-                emit(&value, view, &Default::default());
+                emit(&invocation.command, &value, format, &context);
                 // ADR 0018 §3: `engine add` with no role running says where
                 // the profile was saved and what to run next.
-                if format == OutputFormat::Text {
-                    if let Some(notice) = value["notice"].as_str() {
-                        eprintln!("{notice}");
-                    }
-                }
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -141,7 +154,8 @@ fn main() -> ExitCode {
             *wait,
         )) {
             Ok(value) => {
-                println!("{value}");
+                emit(&invocation.command, &value, format, &context);
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -164,7 +178,8 @@ fn main() -> ExitCode {
             invocation.request_id.as_deref(),
         )) {
             Ok(value) => {
-                println!("{value}");
+                emit(&invocation.command, &value, format, &context);
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -193,7 +208,8 @@ fn main() -> ExitCode {
             invocation.config.as_deref(),
         )) {
             Ok(value) => {
-                println!("{value}");
+                emit(&invocation.command, &value, format, &context);
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -217,7 +233,8 @@ fn main() -> ExitCode {
             named_root.as_deref(),
         ) {
             Ok(value) => {
-                println!("{value}");
+                emit(&invocation.command, &value, format, &context);
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -230,7 +247,7 @@ fn main() -> ExitCode {
     if let Command::ConfigShow { role, sets } = &invocation.command {
         return match mllm_cli::settings::config_show(&invocation, *role, sets, &state_root) {
             Ok(value) => {
-                if json_records {
+                if format == OutputFormat::Json {
                     println!("{value}");
                 } else {
                     print!("{}", mllm_cli::settings::render_table(&value));
@@ -258,20 +275,27 @@ fn main() -> ExitCode {
             invocation.wait,
         )) {
             Ok(value) => {
-                let names = match view {
-                    Some(view) if view.needs_host_names() => runtime.block_on(
-                        mllm_cli::client::host_names(&state_root, invocation.config.as_deref()),
-                    ),
-                    _ => Default::default(),
+                // Text only: JSON never shows names. `--wait` results carry a
+                // deployment whose instances name hosts by id.
+                let wants_names = format == OutputFormat::Text
+                    && (view.is_some_and(|view| view.needs_host_names())
+                        || value["deployment"].is_object());
+                let names = if wants_names {
+                    runtime.block_on(mllm_cli::client::host_names(
+                        &state_root,
+                        invocation.config.as_deref(),
+                    ))
+                } else {
+                    Default::default()
                 };
-                emit(&value, view, &names);
+                let context = mllm_cli::views::Context {
+                    names: &names,
+                    deployment_name: context.deployment_name.clone(),
+                };
+                emit(&invocation.command, &value, format, &context);
                 warn_development_controls(&value, format);
                 // ADR 0014 §7: an asynchronous deploy says what starts it.
-                if format == OutputFormat::Text {
-                    if let Some(notice) = value["notice"].as_str() {
-                        eprintln!("{notice}");
-                    }
-                }
+                notice_on_stderr(&value, format);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -289,13 +313,41 @@ fn main() -> ExitCode {
     }
 }
 
-/// Owner decision 2026-09-25: a record view prints as a table unless JSON was
-/// asked for; everything else prints its JSON result, as it always has.
-fn emit(value: &serde_json::Value, view: Option<View>, names: &HostNames) {
-    match view {
-        Some(view) => print!("{}", table::render(view, value, names)),
-        None => println!("{value}"),
+/// ADR 0021: text views by default, the JSON result unchanged on request.
+fn emit(
+    command: &Command,
+    value: &serde_json::Value,
+    format: OutputFormat,
+    context: &mllm_cli::views::Context,
+) {
+    match format {
+        OutputFormat::Json => println!("{value}"),
+        OutputFormat::Text => print!("{}", mllm_cli::views::render(command, value, context)),
     }
+}
+
+/// A result's `notice` prints once on stderr in text mode; in JSON mode it
+/// stays inside the result.
+fn notice_on_stderr(value: &serde_json::Value, format: OutputFormat) {
+    if format == OutputFormat::Text {
+        if let Some(notice) = value["notice"].as_str() {
+            eprintln!("{notice}");
+        }
+    }
+}
+
+/// The `name` a deployment file states, for the text of `deploy`.
+fn deployment_name(command: &Command) -> Option<String> {
+    let Command::Deploy {
+        file: Some(file), ..
+    } = command
+    else {
+        return None;
+    };
+    let text = std::fs::read_to_string(file).ok()?;
+    mllm_config::parse_document(&text).ok()?["name"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// SPEC §9.1 / T21 / P4: in text mode, status and inspect views warn on stderr
@@ -373,20 +425,20 @@ async fn serve_standalone(
     roles::inference_override(listen)?;
     exposure::effective_inference_auth(exposure::InferenceAuth::ApiKey, no_inference_auth)?;
     if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     // Owner rule 2026-09-25: a deprecated variable name is warned about once.
     for warning in
         mllm_config::engine_settings::deprecation_warnings(&|key| std::env::var(key).ok())
     {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     // Owner decision 2026-09-25: `--management-listen` >
     // MLLM_MANAGEMENT_ADDR (or its deprecated alias) > the document, checked
     // before the boot so a bad override refuses without side effects.
     let management_override = roles::management_override(invocation.management_listen)?;
     if let Some(warning) = roles::deprecated_management_env_warning(invocation.management_listen) {
-        eprintln!("{warning}");
+        roles::role_warning(&warning);
     }
     let mut signals = shutdown::Signals::install()?;
     // Owner decision 2026-09-25: `--models-root`, `--model-sources` and
@@ -402,7 +454,7 @@ async fn serve_standalone(
         exposure::effective_inference_auth(app.inference_auth(), no_inference_auth)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
-        eprintln!("warning: {notice}");
+        mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, notice);
     }
     // Design §9: said out loud before the listener accepts connections.
     exposure::warn_if_exposed(inference_address, inference_auth);
@@ -428,10 +480,15 @@ async fn serve_standalone(
     ));
     // Design §9 ("Where the key is"): the ready line names the owner-only
     // credentials file that holds the API key, never the key.
-    println!(
-        "standalone ready (state_dir {}; inference listener {inference_address}; credentials {})",
-        state_dir.display(),
-        roles::credentials_path(state_dir).display()
+    print!(
+        "{}",
+        mllm_cli::role_text::banner(&serde_json::json!({
+            "role": "standalone", "ready": true, "version": env!("CARGO_PKG_VERSION"),
+            "inference": inference_address.to_string(),
+            "inference_auth": if matches!(inference_auth, exposure::InferenceAuth::None) { "none" } else { "api_key" },
+            "management": management_address.to_string(),
+            "state_dir": state_dir, "credentials": roles::credentials_path(state_dir),
+        }))
     );
     let failed = tokio::select! {
         _ = signals.recv() => None,
@@ -456,9 +513,9 @@ async fn serve_standalone(
     inference.abort();
     control.abort();
     let worker = app.shutdown().await;
-    println!(
+    print!(
         "{}",
-        serde_json::json!({
+        mllm_cli::role_text::stopped(&serde_json::json!({
             "role": "standalone",
             "stopped": true,
             "engines": "retained",
@@ -466,7 +523,7 @@ async fn serve_standalone(
             "drain_bound_secs": bound.as_secs(),
             "shutdown_ms": shutdown::elapsed_ms(started),
             "worker": format!("{worker:?}"),
-        })
+        }))
     );
     Ok(())
 }

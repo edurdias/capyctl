@@ -152,7 +152,10 @@ impl RequestLeaseWriter {
             Err(_) => {
                 // The receiver was dropped with the closure: every write is then
                 // refused as unavailable rather than silently skipped.
-                eprintln!("request lease writer could not start; dispatch will be refused");
+                mllm_domain::role_log::notice(
+                    mllm_domain::role_log::Level::Warning,
+                    "request lease writer could not start; dispatch will be refused",
+                );
                 None
             }
         };

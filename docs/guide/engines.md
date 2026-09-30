@@ -11,9 +11,9 @@ mllm engine detect
 ```
 
 ```text
-ENGINE   VERSION     CUSTOM   ENVIRONMENT                   SOURCE
-vllm     0.29.0      no       /home/me/venvs/vllm           venv
-vllm     0.30.0rc1   yes      /home/me/venvs/vllm-nightly   venv
+ENGINE   VERSION   CUSTOM   ENVIRONMENT                SOURCE
+sglang   0.5.20    no       /home/me/venvs/sglang      venv
+vllm     0.29.0    no       /home/me/venvs/vllm        venv
 ```
 
 `detect` only reads package metadata; it runs nothing. It looks on your
@@ -30,6 +30,13 @@ mllm engine add ~/venvs/vllm
 ```
 
 ```text
+Registered vllm (vllm 0.29.0)
+
+  Executable     /home/me/venvs/vllm/bin/vllm
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/mllm/engines.yaml (revision 1)
+  Published      when mllm starts
 saved to /home/me/.config/mllm/engines.yaml (revision 1); start mllm (`mllm start standalone`) to use it
 ```
 
@@ -39,7 +46,7 @@ the CUDA toolkit it finds for the engine's kernel builds.
 
 That output is from a first run, before mllm was started: the engine is saved
 and used from the first start. If mllm is running, it uses the engine at once
-and prints `"published":"published"`, as below.
+and prints `Published      yes`, as below.
 
 On a GPU machine that runs a host, the same command adds the engine to the
 host: the host records the file it was started with, and the engine commands
@@ -56,7 +63,13 @@ mllm engine add ~/venvs/vllm-nightly --name vllm-nightly
 ```
 
 ```text
-{"cuda_home":"/usr/local/cuda","custom":true,"deep_park":"enabled","deep_park_probe":"available","engine":"vllm","engines_file":"/home/me/.config/mllm/engines.yaml","executable":"/home/me/venvs/vllm-nightly/bin/vllm","fingerprint":{"digest":"sha256:75e6dea2b0a0bb2a620d8ac4c492c5cb89d9fb0debaa09c3504bfcd6c7adae57","version":"0.30.0rc1"},"profile":"vllm-nightly","published":"published","revision":2,"version":"0.30.0rc1"}
+Registered vllm-nightly (vllm 0.30.0rc1)
+
+  Executable     /home/me/venvs/vllm-nightly/bin/vllm
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/mllm/engines.yaml (revision 2)
+  Published      yes
 ```
 
 A deployment then uses it with `engine: vllm-nightly`. Other options:
@@ -85,8 +98,15 @@ mllm engine remove vllm-nightly
 ```
 
 ```text
-{"engines_file":"/home/me/.config/mllm/engines.yaml","published":"published","removed":"vllm-nightly","revision":3}
+Removed vllm-nightly
+
+  Engines file   /home/me/.config/mllm/engines.yaml (revision 3)
+  Published      yes
 ```
+
+Scripts add `--json` to any of these commands to get the JSON result, for
+example `"published":"published"` in the record of `engine add` and
+`engine remove`.
 
 A profile a deployment still uses is not removed; the command names the
 deployment. `--drain` stops those deployments first. Removing needs mllm

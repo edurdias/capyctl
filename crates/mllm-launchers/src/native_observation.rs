@@ -38,9 +38,8 @@ type Result<T> = std::result::Result<T, ObservationError>;
 /// 2026-09-23 (M28): every failure read alike and an SGLang park could only
 /// be refused as unchanged, with no trace of why.
 fn staged(stage: &'static str) -> ObservationError {
-    eprintln!(
-        "{}",
-        serde_json::json!({"event": "native_observation_failed", "stage": stage})
+    mllm_domain::role_log::event(
+        serde_json::json!({"event": "native_observation_failed", "stage": stage}),
     );
     ObservationError
 }
@@ -61,20 +60,17 @@ fn staged_io(stage: &'static str, failure: Failure<'_>) -> ObservationError {
     let owner_alive = crate::exec::process_identity(failure.owner.pid, &failure.owner.role)
         .as_ref()
         == Some(failure.owner);
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "event": "native_observation_failed",
-            "stage": stage,
-            "cause": cause,
-            "errno": errno,
-            "received": failure.received,
-            "expected": failure.expected,
-            "elapsed_ms": failure.started.elapsed().as_millis() as u64,
-            "timeout_ms": failure.timeout_ms as u64,
-            "owner_alive": owner_alive,
-        })
-    );
+    mllm_domain::role_log::event(serde_json::json!({
+        "event": "native_observation_failed",
+        "stage": stage,
+        "cause": cause,
+        "errno": errno,
+        "received": failure.received,
+        "expected": failure.expected,
+        "elapsed_ms": failure.started.elapsed().as_millis() as u64,
+        "timeout_ms": failure.timeout_ms as u64,
+        "owner_alive": owner_alive,
+    }));
     ObservationError
 }
 
@@ -564,14 +560,11 @@ impl NativeObservationClient {
             // that end in `receive_header` show up here first (an idle
             // scheduler answers in tens of milliseconds, measured live
             // 2026-09-25), and the engine's own log is off by default.
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "native_observation_slow",
-                    "elapsed_ms": elapsed.as_millis() as u64,
-                    "timeout_ms": timeout_ms as u64,
-                })
-            );
+            mllm_domain::role_log::event(serde_json::json!({
+                "event": "native_observation_slow",
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "timeout_ms": timeout_ms as u64,
+            }));
         }
         Ok(AllocationFacts {
             binding_id: response.binding_id,

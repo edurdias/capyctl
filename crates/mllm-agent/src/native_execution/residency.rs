@@ -342,18 +342,15 @@ impl Run<'_> {
                             "kv_virtual": m.kv_virtual_bytes,
                         })
                     });
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "sglang_park_not_quiescent",
-                            "binding": self.plan.binding_id,
-                            "real_memory_saver": o.real_memory_saver,
-                            "quiesced": o.quiesced,
-                            "unknown_work": o.unknown_work,
-                            "allocations_resident": o.allocations,
-                            "saver": saver,
-                        })
-                    );
+                    mllm_domain::role_log::event(serde_json::json!({
+                        "event": "sglang_park_not_quiescent",
+                        "binding": self.plan.binding_id,
+                        "real_memory_saver": o.real_memory_saver,
+                        "quiesced": o.quiesced,
+                        "unknown_work": o.unknown_work,
+                        "allocations_resident": o.allocations,
+                        "saver": saver,
+                    }));
                 }
                 ready
             }

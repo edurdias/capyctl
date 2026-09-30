@@ -168,10 +168,13 @@ impl EngineExits {
             }
         };
         if launch.first {
-            eprintln!(
-                "deployment {} instance {}: engine exited ({}); dispatch closed, settling \
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {} instance {}: engine exited ({}); dispatch closed, settling \
                  with verified cleanup",
-                launch.fence.deployment_id, launch.instance_index, exit.status
+                    launch.fence.deployment_id, launch.instance_index, exit.status
+                ),
             );
         }
         match self.stop(&launch) {
@@ -179,10 +182,13 @@ impl EngineExits {
             Err(reason) => {
                 // Retried on every later observation of the same exit; said once.
                 if launch.first {
-                    eprintln!(
-                        "deployment {} instance {}: the cleanup of the exited engine was not \
+                    mllm_domain::role_log::notice(
+                        mllm_domain::role_log::Level::Warning,
+                        &format!(
+                            "deployment {} instance {}: the cleanup of the exited engine was not \
                          accepted yet ({reason}); dispatch stays closed and accounting charged",
-                        launch.fence.deployment_id, launch.instance_index
+                            launch.fence.deployment_id, launch.instance_index
+                        ),
                     );
                 }
                 ExitHandled::Suspended { reason }

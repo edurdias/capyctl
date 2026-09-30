@@ -456,7 +456,10 @@ pub(crate) async fn close_lease(
     if let Some(lease) = lease {
         let id = lease.id().to_owned();
         if let Err(error) = controller.close_request_lease(lease, end).await {
-            eprintln!("request lease {id} stays charged: {error}");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!("request lease {id} stays charged: {error}"),
+            );
         }
     }
 }

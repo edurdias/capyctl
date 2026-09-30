@@ -329,6 +329,11 @@ setuid helper such as `nvidia-modprobe` cannot create missing device nodes from
 inside the service; make sure the driver's device nodes exist at boot
 (for example with `nvidia-persistenced`).
 
+Services log one JSON object per line, because their output is not a
+terminal. Read them as they come with `journalctl -u mllm-host -o cat`, or
+pretty-printed with `journalctl -u mllm-host -o cat | jq`. For text in the
+journal, add `--format text` to `ExecStart=` in a drop-in.
+
 ### Server
 
 ```bash
@@ -622,24 +627,27 @@ not to), and how to put a TLS reverse proxy in front for the internet.
 
 ## Command output
 
-Commands that read records print an aligned table by default, whether or not
-the output is a terminal: `list hosts`, `list deployments`, `list engines`,
-`status deployment`, `engine list` and `engine detect`. Hosts appear by name
-(by id when they have none), memory in GiB and timeouts in seconds. Nested
-detail (latency distributions, installation fingerprints, development-control
-marks) is only in the JSON.
+Commands print text unless `--json` (or `--format json`) is given, whether or
+not the output is a terminal. Commands that read records print an aligned
+table: `list hosts`, `list deployments`, `list engines`, `status deployment`,
+`engine list` and `engine detect`. Commands that change something (`deploy`,
+`start`, `stop`, `drain`, `revoke`, `engine add`, ...) and `inspect`,
+`validate` and `prune` print a short summary with key-value details. Hosts
+appear by name (by id when they have none), memory in GiB and timeouts in
+seconds. Nested detail (latency distributions, installation fingerprints,
+development-control marks) is only in the JSON.
 
     $ mllm list engines
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
     gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
-Scripts pass `--format json` (or `--json`): the command then prints its JSON
-result, the same document earlier releases printed, and reports errors as JSON
-on stderr. `--output json` is still accepted and means the same. `--format
-table` asks for the default explicitly. Commands that change something
-(`deploy`, `start`, `stop`, `drain`, `revoke`, `engine add`, ...) and
-`inspect`, `validate` and `prune` print JSON as before. Exit codes do not
-depend on the format.
+Scripts pass `--json`: the command then prints its JSON result, the same
+document earlier releases printed, and reports errors as JSON on stderr.
+`--output json` is still accepted and means the same. `--format text` asks for
+the default explicitly. The roles (`start server`, `start host`, `start
+standalone`) print text on a terminal and one JSON object per line otherwise,
+so the journal and log files are JSON. Exit codes do not depend on the
+format.
 
 ## Registering engines
 

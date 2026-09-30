@@ -915,11 +915,14 @@ impl ExecTask {
         outcome: Result<(), String>,
     ) {
         if std::env::var("MLLM_DEBUG").is_ok() {
-            eprintln!(
-                "DEBUG op {} action {:?} outcome {:?}",
-                op.0,
-                action,
-                outcome.as_ref().err()
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Notice,
+                &format!(
+                    "DEBUG op {} action {:?} outcome {:?}",
+                    op.0,
+                    action,
+                    outcome.as_ref().err()
+                ),
             );
         }
         match outcome {

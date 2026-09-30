@@ -269,20 +269,20 @@ impl Switcher {
         };
         // Evidence only: a failed event write never changes the outcome.
         if let Err(error) = self.commands.record_switch(&record) {
-            eprintln!("switch {switch_id}: event not recorded: {error}");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!("switch {switch_id}: event not recorded: {error}"),
+            );
         }
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "event": "switch",
-                "phase": format!("{phase:?}"),
-                "switch_id": switch_id,
-                "target": target,
-                "host": host,
-                "victims": victims,
-                "detail": detail,
-            })
-        );
+        mllm_domain::role_log::event(serde_json::json!({
+            "event": "switch",
+            "phase": format!("{phase:?}"),
+            "switch_id": switch_id,
+            "target": target,
+            "host": host,
+            "victims": victims,
+            "detail": detail,
+        }));
     }
 
     /// Record that the waiting deployment is READY after this switch.
@@ -840,9 +840,12 @@ impl Switcher {
                 self.commands
                     .reopen_after_switch(&v.deployment_id, v.instance, v.generation)
             {
-                eprintln!(
-                    "switch: {}/{} not reopened: {error}",
-                    v.deployment_id, v.instance
+                mllm_domain::role_log::notice(
+                    mllm_domain::role_log::Level::Warning,
+                    &format!(
+                        "switch: {}/{} not reopened: {error}",
+                        v.deployment_id, v.instance
+                    ),
                 );
             }
         }

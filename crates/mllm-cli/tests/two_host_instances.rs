@@ -578,7 +578,13 @@ fn command(state: &Path) -> Command {
 }
 
 fn cli(state: &Path, args: &[&str]) -> std::process::Output {
-    command(state).args(args).output().unwrap()
+    let mut command = command(state);
+    command.args(args);
+    // `--format` and `--json` conflict; a caller that names a format keeps it.
+    if !args.contains(&"--format") {
+        command.arg("--json");
+    }
+    command.output().unwrap()
 }
 
 /// T05 T10 T15 T16 T27 T29 T33: two instances of one deployment placed across

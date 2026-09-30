@@ -198,7 +198,7 @@ impl Role {
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match role.lines.recv_timeout(left) {
-                    Ok(line) if line.starts_with(ready) => break,
+                    Ok(line) if line.contains(ready) => break,
                     Ok(_) => {}
                     Err(error) => panic!("the role never printed {ready:?}: {error}"),
                 }
@@ -375,6 +375,7 @@ impl Installation {
             file.to_str().unwrap(),
             "--activate",
             "--wait",
+            "--json",
         ]);
         assert!(
             out.status.success(),
@@ -417,7 +418,7 @@ async fn a_standalone_engine_exit_is_settled_and_relaunched_on_demand() {
             command.args(["start", "standalone"]);
             command
         },
-        Some("standalone ready"),
+        Some("\"role\":\"standalone\""),
     );
     let deployment = installation.deploy();
     installation.served_within(Duration::from_secs(20)).await;
@@ -774,6 +775,7 @@ async fn a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand() {
         file.to_str().unwrap(),
         "--activate",
         "--wait",
+        "--json",
     ]);
     assert!(
         out.status.success(),

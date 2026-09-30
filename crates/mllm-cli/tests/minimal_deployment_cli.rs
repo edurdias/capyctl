@@ -19,7 +19,8 @@ fn mllm(state: &Path, home: &Path, args: &[&str], extra: &[(&str, &str)]) -> Out
     command
         .env("MLLM_STATE_DIR", state)
         .env("HOME", home)
-        .args(args);
+        .args(args)
+        .arg("--json");
     for (key, value) in extra {
         command.env(key, value);
     }

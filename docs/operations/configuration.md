@@ -302,7 +302,7 @@ shutdown.drain_timeout                             30s                          
 state_dir                                          /home/me/.local/state/mllm          default
 ```
 
-`--format json` (or `--json`) prints the same as
+`--format json` (or `--json`) prints the JSON result instead:
 `{"role", "document", "settings": [{"path", "value", "source"}]}`. The flags a
 role start takes (`--deep-park`, `--listen`, ...) are not options of `config
 show`; their variables are read from the environment, and `--set` stands in
@@ -316,12 +316,18 @@ variables.
 
 ## Command options that are not settings
 
-`--format table|json` (`--json`), `--output`, `--request-id`, `--wait`,
+`--format text|json` (`--json`), `--output`, `--request-id`, `--wait`,
 `--activate`, `--evict`, `--initialize-timeout` and the other per-command
 options change one command's behaviour, not the role's configuration, so they
 have no variable or YAML form. `--debug-engine-logs` on `start host` and
 `start standalone` is a flag only on purpose: full engine logs may contain
 secrets, so a variable left in a shell or unit file must not turn them on.
+
+Commands print text (tables, or a summary with details) unless `--format json`
+is given, even when their output is piped. `start server`, `start host` and
+`start standalone` print text when their output is a terminal and one JSON
+object per line otherwise, so the journal and log files are JSON; `--format`
+overrides that either way.
 
 ## Variables mllm sets for engines
 

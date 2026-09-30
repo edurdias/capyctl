@@ -16,11 +16,13 @@ use mllm_config::effective::{Engine, ModelSource};
 use serde_json::Value;
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
-    let result = mllm()
-        .env("MLLM_STATE_DIR", state)
-        .args(args)
-        .output()
-        .unwrap();
+    let mut command = mllm();
+    command.env("MLLM_STATE_DIR", state).args(args);
+    // `--format` and `--json` conflict; a caller that names a format keeps it.
+    if !args.contains(&"--format") {
+        command.arg("--json");
+    }
+    let result = command.output().unwrap();
     assert!(
         result.status.success(),
         "{}",

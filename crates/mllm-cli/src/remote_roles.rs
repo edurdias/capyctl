@@ -265,10 +265,13 @@ fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Opt
     if winner == crate::engine::absolute(document_state_dir) {
         return None;
     }
-    eprintln!(
-        "notice: state directory {} from {source} overrides the document's state_dir {}",
-        winner.display(),
-        document_state_dir.display()
+    mllm_domain::role_log::notice(
+        mllm_domain::role_log::Level::Notice,
+        &format!(
+            "state directory {} from {source} overrides the document's state_dir {}",
+            winner.display(),
+            document_state_dir.display()
+        ),
     );
     Some(winner)
 }
@@ -757,13 +760,19 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             TcpListenerStream::new(control_listener),
             stopping(stopped.clone()),
         );
-    println!(
+    // Design §9 ("Where the key is"): the owner-only file holding the API key
+    // and admin token, never the key itself.
+    print!(
         "{}",
-        // Design §9 ("Where the key is"): the owner-only file holding the
-        // API key and admin token, never the key itself.
-        json!({"role":"server","management":config.management.to_string(),
-            "inference":config.inference.to_string(),"state_dir":config.state_dir,
-            "credentials":config.identity_dir.join("server-credentials.json")})
+        crate::role_text::banner(&json!({"role":"server","ready":true,
+            "version":env!("CARGO_PKG_VERSION"),
+            "management":config.management.to_string(),
+            "inference":config.inference.to_string(),
+            "inference_auth": if matches!(config.inference_auth, crate::exposure::InferenceAuth::None) { "none" } else { "api_key" },
+            "bootstrap":config.bootstrap.to_string(),
+            "control":config.control.to_string(),
+            "state_dir":config.state_dir,
+            "credentials":config.identity_dir.join("server-credentials.json")}))
     );
     // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
     let management_stopped = stopped.clone();
@@ -1094,7 +1103,10 @@ async fn serve_host(
             Some(tokio::spawn(server.serve(handler, uid, control_shutdown)))
         }
         Err(failure) => {
-            eprintln!("host control socket unavailable: {failure}");
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!("host control socket unavailable: {failure}"),
+            );
             None
         }
     };
@@ -1113,17 +1125,14 @@ async fn serve_host(
     let router = admission.gate(ingress.router());
     // Design §9 ("Where the key is"): ready, said as `start standalone` says
     // it, naming the owner-only identity file and never its contents.
-    println!(
-        "host ready (state_dir {}; ingress listener {}; credentials {})",
-        config.state_dir.display(),
-        config
-            .ingress
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), |settings| settings.bind.to_string()),
-        config
-            .identity_dir
-            .join(mllm_agent::enrollment::HOST_FILE)
-            .display()
+    print!(
+        "{}",
+        crate::role_text::banner(&json!({"role": "host", "ready": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "host_id": host,
+            "state_dir": config.state_dir,
+            "ingress": config.ingress.as_ref().map(|settings| settings.bind.to_string()),
+            "credentials": config.identity_dir.join(mllm_agent::enrollment::HOST_FILE)}))
     );
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
@@ -1293,7 +1302,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(warning) =
                     crate::roles::deprecated_inference_env_warning(invocation.listen)
                 {
-                    eprintln!("{warning}");
+                    crate::roles::role_warning(&warning);
                 }
                 let invalid = |e: mllm_config::ConfigError| {
                     error(&format!(
@@ -1360,7 +1369,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 for warning in mllm_config::engine_settings::deprecation_warnings(&|key| {
                     std::env::var(key).ok()
                 }) {
-                    eprintln!("{warning}");
+                    crate::roles::role_warning(&warning);
                 }
                 let mut host = load_host(
                     &path,

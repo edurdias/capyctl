@@ -91,21 +91,27 @@ fn engine_add_with_no_role_running_saves_and_succeeds() {
     let output = mllm(
         root.path(),
         root.path(),
-        &["engine", "add", env.to_str().unwrap()],
+        &["engine", "add", env.to_str().unwrap(), "--json"],
         &[],
     );
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     let engines = root.path().join("home/.config/mllm/engines.yaml");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["published"], "role_not_running", "{}", text(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The notice is part of the result: with `--json` it is the `notice` field.
+    let notice = result["notice"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains(&format!("saved to {}", engines.display()))
-            && stderr.contains("start mllm")
-            && stderr.contains("mllm start standalone"),
-        "{stderr}"
+        notice.contains(&format!("saved to {}", engines.display()))
+            && notice.contains("start mllm")
+            && notice.contains("mllm start standalone"),
+        "{}",
+        text(&output)
     );
-    assert!(!stderr.contains("agent_unreachable"), "{stderr}");
+    assert!(
+        !text(&output).contains("agent_unreachable"),
+        "{}",
+        text(&output)
+    );
     assert!(std::fs::read_to_string(&engines)
         .unwrap()
         .contains("\"vllm\""));
@@ -195,6 +201,7 @@ async fn engine_add_with_a_relative_config_publishes() {
                 venv.to_str().unwrap(),
                 "--config",
                 "host.yaml",
+                "--json",
             ],
             &[],
         )
@@ -226,7 +233,7 @@ async fn engine_add_with_a_relative_mllm_config_publishes() {
         mllm(
             &home,
             &cwd,
-            &["engine", "add", venv.to_str().unwrap()],
+            &["engine", "add", venv.to_str().unwrap(), "--json"],
             &[("MLLM_CONFIG", "host.yaml")],
         )
     })
@@ -381,7 +388,7 @@ async fn deploy_activate_waits_for_the_checkpoint_digest() {
         source: false,
     });
     let address = management(state.clone(), 60_000).await;
-    let output = deploy(root.path(), address, &["--activate"]).await;
+    let output = deploy(root.path(), address, &["--activate", "--json"]).await;
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["operation_id"], "01K00000000000000000000003");

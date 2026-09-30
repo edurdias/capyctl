@@ -247,7 +247,9 @@ impl SourceStore {
             jobs: Mutex::default(),
             failures: Mutex::default(),
             accounting: Mutex::default(),
-            log: Mutex::new(Arc::new(|line| eprintln!("{line}"))),
+            log: Mutex::new(Arc::new(|line| {
+                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Notice, line)
+            })),
             free_override: Mutex::default(),
             environment: Mutex::new(Arc::new(|key| std::env::var(key).ok())),
         })

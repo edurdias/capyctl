@@ -54,7 +54,19 @@ pub fn exposure_warning(bind: SocketAddr, auth: InferenceAuth) -> Option<String>
 /// log) before the listener accepts connections.
 pub fn warn_if_exposed(bind: SocketAddr, auth: InferenceAuth) {
     if let Some(warning) = exposure_warning(bind, auth) {
-        eprintln!("{warning}");
+        eprintln!("{}", warning_line(mllm_domain::role_log::mode(), &warning));
+    }
+}
+
+/// ADR 0019: on a terminal the warning keeps its documented wording; piped,
+/// it is a warning notice like every other role line.
+fn warning_line(mode: mllm_domain::role_log::Mode, warning: &str) -> String {
+    match mode {
+        mllm_domain::role_log::Mode::Text => warning.to_owned(),
+        mllm_domain::role_log::Mode::Json => {
+            let text = warning.strip_prefix("WARNING: ").unwrap_or(warning);
+            serde_json::json!({"level": "warning", "message": text}).to_string()
+        }
     }
 }
 
@@ -86,6 +98,18 @@ pub fn status_notice(view: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T37 (ADR 0019): text keeps the documented wording, JSON wraps it.
+    #[test]
+    fn the_warning_line_follows_the_mode() {
+        use mllm_domain::role_log::Mode;
+        let open: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        let warning = exposure_warning(open, InferenceAuth::None).unwrap();
+        assert!(warning_line(Mode::Text, &warning)
+            .starts_with("WARNING: the inference endpoint on 0.0.0.0:8443 accepts requests"));
+        assert!(warning_line(Mode::Json, &warning)
+            .starts_with(r#"{"level":"warning","message":"the inference endpoint on"#));
+    }
 
     // T37: the warning fires only for an unauthenticated non-loopback bind.
     #[test]

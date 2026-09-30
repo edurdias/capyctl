@@ -287,9 +287,15 @@ struct Cli {
     /// prints JSON results, as `--format json` does.
     #[arg(long, global = true, value_name = "TARGET")]
     output: Option<String>,
-    /// How a command that reads records prints them: an aligned table (the
-    /// default, terminal or not) or the JSON result, as scripts need it.
-    #[arg(long, global = true, value_name = "FORMAT", value_parser = ["table", "json"])]
+    /// How results print: `text` (the default: tables and summaries) or
+    /// `json`. A role (`start server|host|standalone`) prints JSON lines when
+    /// its output is not a terminal, unless this option says otherwise.
+    #[arg(long, global = true, value_name = "FORMAT",
+          value_parser = clap::builder::PossibleValuesParser::new([
+              clap::builder::PossibleValue::new("text"),
+              clap::builder::PossibleValue::new("json"),
+              clap::builder::PossibleValue::new("table").hide(true),
+          ]))]
     format: Option<String>,
     /// Short for `--format json`.
     #[arg(long, global = true, conflicts_with = "format")]
@@ -1093,8 +1099,8 @@ pub struct Invocation {
     pub command: Command,
     pub config: Option<PathBuf>,
     pub output: Option<String>,
-    /// Owner decision 2026-09-25: `--format table|json` (`--json` is
-    /// `--format json`). `None` is the default, a table for record views.
+    /// ADR 0021: `--format text|json` (`table` is a hidden synonym of `text`).
+    /// `--json` is `--format json`.
     pub format: Option<String>,
     pub debug_engine_logs: bool,
     pub request_id: Option<String>,
