@@ -67,7 +67,7 @@ host_poll_start() {
   rm -f "$HOSTPOLL_STOP"
   (while [ ! -f "$HOSTPOLL_STOP" ]; do
      printf '%s ' "$(now_ms)"
-     "$MLLM" list hosts "$(cli_format_flag)" json --config "$SERVER_CFG" 2>/dev/null | python3 -c 'import json,sys
+     "$MLLM" list hosts --json --config "$SERVER_CFG" 2>/dev/null | python3 -c 'import json,sys
 try:
     hs=json.load(sys.stdin).get("hosts",[])
     print(json.dumps({h["name"]:{k:h.get(k) for k in ("online","eligible","state","responsive","suspended","unresponsive","session")} for h in hs}, separators=(",",":")))

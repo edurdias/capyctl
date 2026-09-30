@@ -79,7 +79,7 @@ start_role() { # start_role <log name> [start args...]
   ROLE_PID=$!
   local i
   for i in $(seq 120); do
-    grep -q "standalone ready" "$log" && { say "standalone up (pid $ROLE_PID): $*"; return 0; }
+    grep -q '"role":"standalone"' "$log" && { say "standalone up (pid $ROLE_PID): $*"; return 0; }
     kill -0 "$ROLE_PID" 2>/dev/null || { cat "$log" >&2; die "standalone exited at start"; }
     sleep 0.5
   done
