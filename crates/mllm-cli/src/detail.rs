@@ -74,7 +74,7 @@ pub fn one_line(text: &str) -> String {
         .collect()
 }
 
-/// `ready_instances` -> `Ready Instances`; a trailing `_id` reads `ID`.
+/// `ready_instances` -> `Ready Instances`; an `id` segment reads `ID`.
 fn label(key: &str) -> String {
     key.split('_')
         .filter(|w| !w.is_empty())

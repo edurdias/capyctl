@@ -149,6 +149,7 @@ mllm start host --config ~/host.yaml
 mllm 0.1.0 host ready
 
   Ingress       100.64.0.21:8444
+  Host ID       01M3R7FJRKN5AQMC4EMYSG7KSK
   State         /home/me/.local/state/mllm
   Credentials   /home/me/.local/state/mllm/identity/host-identity.json
 ```
@@ -216,7 +217,7 @@ Waiting for the checkpoint digest of my-model to be measured (at most 900s)
 Deployed my-model: ready
 
   Revision    1
-  Hosts       01M3R7FJRKN5AQMC4EMYSG7KSK
+  Hosts       gpu-box
   Ready       1/1
   Startup     28.5 GiB
   Operation   initialize succeeded

@@ -14,15 +14,20 @@ pub struct Context<'a> {
     pub deployment_name: Option<String>,
 }
 
-pub fn has_view(command: &Command) -> bool {
-    !matches!(command, Command::Doctor { .. })
-}
-
+/// Every command is named here on purpose: adding one to the grammar fails
+/// the build until it is routed to a view or to the generic text.
 pub fn render(command: &Command, value: &Value, context: &Context) -> String {
-    if let Some(view) = View::of(command) {
-        return table::render(view, value, context.names);
-    }
     match command {
+        Command::List { .. }
+        | Command::Status { .. }
+        | Command::EngineList
+        | Command::EngineDetect { .. } => match View::of(command) {
+            Some(view) => table::render(view, value, context.names),
+            None => generic(command, value),
+        },
+        Command::Doctor { .. } | Command::Start(_) | Command::ConfigShow { .. } => {
+            generic(command, value)
+        }
         Command::Deploy { .. } => deploy(value, context),
         Command::Lifecycle { action, deployment } => {
             lifecycle(*action, deployment, None, value, context)
@@ -57,16 +62,18 @@ pub fn render(command: &Command, value: &Value, context: &Context) -> String {
                 .unwrap_or_default();
             record(format!("{kind} {name}").trim_end(), value)
         }
-        other => {
-            let name = format!("{other:?}");
-            let name = name
-                .split([' ', '(', '{'])
-                .next()
-                .unwrap_or("command")
-                .to_lowercase();
-            record(&format!("{name} done"), value)
-        }
     }
+}
+
+/// Commands without a purpose-built sentence: the name and every field.
+fn generic(command: &Command, value: &Value) -> String {
+    let name = format!("{command:?}");
+    let name = name
+        .split([' ', '(', '{'])
+        .next()
+        .unwrap_or("command")
+        .to_lowercase();
+    record(&format!("{name} done"), value)
 }
 
 /// A scalar as text; empty for null or absent.
@@ -101,7 +108,9 @@ fn state_rows(detail: Detail, d: &Value, context: &Context) -> Detail {
 fn deploy(value: &Value, context: &Context) -> String {
     let d = &value["deployment"];
     if d.is_object() {
-        let name = opt(&d["name"]).unwrap_or_default();
+        let name = opt(&d["name"])
+            .or_else(|| context.deployment_name.clone())
+            .unwrap_or_default();
         return Detail::new(format!("Deployed {name}: {}", s(&d["observed_state"])))
             .row("Revision", s(&d["revision"]))
             .row("Hosts", table::instance_hosts(d, context.names))
@@ -125,6 +134,7 @@ fn deploy(value: &Value, context: &Context) -> String {
         (Some(true), Some(rev)) => format!("Deployment{name} revision {rev} already accepted"),
         (_, Some(rev)) if rev != "1" => format!("Deployment{name} updated (revision {rev})"),
         (_, Some(rev)) => format!("Deployment{name} created (revision {rev})"),
+        (Some(true), None) => format!("Deployment{name} already accepted"),
         (_, None) => format!("Deployment{name} created"),
     };
     let digest = match value["checkpoint_digest"].as_str() {
@@ -174,7 +184,7 @@ fn lifecycle(
 }
 
 fn delete(deployment: &str, value: &Value) -> String {
-    let done = value["deleted"] == true || value["state"] == "deleted";
+    let done = value["deleted"] == true;
     let summary = if done {
         format!("Deleted {deployment}")
     } else {
@@ -540,10 +550,10 @@ mod tests {
         );
     }
 
-    // T02 (ADR 0021): every command has a view, or is listed as using the
-    // generic one on purpose.
+    // T02 (ADR 0021): the match in `render` is exhaustive, so a new command
+    // cannot fall through unnoticed; every command renders text, never JSON.
     #[test]
-    fn every_command_has_a_view() {
+    fn every_command_renders_text() {
         use crate::grammar::{ListResource, Role};
         let all = vec![
             Command::Start(Role::Server),
@@ -616,13 +626,24 @@ mod tests {
                 drain: false,
             },
         ];
-        // `doctor` is refused before it has a result.
-        let generic = ["Doctor"];
         for command in all {
             let name = format!("{command:?}");
-            let name = name.split([' ', '(', '{']).next().unwrap();
-            assert_eq!(has_view(&command), !generic.contains(&name), "{name}");
+            let text = run(command, json!({}), None);
+            assert!(!text.starts_with('{'), "{name}: {text}");
         }
+    }
+
+    // T02 (ADR 0021): review fixes, joined without a revision and a nameless record.
+    #[test]
+    fn deploy_edge_cases() {
+        assert_eq!(
+            run(deploy(false), json!({"joined": true}), Some("my-model")),
+            "Deployment my-model already accepted\n"
+        );
+        let mut d = deployment();
+        d["name"] = json!(null);
+        let text = run(deploy(true), json!({"deployment": d}), Some("my-model"));
+        assert!(text.starts_with("Deployed my-model: ready\n"), "{text}");
     }
 
     // T02 (ADR 0021): the results `delete` and `drain --wait` really return.
