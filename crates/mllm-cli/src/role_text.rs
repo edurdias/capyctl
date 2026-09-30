@@ -127,6 +127,7 @@ pub fn stopped(value: &Value) -> String {
         Mode::Json => format!("{value}\n"),
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +171,33 @@ mod tests {
         assert_eq!(
             stopped_text(&stopped_value),
             "mllm standalone stopped: drained, 0 requests in flight; engines kept running\n"
+        );
+    }
+
+    // T02 (ADR 0021)
+    #[test]
+    fn banner_says_when_no_api_key_is_needed() {
+        let value = json!({"role": "server", "ready": true, "version": "0.1.0",
+            "inference": "0.0.0.0:8443", "inference_auth": "none"});
+        assert!(banner_text(&value).contains("0.0.0.0:8443 (no API key)"));
+    }
+
+    // T02 (ADR 0021)
+    #[test]
+    fn server_and_host_banners_render_their_rows() {
+        let server = json!({"role": "server", "ready": true, "version": "0.1.0",
+            "management": "127.0.0.1:7443", "inference": "0.0.0.0:8443", "inference_auth": "api_key",
+            "bootstrap": "0.0.0.0:7444", "control": "0.0.0.0:7445",
+            "state_dir": "/s", "credentials": "/s/identity/server-credentials.json"});
+        assert_eq!(
+            banner_text(&server),
+            "mllm 0.1.0 server ready\n\n  Inference     0.0.0.0:8443 (API key required)\n  Management    127.0.0.1:7443\n  Bootstrap     0.0.0.0:7444\n  Control       0.0.0.0:7445\n  State         /s\n  Credentials   /s/identity/server-credentials.json\n"
+        );
+        let host = json!({"role": "host", "ready": true, "version": "0.1.0",
+            "state_dir": "/h", "ingress": null, "credentials": "/h/identity/host-identity.json"});
+        assert_eq!(
+            banner_text(&host),
+            "mllm 0.1.0 host ready\n\n  State         /h\n  Credentials   /h/identity/host-identity.json\n"
         );
     }
 }

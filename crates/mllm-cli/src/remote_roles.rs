@@ -765,6 +765,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             "version":env!("CARGO_PKG_VERSION"),
             "management":config.management.to_string(),
             "inference":config.inference.to_string(),
+            "inference_auth": if matches!(config.inference_auth, crate::exposure::InferenceAuth::None) { "none" } else { "api_key" },
             "bootstrap":config.bootstrap.to_string(),
             "control":config.control.to_string(),
             "state_dir":config.state_dir,
