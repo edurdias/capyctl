@@ -1129,6 +1129,7 @@ async fn serve_host(
         "{}",
         crate::role_text::banner(&json!({"role": "host", "ready": true,
             "version": env!("CARGO_PKG_VERSION"),
+            "host_id": host,
             "state_dir": config.state_dir,
             "ingress": config.ingress.as_ref().map(|settings| settings.bind.to_string()),
             "credentials": config.identity_dir.join(mllm_agent::enrollment::HOST_FILE)}))

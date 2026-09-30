@@ -20,7 +20,8 @@ pub enum Level {
     Warning,
 }
 
-/// Text for one structured event, or `None` to use the generic fallback.
+/// Text for one structured event, or `None` to use the generic fallback. A
+/// formatter that wants the fallback with its own decoration calls [`fallback`].
 pub type Formatter = fn(&Value) -> Option<String>;
 
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -83,7 +84,7 @@ fn render_notice_in(mode: Mode, level: Level, message: &str) -> String {
 
 /// `<event> key=value …` over the scalar fields, sorted by key; nested
 /// values are left out (they stay in JSON mode).
-fn fallback(value: &Value) -> String {
+pub fn fallback(value: &Value) -> String {
     let name = value["event"].as_str().unwrap_or("event");
     let mut out = name.to_owned();
     if let Value::Object(fields) = value {
