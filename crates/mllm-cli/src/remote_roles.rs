@@ -1104,7 +1104,7 @@ async fn serve_host(
         }
         Err(failure) => {
             mllm_domain::role_log::notice(
-                mllm_domain::role_log::Level::Notice,
+                mllm_domain::role_log::Level::Warning,
                 &format!("host control socket unavailable: {failure}"),
             );
             None

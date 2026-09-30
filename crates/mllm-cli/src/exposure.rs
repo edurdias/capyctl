@@ -54,8 +54,15 @@ pub fn exposure_warning(bind: SocketAddr, auth: InferenceAuth) -> Option<String>
 /// log) before the listener accepts connections.
 pub fn warn_if_exposed(bind: SocketAddr, auth: InferenceAuth) {
     if let Some(warning) = exposure_warning(bind, auth) {
-        let text = warning.strip_prefix("WARNING: ").unwrap_or(&warning);
-        mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, text);
+        // ADR 0019: on a terminal the warning keeps its documented wording;
+        // piped, it is a warning notice like every other role line.
+        match mllm_domain::role_log::mode() {
+            mllm_domain::role_log::Mode::Text => eprintln!("{warning}"),
+            mllm_domain::role_log::Mode::Json => {
+                let text = warning.strip_prefix("WARNING: ").unwrap_or(&warning);
+                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, text);
+            }
+        }
     }
 }
 

@@ -865,7 +865,12 @@ impl AgentSessions {
         let Some(observed) = controller_time(result.observed_at_unix_ms, received_at)
             .filter(|observed| received_at - observed <= 2_000)
         else {
-            mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {session}: ignored a result whose observation is not fresh"));
+            mllm_domain::role_log::notice(
+                mllm_domain::role_log::Level::Warning,
+                &format!(
+                    "host {host} control session {session}: ignored a result whose observation is not fresh",
+                ),
+            );
             return Ok(());
         };
         result.observed_at_unix_ms = observed;
@@ -1071,8 +1076,13 @@ impl AgentSessions {
                             if silence >= policy.suspend_after && !silent {
                                 silent = true;
                                 self.set_unresponsive(&host, &id, true).map_err(|status| *status)?;
-                                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {id}: no heartbeat for {} ms; dispatch suspended, accounting kept",
-                                    silence.as_millis()));
+                                mllm_domain::role_log::notice(
+                                    mllm_domain::role_log::Level::Warning,
+                                    &format!(
+                                        "host {host} control session {id}: no heartbeat for {} ms; dispatch suspended, accounting kept",
+                                        silence.as_millis()
+                                    ),
+                                );
                                 let hook = self.unresponsive_hook.lock().ok().and_then(|hook| hook.clone());
                                 if let Some(hook) = hook {
                                     let named = host.clone();
@@ -1094,7 +1104,12 @@ impl AgentSessions {
                             // session before dispatch reopens (same as reconnect).
                             silent = false;
                             self.set_unresponsive(&host, &id, false).map_err(|status| *status)?;
-                            mllm_domain::role_log::notice(mllm_domain::role_log::Level::Notice, &format!("host {host} control session {id}: heartbeats resumed; readiness must be re-proven before dispatch reopens"));
+                            mllm_domain::role_log::notice(
+                                mllm_domain::role_log::Level::Notice,
+                                &format!(
+                                    "host {host} control session {id}: heartbeats resumed; readiness must be re-proven before dispatch reopens",
+                                ),
+                            );
                         }
                         let mut draining = false;
                         let mut exited = None;
@@ -1402,7 +1417,12 @@ impl AgentSessions {
                             let (heartbeat_interval_ms, heartbeat_lost_after_ms) = if heartbeats {
                                 (millis(policy.interval), millis(policy.lost_after))
                             } else {
-                                mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, &format!("host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost"));
+                                mllm_domain::role_log::notice(
+                                    mllm_domain::role_log::Level::Warning,
+                                    &format!(
+                                        "host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost",
+                                    ),
+                                );
                                 (0, 0)
                             };
                             send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms, capabilities: capabilities::server_capabilities() })) }).await.map_err(|status| *status)?;

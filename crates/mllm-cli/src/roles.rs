@@ -342,8 +342,6 @@ pub fn management_override(
         })
 }
 
-/// The warning a role prints once at start when the deprecated
-/// `MLLM_STANDALONE_MANAGEMENT_ADDR` is set, or `None`.
 /// Print a role warning that may carry the legacy `warning: ` prefix; the sink
 /// adds its own.
 pub fn role_warning(line: &str) {
@@ -351,6 +349,8 @@ pub fn role_warning(line: &str) {
     mllm_domain::role_log::notice(mllm_domain::role_log::Level::Warning, text);
 }
 
+/// The warning a role prints once at start when the deprecated
+/// `MLLM_STANDALONE_MANAGEMENT_ADDR` is set, or `None`.
 pub fn deprecated_management_env_warning(flag: Option<std::net::SocketAddr>) -> Option<String> {
     std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV)?;
     let ignored = flag.is_some() || std::env::var_os(MANAGEMENT_ADDR_ENV).is_some();
