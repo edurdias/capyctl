@@ -9,7 +9,9 @@
 //! evidence; no engine runs. Passing here never qualifies a native engine
 //! recipe on a discrete GPU (SPEC §18).
 use capyctl_config::effective::CudaNamespace;
-use capyctl_config::remote_resources::{ledger_key, local_deployment_document, scope_host_document};
+use capyctl_config::remote_resources::{
+    ledger_key, local_deployment_document, scope_host_document,
+};
 use capyctl_domain::completion::{
     CompletionEvidence, Milestone, OwnedLaunchReceipt, ProcessIdentity, StepExecutionContext,
 };

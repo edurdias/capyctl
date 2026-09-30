@@ -166,7 +166,10 @@ fn an_unknown_path_names_the_nearest_settings() {
         &env(&[("CAPYCTL_SET__LOAD__REPORT", "1s")]),
     )
     .unwrap_err();
-    assert!(error.detail.contains("CAPYCTL_SET__LOAD__REPORT"), "{error}");
+    assert!(
+        error.detail.contains("CAPYCTL_SET__LOAD__REPORT"),
+        "{error}"
+    );
     // A block is not a value, and the document's identity is not a setting.
     let error =
         SettingOverrides::parse(ConfigKind::Server, &sets(&["shutdown=1s"]), &[]).unwrap_err();

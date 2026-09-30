@@ -116,7 +116,11 @@ struct Resolved {
     /// ADR 0019 (discrete GPU design §7): on a multi-GPU host, the revision
     /// resolved once per GPU (device, source, resolution) when the deployment
     /// pins no device; `source` and `effective` are the first of them.
-    devices: Vec<(String, Value, capyctl_config::effective::EffectiveDeployment)>,
+    devices: Vec<(
+        String,
+        Value,
+        capyctl_config::effective::EffectiveDeployment,
+    )>,
 }
 
 fn scoped_source(target: &HostTarget, config: &Value) -> Result<Value> {
@@ -356,8 +360,9 @@ impl crate::Store {
                 // no device is resolved once per GPU of a discrete host, and
                 // placement picks the GPU. The host's own resolution is the
                 // lowest-index GPU's.
-                let choices = capyctl_config::instances::device_choices(&command, &host.trusted_host)
-                    .map_err(ManagedConfigurationError::Rejected)?;
+                let choices =
+                    capyctl_config::instances::device_choices(&command, &host.trusted_host)
+                        .map_err(ManagedConfigurationError::Rejected)?;
                 let recipe = |document: &Value| -> Result<Value> {
                     // ADR 0013 §2: unnamed device claims take this host's
                     // devices, and the per-host recipe carries no

@@ -40,9 +40,12 @@ fn pre_e1_deployment() -> String {
     .unwrap();
     let mut deployment = fixture["deployment"].clone();
     deployment.as_object_mut().unwrap().remove("engine_config");
-    capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &deployment.to_string())
-        .unwrap()
-        .to_string()
+    capyctl_config::parse_strict(
+        capyctl_config::ConfigKind::Deployment,
+        &deployment.to_string(),
+    )
+    .unwrap()
+    .to_string()
 }
 
 // T33 T13

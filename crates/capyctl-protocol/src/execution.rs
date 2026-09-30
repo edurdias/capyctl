@@ -3,7 +3,9 @@
 //! must recompute the canonical payload digest, fence generations and deduplicate
 //! command identities before acknowledging or performing any effect.
 use crate::pb;
-use capyctl_domain::group::{CommandIdentity, GroupIdentityError, GroupPlan, MemberKey, MemberPlan};
+use capyctl_domain::group::{
+    CommandIdentity, GroupIdentityError, GroupPlan, MemberKey, MemberPlan,
+};
 
 /// SPEC §§3, 7, 13: only local approved profile resolution may render a launch.
 /// The server supplies immutable requests and a grant identity, never native argv.
@@ -69,9 +71,11 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
         {
             return Err(GroupIdentityError);
         }
-        let config =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| GroupIdentityError)?;
+        let config = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
             profile_name: plan.profile_name,
@@ -145,9 +149,11 @@ impl TryFrom<pb::DigestCheckpointRequest> for DigestCheckpointPlan {
         {
             return Err(GroupIdentityError);
         }
-        let config =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| GroupIdentityError)?;
+        let config = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
             host_policy_fingerprint: plan.host_policy_fingerprint,
@@ -207,7 +213,9 @@ impl MaterializeSourcePlan {
     }
 }
 /// The deployment's remote `model.source`, validated; `None` for a local one.
-fn remote_source(deployment: &serde_json::Value) -> Option<capyctl_config::model_source::ModelSource> {
+fn remote_source(
+    deployment: &serde_json::Value,
+) -> Option<capyctl_config::model_source::ModelSource> {
     let source: capyctl_config::model_source::ModelSource =
         serde_json::from_value(deployment.get("model")?.get("source")?.clone()).ok()?;
     (source.is_remote() && source.validate().is_ok()).then_some(source)
@@ -224,9 +232,11 @@ impl TryFrom<pb::MaterializeSourceRequest> for MaterializeSourcePlan {
         {
             return Err(GroupIdentityError);
         }
-        let config =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| GroupIdentityError)?;
+        let config = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| GroupIdentityError)?;
         let source = remote_source(&config).ok_or(GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,

@@ -168,7 +168,10 @@ async fn a_minimal_file_deploys_on_standalone() {
         (
             "flag-mini",
             vec!["--hf-endpoint", origin.as_str()],
-            vec![("CAPYCTL_HF_ENDPOINT", not_https), ("HF_ENDPOINT", not_https)],
+            vec![
+                ("CAPYCTL_HF_ENDPOINT", not_https),
+                ("HF_ENDPOINT", not_https),
+            ],
         ),
         (
             "env-mini",

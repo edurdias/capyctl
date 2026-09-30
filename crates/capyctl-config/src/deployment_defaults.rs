@@ -471,7 +471,10 @@ mod tests {
         for unpinned in ["Qwen/Qwen3-4B", "Qwen/Qwen3-4B@main"] {
             let error = expanded(json!({"name": "m", "model": {"hf": unpinned}})).unwrap_err();
             assert_eq!(error.path, "model.hf");
-            assert!(error.detail.contains("capyctl deploy model --file"), "{error}");
+            assert!(
+                error.detail.contains("capyctl deploy model --file"),
+                "{error}"
+            );
         }
         assert_eq!(
             unpinned_hf(&json!({"model": {"hf": "Qwen/Qwen3-4B"}})),

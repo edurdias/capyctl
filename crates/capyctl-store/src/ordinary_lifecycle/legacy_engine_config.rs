@@ -111,9 +111,10 @@ fn carry(
             if !object.contains_key("engine_config") {
                 object.insert("engine_config".into(), migrated.engine_config.clone());
             }
-            if let Err(error) =
-                capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &carried.to_string())
-            {
+            if let Err(error) = capyctl_config::parse_strict(
+                capyctl_config::ConfigKind::Deployment,
+                &carried.to_string(),
+            ) {
                 return Ok(Err(format!(
                     "the retained deployment source does not parse once migrated: {error}"
                 )));

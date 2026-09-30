@@ -410,9 +410,12 @@ pub fn latency_report(
         if !view.key.engine.is_empty() {
             group.engine.get_or_insert_with(|| view.key.engine.clone());
         }
-        group
-            .series
-            .push(series_json(view.series, "router", "capyctl", &view.histogram));
+        group.series.push(series_json(
+            view.series,
+            "router",
+            "capyctl",
+            &view.histogram,
+        ));
     }
     for view in hosts
         .iter()
@@ -527,7 +530,9 @@ mod tests {
 
     /// A host latency table holding one report for `d`, generation 1, from a
     /// host running `engine`.
-    fn host_running(engine: &str) -> std::sync::Arc<capyctl_controller::latency_table::LatencyTable> {
+    fn host_running(
+        engine: &str,
+    ) -> std::sync::Arc<capyctl_controller::latency_table::LatencyTable> {
         use capyctl_protocol::reports::{LoadReport, LoadSample, SampleLatency};
         let mut histogram = Histogram::capyctl();
         histogram.observe(0.01);

@@ -507,8 +507,8 @@ mod tests {
         assert_eq!(
             changed,
             vec![
-                "missing sglang_entry.py".to_owned(),
                 "capyctl_vllm_guard.py (contents)".to_owned(),
+                "missing sglang_entry.py".to_owned(),
                 "unexpected __pycache__".to_owned(),
                 "vllm_entry.py (type, owner or mode)".to_owned(),
             ]

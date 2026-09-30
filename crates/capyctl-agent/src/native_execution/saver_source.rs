@@ -438,9 +438,11 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
                 access,
             ))
             .await;
-        let idle =
-            capyctl_adapters::sglang::observation::engine_idle(access.endpoint, access.inference_key)
-                .await;
+        let idle = capyctl_adapters::sglang::observation::engine_idle(
+            access.endpoint,
+            access.inference_key,
+        )
+        .await;
         let facts = saver_facts(&mapped);
         let (weights, cache) = content(command.action)[usize::from(after)];
         Ok(SglangRuntimeObservation {
@@ -464,9 +466,11 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
         let mapped = self
             .saver(scope(access.binding_id, access.incarnation, None, access))
             .await;
-        let idle =
-            capyctl_adapters::sglang::observation::engine_idle(access.endpoint, access.inference_key)
-                .await;
+        let idle = capyctl_adapters::sglang::observation::engine_idle(
+            access.endpoint,
+            access.inference_key,
+        )
+        .await;
         idle == Ok(true) && saver_facts(&mapped).is_some_and(|f| f.real_saver && f.resident)
     }
 

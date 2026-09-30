@@ -369,7 +369,12 @@ fn aggregate_floor_validation_preserves_phase_error_precedence() {
         Err(ResourceError::CategoryLimit)
     );
     assert_eq!(
-        capyctl_scheduler::residency::admit_phase(&initial, "b", &f(ResourcePhase::Ready, 1), context),
+        capyctl_scheduler::residency::admit_phase(
+            &initial,
+            "b",
+            &f(ResourcePhase::Ready, 1),
+            context
+        ),
         Err(ResourceError::Invalid)
     );
 }

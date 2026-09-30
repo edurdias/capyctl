@@ -240,7 +240,8 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
         .iter()
         .any(|r| r.command_id == "exit-launch" && r.claim_retained));
     // The first observation is journaled: a later scan reports the same time.
-    let again = capyctl_agent::exits::scan(&journal, "host", capyctl_protocol::now_unix_ms() + 5_000);
+    let again =
+        capyctl_agent::exits::scan(&journal, "host", capyctl_protocol::now_unix_ms() + 5_000);
     assert_eq!(again[0].exit.observed_at_ms, reported[0].observed_at_ms);
 
     // A Terminate settles the launch; nothing is watched after it.
@@ -257,5 +258,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
         panic!("fresh acceptance");
     };
     journal.execute(ticket, 10, policy.as_ref()).unwrap();
-    assert!(capyctl_agent::exits::scan(&journal, "host", capyctl_protocol::now_unix_ms()).is_empty());
+    assert!(
+        capyctl_agent::exits::scan(&journal, "host", capyctl_protocol::now_unix_ms()).is_empty()
+    );
 }

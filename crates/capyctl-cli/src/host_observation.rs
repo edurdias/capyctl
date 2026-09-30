@@ -471,7 +471,8 @@ mod tests {
             let sampled = sampled.clone();
             Arc::new(move || {
                 sampled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                present.then(|| capyctl_agent::gpu_memory::parse_query_gpu(DISCRETE_ROW, 5).unwrap())
+                present
+                    .then(|| capyctl_agent::gpu_memory::parse_query_gpu(DISCRETE_ROW, 5).unwrap())
             })
         };
         let discrete = vec![

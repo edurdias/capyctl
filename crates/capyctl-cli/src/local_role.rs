@@ -437,7 +437,11 @@ mod tests {
             refused.message
         );
         let refused = resolve_with(dir.path(), None, Some(&host)).unwrap_err();
-        assert!(refused.message.contains("capyctl host"), "{}", refused.message);
+        assert!(
+            refused.message.contains("capyctl host"),
+            "{}",
+            refused.message
+        );
     }
 
     // T01: a host started with a named document is found through its record;

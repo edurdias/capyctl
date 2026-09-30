@@ -205,7 +205,9 @@ fn fixture(limits: WaitLimits) -> Fixture {
             max_buffered_bytes_total: 64 * 1024,
         },
         api_key: None,
-        inflight: Arc::new(capyctl_router::admission::InFlight::with_wait_limits(limits)),
+        inflight: Arc::new(capyctl_router::admission::InFlight::with_wait_limits(
+            limits,
+        )),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
     };
     Fixture {

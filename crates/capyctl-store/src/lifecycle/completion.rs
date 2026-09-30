@@ -1,6 +1,8 @@
 //! Physical completion retains conservative accounting and closed admission.
 use super::*;
-use capyctl_domain::completion::{CompletionEvidence, Milestone, OwnedLaunchReceipt, TransitionToken};
+use capyctl_domain::completion::{
+    CompletionEvidence, Milestone, OwnedLaunchReceipt, TransitionToken,
+};
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, LifecycleError> {
     if text.len() > MAX_DTO_BYTES {

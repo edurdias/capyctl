@@ -166,7 +166,8 @@ pub(super) async fn initialize(
     }
     let debug_logs = std::env::var("CAPYCTL_DEBUG_ENGINE_LOGS").as_deref() == Ok("1");
     if debug_logs {
-        cmd.env.insert("CAPYCTL_DEBUG_ENGINE_LOGS".into(), "1".into());
+        cmd.env
+            .insert("CAPYCTL_DEBUG_ENGINE_LOGS".into(), "1".into());
     }
     if let Some(log) = adapter.engine_log() {
         cmd.env.insert("CAPYCTL_ENGINE_LOG".into(), log.to_string());

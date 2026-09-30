@@ -622,7 +622,9 @@ fn native_launch_stale_session_cannot_spawn_prepared_handoff() {
     .unwrap();
     let _new_session = fixture.store.begin_coordinator_session().unwrap();
     // Revalidation must return before any process creation. Never execute Python here.
-    assert!(handoff.spawn(&capyctl_launchers::DurableSpawn::new()).is_err());
+    assert!(handoff
+        .spawn(&capyctl_launchers::DurableSpawn::new())
+        .is_err());
 }
 
 #[test]
@@ -642,7 +644,9 @@ fn native_launch_stale_generation_cannot_spawn_prepared_handoff() {
     .unwrap()
     .unwrap();
     fixture.store.bump_generation(&fixture.deployment).unwrap();
-    assert!(handoff.spawn(&capyctl_launchers::DurableSpawn::new()).is_err());
+    assert!(handoff
+        .spawn(&capyctl_launchers::DurableSpawn::new())
+        .is_err());
 }
 
 #[test]
@@ -668,7 +672,9 @@ fn native_launch_changed_binding_cannot_spawn_prepared_handoff() {
             [ulid::Ulid::new().to_string()],
         )
         .unwrap();
-    assert!(handoff.spawn(&capyctl_launchers::DurableSpawn::new()).is_err());
+    assert!(handoff
+        .spawn(&capyctl_launchers::DurableSpawn::new())
+        .is_err());
 }
 
 #[test]

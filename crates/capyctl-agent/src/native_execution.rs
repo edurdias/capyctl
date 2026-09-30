@@ -474,9 +474,11 @@ impl NativeHostExecution {
         let MemberAction::LaunchSingle(plan) = &command.action else {
             return Err(JournalError::Unauthorized);
         };
-        let config =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| JournalError::Unauthorized)?;
+        let config = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| JournalError::Unauthorized)?;
         let legacy = retained
             .then(|| capyctl_config::effective::legacy_retained_deployment(&config))
             .flatten();
@@ -743,9 +745,11 @@ impl NativeHostExecution {
         let Some(set) = self.profiles.for_fingerprint(&plan.host_policy_fingerprint) else {
             return Err("unauthorized");
         };
-        let deployment =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| "unauthorized")?;
+        let deployment = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| "unauthorized")?;
         let host = capyctl_config::remote_resources::local_host_document(&set.config.document)
             .map_err(|_| "unauthorized")?;
         capyctl_config::effective::checkpoint_location(&deployment, &host).map_err(|error| {
@@ -926,7 +930,11 @@ impl NativeHostExecution {
         let prepared = self.prepare(&effective, plan, &served)?;
         let tools = self
             .journal
-            .launch_tools(ticket, capyctl_protocol::now_unix_ms(), Arc::new(self.clone()))
+            .launch_tools(
+                ticket,
+                capyctl_protocol::now_unix_ms(),
+                Arc::new(self.clone()),
+            )
             .map_err(|_| SessionError)?;
         let adapter = self.launch_adapter(prepared, &effective, plan, &keys, &served, tools)?;
         self.ingress
@@ -969,9 +977,11 @@ impl NativeHostExecution {
             .identities
             .load(&scope, owned.identity.payload_digest)
             .map_err(|_| SessionError)?;
-        let deployment =
-            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &plan.deployment_config)
-                .map_err(|_| SessionError)?;
+        let deployment = capyctl_config::parse_strict(
+            capyctl_config::ConfigKind::Deployment,
+            &plan.deployment_config,
+        )
+        .map_err(|_| SessionError)?;
         let served = deployment["routes"]
             .as_array()
             .and_then(|r| r.first())
@@ -1340,7 +1350,9 @@ async fn fresh_probe(
     stop_at_ms: i64,
 ) -> Result<(), SessionError> {
     let remaining = || {
-        Duration::from_millis(u64::try_from(stop_at_ms - capyctl_protocol::now_unix_ms()).unwrap_or(0))
+        Duration::from_millis(
+            u64::try_from(stop_at_ms - capyctl_protocol::now_unix_ms()).unwrap_or(0),
+        )
     };
     let listed = tokio::time::timeout(
         remaining().min(PROBE_MODELS_TIMEOUT),
@@ -1597,8 +1609,11 @@ impl SessionExecution for NativeHostExecution {
         Some(Box::pin(async move {
             // `/proc` reads and journal writes are blocking work.
             tokio::task::spawn_blocking(move || {
-                let exited =
-                    crate::exits::scan(&host.journal, &host.host_id, capyctl_protocol::now_unix_ms());
+                let exited = crate::exits::scan(
+                    &host.journal,
+                    &host.host_id,
+                    capyctl_protocol::now_unix_ms(),
+                );
                 for launch in &exited {
                     // SPEC §§6.1, 13.2 (W13): an engine with an exited member
                     // is not the group readiness proved. Its readiness authority
@@ -1989,7 +2004,8 @@ mod tests {
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         std::fs::write(root.join("runtime/capyctl_vllm_guard.py"), "").unwrap();
         std::fs::write(
-            root.join("runtime").join(capyctl_adapters::vllm::VLLM_ENTRY),
+            root.join("runtime")
+                .join(capyctl_adapters::vllm::VLLM_ENTRY),
             "",
         )
         .unwrap();
@@ -2000,7 +2016,8 @@ mod tests {
         for path in [
             root.join("runtime"),
             root.join("runtime/capyctl_vllm_guard.py"),
-            root.join("runtime").join(capyctl_adapters::vllm::VLLM_ENTRY),
+            root.join("runtime")
+                .join(capyctl_adapters::vllm::VLLM_ENTRY),
             root.join("runtime/engine_capabilities.py"),
         ] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2040,7 +2057,10 @@ mod tests {
         (executor, deployment, policy)
     }
 
-    fn checkpoint_identity(id: &str, expected_state: &str) -> capyctl_domain::group::CommandIdentity {
+    fn checkpoint_identity(
+        id: &str,
+        expected_state: &str,
+    ) -> capyctl_domain::group::CommandIdentity {
         capyctl_domain::group::CommandIdentity {
             controller_id: "controller".into(),
             member: capyctl_domain::group::MemberKey {
@@ -2569,7 +2589,8 @@ mod tests {
         launch.identity.payload_digest = launch.canonical_digest();
         let effective = executor.resolve(&launch).unwrap();
         assert_eq!(effective.profile.engine, Engine::Sglang);
-        let capyctl_domain::launch::LaunchSettings::Sglang(settings) = &effective.engine_config else {
+        let capyctl_domain::launch::LaunchSettings::Sglang(settings) = &effective.engine_config
+        else {
             panic!("an SGLang profile resolves SGLang settings");
         };
         assert!(!settings.memory_saver && !settings.cpu_weight_backup);

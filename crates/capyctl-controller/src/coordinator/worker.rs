@@ -1,6 +1,5 @@
 use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
-use futures::FutureExt;
 use capyctl_adapters::traits::{
     EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand, RuntimeError,
 };
@@ -22,6 +21,7 @@ use capyctl_store::{
     ordinary_lifecycle::worker::{InitializePoll, InitializeStatus, InitializeWork},
     ordinary_lifecycle::StartReceipt,
 };
+use futures::FutureExt;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -1333,15 +1333,14 @@ impl OwnedCoordinator {
                                     "the admin and inference engine keys are the same".into(),
                                 ));
                             }
-                            let roles = std::iter::once((
-                                key.as_str(),
-                                capyctl_store::secrets::SecretRole::Inference,
-                            ))
-                            .chain(
-                                admin_key
-                                    .as_deref()
-                                    .map(|admin| (admin, capyctl_store::secrets::SecretRole::Admin)),
-                            );
+                            let roles =
+                                std::iter::once((
+                                    key.as_str(),
+                                    capyctl_store::secrets::SecretRole::Inference,
+                                ))
+                                .chain(admin_key.as_deref().map(
+                                    |admin| (admin, capyctl_store::secrets::SecretRole::Admin),
+                                ));
                             for (key, role) in roles {
                                 let sealed: [u8; 32] = hex::decode(key)
                                     .ok()

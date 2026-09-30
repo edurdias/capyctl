@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::IntoResponse;
-use futures::{FutureExt, StreamExt};
 use capyctl_adapters::traits::StreamEnded;
 use capyctl_adapters::{AdapterError, ChatForward};
 use capyctl_router::{admission::InFlight, stream::stream_response};
+use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 

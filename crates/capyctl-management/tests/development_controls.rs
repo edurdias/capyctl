@@ -3,7 +3,6 @@
 //! CPU tests of this surface are not qualification of any native engine recipe.
 
 use axum::{body::Body, http::Request};
-use http_body_util::BodyExt;
 use capyctl_adapters::vllm::{plan_from_effective, render_command};
 use capyctl_config::effective::resolve_effective;
 use capyctl_controller::{
@@ -11,6 +10,7 @@ use capyctl_controller::{
 };
 use capyctl_management::{hosts::hosts_router, ManagementCredentials};
 use capyctl_store::development_controls::for_effective;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::{
     os::unix::fs::PermissionsExt,

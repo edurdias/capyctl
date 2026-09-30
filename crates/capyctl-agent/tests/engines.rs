@@ -116,7 +116,10 @@ fn the_version_check_is_bounded_and_must_agree() {
     );
 
     std::env::set_var("CAPYCTL_TEST_LEAK", "leaked");
-    script(&env.join("bin/vllm"), "echo \"${CAPYCTL_TEST_LEAK:-0.29.0}\"");
+    script(
+        &env.join("bin/vllm"),
+        "echo \"${CAPYCTL_TEST_LEAK:-0.29.0}\"",
+    );
     assert_eq!(
         check_version(&resolved, Duration::from_secs(5)).unwrap(),
         "0.29.0"

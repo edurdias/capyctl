@@ -1,9 +1,14 @@
-use harness::f2_pressure::{PressureAbort, PressureGuard, PressureStatus};
 use capyctl_agent::memory::parse_meminfo;
+use harness::f2_pressure::{PressureAbort, PressureGuard, PressureStatus};
 
 const GIB: i64 = 1 << 30;
 
-fn sample(total: i64, available: i64, swap: i64, now: i64) -> capyctl_agent::memory::HostMemorySample {
+fn sample(
+    total: i64,
+    available: i64,
+    swap: i64,
+    now: i64,
+) -> capyctl_agent::memory::HostMemorySample {
     parse_meminfo(
         &format!(
             "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: 1048576 kB\nSwapFree: {} kB\n",

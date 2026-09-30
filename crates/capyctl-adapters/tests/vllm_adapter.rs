@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::Json;
-use harness::{run_conformance, ParkGateMode};
 use capyctl_adapters::traits::EngineAdapter;
 use capyctl_adapters::vllm::VllmAdapter;
 use capyctl_adapters::ParkPolicy;
 use capyctl_adapters::{MemberRef, ParkLevel, Readiness};
 use capyctl_testkit::FakeLauncher;
+use harness::{run_conformance, ParkGateMode};
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -132,7 +132,10 @@ async fn park_permitted_by_default() {
         "toy-model".into(),
     );
     let out = a.park(&member(), ParkLevel::Two).await;
-    assert!(matches!(out, Ok(capyctl_adapters::ParkOutcome::Parked { .. })));
+    assert!(matches!(
+        out,
+        Ok(capyctl_adapters::ParkOutcome::Parked { .. })
+    ));
     assert_eq!(
         st.sleep_hits.load(Ordering::SeqCst),
         1,
@@ -271,7 +274,10 @@ async fn cancel_without_ack_is_uncertain_no_call() {
         )
         .await
         .unwrap();
-    assert!(matches!(out, capyctl_adapters::CancellationOutcome::Uncertain));
+    assert!(matches!(
+        out,
+        capyctl_adapters::CancellationOutcome::Uncertain
+    ));
 }
 
 #[tokio::test]

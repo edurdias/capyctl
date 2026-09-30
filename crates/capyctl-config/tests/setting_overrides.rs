@@ -49,7 +49,10 @@ fn secs(duration: Duration) -> String {
 }
 
 fn env_name(path: &str) -> String {
-    format!("CAPYCTL_SET__{}", path.replace('.', "__").to_ascii_uppercase())
+    format!(
+        "CAPYCTL_SET__{}",
+        path.replace('.', "__").to_ascii_uppercase()
+    )
 }
 
 // T03 (owner decision 2026-09-25, SPEC §15.2): for settings stated only in

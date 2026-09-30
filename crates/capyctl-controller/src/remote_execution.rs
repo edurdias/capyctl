@@ -272,7 +272,8 @@ impl RemoteEngine {
     ) -> Result<EffectObservation, RuntimeError> {
         let c = &runtime.context;
         let b = &self.binding;
-        let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities else {
+        let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities
+        else {
             return Err(RuntimeError::StaleRevision);
         };
         if c.binding_id != b.plan.binding_id
@@ -685,7 +686,8 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
         return Ok(());
     }
     if crate::agent_sessions::launch_ended_before_readiness(result) {
-        let reason = if capyctl_protocol::execution::is_launch_failure_text(&result.launch_failure) {
+        let reason = if capyctl_protocol::execution::is_launch_failure_text(&result.launch_failure)
+        {
             result.launch_failure.clone()
         } else {
             "the engine exited before readiness".into()

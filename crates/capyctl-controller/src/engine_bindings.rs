@@ -108,9 +108,8 @@ impl ProfileBindings {
     /// ADR 0014 §7, owner decision Q9: keep the checkpoint stat cache in this
     /// private directory so a restart does not hash unchanged checkpoints again.
     pub fn with_checkpoint_cache(mut self, dir: PathBuf) -> Self {
-        self.checkpoints = std::sync::Arc::new(
-            capyctl_agent::checkpoint::CheckpointVerifier::with_cache_dir(dir),
-        );
+        self.checkpoints =
+            std::sync::Arc::new(capyctl_agent::checkpoint::CheckpointVerifier::with_cache_dir(dir));
         self
     }
 

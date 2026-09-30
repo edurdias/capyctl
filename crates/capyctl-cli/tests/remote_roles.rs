@@ -265,14 +265,22 @@ fn explicit_missing_role_config_has_no_side_effects() {
     for role in ["server", "host", "standalone"] {
         let result = refused_start(
             &state,
-            &["start", role, "--config", "/definitely/missing/capyctl.yaml"],
+            &[
+                "start",
+                role,
+                "--config",
+                "/definitely/missing/capyctl.yaml",
+            ],
         );
         assert!(!result.status.success());
         assert!(!state.exists(), "{role}");
         if role == "standalone" {
             assert_eq!(result.status.code(), Some(2), "{result:?}");
             let stderr = String::from_utf8_lossy(&result.stderr);
-            assert!(stderr.contains("/definitely/missing/capyctl.yaml"), "{stderr}");
+            assert!(
+                stderr.contains("/definitely/missing/capyctl.yaml"),
+                "{stderr}"
+            );
             assert!(!stderr.contains("not_implemented"), "{stderr}");
         }
     }

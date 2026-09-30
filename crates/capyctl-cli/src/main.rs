@@ -16,7 +16,10 @@ fn main() -> ExitCode {
     // ADR 0018 §2: `--config` is resolved against the working directory once,
     // here, so every command and role names the same absolute document (and
     // the engines file beside it) whatever it does later.
-    invocation.config = invocation.config.as_deref().map(capyctl_cli::engine::absolute);
+    invocation.config = invocation
+        .config
+        .as_deref()
+        .map(capyctl_cli::engine::absolute);
     // Owner rule 2026-09-25: the state root, `--state-dir` > `CAPYCTL_STATE_DIR`
     // > the per-user default, resolved once for every command.
     let state_root = state_root(&invocation);
@@ -53,7 +56,8 @@ fn main() -> ExitCode {
             Ok(runtime) => runtime,
             Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
         };
-        return match runtime.block_on(capyctl_cli::remote_roles::execute(&invocation, &state_root)) {
+        return match runtime.block_on(capyctl_cli::remote_roles::execute(&invocation, &state_root))
+        {
             Ok(value) => {
                 // ADR 0021: a role's shutdown summary is role output.
                 if matches!(
@@ -89,9 +93,10 @@ fn main() -> ExitCode {
         // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
         // ADR 0018 §2 (review decision 2026-09-25): `$CAPYCTL_CONFIG` names it
         // when `--config` is absent, exactly as for `capyctl engine`.
-        let config = capyctl_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
-            std::env::var(key).ok().filter(|value| !value.is_empty())
-        });
+        let config =
+            capyctl_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
+                std::env::var(key).ok().filter(|value| !value.is_empty())
+            });
         // Owner decision 2026-09-25: `--set` > `CAPYCTL_SET__…` > the document;
         // a named flag or variable of the same setting must agree.
         let overrides = match capyctl_cli::settings::role_overrides(
@@ -548,15 +553,17 @@ fn state_root(invocation: &grammar::Invocation) -> PathBuf {
         Command::Start(Role::Standalone) => true,
         Command::ConfigShow { role, .. } => match role {
             Some(role) => *role == Role::Standalone,
-            None => capyctl_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
-                std::env::var(key).ok().filter(|value| !value.is_empty())
-            })
-            .is_none_or(|named| {
-                std::fs::read_to_string(named)
-                    .ok()
-                    .and_then(|text| capyctl_config::parse_document(&text).ok())
-                    .is_some_and(|document| document["kind"] == "standalone")
-            }),
+            None => {
+                capyctl_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
+                    std::env::var(key).ok().filter(|value| !value.is_empty())
+                })
+                .is_none_or(|named| {
+                    std::fs::read_to_string(named)
+                        .ok()
+                        .and_then(|text| capyctl_config::parse_document(&text).ok())
+                        .is_some_and(|document| document["kind"] == "standalone")
+                })
+            }
         },
         _ => false,
     };

@@ -143,8 +143,8 @@ fn stored_host_documents_lose_only_their_launch_settings() {
     resolve_effective(&pre["deployment"], &stripped).unwrap();
     assert!(strip_legacy_launch_settings(&stripped).is_none());
     // JSON is YAML: the host's own file with the retired block is refused.
-    let error =
-        capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &host.to_string()).unwrap_err();
+    let error = capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &host.to_string())
+        .unwrap_err();
     assert!(error.to_string().contains("engine_config"), "{error}");
 }
 

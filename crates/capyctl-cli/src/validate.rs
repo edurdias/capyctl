@@ -175,7 +175,9 @@ pub fn validate_config_at(
                     read(host_file)?;
                     let (name, host_document) = host_policy_document(
                         host_file,
-                        &capyctl_config::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+                        &capyctl_config::setting_overrides::SettingOverrides::none(
+                            ConfigKind::Host,
+                        ),
                     )
                     .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
                     // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's
@@ -397,8 +399,12 @@ fn resolve_for_acceptance(
                 weights_bytes: Some(0),
                 ..Default::default()
             };
-            capyctl_config::effective::resolve_effective_with_checkpoint(deployment, host, placeholder)
-                .map(|effective| (effective, true))
+            capyctl_config::effective::resolve_effective_with_checkpoint(
+                deployment,
+                host,
+                placeholder,
+            )
+            .map(|effective| (effective, true))
         }
         Err(error) => Err(error),
     }

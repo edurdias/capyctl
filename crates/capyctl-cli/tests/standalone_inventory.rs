@@ -13,9 +13,10 @@ use support::safe_state_dir;
 
 /// The command as the binary runs it: parsed, then sent to the local role.
 async fn run(args: &[&str], root: &std::path::Path) -> serde_json::Value {
-    let invocation =
-        capyctl_cli::grammar::parse_invocation(std::iter::once("capyctl").chain(args.iter().copied()))
-            .unwrap();
+    let invocation = capyctl_cli::grammar::parse_invocation(
+        std::iter::once("capyctl").chain(args.iter().copied()),
+    )
+    .unwrap();
     capyctl_cli::remote_roles::execute(&invocation, root)
         .await
         .unwrap_or_else(|failure| panic!("{}: {}", failure.code, failure.message))

@@ -643,7 +643,10 @@ impl RoleSettingsArgs {
         }
     }
 
-    fn engines(&self, kv_cache: Option<String>) -> capyctl_config::engine_settings::EngineOverrides {
+    fn engines(
+        &self,
+        kv_cache: Option<String>,
+    ) -> capyctl_config::engine_settings::EngineOverrides {
         capyctl_config::engine_settings::EngineOverrides {
             vllm: self.vllm_bin.clone(),
             sglang: self.sglang_bin.clone(),
@@ -1412,19 +1415,22 @@ fn parse_deep_park(text: &str) -> Result<bool, String> {
 
 /// Owner rule 2026-09-25: `--trust-remote-code true|false`.
 fn parse_trust_remote_code(text: &str) -> Result<bool, String> {
-    capyctl_config::engine_settings::boolean("--trust-remote-code", text).map_err(|error| error.detail)
+    capyctl_config::engine_settings::boolean("--trust-remote-code", text)
+        .map_err(|error| error.detail)
 }
 
 /// Owner rule 2026-09-25: `--installation-drift warn|refuse`.
 fn parse_installation_drift(
     text: &str,
 ) -> Result<capyctl_config::effective::InstallationDrift, String> {
-    capyctl_config::engine_settings::drift("--installation-drift", text).map_err(|error| error.detail)
+    capyctl_config::engine_settings::drift("--installation-drift", text)
+        .map_err(|error| error.detail)
 }
 
 /// Owner rule 2026-09-25: `--engine-ports start-end`.
 fn parse_engine_ports(text: &str) -> Result<(u16, u16), String> {
-    capyctl_config::engine_settings::port_range("--engine-ports", text).map_err(|error| error.detail)
+    capyctl_config::engine_settings::port_range("--engine-ports", text)
+        .map_err(|error| error.detail)
 }
 
 /// Owner rule 2026-09-25: `--kv-cache <size>` on `start standalone`.

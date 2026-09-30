@@ -35,9 +35,9 @@
 
 mod tar;
 
-use futures::StreamExt;
 use capyctl_config::effective::ModelSourcePolicy;
 use capyctl_config::model_source::{pattern_matches, secret_name, Archive, ModelSource};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha1::Digest as _;
 use std::collections::{BTreeMap, BTreeSet};

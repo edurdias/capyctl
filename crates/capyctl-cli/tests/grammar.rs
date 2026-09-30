@@ -44,8 +44,10 @@ fn list_and_status_never_activate() {
             resource: ListResource::Deployments
         })
     ));
-    assert!(matches!(parse(["capyctl", "status", "deployment", "dep_x"]),
-        Ok(Command::Status{deployment, watch: false}) if deployment == "dep_x"));
+    assert!(
+        matches!(parse(["capyctl", "status", "deployment", "dep_x"]),
+        Ok(Command::Status{deployment, watch: false}) if deployment == "dep_x")
+    );
     assert!(matches!(
         parse(["capyctl", "status", "deployment", "dep_x", "--watch"]),
         Ok(Command::Status { watch: true, .. })
@@ -128,8 +130,15 @@ fn invite_join_inspect_doctor() {
         matches!(inspect_dep, Command::Inspect{resource: Resource::Deployment, id: Some(id), effective: true} if id == "dep_x")
     );
 
-    let inspect_cfg =
-        parse(["capyctl", "inspect", "config", "--role", "host", "--effective"]).unwrap();
+    let inspect_cfg = parse([
+        "capyctl",
+        "inspect",
+        "config",
+        "--role",
+        "host",
+        "--effective",
+    ])
+    .unwrap();
     assert!(
         matches!(inspect_cfg, Command::Inspect{resource: Resource::Config, id: Some(role), effective: true} if role == "host")
     );
@@ -179,8 +188,10 @@ fn lifecycle_forms() {
 // the object removed; `--stop` stops every instance first. `undeploy` is gone.
 #[test]
 fn delete_deployment_forms() {
-    assert!(matches!(parse(["capyctl", "delete", "deployment", "dep_x"]),
-        Ok(Command::Delete{deployment, stop: false}) if deployment == "dep_x"));
+    assert!(
+        matches!(parse(["capyctl", "delete", "deployment", "dep_x"]),
+        Ok(Command::Delete{deployment, stop: false}) if deployment == "dep_x")
+    );
     assert!(
         matches!(parse(["capyctl", "delete", "deployment", "dep_x", "--stop"]),
         Ok(Command::Delete{deployment, stop: true}) if deployment == "dep_x")
@@ -249,8 +260,15 @@ fn validate_config_file() {
 fn machine_mode_output_flag() {
     let inv = parse_invocation(["capyctl", "deploy", "model", "--output", "json"]).unwrap();
     assert_eq!(inv.output.as_deref(), Some("json"));
-    let inv =
-        parse_invocation(["capyctl", "status", "deployment", "dep_x", "--output", "text"]).unwrap();
+    let inv = parse_invocation([
+        "capyctl",
+        "status",
+        "deployment",
+        "dep_x",
+        "--output",
+        "text",
+    ])
+    .unwrap();
     assert_eq!(inv.output.as_deref(), Some("text"));
 }
 
@@ -284,7 +302,10 @@ fn format_flag_selects_table_or_json() {
 
 #[test]
 fn malformed_invocations_rejected() {
-    assert!(parse(["capyctl", "start"]).is_err(), "start requires a role");
+    assert!(
+        parse(["capyctl", "start"]).is_err(),
+        "start requires a role"
+    );
     assert!(
         parse(["capyctl", "stop", "model", "dep_x"]).is_err(),
         "stop targets deployments"
@@ -297,7 +318,10 @@ fn malformed_invocations_rejected() {
         parse(["capyctl", "deploy", "model", "--activate", "--file"]).is_err(),
         "--file needs a value"
     );
-    assert!(parse(["capyctl"]).is_err(), "bare invocation needs an action");
+    assert!(
+        parse(["capyctl"]).is_err(),
+        "bare invocation needs an action"
+    );
 }
 
 // T22: full native logs require an explicit standalone-only operator flag.
@@ -313,10 +337,17 @@ fn debug_engine_logs_are_explicit_and_scoped_to_standalone() {
             .unwrap()
             .debug_engine_logs
     );
-    assert!(parse_invocation(["capyctl", "start", "deployment", "d", "--debug-engine-logs"]).is_err());
     assert!(
-        parse_invocation(["capyctl", "status", "deployment", "d", "--debug-engine-logs"]).is_err()
+        parse_invocation(["capyctl", "start", "deployment", "d", "--debug-engine-logs"]).is_err()
     );
+    assert!(parse_invocation([
+        "capyctl",
+        "status",
+        "deployment",
+        "d",
+        "--debug-engine-logs"
+    ])
+    .is_err());
 }
 
 // SPEC §14 (deploy model): updating an existing deployment requires an
@@ -548,7 +579,9 @@ fn engine_commands_parse() {
     assert!(parse(["capyctl", "engine", "add", "--deep-park", "maybe"]).is_err());
     assert!(parse(["capyctl", "engine", "remove"]).is_err());
     assert_eq!(
-        parse(["capyctl", "engine", "remove", "vllm"]).unwrap().label(),
+        parse(["capyctl", "engine", "remove", "vllm"])
+            .unwrap()
+            .label(),
         "engine remove vllm"
     );
     assert_eq!(
@@ -561,8 +594,14 @@ fn engine_commands_parse() {
 // `start standalone` and `start server`, and of no other command.
 #[test]
 fn listen_is_parsed_on_start_standalone_and_server() {
-    let i =
-        parse_invocation(["capyctl", "start", "standalone", "--listen", "100.64.0.5:8443"]).unwrap();
+    let i = parse_invocation([
+        "capyctl",
+        "start",
+        "standalone",
+        "--listen",
+        "100.64.0.5:8443",
+    ])
+    .unwrap();
     assert!(matches!(i.command, Command::Start(Role::Standalone)));
     assert_eq!(i.listen, Some("100.64.0.5:8443".parse().unwrap()));
     let i = parse_invocation(["capyctl", "start", "server", "--listen", "[::]:9443"]).unwrap();
@@ -631,7 +670,9 @@ fn model_flags_are_parsed_on_start_standalone_and_host() {
         let i = parse_invocation(["capyctl", "start", role, "--model-sources", "allowed"]).unwrap();
         assert_eq!(i.model_overrides.sources, Some(SourceSwitch::Allowed));
         assert!(parse_invocation(["capyctl", "start", role, "--model-sources", "maybe"]).is_err());
-        assert!(parse_invocation(["capyctl", "start", role, "--model-sources-max", "lots"]).is_err());
+        assert!(
+            parse_invocation(["capyctl", "start", role, "--model-sources-max", "lots"]).is_err()
+        );
         // A relative directory is made absolute against the working directory.
         let i = parse_invocation(["capyctl", "start", role, "--models-root", "m"]).unwrap();
         assert!(i.model_overrides.models_root.unwrap().is_absolute());
@@ -815,7 +856,8 @@ fn generic_overrides_and_config_show_parse() {
     assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
     for bad in ["0.0.0.0:7543", "127.0.0.1:0", "localhost"] {
         assert!(
-            parse_invocation(["capyctl", "start", "standalone", "--management-listen", bad]).is_err(),
+            parse_invocation(["capyctl", "start", "standalone", "--management-listen", bad])
+                .is_err(),
             "{bad}"
         );
     }
@@ -872,15 +914,19 @@ fn output_help_is_shown_only_where_it_means_something() {
         .map(|(path, _)| path.as_str())
         .collect();
     assert!(with_output.contains(&"capyctl"), "{with_output:?}");
-    assert!(with_output.contains(&"capyctl init host"), "{with_output:?}");
-    assert!(with_output.contains(&"capyctl invite"), "{with_output:?}");
     assert!(
-        with_output
-            .iter()
-            .all(|path| *path == "capyctl" || path.starts_with("capyctl init") || *path == "capyctl invite"),
+        with_output.contains(&"capyctl init host"),
         "{with_output:?}"
     );
-    let inv = parse_invocation(["capyctl", "status", "deployment", "d", "--output", "json"]).unwrap();
+    assert!(with_output.contains(&"capyctl invite"), "{with_output:?}");
+    assert!(
+        with_output.iter().all(|path| *path == "capyctl"
+            || path.starts_with("capyctl init")
+            || *path == "capyctl invite"),
+        "{with_output:?}"
+    );
+    let inv =
+        parse_invocation(["capyctl", "status", "deployment", "d", "--output", "json"]).unwrap();
     assert_eq!(inv.output.as_deref(), Some("json"));
     let inv = parse_invocation(["capyctl", "--output", "json", "list", "hosts"]).unwrap();
     assert_eq!(inv.output.as_deref(), Some("json"));

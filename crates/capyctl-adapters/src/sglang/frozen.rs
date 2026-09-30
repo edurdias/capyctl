@@ -32,7 +32,8 @@ pub fn frozen_from_effective(
     // where the checkpoint is, and rendered as `--context-length`. The digest
     // below covers the value the entry is given.
     let mut settings = declared.clone();
-    settings.common.context_length = capyctl_config::context_fit::fit_for_effective(effective).tokens;
+    settings.common.context_length =
+        capyctl_config::context_fit::fit_for_effective(effective).tokens;
     let settings = &settings;
     // SPEC §3: the launch carries exactly one reviewed logical placement. The
     // native startup still resolves and corroborates it independently.

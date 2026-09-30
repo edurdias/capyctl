@@ -96,7 +96,10 @@ async fn timed_out_sink_is_not_called_again_but_backend_terminal_is_still_verifi
 }
 #[async_trait::async_trait]
 impl capyctl_adapters::traits::ChatSink for SlowSink {
-    async fn send(&mut self, chunk: String) -> Result<(), capyctl_adapters::traits::DeliveryFailed> {
+    async fn send(
+        &mut self,
+        chunk: String,
+    ) -> Result<(), capyctl_adapters::traits::DeliveryFailed> {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         self.chunks.push(chunk);
         if self.fail {

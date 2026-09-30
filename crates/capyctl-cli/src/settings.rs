@@ -186,7 +186,8 @@ pub fn config_show(
     let mut put = |path: String, value: Value, source: Source| {
         effective.insert(path, (value, source));
     };
-    for (path, value) in capyctl_config::setting_overrides::defaults(kind, home.as_deref(), state_root)
+    for (path, value) in
+        capyctl_config::setting_overrides::defaults(kind, home.as_deref(), state_root)
     {
         put(path, value, Source::Default);
     }

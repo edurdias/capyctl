@@ -54,7 +54,10 @@ pub fn exposure_warning(bind: SocketAddr, auth: InferenceAuth) -> Option<String>
 /// log) before the listener accepts connections.
 pub fn warn_if_exposed(bind: SocketAddr, auth: InferenceAuth) {
     if let Some(warning) = exposure_warning(bind, auth) {
-        eprintln!("{}", warning_line(capyctl_domain::role_log::mode(), &warning));
+        eprintln!(
+            "{}",
+            warning_line(capyctl_domain::role_log::mode(), &warning)
+        );
     }
 }
 

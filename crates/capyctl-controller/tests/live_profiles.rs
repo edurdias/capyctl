@@ -237,8 +237,8 @@ fn all() -> Vec<String> {
 fn with_vllm(host: &str) -> pb::ReportInventory {
     let mut inventory = inventory(host);
     let mut document: Value = serde_json::from_str(&inventory.approved_host_config_json).unwrap();
-    document["runtime_profiles"]["vllm"] =
-        capyctl_config::registration::profile_document(&capyctl_config::registration::ProfileSpec {
+    document["runtime_profiles"]["vllm"] = capyctl_config::registration::profile_document(
+        &capyctl_config::registration::ProfileSpec {
             engine: capyctl_config::engine_policy::Engine::Vllm,
             executable: "/home/operator/venv/bin/vllm".into(),
             build_fingerprint: "0.29.0".into(),
@@ -246,7 +246,8 @@ fn with_vllm(host: &str) -> pb::ReportInventory {
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
-        });
+        },
+    );
     inventory.approved_host_config_json = document.to_string();
     inventory.policy_fingerprint = capyctl_config::remote_resources::policy_fingerprint(&document);
     inventory.profiles.push(pb::RuntimeProfileStatus {

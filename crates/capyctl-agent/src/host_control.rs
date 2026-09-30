@@ -78,7 +78,10 @@ impl HostControl {
         // environment, document, defaults) and change only with a restart,
         // like every setting outside runtime_profiles.
         let mut document = loaded.document;
-        capyctl_config::engine_settings::carry_start_settings(&self.running.document, &mut document);
+        capyctl_config::engine_settings::carry_start_settings(
+            &self.running.document,
+            &mut document,
+        );
         let config = HostConfig::parse(&document.to_string()).map_err(invalid)?;
         // ADR 0018 §3: everything outside runtime_profiles needs a restart.
         if !only_profiles_differ(&self.running.document, &config.document) {
@@ -159,7 +162,9 @@ impl HostControl {
     fn declared_by_operator(&self, profile: &str) -> bool {
         std::fs::read_to_string(&self.document)
             .ok()
-            .and_then(|text| capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &text).ok())
+            .and_then(|text| {
+                capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &text).ok()
+            })
             .is_some_and(|document| document["runtime_profiles"].get(profile).is_some())
     }
 

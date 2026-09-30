@@ -77,7 +77,8 @@ fn listen_failed(
 ) -> StructuredError {
     let reason = match failure.kind() {
         std::io::ErrorKind::AddrInUse => {
-            "the address is already in use (another capyctl role or program listens there)".to_owned()
+            "the address is already in use (another capyctl role or program listens there)"
+                .to_owned()
         }
         std::io::ErrorKind::AddrNotAvailable => {
             "the address does not belong to this machine".to_owned()
@@ -456,9 +457,10 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         .map_err(|_| unavailable())?;
     // Reopening never regenerates the sealing key of an existing controller.
     private_read(&config.identity_dir.join("secrets.key"))?;
-    let secrets =
-        capyctl_store::secrets::SecretsKey::load_or_create(&config.identity_dir.join("secrets.key"))
-            .map_err(|_| unavailable())?;
+    let secrets = capyctl_store::secrets::SecretsKey::load_or_create(
+        &config.identity_dir.join("secrets.key"),
+    )
+    .map_err(|_| unavailable())?;
     let owner = Arc::new(Mutex::new(
         OwnedCoordinatorState::open_with_secrets(&config.state_dir, secrets).map_err(
             |failure| match failure {
@@ -593,9 +595,9 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             .with_switcher(switcher.clone()),
     );
     // ADR 0018 §4: retiring a host's runtime profile through the ordinary stop path.
-    sessions.with_profile_retirements(Arc::new(capyctl_management::engines::StoreRetirements::new(
-        actions.clone(),
-    )));
+    sessions.with_profile_retirements(Arc::new(
+        capyctl_management::engines::StoreRetirements::new(actions.clone()),
+    ));
     // ADR 0013 §10 (I3, D9): the router balances across instances on host
     // liveness and the engine load each host agent reports.
     let controller = Arc::new(
@@ -689,7 +691,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                     management_credentials(&credentials)?,
                     {
                         let view = Arc::new(
-                            capyctl_management::inference_listener::InferenceListenerView::default(),
+                            capyctl_management::inference_listener::InferenceListenerView::default(
+                            ),
                         );
                         view.set(crate::exposure::listener_view(
                             config.inference,
@@ -886,7 +889,8 @@ fn load_host(
             e.path, e.detail
         ))
     };
-    let env = capyctl_config::model_settings::ModelOverrides::from_process_env().map_err(invalid)?;
+    let env =
+        capyctl_config::model_settings::ModelOverrides::from_process_env().map_err(invalid)?;
     let engine_env =
         capyctl_config::engine_settings::EngineOverrides::from_process_env().map_err(invalid)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -929,8 +933,8 @@ async fn serve_host(
     // mismatch. Unified hosts still publish the placement inventory above.
     let discrete = !capyctl_agent::device_domains::device_domains(&config.document).is_empty();
     if discrete {
-        let shape =
-            capyctl_agent::gpu_memory::shape(boot_gpu.as_ref()).map_err(|e| error(&e.to_string()))?;
+        let shape = capyctl_agent::gpu_memory::shape(boot_gpu.as_ref())
+            .map_err(|e| error(&e.to_string()))?;
         check_host_device_policy(&config.document, &shape)?;
     }
     let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
@@ -1047,9 +1051,11 @@ async fn serve_host(
         .with_rendezvous_root(config.state_dir.join("rendezvous"))
         // SPEC §9.2 (W4): the production saver observation source; without it
         // SGLang Park is refused unchanged.
-        .with_saver_residency(Arc::new(capyctl_agent::native_execution::EnrolledSaver::new(
-            config.state_dir.join("observation"),
-        )))
+        .with_saver_residency(Arc::new(
+            capyctl_agent::native_execution::EnrolledSaver::new(
+                config.state_dir.join("observation"),
+            ),
+        ))
         // ADR 0007 (found live 2026-09-23, matrix M33): each GPU process's
         // memory rides the availability reports, so the server credits
         // resident engines instead of charging them twice.
@@ -1076,10 +1082,9 @@ async fn serve_host(
     // shared with the session and the local control handler.
     let host_profiles = match &execution {
         Some(native) => native.profiles(),
-        None => capyctl_agent::profiles::HostProfiles::new(capyctl_agent::profiles::ProfileSet::new(
-            config.clone(),
-            inventory.clone(),
-        )),
+        None => capyctl_agent::profiles::HostProfiles::new(
+            capyctl_agent::profiles::ProfileSet::new(config.clone(), inventory.clone()),
+        ),
     };
     let updates = capyctl_agent::session::ProfileUpdates::new(host_profiles);
     // ADR 0018 §3: the local control channel, bound only inside the role's

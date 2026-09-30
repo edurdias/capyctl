@@ -92,7 +92,10 @@ impl capyctl_agent::session::SessionExecution for JournalExecutor {
                     return Err(capyctl_agent::session::SessionError);
                 }
                 journal
-                    .execution_result(&command.identity.command_id, capyctl_protocol::now_unix_ms())
+                    .execution_result(
+                        &command.identity.command_id,
+                        capyctl_protocol::now_unix_ms(),
+                    )
                     .map_err(|_| capyctl_agent::session::SessionError)
             })
             .await
@@ -556,7 +559,10 @@ impl capyctl_agent::session::SessionExecution for SlowExecutor {
                         .map_err(|_| capyctl_agent::session::SessionError)?;
                 }
                 journal
-                    .execution_result(&command.identity.command_id, capyctl_protocol::now_unix_ms())
+                    .execution_result(
+                        &command.identity.command_id,
+                        capyctl_protocol::now_unix_ms(),
+                    )
                     .map_err(|_| capyctl_agent::session::SessionError)
             })
             .await
@@ -1412,7 +1418,11 @@ async fn an_engine_gone_before_readiness_is_a_terminal_launch_result() {
             .await
         });
         eventually(|| sessions.inspect(&host).is_some_and(|s| s.reconciled)).await;
-        let launch = launch_command(controller_id, &host, capyctl_protocol::now_unix_ms() + 60_000);
+        let launch = launch_command(
+            controller_id,
+            &host,
+            capyctl_protocol::now_unix_ms() + 60_000,
+        );
         let outcome = tokio::time::timeout(Duration::from_secs(3), sessions.execute(launch)).await;
         if terminal {
             let result = outcome

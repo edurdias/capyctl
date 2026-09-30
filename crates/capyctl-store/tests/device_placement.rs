@@ -479,10 +479,12 @@ fn eviction_frees_one_gpu_by_least_recent_use() {
             )
             .unwrap()
         {
-            capyctl_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => victims
-                .into_iter()
-                .map(|v| v.deployment_id)
-                .collect::<Vec<_>>(),
+            capyctl_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => {
+                victims
+                    .into_iter()
+                    .map(|v| v.deployment_id)
+                    .collect::<Vec<_>>()
+            }
             other => panic!("{other:?}"),
         }
     };
@@ -622,7 +624,8 @@ fn a_host_backed_victim_is_planned_a_stop_when_observed_host_ram_cannot_take_its
     let c = deploy("c", host_backed_resources(12, 4, 8));
     let host = t.host["name"].as_str().unwrap().to_owned();
     let plan = |system_available: i64| {
-        let mut observed = capyctl_store::ordinary_lifecycle::switching::PlanningObservations::new();
+        let mut observed =
+            capyctl_store::ordinary_lifecycle::switching::PlanningObservations::new();
         if system_available > 0 {
             let observation = |domain: &str, capacity: i64, available: i64| MemoryObservation {
                 domain: domain.into(),
@@ -665,10 +668,12 @@ fn a_host_backed_victim_is_planned_a_stop_when_observed_host_ram_cannot_take_its
             )
             .unwrap()
         {
-            capyctl_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => victims
-                .into_iter()
-                .map(|v| (v.deployment_id, v.parks, v.park_does_not_fit))
-                .collect::<Vec<_>>(),
+            capyctl_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => {
+                victims
+                    .into_iter()
+                    .map(|v| (v.deployment_id, v.parks, v.park_does_not_fit))
+                    .collect::<Vec<_>>()
+            }
             other => panic!("{other:?}"),
         }
     };

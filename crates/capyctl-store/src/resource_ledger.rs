@@ -1,5 +1,7 @@
 use capyctl_domain::resources::*;
-use capyctl_scheduler::residency::{admit_phase, validate_footprint, AdmissionContext, ResourceError};
+use capyctl_scheduler::residency::{
+    admit_phase, validate_footprint, AdmissionContext, ResourceError,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 

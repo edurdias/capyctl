@@ -1221,14 +1221,15 @@ fn a_wake_beside_a_ready_engine_is_credited_its_resident_memory() {
             )
             .unwrap()
     };
-    let resident = |pid: u32, start_ticks: u64, gib: i64| capyctl_domain::resources::ProcessResident {
-        pid,
-        boot_id: "boot-1".into(),
-        start_ticks,
-        bytes: gib << 30,
-        device_bytes: 0,
-        host_bytes: 0,
-    };
+    let resident =
+        |pid: u32, start_ticks: u64, gib: i64| capyctl_domain::resources::ProcessResident {
+            pid,
+            boot_id: "boot-1".into(),
+            start_ticks,
+            bytes: gib << 30,
+            device_bytes: 0,
+            host_bytes: 0,
+        };
     // Without a sample, or with one naming other processes, nothing is
     // credited and the wake waits, as before.
     assert!(matches!(arm(&[]), ResidencyArm::Blocked(_)));

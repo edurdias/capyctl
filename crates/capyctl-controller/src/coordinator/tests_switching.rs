@@ -386,7 +386,8 @@ impl Lab {
     }
 }
 
-const VLLM: &str = include_str!("../../../capyctl-config/tests/fixtures/effective-vllm-golden.json");
+const VLLM: &str =
+    include_str!("../../../capyctl-config/tests/fixtures/effective-vllm-golden.json");
 const SGLANG: &str =
     include_str!("../../../capyctl-config/tests/fixtures/effective-sglang-golden.json");
 

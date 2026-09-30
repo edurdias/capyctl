@@ -109,8 +109,10 @@ fn trusted_inventory_runtime_uses_isolated_imports_and_relative_helpers() {
     let poison = "from pathlib import Path\nPath(__file__).with_name('wrong-import').touch()\nraise RuntimeError('wrong import')\n";
     std::fs::write(root.path().join("runtime.py"), poison).unwrap();
     std::fs::write(root.path().join("sitecustomize.py"), poison).unwrap();
-    capyctl_adapters::sglang::SglangLaunch::validate_wrapper_path(&selected.join("sglang_device.py"))
-        .expect("fixture path is trusted");
+    capyctl_adapters::sglang::SglangLaunch::validate_wrapper_path(
+        &selected.join("sglang_device.py"),
+    )
+    .expect("fixture path is trusted");
     capyctl_agent::runtime_integrity::verify(&selected, &["sglang_device.py"])
         .expect("fixture runtime is trusted");
     let published = capyctl_cli::device_inventory::collect(&selected, None)

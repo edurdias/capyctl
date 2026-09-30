@@ -515,9 +515,11 @@ pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::Socke
             crate::settings::describe(&error)
         ))
     };
-    let overrides =
-        capyctl_config::setting_overrides::SettingOverrides::from_process(ConfigKind::Standalone, &[])
-            .map_err(refused)?;
+    let overrides = capyctl_config::setting_overrides::SettingOverrides::from_process(
+        ConfigKind::Standalone,
+        &[],
+    )
+    .map_err(refused)?;
     let parsed = capyctl_config::parse_document(&text)
         .and_then(|parsed| overrides.apply_and_validate(parsed))
         .map_err(refused)?;
@@ -1782,8 +1784,8 @@ async fn start_standalone_in(
         .await
         .map_err(|_| StartError::Deploy("installation registration did not finish".into()))?
     };
-    let bindings: Arc<dyn EngineBindings> =
-        Arc::new(capyctl_controller::installation_gate::InstalledBindings::new(
+    let bindings: Arc<dyn EngineBindings> = Arc::new(
+        capyctl_controller::installation_gate::InstalledBindings::new(
             // Discrete GPU design §6: engines on a device domain are sized
             // against the total of the card the boot sample observed.
             provider.bindings_for_devices(
@@ -1793,7 +1795,8 @@ async fn start_standalone_in(
                 device_totals(&gpu_shape),
             ),
             embedded.installations(),
-        ));
+        ),
+    );
     // ADR 0014 §7 (WE3): the embedded host measures pending checkpoint digests
     // with the verifier its launches use, so they share one stat cache.
     let mut supervision = crate::shutdown::Supervision::new();

@@ -51,7 +51,10 @@ fn host_runtime_and_ingress_are_explicit_and_fail_closed() {
     document["runtime_dir"] = "/home/operator/capyctl/runtime".into();
     document["ingress"] = serde_json::json!({"bind":"100.64.0.10:9443","address":"http://100.64.0.10:9443","transport":"trusted_private_link"});
     let config = HostConfig::parse(&document.to_string()).unwrap();
-    assert_eq!(config.runtime_dir, Path::new("/home/operator/capyctl/runtime"));
+    assert_eq!(
+        config.runtime_dir,
+        Path::new("/home/operator/capyctl/runtime")
+    );
     assert!(config.runtime_dir_declared);
     assert_eq!(config.ingress.unwrap().bind.port(), 9443);
     for address in [
@@ -85,7 +88,8 @@ fn host_load_report_interval_defaults_and_is_bounded() {
         let config = HostConfig::parse(&document.to_string()).unwrap();
         assert_eq!(config.load_report_interval, expected, "{text}");
         // Role-local: dropped before the host document is resolved against.
-        let local = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+        let local =
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
         assert!(local.get("load_report_interval").is_none());
     }
     for text in ["249ms", "0s", "6s", "1m", "soon"] {
@@ -136,7 +140,8 @@ fn shutdown_drain_timeout_defaults_and_is_bounded() {
         let config = HostConfig::parse(&host.to_string()).unwrap();
         assert_eq!(config.drain_timeout, expected);
         // Role-local: never part of the document a deployment resolves against.
-        let local = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+        let local =
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
         assert!(local.get("shutdown").is_none());
         let parsed = parse_strict(ConfigKind::Standalone, &standalone.to_string()).unwrap();
         assert_eq!(drain_timeout(&parsed).unwrap(), expected, "{text}");
@@ -435,7 +440,8 @@ fn a_server_host_allows_model_sources_by_default() {
             .expect("a host document may omit model_store")
             .with_models(flags, env, Some(home))
             .unwrap();
-        let local = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+        let local =
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
         capyctl_config::effective::normalize_host_policy(&local).unwrap()
     };
     let none = ModelOverrides::default();

@@ -214,8 +214,10 @@ async fn a_prepared_host_is_eligible_only_while_its_reconciled_session_lives() {
     });
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
-        capyctl_agent::session::run_session_with_execution(&identity, journal, report, shutdown, None)
-            .await
+        capyctl_agent::session::run_session_with_execution(
+            &identity, journal, report, shutdown, None,
+        )
+        .await
     });
     eventually(|| sessions.inspect(&host).is_some_and(|s| s.reconciled)).await;
     let view = sessions.inspect(&host).unwrap();
@@ -301,8 +303,10 @@ async fn a_host_with_a_pending_drain_is_not_a_placement_candidate() {
     });
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
-        capyctl_agent::session::run_session_with_execution(&identity, journal, report, shutdown, None)
-            .await
+        capyctl_agent::session::run_session_with_execution(
+            &identity, journal, report, shutdown, None,
+        )
+        .await
     });
     eventually(|| sessions.inspect(&host).is_some_and(|s| s.reconciled)).await;
     assert!(sessions.eligible_hosts().unwrap().contains(&host));

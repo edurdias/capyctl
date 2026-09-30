@@ -44,7 +44,9 @@ fn malformed_database_failure_releases_lifetime_lock() {
     fs::write(&path, b"not sqlite").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(OwnedCoordinatorState::open(dir.path()).is_err());
-    assert!(capyctl_launchers::ControllerLock::acquire(&dir.path().join("controller.lock")).is_ok());
+    assert!(
+        capyctl_launchers::ControllerLock::acquire(&dir.path().join("controller.lock")).is_ok()
+    );
 }
 
 #[test]

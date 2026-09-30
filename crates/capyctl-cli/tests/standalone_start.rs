@@ -49,14 +49,19 @@ async fn standalone_refuses_to_boot_without_an_engine_installation() {
     std::env::remove_var("CAPYCTL_VLLM_BIN");
     std::env::remove_var("CAPYCTL_MODELS_ROOT");
 
-    let error =
-        capyctl_cli::roles::start_standalone_with_config_home(dir.path(), &dir.path().join(".config"))
-            .await
-            .err()
-            .expect("a host with no engine must refuse to boot");
+    let error = capyctl_cli::roles::start_standalone_with_config_home(
+        dir.path(),
+        &dir.path().join(".config"),
+    )
+    .await
+    .err()
+    .expect("a host with no engine must refuse to boot");
 
     assert!(
-        matches!(error, capyctl_cli::roles::StartError::NoEngineInstallation(_)),
+        matches!(
+            error,
+            capyctl_cli::roles::StartError::NoEngineInstallation(_)
+        ),
         "{error:?}"
     );
     let said = error.to_string();
@@ -108,17 +113,20 @@ async fn standalone_limits_follow_the_stated_capacity_not_the_suite_machine() {
 async fn standalone_refuses_a_document_stating_settings_it_does_not_honour() {
     let dir = safe_state_dir();
     let (path, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path()).unwrap();
+        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path())
+            .unwrap();
     let text = std::fs::read_to_string(&path).unwrap().replace(
         "  listeners:\n",
         "  tls:\n    mode: managed\n    identity_dir: /nowhere\n  listeners:\n",
     );
     std::fs::write(&path, text).unwrap();
-    let error =
-        capyctl_cli::roles::start_standalone_with_config_home(dir.path(), &dir.path().join(".config"))
-            .await
-            .err()
-            .expect("an ignored setting must refuse the boot");
+    let error = capyctl_cli::roles::start_standalone_with_config_home(
+        dir.path(),
+        &dir.path().join(".config"),
+    )
+    .await
+    .err()
+    .expect("an ignored setting must refuse the boot");
     let said = error.to_string();
     assert!(said.contains("server.tls"), "{said}");
     assert!(
@@ -170,7 +178,8 @@ fn legacy_generated(state: &str) -> String {
 async fn standalone_starts_from_a_document_an_older_generator_wrote() {
     let dir = safe_state_dir();
     let (path, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path()).unwrap();
+        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path())
+            .unwrap();
     let legacy = legacy_generated(&dir.path().to_string_lossy());
     std::fs::write(&path, &legacy).unwrap();
 
@@ -253,7 +262,8 @@ async fn a_document_may_turn_inference_authentication_off() {
     use capyctl_cli::exposure::InferenceAuth;
     let dir = safe_state_dir();
     let (path, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path()).unwrap();
+        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path())
+            .unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("authentication: api_key"), "{text}");
     std::fs::write(
@@ -412,7 +422,8 @@ async fn an_explicit_standalone_document_that_is_missing_refuses_without_fallbac
 async fn an_explicit_standalone_document_that_is_invalid_is_not_replaced_by_the_implicit_one() {
     let dir = safe_state_dir();
     let (implicit, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path()).unwrap();
+        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, dir.path())
+            .unwrap();
     let implicit_before = std::fs::read_to_string(&implicit).unwrap();
     let explicit = dir.path().join("explicit.yaml");
     let invalid = "schema_version: 1\nkind: standalone\nname: local\nname: again\n";

@@ -108,7 +108,8 @@ impl LifecycleState {
         &self,
         context: &capyctl_domain::completion::StepExecutionContext,
     ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
-        let capyctl_domain::completion::ExecutionIdentities::Retained(expected) = &context.identities
+        let capyctl_domain::completion::ExecutionIdentities::Retained(expected) =
+            &context.identities
         else {
             return Err(RuntimeError::Unsupported);
         };

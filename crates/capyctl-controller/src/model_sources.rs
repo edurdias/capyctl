@@ -292,9 +292,9 @@ pub async fn ensure_materialized(
     };
     if !sessions.supports_model_sources(host) {
         // ADR 0017: the typed refusal for a host without the feature.
-        return Err(RuntimeError::Refused(capyctl_protocol::capabilities::missing(
-            capyctl_protocol::capabilities::MODEL_SOURCES,
-        )));
+        return Err(RuntimeError::Refused(
+            capyctl_protocol::capabilities::missing(capyctl_protocol::capabilities::MODEL_SOURCES),
+        ));
     }
     loop {
         let now = capyctl_protocol::now_unix_ms();

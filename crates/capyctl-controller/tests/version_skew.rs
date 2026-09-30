@@ -972,7 +972,8 @@ async fn a_device_observation_is_accepted() {
         (gpu.kind.as_str(), gpu.device_id.as_str()),
         ("device", "gpu0")
     );
-    let key = |domain: &str| capyctl_config::remote_resources::ledger_key(&h.host, "domain", domain);
+    let key =
+        |domain: &str| capyctl_config::remote_resources::ledger_key(&h.host, "domain", domain);
     let (observations, residents) = h
         .sessions
         .observe_with_residents(h.host.clone())

@@ -8,7 +8,9 @@
 
 use capyctl_adapters::sglang::frozen_from_effective;
 use capyctl_adapters::vllm::{plan_from_effective, render_command, VllmPlanError};
-use capyctl_config::effective::{resolve_effective, CudaNamespace, DomainMemory, EffectiveDeployment};
+use capyctl_config::effective::{
+    resolve_effective, CudaNamespace, DomainMemory, EffectiveDeployment,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 

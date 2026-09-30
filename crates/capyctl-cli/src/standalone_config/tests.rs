@@ -513,7 +513,10 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     assert_eq!(deployment["residency"], "deep");
     let resolved = capyctl_config::effective::resolve_effective(&deployment, &host)
         .expect("a deep vLLM deployment resolves on a deep-parking host");
-    assert_eq!(resolved.residency, capyctl_config::effective::Residency::Deep);
+    assert_eq!(
+        resolved.residency,
+        capyctl_config::effective::Residency::Deep
+    );
     let LaunchSettings::Vllm(settings) = &resolved.engine_config else {
         panic!("a vLLM installation resolves vLLM settings");
     };
@@ -664,7 +667,10 @@ fn host_policy_from_env_is_complete() {
     // SPEC §9.1 / ADR 0012: an unset `CAPYCTL_DEEP_PARK` leaves deep parking on,
     // so the generated vLLM deployment is deep and sleep mode is derived from
     // it (SPEC §6.2), as in server mode.
-    assert_eq!(resolved.residency, capyctl_config::effective::Residency::Deep);
+    assert_eq!(
+        resolved.residency,
+        capyctl_config::effective::Residency::Deep
+    );
     assert!(settings.enable_sleep_mode);
     assert_eq!(
         settings.provenance["enable_sleep_mode"],
@@ -727,7 +733,10 @@ fn deep_park_is_on_unless_the_host_opts_out() {
             .installation()
             .expect_err("an unrecognized value is refused");
         let message = refusal.to_string();
-        assert!(message.contains("CAPYCTL_DEEP_PARK"), "{value:?}: {message}");
+        assert!(
+            message.contains("CAPYCTL_DEEP_PARK"),
+            "{value:?}: {message}"
+        );
         assert!(message.contains("off"), "{value:?}: {message}");
     }
 
@@ -1091,8 +1100,8 @@ fn names(found: &[capyctl_controller::engine_provider::NamedInstallation]) -> Ve
 }
 
 fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
-    let profile =
-        capyctl_config::registration::profile_document(&capyctl_config::registration::ProfileSpec {
+    let profile = capyctl_config::registration::profile_document(
+        &capyctl_config::registration::ProfileSpec {
             engine: Engine::Vllm,
             executable: executable.into(),
             build_fingerprint: "0.29.0".into(),
@@ -1100,7 +1109,8 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
-        });
+        },
+    );
     [("vllm-patched".to_string(), profile)]
         .into_iter()
         .collect()
@@ -1829,7 +1839,8 @@ fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
         ..Default::default()
     };
     let effective =
-        capyctl_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts).unwrap();
+        capyctl_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts)
+            .unwrap();
     let (_, charged) = effective.ready_device_allocation().unwrap();
     assert!(charged >= MEASURED_HELD, "{charged} < {MEASURED_HELD}");
     assert!(charged <= limits.managed_limit);

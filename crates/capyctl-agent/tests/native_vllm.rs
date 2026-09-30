@@ -1801,7 +1801,8 @@ async fn a_parked_launch_that_loses_a_member_is_reported() {
     unsafe { libc::kill(worker as i32, libc::SIGKILL) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let exit = loop {
-        let exited = capyctl_agent::exits::scan(&host.journal, "host", capyctl_protocol::now_unix_ms());
+        let exited =
+            capyctl_agent::exits::scan(&host.journal, "host", capyctl_protocol::now_unix_ms());
         if let Some(launch) = exited.into_iter().next() {
             break launch.exit;
         }

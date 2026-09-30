@@ -345,9 +345,9 @@ fn a_server_document_is_checked_by_the_server_parser() {
 #[test]
 fn an_out_of_range_drain_timeout_is_a_named_error_in_every_role_document() {
     let dir = tempfile::tempdir().unwrap();
-    let server: Value = serde_json::from_str(&capyctl_config::remote_roles::ServerConfig::template(
-        &dir.path().join("srv"),
-    ))
+    let server: Value = serde_json::from_str(
+        &capyctl_config::remote_roles::ServerConfig::template(&dir.path().join("srv")),
+    )
     .unwrap();
     let standalone = json!({"schema_version": 1, "kind": "standalone", "name": "local"});
     for (name, mut document) in [

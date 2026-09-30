@@ -221,7 +221,10 @@ async fn standalone_model_settings_follow_flag_env_document_default() {
     .await
     .err()
     .expect("a malformed switch is refused");
-    assert!(error.to_string().contains("CAPYCTL_MODEL_SOURCES"), "{error}");
+    assert!(
+        error.to_string().contains("CAPYCTL_MODEL_SOURCES"),
+        "{error}"
+    );
     for name in [
         "CAPYCTL_MODELS_ROOT",
         "CAPYCTL_MODEL_SOURCES",

@@ -3,8 +3,10 @@
 use capyctl_config::remote_roles::{timing_header, ServerConfig};
 
 fn server(observability: Option<serde_json::Value>) -> String {
-    let mut document: serde_json::Value =
-        serde_json::from_str(&ServerConfig::template(std::path::Path::new("/srv/capyctl"))).unwrap();
+    let mut document: serde_json::Value = serde_json::from_str(&ServerConfig::template(
+        std::path::Path::new("/srv/capyctl"),
+    ))
+    .unwrap();
     if let Some(observability) = observability {
         document["observability"] = observability;
     }

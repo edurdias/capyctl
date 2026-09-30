@@ -336,7 +336,8 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
     fn runtime_endpoint(
         &self,
         deployment: &str,
-    ) -> Result<Option<capyctl_controller::RuntimeEndpoint>, capyctl_controller::LifecycleFault> {
+    ) -> Result<Option<capyctl_controller::RuntimeEndpoint>, capyctl_controller::LifecycleFault>
+    {
         if deployment != self.deployment {
             return Ok(None);
         }

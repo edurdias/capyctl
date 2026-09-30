@@ -35,13 +35,13 @@ mod supervised;
 // SPEC §10, ADR 0013 §8 (W10): request-driven switching.
 pub mod switching;
 
+pub use capyctl_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
+pub use capyctl_domain::completion;
+pub use capyctl_domain::LifecycleAction;
 pub use coordinator_port::{CoordinatorLifecycle, RoutingSignals};
 pub use engine_bindings::ProfileBindings;
 pub use engine_provider::{EngineInstallation, EngineProvider, ProviderError};
 pub use fault::LifecycleFault;
-pub use capyctl_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
-pub use capyctl_domain::completion;
-pub use capyctl_domain::LifecycleAction;
 pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
 pub use ownership::{OwnedCoordinatorState, OwnedStateError};
 pub use port::{LifecyclePort, RuntimeEndpoint, ServingInstance};

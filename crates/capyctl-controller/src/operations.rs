@@ -1064,7 +1064,8 @@ impl Controller {
     pub async fn observe_adapter(
         &self,
         deployment: &str,
-    ) -> Result<capyctl_adapters::traits::WorkObservation, capyctl_adapters::traits::AdapterError> {
+    ) -> Result<capyctl_adapters::traits::WorkObservation, capyctl_adapters::traits::AdapterError>
+    {
         let member = capyctl_adapters::traits::MemberRef {
             deployment_id: deployment.to_string(),
             member_id: format!("{deployment}-head"),

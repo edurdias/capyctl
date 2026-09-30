@@ -140,7 +140,10 @@ fn a_minimal_file_resolves_on_a_unified_host() {
         8 * GIB + 4 * GIB + capyctl_config::effective::overhead_margin(effective.profile.engine)
     );
     let provenance = provenance(&effective);
-    assert_eq!(provenance["residency"], json!(SettingSource::CapyctlDefault));
+    assert_eq!(
+        provenance["residency"],
+        json!(SettingSource::CapyctlDefault)
+    );
     assert_eq!(
         provenance["memory.kv_cache"],
         json!(SettingSource::CapyctlDefault)

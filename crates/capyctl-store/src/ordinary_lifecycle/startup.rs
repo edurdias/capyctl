@@ -127,7 +127,8 @@ fn weighed_placeholder(
             )
         })
         .and_then(|estimate| {
-            estimate.checked_add(capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
+            estimate
+                .checked_add(capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
         })
     else {
         return Ok(None);

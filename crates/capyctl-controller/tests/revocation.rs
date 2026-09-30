@@ -53,7 +53,10 @@ async fn eventually(mut predicate: impl FnMut() -> bool) {
 /// Inspect-only host policy: nothing here launches a process.
 struct InspectPolicy;
 impl capyctl_agent::journal::LocalExecutionPolicy for InspectPolicy {
-    fn authorize(&self, command: &MemberCommand) -> Result<(), capyctl_agent::journal::JournalError> {
+    fn authorize(
+        &self,
+        command: &MemberCommand,
+    ) -> Result<(), capyctl_agent::journal::JournalError> {
         if matches!(command.action, MemberAction::Inspect) {
             Ok(())
         } else {
@@ -99,7 +102,10 @@ impl capyctl_agent::session::SessionExecution for JournalExecutor {
                     capyctl_agent::journal::Acceptance::Replay(_) => {}
                 }
                 journal
-                    .execution_result(&command.identity.command_id, capyctl_protocol::now_unix_ms())
+                    .execution_result(
+                        &command.identity.command_id,
+                        capyctl_protocol::now_unix_ms(),
+                    )
                     .map_err(|_| capyctl_agent::session::SessionError)
             })
             .await

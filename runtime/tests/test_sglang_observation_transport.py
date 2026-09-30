@@ -422,9 +422,9 @@ class ObservationTransportTests(unittest.TestCase):
         # The same vectors crates/capyctl-adapters/src/sglang/observation.rs computes.
         vector = self.module.observation_key("admin", "binding", "incarnation")
         self.assertEqual(vector.hex(),
-                         "57fccc735da4dbf27df1429ffdd32592821c41c56fa440fe7ed32aa97411581e")
+                         "b8554e55164b83355eeb71802ce34e3bb258d3ce4d65435d2fb9277913ae85e0")
         self.assertEqual(self.module.request_proof(vector, "binding", "incarnation", "r-1"),
-                         "ed01f094bf1dbca00b9ab32be46c29cc89768bbd5aed1cd0b4f567f1d89fadf3")
+                         "1ee4a2715d328a008eb2388c4af021426bac79190b9c6c4977dde11ce9655904")
         key = self.module.observation_key("admin-key", "binding-1", "incarnation-1")
         self.assertEqual(len(key), 32)
         self.assertNotEqual(key, self.module.observation_key("admin-key", "binding-1", "other"))

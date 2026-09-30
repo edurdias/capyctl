@@ -67,8 +67,9 @@ pub fn publish(
             Err(PublicationError::default())
         };
     }
-    let config = capyctl_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
-        .map_err(|_| PublicationError::default())?;
+    let config =
+        capyctl_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
+            .map_err(|_| PublicationError::default())?;
     if capyctl_config::remote_resources::policy_fingerprint(&config.document)
         != inventory.policy_fingerprint
     {
@@ -163,8 +164,9 @@ pub fn republish(
     inventory: &ReportInventory,
     previous: &ReportInventory,
 ) -> Result<(), String> {
-    let config = capyctl_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
-        .map_err(|e| format!("the document is not a valid host document: {}", e.detail))?;
+    let config =
+        capyctl_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
+            .map_err(|e| format!("the document is not a valid host document: {}", e.detail))?;
     if capyctl_config::remote_resources::policy_fingerprint(&config.document)
         != inventory.policy_fingerprint
     {

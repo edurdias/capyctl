@@ -8,8 +8,8 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use futures::StreamExt;
 use capyctl_domain::latency::Histogram;
+use futures::StreamExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,

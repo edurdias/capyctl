@@ -156,7 +156,15 @@ fn a_revoked_host_exits_with_its_own_code_and_the_recovery_commands() {
         "FILE",
     ])
     .unwrap();
-    parse(["capyctl", "join", "host", "--join-file", "FILE", "--recover"]).unwrap();
+    parse([
+        "capyctl",
+        "join",
+        "host",
+        "--join-file",
+        "FILE",
+        "--recover",
+    ])
+    .unwrap();
 }
 
 // T23 (owner decision 2026-09-25): a start refused because no allowed host is

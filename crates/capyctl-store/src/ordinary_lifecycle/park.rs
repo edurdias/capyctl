@@ -1540,7 +1540,9 @@ fn fit(
         {
             continue;
         }
-        match capyctl_scheduler::sequence::lru_parked_victims(&state, owner, target, &order, context) {
+        match capyctl_scheduler::sequence::lru_parked_victims(
+            &state, owner, target, &order, context,
+        ) {
             Some(more) => {
                 for victim in more {
                     capyctl_scheduler::sequence::forecast_removal(
@@ -1554,7 +1556,8 @@ fn fit(
             }
             None => {
                 return Ok(Fit::Impossible(
-                    match capyctl_scheduler::residency::admit_phase(&state, owner, target, context) {
+                    match capyctl_scheduler::residency::admit_phase(&state, owner, target, context)
+                    {
                         Err(error) => error.to_string(),
                         Ok(()) => "no fit".into(),
                     },

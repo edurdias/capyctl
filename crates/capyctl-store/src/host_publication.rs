@@ -49,7 +49,9 @@ impl RepublishRefusal {
                     .into()
             }
             Self::NotRetired(name) => {
-                format!("profile {name} is still in use or was not retired; run capyctl engine remove")
+                format!(
+                    "profile {name} is still in use or was not retired; run capyctl engine remove"
+                )
             }
             Self::Store => "the server could not record the publication".into(),
         }
@@ -331,9 +333,11 @@ impl Store {
             )
             .optional()?;
         match source {
-            Some(source) => capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &source)
-                .map(Some)
-                .map_err(|_| StoreError::Conflict),
+            Some(source) => {
+                capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &source)
+                    .map(Some)
+                    .map_err(|_| StoreError::Conflict)
+            }
             None => self.managed_configuration_source(deployment, revision),
         }
     }
@@ -365,9 +369,11 @@ impl Store {
             None => None,
         };
         match chosen {
-            Some(source) => capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &source)
-                .map(Some)
-                .map_err(|_| StoreError::Conflict),
+            Some(source) => {
+                capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, &source)
+                    .map(Some)
+                    .map_err(|_| StoreError::Conflict)
+            }
             None => self.host_configuration_source(deployment, revision, host),
         }
     }

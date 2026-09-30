@@ -843,7 +843,10 @@ fn a_malformed_drain_bound_refuses_startup() {
 fn a_writable_runtime_module_refuses_standalone_startup() {
     let installation = Installation::new();
     std::fs::set_permissions(
-        installation.root.path().join("runtime/capyctl_vllm_guard.py"),
+        installation
+            .root
+            .path()
+            .join("runtime/capyctl_vllm_guard.py"),
         std::fs::Permissions::from_mode(0o666),
     )
     .unwrap();
@@ -868,7 +871,10 @@ fn a_non_loopback_standalone_listener_is_refused() {
     // public port, and serve until the bound below fails the test.
     // Owner decision 2026-09-25: CAPYCTL_MANAGEMENT_ADDR, and the deprecated
     // CAPYCTL_STANDALONE_MANAGEMENT_ADDR when it is the one set.
-    for variable in ["CAPYCTL_MANAGEMENT_ADDR", "CAPYCTL_STANDALONE_MANAGEMENT_ADDR"] {
+    for variable in [
+        "CAPYCTL_MANAGEMENT_ADDR",
+        "CAPYCTL_STANDALONE_MANAGEMENT_ADDR",
+    ] {
         let out = output_within(
             installation
                 .command()
@@ -881,7 +887,10 @@ fn a_non_loopback_standalone_listener_is_refused() {
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(said.contains(variable), "{said}");
     }
-    for variable in ["CAPYCTL_INFERENCE_ADDR", "CAPYCTL_STANDALONE_INFERENCE_ADDR"] {
+    for variable in [
+        "CAPYCTL_INFERENCE_ADDR",
+        "CAPYCTL_STANDALONE_INFERENCE_ADDR",
+    ] {
         let out = output_within(
             installation
                 .command()
@@ -931,9 +940,11 @@ fn run_until_ready(command: &mut Command, ready: impl Fn(&str) -> bool) -> (Stri
 #[test]
 fn a_loopback_standalone_document_is_never_rewritten() {
     let installation = Installation::new();
-    let (path, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, &installation.state())
-            .unwrap();
+    let (path, _) = capyctl_config::generate_default(
+        capyctl_config::ConfigKind::Standalone,
+        &installation.state(),
+    )
+    .unwrap();
     let previous = std::fs::read_to_string(&path)
         .unwrap()
         .replace("0.0.0.0:8443", "127.0.0.1:8443");
@@ -984,9 +995,11 @@ fn a_piped_role_writes_only_json_lines() {
 #[test]
 fn the_standalone_inference_address_follows_flag_then_environment_then_document() {
     let installation = Installation::new();
-    let (path, _) =
-        capyctl_config::generate_default(capyctl_config::ConfigKind::Standalone, &installation.state())
-            .unwrap();
+    let (path, _) = capyctl_config::generate_default(
+        capyctl_config::ConfigKind::Standalone,
+        &installation.state(),
+    )
+    .unwrap();
     let document = format!("127.0.0.1:{}", free_port());
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, text.replace("0.0.0.0:8443", &document)).unwrap();
@@ -1032,7 +1045,9 @@ fn the_standalone_inference_address_follows_flag_then_environment_then_document(
     let (line, said) = run_until_ready(&mut command, standalone);
     assert_eq!(bound(&line), alias);
     assert!(
-        said.contains("CAPYCTL_STANDALONE_INFERENCE_ADDR is deprecated; use CAPYCTL_INFERENCE_ADDR"),
+        said.contains(
+            "CAPYCTL_STANDALONE_INFERENCE_ADDR is deprecated; use CAPYCTL_INFERENCE_ADDR"
+        ),
         "{said}"
     );
 
