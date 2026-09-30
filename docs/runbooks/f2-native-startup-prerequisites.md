@@ -117,7 +117,7 @@ patch on host-a. Existing environments and drivers remain outside that change.
 ### Installed read-only preflight — September 15, 2026
 
 On the authorized host-a, `git archive bf4b209 runtime` was extracted
-into a new mode-0700 directory, `$HOME/mllm-sglang-f2-runtime-bf4b209`.
+into a new mode-0700 directory, `$HOME/capyctl-sglang-f2-runtime-bf4b209`.
 The install refused an existing destination. No existing engine environment,
 checkpoint, driver, or service was modified.
 
@@ -134,7 +134,7 @@ This is read-only prerequisite evidence, not device-policy provisioning,
 whole-package attestation, live qualification, or durable launch authority.
 The native entrypoint remains closed.
 
-A second immutable helper install, `$HOME/mllm-sglang-f2-runtime-8356c51`,
+A second immutable helper install, `$HOME/capyctl-sglang-f2-runtime-8356c51`,
 contains the committed saver-source and scheduler-bridge helpers. It used the same
 new-directory/no-overwrite procedure. Import-free preflight verified and revalidated
 all nine saver Python files against release `0.0.9.post1` and source archive SHA-256
@@ -143,7 +143,7 @@ All nine selected SGLang sources and closed external-plugin checks also passed.
 The check imported none of `sglang`, `torch`, `transformers`, or `torch_memory_saver`.
 The observer binary patch is still not built/installed, and no model was loaded.
 
-A third immutable helper install, `$HOME/mllm-sglang-f2-runtime-c17819e`,
+A third immutable helper install, `$HOME/capyctl-sglang-f2-runtime-c17819e`,
 contains the spawn-preparation guard and prior committed runtime helpers. The
 mode-0700 destination was checked absent and created without overwriting either
 older installation. A read-only inspection of the isolated Python 3.12.3 confirms
@@ -153,7 +153,7 @@ argument imports and pre-import plugin rejection. No native package was imported
 no observer binary was built, no model was loaded, and no existing environment or
 driver was changed. Full runtime verification on the local host passed 212 tests.
 
-A fourth immutable helper install, `$HOME/mllm-sglang-f2-runtime-949609b`,
+A fourth immutable helper install, `$HOME/capyctl-sglang-f2-runtime-949609b`,
 contains the version-2 private launch scope. The destination was first checked
 absent on host-a, then created with mode0700 and extracted from the committed
 `949609b` runtime archive without overwriting prior installations. All sixteen

@@ -9,7 +9,7 @@
 # rendezvous directory or bytecode in the runtime tree; MemAvailable is back near
 # the pre-soak baseline (M48 records it); then SIGTERM both host roles and the
 # server: each exits 0 (role_exec.sh records the status in the role's log) and no
-# mllm role process remains on any machine.
+# capyctl role process remains on any machine.
 
 M49_MEM_SLACK_KB=${M49_MEM_SLACK_KB:-$((4 * 1024 * 1024))}
 
@@ -54,9 +54,9 @@ roles_exit() { # after roles.sh down: each role logged exit 0 and none is runnin
   tail -n 1 "$LRD/server.log" | grep -aq '^# .* exit 0$' || { echo "FINDING: server did not log exit 0"; rc=1; }
   for host in "${MATRIX_HOSTS[@]}"; do
     rsh "$host" "tail -n 3 $RRD/host.log | grep -a '^# .* exit ' ; tail -n 1 $RRD/host.log | grep -aq '^# .* exit 0\$' || { echo 'FINDING: host role did not log exit 0'; exit 1; }; \
-pgrep -af 'mllm[ ]start' && { echo 'FINDING: an mllm role still runs'; exit 1; }; true" || rc=1
+pgrep -af 'capyctl[ ]start' && { echo 'FINDING: an capyctl role still runs'; exit 1; }; true" || rc=1
   done
-  pgrep -af 'mllm[ ]start' && { echo "FINDING: an mllm role still runs on control-host"; rc=1; }
+  pgrep -af 'capyctl[ ]start' && { echo "FINDING: an capyctl role still runs on control-host"; rc=1; }
   return "$rc"
 }
 

@@ -1,16 +1,16 @@
 name: Bug report
-description: Report a reproducible problem in mllm.
+description: Report a reproducible problem in capyctl.
 title: "[Bug] "
 body:
   - type: markdown
     attributes:
       value: |
-        For vulnerabilities, use [private security reporting](https://github.com/edurdias/mllm/security/advisories/new); do not share exploit details here. Remove API keys, enrollment material, private data and machine identifiers from all evidence.
+        For vulnerabilities, use [private security reporting](https://github.com/edurdias/capyctl/security/advisories/new); do not share exploit details here. Remove API keys, enrollment material, private data and machine identifiers from all evidence.
   - type: input
     id: version
     attributes:
-      label: mllm version
-      description: Output of mllm --version, or commit if built from source.
+      label: capyctl version
+      description: Output of capyctl --version, or commit if built from source.
     validations:
       required: true
   - type: textarea

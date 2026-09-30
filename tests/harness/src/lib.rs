@@ -4,7 +4,7 @@
 //! design (readiness gating, the deep-park policy gate, cancellation
 //! uncertainty, and handle ownership) against ANY [`EngineAdapter`] /
 //! [`Launcher`] pair. The F1/F2 real adapters run this suite in addition to
-//! their own tests; the Fake engine in `mllm-testkit` is the reference
+//! their own tests; the Fake engine in `capyctl-testkit` is the reference
 //! implementation these checks were developed against, and passing against it
 //! is never qualification of a native recipe.
 
@@ -21,7 +21,7 @@ pub mod f2_sse;
 pub mod f2_streamed;
 pub mod f2_timing;
 
-use mllm_adapters::{
+use capyctl_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
     Readiness, RenderedCommand, RequestRef,
 };
@@ -260,7 +260,7 @@ async fn check_cancellation_uncertainty(
     // The core "no false success" contract: without requiring an ack, the
     // adapter must not claim the cancellation was acknowledged.
     match adapter.cancel_work(member, req, false).await {
-        Ok(mllm_adapters::CancellationOutcome::Acknowledged) => CheckResult {
+        Ok(capyctl_adapters::CancellationOutcome::Acknowledged) => CheckResult {
             name: "cancellation_uncertainty",
             status: CheckStatus::Fail,
             detail: "cancel without ack reported Acknowledged — fabricated success".into(),
@@ -361,11 +361,11 @@ fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mllm_adapters::{
+    use capyctl_adapters::{
         CancellationOutcome, EngineState, ExitReport, LauncherError, ParkOutcome, Quiescence,
         ReloadOutcome, RestoreOutcome, WorkObservation,
     };
-    use mllm_testkit::{FakeEngine, FakeLauncher};
+    use capyctl_testkit::{FakeEngine, FakeLauncher};
 
     #[tokio::test]
     async fn fake_engine_passes_full_conformance_suite() {
@@ -410,8 +410,8 @@ mod tests {
         }
         async fn render_plan(
             &self,
-            _: &mllm_adapters::PlanInput,
-        ) -> Result<mllm_adapters::RenderedCommand, AdapterError> {
+            _: &capyctl_adapters::PlanInput,
+        ) -> Result<capyctl_adapters::RenderedCommand, AdapterError> {
             Err(AdapterError::UnsupportedCapability)
         }
         async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
@@ -470,8 +470,8 @@ mod tests {
         }
         async fn render_plan(
             &self,
-            _: &mllm_adapters::PlanInput,
-        ) -> Result<mllm_adapters::RenderedCommand, AdapterError> {
+            _: &capyctl_adapters::PlanInput,
+        ) -> Result<capyctl_adapters::RenderedCommand, AdapterError> {
             Err(AdapterError::UnsupportedCapability)
         }
         async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {

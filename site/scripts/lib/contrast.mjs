@@ -14,7 +14,7 @@ const block = (css, selector) => {
   const start = css.indexOf(selector);
   if (start < 0) throw new Error(`selector not found: ${selector}`);
   const body = css.slice(css.indexOf('{', start) + 1, css.indexOf('}', start));
-  return Object.fromEntries([...body.matchAll(/--mllm-([a-z-]+):\s*(#[0-9a-f]{6})/gi)].map((m) => [m[1], m[2].toLowerCase()]));
+  return Object.fromEntries([...body.matchAll(/--capyctl-([a-z-]+):\s*(#[0-9a-f]{6})/gi)].map((m) => [m[1], m[2].toLowerCase()]));
 };
 
 export function themes(css) {

@@ -16,12 +16,12 @@ for (const page of PAGES) {
   const file = join(out, page.slug === 'docs' ? 'docs/index.md' : `${page.slug}.md`);
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, toStarlight(read(page.source), page, PAGES, REPO_URL, read, {
-    settings: { installUrl: INSTALL_URL, installCommand: INSTALL_COMMAND, version: RELEASE_VERSION, defaultInstallUrl: DEFAULTS.MLLM_INSTALL_URL },
+    settings: { installUrl: INSTALL_URL, installCommand: INSTALL_COMMAND, version: RELEASE_VERSION, defaultInstallUrl: DEFAULTS.CAPYCTL_INSTALL_URL },
     banner: PREVIEW ? PREVIEW_NOTE : undefined,
     base: BASE,
   }));
 }
 // Owner decision 2026-09-25: the site serves the installer at
-// <MLLM_SITE_URL>/install.sh, byte for byte packaging/install.sh.
+// <CAPYCTL_SITE_URL>/install.sh, byte for byte packaging/install.sh.
 copyFileSync(join(repo, 'packaging', 'install.sh'), join(repo, 'site', 'public', 'install.sh'));
 console.log(`synced ${PAGES.length} pages and install.sh`);

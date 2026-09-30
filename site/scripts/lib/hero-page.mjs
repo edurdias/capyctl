@@ -1,5 +1,5 @@
 // Owner feedback 2026-09-25: the hero block must be byte-identical to real
-// `mllm list deployments` output. This reads the block back out of the built
+// `capyctl list deployments` output. This reads the block back out of the built
 // page as a browser would show it.
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", apos: "'" };
 

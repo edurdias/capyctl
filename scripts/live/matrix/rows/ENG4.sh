@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
-#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- b
+#   CAPYCTL_RC3_LOCAL=~/rc3/capyctl CAPYCTL_RC3_REMOTE=~/rc3/capyctl run_row.sh ENG4 --no-e0 -- b
 #
-# Preconditions (checked, never installed or downloaded): MLLM_RC3_LOCAL
-# (control-host) and MLLM_RC3_REMOTE (on the host) are existing rc.3 binaries whose
+# Preconditions (checked, never installed or downloaded): CAPYCTL_RC3_LOCAL
+# (control-host) and CAPYCTL_RC3_REMOTE (on the host) are existing rc.3 binaries whose
 # `--version` prints 0.1.0-rc.3.
 #
 # Expected:
@@ -20,10 +20,10 @@
 
 eng4_preconditions() {
   local host=$1
-  [ -n "${MLLM_RC3_LOCAL:-}" ] && [ -n "${MLLM_RC3_REMOTE:-}" ] || { echo "set MLLM_RC3_LOCAL and MLLM_RC3_REMOTE"; return 1; }
+  [ -n "${CAPYCTL_RC3_LOCAL:-}" ] && [ -n "${CAPYCTL_RC3_REMOTE:-}" ] || { echo "set CAPYCTL_RC3_LOCAL and CAPYCTL_RC3_REMOTE"; return 1; }
   dry && return 0
-  "$MLLM_RC3_LOCAL" --version | grep -q '0.1.0-rc.3' || { echo "MLLM_RC3_LOCAL is not rc.3"; return 1; }
-  rsh "$host" "$MLLM_RC3_REMOTE --version | grep -q '0.1.0-rc.3'" || { echo "MLLM_RC3_REMOTE is not rc.3"; return 1; }
+  "$CAPYCTL_RC3_LOCAL" --version | grep -q '0.1.0-rc.3' || { echo "CAPYCTL_RC3_LOCAL is not rc.3"; return 1; }
+  rsh "$host" "$CAPYCTL_RC3_REMOTE --version | grep -q '0.1.0-rc.3'" || { echo "CAPYCTL_RC3_REMOTE is not rc.3"; return 1; }
 }
 
 eng4_host_has() { # eng4_host_has <hosts.json> <host> <profile>: that host's entry names the profile
@@ -41,11 +41,11 @@ eng4_rc3_agent() { # (a)
   short=$(host_short "$host")
   "$MATRIX_DIR/roles.sh" host-down "$host" && rsh "$host" "rm -f $RRD/engines.yaml" &&
     "$MATRIX_DIR/roles.sh" host-doc-bare "$host" "${POLICY:-normal}" || return 1
-  env "MLLM_REMOTE_BIN_$short=$MLLM_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
+  env "CAPYCTL_REMOTE_BIN_$short=$CAPYCTL_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
   refused_with agent_unreachable rsh "$host" "$RBIN engine add $(vllm_venv "$host")/bin/vllm --config $RRD/host.yaml" || return 1
   "$MATRIX_DIR/roles.sh" host-down "$host" &&
-    env "MLLM_REMOTE_BIN_$short=$MLLM_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
+    env "CAPYCTL_REMOTE_BIN_$short=$CAPYCTL_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
   # rc.3 ignores engines.yaml: not published.
   # Only this host's entry counts: the other host's full document declares vllm.
@@ -64,7 +64,7 @@ eng4_rc3_agent() { # (a)
 eng4_rc3_server() ( # (b) a subshell: every server-side command uses the rc.3 binary
   local host=$1 out
   "$MATRIX_DIR/roles.sh" down || true
-  export MLLM_LOCAL_BIN=$MLLM_RC3_LOCAL
+  export CAPYCTL_LOCAL_BIN=$CAPYCTL_RC3_LOCAL
   "$MATRIX_DIR/roles.sh" up "${POLICY:-normal}" || return 1
   # `up` started a new run: its run root, server document and binary.
   load_run

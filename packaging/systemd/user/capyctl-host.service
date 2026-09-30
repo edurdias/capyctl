@@ -1,0 +1,81 @@
+# capyctl host agent, as a user service (SPEC §4.3: foreground role, OS
+# service definition, no custom daemonization).
+#
+# Install: docs/operations/install.md. Customize with a drop-in
+# (`systemctl --user edit capyctl-host`), never by editing this file in place.
+# Keep the user manager running while logged out: `loginctl enable-linger`;
+# otherwise logging out stops the role.
+#
+# Stopping or restarting this unit is a SERVICE RESTART, not a drain.
+# SIGTERM closes admission, lets admitted requests finish within the host
+# document's `shutdown.drain_timeout`, and exits without touching an engine.
+# The engines stay running in their own process groups and the next start
+# re-attaches them (crates/capyctl-cli/src/shutdown.rs, decided 2026-09-22). To
+# stop the engines on this host, drain it explicitly BEFORE stopping the unit:
+#
+#     capyctl drain host <name> --config <server.yaml>   (on the server)
+#
+# There is deliberately no ExecStop= that drains: a package upgrade or a
+# `systemctl restart` must never stop deployments as a side effect.
+
+[Unit]
+Description=capyctl host agent
+Documentation=file://%h/.local/share/capyctl/docs/operations/install.md
+
+[Service]
+Type=simple
+# Optional overrides (CAPYCTL_CONFIG, RUST_LOG, ...). The leading '-' makes the
+# file optional.
+Environment=CAPYCTL_CONFIG=%E/capyctl/host.yaml
+EnvironmentFile=-%E/capyctl/host.env
+ExecStart=%h/.local/bin/capyctl start host --config ${CAPYCTL_CONFIG}
+
+# SPEC §4.3: engines must SURVIVE a restart of this unit. systemd's default
+# (control-group) and `mixed` both signal every process in the cgroup, which
+# would kill the engines the host launched. `process` signals the main capyctl
+# process only; the engines, launched into their own process groups, keep
+# serving and are re-attached by the next start. They remain in this unit's
+# cgroup, which is why the resource limits below apply to them too.
+KillMode=process
+KillSignal=SIGTERM
+# Must cover the drain: `shutdown.drain_timeout` (default 30s, at most 600s)
+# plus the 2s cancellation grace and teardown. Keep it at least
+# drain_timeout + 60s; raise it in a drop-in when the host document raises
+# drain_timeout. Only the capyctl process is killed if it expires.
+TimeoutStopSec=90s
+TimeoutStartSec=90s
+
+Restart=on-failure
+RestartSec=5s
+# Invalid configuration (2), unauthorized identity (3), unsupported requests
+# (5) and a host the controller revoked (14) do not heal by restarting.
+# SPEC §4.1, ADR 0016: on 14 the agent has stopped reconnecting; KillMode=process
+# leaves its engines running for `capyctl join host --recover` to re-prove.
+RestartPreventExitStatus=2 3 5 14
+# An engine the kernel OOM-kills is the host's to reconcile; it must not stop
+# the agent (the default OOMPolicy stops the whole unit).
+OOMPolicy=continue
+
+# Engines inherit these limits (they run in this cgroup).
+# The user manager cannot raise the hard limit; keep within it.
+LimitNOFILE=65536:524288
+TasksMax=infinity
+
+# capyctl's private state is owner-only (SPEC §13.3).
+UMask=0077
+# The state root, ~/.local/state/capyctl (%S/capyctl). Role state_dir values live
+# beneath it; it must be a real directory, not a symlink.
+StateDirectory=capyctl capyctl/tmp
+StateDirectoryMode=0700
+# Engines' temporary files (torch/triton compilation, sockets) go to a private
+# directory instead of the shared /tmp.
+Environment=TMPDIR=%S/capyctl/tmp
+
+# User units get no file-system sandboxing: ProtectSystem= and friends need
+# privileges the per-user manager does not have (systemd.exec(5)). The service
+# runs with the invoking user's own rights; the system unit is the hardened
+# form.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

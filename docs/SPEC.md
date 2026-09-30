@@ -1,10 +1,10 @@
-# mllm — Architecture and Implementation Handoff
+# capyctl — Architecture and Implementation Handoff
 
 **Revision:** 0.2  
 **Date:** September 10, 2026  
 **Owner:** Eduardo Rodrigues Dias  
-**Status:** Consolidated design for implementation planning. No mllm runtime has been implemented or qualified by this document.  
-**Supersedes:** `mllm-initial-design.md`, revision 0.1, and conflicting configuration/CLI sketches in the preceding discussion.  
+**Status:** Consolidated design for implementation planning. No capyctl runtime has been implemented or qualified by this document.  
+**Supersedes:** `capyctl-initial-design.md`, revision 0.1, and conflicting configuration/CLI sketches in the preceding discussion.  
 **Engine delivery order:** vLLM first; SGLang immediately next.
 
 > One endpoint. Bring your own inference engines. Explicit deployment ownership, safe model residency transitions, and aggregate resource control.
@@ -15,7 +15,7 @@ Read sections 1–5 for the product boundary, sections 6–13 for behavior and s
 
 **MUST / MUST NOT** identify required behavior. **SHOULD** identifies a recommended default that may be changed with a documented architectural decision. Implementation language, internal libraries, numeric default tuning, and the illustrative YAML field names are baseline proposals, not claims of separately approved implementation details. The requirements and ownership boundaries are the established direction.
 
-All mllm commands, protocol names, and YAML below describe a proposed product. They are not available commands or tested engine recipes. Sources establish specific upstream behavior only. A source-backed engine capability does not establish that a particular patched build, checkpoint, cache layout, or multi-node combination works.
+All capyctl commands, protocol names, and YAML below describe a proposed product. They are not available commands or tested engine recipes. Sources establish specific upstream behavior only. A source-backed engine capability does not establish that a particular patched build, checkpoint, cache layout, or multi-node combination works.
 
 ## Navigation
 
@@ -28,7 +28,7 @@ All mllm commands, protocol names, and YAML below describe a proposed product. T
 
 ## 1. Purpose and agreed scope
 
-mllm makes a catalog of model deployments available on hardware that cannot keep all model weights resident simultaneously. A client chooses a public model ID. mllm admits the request, activates the corresponding deployment when necessary, and routes inference to its engine group. Activation may restore a parked group or start a stopped one.
+capyctl makes a catalog of model deployments available on hardware that cannot keep all model weights resident simultaneously. A client chooses a public model ID. capyctl admits the request, activates the corresponding deployment when necessary, and routes inference to its engine group. Activation may restore a parked group or start a stopped one.
 
 The project is a fresh, standalone open-source controller, not a fork of an existing proxy or a modification embedded inside an inference engine. Its value is correct lifecycle and residency management, not an assertion that no other project supports routing, unloading, or sleep helpers.
 
@@ -46,18 +46,18 @@ The project is a fresh, standalone open-source controller, not a fork of an exis
 | R08 | Keep initialized engines parked where the declared residency tier can be delivered (ADR 0010, ADR 0011); otherwise use stop/start. |
 | R09 | Keep model parking and KV-cache offloading separate but coordinate their resource ownership and compatibility. |
 | R10 | Deployments request resources and select cache integrations; hosts enforce aggregate boundaries across all managed owners. |
-| R11 | Use action-first commands: `mllm <action> <resource>`. |
+| R11 | Use action-first commands: `capyctl <action> <resource>`. |
 | R12 | `deploy` without `--wait` returns a durable deployment ID; status remains queryable after the CLI disconnects. |
 | R13 | Generate safe default configuration when no implicit configuration exists; never replace an explicitly supplied missing or invalid file with defaults. |
 | R14 | Preserve streaming, cancellation, fairness, whole-group ownership, and recovery correctness through every lifecycle transition. |
 
 ### 1.2 Boundaries and non-goals
 
-mllm owns routing, admission, deployment intent, reservations, lifecycle coordination, local supervision, and operational visibility. Engines own tokenization, kernels, batching, attention, tensor/pipeline distribution, and inference. Cache backends own KV serialization and block management.
+capyctl owns routing, admission, deployment intent, reservations, lifecycle coordination, local supervision, and operational visibility. Engines own tokenization, kernels, batching, attention, tensor/pipeline distribution, and inference. Cache backends own KV serialization and block management.
 
-The initial product does not install drivers, compile kernels, quantize checkpoints, download checkpoints implicitly ([ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md) permits materializing an explicitly declared model source), implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call mllm, but none is required to operate it. Ray and container runtimes are not mandatory mllm dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
+The initial product does not install drivers, compile kernels, quantize checkpoints, download checkpoints implicitly ([ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md) permits materializing an explicitly declared model source), implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call capyctl, but none is required to operate it. Ray and container runtimes are not mandatory capyctl dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
 
-llama-swap and NVIDIA PAIR are reference projects, not dependencies or the implementation base. Do not position mllm merely as the first router with unloading or sleep. Any later integration must establish one lifecycle owner rather than letting two controllers manage the same engine.
+llama-swap and NVIDIA PAIR are reference projects, not dependencies or the implementation base. Do not position capyctl merely as the first router with unloading or sleep. Any later integration must establish one lifecycle owner rather than letting two controllers manage the same engine.
 
 Do not turn one initialized base-model engine into an arbitrary different architecture by swapping a model name. Separate runtime configurations are separate deployments. Adapter-specific LoRA support or compatible weight-update use cases are later features, not a substitute for this ownership model.
 
@@ -105,9 +105,9 @@ The controller decides what should run. The agent may reject an unsafe or unauth
 
 ### 3.2 Deployment modes
 
-**Standalone:** `mllm start standalone` runs the server and embedded host-agent components together. Use the same contracts and domain model, with in-process calls rather than enrollment and a network management stream. A separate local proxy hop is unnecessary if equivalent admission and endpoint isolation are preserved.
+**Standalone:** `capyctl start standalone` runs the server and embedded host-agent components together. Use the same contracts and domain model, with in-process calls rather than enrollment and a network management stream. A separate local proxy hop is unnecessary if equivalent admission and endpoint isolation are preserved.
 
-**Remote:** `mllm start server` runs the server; `mllm start host` runs one agent per managed host. The server may be GPU-less. An agent establishes an authenticated connection to the server and controls engines locally.
+**Remote:** `capyctl start server` runs the server; `capyctl start host` runs one agent per managed host. The server may be GPU-less. An agent establishes an authenticated connection to the server and controls engines locally.
 
 **Mixed:** the server may manage an embedded local host plus remote hosts. Client-only machines need the executable and credentials, not a running agent.
 
@@ -122,7 +122,7 @@ Management RPCs MUST NOT become an implicit tunnel for prompts, token streams, w
 
 ### 3.3 Implementation baseline
 
-Recommend Rust throughout the long-lived mllm components, with one executable per supported OS/architecture. This favors distribution and separation from engine environments; no unmeasured speedup over Python is asserted. Keep Python available for external launch helpers and integration tests, not as a required server runtime.
+Recommend Rust throughout the long-lived capyctl components, with one executable per supported OS/architecture. This favors distribution and separation from engine environments; no unmeasured speedup over Python is asserted. Keep Python available for external launch helpers and integration tests, not as a required server runtime.
 
 Recommended baseline: asynchronous I/O, a transactional embedded server store and local agent journal, and versioned gRPC with mutual TLS for remote control. SQLite is a reasonable initial store candidate. Record the language, storage, and transport decisions before scaffolding; do not introduce a second language/runtime or external broker without a specific justification.
 
@@ -157,7 +157,7 @@ Host administrators register trusted runtime profiles, permitted devices and dir
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-Host administrators register runtime profiles with `mllm engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; mllm never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). mllm still installs no engine.
+Host administrators register runtime profiles with `capyctl engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; capyctl never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). capyctl still installs no engine.
 
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
@@ -169,15 +169,15 @@ Role-start commands stay in the foreground. Provide normal OS service definition
 
 ### 5.1 Managed
 
-The agent launches an approved runtime profile and obtains a verifiable ownership handle. mllm may drain, park, restore, stop, and recover that group under policy. Engine workers and explicitly managed cache services have separate ownership records when their lifetimes differ.
+The agent launches an approved runtime profile and obtains a verifiable ownership handle. capyctl may drain, park, restore, stop, and recover that group under policy. Engine workers and explicitly managed cache services have separate ownership records when their lifetimes differ.
 
 ### 5.2 Attached
 
 Attachment registers and validates an already-running inference service for routing and observation. It grants no implicit permission to sleep, kill, replace weights, restart, or evict resources. An upstream disappearing is not proof that its allocations disappeared.
 
-If the service shares a managed host, its resource usage must be represented conservatively. Uncertain attached usage cannot be treated as reclaimable capacity. Direct external clients may bypass mllm's in-flight counts; no drain-based lifecycle operation is authorized without exclusive admission control or a validated external quiescence contract.
+If the service shares a managed host, its resource usage must be represented conservatively. Uncertain attached usage cannot be treated as reclaimable capacity. Direct external clients may bypass capyctl's in-flight counts; no drain-based lifecycle operation is authorized without exclusive admission control or a validated external quiescence contract.
 
-An externally managed endpoint may use no mllm agent, but restart guarantees are unavailable unless an equivalent supervisor integration is explicitly configured. Mark that limitation in status.
+An externally managed endpoint may use no capyctl agent, but restart guarantees are unavailable unless an equivalent supervisor integration is explicitly configured. Mark that limitation in status.
 
 ### 5.3 Adoption
 
@@ -283,7 +283,7 @@ Track system/agent/router overhead and external workloads through the configured
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-On a discrete-GPU host each GPU's memory is a `device` domain observed from the device; host RAM is a `distinct` system domain. A deployment's derived budget charges both. A device domain without a fresh observation closes admission on that domain (`device_unobserved`) and keeps every reservation charged. One GPU serves one model; mllm picks the GPU unless the deployment pins one.
+On a discrete-GPU host each GPU's memory is a `device` domain observed from the device; host RAM is a `distinct` system domain. A deployment's derived budget charges both. A device domain without a fresh observation closes admission on that domain (`device_unobserved`) and keeps every reservation charged. One GPU serves one model; capyctl picks the GPU unless the deployment pins one.
 
 ### 7.3 Reservation lifecycle
 
@@ -310,7 +310,7 @@ override exclusivity, and shared execution does not promise performance isolatio
 
 If host-KV capacity is 16 GiB, A retains 9 GiB, and B requests 8 GiB, B is blocked: 17 GiB exceeds the boundary. First reclaim A through a supported cache operation, stop an eligible owner, or wait. Do not assume parking released A's private host cache. Do not shrink B's requested allocation silently.
 
-If A and B use the same 16 GiB shared cache service, charge the service's physical allocation once. Client quotas partition its usable capacity; they are not a second physical charge. Account for the service's own metadata/overhead separately from usable cache bytes where necessary. LMCache documents an isolated eviction policy with per-namespace quotas [S7]; mllm must verify the selected backend's actual quota behavior rather than infer it from a connector name.
+If A and B use the same 16 GiB shared cache service, charge the service's physical allocation once. Client quotas partition its usable capacity; they are not a second physical charge. Account for the service's own metadata/overhead separately from usable cache bytes where necessary. LMCache documents an isolated eviction policy with per-namespace quotas [S7]; capyctl must verify the selected backend's actual quota behavior rather than infer it from a connector name.
 
 Remote stores require one shared resource identity and quota authority. Each host must not independently assume ownership of the store's full capacity. Separate logical pools on the same filesystem also share a real free-space boundary.
 
@@ -336,15 +336,15 @@ A managed profile supplies an executable and argument array, controlled environm
 
 A process that backgrounds children and exits without a durable ownership handle is invalid. Container/service launchers must track actual container/service identity; killing a CLI wrapper is not complete cleanup. A host script must not secretly launch remote ranks beyond the participating agents' ownership.
 
-Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse a superseded binding identity. mllm validates a recipe's shape and the host's capacity to hold it; whether the recipe works is the user's responsibility (ADR 0011).
+Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse a superseded binding identity. capyctl validates a recipe's shape and the host's capacity to hold it; whether the recipe works is the user's responsibility (ADR 0011).
 
-Custom and patched engine builds are first-class (ADR 0008, owner decision 2026-09-23). An engine installation is fingerprinted when the host registers it: the engine package's version and a `sha256:` digest over its files. A launch that measures a different fingerprint flags the drift in the host's status and the event journal, and is refused (`installation_drift`) only when the installation's host policy says `installation_drift: refuse`; the default is `warn`. mllm MUST NOT compare installation files to hard-coded hashes and applies no permission rule to them. The engine internals mllm hooks are probed by shape at launch (import, attribute or signature presence, record fields, served routes); a missing capability refuses only the feature that depends on it with a closed `capability_missing:<name>` reason, and serving without that feature stays available.
+Custom and patched engine builds are first-class (ADR 0008, owner decision 2026-09-23). An engine installation is fingerprinted when the host registers it: the engine package's version and a `sha256:` digest over its files. A launch that measures a different fingerprint flags the drift in the host's status and the event journal, and is refused (`installation_drift`) only when the installation's host policy says `installation_drift: refuse`; the default is `warn`. capyctl MUST NOT compare installation files to hard-coded hashes and applies no permission rule to them. The engine internals capyctl hooks are probed by shape at launch (import, attribute or signature presence, record fields, served routes); a missing capability refuses only the feature that depends on it with a closed `capability_missing:<name>` reason, and serving without that feature stays available.
 
 ### 8.2 Parameter ownership
 
 Deployment recipes contain engine tuning; host profiles contain launch context and fixed local constraints. The adapter constructs one effective command, not a blind concatenation of conflicting flags.
 
-mllm controls or validates device assignment, process ownership, bind addresses, private ports, public/upstream model mapping, distributed ranks, rendezvous data, granted memory/cache settings, and required lifecycle prerequisites. Reject conflicting overrides, duplicate reserved flags, or hidden configuration-file values. Unknown ordinary engine arguments may be passed through subject to operator policy; security-sensitive code-loading or path options are not unrestricted inference-client inputs.
+capyctl controls or validates device assignment, process ownership, bind addresses, private ports, public/upstream model mapping, distributed ranks, rendezvous data, granted memory/cache settings, and required lifecycle prerequisites. Reject conflicting overrides, duplicate reserved flags, or hidden configuration-file values. Unknown ordinary engine arguments may be passed through subject to operator policy; security-sensitive code-loading or path options are not unrestricted inference-client inputs.
 
 Preserve the original engine's supported arguments where possible. Do not place every new kernel flag into the generic control-plane schema. `inspect deployment --effective-config` exposes the resolved command and provenance with secrets redacted.
 
@@ -375,9 +375,9 @@ that references in §20 remain stable. Recipe ownership is stated in §8.1.
 
 Current vLLM documentation distinguishes level 1, which keeps a CPU weight backup, from level 2, which discards weights and KV while retaining some buffers. The documented online deep-sleep path is `POST /sleep?level=2`; restoration wakes weight allocations, invokes `reload_weights` through the collective RPC interface, then wakes KV allocations. Online controls require startup configuration including sleep support and development mode [S1].
 
-The vLLM adapter wraps this in mllm admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
+The vLLM adapter wraps this in capyctl admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
 
-**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It is enabled unless host policy forbids it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes. Owner decision 2026-09-17, reaffirmed 2026-09-22 (ADR 0012): deep parking is enabled by default and a host opts out with `security.deep_park: disabled` on the runtime profile; standalone opts out with `MLLM_DEEP_PARK=off`. Default enablement is not a production-safety claim: development controls stay on loopback behind the per-launch key guard, are never reachable through host ingress or the router, and status marks every profile that uses them.
+**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It is enabled unless host policy forbids it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes. Owner decision 2026-09-17, reaffirmed 2026-09-22 (ADR 0012): deep parking is enabled by default and a host opts out with `security.deep_park: disabled` on the runtime profile; standalone opts out with `CAPYCTL_DEEP_PARK=off`. Default enablement is not a production-safety claim: development controls stay on loopback behind the per-launch key guard, are never reachable through host ingress or the router, and status marks every profile that uses them.
 
 ### 9.2 SGLang immediately next
 
@@ -404,9 +404,9 @@ The first inference surface is `GET /v1/models` and streaming/non-streaming `POS
 
 Resolve model aliases to explicit deployments. A deployment with several instances is served by all of its READY instances; the router selects among instances with open admission using its own in-flight counts and fresh host-reported engine load, and fails over to another instance only before upstream acceptance (ADR 0013). Preserve supported payloads, tool calls, structured-output parameters, reasoning fields, multimodal content, and stream events. Do not tokenize, rewrite prompts, silently substitute models, or execute client tools. Any model-name remapping in responses must be documented and limited.
 
-Note (2026-09-24): mllm relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser through `engine_config.extra_args` with `accept_extra_args: true` (vLLM `--enable-auto-tool-choice --tool-call-parser <name>`, SGLang `--tool-call-parser <name>`). Without one, the engine rejects the request or answers in plain text, and mllm relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
+Note (2026-09-24): capyctl relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser through `engine_config.extra_args` with `accept_extra_args: true` (vLLM `--enable-auto-tool-choice --tool-call-parser <name>`, SGLang `--tool-call-parser <name>`). Without one, the engine rejects the request or answers in plain text, and capyctl relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
 
-Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `mllm start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
+Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `capyctl start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
 
 Eviction is planned per host and per instance: B is served by an existing READY instance when one exists; otherwise the planner releases capacity only on the one host that will run B's instance, preferring instances whose deployment keeps serving elsewhere. Steps 3–5 below apply in full when the victim is its deployment's last READY instance (ADR 0013).
 
@@ -433,7 +433,7 @@ Management operations are durable; queued inference bodies and open streams are 
 
 ## 11. Multi-node groups and failure coordination
 
-Use an agent on every host directly supervised by mllm. Only the API-facing group member needs ingress. The group may expose one inference endpoint while owning workers on both Sparks. vLLM's documented native multi-node topology includes an API-facing node and headless workers [S10]. mllm manages the deployment; the engine implements distributed inference.
+Use an agent on every host directly supervised by capyctl. Only the API-facing group member needs ingress. The group may expose one inference endpoint while owning workers on both Sparks. vLLM's documented native multi-node topology includes an API-facing node and headless workers [S10]. capyctl manages the deployment; the engine implements distributed inference.
 
 Worker agents exist to start missing processes, observe exits, account for local resources, reconcile orphans, and clean up after head failure. They are not inference routers or tensor relays. A head-only integration is allowed only when an explicitly supported external supervisor provides equivalent remote ownership guarantees; it is not the default bare-metal topology.
 
@@ -451,7 +451,7 @@ Model parking reduces inactive weight residency. Persistent KV caching can prese
 
 vLLM documents hierarchical offloading connectors and filesystem storage [S6]. SGLang HiCache documents private per-instance device/host tiers and an external sharing tier [S11]. Cache selection is per deployment and exact build. A path called a cache pool does not enable or convert an engine integration.
 
-mllm retains cache configuration and namespaces, accounts for all owners, starts/stops explicitly owned cache services, and coordinates supported persistence barriers. Engines/connectors serialize, retrieve, index, and evict blocks. Cross-engine KV conversion is outside scope.
+capyctl retains cache configuration and namespaces, accounts for all owners, starts/stops explicitly owned cache services, and coordinates supported persistence barriers. Engines/connectors serialize, retrieve, index, and evict blocks. Cross-engine KV conversion is outside scope.
 
 Namespace isolation includes model/checkpoint revision, engine/layout, quantization, tokenizer/template effects, parallelism/rank, and security domain. Conservatively isolate by deployment until reuse is verified. Public model aliases must not collapse incompatible caches. Secret-bearing prompts and KV are sensitive even when text is not logged.
 
@@ -491,64 +491,64 @@ Run agents with the least privilege needed for their approved processes. Arbitra
 
 Allowlist normalized methods and paths, strip/replace internal routing headers, verify trusted upstream destinations, bound resource-amplifying requests, and prevent public access to administrative RPCs. Remote control and ingress use distinct authenticated identities/roles; do not pass end-user API secrets to unrelated upstream services. Local-only does not mean unauthenticated by default.
 
-Protect credentials, journals, checkpoint permissions, and sensitive cache directories. mllm's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). mllm's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. *Amended 2026-09-25 (owner decision):* an engine's environment is closed. Its PATH is the installation's own `bin`, then fixed system directories, never the caller's shell PATH. A runtime profile may name a host-approved CUDA toolkit root, `cuda_home`, approved like `executable`. The host administrator writes it, or `mllm engine add` detects it from `CUDA_HOME`, else from `/usr/local/cuda` when it holds `bin/nvcc`; standalone environment installations take `MLLM_CUDA_HOME`. When `cuda_home` is set, mllm puts `<cuda_home>/bin` right after the installation's `bin` and sets `CUDA_HOME`; without it the PATH stays minimal. mllm also bounds JIT compile parallelism in the engine environment. It sets `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)` and `FLASHINFER_NVCC_THREADS` to 1. A profile's `env` may override either one with a positive integer, and the host log records the chosen value at every launch. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
+Protect credentials, journals, checkpoint permissions, and sensitive cache directories. capyctl's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). capyctl's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. *Amended 2026-09-25 (owner decision):* an engine's environment is closed. Its PATH is the installation's own `bin`, then fixed system directories, never the caller's shell PATH. A runtime profile may name a host-approved CUDA toolkit root, `cuda_home`, approved like `executable`. The host administrator writes it, or `capyctl engine add` detects it from `CUDA_HOME`, else from `/usr/local/cuda` when it holds `bin/nvcc`; standalone environment installations take `CAPYCTL_CUDA_HOME`. When `cuda_home` is set, capyctl puts `<cuda_home>/bin` right after the installation's `bin` and sets `CUDA_HOME`; without it the PATH stays minimal. capyctl also bounds JIT compile parallelism in the engine environment. It sets `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)` and `FLASHINFER_NVCC_THREADS` to 1. A profile's `env` may override either one with a positive integer, and the host log records the chosen value at every launch. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-The inference listener may be reachable from the network. It requires the API key by default; turning the key off (`authentication: none`, `--no-inference-auth` or `MLLM_INFERENCE_AUTH=none`) prints a warning at start when the bind is not loopback, and there is no constant or fallback key. The router's allowlists, header stripping and amplification bounds apply on every bind. The management listener, engine listeners and the key-guard protections keep their loopback rules.
+The inference listener may be reachable from the network. It requires the API key by default; turning the key off (`authentication: none`, `--no-inference-auth` or `CAPYCTL_INFERENCE_AUTH=none`) prints a warning at start when the bind is not loopback, and there is no constant or fallback key. The router's allowlists, header stripping and amplification bounds apply on every bind. The management listener, engine listeners and the key-guard protections keep their loopback rules.
 
 ## 14. Action-first CLI and interfaces
 
-Canonical grammar: `mllm <action> <resource> [identifier] [options]`.
+Canonical grammar: `capyctl <action> <resource> [identifier] [options]`.
 
 ```bash
 # Role startup is local and foregrounded.
-mllm start server --config server.yaml
-mllm start host --config host.yaml
-mllm start standalone --config standalone.yaml
+capyctl start server --config server.yaml
+capyctl start host --config host.yaml
+capyctl start standalone --config standalone.yaml
 
 # Initialize / enroll.
-mllm init server --output server.yaml
-mllm init host --output host.yaml
-mllm invite host --name host-a --output host-a.join
-mllm join host --join-file host-a.join --config host.yaml
+capyctl init server --output server.yaml
+capyctl init host --output host.yaml
+capyctl invite host --name host-a --output host-a.join
+capyctl join host --join-file host-a.join --config host.yaml
 
 # Inventory and preparation.
-mllm list hosts
-mllm inspect host host-a
-mllm doctor host host-a
+capyctl list hosts
+capyctl inspect host host-a
+capyctl doctor host host-a
 
 # Submit and observe deployment intent.
-mllm deploy model --file deployment.yaml
-mllm deploy model --file deployment.yaml --activate --wait
-mllm status deployment dep_example
-mllm status deployment dep_example --watch
-mllm inspect deployment dep_example --effective-config
+capyctl deploy model --file deployment.yaml
+capyctl deploy model --file deployment.yaml --activate --wait
+capyctl status deployment dep_example
+capyctl status deployment dep_example --watch
+capyctl inspect deployment dep_example --effective-config
 
 # Lifecycle actions go through the same control-plane rules.
-mllm start deployment dep_example
-mllm park deployment dep_example
-mllm stop deployment dep_example
-mllm preinitialize deployment dep_example
-mllm delete deployment dep_example
-mllm delete deployment dep_example --stop
+capyctl start deployment dep_example
+capyctl park deployment dep_example
+capyctl stop deployment dep_example
+capyctl preinitialize deployment dep_example
+capyctl delete deployment dep_example
+capyctl delete deployment dep_example --stop
 
 # Configuration operations.
-mllm validate config --file host.yaml
-mllm inspect config --role host --effective
+capyctl validate config --file host.yaml
+capyctl inspect config --role host --effective
 
 # Reclaim materialized model sources no deployment references (ADR 0008).
-mllm prune sources --host-config host.yaml --apply
+capyctl prune sources --host-config host.yaml --apply
 
 # Register runtime profiles from an engine already installed (ADR 0018).
-mllm engine detect [--path DIR]
-mllm engine add [PATH] [--name NAME] [--deep-park enabled|disabled] [--drift warn|refuse]
-mllm engine list
-mllm engine remove NAME [--drain]
-mllm list engines --config server.yaml
+capyctl engine detect [--path DIR]
+capyctl engine add [PATH] [--name NAME] [--deep-park enabled|disabled] [--drift warn|refuse]
+capyctl engine list
+capyctl engine remove NAME [--drain]
+capyctl list engines --config server.yaml
 ```
 
-`start host` starts the local agent, not a remote machine or power-on action. A client-only installation selects a server context and credential reference. Do not mix action-first commands with the previous `mllm server run` grammar in user documentation.
+`start host` starts the local agent, not a remote machine or power-on action. A client-only installation selects a server context and credential reference. Do not mix action-first commands with the previous `capyctl server run` grammar in user documentation.
 
 `deploy model` without `--wait` returns a deployment ID after durable acceptance. `--wait` waits for the specific accepted target operation, not forever for the deployment to remain ready. Machine-readable JSON and stable error codes are required; exact output layout can be finalized with the CLI tests. Owner decision 2026-09-25: commands that read records (`list`, `status`, `engine list`, `engine detect`) print an aligned, human-readable table by default, terminal or not; `--format json` (or `--json`, or the older `--output json`) prints the JSON result unchanged and reports errors as JSON. List/status commands do not activate models as a side effect.
 
@@ -556,7 +556,7 @@ The management API is the source of semantics for CLI, future UI, and integratio
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-`mllm engine detect|add|list|remove` and `mllm list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one mllm integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, no role is listening on `<state_dir>/control.sock`; `add` still writes `engines.yaml` and the role picks it up at its next start, `remove` writes nothing), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`mllm engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
+`capyctl engine detect|add|list|remove` and `capyctl list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one capyctl integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, no role is listening on `<state_dir>/control.sock`; `add` still writes `engines.yaml` and the role picks it up at its next start, `remove` writes nothing), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`capyctl engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
 
 ## 15. Configuration model and generated defaults
 
@@ -566,7 +566,7 @@ The management API is the source of semantics for CLI, future UI, and integratio
 |---|---|---|
 | Server YAML | Listeners, authentication, enrollment, state location, scheduler and lifecycle defaults. | Host executable paths, static copies of all enrolled hosts, individual deployment records. |
 | Host YAML | Server identity reference, approved inventory, aggregate boundaries, storage pools, ingress, runtime profiles, supervision. | Model-specific allocations, global routing, private independent swap scheduling. |
-| Engines file (`engines.yaml`) | Runtime profiles registered with `mllm engine add`, beside the role's configuration file; written only by `mllm engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
+| Engines file (`engines.yaml`) | Runtime profiles registered with `capyctl engine add`, beside the role's configuration file; written only by `capyctl engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
 | Deployment YAML | Model identity, runtime profile, placement/topology, per-host budgets, cache choice, route, lifecycle overrides. | Agent secrets, executable installation, controller credentials. |
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
@@ -575,11 +575,11 @@ Operator configuration is not mutable runtime state. Server/agent processes writ
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-The engines file is mllm-owned operational state, not administrator YAML: mllm writes it only when the operator runs `mllm engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# mllm-document-revision: N`. The role's own document is never rewritten.
+The engines file is capyctl-owned operational state, not administrator YAML: capyctl writes it only when the operator runs `capyctl engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# capyctl-document-revision: N`. The role's own document is never rewritten.
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-mllm never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
+capyctl never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
 
 ### 15.2 No-config behavior
 
@@ -607,7 +607,7 @@ Material default changes affect new deployments only unless an explicit update i
 
 ### 15.3 Validation
 
-Reject unknown mllm fields, duplicate YAML mapping keys, invalid units, unsatisfied required fields, unsupported role/adapter combinations, conflicting reserved arguments, invalid cache references, and contradictory standalone/remote connections. Secrets use references or protected files. No arbitrary YAML object construction or shell evaluation.
+Reject unknown capyctl fields, duplicate YAML mapping keys, invalid units, unsatisfied required fields, unsupported role/adapter combinations, conflicting reserved arguments, invalid cache references, and contradictory standalone/remote connections. Secrets use references or protected files. No arbitrary YAML object construction or shell evaluation.
 
 Validate syntax/schema before side effects. Resolve paths and fingerprints locally, then perform distributed preflight. Editing a profile cannot mutate an active process in place; changes require controlled revision/reconciliation. A decrease in host limits below current reservations blocks new admission and reports the condition rather than killing workloads immediately.
 
@@ -625,23 +625,23 @@ The canonical examples use `memory.system` for the host's system physical domain
 schema_version: 1
 kind: server
 name: lab
-state_dir: /var/lib/mllm/server
+state_dir: /var/lib/capyctl/server
 listeners:
   management:
     bind: "10.10.0.10:7443"
-    advertise_url: "https://mllm.lab:7443"
+    advertise_url: "https://capyctl.lab:7443"
     authentication: admin_token
   agents:
     bind: "10.10.0.10:7444"
-    advertise_url: "https://mllm.lab:7444"
+    advertise_url: "https://capyctl.lab:7444"
     authentication: mtls
   inference:
     bind: "10.10.0.10:8443"
-    advertise_url: "https://mllm.lab:8443"
+    advertise_url: "https://capyctl.lab:8443"
     authentication: api_key
 tls:
   mode: managed
-  identity_dir: /var/lib/mllm/server/identity
+  identity_dir: /var/lib/capyctl/server/identity
 enrollment:
   method: invitation
   default_invitation_ttl: "15m"
@@ -669,10 +669,10 @@ This is an explicitly networked example, not the auto-generated local-only defau
 schema_version: 1
 kind: host
 name: host-a
-state_dir: /var/lib/mllm/host
+state_dir: /var/lib/capyctl/host
 server:
-  url: "https://mllm.lab:7444"
-  identity_dir: /var/lib/mllm/host/identity
+  url: "https://capyctl.lab:7444"
+  identity_dir: /var/lib/capyctl/host/identity
 resource_policy:
   allowed_devices: ["gpu:0"]
   memory:
@@ -688,7 +688,7 @@ storage_pools:
     path: /srv/models
     access: read_only
   kv-local:
-    path: /srv/mllm/kv-cache
+    path: /srv/capyctl/kv-cache
     aggregate_limit: "200GiB"
     filesystem_free_reserve: "50GiB"
 network:
@@ -715,7 +715,7 @@ runtime_profiles:
       command: ["/opt/inference/start-vllm-patched"]
       argument_contract: native
       working_directory: /opt/inference
-      environment_file: /etc/mllm/runtime/vllm-patched.env
+      environment_file: /etc/capyctl/runtime/vllm-patched.env
   sglang-patched:
     adapter: sglang
     launch:
@@ -794,7 +794,7 @@ engine_config:
     kv_cache: "8GiB"
 ```
 
-`integration: none` disables an mllm-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified. `engine_config` is validated for shape; whether the engine supports the combination on this checkpoint is the user's responsibility (ADR 0011).
+`integration: none` disables an capyctl-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified. `engine_config` is validated for shape; whether the engine supports the combination on this checkpoint is the user's responsibility (ADR 0011).
 
 ### 16.4 Two-host engine group (one TP2 instance) with private host-cache and persistent storage
 
@@ -951,7 +951,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T18 | Late ingress request | Stale generation/admission token rejected after closure. |
 | T19 | Fairness and queue bounds | Busy A cannot reset the window forever; byte/count limits and deadlines enforced. |
 | T20 | Park/reload timeout or partial failure | No blind repeated collective; reconcile, quarantine, or verified restart. |
-| T21 | vLLM experimental-controls policy | Development controls enabled by default for deep parking and refused when the host opts out (`security.deep_park: disabled`; standalone `MLLM_DEEP_PARK=off`); omitted policy enables; controls reachable only on loopback with the per-launch key; no public admin passthrough; status shows the experimental-controls surface (ADR 0012). |
+| T21 | vLLM experimental-controls policy | Development controls enabled by default for deep parking and refused when the host opts out (`security.deep_park: disabled`; standalone `CAPYCTL_DEEP_PARK=off`); omitted policy enables; controls reachable only on loopback with the per-launch key; no public admin passthrough; status shows the experimental-controls surface (ADR 0012). |
 | T22 | SGLang conformance | Same domain/controller tests pass; no assumption of vLLM sleep semantics. A custom build that keeps the probed shapes launches `restart_only` and `deep`; one missing the saver hooks refuses `deep` and Park with `capability_missing:deep_park` and serves `restart_only`; installation drift is flagged, refused only under `installation_drift: refuse` (§8.1). |
 | T23 | Peak activation versus steady state | Candidate blocked when transient demand exceeds the available budget. |
 | T24 | Retained private host caches: 9 + 8 > 16 GiB | Admission blocked until supported reclamation is verified. |
@@ -967,7 +967,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. A newer host is refused ("upgrade the server first"), an older-than-N-1 or unversioned host is drain-only, and a command needing a capability the host did not declare is refused typed and never sent (ADR 0017). |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
 | T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
-| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. mllm's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
+| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. capyctl's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
@@ -982,11 +982,11 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
-- 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by mllm, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
+- 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by capyctl, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 
 ### Sources
 
-Original project source: the owner's `mllm-initial-design.md` revision 0.1 and the design decisions that followed it. Primary documentation below was inspected on September 10, 2026. It is live/unversioned documentation; implementers must recheck against pinned builds. No inference was executed on the owner's machines while this specification was prepared.
+Original project source: the owner's `capyctl-initial-design.md` revision 0.1 and the design decisions that followed it. Primary documentation below was inspected on September 10, 2026. It is live/unversioned documentation; implementers must recheck against pinned builds. No inference was executed on the owner's machines while this specification was prepared.
 
 - **[S1]** vLLM, Sleep Mode — levels, startup prerequisites, explicit restoration: <https://docs.vllm.ai/en/latest/features/sleep_mode/>.
 - **[S2]** vLLM, Security — development-mode warning and endpoint exposure: <https://docs.vllm.ai/en/latest/usage/security/>.

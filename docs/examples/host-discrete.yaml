@@ -1,27 +1,27 @@
-# mllm host role document (`mllm start host --config host.yaml`) for a
+# capyctl host role document (`capyctl start host --config host.yaml`) for a
 # discrete-GPU host (one 24 GB NVIDIA card; device memory is its own domain).
 # Host RAM is the `system` domain and the card's memory is the `gpu0` domain;
 # every deployment is charged on both.
-# Parsed by the product: `mllm validate config --file docs/examples/host-discrete.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/host-discrete.yaml`.
 # An illustration of the schema, not a tested engine recipe: executables,
 # fingerprints and limits are placeholders for the host's own values.
 schema_version: 1
 kind: host
 name: desk-gpu
-state_dir: /var/lib/mllm/host
+state_dir: /var/lib/capyctl/host
 # Must be `<state_dir>/identity`.
-identity_dir: /var/lib/mllm/host/identity
-# mllm's runtime helpers are compiled into the binary and written, owner-only,
+identity_dir: /var/lib/capyctl/host/identity
+# capyctl's runtime helpers are compiled into the binary and written, owner-only,
 # to <state_dir>/runtime at every start. Name runtime_dir only to run from a
-# directory you maintain yourself (development); mllm never writes to it.
-# runtime_dir: /home/operator/mllm/runtime
+# directory you maintain yourself (development); capyctl never writes to it.
+# runtime_dir: /home/operator/capyctl/runtime
 # The host's own installation may also be named here instead of (or besides)
 # runtime_profiles; it is published as the profile `local` (both engines:
-# `local-vllm` and `local-sglang`). --vllm-bin or MLLM_VLLM_BIN name it too
+# `local-vllm` and `local-sglang`). --vllm-bin or CAPYCTL_VLLM_BIN name it too
 # (docs/operations/configuration.md).
 # local_engine:
 #   vllm: /opt/vllm/bin/vllm
-#   cuda_home: /usr/local/cuda   # or --cuda-home, MLLM_CUDA_HOME
+#   cuda_home: /usr/local/cuda   # or --cuda-home, CAPYCTL_CUDA_HOME
 hardware_fingerprint: example-hw-1
 environment_fingerprint: example-env-1
 # Relative model paths in deployments resolve under this directory.
@@ -84,7 +84,7 @@ runtime_profiles:
     # Optional: the CUDA toolkit whose bin/ joins the engine PATH (vLLM needs
     # nvcc there to use FlashInfer). Omit it to keep the minimal PATH.
     cuda_home: /usr/local/cuda
-    # Optional overrides of the JIT build limits mllm computes at launch
+    # Optional overrides of the JIT build limits capyctl computes at launch
     # (MAX_JOBS = free memory / 8 GiB, at most the CPU count).
     env: {}
     log_policy:

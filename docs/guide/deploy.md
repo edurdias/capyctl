@@ -1,6 +1,6 @@
 # Deploy a model
 
-A deployment tells mllm which model to run, with which engine, and the name
+A deployment tells capyctl which model to run, with which engine, and the name
 clients ask for. You write it once as a YAML file.
 
 ## The deployment file
@@ -14,7 +14,7 @@ model: Qwen3-4B
 ```
 
 - `name`: the name clients send as `model` in their requests.
-- `engine`: the engine profile, as `mllm engine list` shows it
+- `engine`: the engine profile, as `capyctl engine list` shows it
   ([Add an engine](engines.md)).
 - `model`: where the weights are. A directory under your models directory
   (`~/models` unless you set another), an absolute path, or a Hugging Face
@@ -26,19 +26,19 @@ engine: vllm
 model: {hf: Qwen/Qwen3-4B-Instruct-2507}
 ```
 
-mllm pins a Hugging Face repository to the commit it points at when you
+capyctl pins a Hugging Face repository to the commit it points at when you
 deploy (write `Qwen/Qwen3-4B-Instruct-2507@<commit>` to pick one yourself),
 then downloads it into `~/models/sources` on the machine that runs it. It
 checks free disk space first, and all downloads together are capped at
 500 GiB. See [settings](../operations/configuration.md#models-and-downloads)
 to change the cap or turn downloads off.
 
-mllm fills in the rest: the GPU, the memory the engine may use (sized from
+capyctl fills in the rest: the GPU, the memory the engine may use (sized from
 the checkpoint and the GPU), and how the model parks. To see what it fills
 in:
 
 ```bash
-mllm validate config --file my-model.yaml
+capyctl validate config --file my-model.yaml
 ```
 
 `validate` works offline, so it refuses an `hf:` reference without a commit;
@@ -60,7 +60,7 @@ Every other field is in [Configuration files](configuration.md).
 ## Deploy and start
 
 ```bash
-mllm deploy model --file my-model.yaml --activate --wait
+capyctl deploy model --file my-model.yaml --activate --wait
 ```
 
 ```text
@@ -77,14 +77,14 @@ Deployed my-model: ready
 ```
 
 This saves the deployment, starts it and returns when the model answers. The
-first time mllm sees a checkpoint it reads the files once to fingerprint
+first time capyctl sees a checkpoint it reads the files once to fingerprint
 them, so the first start takes longer.
 
 Without `--activate`, `deploy` only saves it. For a second model,
 `other-model.yaml`:
 
 ```bash
-mllm deploy model --file other-model.yaml
+capyctl deploy model --file other-model.yaml
 ```
 
 ```text
@@ -94,19 +94,19 @@ Deployment other-model created (revision 1)
   Deployment ID       01M3R7A6YJW402N962HH17A66W
   Operation           01M3R7A6YJFV3HDFWQNZTWQTN0
   Checkpoint digest   being measured
-the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment
+the checkpoint digest of other-model is being measured; `capyctl start deployment other-model --wait` waits for it and starts the deployment
 ```
 
 Then start it when you want it:
 
 ```bash
-mllm start deployment other-model --wait
+capyctl start deployment other-model --wait
 ```
 
 ## Check on it
 
 ```bash
-mllm list deployments
+capyctl list deployments
 ```
 
 ```text
@@ -115,7 +115,7 @@ my-model   ready   1/1     1          gpu-box
 ```
 
 ```bash
-mllm status deployment my-model
+capyctl status deployment my-model
 ```
 
 ```text
@@ -130,7 +130,7 @@ To take a model off the GPU without stopping it, park it. The deployment shows
 `parking` and then `parked` while its memory is freed:
 
 ```bash
-mllm park deployment my-model
+capyctl park deployment my-model
 ```
 
 ```text
@@ -141,7 +141,7 @@ Park requested for my-model
 ```
 
 ```bash
-mllm status deployment my-model
+capyctl status deployment my-model
 ```
 
 ```text
@@ -152,7 +152,7 @@ INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   parked   active      gpu0      -
 ```
 
-`STARTUP` is the memory mllm set aside to start the model. When a start fails,
+`STARTUP` is the memory capyctl set aside to start the model. When a start fails,
 `LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
 
 ```text
@@ -171,9 +171,9 @@ controls enabled. Those controls listen on loopback only. Add
 ## Stop, start, delete
 
 ```bash
-mllm stop deployment my-model               # stops the engine, keeps the deployment
-mllm start deployment my-model --wait       # starts it again
-mllm delete deployment my-model --stop      # stops it and removes it
+capyctl stop deployment my-model               # stops the engine, keeps the deployment
+capyctl start deployment my-model --wait       # starts it again
+capyctl delete deployment my-model --stop      # stops it and removes it
 ```
 
 ```text
@@ -188,16 +188,16 @@ away. A `start` right after it is refused, exit status 25, and nothing is
 started:
 
 ```text
-$ mllm start deployment my-model
+$ capyctl start deployment my-model
 Request identity: 01M3R7BZ98AKHFBBTZXBCCX1BC (reuse --request-id 01M3R7BZ98AKHFBBTZXBCCX1BC to recover this command)
-error [still_stopping]: my-model is still stopping; nothing was started. Retry in a moment, or run `mllm start deployment my-model --wait`, which waits for the stop to finish and then starts
+error [still_stopping]: my-model is still stopping; nothing was started. Retry in a moment, or run `capyctl start deployment my-model --wait`, which waits for the stop to finish and then starts
 ```
 
 With `--wait`, `start` waits for the stop to finish, starts the model and
 returns when it answers:
 
 ```text
-$ mllm start deployment my-model --wait
+$ capyctl start deployment my-model --wait
 Request identity: 01M3R7BZA67CC0V5C8F8BFF7BR (reuse --request-id 01M3R7BZA67CC0V5C8F8BFF7BR to recover this command)
 Waiting for the stop of my-model to finish (at most 160s)
 Started my-model: ready
@@ -210,16 +210,16 @@ Started my-model: ready
 A request for a stopped deployment is refused; it does not start it:
 
 ```text
-{"code":"deployment_stopped","message":"deployment 01M3R7A6YJW402N962HH17A66W was stopped by an operator; inference does not start it; start it with `mllm start deployment 01M3R7A6YJW402N962HH17A66W`"}
+{"code":"deployment_stopped","message":"deployment 01M3R7A6YJW402N962HH17A66W was stopped by an operator; inference does not start it; start it with `capyctl start deployment 01M3R7A6YJW402N962HH17A66W`"}
 ```
 
 Deleting never touches the model files.
 
 To change a deployment, edit the file and deploy it again with its current
-revision, the `REVISION` column of `mllm list deployments`:
+revision, the `REVISION` column of `capyctl list deployments`:
 
 ```bash
-mllm deploy model --file my-model.yaml --revision 1
+capyctl deploy model --file my-model.yaml --revision 1
 ```
 
 ```text

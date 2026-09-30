@@ -79,7 +79,7 @@ _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io"
                     # network (loopback_rendezvous.py).
                     "loopback_rendezvous_failed"})
 # ADR 0014 §2: the typed settings a deployment may state. None means the
-# engine's own default applies; mllm validates type and range only (ADR 0011).
+# engine's own default applies; capyctl validates type and range only (ADR 0011).
 _SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
              "max_running_requests", "cuda_graphs", "language_model_only",
              "trust_remote_code", "max_total_tokens", "chunked_prefill_size",
@@ -261,7 +261,7 @@ def _validate_public(value):
     # The served name is the deployment's route (Spec §3), not a derived
     # binding artifact: an ASCII printable token, a non-empty run of at most
     # 256 bytes restricted to 0x21..=0x7E. This mirrors the coordinator's
-    # `served_name_token` in crates/mllm-adapters/src/sglang/args.rs, so both
+    # `served_name_token` in crates/capyctl-adapters/src/sglang/args.rs, so both
     # validators refuse exactly the same inputs.
     served = _text(value["served_name"], 256)
     if (not served.isascii() or not served.isprintable()
@@ -564,7 +564,7 @@ def _import_and_launch(spec, contract, approvals=None):
 
 
 def _keep_served_name_on_reload():
-    """SPEC §3: the served name is mllm's (the route name), and stays so.
+    """SPEC §3: the served name is capyctl's (the route name), and stays so.
 
     Found live 2026-09-23 (M28, SGLang 0.5.20): `update_weights_from_disk`, the
     reload every deep wake performs, renames the served model to the checkpoint
@@ -602,7 +602,7 @@ def _observation_target(spec, launch):
     The child scope carries the launch's declared weight restore, so the saver
     observer admits the weights backup of a `host_backed` launch only (ADR 0019).
     Only a memory-saver launch enrolls, only when the host supplied its private
-    observation directory (MLLM_OBSERVATION_DIR) and it validates, and only when
+    observation directory (CAPYCTL_OBSERVATION_DIR) and it validates, and only when
     the installation's `launch_server` takes a scheduler target (the
     `observation` capability, engine_capabilities.py). Anything else serves
     without an observation, and the host refuses Park unchanged (fail closed).

@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# ENG2 (ADR 0018 §5): standalone with MLLM_VLLM_BIN and MLLM_SGLANG_BIN both
+# ENG2 (ADR 0018 §5): standalone with CAPYCTL_VLLM_BIN and CAPYCTL_SGLANG_BIN both
 # set (refused before) publishes local-vllm and local-sglang, and serves a
 # deployment on each in turn:
 #   run_row.sh ENG2 --no-e0 -- a
@@ -30,15 +30,15 @@ eng2_start() { # eng2_start <host>
   local host=$1
   ENG2_DIR=$RRD/eng2-standalone
   rsh "$host" "rm -rf $ENG2_DIR && mkdir -m 700 $ENG2_DIR && tmux new-session -d -s mx-eng2-$RUN \
-env MLLM_STATE_DIR=$ENG2_DIR MLLM_VLLM_BIN=$(vllm_venv "$host")/bin/vllm MLLM_SGLANG_BIN=$SGLANG_VENV/bin/python3 \
-MLLM_MODELS_ROOT=$MODELS_ROOT $REMOTE_TREE/scripts/live/matrix/role_exec.sh $ENG2_DIR/role.pid $ENG2_DIR/role.log \
+env CAPYCTL_STATE_DIR=$ENG2_DIR CAPYCTL_VLLM_BIN=$(vllm_venv "$host")/bin/vllm CAPYCTL_SGLANG_BIN=$SGLANG_VENV/bin/python3 \
+CAPYCTL_MODELS_ROOT=$MODELS_ROOT $REMOTE_TREE/scripts/live/matrix/role_exec.sh $ENG2_DIR/role.pid $ENG2_DIR/role.log \
 $(rbin "$host") start standalone --debug-engine-logs"
   rsh "$host" "for i in \$(seq 1 120); do [ -S $ENG2_DIR/control.sock ] && exit 0; sleep 1; done; exit 1"
 }
 
 eng2_list() { # eng2_list <host>
   local host=$1
-  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" | tee "$EVID/eng2-list.json"
+  rsh "$host" "CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" | tee "$EVID/eng2-list.json"
   dry && return 0
   python3 - "$EVID/eng2-list.json" <<'PY'
 import json, sys
@@ -59,7 +59,7 @@ sleep 10; rm -rf $ENG2_DIR"
 
 # The standalone role's config home engines.yaml (ADR 0018 §5) must not exist
 # before the row: the row writes it and removes it.
-eng2_config_home_free() { rsh "$1" "! test -e \$HOME/.config/mllm/engines.yaml"; }
+eng2_config_home_free() { rsh "$1" "! test -e \$HOME/.config/capyctl/engines.yaml"; }
 
 eng2_serve() { # eng2_serve <host> <fixture> <tag> <profile> [gen_deployment args...]
   local host=$1 fix=$2 tag=$3 profile=$4 dep file
@@ -68,8 +68,8 @@ eng2_serve() { # eng2_serve <host> <fixture> <tag> <profile> [gen_deployment arg
   variant "$fix" "$tag" --document-json "{\"runtime_profile\": \"$profile\", \"host\": null}" "$@" || return 1
   file=$(FIXTURE_VARIANT=$tag fixture_file "$fix")
   rcopy "$file" "$host:$ENG2_DIR/$dep.yaml" || return 1
-  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR timeout 1200 $(rbin "$host") deploy model --file $ENG2_DIR/$dep.yaml --activate --wait --format json | tail -c 1500; echo; \
-MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") status deployment $dep --format json | python3 -c 'import json,sys
+  rsh "$host" "CAPYCTL_STATE_DIR=$ENG2_DIR timeout 1200 $(rbin "$host") deploy model --file $ENG2_DIR/$dep.yaml --activate --wait --format json | tail -c 1500; echo; \
+CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$host") status deployment $dep --format json | python3 -c 'import json,sys
 d=json.load(sys.stdin); d=d.get(\"deployment\",d)
 print(json.dumps({k: d.get(k) for k in (\"name\", \"observed_state\", \"conditions\")}))'"
 }
@@ -84,10 +84,10 @@ eng2_engine_reason() { # eng2_engine_reason <host>: context-length lines of the 
   rsh "$1" "grep -rhaiE 'max_model_len|max model len|model length|KV cache' $ENG2_DIR/logs 2>/dev/null | grep -viE 'key|token=|secret|bearer' | tail -n 6; true"
 }
 
-eng2_delete() { rsh "$1" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$1") delete deployment $2 --stop --format json"; }
+eng2_delete() { rsh "$1" "CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$1") delete deployment $2 --stop --format json"; }
 
 eng2_argv() { # eng2_argv <host>: the running vLLM api process's argv tail (no credential is on argv)
-  rsh "$1" "for p in \$(pgrep -f 'vllm_entr[y]'); do tr '\\0' ' ' < /proc/\$p/cmdline | grep -o -- '--mllm-user-args.*' ; done; true"
+  rsh "$1" "for p in \$(pgrep -f 'vllm_entr[y]'); do tr '\\0' ' ' < /proc/\$p/cmdline | grep -o -- '--capyctl-user-args.*' ; done; true"
 }
 
 row_main() {
@@ -99,7 +99,7 @@ row_main() {
   step matrix-host-down "$MATRIX_DIR/roles.sh" host-down "$host" || return 1
   step start eng2_start "$host" || { rc=1; }
   step list eng2_list "$host" || rc=1
-  step env-remove-refused refused_with invalid_config rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine remove local-vllm" || rc=1
+  step env-remove-refused refused_with invalid_config rsh "$host" "CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$host") engine remove local-vllm" || rc=1
   step serve-local-vllm eng2_serve "$host" va-4 lv local-vllm --engine-config-json '{"context_length": null}' || rc=1
   step argv-local-vllm eng2_argv "$host"
   step infer-local-vllm eng2_infer "$host" va-4-lv || rc=1
@@ -107,8 +107,8 @@ row_main() {
   step serve-local-sglang eng2_serve "$host" sa-4 ls local-sglang || rc=1
   step infer-local-sglang eng2_infer "$host" sa-4-ls || rc=1
   step delete-local-sglang eng2_delete "$host" sa-4-ls || rc=1
-  step add-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine add $(vllm_venv "$host")/bin/vllm --name vllm-reg" || rc=1
-  step list-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" || rc=1
+  step add-registered rsh "$host" "CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$host") engine add $(vllm_venv "$host")/bin/vllm --name vllm-reg" || rc=1
+  step list-registered rsh "$host" "CAPYCTL_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" || rc=1
   step serve-registered eng2_serve "$host" va-4 reg vllm-reg || rc=1
   step argv-registered eng2_argv "$host"
   step infer-registered eng2_infer "$host" va-4-reg || rc=1
@@ -120,7 +120,7 @@ row_main() {
   step reason-registered-noctx eng2_engine_reason "$host"
   step delete-registered-noctx eng2_delete "$host" va-4-regnc || rc=1
   step stop eng2_stop "$host" || rc=1
-  step engines-file-removed rsh "$host" "rm -f \$HOME/.config/mllm/engines.yaml \$HOME/.config/mllm/engines.yaml.lock" || rc=1
+  step engines-file-removed rsh "$host" "rm -f \$HOME/.config/capyctl/engines.yaml \$HOME/.config/capyctl/engines.yaml.lock" || rc=1
   step idle host_idle "$host" || rc=1
   step matrix-host-up "$MATRIX_DIR/roles.sh" host-up "$host" || rc=1
   step online "$MATRIX_DIR/roles.sh" wait-online 180 || rc=1

@@ -1,13 +1,13 @@
 # Security policy
 
-mllm is early software. Security fixes target the latest release; older releases
-have no separate maintenance commitment. Run current versions of mllm and the
+capyctl is early software. Security fixes target the latest release; older releases
+have no separate maintenance commitment. Run current versions of capyctl and the
 inference engines you use, and review their release notes before upgrading.
 
 ## Report a vulnerability privately
 
 Use GitHub's **Report a vulnerability** action on the repository's Security tab:
-[private vulnerability report](https://github.com/edurdias/mllm/security/advisories/new).
+[private vulnerability report](https://github.com/edurdias/capyctl/security/advisories/new).
 This channel becomes available after the repository is public and maintainers
 have enabled private vulnerability reporting. If the action is unavailable, do
 not put exploit details or secrets in a public issue. You may open an issue asking
@@ -31,7 +31,7 @@ See [network access](docs/operations/network-access.md) and the
 [configuration reference](docs/operations/configuration.md). Do not expose engine
 control ports as a workaround for connectivity problems.
 
-mllm does not install or maintain your engines, GPU drivers or model weights.
+capyctl does not install or maintain your engines, GPU drivers or model weights.
 Report vulnerabilities in those components to their maintainers; report problems
-in mllm's integration here. Passing CPU or Fake-engine tests is not native engine
+in capyctl's integration here. Passing CPU or Fake-engine tests is not native engine
 qualification or a security audit.

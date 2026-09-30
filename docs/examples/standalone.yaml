@@ -1,22 +1,22 @@
-# mllm standalone role document: an embedded server and host on one machine,
-# with authenticated listeners. `mllm start standalone` generates this shape
+# capyctl standalone role document: an embedded server and host on one machine,
+# with authenticated listeners. `capyctl start standalone` generates this shape
 # under its state directory when none exists. The engine installation is
 # named here (`host.local_engine`), by a flag (--vllm-bin) or by a variable
-# (MLLM_VLLM_BIN); a flag wins over a variable, which wins over this file
+# (CAPYCTL_VLLM_BIN); a flag wins over a variable, which wins over this file
 # (docs/operations/configuration.md lists every setting). Inference listens on
 # all interfaces and requires the API key; management stays on loopback
 # (docs/operations/network-access.md). The listeners serve plain HTTP, so
 # there is no `tls` block: use a private network or a TLS reverse proxy.
 # Models live in ~/models unless `host.model_store.path` (or --models-root,
-# MLLM_MODELS_ROOT) names another directory; Hugging Face and HTTP downloads
+# CAPYCTL_MODELS_ROOT) names another directory; Hugging Face and HTTP downloads
 # are allowed with a 500 GiB cap unless `host.model_sources` says otherwise.
-# Parsed by the product: `mllm validate config --file docs/examples/standalone.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/standalone.yaml`.
 schema_version: 1
 kind: standalone
 name: local
 server:
   name: local
-  state_dir: /home/operator/.local/state/mllm/server
+  state_dir: /home/operator/.local/state/capyctl/server
   listeners:
     management:
       bind: "127.0.0.1:7443"
@@ -26,7 +26,7 @@ server:
       authentication: api_key
 host:
   name: local
-  state_dir: /home/operator/.local/state/mllm/host
+  state_dir: /home/operator/.local/state/capyctl/host
   connection: embedded
   resource_policy:
     allowed_devices: auto
@@ -47,6 +47,6 @@ host:
   #   vllm: /opt/vllm/bin/vllm  # or sglang: /opt/sglang/bin/python3
   #   deep_park: "on"           # or "off"
   #   installation_drift: warn  # or refuse
-  # runtime_dir: /home/operator/mllm/runtime   # development only
+  # runtime_dir: /home/operator/capyctl/runtime   # development only
 shutdown:
   drain_timeout: "30s"

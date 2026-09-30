@@ -1,6 +1,6 @@
 # Live evidence: F2 on host-a
 
-Purpose: this is the record of what was actually observed when mllm drove a real
+Purpose: this is the record of what was actually observed when capyctl drove a real
 inference engine on real hardware. Nothing else in the repository can stand in for
 it — the CPU and Fake-engine suites prove that the controller's machinery holds
 together, and passing them establishes nothing about a native recipe (SPEC §18).
@@ -10,7 +10,7 @@ newest last. An entry names the commit it ran at, so the code that produced a re
 can be recovered; it never carries the output itself, which lives in
 `target/live/<stamp>/` on the machine that ran the script.
 
-That runner and the suites it ran (`crates/mllm-cli/tests/live_vllm.rs`,
+That runner and the suites it ran (`crates/capyctl-cli/tests/live_vllm.rs`,
 `live_sglang.rs`) drove standalone in process rather than the shipped binary. By owner
 decision (2026-09-22) they were replaced by matrix rows driven through the shipped CLI
 and roles (M38, M73, M74, M75 in
@@ -91,7 +91,7 @@ the real launch path has.
   that commits the release. Fixed in `000b832`.
 
 vLLM control routes keyed by API key: no, not by vLLM's own middleware; yes with
-`runtime/mllm_vllm_guard.py` loaded, which L3 asserts (see the auth-scope finding
+`runtime/capyctl_vllm_guard.py` loaded, which L3 asserts (see the auth-scope finding
 below).
 
 What this run does and does not establish. It establishes that the coordinator
@@ -139,12 +139,12 @@ From `vllm/entrypoints/serve/middleware/authenticate.py`:
     GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")
 
 Everything outside that list is unauthenticated, which includes exactly the routes
-mllm depends on for deep park: `/sleep`, `/wake_up`, `/is_sleeping` and
+capyctl depends on for deep park: `/sleep`, `/wake_up`, `/is_sleeping` and
 `/collective_rpc`. On a development-mode server those are open to any local caller.
 SPEC §9.1 and T21 require that surface to be denied by default with explicit opt-in
 only, so shipping on vLLM's own middleware would not have met the requirement.
 
-mllm closes the gap with its own ASGI middleware, `runtime/mllm_vllm_guard.py`,
+capyctl closes the gap with its own ASGI middleware, `runtime/capyctl_vllm_guard.py`,
 loaded into the engine process through vLLM's `--middleware` flag. It requires a
 valid `Authorization: Bearer <VLLM_API_KEY>` on every HTTP and WebSocket path except
 `/health`, with `OPTIONS` passed through unchecked because a preflight is not a
@@ -167,7 +167,7 @@ returns, and the argument for that being sufficient is structural: `ChatForward`
 carries no path at all, so the only upstream a forwarder can express is the one
 `upstream` builds, and a forwarder driven directly has no path argument to refuse.
 The allowlist is pinned by a unit test over `upstream` instead
-(`crates/mllm-adapters/src/forward.rs`, T19).
+(`crates/capyctl-adapters/src/forward.rs`, T19).
 
 That argument is sound, but it is a different proof from the one the spec names, so
 the evidence table above should not be read as covering a drive that was never run.
@@ -199,13 +199,13 @@ not a clean-checkout result. Launch/configuration fixes are committed in `047007
 and runner/evidence changes in `5d07f11`.
 
 SGLang 0.5.19, qwen3-4b-instruct, host-a. The runner explicitly set
-`MLLM_DEEP_PARK=on`. Wrapper ancestors passed the permission inspection after
+`CAPYCTL_DEEP_PARK=on`. Wrapper ancestors passed the permission inspection after
 synchronization. Release binary checks passed. The gate failed in 4.43 seconds:
 Initialize armed and reached the protected wrapper, which reported
 `sglang_startup_failed: source_revalidation_failed`. No Ready or inference result
 was established, so SGL1–SGL3 did not pass.
 
-Read-only inspection of `~/mllm-sglang-f2-venv/lib/python3.12/site-packages/sglang/srt`
+Read-only inspection of `~/capyctl-sglang-f2-venv/lib/python3.12/site-packages/sglang/srt`
 found `unsafe_file`: package directories have mode 0775 and selected source files
 have mode 0664. Seven of ten audited files also disagree with the pinned source
 hashes: `server_args.py`, `managers/scheduler.py`,

@@ -39,7 +39,7 @@ bad = []
 out = {}
 for p in paths:
     for m in ("GET", "POST"):
-        keyed = call(m, p, os.environ["MLLM_API_KEY"])
+        keyed = call(m, p, os.environ["CAPYCTL_API_KEY"])
         unkeyed = call(m, p, None)
         out[f"{m} {p}"] = {"keyed": keyed, "unkeyed": unkeyed}
         # The router's own /health may answer; no engine path may.

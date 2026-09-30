@@ -62,7 +62,7 @@ def row_for(report, prompt, concurrency):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--live", default=os.environ.get("MLLM_MATRIX_LIVE", os.path.join(REPO, "target/live/matrix")))
+    parser.add_argument("--live", default=os.environ.get("CAPYCTL_MATRIX_LIVE", os.path.join(REPO, "target/live/matrix")))
     parser.add_argument("--out-md")
     parser.add_argument("--out-json")
     parser.add_argument("--prompt", type=int, default=2048)

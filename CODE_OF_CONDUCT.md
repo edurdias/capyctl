@@ -1,7 +1,7 @@
 # Code of conduct
 
 We want people with different experience and backgrounds to be able to ask
-questions, report problems and contribute to mllm.
+questions, report problems and contribute to capyctl.
 
 Be respectful and specific. Critique ideas and code, not people. Assume that a
 question may come from someone learning, accept corrections, and respect another

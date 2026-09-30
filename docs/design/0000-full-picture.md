@@ -1,4 +1,4 @@
-# mllm — Full-Picture Design
+# capyctl — Full-Picture Design
 
 **Status:** Approved direction, September 10, 2026.
 **Authoritative source:** [`../SPEC.md`](../SPEC.md) revision 0.2. This document records
@@ -8,7 +8,7 @@ decisions and structure around that spec; it never overrides it. Where summaries
 
 ## 1. Purpose and boundary
 
-mllm is a fresh, engine-neutral lifecycle and inference-routing controller: one endpoint,
+capyctl is a fresh, engine-neutral lifecycle and inference-routing controller: one endpoint,
 bring-your-own inference engines, explicit deployment ownership, safe model residency
 transitions, and aggregate resource control. It owns routing, admission, deployment intent,
 reservations, lifecycle coordination, local supervision, and visibility. Engines own
@@ -23,8 +23,8 @@ training, marketplace, or HA consensus.
 One platform executable supplies action-first CLI roles:
 
 ```text
-mllm start server | mllm start host | mllm start standalone
-mllm <action> <resource> [identifier] [options]
+capyctl start server | capyctl start host | capyctl start standalone
+capyctl <action> <resource> [identifier] [options]
 ```
 
 Path separation (SPEC §3.2) is the hard boundary:
@@ -43,23 +43,23 @@ Management RPCs are never an implicit tunnel for prompts, tokens, weights, or KV
 Crate layout (proposal, refined at F0 design time):
 
 ```text
-mllm/
+capyctl/
   crates/
-    mllm-domain/        # state machines, deployment/generation/owner types,
+    capyctl-domain/        # state machines, deployment/generation/owner types,
                         # lifecycle states, no I/O
-    mllm-store/         # SQLite server store + agent journal, transactions,
+    capyctl-store/         # SQLite server store + agent journal, transactions,
                         # migrations
-    mllm-scheduler/     # resource ledger, physical domains, exclusive pools,
+    capyctl-scheduler/     # resource ledger, physical domains, exclusive pools,
                         # reservation admission, fairness queues
-    mllm-protocol/      # gRPC protos + generated types, schema versioning
-    mllm-controller/    # operation engine, reconciliation, lifecycle intents
-    mllm-router/        # /v1/models, /v1/chat/completions, admission, streams,
+    capyctl-protocol/      # gRPC protos + generated types, schema versioning
+    capyctl-controller/    # operation engine, reconciliation, lifecycle intents
+    capyctl-router/        # /v1/models, /v1/chat/completions, admission, streams,
                         # cancellation accounting
-    mllm-agent/         # host supervision, launch/ownership handles, ingress gate
-    mllm-adapters/      # vllm, sglang, fake adapter (trait + per-engine impls)
-    mllm-launchers/     # exec/foreground; later: container/service
-    mllm-config/        # strict YAML schema, validation, default generation
-    mllm-cli/           # action-first grammar, binary entrypoint
+    capyctl-agent/         # host supervision, launch/ownership handles, ingress gate
+    capyctl-adapters/      # vllm, sglang, fake adapter (trait + per-engine impls)
+    capyctl-launchers/     # exec/foreground; later: container/service
+    capyctl-config/        # strict YAML schema, validation, default generation
+    capyctl-cli/           # action-first grammar, binary entrypoint
   tests/
     harness/            # fake-engine simulator: slow start, sleep/reload,
                         # retained memory/cache, cancellation, crashes,
@@ -68,7 +68,7 @@ mllm/
 
 Enforced separations:
 
-- `mllm-domain` has no async/I-O; state machines are unit-testable.
+- `capyctl-domain` has no async/I-O; state machines are unit-testable.
 - The fake engine adapter lives beside real adapters behind the same trait, so the
   conformance suite runs engine-free first; F0 needs no GPUs.
 - The router never imports engine crates; adapters keep all engine-specific endpoints and

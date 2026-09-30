@@ -12,7 +12,7 @@ set -euo pipefail
 
 MATRIX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$MATRIX_DIR/../../.." && pwd)
-LIVE=${MLLM_MATRIX_LIVE:-$REPO/target/live/matrix}
+LIVE=${CAPYCTL_MATRIX_LIVE:-$REPO/target/live/matrix}
 RUNSTATE=$LIVE/run
 SNAPSHOT=$LIVE/snapshot
 DRY_RUN=${DRY_RUN:-0}
@@ -21,9 +21,9 @@ die() { echo "matrix: $*" >&2; exit 2; }
 
 # Machines come from an untracked local file so that no lab-specific host name,
 # address or path lives in the tree. hosts.example.env documents every variable;
-# copy it to hosts.local.env and fill it in. MLLM_MATRIX_HOSTS_ENV points at
+# copy it to hosts.local.env and fill it in. CAPYCTL_MATRIX_HOSTS_ENV points at
 # another file.
-HOSTS_ENV=${MLLM_MATRIX_HOSTS_ENV:-$MATRIX_DIR/hosts.local.env}
+HOSTS_ENV=${CAPYCTL_MATRIX_HOSTS_ENV:-$MATRIX_DIR/hosts.local.env}
 [ -f "$HOSTS_ENV" ] || die "missing $HOSTS_ENV: copy $MATRIX_DIR/hosts.example.env to hosts.local.env and set the lab's hosts"
 # shellcheck disable=SC1090
 . "$HOSTS_ENV"
@@ -35,11 +35,11 @@ unset _v
 [ "$HOST_A" != "$HOST_B" ] || die "HOST_A and HOST_B must differ"
 export HOST_A HOST_B
 
-REMOTE_HOME=${MLLM_REMOTE_HOME:-$REMOTE_HOME}
-# MLLM_REMOTE_TREE lets a second worktree keep its own tree and binary on the
-# hosts (the 2026-09-24 soak ran from ~/mllm-soak beside another tree).
-REMOTE_TREE=${MLLM_REMOTE_TREE:-$REMOTE_HOME/mllm-f2}
-SERVER_IP=${MLLM_SERVER_IP:-$CONTROL_HOST_ADDR}
+REMOTE_HOME=${CAPYCTL_REMOTE_HOME:-$REMOTE_HOME}
+# CAPYCTL_REMOTE_TREE lets a second worktree keep its own tree and binary on the
+# hosts (the 2026-09-24 soak ran from ~/capyctl-soak beside another tree).
+REMOTE_TREE=${CAPYCTL_REMOTE_TREE:-$REMOTE_HOME/capyctl-f2}
+SERVER_IP=${CAPYCTL_SERVER_IP:-$CONTROL_HOST_ADDR}
 MATRIX_HOSTS=("$HOST_A" "$HOST_B")
 MODELS_ROOT=$REMOTE_HOME/models
 export MODELS_ROOT
@@ -106,7 +106,7 @@ rsh() {
   log_cmd "$host" "$script"
   # A dry run still parses every remote script, so quoting errors surface here.
   if dry; then bash -n <<<"$script" || die "remote script for $host does not parse"; return 0; fi
-  # Harness rehearsal only (MATRIX_LOCAL_RSH=1, with MLLM_REMOTE_HOME pointing at a
+  # Harness rehearsal only (MATRIX_LOCAL_RSH=1, with CAPYCTL_REMOTE_HOME pointing at a
   # scratch tree of fake venvs and models): run the "remote" script on this machine.
   if [ "${MATRIX_LOCAL_RSH:-0}" = 1 ]; then bash -c "$script" </dev/null; return; fi
   # shellcheck disable=SC2029  # the script is meant to expand remotely
@@ -140,23 +140,23 @@ load_run() {
   else
     die "no run: start one with roles.sh up (or roles.sh server-init)"
   fi
-  LRD=${MLLM_LOCAL_RUN_ROOT:-$HOME/mllm-runs/$RUN}         # control-host run root (server state, private)
-  RRD=${MLLM_REMOTE_RUN_ROOT:-$REMOTE_HOME/mllm-runs/$RUN}  # host run root (host state, private)
+  LRD=${CAPYCTL_LOCAL_RUN_ROOT:-$HOME/capyctl-runs/$RUN}         # control-host run root (server state, private)
+  RRD=${CAPYCTL_REMOTE_RUN_ROOT:-$REMOTE_HOME/capyctl-runs/$RUN}  # host run root (host state, private)
   SERVER_CFG=$LRD/server.yaml
   SERVER_DB=$LRD/server/srv.sqlite3
-  # Release validation (MLLM_LOCAL_BIN / MLLM_REMOTE_BIN, e.g. ~/.local/bin/mllm
+  # Release validation (CAPYCTL_LOCAL_BIN / CAPYCTL_REMOTE_BIN, e.g. ~/.local/bin/capyctl
   # from install.sh) runs the installed binaries instead of snapshot builds; the
-  # rows then only need the harness scripts under MLLM_REMOTE_TREE.
-  MLLM=${MLLM_LOCAL_BIN:-$LRD/mllm}                          # the server binary
-  RBIN=${MLLM_REMOTE_BIN:-$REMOTE_TREE/target/release/mllm}  # the host binary
+  # rows then only need the harness scripts under CAPYCTL_REMOTE_TREE.
+  CAPYCTL=${CAPYCTL_LOCAL_BIN:-$LRD/capyctl}                          # the server binary
+  RBIN=${CAPYCTL_REMOTE_BIN:-$REMOTE_TREE/target/release/capyctl}  # the host binary
 }
 
 # ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
-# rc.3 agent beside new ones. MLLM_REMOTE_BIN_a / MLLM_REMOTE_BIN_b override
+# rc.3 agent beside new ones. CAPYCTL_REMOTE_BIN_a / CAPYCTL_REMOTE_BIN_b override
 # RBIN for that host only.
 rbin() { # rbin <host>
   local var
-  var="MLLM_REMOTE_BIN_$(host_short "$1")"
+  var="CAPYCTL_REMOTE_BIN_$(host_short "$1")"
   printf '%s\n' "${!var:-$RBIN}"
 }
 
@@ -175,9 +175,9 @@ save_run_var() { # save_run_var NAME VALUE
 # under validation) knows only `--output json`, which every later binary still
 # accepts, so the flag is translated for it. The probe is cached per binary.
 cli_format_probe() {
-  [ "${CLI_FORMAT_BIN:-}" = "$MLLM" ] && return 0
-  CLI_FORMAT_BIN=$MLLM
-  case "$("$MLLM" --help 2>/dev/null)" in
+  [ "${CLI_FORMAT_BIN:-}" = "$CAPYCTL" ] && return 0
+  CLI_FORMAT_BIN=$CAPYCTL
+  case "$("$CAPYCTL" --help 2>/dev/null)" in
     *--format*) CLI_FORMAT_FLAG=--format ;;
     *) CLI_FORMAT_FLAG=--output ;;
   esac
@@ -191,17 +191,17 @@ cli() {
     [ "$arg" = --format ] && [ "${CLI_FORMAT_FLAG:---format}" = --output ] && arg=--output
     args+=("$arg")
   done
-  log_cmd control-host "mllm ${args[*]} --config $SERVER_CFG"
+  log_cmd control-host "capyctl ${args[*]} --config $SERVER_CFG"
   dry && { echo '{}'; return 0; }
-  "$MLLM" "${args[@]}" --config "$SERVER_CFG"
+  "$CAPYCTL" "${args[@]}" --config "$SERVER_CFG"
 }
 
 # Read the inference key into the environment only. Never echo it.
 load_api_key() {
-  if dry; then log_cmd control-host "export MLLM_API_KEY=<api_key from $LRD/server/identity/server-credentials.json>"; export MLLM_API_KEY=dry-run; return 0; fi
-  MLLM_API_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["api_key"])' \
+  if dry; then log_cmd control-host "export CAPYCTL_API_KEY=<api_key from $LRD/server/identity/server-credentials.json>"; export CAPYCTL_API_KEY=dry-run; return 0; fi
+  CAPYCTL_API_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["api_key"])' \
     "$LRD/server/identity/server-credentials.json")
-  export MLLM_API_KEY
+  export CAPYCTL_API_KEY
 }
 
 # Host enrolment ids recorded by roles.sh enroll.
@@ -213,6 +213,6 @@ host_id() {
 
 # Tree digest over a directory: every regular file except build output, VCS,
 # hidden directories (local working notes), logs and bytecode, by relative path.
-# The same function runs locally over the snapshot and remotely over ~/mllm-f2,
+# The same function runs locally over the snapshot and remotely over ~/capyctl-f2,
 # so equality proves the host builds exactly the snapshot.
 TREE_DIGEST_SH='find . \( -name target -o -name .git -o \( -type d -name ".?*" \) -o -name __pycache__ \) -prune -o -type f ! -name "*.log" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64'

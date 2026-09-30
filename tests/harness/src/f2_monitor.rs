@@ -4,7 +4,7 @@
 //! close server admission by itself. The runner must consult a fresh handle
 //! status before each submission and compose its run-abort API on a breach.
 use crate::f2_pressure::{PressureAbort, PressureBounds, PressureGuard, PressureStatus};
-use mllm_agent::memory::{read_host_memory, HostMemorySample};
+use capyctl_agent::memory::{read_host_memory, HostMemorySample};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -230,7 +230,7 @@ async fn run(shared: Arc<Shared>, reader: Reader, mut stop: watch::Receiver<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mllm_agent::memory::parse_meminfo;
+    use capyctl_agent::memory::parse_meminfo;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, Mutex,

@@ -29,7 +29,7 @@ then authenticated routed inference. Policy gates and timeouts are unchanged.
 
 Each row is a fresh engine process with three immediate park/wake cycles.
 Latency runs from controller Start request to a fully read and validated,
-non-streaming mllm HTTP completion. This is not request-to-first-token.
+non-streaming capyctl HTTP completion. This is not request-to-first-token.
 The prompt is `Say 'live' and nothing else.`, with `max_tokens: 8`.
 
 | Run | Wake → response samples (s) | Median (s) | Reload samples (s) |
@@ -103,12 +103,12 @@ Use the environment in [the environment runbook](vllm-env.md). Run one
 engine per host and confirm the prior process has exited. On host-a:
 
 ```bash
-MLLM_LIVE=1 \
-MLLM_VLLM_BIN=$HOME/mllm-vllm-venv2/bin/vllm \
-MLLM_MODEL_PATH=$HOME/models/qwen3-4b-instruct \
-MLLM_MODEL_ID=qwen3-4b-instruct MLLM_PORT=8150 \
-MLLM_ENGINE_PATH=$HOME/mllm-vllm-venv2/bin \
-cargo test --release -p mllm-cli --test live_spark live_park_reload -- --exact --nocapture
+CAPYCTL_LIVE=1 \
+CAPYCTL_VLLM_BIN=$HOME/capyctl-vllm-venv2/bin/vllm \
+CAPYCTL_MODEL_PATH=$HOME/models/qwen3-4b-instruct \
+CAPYCTL_MODEL_ID=qwen3-4b-instruct CAPYCTL_PORT=8150 \
+CAPYCTL_ENGINE_PATH=$HOME/capyctl-vllm-venv2/bin \
+cargo test --release -p capyctl-cli --test live_spark live_park_reload -- --exact --nocapture
 ```
 
 `LIVE-METRIC` records park, wake-to-ready and wake-to-full-response seconds.

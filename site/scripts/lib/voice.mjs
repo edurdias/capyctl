@@ -1,5 +1,5 @@
 // Website spec, Audience and voice: no parent company, no "powered by", never
-// say where mllm was tested, no marketing language. Machine and company names
+// say where capyctl was tested, no marketing language. Machine and company names
 // are kept out of the repository: list them one per line in
 // site/voice-denylist.local.txt (gitignored).
 export const PHRASES = ['powered by', 'tested on', 'tested with', 'verified on', 'owner decision',
@@ -35,7 +35,7 @@ export function findInternalTerms(text) {
 }
 
 // Owner feedback 2026-09-25: the landing page names no port. Its text,
-// terminal blocks included, carries no `:<port>` and none of mllm's default
+// terminal blocks included, carries no `:<port>` and none of capyctl's default
 // port numbers.
 export function findPorts(html) {
   const text = html

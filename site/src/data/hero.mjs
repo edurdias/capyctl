@@ -1,8 +1,8 @@
-// Website spec, Landing page 1: the hero shows `mllm list deployments` as the
+// Website spec, Landing page 1: the hero shows `capyctl list deployments` as the
 // CLI prints it by default, a table. The table text is rendered at build time
 // by the CLI's own table code (scripts/gen-hero.mjs); this only marks the
 // `parked` state for colour.
-export const HERO_COMMAND = 'mllm list deployments';
+export const HERO_COMMAND = 'capyctl list deployments';
 
 export function heroSegments(text) {
   return text.replace(/\n$/, '').split('\n').map((line) => {

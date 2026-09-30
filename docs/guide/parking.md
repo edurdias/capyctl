@@ -1,17 +1,17 @@
 # Parking and switching
 
-A GPU holds one or two models at a time. mllm keeps the others parked: the
+A GPU holds one or two models at a time. capyctl keeps the others parked: the
 engine stays up but gives back its GPU memory. A request for a parked model
 wakes it. The time depends on the engine, model and parking tier.
 
 A deployment parks unless it says `residency: restart_only`, as long as its
-engine supports parking: `mllm engine list` shows `DEEP PARK enabled`.
+engine supports parking: `capyctl engine list` shows `DEEP PARK enabled`.
 [How it works](how-it-works.md#ready-parked-stopped) shows where the memory
 goes in each state.
 
 ## How a model parks
 
-mllm picks the way from your hardware:
+capyctl picks the way from your hardware:
 
 - On a discrete card, a parked model's weights are copied to host RAM, and a
   wake copies them back in seconds. When the copy does not fit in host RAM,
@@ -25,19 +25,19 @@ only), `residency: deep` or `residency: restart_only` in the deployment.
 ## Park and wake
 
 ```bash
-mllm park deployment my-model
-mllm list deployments
+capyctl park deployment my-model
+capyctl list deployments
 ```
 
 Parking runs in the background. The first status query may show `parking`;
-run `mllm list deployments` again until it shows `parked`:
+run `capyctl list deployments` again until it shows `parked`:
 
 ```text
 NAME       STATE    READY   REVISION   HOSTS
 my-model   parked   0/1     1          gpu-box
 ```
 
-Send a request for `my-model` ([Make a request](requests.md)). mllm wakes the
+Send a request for `my-model` ([Make a request](requests.md)). capyctl wakes the
 model and answers; the first answer takes longer. Afterwards:
 
 ```text
@@ -47,12 +47,12 @@ my-model   ready   1/1     1          gpu-box
 
 ## Switch between models
 
-When a model needs memory that another one holds, mllm parks the idle one.
+When a model needs memory that another one holds, capyctl parks the idle one.
 Starting a second model with `--evict` allows that and names what it parked:
 
 ```bash
-mllm deploy model --file other-model.yaml
-mllm start deployment other-model --evict --wait
+capyctl deploy model --file other-model.yaml
+capyctl start deployment other-model --evict --wait
 ```
 
 `--wait` waits for the checkpoint measurement, then for the model to be ready.
@@ -64,7 +64,7 @@ After the start succeeds, check the states. When there is room to keep the first
 model parked, the result looks like this:
 
 ```bash
-mllm list deployments
+capyctl list deployments
 ```
 
 ```text
@@ -75,7 +75,7 @@ other-model   ready    1/1     1          gpu-box
 
 Without `--evict`, a start never parks anything; it waits for memory instead.
 
-A request switches the same way. Ask for `my-model` now and mllm parks
+A request switches the same way. Ask for `my-model` now and capyctl parks
 `other-model`, wakes `my-model` and answers:
 
 ```text
@@ -84,8 +84,8 @@ my-model      ready    1/1     1          gpu-box
 other-model   parked   0/1     1          gpu-box
 ```
 
-mllm waits for requests in progress to finish before it parks a model; it
-never cuts an answer off. When there is no room to keep a parked copy, mllm
+capyctl waits for requests in progress to finish before it parks a model; it
+never cuts an answer off. When there is no room to keep a parked copy, capyctl
 stops the idle model instead and says so:
 `released: stopped (no room to park)`.
 
@@ -98,5 +98,5 @@ stops the idle model instead and says so:
 | A request | wakes it | wakes it | starts it after a pressure stop; refused after an operator stop |
 | Back to ready | seconds | a reload from disk | a full start |
 
-`mllm stop deployment other-model` stops it; `mllm start deployment other-model --wait`
+`capyctl stop deployment other-model` stops it; `capyctl start deployment other-model --wait`
 starts it again.

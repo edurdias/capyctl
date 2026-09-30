@@ -32,7 +32,7 @@ M38_EMPTY_DIR=""
 deploy_as() { local tag=$1; shift; FIXTURE_VARIANT=$tag deploy "$@"; }
 
 empty_dir_create() { # empty_dir_create <host>
-  M38_EMPTY_DIR=$MODELS_ROOT/mllm-matrix-empty-$RUN
+  M38_EMPTY_DIR=$MODELS_ROOT/capyctl-matrix-empty-$RUN
   rsh "$1" "mkdir -p -m 700 $M38_EMPTY_DIR && [ -z \"\$(ls -A $M38_EMPTY_DIR)\" ] && ls -lad $M38_EMPTY_DIR"
 }
 
@@ -62,7 +62,7 @@ row_main() {
   # L6
   step empty-dir empty_dir_create "$host" || return 1
   step variant-empty variant "$fix" empty --document-json \
-    "{\"model\": {\"source\": {\"type\": \"local\", \"path\": \"$M38_EMPTY_DIR\"}, \"content_fingerprint\": \"sha256:mllm-matrix-empty\"}}" || rc=1
+    "{\"model\": {\"source\": {\"type\": \"local\", \"path\": \"$M38_EMPTY_DIR\"}, \"content_fingerprint\": \"sha256:capyctl-matrix-empty\"}}" || rc=1
   failure_shape "$fix" empty "$host" || rc=1
   step empty-dir-remove empty_dir_remove "$host" || rc=1
 

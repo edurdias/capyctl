@@ -14,9 +14,9 @@ claims never substitute. Filled during execution (F1 design §8 sequence).
 | Python | 3.12.14 (uv-managed, headers included) | venv capture |
 | PyTorch | 2.13.0+cu130 | venv import |
 | vLLM | **0.29.0** (pinned) | `vllm --version` |
-| venv path | `$HOME/mllm-vllm-venv2` (uv-managed; system python lacks dev headers and `/opt` is root-owned — recorded deviations) | |
+| venv path | `$HOME/capyctl-vllm-venv2` (uv-managed; system python lacks dev headers and `/opt` is root-owned — recorded deviations) | |
 | Checkpoint | `~/models/qwen3-4b-instruct` (Qwen/Qwen3-4B-Instruct-2507, BF16) | §2 |
-| mllm binary | `~/mllm/target/release/mllm`, cargo 1.98.1 aarch64 release build | |
+| capyctl binary | `~/capyctl/target/release/capyctl`, cargo 1.98.1 aarch64 release build | |
 
 Install deviations (owner-visible, no silent decisions): `/opt` is root-owned and sudo
 requires a password; the venv lives in the user's home. The system Python lacks
@@ -45,13 +45,13 @@ sizing and fail-fast diagnostics remain required F2 work.
 
 ## 3. Restart-only qualification — **PASSED live** (2026-09-12)
 
-Executed via `~/mllm-qual/live-run.sh` → `cargo test --release -p mllm-cli --test
-live_spark live_restart_only` (evidence: this file + `~/mllm-qual/live-out.log`
+Executed via `~/capyctl-qual/live-run.sh` → `cargo test --release -p capyctl-cli --test
+live_spark live_restart_only` (evidence: this file + `~/capyctl-qual/live-out.log`
 on the host):
 
 - **Cold init to READY: 62.7s** (deploy → spawn → weight load → API server up →
-  mllm readiness via `/v1/models` serving the route id — liveness ≠ readiness).
-- **Real inference through mllm**: chat completion returned the model's tokens
+  capyctl readiness via `/v1/models` serving the route id — liveness ≠ readiness).
+- **Real inference through capyctl**: chat completion returned the model's tokens
   (response "live") through the wired forwarder (controller → adapter → engine
   SSE; router dispatch exercised at simulator tier).
 - **Stop: engine process group terminated** (verified via `/proc/<pid>` gone);
@@ -78,19 +78,19 @@ See [the matched measurements and limits](deep-wake-optimization.md).
 routed inference after every reload, stock switching, default denial, and
 ambiguous-park injection.**
 
-Commands ran in `~/mllm` with `MLLM_LIVE=1`, `MLLM_PORT=8150`,
-`MLLM_VLLM_BIN=~/mllm-vllm-venv2/bin/vllm`,
-`MLLM_ENGINE_PATH=~/mllm-vllm-venv2/bin`,
-`MLLM_MODEL_PATH=~/models/qwen3-4b-instruct`, and
-`MLLM_MODEL_ID=qwen3-4b-instruct` (tilde paths expanded by the launching shell).
-Each command used `cargo test --release -p mllm-cli --test live_spark <test>
+Commands ran in `~/capyctl` with `CAPYCTL_LIVE=1`, `CAPYCTL_PORT=8150`,
+`CAPYCTL_VLLM_BIN=~/capyctl-vllm-venv2/bin/vllm`,
+`CAPYCTL_ENGINE_PATH=~/capyctl-vllm-venv2/bin`,
+`CAPYCTL_MODEL_PATH=~/models/qwen3-4b-instruct`, and
+`CAPYCTL_MODEL_ID=qwen3-4b-instruct` (tilde paths expanded by the launching shell).
+Each command used `cargo test --release -p capyctl-cli --test live_spark <test>
 -- --nocapture`. Run these named checks separately, confirming the previous
 engine exited before the next check: the recipe uses one engine port.
 
 | Stage | Host / test | Captured result |
 |---|---|---|
 | A→B→A, stock profile | host-b / `live_switch_restart_only` | PASS, 234.24s; A generation 2→4, B generation 2; A stopped before B launch |
-| Level-2 park→wake ×3 | host-a / `live_park_reload` | PASS, 212.28s; each reload followed by authenticated HTTP inference through mllm returning `live`; stale-generation dispatch rejected |
+| Level-2 park→wake ×3 | host-a / `live_park_reload` | PASS, 212.28s; each reload followed by authenticated HTTP inference through capyctl returning `live`; stale-generation dispatch rejected |
 | T21 default denial | host-a / `live_default_denies_sleep_profile` | PASS, 0.06s; `policy_denied`, no engine PID |
 | T20 lost acknowledgement | host-b / `live_ambiguous_park_reconciles` | PASS, 63.95s (final harness); real `/sleep` succeeded, downstream ack dropped, engine confirmed sleeping, one request/park operation, uncertainty recorded, final state Failed |
 
@@ -104,7 +104,7 @@ Corrections established against the installed vLLM 0.29.0:
 
 - `entrypoints/launchers/api_server/routers.py:34` registers development routers
   only with `VLLM_SERVER_DEV_MODE=1`; `--enable-sleep-mode` alone returned 404.
-  mllm now sets the environment explicitly to 1 under the opt-in, 0 otherwise.
+  capyctl now sets the environment explicitly to 1 under the opt-in, 0 otherwise.
 - `/collective_rpc` requires `{"method":"reload_weights"}`; the empty request
   returned 400. A successful wake allocation alone does not restore weights.
 - The original 30s control timeout expired during a measured 46.14s reload.
@@ -120,15 +120,15 @@ Corrections established against the installed vLLM 0.29.0:
 
 Machine-local evidence (OS-managed `/tmp` state is not permanent):
 
-- host-a final: `~/mllm-qual/park-router-green.log`,
+- host-a final: `~/capyctl-qual/park-router-green.log`,
   `<temporary-directory>/engine.log.*`; routed red:
-  `~/mllm-qual/park-router-red.log`, `<temporary-directory>/engine.log.*`.
-  Intermediate: `~/mllm-qual/park-reload-fix-2.log`,
+  `~/capyctl-qual/park-router-red.log`, `<temporary-directory>/engine.log.*`.
+  Intermediate: `~/capyctl-qual/park-reload-fix-2.log`,
   `<temporary-directory>/engine.log.*`; failed short-timeout run:
-  `~/mllm-qual/park-reload-fix.log`, `<temporary-directory>/engine.log.*`.
-- host-b: `~/mllm-qual/switch-fix.log`, `<temporary-directory>/engine.log.*`;
-  `~/mllm-qual/ambiguous-park-final.log`, `<temporary-directory>/server/`.
-  Earlier injection: `~/mllm-qual/ambiguous-park.log`,
+  `~/capyctl-qual/park-reload-fix.log`, `<temporary-directory>/engine.log.*`.
+- host-b: `~/capyctl-qual/switch-fix.log`, `<temporary-directory>/engine.log.*`;
+  `~/capyctl-qual/ambiguous-park-final.log`, `<temporary-directory>/server/`.
+  Earlier injection: `~/capyctl-qual/ambiguous-park.log`,
   `<temporary-directory>/server/srv.sqlite3` (read-only query confirmed journal
   states `reconciling` then `failed` for the uncertain park).
 
@@ -144,7 +144,7 @@ automatic production recovery from Failed.
 | Claim | Tier | Evidence |
 |---|---|---|
 | deploy → READY cycle (cold + warm) | live (host) | this file §3; test `live_restart_only_qualification` PASSED |
-| real inference through mllm | live (host) | chat response recorded above |
+| real inference through capyctl | live (host) | chat response recorded above |
 | engine stop → process group terminated | live (host) | `/proc/<pid>` verified gone |
 | switching A→B→A live | live (host-b) | §4; `live_switch_restart_only` PASSED |
 | park/reload cycles (core feature) live | live (host-a) | §4; three cycles with authenticated routed inference PASSED |

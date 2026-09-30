@@ -16,7 +16,7 @@
 #      Ready and answer; stop with verified cleanup; deleted.
 #   e  the host is returned to its tmux role and full document.
 
-eng_remote() { # eng_remote <host> <engine args...>: run `mllm engine` on the host
+eng_remote() { # eng_remote <host> <engine args...>: run `capyctl engine` on the host
   local host=$1
   shift
   rsh "$host" "$(rbin "$host") engine $* --config $RRD/host.yaml"

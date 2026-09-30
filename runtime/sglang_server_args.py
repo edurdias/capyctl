@@ -1,7 +1,7 @@
 """Pure ServerArgs mapping for SGLang 94602c9c2b7cbdb8efd5c52802dac6a1c180089e.
 
 ADR 0014 §2, §3, §4, §6: a deployment's typed engine settings and its extra
-arguments flow into ServerArgs; only the settings mllm owns (the reserved
+arguments flow into ServerArgs; only the settings capyctl owns (the reserved
 subset) are fixed, and they are checked again after SGLang's own resolution.
 
 No SGLang imports, device access, or launch authority live here. In particular,
@@ -66,7 +66,7 @@ class ObservedPlacement:
         return "ObservedPlacement(<local observation>)"
 
 
-# ADR 0014 §3: the ServerArgs fields mllm owns, with the constant value each
+# ADR 0014 §3: the ServerArgs fields capyctl owns, with the constant value each
 # takes. Fields rendered from the binding, grant or residency are added in
 # construct_server_args. Names were read from the installed 0.5.20 tree
 # (arg_groups/fields/*.py). A reserved name missing from the resolved record
@@ -76,7 +76,7 @@ _RESERVED_CONSTANT = {
     "tp_size": 1, "dp_size": 1, "pp_size": 1, "ep_size": 1,
     "dcp_size": 1, "attn_cp_size": 1, "moe_dp_size": 1,
     "nnodes": 1, "node_rank": 0, "dist_init_addr": None, "use_ray": False,
-    # SPEC §8.2 / T21: the rendezvous is mllm's file store
+    # SPEC §8.2 / T21: the rendezvous is capyctl's file store
     # (loopback_rendezvous.py); no TCP rendezvous port is chosen or bound.
     "nccl_port": None,
     "enable_dp_attention": False, "cpu_offload_gb": 0,
@@ -121,7 +121,7 @@ _TYPED_DESTINATIONS = frozenset({
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, "config"})
-# ADR 0014 §4: mllm safe defaults the deployment may override with extra args.
+# ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
 
@@ -182,7 +182,7 @@ def available_memory_bytes(meminfo="/proc/meminfo"):
     get_available_gpu_memory reads psutil's system `available`, which is
     /proc/meminfo MemAvailable. This is read before the engine starts, so a
     later release by another engine can raise SGLang's own reading; the
-    resolved fraction is still the one mllm rendered. A discrete device sizes
+    resolved fraction is still the one capyctl rendered. A discrete device sizes
     against its own total instead (`available_bytes_for`).
     """
     try:
@@ -365,7 +365,7 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         available_bytes_for(settings["memory"]) if available_bytes is None
         else available_bytes)
     reserved = dict(_RESERVED_CONSTANT)
-    if os.environ.get("MLLM_DEBUG_ENGINE_LOGS") == "1":
+    if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") == "1":
         reserved.update(log_level="debug", log_level_http="debug")
     reserved.update(model_path=spec._checkpoint_root, tokenizer_path=spec._checkpoint_root,
                     served_model_name=public["served_name"],

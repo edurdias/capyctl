@@ -1,6 +1,6 @@
 """Protected vLLM startup boundary (ADR 0014 §6, owner decision Q11).
 
-mllm launches `python vllm_entry.py serve <model> <reserved> --mllm-user-args
+capyctl launches `python vllm_entry.py serve <model> <reserved> --capyctl-user-args
 <typed, host-fixed and extra arguments>`. This entry:
 
 1. refuses, before any engine import, user tokens that could load a
@@ -17,7 +17,7 @@ mllm launches `python vllm_entry.py serve <model> <reserved> --mllm-user-args
    checked, so nothing is parsed twice with different rules.
 
 The guard middleware and development-mode environment are unchanged (ADR 0012):
-mllm renders `--middleware mllm_vllm_guard.RequireEngineKey` in the reserved
+capyctl renders `--middleware capyctl_vllm_guard.RequireEngineKey` in the reserved
 block whenever sleep mode is on, and the key rides `VLLM_API_KEY`.
 
 Engine multiprocessing may re-import this file as `__mp_main__`; the module
@@ -28,13 +28,13 @@ that a vLLM build serves a model.
 import os
 import sys
 
-MARKER = "--mllm-user-args"
+MARKER = "--capyctl-user-args"
 # ADR 0014 §8, SPEC §8.2: the deployment's own extra arguments follow this
 # second marker (typed and host-fixed arguments precede it), so the entry can
 # gate exactly the destinations they set, as vLLM's parser resolved them.
-EXTRA_MARKER = "--mllm-extra-args"
+EXTRA_MARKER = "--capyctl-extra-args"
 
-# ADR 0014 §3: vLLM 0.29.0 parser destinations mllm owns. Names were read from
+# ADR 0014 §3: vLLM 0.29.0 parser destinations capyctl owns. Names were read from
 # the installed build (vllm/engine/arg_utils.py, vllm/entrypoints/launchers/
 # cli_args.py). `--device`, `--swap-space` and `--disable-log-requests` no
 # longer exist in 0.29.0; the parser itself refuses them as unknown.
@@ -58,7 +58,7 @@ TYPED = ("dtype", "quantization", "kv_cache_dtype", "max_model_len", "max_num_se
          "max_num_batched_tokens")
 # Whole families, matched on every destination the parser defines.
 RESERVED_FAMILIES = ("ssl_", "data_parallel_")
-# ADR 0014 §4: reserved only while sleep mode is on (mllm renders `eager`).
+# ADR 0014 §4: reserved only while sleep mode is on (capyctl renders `eager`).
 SLEEP_RESERVED = ("safetensors_load_strategy",)
 
 _CODES = frozenset({"invalid_launch_arguments", "config_file_refused",
@@ -124,7 +124,7 @@ def check_user_tokens(user):
         if not token.startswith("-") or token == "-":
             continue
         name = _option_name(token)
-        if name.startswith("--mllm-"):
+        if name.startswith("--capyctl-"):
             raise LaunchError("invalid_launch_arguments")
         if len(name) > 2 and "--config".startswith(name) or name == "--config":
             raise LaunchError("config_file_refused")
@@ -151,7 +151,7 @@ def reserved_destinations(namespace, sleep_mode):
 
 
 def check_reserved(expected, actual):
-    """Every reserved destination keeps the value mllm rendered, exactly."""
+    """Every reserved destination keeps the value capyctl rendered, exactly."""
     sleep_mode = getattr(expected, "enable_sleep_mode", None)
     if type(sleep_mode) is not bool:
         raise LaunchError("effective_args_mismatch")
@@ -221,7 +221,7 @@ def resolve(argv, parser, approvals=None):
 def check_plugins(entry_points=None):
     """ADR 0012 / T21: refuse any installed vLLM plugin that is not vLLM's own.
 
-    Plugins run code when vLLM imports them. mllm also pins VLLM_PLUGINS to the
+    Plugins run code when vLLM imports them. capyctl also pins VLLM_PLUGINS to the
     empty list so none loads; an installation carrying a foreign one is refused
     before any engine import rather than trusted to that pin alone.
     """

@@ -16,4 +16,4 @@ results, include the engine/model versions, hardware, configuration and scope.
 - [ ] Spec-driven behavior cites its requirement; acceptance tests carry their T-ID where applicable.
 - [ ] Shared examples and evidence contain no secrets, private data or machine identifiers.
 
-See [CONTRIBUTING.md](https://github.com/edurdias/mllm/blob/main/CONTRIBUTING.md) for verification commands and contribution terms.
+See [CONTRIBUTING.md](https://github.com/edurdias/capyctl/blob/main/CONTRIBUTING.md) for verification commands and contribution terms.

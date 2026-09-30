@@ -2,19 +2,19 @@
    the landing page and Starlight. Hex only: tests/contrast.test.mjs parses it. */
 :root,
 ::backdrop {
-  --mllm-bg: #1c1917;
-  --mllm-surface: #292524;
-  --mllm-text: #e7e5e4;
-  --mllm-muted: #a8a29e;
-  --mllm-rule: #44403c;
-  --mllm-accent: #fb923c;
-  --mllm-accent-text: #fb923c;
-  --mllm-button-bg: #fb923c;
-  --mllm-button-text: #0c0a09;
-  --mllm-code-bg: #0c0a09;
-  --mllm-code-text: #e7e5e4;
-  --mllm-code-muted: #a8a29e;
-  --mllm-code-accent: #fb923c;
+  --capyctl-bg: #1c1917;
+  --capyctl-surface: #292524;
+  --capyctl-text: #e7e5e4;
+  --capyctl-muted: #a8a29e;
+  --capyctl-rule: #44403c;
+  --capyctl-accent: #fb923c;
+  --capyctl-accent-text: #fb923c;
+  --capyctl-button-bg: #fb923c;
+  --capyctl-button-text: #0c0a09;
+  --capyctl-code-bg: #0c0a09;
+  --capyctl-code-text: #e7e5e4;
+  --capyctl-code-muted: #a8a29e;
+  --capyctl-code-accent: #fb923c;
 
   --sl-color-white: #fafaf9;
   --sl-color-gray-1: #e7e5e4;
@@ -31,21 +31,21 @@
 
 :root[data-theme='light'],
 [data-theme='light'] ::backdrop {
-  --mllm-bg: #fafaf9;
-  --mllm-surface: #f5f5f4;
-  --mllm-text: #1c1917;
-  --mllm-muted: #57534e;
-  --mllm-rule: #e7e5e4;
+  --capyctl-bg: #fafaf9;
+  --capyctl-surface: #f5f5f4;
+  --capyctl-text: #1c1917;
+  --capyctl-muted: #57534e;
+  --capyctl-rule: #e7e5e4;
   /* orange 600 for fills and rules; orange 700 where the accent is text,
      because orange 600 on stone 50 is 3.4:1, under WCAG AA for text. */
-  --mllm-accent: #ea580c;
-  --mllm-accent-text: #c2410c;
-  --mllm-button-bg: #c2410c;
-  --mllm-button-text: #ffffff;
-  --mllm-code-bg: #1c1917;
-  --mllm-code-text: #e7e5e4;
-  --mllm-code-muted: #a8a29e;
-  --mllm-code-accent: #fb923c;
+  --capyctl-accent: #ea580c;
+  --capyctl-accent-text: #c2410c;
+  --capyctl-button-bg: #c2410c;
+  --capyctl-button-text: #ffffff;
+  --capyctl-code-bg: #1c1917;
+  --capyctl-code-text: #e7e5e4;
+  --capyctl-code-muted: #a8a29e;
+  --capyctl-code-accent: #fb923c;
 
   --sl-color-white: #1c1917;
   --sl-color-gray-1: #292524;
@@ -64,21 +64,21 @@
 /* Without JavaScript no data-theme is set: follow the system setting. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
-    --mllm-bg: #fafaf9;
-    --mllm-surface: #f5f5f4;
-    --mllm-text: #1c1917;
-    --mllm-muted: #57534e;
-    --mllm-rule: #e7e5e4;
+    --capyctl-bg: #fafaf9;
+    --capyctl-surface: #f5f5f4;
+    --capyctl-text: #1c1917;
+    --capyctl-muted: #57534e;
+    --capyctl-rule: #e7e5e4;
     /* orange 600 for fills and rules; orange 700 where the accent is text,
        because orange 600 on stone 50 is 3.4:1, under WCAG AA for text. */
-    --mllm-accent: #ea580c;
-    --mllm-accent-text: #c2410c;
-    --mllm-button-bg: #c2410c;
-    --mllm-button-text: #ffffff;
-    --mllm-code-bg: #1c1917;
-    --mllm-code-text: #e7e5e4;
-    --mllm-code-muted: #a8a29e;
-    --mllm-code-accent: #fb923c;
+    --capyctl-accent: #ea580c;
+    --capyctl-accent-text: #c2410c;
+    --capyctl-button-bg: #c2410c;
+    --capyctl-button-text: #ffffff;
+    --capyctl-code-bg: #1c1917;
+    --capyctl-code-text: #e7e5e4;
+    --capyctl-code-muted: #a8a29e;
+    --capyctl-code-accent: #fb923c;
 
     --sl-color-white: #1c1917;
     --sl-color-gray-1: #292524;
@@ -97,10 +97,10 @@
 
 
 :root {
-  --mllm-font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --mllm-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-  --sl-font: var(--mllm-font-sans);
-  --sl-font-mono: var(--mllm-font-mono);
+  --capyctl-font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --capyctl-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --sl-font: var(--capyctl-font-sans);
+  --sl-font-mono: var(--capyctl-font-mono);
 }
 
 /* Inline diagrams on docs pages (docs/guide/*.svg): full column width, and

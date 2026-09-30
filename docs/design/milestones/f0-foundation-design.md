@@ -22,14 +22,14 @@ Six slices in build order; each leaves a coherent tested product.
 
 | Slice | Deliverable | Tests |
 |---|---|---|
-| S1 — Workspace + domain | Cargo workspace — all 11 crates of the full-picture layout: `mllm-domain`, `mllm-store`, `mllm-scheduler`, `mllm-protocol`, `mllm-controller`, `mllm-router`, `mllm-agent`, `mllm-adapters`, `mllm-launchers`, `mllm-config`, `mllm-cli` (later slices populate the empty crates); lifecycle state machine; identity types; stale-generation rejection | Transition-table property tests; generation rejection |
+| S1 — Workspace + domain | Cargo workspace — all 11 crates of the full-picture layout: `capyctl-domain`, `capyctl-store`, `capyctl-scheduler`, `capyctl-protocol`, `capyctl-controller`, `capyctl-router`, `capyctl-agent`, `capyctl-adapters`, `capyctl-launchers`, `capyctl-config`, `capyctl-cli` (later slices populate the empty crates); lifecycle state machine; identity types; stale-generation rejection | Transition-table property tests; generation rejection |
 | S2 — Config | Strict YAML schema v1; §15.2 no-config matrix; `init`/`validate config` | T02, T03, T04 |
 | S3 — Store | SQLite schema; transactional acceptance; migrations; idempotency keys | T08, T09 |
 | S4 — Ledger | Physical-domain accounting; exclusive pools; `auto` resolution; admission blocking | T26, T27, and a sub-limit block scenario (retained host-KV owners exceeding `host_kv_limit`) |
 | S5 — Contracts + fake engine | Adapter/launcher/agent traits; fake-engine harness | Fake-engine scenario suite |
 | S6 — CLI + proto freeze | Full action-first parser; role startup wiring; frozen proto v1 with a wire-level round-trip (AgentControl stream plus report/replay against the fake engine over a real in-process gRPC channel) | T01 plus the round-trip scenario |
 
-## 3. Domain model (`mllm-domain`)
+## 3. Domain model (`capyctl-domain`)
 
 ### 3.1 Identities
 
@@ -64,7 +64,7 @@ Desired state and observed state are distinct values. A stopped-but-enabled (on-
 deployment and a suspended deployment are distinct conditions (SPEC §2). Operations record
 attempted transitions; observations record reported engine/agent state.
 
-## 4. Durable store (`mllm-store`)
+## 4. Durable store (`capyctl-store`)
 
 Embedded transactional SQLite per ADR 0002.
 
@@ -114,7 +114,7 @@ Store files, WAL/journal sidecars, and generated state directories are created o
 (0700 directories, 0600 files), matching the config creation posture; a permissions test
 runs alongside T04.
 
-## 5. Resource ledger (`mllm-scheduler`)
+## 5. Resource ledger (`capyctl-scheduler`)
 
 ### 5.1 Domains and charging
 
@@ -174,11 +174,11 @@ resolution timestamp). Resolution happens per admission; numeric default changes
 apply retroactively to pinned deployments (T39). Device domains (`device_memory`) are
 never auto-resolved — omission is not unlimited VRAM (SPEC §16 note).
 
-## 6. Configuration (`mllm-config`)
+## 6. Configuration (`capyctl-config`)
 
 Schema v1 for kinds `server`, `host`, `deployment`, `standalone` with the field set of the
 SPEC §16 sketches (any renaming documented in the schema fixture tests). Validation
-rejects unknown mllm fields, duplicate mapping keys, invalid units, unsatisfied required
+rejects unknown capyctl fields, duplicate mapping keys, invalid units, unsatisfied required
 fields, unsupported role/adapter combinations, conflicting reserved arguments, invalid
 cache references, and contradictory standalone/remote connections (SPEC §15.3).
 
@@ -195,10 +195,10 @@ No-config behavior matrix (SPEC §15.2):
 | Existing identity missing/mismatched | Fail for recovery; never overwrite trust |
 
 Creation is atomic (temp file + rename) and owner-protected; concurrent starts cannot
-clobber (T04). `mllm init server|host` and `validate config --file` are implemented in
+clobber (T04). `capyctl init server|host` and `validate config --file` are implemented in
 F0. Secrets use file references; never logged.
 
-## 7. CLI (`mllm-cli`)
+## 7. CLI (`capyctl-cli`)
 
 Full SPEC §14 grammar parsed and dispatched. In F0, `start server|host|standalone` runs
 against embedded contracts: standalone uses in-process calls (SPEC §3.2); `start host`
@@ -225,9 +225,9 @@ json` for machine mode; structured error codes; stable exit codes:
 
 List/status commands never activate models as a side effect (T01, T08).
 
-## 8. Transport contract freeze (`mllm-protocol`)
+## 8. Transport contract freeze (`capyctl-protocol`)
 
-Package `mllm.management.v1`. Full skeleton with frozen field numbers is in
+Package `capyctl.management.v1`. Full skeleton with frozen field numbers is in
 [Appendix A](#appendix-a--frozen-proto-skeleton). Services:
 
 - `Bootstrap`: server-authenticated invitation enrollment exchange (exercised in F3;
@@ -251,7 +251,7 @@ condition (`clock_skew_exceeded`) carried in `ReportOperationResult` — never s
 rejection. The F0 harness exercises both directions (agent clock ahead/behind) so the
 tolerance path is tested before the field freeze ships.
 
-## 9. Fake engine and contracts (`mllm-adapters`, `tests/harness`)
+## 9. Fake engine and contracts (`capyctl-adapters`, `tests/harness`)
 
 Adapter trait = SPEC §8.3 operation set: `inspect`, `render_plan`, `check_readiness`,
 `prepare_park`, `park`, `restore`, `reload_weights`, `observe_work`, `cancel_work`.
@@ -299,7 +299,7 @@ State, allocation, idempotency, and bootstrap/default tests pass without GPUs (S
 T01–T04, T08, T09, T26, T27 green; fake-engine scenario suite green; proto compiles,
 is version-checked, and passes a wire-level AgentControl round-trip over a real gRPC
 channel against the fake engine — the freeze is declared only after stream evidence, so
-F3 adds no compatibility shims; `mllm start standalone` boots an embedded server + host
+F3 adds no compatibility shims; `capyctl start standalone` boots an embedded server + host
 against the store with a fake engine deployment completing the full lifecycle STOPPED →
 STARTING → READY → DRAINING → PARKING → PARKED → WAKING → READY and STOPPED.
 
@@ -307,7 +307,7 @@ STARTING → READY → DRAINING → PARKING → PARKED → WAKING → READY and 
 
 ```protobuf
 syntax = "proto3";
-package mllm.management.v1;
+package capyctl.management.v1;
 
 // Common envelope for every command and report.
 message Envelope {

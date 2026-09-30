@@ -1,10 +1,10 @@
-# Installing and operating mllm as a service
+# Installing and operating capyctl as a service
 
 This guide covers installing a release with `install.sh`, running each role
-under systemd, upgrading, and rolling back. mllm is one executable per OS and
+under systemd, upgrading, and rolling back. capyctl is one executable per OS and
 architecture; each role runs in the foreground under a service manager.
 
-Every setting mllm reads, with its YAML field, flag and environment variable,
+Every setting capyctl reads, with its YAML field, flag and environment variable,
 is listed in the [settings reference](configuration.md).
 
 ## Restart is not drain
@@ -13,13 +13,13 @@ Read this before anything else.
 
 | Action | What happens to engines | Deployments |
 |---|---|---|
-| `systemctl stop` / `restart` of `mllm-host` or `mllm-standalone` | Keep running in their own process groups; the next start re-attaches them. | Kept. |
-| `systemctl stop` / `restart` of `mllm-server` | Keep running on their hosts; the next start reconciles them. | Kept. |
+| `systemctl stop` / `restart` of `capyctl-host` or `capyctl-standalone` | Keep running in their own process groups; the next start re-attaches them. | Kept. |
+| `systemctl stop` / `restart` of `capyctl-server` | Keep running on their hosts; the next start reconciles them. | Kept. |
 | Host crash, `Restart=on-failure` restart | Keep running; re-attached. | Kept. |
-| `mllm drain host <name>` (server running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
-| `mllm drain standalone` (standalone running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
-| `mllm delete deployment <id> --stop` | That deployment's engines stopped. | Deleted. |
-| `mllm revoke host <name>` (the host role exits with code 14, not restarted) | Keep running, owned and charged; dispatch to them is closed. `join host --recover` re-proves them. | Kept. |
+| `capyctl drain host <name>` (server running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
+| `capyctl drain standalone` (standalone running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
+| `capyctl delete deployment <id> --stop` | That deployment's engines stopped. | Deleted. |
+| `capyctl revoke host <name>` (the host role exits with code 14, not restarted) | Keep running, owned and charged; dispatch to them is closed. `join host --recover` re-proves them. | Kept. |
 
 A signal (SIGTERM, SIGINT) to any role closes admission, lets admitted
 requests finish within the role document's `shutdown.drain_timeout` (30 s by
@@ -32,16 +32,16 @@ first, then stop the unit:
 
 ```bash
 # Remote host: from the server, as the service user.
-sudo -u mllm mllm drain host gpu-box
-sudo systemctl stop mllm-host           # on gpu-box
+sudo -u capyctl capyctl drain host gpu-box
+sudo systemctl stop capyctl-host           # on gpu-box
 
 # Standalone.
-sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone \
-  mllm drain standalone
-sudo systemctl stop mllm-standalone
+sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone \
+  capyctl drain standalone
+sudo systemctl stop capyctl-standalone
 ```
 
-`mllm drain host` of an offline host returns at once with `stops: "pending"`;
+`capyctl drain host` of an offline host returns at once with `stops: "pending"`;
 the Stops complete when the host reconnects within the drain window, and
 `--wait` waits for them.
 
@@ -55,7 +55,7 @@ unit's cgroup. systemd's default `KillMode=control-group`, and `mixed`, signal
 every process in that cgroup on stop, which would kill every engine at each
 restart and turn an ordinary restart into an unaccounted termination.
 `KillMode=process` sends the stop signal, and the final SIGKILL if
-`TimeoutStopSec=` expires, to the mllm process only. systemd then logs that
+`TimeoutStopSec=` expires, to the capyctl process only. systemd then logs that
 processes remain in the stopped unit, which is expected. At system shutdown the
 remaining engines are terminated with everything else; the host reconciles on
 boot.
@@ -78,12 +78,12 @@ and teardown. Keep `TimeoutStopSec` at least `drain_timeout + 60s`. When a role
 document raises `shutdown.drain_timeout`, raise the unit's timeout with it:
 
 ```bash
-sudo systemctl edit mllm-host
+sudo systemctl edit capyctl-host
 # [Service]
 # TimeoutStopSec=11min        # for drain_timeout: "600s"
 ```
 
-If the timeout expires, systemd kills the mllm process only; engines survive,
+If the timeout expires, systemd kills the capyctl process only; engines survive,
 as with any other restart.
 
 ### Exit codes and restarts
@@ -95,35 +95,35 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 
 | Exit | Meaning | Units | What heals it |
 |---|---|---|---|
-| 2 | Invalid configuration | all | Fix the role document (`mllm validate config`). |
+| 2 | Invalid configuration | all | Fix the role document (`capyctl validate config`). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
 | 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
-| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
+| 5 | Unsupported, including state written by a newer capyctl (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
-| 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `mllm engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `mllm engine detect --path DIR`. |
+| 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `capyctl engine detect --path DIR`. |
 | 17 | The package is not a supported engine (`engine_unsupported`) | none | Register a vLLM or SGLang installation. |
 | 18 | The version check failed or timed out; nothing is written (`engine_version_failed`) | none | Repair the installation until its version check succeeds and matches its package metadata, then add it again. |
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
-| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
+| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `capyctl engine list`, then `capyctl engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
-| 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
-| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `mllm start deployment <name> --wait`, which waits for the stop to finish and then starts. |
+| 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `capyctl engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
+| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop to finish and then starts. |
 
-**A revoked host (14).** After `mllm revoke host <name|id>`, the controller
+**A revoked host (14).** After `capyctl revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its
 certificate is revoked. The host logs one line and exits with code 14 instead
 of retrying:
 
 ```
-error [host_revoked]: Host <host id> is revoked; its engines keep running. To recover the same identity, run `mllm invite host <host id> --recover --output FILE` on the server for a new recovery invitation, then `mllm join host --join-file FILE --recover` on this host, and start the host again
+error [host_revoked]: Host <host id> is revoked; its engines keep running. To recover the same identity, run `capyctl invite host <host id> --recover --output FILE` on the server for a new recovery invitation, then `capyctl join host --join-file FILE --recover` on this host, and start the host again
 ```
 
 Its engines are neither stopped nor signalled, and its state directory and
 journal are untouched. After `join host --recover` and
-`systemctl start mllm-host`, the host reconnects under the same host id and
+`systemctl start capyctl-host`, the host reconnects under the same host id and
 each engine is re-proven by a fresh probe, not relaunched. Only that exact,
 authenticated answer from the controller stops the host: an unreachable or
 restarting server, a version refusal and any other refusal keep it
@@ -137,17 +137,17 @@ Releases with `install.sh`. It carries these assets:
 
 | Asset | Holds |
 |---|---|
-| `mllm-<version>-linux-x86_64.tar.gz` | The x86-64 build. |
-| `mllm-<version>-linux-aarch64.tar.gz` | The ARM64 build. |
+| `capyctl-<version>-linux-x86_64.tar.gz` | The x86-64 build. |
+| `capyctl-<version>-linux-aarch64.tar.gz` | The ARM64 build. |
 | `install.sh` | The installer (POSIX `sh`). |
 | `SHA256SUMS` | SHA-256 of every tarball and of `install.sh`. |
 
 Each tarball holds one directory:
 
 ```text
-mllm-<version>-linux-<arch>/
-  bin/mllm                  stripped release binary: every role, the CLI and
-                            mllm's Python runtime helpers (embedded)
+capyctl-<version>-linux-<arch>/
+  bin/capyctl                  stripped release binary: every role, the CLI and
+                            capyctl's Python runtime helpers (embedded)
   packaging/systemd/system/ system units
   packaging/systemd/user/   user units
   docs/examples/            example role and deployment documents
@@ -157,9 +157,9 @@ mllm-<version>-linux-<arch>/
   SHA256SUMS                digest of every file in the directory
 ```
 
-There is no `runtime/` directory in the release. mllm's Python helpers (the
+There is no `runtime/` directory in the release. capyctl's Python helpers (the
 vLLM guard and entry, the SGLang entry and its modules, the capability
-probes) are compiled into `bin/mllm` with a manifest of their SHA-256 digests, and each role that launches engines writes
+probes) are compiled into `bin/capyctl` with a manifest of their SHA-256 digests, and each role that launches engines writes
 them to its own state directory; see "The managed runtime directory".
 
 Engines, engine Python environments, model weights and GPU drivers are not in
@@ -190,14 +190,14 @@ The project site serves the installer; each release also publishes a copy
 beside its tarballs. It downloads the release from GitHub with `curl`.
 
 ```bash
-# As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh
+# As yourself: ~/.local/bin/capyctl (add ~/.local/bin to PATH).
+curl -fsSL https://edurdias.github.io/capyctl/install.sh | sh
 
 # A named release, and a user unit for a role (installed, not enabled).
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version <version> --systemd standalone
+curl -fsSL https://edurdias.github.io/capyctl/install.sh | sh -s -- --version <version> --systemd standalone
 
-# For every user: /usr/local/bin/mllm and system units.
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sudo sh -s -- --system --version <version> --systemd host
+# For every user: /usr/local/bin/capyctl and system units.
+curl -fsSL https://edurdias.github.io/capyctl/install.sh | sudo sh -s -- --system --version <version> --systemd host
 ```
 
 A downloaded copy takes the same options: `sh install.sh --version <version>`.
@@ -210,7 +210,7 @@ installed only by naming it.
 **Private repository.** The public download needs no credential. While the
 repository is private, log in with `gh auth login` first, or export
 `GITHUB_TOKEN` with read access, and fetch the installer itself the same way
-(`gh release download <tag> -R <owner>/mllm -p install.sh`).
+(`gh release download <tag> -R <owner>/capyctl -p install.sh`).
 
 Without `--version` the latest published full release is installed; a draft
 or a pre-release is installed only by naming it. The installer:
@@ -219,22 +219,22 @@ or a pre-release is installed only by naming it. The installer:
 2. downloads the tarball and `SHA256SUMS` from the public download URL with
    `curl`; when `gh` is logged in it uses `gh release download`, and when
    `GITHUB_TOKEN` is set the GitHub API, which also work for a private
-   repository (`MLLM_INSTALL_BASE_URL` names a mirror directory, `https://` or
+   repository (`CAPYCTL_INSTALL_BASE_URL` names a mirror directory, `https://` or
    `file://`, instead);
 3. refuses to install unless the tarball's SHA-256 matches `SHA256SUMS`, every
    file in it matches the archive's own `SHA256SUMS`, and the binary reports
    the requested version;
-4. replaces `<prefix>/bin/mllm` atomically (a running role keeps its open
+4. replaces `<prefix>/bin/capyctl` atomically (a running role keeps its open
    executable) and keeps the units, examples and this guide under
-   `<prefix>/share/mllm/`;
+   `<prefix>/share/capyctl/`;
 5. with `--systemd <server|host|standalone>`, writes that role's unit to
    `~/.config/systemd/user/` (or `/etc/systemd/system/` with `--system`),
    pointed at the installed binary, and runs `systemctl daemon-reload`. It
    never enables or starts a unit, creates users or touches state, except
-   that a user unit gets an empty `~/.local/state/mllm` (0700) if there is
+   that a user unit gets an empty `~/.local/state/capyctl` (0700) if there is
    none (see "User services").
 
-`sh install.sh --uninstall [--system]` removes the binary, `<prefix>/share/mllm`
+`sh install.sh --uninstall [--system]` removes the binary, `<prefix>/share/capyctl`
 and the units the installer wrote. State directories are kept.
 
 To install from a downloaded tarball by hand instead:
@@ -242,37 +242,37 @@ To install from a downloaded tarball by hand instead:
 ```bash
 V=x.y.z; A=$(uname -m)   # the version you downloaded
 sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf mllm-$V-linux-$A.tar.gz
-(cd mllm-$V-linux-$A && sha256sum -c --quiet SHA256SUMS)
-sudo install -m 0755 mllm-$V-linux-$A/bin/mllm /usr/local/bin/mllm
+tar -xzf capyctl-$V-linux-$A.tar.gz
+(cd capyctl-$V-linux-$A && sha256sum -c --quiet SHA256SUMS)
+sudo install -m 0755 capyctl-$V-linux-$A/bin/capyctl /usr/local/bin/capyctl
 ```
 
 ## Layout
 
 | Path | Owner, mode | Holds |
 |---|---|---|
-| `/usr/local/bin/mllm` (`~/.local/bin/mllm`) | root (you), 0755 | The binary. |
-| `/usr/local/share/mllm/` (`~/.local/share/mllm/`) | root (you), 0755 | Units, examples, this guide, `BUILDINFO` of the installed release. |
-| `/etc/mllm/<role>.yaml` | root:mllm, 0640 | Role documents (operator configuration). |
-| `/etc/mllm/<role>.env` | root:mllm, 0640 | Optional environment for the unit. |
-| `/var/lib/mllm/` | `mllm:mllm`, 0700 | State root (`StateDirectory=`); holds `server/`, `host/`, `standalone/`, `tmp/`. |
-| `/var/lib/mllm/host/runtime/` | `mllm:mllm`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/mllm/standalone/runtime/`). Written by mllm. |
-| model store (`/srv/models`) | readable by `mllm` | Checkpoints. Read-only to the host unit by default. |
+| `/usr/local/bin/capyctl` (`~/.local/bin/capyctl`) | root (you), 0755 | The binary. |
+| `/usr/local/share/capyctl/` (`~/.local/share/capyctl/`) | root (you), 0755 | Units, examples, this guide, `BUILDINFO` of the installed release. |
+| `/etc/capyctl/<role>.yaml` | root:capyctl, 0640 | Role documents (operator configuration). |
+| `/etc/capyctl/<role>.env` | root:capyctl, 0640 | Optional environment for the unit. |
+| `/var/lib/capyctl/` | `capyctl:capyctl`, 0700 | State root (`StateDirectory=`); holds `server/`, `host/`, `standalone/`, `tmp/`. |
+| `/var/lib/capyctl/host/runtime/` | `capyctl:capyctl`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/capyctl/standalone/runtime/`). Written by capyctl. |
+| model store (`/srv/models`) | readable by `capyctl` | Checkpoints. Read-only to the host unit by default. |
 
 ### The managed runtime directory
 
-The engine imports mllm's own Python from the runtime directory, so a module
+The engine imports capyctl's own Python from the runtime directory, so a module
 another account can rewrite runs as the engine behind the controls it is meant
 to guard. The binary therefore writes that directory
 itself:
 
 - **Where.** A host whose document does not name `runtime_dir` uses
   `<state_dir>/runtime`. Standalone uses `<state root>/runtime` unless
-  `MLLM_RUNTIME_DIR` is set. The server launches no engine and has none.
-- **When.** `mllm init host` writes it; every `mllm start host` and
-  `mllm start standalone` checks it before anything can launch.
+  `CAPYCTL_RUNTIME_DIR` is set. The server launches no engine and has none.
+- **When.** `capyctl init host` writes it; every `capyctl start host` and
+  `capyctl start standalone` checks it before anything can launch.
 - **How.** A 0700 directory owned by the service user, each module 0600,
-  and a marker file `.mllm-managed-runtime` naming the embedded manifest. It
+  and a marker file `.capyctl-managed-runtime` naming the embedded manifest. It
   is built in a sibling directory and renamed into place, so a launch never
   sees a partial tree.
 - **Upgrade.** A binary with a different embedded manifest replaces the tree
@@ -282,9 +282,9 @@ itself:
   the manifest (an edited module, a `__pycache__`, a loosened mode, a deleted
   file) is restored from the embedded copy at start, with a warning naming
   what differed (never contents).
-- **Not mllm's.** A directory at that path without the marker is refused, not
+- **Not capyctl's.** A directory at that path without the marker is refused, not
   overwritten: remove it, or name it as `runtime_dir`. A directory named by
-  `runtime_dir` or `MLLM_RUNTIME_DIR` is never written; mllm only checks it.
+  `runtime_dir` or `CAPYCTL_RUNTIME_DIR` is never written; capyctl only checks it.
 
 Every launch still passes the integrity check: the directory, every subdirectory
 and every `.py` module owned by the service user, nothing writable by other,
@@ -302,8 +302,8 @@ the service user, mode 0700, and every ancestor of the identity directory must
 be owned by root or the service user with no group or other write at all
 (`init` otherwise fails with "Role identity refused:" and names the path
 and the check that failed, for example a parent other users can write, as
-anywhere under `/tmp`). mllm creates the directories
-itself; do not place `/var/lib/mllm` behind a symlink or under a
+anywhere under `/tmp`). capyctl creates the directories
+itself; do not place `/var/lib/capyctl` behind a symlink or under a
 group-writable directory.
 
 ## First installation (system service)
@@ -313,12 +313,12 @@ Run as root on each machine.
 ```bash
 # Service user with a private group; its home is the state root, so engine
 # caches under $HOME (triton, flashinfer, ...) land in private state.
-useradd --system --user-group --home-dir /var/lib/mllm --shell /usr/sbin/nologin mllm
-install -d -o mllm -g mllm -m 0700 /var/lib/mllm
+useradd --system --user-group --home-dir /var/lib/capyctl --shell /usr/sbin/nologin capyctl
+install -d -o capyctl -g capyctl -m 0700 /var/lib/capyctl
 
 # The binary and the role's unit (host shown; server and standalone alike).
 sh install.sh --system --version <version> --systemd host
-install -d -m 0750 -g mllm /etc/mllm
+install -d -m 0750 -g capyctl /etc/capyctl
 ```
 
 The service user also needs read access to the engine installations named in
@@ -330,20 +330,20 @@ inside the service; make sure the driver's device nodes exist at boot
 (for example with `nvidia-persistenced`).
 
 Services log one JSON object per line, because their output is not a
-terminal. Read them as they come with `journalctl -u mllm-host -o cat`, or
-pretty-printed with `journalctl -u mllm-host -o cat | jq`. For text in the
+terminal. Read them as they come with `journalctl -u capyctl-host -o cat`, or
+pretty-printed with `journalctl -u capyctl-host -o cat | jq`. For text in the
 journal, add `--format text` to `ExecStart=` in a drop-in.
 
 ### Server
 
 ```bash
-sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/server \
-  mllm init server --output /var/lib/mllm/server/config/server.yaml
-install -m 0640 -o root -g mllm /var/lib/mllm/server/config/server.yaml /etc/mllm/server.yaml
-# Edit /etc/mllm/server.yaml: bootstrap and control listeners, enrollment
+sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/server \
+  capyctl init server --output /var/lib/capyctl/server/config/server.yaml
+install -m 0640 -o root -g capyctl /var/lib/capyctl/server/config/server.yaml /etc/capyctl/server.yaml
+# Edit /etc/capyctl/server.yaml: bootstrap and control listeners, enrollment
 # addresses, shutdown.drain_timeout (see docs/examples/server.yaml).
-mllm validate config --file /etc/mllm/server.yaml
-systemctl enable --now mllm-server
+capyctl validate config --file /etc/capyctl/server.yaml
+systemctl enable --now capyctl-server
 ```
 
 `init` creates the server identity and credentials under the state directory
@@ -353,68 +353,68 @@ server records the document it was started with, and they use it (see
 [Which role a command uses](configuration.md#which-role-a-command-uses)):
 
 ```bash
-sudo -u mllm mllm list hosts
-sudo -u mllm mllm invite host gpu-box --output gpu-box.join
+sudo -u capyctl capyctl list hosts
+sudo -u capyctl capyctl invite host gpu-box --output gpu-box.join
 ```
 
 ### Host
 
 ```bash
-sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
-  mllm init host --output /var/lib/mllm/host/config/host.yaml
-install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
+sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/host \
+  capyctl init host --output /var/lib/capyctl/host/config/host.yaml
+install -m 0640 -o root -g capyctl /var/lib/capyctl/host/config/host.yaml /etc/capyctl/host.yaml
 # The generated document validates as written: its resource_policy is derived
 # from this machine's memory and GPUs as standalone derives its own, and models
 # live in ~/models of the service user (downloads in ~/models/sources) unless
 # model_store names another directory (see "Models and downloads").
-# Edit /etc/mllm/host.yaml for name, ingress (the address the server forwards
+# Edit /etc/capyctl/host.yaml for name, ingress (the address the server forwards
 # inference to) and, if you like, the limits (see docs/examples/host.yaml).
 # Leave runtime_dir out.
-mllm validate config --file /etc/mllm/host.yaml
+capyctl validate config --file /etc/capyctl/host.yaml
 
-# Enroll with an invitation created on the server (`mllm invite host`).
-sudo -u mllm mllm join host --join-file gpu-box.join --config /etc/mllm/host.yaml
-systemctl enable --now mllm-host
+# Enroll with an invitation created on the server (`capyctl invite host`).
+sudo -u capyctl capyctl join host --join-file gpu-box.join --config /etc/capyctl/host.yaml
+systemctl enable --now capyctl-host
 ```
 
 `init host` prints the managed `runtime_dir` it wrote
-(`/var/lib/mllm/host/runtime`). Name `runtime_dir` in the document only to run
+(`/var/lib/capyctl/host/runtime`). Name `runtime_dir` in the document only to run
 from a directory you maintain yourself.
 
 ### Standalone
 
-Without `--config`, `mllm start standalone` loads its role document from
-`<MLLM_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
+Without `--config`, `capyctl start standalone` loads its role document from
+`<CAPYCTL_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
 credentials) on first start, and writes the managed runtime to
-`<MLLM_STATE_DIR>/runtime`. Its engine installation comes from a flag, the
+`<CAPYCTL_STATE_DIR>/runtime`. Its engine installation comes from a flag, the
 environment or the document's `host.local_engine` (see the
 [settings reference](configuration.md#engine-installation)); with the
 packaged unit the environment is simplest. Put it in
-`/etc/mllm/standalone.env`:
+`/etc/capyctl/standalone.env`:
 
 ```bash
-# /etc/mllm/standalone.env (root:mllm 0640)
-MLLM_VLLM_BIN=/opt/vllm/bin/vllm
+# /etc/capyctl/standalone.env (root:capyctl 0640)
+CAPYCTL_VLLM_BIN=/opt/vllm/bin/vllm
 # Optional: models are in ~/models of the service user unless named here.
-MLLM_MODELS_ROOT=/srv/models
+CAPYCTL_MODELS_ROOT=/srv/models
 ```
 
 ```bash
-systemctl enable --now mllm-standalone
+systemctl enable --now capyctl-standalone
 ```
 
-The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone`. Operator commands must
-use the same state directory (and the same `MLLM_MANAGEMENT_ADDR`, if the unit
-moves the management listener with the variable rather than the document): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
-`MLLM_RUNTIME_DIR` (development) makes standalone run from that directory
+The unit sets `CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone`. Operator commands must
+use the same state directory (and the same `CAPYCTL_MANAGEMENT_ADDR`, if the unit
+moves the management listener with the variable rather than the document): `sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone capyctl status deployment <id>`.
+`CAPYCTL_RUNTIME_DIR` (development) makes standalone run from that directory
 instead of the managed one.
 
 #### Explicit standalone document
 
-`mllm start standalone --config <file>` uses `<file>` as the role document
+`capyctl start standalone --config <file>` uses `<file>` as the role document
 instead. A missing or invalid explicit file refuses the
 start with exit code 2; it is never replaced by the generated default, and
-nothing is written under `<MLLM_STATE_DIR>/config`. On a state root that has
+nothing is written under `<CAPYCTL_STATE_DIR>/config`. On a state root that has
 never served, the first start creates the protected credentials there, as a
 first implicit start would; a state root that has served and lost its
 credentials refuses instead.
@@ -423,46 +423,46 @@ Where each setting comes from, highest precedence first:
 
 | Setting | Source |
 |---|---|
-| Role document | `--config <file>`, else `$MLLM_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
-| Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_CONFIG_HOME/mllm/engines.yaml` (`~/.config/mllm/engines.yaml`). `mllm engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
-| State root | `--state-dir`, else `MLLM_STATE_DIR`, else the top-level `state_dir` of the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
-| Listener addresses | Inference: `--listen`, else `MLLM_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback only. |
-| Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `mllm engine add`. See the [settings reference](configuration.md#engine-installation). |
-| Models directory | `--models-root`, else `MLLM_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
-| Model downloads | `--model-sources` / `--model-sources-max`, else `MLLM_MODEL_SOURCES` / `MLLM_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
-| Any other setting of the document | `--set <path>=<value>`, else `MLLM_SET__<PATH>`, else the document, else its default. `mllm config show` prints every effective value and where it came from. See the [settings reference](configuration.md#any-setting-by-its-path). |
+| Role document | `--config <file>`, else `$CAPYCTL_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
+| Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$CAPYCTL_CONFIG`, else `$XDG_CONFIG_HOME/capyctl/engines.yaml` (`~/.config/capyctl/engines.yaml`). `capyctl engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
+| State root | `--state-dir`, else `CAPYCTL_STATE_DIR`, else the top-level `state_dir` of the document named by `--config` or `$CAPYCTL_CONFIG`, else `$XDG_STATE_HOME/capyctl`, else `~/.local/state/capyctl`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
+| Listener addresses | Inference: `--listen`, else `CAPYCTL_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `CAPYCTL_MANAGEMENT_ADDR` (`CAPYCTL_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback only. |
+| Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `CAPYCTL_VLLM_BIN` / `CAPYCTL_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `capyctl engine add`. See the [settings reference](configuration.md#engine-installation). |
+| Models directory | `--models-root`, else `CAPYCTL_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
+| Model downloads | `--model-sources` / `--model-sources-max`, else `CAPYCTL_MODEL_SOURCES` / `CAPYCTL_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
+| Any other setting of the document | `--set <path>=<value>`, else `CAPYCTL_SET__<PATH>`, else the document, else its default. `capyctl config show` prints every effective value and where it came from. See the [settings reference](configuration.md#any-setting-by-its-path). |
 | Drain bound, switching, observability | The role document in use. |
 
 The packaged units start standalone without `--config`, so an upgrade that
 reinstalls them never depends on a file the operator has not written. To keep
-the document under `/etc/mllm` instead, write it (a generated one is a good
+the document under `/etc/capyctl` instead, write it (a generated one is a good
 start), validate it, and override `ExecStart=` in a drop-in:
 
 ```bash
-install -m 0640 -o root -g mllm /var/lib/mllm/standalone/config/standalone.yaml /etc/mllm/standalone.yaml
-mllm validate config --file /etc/mllm/standalone.yaml
-systemctl edit mllm-standalone
+install -m 0640 -o root -g capyctl /var/lib/capyctl/standalone/config/standalone.yaml /etc/capyctl/standalone.yaml
+capyctl validate config --file /etc/capyctl/standalone.yaml
+systemctl edit capyctl-standalone
 #   [Service]
 #   ExecStart=
-#   ExecStart=mllm start standalone --config /etc/mllm/standalone.yaml
-systemctl restart mllm-standalone
+#   ExecStart=capyctl start standalone --config /etc/capyctl/standalone.yaml
+systemctl restart capyctl-standalone
 ```
 
 ### Models and downloads
 
 Standalone and enrolled hosts resolve the same two settings by the same rule,
-highest precedence first: the flag on `mllm start standalone` or
-`mllm start host`, then the environment, then the YAML document (the host
+highest precedence first: the flag on `capyctl start standalone` or
+`capyctl start host`, then the environment, then the YAML document (the host
 document, or the `host:` block of the standalone document), then the default.
 
 | Setting | Flag | Variable | YAML | Default |
 |---|---|---|---|---|
-| Models directory (relative model paths resolve here) | `--models-root <dir>` | `MLLM_MODELS_ROOT` | `model_store.path` | `~/models` |
-| Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `MLLM_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
-| Cap on all downloaded models | `--model-sources-max <size>` | `MLLM_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
-| Where downloads are kept | `--model-sources-path <dir>` | `MLLM_MODEL_SOURCES_PATH` | `model_sources.path` | the models directory (`~/models/sources`) |
-| Hugging Face endpoint | `--hf-endpoint <url>` | `MLLM_HF_ENDPOINT`, else `HF_ENDPOINT` | `model_sources.huggingface_endpoint` | `https://huggingface.co` |
-| Hugging Face token for a source that names none (never a flag) | | `MLLM_HF_TOKEN`, else `HF_TOKEN` | `model_sources.huggingface_token_file` | none |
+| Models directory (relative model paths resolve here) | `--models-root <dir>` | `CAPYCTL_MODELS_ROOT` | `model_store.path` | `~/models` |
+| Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `CAPYCTL_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
+| Cap on all downloaded models | `--model-sources-max <size>` | `CAPYCTL_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
+| Where downloads are kept | `--model-sources-path <dir>` | `CAPYCTL_MODEL_SOURCES_PATH` | `model_sources.path` | the models directory (`~/models/sources`) |
+| Hugging Face endpoint | `--hf-endpoint <url>` | `CAPYCTL_HF_ENDPOINT`, else `HF_ENDPOINT` | `model_sources.huggingface_endpoint` | `https://huggingface.co` |
+| Hugging Face token for a source that names none (never a flag) | | `CAPYCTL_HF_TOKEN`, else `HF_TOKEN` | `model_sources.huggingface_token_file` | none |
 
 A deployment that names a pinned Hugging Face revision or an HTTP URL with its
 SHA-256 is downloaded by the host it is placed on, into
@@ -471,41 +471,41 @@ SHA-256 is downloaded by the host it is placed on, into
 written the host reserves the download's full size against the cap and against
 the free space of the filesystem, keeping 1 GiB free; a download that does not
 fit is refused (`too_large` or `insufficient_space`, shown by
-`mllm status deployment`). A document that states `huggingface: disabled` (or
+`capyctl status deployment`). A document that states `huggingface: disabled` (or
 `denied`) keeps that kind off; `allowed_hosts` and `huggingface_endpoint` still
 narrow where downloads may come from. The role writes the values it resolved
 into the host document it publishes, so the server plans against exactly what
-the host enforces. `mllm prune sources --host-config <host.yaml>` reclaims
+the host enforces. `capyctl prune sources --host-config <host.yaml>` reclaims
 downloads no deployment references.
 
 ### User services
 
 `packaging/systemd/user/` holds the same three roles for the per-user manager,
 for a single operator account without a dedicated service user. They run
-`~/.local/bin/mllm`, read `~/.config/mllm/<role>.yaml` and `<role>.env`, and
+`~/.local/bin/capyctl`, read `~/.config/capyctl/<role>.yaml` and `<role>.env`, and
 keep state, including the managed runtime directory, under
-`~/.local/state/mllm`. The ancestor rules above apply: with a umask of 002,
+`~/.local/state/capyctl`. The ancestor rules above apply: with a umask of 002,
 `~/.local` and `~/.local/state` are created group-writable and must be fixed
 first (`chmod go-w ~ ~/.local ~/.local/state`). The standalone user unit
-leaves `MLLM_STATE_DIR` unset, so it and your shell both use
-`~/.local/state/mllm`.
+leaves `CAPYCTL_STATE_DIR` unset, so it and your shell both use
+`~/.local/state/capyctl`.
 
 ```bash
 sh install.sh --version <version> --systemd host
-systemctl --user enable --now mllm-host
+systemctl --user enable --now capyctl-host
 loginctl enable-linger "$USER"   # keep it running after logout
 ```
 
 The state root must exist as a real directory before the unit first starts.
-systemd 254 and later, finding `~/.local/state/mllm` missing while
-`~/.config/mllm` (where the units read `<role>.yaml` and `<role>.env`)
-exists, assumes its pre-254 layout and makes `~/.local/state/mllm` a symlink
-to `~/.config/mllm` ("creating compatibility symlink" in the journal). State
+systemd 254 and later, finding `~/.local/state/capyctl` missing while
+`~/.config/capyctl` (where the units read `<role>.yaml` and `<role>.env`)
+exists, assumes its pre-254 layout and makes `~/.local/state/capyctl` a symlink
+to `~/.config/capyctl` ("creating compatibility symlink" in the journal). State
 would then land in the configuration directory, behind a symlink the roles'
 identity rules refuse. `install.sh --systemd <role>` creates the empty
 directory for you and warns if the link already exists; to repair a link,
-stop the unit, `rm ~/.local/state/mllm` (the link only), move anything mllm
-wrote under `~/.config/mllm` back out, and reinstall. Observed with systemd
+stop the unit, `rm ~/.local/state/capyctl` (the link only), move anything capyctl
+wrote under `~/.config/capyctl` back out, and reinstall. Observed with systemd
 255.
 
 User units carry no file-system sandboxing: `ProtectSystem=` and similar need
@@ -514,13 +514,13 @@ units on shared machines.
 
 ## Discrete NVIDIA GPUs
 
-mllm runs on machines whose GPU has its own memory (a GeForce, RTX or data
+capyctl runs on machines whose GPU has its own memory (a GeForce, RTX or data
 center card) as well as on unified-memory machines such as the GB10, where the
 GPU and the CPU share one pool. The steps are the same on both; this section
 covers what differs.
 
 **Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
-(or `/bin/nvidia-smi`), which every driver package installs. mllm runs it with
+(or `/bin/nvidia-smi`), which every driver package installs. capyctl runs it with
 a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
 address and memory; it needs no other library. A machine that mixes an
 integrated and a discrete GPU is refused at start (`unsupported_gpu_topology`,
@@ -536,7 +536,7 @@ single `unified` domain. Otherwise it publishes two kinds of memory domain:
 | `gpuN` (`memory: device`), one per GPU | the card | total − reserve | the larger of 1 GiB and 8 % of the card | the smaller of 8 GiB and 25 % of the card |
 
 The reserve on the card leaves room for a desktop session on a workstation
-GPU. Memory other programs already hold on the card lowers what mllm sees as
+GPU. Memory other programs already hold on the card lowers what capyctl sees as
 available; it is never hidden. An enrolled host states the same shape in its
 document ([`examples/host-discrete.yaml`](../examples/host-discrete.yaml)), and
 the host refuses to start if a `device` domain does not match the GPU it
@@ -553,10 +553,10 @@ limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
 about 10 GiB or more. On a smaller card the host still starts, and each vLLM
 deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
 name the `system` domain as well as the GPU's (`missing_system_allocation`
-otherwise); leaving them out and letting mllm derive them is the portable form.
+otherwise); leaving them out and letting capyctl derive them is the portable form.
 
-**One GPU per model; mllm picks it.** On a machine with several GPUs, each GPU
-is its own domain. mllm places a new instance on the GPU where it fits with the
+**One GPU per model; capyctl picks it.** On a machine with several GPUs, each GPU
+is its own domain. capyctl places a new instance on the GPU where it fits with the
 most room, and when none has room it parks or stops models on the GPU where the
 fewest need to go. A stopped instance returns to its last GPU when it fits
 there. To pin a GPU, name it in the deployment:
@@ -585,7 +585,7 @@ started through a path that does not place it runs on the lowest-index GPU.
 | `restart_only` | never parks: the engine is stopped | a cold start | none |
 
 `host_backed` is the default on a discrete GPU, because a wake from host RAM is
-several times faster than a reload from disk. mllm chooses it when the copy
+several times faster than a reload from disk. capyctl chooses it when the copy
 plus the engine process fits the `system` domain's parked limit, and `deep`
 otherwise (also while a downloaded model's size is not known yet);
 `restart_only` when the engine's deep parking is off. The copy is charged in
@@ -604,7 +604,7 @@ so choose `restart_only` for it. On a unified machine `host_backed` is refused
 memory it is supposed to free.
 
 **`insufficient_device_memory`** (exit 4) means the GPU cannot hold the
-deployment's card allocation plus its reserve: at deploy, when the size mllm
+deployment's card allocation plus its reserve: at deploy, when the size capyctl
 derived from the checkpoint is larger than the card's managed limit, or at
 launch, when the card has less free memory than the allocation needs (another
 program may be holding it). Use a smaller or quantized checkpoint, a smaller KV
@@ -637,7 +637,7 @@ appear by name (by id when they have none), memory in GiB and timeouts in
 seconds. Nested detail (latency distributions, installation fingerprints,
 development-control marks) is only in the JSON.
 
-    $ mllm list engines
+    $ capyctl list engines
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
     gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
@@ -651,32 +651,32 @@ format.
 
 ## Registering engines
 
-mllm uses engines you install yourself. Register them on the machine that runs them:
+capyctl uses engines you install yourself. Register them on the machine that runs them:
 
-    mllm engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
-    mllm engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
-    mllm engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
-    mllm engine list
-    mllm engine remove vllm [--drain]
-    mllm list engines                      # every host's engines on a server; this machine's on standalone
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
+    capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
+    capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
+    capyctl engine list
+    capyctl engine remove vllm [--drain]
+    capyctl list engines                      # every host's engines on a server; this machine's on standalone
 
 `detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
 `~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly
-in your home directory (for example `~/mllm-vllm-venv2`).
+in your home directory (for example `~/capyctl-vllm-venv2`).
 
 `engine add` runs the installation only after you name or pick it (a bounded
 version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
-without a restart. mllm never rewrites `host.yaml` or `standalone.yaml`.
+without a restart. capyctl never rewrites `host.yaml` or `standalone.yaml`.
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
 it sits beside the document the host was started with (the host records it),
-and otherwise it is `~/.config/mllm/engines.yaml`, for a host and for
+and otherwise it is `~/.config/capyctl/engines.yaml`, for a host and for
 standalone alike. The role
 merges it with its own document at start; a profile name declared in both is
-refused. Its first line records its revision (`# mllm-document-revision: N`).
+refused. Its first line records its revision (`# capyctl-document-revision: N`).
 The running role listens on `<state_dir>/control.sock` (mode 0600; only the
-role's own user and root are served) for these commands. Only the `mllm engine`
+role's own user and root are served) for these commands. Only the `capyctl engine`
 command writes `engines.yaml`; the running role only reads it.
 
 `engine remove` removes only profiles `engine add` registered; one you wrote
@@ -689,100 +689,100 @@ role that is not running cannot remove a published profile
 (`agent_unreachable`); start it and retry. If a removal is interrupted after
 the confirmation (the command was killed, the connection dropped, or the
 publication failed), the profile stays out of placement on that machine; run
-`mllm engine remove <name>` again, which resumes the same removal and finishes
+`capyctl engine remove <name>` again, which resumes the same removal and finishes
 it.
 
 A deployment naming a runtime profile that no allowed host publishes is refused
 at `deploy` (`profile_not_published`), naming the profile and each host; run
-`mllm engine add <path> --name <profile>` on a host, then deploy again.
+`capyctl engine add <path> --name <profile>` on a host, then deploy again.
 
-In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
+In standalone, `CAPYCTL_VLLM_BIN` or `CAPYCTL_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
 with them.
 
 **CUDA toolkit and compile jobs.** Engines compile some GPU kernels the first
-time they start. `mllm engine add` records the CUDA toolkit as the profile's
+time they start. `capyctl engine add` records the CUDA toolkit as the profile's
 `cuda_home`: `CUDA_HOME` if it holds `bin/nvcc`, otherwise `/usr/local/cuda`
 if that holds it. For the role's own installation (`--vllm-bin`,
-`MLLM_VLLM_BIN` or `local_engine`, on a host or standalone), state it with
-`--cuda-home`, `MLLM_CUDA_HOME` or `local_engine.cuda_home`; nothing is
+`CAPYCTL_VLLM_BIN` or `local_engine`, on a host or standalone), state it with
+`--cuda-home`, `CAPYCTL_CUDA_HOME` or `local_engine.cuda_home`; nothing is
 detected for it. The engine then gets `<cuda_home>/bin` on its PATH and
 `CUDA_HOME` set; vLLM uses FlashInfer only when `nvcc` is found. Without
 `cuda_home`, the engine PATH has only the engine's own `bin` and the system
 directories.
 
-Each compile job can take several GB. mllm sets `MAX_JOBS` to the free memory
+Each compile job can take several GB. capyctl sets `MAX_JOBS` to the free memory
 at launch divided by 8 GiB, at most the CPU count, and
 `FLASHINFER_NVCC_THREADS=1`. The host log prints the chosen value at every
 launch. To choose other limits, put `MAX_JOBS` or `FLASHINFER_NVCC_THREADS`
 (positive integers) in the profile's `env`.
 
-**With the system units, run `mllm engine` as root with the unit's
-`--config`.** The host unit reads `/etc/mllm/host.yaml`, so its `engines.yaml`
-is `/etc/mllm/engines.yaml`. `/etc/mllm` is root's (mode 0750, group `mllm`),
+**With the system units, run `capyctl engine` as root with the unit's
+`--config`.** The host unit reads `/etc/capyctl/host.yaml`, so its `engines.yaml`
+is `/etc/capyctl/engines.yaml`. `/etc/capyctl` is root's (mode 0750, group `capyctl`),
 and the unit makes `/etc` read-only to the role (`ProtectSystem=strict`), so
-the role never writes there; `mllm engine` does, and only root can:
+the role never writes there; `capyctl engine` does, and only root can:
 
-    sudo mllm engine add /opt/venvs/vllm --config /etc/mllm/host.yaml
-    sudo mllm engine list --config /etc/mllm/host.yaml
-    sudo mllm engine remove vllm --drain --config /etc/mllm/host.yaml
+    sudo capyctl engine add /opt/venvs/vllm --config /etc/capyctl/host.yaml
+    sudo capyctl engine list --config /etc/capyctl/host.yaml
+    sudo capyctl engine remove vllm --drain --config /etc/capyctl/host.yaml
 
 Run as root, the command keeps an existing `engines.yaml`'s owner and mode, and
 creates a new one (and its lock) owned by the role's service user (the owner of
-the host's `state_dir`, `mllm`), mode 0600, so the role can read it. It talks to
+the host's `state_dir`, `capyctl`), mode 0600, so the role can read it. It talks to
 the role over `<state_dir>/control.sock`, which serves root as well as the
 service user. Root also runs the named installation's version check and
 deep-park probe, so name only an installation you trust. Keep the `--config`
 here: a command finds the role running on the machine through the state root
 of the user who runs it, and root's is not the service user's, so without it
-root's `~/.config/mllm/engines.yaml` is a different file than the one the role
-reads. Run as the service user, `mllm engine` finds the host without it. The packaged standalone unit
+root's `~/.config/capyctl/engines.yaml` is a different file than the one the role
+reads. Run as the service user, `capyctl engine` finds the host without it. The packaged standalone unit
 starts without `--config`, so its `engines.yaml` is the service user's
-`/var/lib/mllm/.config/mllm/engines.yaml`, which the service user can write:
-`sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.
+`/var/lib/capyctl/.config/capyctl/engines.yaml`, which the service user can write:
+`sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone capyctl engine add …`.
 
 `engine add` also works before any role has ever started — the first-run path
 of adding an engine, then starting the role for the first time (standalone
 refuses to start with no engine). It creates the state directory the role will
 use (owner-only, mode 0700) if it does not exist yet, writes `engines.yaml`, and
 exits 0 with `published: role_not_running` and the line `saved to
-<engines.yaml> (revision N); start mllm (…) to use it`: no role is running (no
+<engines.yaml> (revision N); start capyctl (…) to use it`: no role is running (no
 control socket, or a stale one nobody listens on), so the profile takes effect
 at the role's first start. Only a role that is running but does not take or
 answer the request exits 22 (`agent_unreachable`).
 
-`--config` and `$MLLM_CONFIG` may be relative: every command and role resolves
-them against its working directory first, so `mllm engine add … --config
+`--config` and `$CAPYCTL_CONFIG` may be relative: every command and role resolves
+them against its working directory first, so `capyctl engine add … --config
 host.yaml` run beside `host.yaml` writes the `engines.yaml` next to it and asks
 the running role to publish it.
 
 ## Engine logs and troubleshooting
 
-mllm does not keep an engine's own output by default, because it may contain
-secrets (prompts, keys in arguments). `--debug-engine-logs` on `mllm start
-host` or `mllm start standalone` keeps it, owner-only, in
+capyctl does not keep an engine's own output by default, because it may contain
+secrets (prompts, keys in arguments). `--debug-engine-logs` on `capyctl start
+host` or `capyctl start standalone` keeps it, owner-only, in
 `<state dir>/logs/<deployment id>/<launch id>.log` for launches from then on.
 It is a flag only: a variable left in a unit file must not turn it on. For a
 unit, add it to `ExecStart=` in a drop-in while you investigate, then remove
 it.
 
-- **A launch fails.** `mllm status deployment <name>` shows the reason in
+- **A launch fails.** `capyctl status deployment <name>` shows the reason in
   `LAST OPERATION` (for example `initialize failed (launch_failed)`); the
   instance's `LAST ERROR` column can still read `-`. `--format json` has the
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
   exited.
-- **SGLang saver permission warning.** Before an SGLang park, mllm checks
+- **SGLang saver permission warning.** Before an SGLang park, capyctl checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable
   environment on a machine whose groups come from a directory service such as
-  `sss`), mllm parks anyway and writes one line to the engine log:
-  `{"event":"mllm_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
+  `sss`), capyctl parks anyway and writes one line to the engine log:
+  `{"event":"capyctl_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
   The line is only in the engine log, so it is visible only with
   `--debug-engine-logs`. To clear it, remove group and other write permission
-  from the engine's environment (`chmod -R go-w <environment>`); mllm never
+  from the engine's environment (`chmod -R go-w <environment>`); capyctl never
   changes engine files itself.
-- **`config show` does not match a running role.** `mllm config show` reads
+- **`config show` does not match a running role.** `capyctl config show` reads
   the document, the environment of the shell it runs in and the `--set`
   options given to it. It does not ask the running role, so a role started
   with `--set`, a flag, or a unit's `.env` file shows those values only if you
@@ -806,7 +806,7 @@ capabilities, and `UMask=0077`. They deliberately omit:
 - `PrivateTmp=`: with `KillMode=process` engines outlive a stop, and systemd
   removes a unit's private `/tmp` when the unit stops, underneath running
   engines; the restarted host would also see a different `/tmp` than the
-  engines it re-attaches. Instead `TMPDIR=/var/lib/mllm/tmp` keeps temporary
+  engines it re-attaches. Instead `TMPDIR=/var/lib/capyctl/tmp` keeps temporary
   files private, and `/tmp`, `/var/tmp` stay writable for engine code that
   ignores `TMPDIR`.
 
@@ -837,9 +837,9 @@ is at worst drain-only until its own upgrade, and its Ready engines keep
 serving. Hosts running a release that predates this policy report no version,
 so after the first server upgrade to a release that has it they are
 drain-only until they are upgraded too. Check the verdicts with
-`mllm list hosts` (its `VERSION` and `COMPATIBILITY` columns; with
+`capyctl list hosts` (its `VERSION` and `COMPATIBILITY` columns; with
 `--format json`, `server_version`, and per host `binary_version`,
-`compatibility`, `compatibility_reason`); `mllm status deployment <id>
+`compatibility`, `compatibility_reason`); `capyctl status deployment <id>
 --format json` shows the same per allowed host. A host listing a `capabilities_missing` entry that a
 launch needs is left out of placement; the operation it lacks is refused as
 `host_capability_missing:<name>`.
@@ -849,17 +849,17 @@ in a minor (or major) release; a patch release never changes the protocol,
 so patch releases of server and hosts mix freely.
 
 ```bash
-systemctl stop mllm-host                       # engines keep serving
+systemctl stop capyctl-host                       # engines keep serving
 
 # Back up state (see "State and migrations").
-tar -C /var/lib/mllm -czf /var/backups/mllm-host-$(date +%Y%m%d%H%M).tar.gz \
+tar -C /var/lib/capyctl -czf /var/backups/capyctl-host-$(date +%Y%m%d%H%M).tar.gz \
   --warning=no-file-ignored host
 
 # Replace the binary (and refresh the installed unit).
 sh install.sh --system --version 0.2.0 --systemd host
-mllm validate config --file /etc/mllm/host.yaml
+capyctl validate config --file /etc/capyctl/host.yaml
 
-systemctl start mllm-host                      # re-attaches running engines
+systemctl start capyctl-host                      # re-attaches running engines
 ```
 
 The start refreshes the managed runtime directory from the new binary and
@@ -874,13 +874,13 @@ its helpers or the engine control contract changed incompatibly, drain the
 host before upgrading instead.
 
 After a restart, check that each deployment is back to its prior state
-(`mllm status deployment <id>`). If one is not, read its status reason before
+(`capyctl status deployment <id>`). If one is not, read its status reason before
 acting on it.
 
 ### Upgrading to 0.1.0
 
 Newly generated documents put the inference endpoint on all interfaces,
-`0.0.0.0:8443`, with the API key required. mllm never rewrites an existing
+`0.0.0.0:8443`, with the API key required. capyctl never rewrites an existing
 document: one an earlier release generated keeps `127.0.0.1:8443` until you
 change it. To open it to the network, set `listeners.inference.bind` (under
 `server:` in standalone) to `0.0.0.0:8443` or start with
@@ -889,7 +889,7 @@ change it. To open it to the network, set `listeners.inference.bind` (under
 To set the address, pick one:
 
 - keep inference on the machine: `--listen 127.0.0.1:8443`, or
-  `MLLM_INFERENCE_ADDR=127.0.0.1:8443` in the unit's `.env` file, or
+  `CAPYCTL_INFERENCE_ADDR=127.0.0.1:8443` in the unit's `.env` file, or
   `listeners.inference.bind: "127.0.0.1:8443"` in the document (under
   `server:` in standalone);
 - limit it to your tailnet: the same, with the machine's Tailscale address
@@ -905,7 +905,7 @@ with a discrete card, 0.1.0 derives a `system` domain (host RAM) and one
 replaces the resource policy it generated and prints:
 
 ```
-this machine's memory shape changed, so the resource policy mllm generated for it was replaced (revision 2): domains [unified] are now [gpu0, system]; stopped with verified cleanup first: <deployments>
+this machine's memory shape changed, so the resource policy capyctl generated for it was replaced (revision 2): domains [unified] are now [gpu0, system]; stopped with verified cleanup first: <deployments>
 re-sized for this machine's resource policy: <deployments>
 ```
 
@@ -919,23 +919,23 @@ keeps the earlier accounting and says so; start it again to retry. A
 deployment that cannot be sized for the card as written is named in the
 notice and must be deployed again with a file for this machine. This runs
 once; later starts re-attach as usual. Unified-memory machines are not
-changed. An enrolled host states its domains in its own document, which mllm
+changed. An enrolled host states its domains in its own document, which capyctl
 never rewrites; for a discrete card, write it in the shape of
 [`examples/host-discrete.yaml`](../examples/host-discrete.yaml).
 
 Two other defaults changed in 0.1.0 for every host and standalone:
 Hugging Face and HTTP model downloads are allowed (500 GiB cap, see "Models and
 downloads"), and relative model paths resolve under `~/models` unless the
-document or `MLLM_MODELS_ROOT` names a models directory. On a discrete GPU,
+document or `CAPYCTL_MODELS_ROOT` names a models directory. On a discrete GPU,
 deployments that state no residency now default to `host_backed` (see
 "Discrete NVIDIA GPUs").
 
 ## Rollback
 
 ```bash
-systemctl stop mllm-host
+systemctl stop capyctl-host
 sh install.sh --system --version <previous> --systemd host
-systemctl start mllm-host
+systemctl start capyctl-host
 ```
 
 The previous binary rewrites the managed runtime directory with its own
@@ -956,16 +956,16 @@ know. So:
 
 - Back up each role's state directory before an upgrade, with the role
   stopped (the tar above). Engines keep running meanwhile; the backup is
-  consistent because mllm is not writing.
+  consistent because capyctl is not writing.
 - Roll back across a schema change only by restoring that backup together
   with the old binary. A restored store does not know about engines launched
-  after the backup was taken; drain the affected hosts first (`mllm drain
+  after the backup was taken; drain the affected hosts first (`capyctl drain
   host`), then stop the role, restore, and start it.
 - Never copy state between hosts or reuse a host's state under a different
   name: identities are bound to it. Losing a host's identity
   requires re-enrollment, not a copied directory.
 
-Role documents under `/etc/mllm` are operator configuration; mllm never
+Role documents under `/etc/capyctl` are operator configuration; capyctl never
 rewrites them, with one exception: the one-time inference listener update
 described in "Upgrading to 0.1.0". Validate them with the new binary
-(`mllm validate config`) before restarting.
+(`capyctl validate config`) before restarting.

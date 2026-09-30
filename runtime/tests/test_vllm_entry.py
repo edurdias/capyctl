@@ -83,7 +83,7 @@ RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name
             "--port", "20001", "--gpu-memory-utilization", "0.10",
             "--kv-cache-memory-bytes", "4294967296"]
 SLEEP = ["--enable-sleep-mode", "--safetensors-load-strategy", "eager",
-         "--middleware", "mllm_vllm_guard.RequireEngineKey"]
+         "--middleware", "capyctl_vllm_guard.RequireEngineKey"]
 
 
 class FakeRuntime:
@@ -178,7 +178,7 @@ class ResolveTests(unittest.TestCase):
 
     def test_sleep_mode_reserves_the_loader_and_the_guard(self):
         args = self.resolve(sleep=True)
-        self.assertEqual(args.middleware, ["mllm_vllm_guard.RequireEngineKey"])
+        self.assertEqual(args.middleware, ["capyctl_vllm_guard.RequireEngineKey"])
         for user in (["--safetensors-load-strategy", "lazy"], ["--no-enable-sleep-mode"],
                      ["--middleware", "other.Middleware"]):
             with self.subTest(user=user):
@@ -215,7 +215,7 @@ class ResolveTests(unittest.TestCase):
             with self.subTest(vector=vector), self.assertRaises(entry.LaunchError) as caught:
                 entry.split_argv(vector)
             self.assertEqual(caught.exception.code, "invalid_launch_arguments")
-        for user in (["--mllm-user-args-x"], ["--help"], ["-h"], ["--version"], ["-v"],
+        for user in (["--capyctl-user-args-x"], ["--help"], ["-h"], ["--version"], ["-v"],
                      ["--help=ModelConfig"]):
             with self.subTest(user=user), self.assertRaises(entry.LaunchError):
                 entry.check_user_tokens(user)
@@ -332,13 +332,13 @@ class MainTests(unittest.TestCase):
     # document is consumed rather than inherited by engine children.
     def test_plugins_are_pinned_off_and_approvals_are_consumed(self):
         os.environ["VLLM_PLUGINS"] = "evil"
-        os.environ["MLLM_EXTRA_APPROVALS"] = (
+        os.environ["CAPYCTL_EXTRA_APPROVALS"] = (
             '{"options": [], "paths": [], "trust_remote_code": false}')
         runtime = FakeRuntime()
         self.assertEqual(entry.main(argv(), runtime, io.StringIO()), 0)
         self.assertEqual(os.environ["VLLM_PLUGINS"], "")
-        self.assertNotIn("MLLM_EXTRA_APPROVALS", os.environ)
-        os.environ["MLLM_EXTRA_APPROVALS"] = "{not json"
+        self.assertNotIn("CAPYCTL_EXTRA_APPROVALS", os.environ)
+        os.environ["CAPYCTL_EXTRA_APPROVALS"] = "{not json"
         error = io.StringIO()
         self.assertEqual(entry.main(argv(), FakeRuntime(), error), 1)
         self.assertIn("invalid_extra_approvals", error.getvalue())
@@ -440,7 +440,7 @@ class MainTests(unittest.TestCase):
                 self.assertIn("run", runtime.events)
 
     # T21: a parser without the guard's middleware destination cannot load
-    # mllm's guard; the reserved-block recheck already refuses it, closed.
+    # capyctl's guard; the reserved-block recheck already refuses it, closed.
     def test_parser_without_the_middleware_destination_is_refused(self):
         runtime = FakeRuntime(drop=("middleware",))
         error = io.StringIO()

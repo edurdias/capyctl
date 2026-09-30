@@ -1,11 +1,11 @@
 #!/bin/sh
-# Install mllm from a GitHub release.
+# Install capyctl from a GitHub release.
 #
 #   curl -fsSL <install URL> | sh                      # latest release
 #   curl -fsSL <install URL> | sh -s -- [OPTIONS]      # with options
 #   sh install.sh [OPTIONS]                            # a downloaded copy
 #
-# Downloads mllm-<version>-linux-<arch>.tar.gz and the release's SHA256SUMS
+# Downloads capyctl-<version>-linux-<arch>.tar.gz and the release's SHA256SUMS
 # with curl, refuses on any checksum mismatch, and installs the one
 # self-contained binary. Engines, engine Python environments, model weights
 # and GPU drivers are never installed.
@@ -14,9 +14,9 @@
 #   --version V     release to install, e.g. 0.1.0 (a leading "v" is
 #                   accepted). Default: the latest release; a release
 #                   candidate is installed only when named.
-#   --system        install for every user: /usr/local/bin/mllm, units under
+#   --system        install for every user: /usr/local/bin/capyctl, units under
 #                   /etc/systemd/system (needs root). Default: this user only,
-#                   ~/.local/bin/mllm and ~/.config/systemd/user.
+#                   ~/.local/bin/capyctl and ~/.config/systemd/user.
 #   --systemd ROLE  also install the unit for ROLE (server, host or
 #                   standalone) and reload systemd. The unit is not enabled
 #                   or started.
@@ -28,7 +28,7 @@
 # Fallbacks, for a private repository or a mirror:
 #   gh                     used when the GitHub CLI is installed and logged in.
 #   GITHUB_TOKEN           used with the GitHub API when set.
-#   MLLM_INSTALL_BASE_URL  a directory holding the release assets (https://
+#   CAPYCTL_INSTALL_BASE_URL  a directory holding the release assets (https://
 #                          or file://), used as is; needs --version.
 #
 # Environment: PREFIX overrides the install prefix (default ~/.local, or
@@ -39,7 +39,7 @@
 # Packaging design: ADR 0001 (one self-contained binary per architecture).
 set -eu
 
-repo=edurdias/mllm
+repo=edurdias/capyctl
 version=
 scope=user
 role=
@@ -49,7 +49,7 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 usage() {
   # Piped into sh, $0 is the shell, not this file.
-  if [ -r "$0" ] && head -n 2 "$0" | grep -q 'Install mllm'; then
+  if [ -r "$0" ] && head -n 2 "$0" | grep -q 'Install capyctl'; then
     sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
   else
     say "usage: install.sh [--version V] [--system] [--systemd ROLE] [--repo OWNER/NAME] | --uninstall [--system]"
@@ -88,7 +88,7 @@ else
   systemctl_scope=--user
 fi
 bin_dir=$prefix/bin
-share_dir=$prefix/share/mllm
+share_dir=$prefix/share/capyctl
 # What this script installed, so --uninstall removes exactly that.
 record=$share_dir/installed-files
 
@@ -105,14 +105,14 @@ if [ "$action" = uninstall ]; then
   [ -f "$record" ] || die "nothing installed by install.sh under $prefix ($record missing)"
   while IFS= read -r path; do
     case $path in
-      "$bin_dir"/mllm | "$unit_dir"/mllm-*.service) rm -f "$path" && say "removed $path" ;;
+      "$bin_dir"/capyctl | "$unit_dir"/capyctl-*.service) rm -f "$path" && say "removed $path" ;;
       *) say "skipped unexpected entry: $path" ;;
     esac
   done <"$record"
   rm -rf "$share_dir"
   say "removed $share_dir"
   reload_systemd
-  say "state directories (for example ~/.local/state/mllm or /var/lib/mllm) were kept"
+  say "state directories (for example ~/.local/state/capyctl or /var/lib/capyctl) were kept"
   exit 0
 fi
 
@@ -136,7 +136,7 @@ fi
 
 have_gh() { command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; }
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/mllm-install.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/capyctl-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 # The GitHub API's JSON, one value per line, without a JSON tool: the asset
@@ -162,8 +162,8 @@ curl_get() { # $1 url, $2 output, [$3 accept header]
 # qualify, so without --version they cannot be found.
 no_latest="GitHub's latest release skips pre-releases and drafts, so while $repo has only pre-releases (release candidates) name one with --version, for example --version v0.1.0"
 if [ -z "$version" ]; then
-  if [ -n "${MLLM_INSTALL_BASE_URL:-}" ]; then
-    die "--version is required with MLLM_INSTALL_BASE_URL"
+  if [ -n "${CAPYCTL_INSTALL_BASE_URL:-}" ]; then
+    die "--version is required with CAPYCTL_INSTALL_BASE_URL"
   elif have_gh; then
     tag=$(gh release view -R "$repo" --json tagName --jq .tagName) ||
       die "no latest release found in $repo: $no_latest"
@@ -181,12 +181,12 @@ if [ -z "$version" ]; then
   version=${tag#v}
 fi
 tag=v$version
-name=mllm-$version-$os-$arch
+name=capyctl-$version-$os-$arch
 tarball=$name.tar.gz
 
-say "installing mllm $version ($os-$arch) from $repo"
-if [ -n "${MLLM_INSTALL_BASE_URL:-}" ]; then
-  base=${MLLM_INSTALL_BASE_URL%/}
+say "installing capyctl $version ($os-$arch) from $repo"
+if [ -n "${CAPYCTL_INSTALL_BASE_URL:-}" ]; then
+  base=${CAPYCTL_INSTALL_BASE_URL%/}
   curl -fsSL -o "$tmp/$tarball" "$base/$tarball" || die "cannot download $base/$tarball"
   curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || die "cannot download $base/SHA256SUMS"
 elif have_gh; then
@@ -217,52 +217,52 @@ say "verified $tarball sha256:$got"
 
 tar -xzf "$tmp/$tarball" -C "$tmp" --no-same-owner
 pkg=$tmp/$name
-[ -f "$pkg/bin/mllm" ] && [ -f "$pkg/SHA256SUMS" ] || die "$tarball does not hold $name/bin/mllm"
+[ -f "$pkg/bin/capyctl" ] && [ -f "$pkg/SHA256SUMS" ] || die "$tarball does not hold $name/bin/capyctl"
 # The archive's own manifest: every file it ships.
 while read -r sum path; do
   [ "$(sha256 "$pkg/$path")" = "$sum" ] || die "$path in $tarball does not match its SHA256SUMS; refusing to install"
 done <"$pkg/SHA256SUMS"
-reported=$("$pkg/bin/mllm" --version) || die "the downloaded binary does not run on this machine"
-[ "$reported" = "mllm $version" ] || die "the downloaded binary reports '$reported', not mllm $version"
+reported=$("$pkg/bin/capyctl" --version) || die "the downloaded binary does not run on this machine"
+[ "$reported" = "capyctl $version" ] || die "the downloaded binary reports '$reported', not capyctl $version"
 
 umask 022
 mkdir -p "$bin_dir" "$share_dir"
 # Replace the binary atomically: a running role keeps its open executable.
-cp "$pkg/bin/mllm" "$bin_dir/.mllm.new.$$"
-chmod 0755 "$bin_dir/.mllm.new.$$"
-mv -f "$bin_dir/.mllm.new.$$" "$bin_dir/mllm"
+cp "$pkg/bin/capyctl" "$bin_dir/.capyctl.new.$$"
+chmod 0755 "$bin_dir/.capyctl.new.$$"
+mv -f "$bin_dir/.capyctl.new.$$" "$bin_dir/capyctl"
 rm -rf "$share_dir/packaging" "$share_dir/docs"
 cp -R "$pkg/packaging" "$pkg/docs" "$share_dir/"
 cp "$pkg/BUILDINFO" "$share_dir/BUILDINFO"
 if [ -f "$pkg/LICENSE" ]; then cp "$pkg/LICENSE" "$share_dir/LICENSE"; fi
-printf '%s\n' "$bin_dir/mllm" >"$record.tmp"
+printf '%s\n' "$bin_dir/capyctl" >"$record.tmp"
 if [ -f "$record" ]; then
-  grep -x "$unit_dir/mllm-.*\\.service" "$record" >>"$record.tmp" || true
+  grep -x "$unit_dir/capyctl-.*\\.service" "$record" >>"$record.tmp" || true
 fi
-say "installed $bin_dir/mllm ($reported)"
+say "installed $bin_dir/capyctl ($reported)"
 
 if [ -n "$role" ]; then
-  unit=mllm-$role.service
+  unit=capyctl-$role.service
   mkdir -p "$unit_dir"
   source_unit=$share_dir/packaging/systemd/$scope/$unit
   # The packaged units name the default locations (/usr/local, ~/.local);
   # point them at this install, so a PREFIX elsewhere is honoured.
-  sed -e "s#^ExecStart=[^ ]*/bin/mllm #ExecStart=$bin_dir/mllm #" \
-    -e "s#^Documentation=file://[^ ]*/share/mllm/#Documentation=file://$share_dir/#" \
+  sed -e "s#^ExecStart=[^ ]*/bin/capyctl #ExecStart=$bin_dir/capyctl #" \
+    -e "s#^Documentation=file://[^ ]*/share/capyctl/#Documentation=file://$share_dir/#" \
     "$source_unit" >"$unit_dir/.$unit.new"
   chmod 0644 "$unit_dir/.$unit.new"
   mv -f "$unit_dir/.$unit.new" "$unit_dir/$unit"
   printf '%s\n' "$unit_dir/$unit" >>"$record.tmp"
   say "installed $unit_dir/$unit (not enabled)"
   if [ "$scope" = user ]; then
-    # The user units keep state in StateDirectory=mllm (~/.local/state/mllm).
-    # systemd 254 and later, finding that missing while ~/.config/mllm (where
+    # The user units keep state in StateDirectory=capyctl (~/.local/state/capyctl).
+    # systemd 254 and later, finding that missing while ~/.config/capyctl (where
     # the units read <role>.yaml and <role>.env) exists, assumes the pre-254
-    # layout and makes ~/.local/state/mllm a symlink to ~/.config/mllm; state
+    # layout and makes ~/.local/state/capyctl a symlink to ~/.config/capyctl; state
     # then lands in the configuration directory, behind a symlink the roles'
     # identity rules refuse (found live 2026-09-24). An empty owner-only
     # directory made now prevents that; nothing in it is ever touched.
-    state_root=${XDG_STATE_HOME:-$HOME/.local/state}/mllm
+    state_root=${XDG_STATE_HOME:-$HOME/.local/state}/capyctl
     if [ -L "$state_root" ]; then
       say "warning: $state_root is a symlink (systemd's pre-254 compatibility link?); the roles refuse state behind it. Stop the unit, remove the link, and run this installer again."
     elif [ ! -e "$state_root" ]; then

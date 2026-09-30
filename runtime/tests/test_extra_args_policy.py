@@ -3,7 +3,7 @@
 The deploy-time check sees only the spelling a deployment wrote. The engines'
 parsers expand abbreviations, aliases and `=value` forms, so the launch gate
 decides on the destination the installed parser resolved: a sensitive one
-needs the host's named approval, carried to the entry in MLLM_EXTRA_APPROVALS.
+needs the host's named approval, carried to the entry in CAPYCTL_EXTRA_APPROVALS.
 CPU-only; never evidence a build serves.
 """
 

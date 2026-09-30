@@ -67,7 +67,7 @@ class _Custody:
                     or not _same(info, linked)):
                 raise ObservationServerError()
             if index == last:
-                # mllm private state: the socket's own 0700 directory stays
+                # capyctl private state: the socket's own 0700 directory stays
                 # strict (no group write at all, owner decision 2026-09-23).
                 if info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
                     raise ObservationServerError()
@@ -157,7 +157,7 @@ The listener never removes a replaced path and never adopts an existing socket.
             server._active = None
             server._closed = False
             server._owner = expected_owner
-            server._thread = threading.Thread(target=server._run, name="mllm-saver-observer", daemon=True)
+            server._thread = threading.Thread(target=server._run, name="capyctl-saver-observer", daemon=True)
             server._thread.start()
             return server
         except Exception:

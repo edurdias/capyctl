@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/mllm-domain", "crates/mllm-store", "crates/mllm-scheduler",
-  "crates/mllm-protocol", "crates/mllm-controller", "crates/mllm-router",
-  "crates/mllm-agent", "crates/mllm-adapters", "crates/mllm-launchers",
-  "crates/mllm-config", "crates/mllm-cli", "crates/mllm-management",
-  "crates/mllm-testkit", "tests/harness",
+  "crates/capyctl-domain", "crates/capyctl-store", "crates/capyctl-scheduler",
+  "crates/capyctl-protocol", "crates/capyctl-controller", "crates/capyctl-router",
+  "crates/capyctl-agent", "crates/capyctl-adapters", "crates/capyctl-launchers",
+  "crates/capyctl-config", "crates/capyctl-cli", "crates/capyctl-management",
+  "crates/capyctl-testkit", "tests/harness",
 ]
 
 [workspace.package]
@@ -30,15 +30,15 @@ hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 axum = { version = "0.8", features = ["macros"] }
 futures = "0.3"
-mllm-domain = { path = "crates/mllm-domain" }
-mllm-store = { path = "crates/mllm-store" }
-mllm-scheduler = { path = "crates/mllm-scheduler" }
-mllm-protocol = { path = "crates/mllm-protocol" }
-mllm-config = { path = "crates/mllm-config" }
-mllm-adapters = { path = "crates/mllm-adapters" }
-mllm-agent = { path = "crates/mllm-agent" }
-mllm-controller = { path = "crates/mllm-controller" }
-mllm-testkit = { path = "crates/mllm-testkit" }
+capyctl-domain = { path = "crates/capyctl-domain" }
+capyctl-store = { path = "crates/capyctl-store" }
+capyctl-scheduler = { path = "crates/capyctl-scheduler" }
+capyctl-protocol = { path = "crates/capyctl-protocol" }
+capyctl-config = { path = "crates/capyctl-config" }
+capyctl-adapters = { path = "crates/capyctl-adapters" }
+capyctl-agent = { path = "crates/capyctl-agent" }
+capyctl-controller = { path = "crates/capyctl-controller" }
+capyctl-testkit = { path = "crates/capyctl-testkit" }
 
 [profile.dev]
 debug = 1

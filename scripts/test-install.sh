@@ -4,12 +4,12 @@
 #   scripts/test-install.sh [TARBALL]
 #
 # With TARBALL (a packaging/release.sh output), that archive is served;
-# otherwise a fake one is built whose bin/mllm is a stub that prints its
+# otherwise a fake one is built whose bin/capyctl is a stub that prints its
 # version. Everything happens under a scratch HOME: no real systemd, no
 # network, no GitHub. Each case runs under every POSIX shell found (sh, dash,
 # bash --posix). Cases:
 #
-#   - file:// install (MLLM_INSTALL_BASE_URL) of the binary and a user unit,
+#   - file:// install (CAPYCTL_INSTALL_BASE_URL) of the binary and a user unit,
 #     with the unit's ExecStart pointed at the installed binary;
 #   - --system with PREFIX/UNIT_DIR (system unit, no --user reload);
 #   - the private-repository API path (GITHUB_TOKEN, a fake curl standing in
@@ -25,7 +25,7 @@ set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 installer=$root/packaging/install.sh
-work=$(mktemp -d "${TMPDIR:-/tmp}/mllm-test-install.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/capyctl-test-install.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 failures=0
@@ -41,21 +41,21 @@ mkdir -p "$release"
 if [ $# -ge 1 ]; then
   tarball=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
   name=$(basename "$tarball" .tar.gz)
-  version=${name#mllm-}
+  version=${name#capyctl-}
   version=${version%-linux-*}
   cp "$tarball" "$release/"
 else
   version=0.0.0-test
-  name=mllm-$version-linux-$arch
+  name=capyctl-$version-linux-$arch
   pkg=$work/build/$name
   mkdir -p "$pkg/bin" "$pkg/docs/operations"
-  printf '#!/bin/sh\necho "mllm %s"\n' "$version" >"$pkg/bin/mllm"
-  chmod 0755 "$pkg/bin/mllm"
+  printf '#!/bin/sh\necho "capyctl %s"\n' "$version" >"$pkg/bin/capyctl"
+  chmod 0755 "$pkg/bin/capyctl"
   mkdir -p "$pkg/packaging"
   cp -R "$root/packaging/systemd" "$pkg/packaging/"
   cp "$root/docs/operations/install.md" "$pkg/docs/operations/"
   cp "$root/LICENSE" "$pkg/LICENSE"
-  printf 'name: mllm\nversion: %s\n' "$version" >"$pkg/BUILDINFO"
+  printf 'name: capyctl\nversion: %s\n' "$version" >"$pkg/BUILDINFO"
   (cd "$pkg" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum) >"$work/sums"
   mv "$work/sums" "$pkg/SHA256SUMS"
   tar -C "$work/build" -czf "$release/$name.tar.gz" "$name"
@@ -107,44 +107,44 @@ for shell in "${shells[@]}"; do
 
   # --- user install over file:// --------------------------------------------
   fresh_home
-  if out=$(run "$shell" MLLM_INSTALL_BASE_URL="file://$release" -- --version "v$version" --systemd host 2>&1); then
-    bin=$home/.local/bin/mllm
-    unit=$home/.config/systemd/user/mllm-host.service
+  if out=$(run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$release" -- --version "v$version" --systemd host 2>&1); then
+    bin=$home/.local/bin/capyctl
+    unit=$home/.config/systemd/user/capyctl-host.service
     problems=()
     [ -x "$bin" ] || problems+=("no executable $bin")
     [ "$(stat -c %a "$bin" 2>/dev/null)" = 755 ] || problems+=("binary mode is not 0755")
-    [ "$("$bin" --version 2>/dev/null)" = "mllm $version" ] || problems+=("binary does not report $version")
-    grep -qx "ExecStart=$bin start host --config \${MLLM_CONFIG}" "$unit" 2>/dev/null ||
+    [ "$("$bin" --version 2>/dev/null)" = "capyctl $version" ] || problems+=("binary does not report $version")
+    grep -qx "ExecStart=$bin start host --config \${CAPYCTL_CONFIG}" "$unit" 2>/dev/null ||
       problems+=("unit ExecStart does not run the installed binary")
-    grep -q "^Documentation=file://$home/.local/share/mllm/docs/operations/install.md" "$unit" 2>/dev/null ||
+    grep -q "^Documentation=file://$home/.local/share/capyctl/docs/operations/install.md" "$unit" 2>/dev/null ||
       problems+=("unit Documentation does not point at the installed guide")
-    [ -f "$home/.local/share/mllm/docs/operations/install.md" ] || problems+=("guide not installed")
-    [ -f "$home/.local/share/mllm/LICENSE" ] || problems+=("license not installed")
-    [ -f "$home/.local/share/mllm/packaging/systemd/system/mllm-server.service" ] || problems+=("units not kept")
+    [ -f "$home/.local/share/capyctl/docs/operations/install.md" ] || problems+=("guide not installed")
+    [ -f "$home/.local/share/capyctl/LICENSE" ] || problems+=("license not installed")
+    [ -f "$home/.local/share/capyctl/packaging/systemd/system/capyctl-server.service" ] || problems+=("units not kept")
     grep -qx -- '--user daemon-reload' "$log" || problems+=("no systemctl --user daemon-reload")
     grep -q 'enable\|start' "$log" && problems+=("the unit was enabled or started")
-    # systemd >= 254 would otherwise link the state root to ~/.config/mllm.
-    { [ -d "$home/.local/state/mllm" ] && [ ! -L "$home/.local/state/mllm" ] &&
-      [ "$(stat -c %a "$home/.local/state/mllm")" = 700 ]; } ||
-      problems+=("the state root ~/.local/state/mllm is not a 0700 directory")
+    # systemd >= 254 would otherwise link the state root to ~/.config/capyctl.
+    { [ -d "$home/.local/state/capyctl" ] && [ ! -L "$home/.local/state/capyctl" ] &&
+      [ "$(stat -c %a "$home/.local/state/capyctl")" = 700 ]; } ||
+      problems+=("the state root ~/.local/state/capyctl is not a 0700 directory")
     if [ "${#problems[@]}" -eq 0 ]; then pass "$label user install over file://"; else
       for p in "${problems[@]}"; do fail "$label user install: $p"; done; echo "$out" >&2; fi
 
     # Reinstall is idempotent; a second role's unit is added to the record.
-    if run "$shell" MLLM_INSTALL_BASE_URL="file://$release" -- --version "$version" --systemd standalone >/dev/null 2>&1 &&
-      [ -f "$home/.config/systemd/user/mllm-standalone.service" ] && [ -f "$unit" ]; then
+    if run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$release" -- --version "$version" --systemd standalone >/dev/null 2>&1 &&
+      [ -f "$home/.config/systemd/user/capyctl-standalone.service" ] && [ -f "$unit" ]; then
       pass "$label reinstall adds a unit and keeps the first"
     else
       fail "$label reinstall"
     fi
 
     # --- uninstall keeps state ------------------------------------------------
-    mkdir -p "$home/.local/state/mllm/host"
-    echo keep >"$home/.local/state/mllm/host/sentinel"
+    mkdir -p "$home/.local/state/capyctl/host"
+    echo keep >"$home/.local/state/capyctl/host/sentinel"
     : >"$log"
     if run "$shell" -- --uninstall >/dev/null 2>&1 && [ ! -e "$bin" ] && [ ! -e "$unit" ] &&
-      [ ! -e "$home/.config/systemd/user/mllm-standalone.service" ] &&
-      [ ! -e "$home/.local/share/mllm" ] && [ -f "$home/.local/state/mllm/host/sentinel" ] &&
+      [ ! -e "$home/.config/systemd/user/capyctl-standalone.service" ] &&
+      [ ! -e "$home/.local/share/capyctl" ] && [ -f "$home/.local/state/capyctl/host/sentinel" ] &&
       grep -qx -- '--user daemon-reload' "$log"; then
       pass "$label uninstall removes the install and keeps state"
     else
@@ -154,10 +154,10 @@ for shell in "${shells[@]}"; do
     # A state root systemd already replaced by its compatibility link is
     # reported, never touched.
     fresh_home
-    mkdir -p "$home/.config/mllm" "$home/.local/state"
-    ln -s ../../.config/mllm "$home/.local/state/mllm"
-    if out=$(run "$shell" MLLM_INSTALL_BASE_URL="file://$release" -- --version "$version" --systemd host 2>&1) &&
-      printf '%s\n' "$out" | grep -q 'is a symlink' && [ -L "$home/.local/state/mllm" ]; then
+    mkdir -p "$home/.config/capyctl" "$home/.local/state"
+    ln -s ../../.config/capyctl "$home/.local/state/capyctl"
+    if out=$(run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$release" -- --version "$version" --systemd host 2>&1) &&
+      printf '%s\n' "$out" | grep -q 'is a symlink' && [ -L "$home/.local/state/capyctl" ]; then
       pass "$label warns about a linked state root and leaves it"
     else
       fail "$label linked state root"; echo "$out" >&2
@@ -170,10 +170,10 @@ for shell in "${shells[@]}"; do
 
   # --- system install under a prefix -----------------------------------------
   fresh_home
-  if run "$shell" MLLM_INSTALL_BASE_URL="file://$release" PREFIX="$home/usr" UNIT_DIR="$home/etc" -- \
+  if run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$release" PREFIX="$home/usr" UNIT_DIR="$home/etc" -- \
     --system --version "$version" --systemd server >/dev/null 2>&1 &&
-    grep -qx "ExecStart=$home/usr/bin/mllm start server --config \${MLLM_CONFIG}" "$home/etc/mllm-server.service" &&
-    grep -qx 'User=mllm' "$home/etc/mllm-server.service" &&
+    grep -qx "ExecStart=$home/usr/bin/capyctl start server --config \${CAPYCTL_CONFIG}" "$home/etc/capyctl-server.service" &&
+    grep -qx 'User=capyctl' "$home/etc/capyctl-server.service" &&
     grep -qx 'daemon-reload' "$log"; then
     pass "$label system install (system unit, system reload)"
   else
@@ -212,14 +212,14 @@ esac
 EOF
   chmod 0755 "$fakebin/curl"
   if run "$shell" GITHUB_TOKEN=secret-token -- --repo o/r --version "$version" >/dev/null 2>&1 &&
-    [ "$("$home/.local/bin/mllm" --version)" = "mllm $version" ]; then
+    [ "$("$home/.local/bin/capyctl" --version)" = "capyctl $version" ]; then
     pass "$label private release through the API with GITHUB_TOKEN"
   else
     fail "$label private release through the API with GITHUB_TOKEN"
   fi
   fresh_home
   if run "$shell" GITHUB_TOKEN=wrong -- --repo o/r --version "$version" >/dev/null 2>&1 ||
-    [ -e "$home/.local/bin/mllm" ]; then
+    [ -e "$home/.local/bin/capyctl" ]; then
     fail "$label a rejected token must not install"
   else
     pass "$label a rejected token installs nothing"
@@ -234,7 +234,7 @@ EOF
     if out=$(run "$shell" ${token:+GITHUB_TOKEN=$token} -- --repo o/r 2>&1); then
       fail "$label no --version with only pre-releases: installed anyway"
     elif grep -qF "skips pre-releases" <<<"$out" && grep -qF -- "--version v0.1.0" <<<"$out" &&
-      { [ -n "$token" ] || grep -qF "gh auth login" <<<"$out"; } && [ ! -e "$home/.local/bin/mllm" ]; then
+      { [ -n "$token" ] || grep -qF "gh auth login" <<<"$out"; } && [ ! -e "$home/.local/bin/capyctl" ]; then
       pass "$label no --version with only pre-releases names the cause${token:+ (token)}"
     else
       fail "$label no --version with only pre-releases: message '$out'"
@@ -247,9 +247,9 @@ EOF
     local what=$1 dir=$2 message=$3 out
     shift 3
     fresh_home
-    if out=$(run "$shell" MLLM_INSTALL_BASE_URL="file://$dir" -- "$@" 2>&1); then
+    if out=$(run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$dir" -- "$@" 2>&1); then
       fail "$label $what: installed anyway"
-    elif [ -e "$home/.local/bin/mllm" ]; then
+    elif [ -e "$home/.local/bin/capyctl" ]; then
       fail "$label $what: left a binary behind"
     elif ! grep -qF -- "$message" <<<"$out"; then
       fail "$label $what: message '$out' lacks '$message'"

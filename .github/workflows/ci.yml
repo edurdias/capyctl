@@ -37,15 +37,15 @@ jobs:
         run: cargo fmt --all --check
       - name: Authoritative core suite
         run: >-
-          cargo test -p mllm-adapters -p mllm-store -p mllm-controller
-          -p mllm-management -p harness --all-targets --no-fail-fast --locked
+          cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller
+          -p capyctl-management -p harness --all-targets --no-fail-fast --locked
           -- --test-threads=4
       - name: Workspace suite
         run: cargo test --workspace --all-targets --locked
       - name: Core Clippy
         run: >-
-          cargo clippy -p mllm-adapters -p mllm-store -p mllm-controller
-          -p mllm-management -p harness --all-targets --locked -- -D warnings
+          cargo clippy -p capyctl-adapters -p capyctl-store -p capyctl-controller
+          -p capyctl-management -p harness --all-targets --locked -- -D warnings
       - name: Fetch and verify CPU fixture source
         run: |
           TMS_SOURCE_ARCHIVE="$RUNNER_TEMP/torch_memory_saver-0.0.9.post1.tar.gz"

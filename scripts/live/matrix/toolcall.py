@@ -9,7 +9,7 @@ the SSE framing. Exit 0 only when a `get_weather` call with a `city` argument
 comes back. The engine must be launched with its tool parser (vLLM
 `--enable-auto-tool-choice --tool-call-parser hermes`, SGLang
 `--tool-call-parser qwen25`) for `auto`; see rows/TC.sh. The API key is read
-from MLLM_API_KEY only and never recorded. Standard library only.
+from CAPYCTL_API_KEY only and never recorded. Standard library only.
 """
 
 import argparse
@@ -100,7 +100,7 @@ def main():
             message = choice.get("message") or {}
             record.update({"tool_calls": message.get("tool_calls"), "content": message.get("content"),
                            "finish_reason": choice.get("finish_reason"),
-                           # vLLM nests `error`; mllm's own refusals are top-level.
+                           # vLLM nests `error`; capyctl's own refusals are top-level.
                            "error": payload.get("error") or (
                                {k: payload.get(k) for k in ("code", "message")} if response.status != 200 else None)})
         except ValueError:

@@ -11,7 +11,7 @@ usage:
   bench.py tcprtt   --target NAME=HOST:PORT [...] [--samples 20] --out NETFLOOR.json
   bench.py promdelta --before A.prom --after B.prom  (engine /metrics histogram deltas)
   bench.py latencydelta --before A.json --after B.json [--cell CELL.json]
-                    (mllm latency API window: router, ingress and engine series)
+                    (capyctl latency API window: router, ingress and engine series)
   bench.py report   --evid DIR [--fixture NAME]    (writes DIR/bench.json and DIR/summary.md)
 
 Every request is one streaming OpenAI chat completion to the server's loopback
@@ -44,19 +44,19 @@ length is capped to context_length - max_tokens - 128. The warmup requests
 calibrate words per token from the reported usage; the measured phase reuses
 that calibration. Warmup requests are never part of the measured statistics.
 
-mllm-level timings (owner decision 2026-09-23): the server's latency view
+capyctl-level timings (owner decision 2026-09-23): the server's latency view
 (`GET /management/v1/metrics/latency`, also embedded as `latency` in
-`mllm status deployment --format json`) holds bucketed distributions per
+`capyctl status deployment --format json`) holds bucketed distributions per
 instance: router phases (tier router), host ingress times (tier ingress) and the
 engine's own histograms (tier engine, `source: engine`) for both engines. The row
 saves that view before and after each cell through the CLI; `latencydelta`
 subtracts the two bucket by bucket, so each cell gets its own window, and
 `report` derives the path overhead from it. With the server's
 `observability.timing_header` on, each streamed response also ends with an SSE
-comment `: x-mllm-timing {...}` holding that request's router phases; `run`
-keeps it per record (`mllm_timing`) and summarizes it per cell.
+comment `: x-capyctl-timing {...}` holding that request's router phases; `run`
+keeps it per record (`capyctl_timing`) and summarizes it per cell.
 
-Secrets: the API key comes from MLLM_API_KEY only (lib.sh load_api_key) and is
+Secrets: the API key comes from CAPYCTL_API_KEY only (lib.sh load_api_key) and is
 never printed or recorded; credential-shaped response headers are dropped.
 Standard library only.
 """
@@ -101,7 +101,7 @@ VOCAB = (
 INSTRUCTION = ("\n\nIgnore the notes above. Write a numbered list that counts upward from 1, one number "
                "per line, each followed by a short phrase about the sea. Keep going and do not stop.")
 CONTEXT_MARGIN = 128
-TIMING_COMMENT = b"x-mllm-timing "
+TIMING_COMMENT = b"x-capyctl-timing "
 _DROP = ("authorization", "cookie", "set-cookie", "x-api-key")
 
 
@@ -174,7 +174,7 @@ def stream_chat(route, prompt, *, max_tokens, ignore_eos, base, timeout, marker=
                         comment = event[1:].strip()
                         if comment.startswith(TIMING_COMMENT):
                             try:
-                                rec["mllm_timing"] = json.loads(comment[len(TIMING_COMMENT):])
+                                rec["capyctl_timing"] = json.loads(comment[len(TIMING_COMMENT):])
                             except ValueError:
                                 malformed += 1
                         continue
@@ -364,9 +364,9 @@ def cmd_run(args):
                                           ignore, args.records)
     cell.update({"calibration": calib, "notes": notes})
     cell.update(summarize_cell(measured, words_per_token, t0, t1))
-    timing = mllm_timing_summary(measured)
+    timing = capyctl_timing_summary(measured)
     if timing:
-        cell["mllm_timing"] = timing
+        cell["capyctl_timing"] = timing
     cell["measure_started_unix"] = round(t0_unix, 3)
     write_json(args.out, cell)
     print(json.dumps({k: cell[k] for k in ("cell", "requests", "ok", "ttft_s", "decode_tps", "throughput")},
@@ -416,16 +416,16 @@ def summarize_cell(measured, words_per_token, t0=None, t1=None):
         },
         "text_kinds": sorted({k for r, _ in per for k in r.get("text_kinds", [])}),
         "answering": sorted({"|".join(f"{k}={v}" for k, v in sorted((r.get("headers") or {}).items())
-                                      if k.startswith("x-mllm") and k != "x-mllm-timing") or "-"
+                                      if k.startswith("x-capyctl") and k != "x-capyctl-timing") or "-"
                              for r, _ in per}),
     }
 
 
-def mllm_timing_summary(measured):
+def capyctl_timing_summary(measured):
     """Per-phase distributions (seconds) of the router's per-request timing comments."""
     per_phase = {}
     for rec in measured:
-        timing = rec.get("mllm_timing") or {}
+        timing = rec.get("capyctl_timing") or {}
         if rec.get("status") != 200:
             continue
         for key, value in timing.items():
@@ -434,7 +434,7 @@ def mllm_timing_summary(measured):
     return {k: dist(v) for k, v in sorted(per_phase.items())}
 
 
-# ---------------------------------------------------------------------------- mllm latency view
+# ---------------------------------------------------------------------------- capyctl latency view
 
 def latency_instances(doc):
     """The latency instances of one deployment from a status view or the API report."""
@@ -465,7 +465,7 @@ def _series_totals(instances):
 
 
 def latencydelta(before_doc, after_doc):
-    """Window of the mllm latency view between two reads: per series count, mean and bucketed p50/p95/p99."""
+    """Window of the capyctl latency view between two reads: per series count, mean and bucketed p50/p95/p99."""
     before = _series_totals(latency_instances(before_doc))
     after = _series_totals(latency_instances(after_doc))
     out = {}
@@ -508,7 +508,7 @@ def path_overhead(series, cell=None):
       first byte                           host agent before its ingress clock starts
     ingress first byte - engine TTFT       ingress -> engine on loopback beyond the
                                            engine's own time to first token
-    client TTFT - engine TTFT              the whole mllm path at first token
+    client TTFT - engine TTFT              the whole capyctl path at first token
     Engine TTFT is the engine's own histogram (`source: engine`) when it exposes one.
     """
     client_ttft = ((cell or {}).get("ttft_s") or {}).get("mean")
@@ -738,15 +738,15 @@ def cmd_report(args):
                 engine["note"] = ("engine /metrics not readable without a secret (vLLM keys it) or not enabled; "
                                   "no direct baseline for this cell")
             cell["engine_side"] = engine
-        # mllm latency view window (router, ingress, engine tiers) when the row saved one.
+        # capyctl latency view window (router, ingress, engine tiers) when the row saved one.
         l_before = os.path.join(evid, "latency", f"{tag}.before.json")
         l_after = os.path.join(evid, "latency", f"{tag}.after.json")
         if os.path.exists(l_before) and os.path.exists(l_after):
             try:
                 series = latencydelta(read_json(l_before), read_json(l_after))
-                cell["mllm_side"] = {"series": series, "overhead": path_overhead(series, cell)}
+                cell["capyctl_side"] = {"series": series, "overhead": path_overhead(series, cell)}
             except (ValueError, KeyError, TypeError) as error:
-                cell["mllm_side"] = {"error": f"{type(error).__name__}: {error}"}
+                cell["capyctl_side"] = {"error": f"{type(error).__name__}: {error}"}
         cells.append(cell)
     lifecycle = []
     life = os.path.join(evid, "lifecycle.jsonl")
@@ -809,16 +809,16 @@ def render_markdown(r):
         for kind, s in r["lifecycle_summary"].items():
             lines.append(f"| {kind} | {s['n']} | {s['failed']} | {fmt(s['p50'], 1000, 0)} | {fmt(s['mean'], 1000, 0)} | "
                          + ", ".join(fmt(x, 1000, 0) for x in s["samples_s"]) + " |")
-    mllm_cells = [c for c in r["cells"] if (c.get("mllm_side") or {}).get("overhead")]
-    if mllm_cells:
-        lines += ["", "Path overhead from the mllm latency view (means, ms): client->router, router pre-forward, "
+    capyctl_cells = [c for c in r["cells"] if (c.get("capyctl_side") or {}).get("overhead")]
+    if capyctl_cells:
+        lines += ["", "Path overhead from the capyctl latency view (means, ms): client->router, router pre-forward, "
                   "router->ingress, ingress->engine TTFT, whole path at TTFT and at the last token. Engine TTFT "
                   "source per cell.", "",
                   "| prompt | C | client->router | pre-forward | router->ingress | ingress->engine | path TTFT "
                   "| path e2e | engine TTFT from |",
                   "|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
-        for c in mllm_cells:
-            o = c["mllm_side"]["overhead"]
+        for c in capyctl_cells:
+            o = c["capyctl_side"]["overhead"]
             lines.append("| {p} | {C} | {a} | {b} | {d} | {e} | {f} | {g} | {h} |".format(
                 p=fmt((c.get("prompt_tokens") or {}).get("p50"), 1, 0), C=c["concurrency"],
                 a=fmt(o.get("client_to_router_ttft_mean_s"), 1000, 2), b=fmt(o.get("router_pre_forward_mean_s"), 1000, 2),

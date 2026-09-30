@@ -3,13 +3,13 @@
 Pass options to the installer after `sh -s --`:
 
 ```bash
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<version> --systemd standalone
+curl -fsSL https://edurdias.github.io/capyctl/install.sh | sh -s -- --version v<version> --systemd standalone
 ```
 
 | Option | What it does |
 |---|---|
 | `--version V` | Install release `V` (for example `v<version>`). Without it, the latest release. A release candidate is only installed when you name it. |
-| `--system` | Install for every user: `/usr/local/bin/mllm` and system units. Run it with `sudo`. |
+| `--system` | Install for every user: `/usr/local/bin/capyctl` and system units. Run it with `sudo`. |
 | `--systemd ROLE` | Also install the systemd unit for `standalone`, `server` or `host`. The unit is not enabled or started. |
 | `--repo OWNER/NAME` | Download from another GitHub repository. |
 | `--uninstall` | Remove the binary and the units the installer wrote. State is kept. |
@@ -17,15 +17,15 @@ curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v<ver
 ## Run standalone as a service
 
 ```bash
-curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --systemd standalone
-mllm engine add ~/venvs/vllm
-systemctl --user enable --now mllm-standalone
+curl -fsSL https://edurdias.github.io/capyctl/install.sh | sh -s -- --systemd standalone
+capyctl engine add ~/venvs/vllm
+systemctl --user enable --now capyctl-standalone
 loginctl enable-linger "$USER"    # keep it running after you log out
 ```
 
-The service uses the same state, engines and `~/models` as `mllm start
+The service uses the same state, engines and `~/models` as `capyctl start
 standalone` in your shell. To change a setting for the service, put its variable in
-`~/.config/mllm/standalone.env`, for example `MLLM_MODELS_ROOT=/srv/models`
+`~/.config/capyctl/standalone.env`, for example `CAPYCTL_MODELS_ROOT=/srv/models`
 ([settings](../operations/configuration.md)).
 
 Stopping or restarting the service leaves running models alone; the next
@@ -36,7 +36,7 @@ start picks them up again.
 The installer downloads with `curl` from the public release URL. For a
 private repository it uses the GitHub CLI when `gh auth login` has been run,
 or the GitHub API when `GITHUB_TOKEN` is set. To install from a mirror, set
-`MLLM_INSTALL_BASE_URL` to a directory holding the release files (`https://`
+`CAPYCTL_INSTALL_BASE_URL` to a directory holding the release files (`https://`
 or `file://`) and pass `--version`.
 
 Service users, hardening, backups and rollback are covered in the

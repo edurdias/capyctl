@@ -15,7 +15,7 @@ model@engine, because vLLM and SGLang kernels may pick a different greedy token
 for the same checkpoint. check passes when the first --prefix tokens (default:
 all) equal the golden's and each compared logprob is within --logprob-tol.
 The checkpoint-digest half of I1 is ledger.py fingerprint against
-checkpoints.json. The API key comes from MLLM_API_KEY only.
+checkpoints.json. The API key comes from CAPYCTL_API_KEY only.
 """
 
 import argparse

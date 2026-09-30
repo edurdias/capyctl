@@ -1,23 +1,23 @@
 # How it works
 
-mllm sits between your apps and the vLLM or SGLang engines on your GPUs. Apps
-see one OpenAI-compatible endpoint. Behind it, mllm starts engines, decides
+capyctl sits between your apps and the vLLM or SGLang engines on your GPUs. Apps
+see one OpenAI-compatible endpoint. Behind it, capyctl starts engines, decides
 which models hold GPU memory, and moves the rest out of the way.
 
-![How requests reach a model through mllm](how-it-works.svg)
+![How requests reach a model through capyctl](how-it-works.svg)
 
 ## One machine or several
 
-On one machine, `mllm start standalone` runs everything in one process: the
+On one machine, `capyctl start standalone` runs everything in one process: the
 endpoint, the scheduler and the engines. This is where most people start.
 
-With several machines, one machine runs `mllm start server` and each GPU
-machine runs `mllm start host`. The server holds the endpoint and decides
+With several machines, one machine runs `capyctl start server` and each GPU
+machine runs `capyctl start host`. The server holds the endpoint and decides
 where each model runs; the hosts start and stop engines when the server asks.
 Hosts and server talk over your private network with mutual TLS. Commands are
 the same in both setups; with several machines you run them on the server.
 
-A discrete card and a unified-memory machine use the same steps. mllm reads
+A discrete card and a unified-memory machine use the same steps. capyctl reads
 the GPU at start. On a discrete card it counts the card's memory and host RAM
 separately; on unified memory it counts the one shared pool.
 
@@ -50,23 +50,23 @@ refused until you start it again.
 
 ## Switching
 
-When a request asks for a parked model and the GPU is full, mllm parks the
+When a request asks for a parked model and the GPU is full, capyctl parks the
 idle model that is in the way, wakes the one asked for, and then answers. It
 waits for requests in progress to finish before it parks anything. If a
-parked copy would not fit in host RAM, mllm stops that model instead and says
+parked copy would not fit in host RAM, capyctl stops that model instead and says
 so.
 
 ## The memory ledger
 
-The memory ledger is mllm's count of how much GPU memory and host RAM each
-model holds or has been promised. mllm checks it before every start, wake and
-switch, so two models never count on the same memory. When mllm cannot tell
+The memory ledger is capyctl's count of how much GPU memory and host RAM each
+model holds or has been promised. capyctl checks it before every start, wake and
+switch, so two models never count on the same memory. When capyctl cannot tell
 whether memory was released, it keeps counting it as used.
 
-## What mllm never does
+## What capyctl never does
 
 - It does not install engines. You register the vLLM or SGLang you already
-  have with `mllm engine add`.
+  have with `capyctl engine add`.
 - It does not touch GPU drivers, CUDA or system packages.
 - It does not expose engines. They listen on loopback with a key made for each
   launch; the endpoint is the only way in.

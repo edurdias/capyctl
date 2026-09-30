@@ -3,7 +3,7 @@
 Start with the [README](README.md), [installation guide](docs/guide/install.md)
 and [configuration reference](docs/operations/configuration.md).
 
-Use [GitHub Issues](https://github.com/edurdias/mllm/issues) for public questions,
+Use [GitHub Issues](https://github.com/edurdias/capyctl/issues) for public questions,
 bug reports, feature requests and documentation feedback. Search existing issues
 first, then choose the closest template. For a usage question, choose the
 question template in the issue chooser. Include what you are trying to do, what you
@@ -11,7 +11,7 @@ have tried and the relevant version and configuration.
 
 For a useful bug report, include:
 
-- `mllm --version`, Linux distribution and architecture.
+- `capyctl --version`, Linux distribution and architecture.
 - GPU model and memory, driver version, and engine name and exact version.
 - Standalone or server/host setup, model identifier and relevant deployment fields.
 - Minimal steps, expected behavior, actual behavior and relevant redacted errors.

@@ -5,8 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-mllm-adapters = { workspace = true }
-mllm-agent = { workspace = true }
+capyctl-adapters = { workspace = true }
+capyctl-agent = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 libc = "0.2"
@@ -14,5 +14,5 @@ serde = { workspace = true }
 serde_json = "1"
 
 [dev-dependencies]
-mllm-testkit = { workspace = true }
+capyctl-testkit = { workspace = true }
 tempfile = { workspace = true }

@@ -1,4 +1,4 @@
-// Owner feedback 2026-09-25: the hero shows exactly what `mllm list
+// Owner feedback 2026-09-25: the hero shows exactly what `capyctl list
 // deployments` prints. Render the fixture again with the CLI's own table code
 // and compare it byte for byte with the block in the built page.
 import { execFileSync } from 'node:child_process';
@@ -10,7 +10,7 @@ import { HERO_COMMAND } from '../src/data/hero.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const data = join(repo, 'site', 'src', 'data');
-const real = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '-p', 'mllm-cli', '--example', 'hero_table', '--',
+const real = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '-p', 'capyctl-cli', '--example', 'hero_table', '--',
   join(data, 'hero-deployments.json'), join(data, 'hero-hosts.json')], {
   cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
 });
@@ -22,4 +22,4 @@ if (page.output !== real) {
   failed = true;
 }
 if (failed) process.exit(1);
-console.log(`hero: byte-identical to mllm list deployments (${real.length} bytes)`);
+console.log(`hero: byte-identical to capyctl list deployments (${real.length} bytes)`);

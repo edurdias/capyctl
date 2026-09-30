@@ -111,8 +111,8 @@ def enforce_closed_plugins():
 
 
 # SPEC §13.3 / T21: a bearer value, or a run of credential-shaped characters as
-# long as mllm's keys (64 hex) or longer than any ordinary token. Mirrors
-# `crates/mllm-adapters/src/vllm/args.rs::redact_text`.
+# long as capyctl's keys (64 hex) or longer than any ordinary token. Mirrors
+# `crates/capyctl-adapters/src/vllm/args.rs::redact_text`.
 _CREDENTIAL = re.compile(r"(?i)(bearer\s+)[^\s'\",;]+|[A-Za-z0-9+/=_-]{48,}")
 
 
@@ -174,7 +174,7 @@ def preimport_guard():
     """
     # Explicit operator development opt-in; plugin checks remain mandatory, and
     # the retained output is scrubbed of credentials (SPEC §13.3).
-    if os.environ.get("MLLM_DEBUG_ENGINE_LOGS") != "1":
+    if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") != "1":
         contain_startup_output()
     else:
         install_log_scrubber()

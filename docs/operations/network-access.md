@@ -1,13 +1,13 @@
 # Reaching inference from other machines
 
-mllm's inference endpoint is the OpenAI-compatible API that clients send
+capyctl's inference endpoint is the OpenAI-compatible API that clients send
 requests to. From 0.1.0 it listens on every interface of the machine and
 requires an API key, so a laptop, a phone or a Tailscale peer can use the models
 on your GPU machine without extra software. This page explains where the key is,
 how to narrow who can connect, and how to put the endpoint on the internet
 safely.
 
-Everything here applies to `mllm start standalone` and `mllm start server`. A
+Everything here applies to `capyctl start standalone` and `capyctl start server`. A
 host role has no inference listener of its own; the server forwards to it over
 its private ingress.
 
@@ -22,21 +22,21 @@ its private ingress.
 
 The key lives in an owner-only file under the role's state directory.
 
-Standalone (the state root is `~/.local/state/mllm` unless `--state-dir` or
-`MLLM_STATE_DIR` names another; the packaged system unit uses
-`/var/lib/mllm/standalone`):
+Standalone (the state root is `~/.local/state/capyctl` unless `--state-dir` or
+`CAPYCTL_STATE_DIR` names another; the packaged system unit uses
+`/var/lib/capyctl/standalone`):
 
 ```bash
-grep '^api_key:' ~/.local/state/mllm/identity/credentials
+grep '^api_key:' ~/.local/state/capyctl/identity/credentials
 ```
 
-Server (created by `mllm init server` in the document's `identity_dir`):
+Server (created by `capyctl init server` in the document's `identity_dir`):
 
 ```bash
-sudo -u mllm python3 -c 'import json; print(json.load(open("/var/lib/mllm/server/identity/server-credentials.json"))["api_key"])'
+sudo -u capyctl python3 -c 'import json; print(json.load(open("/var/lib/capyctl/server/identity/server-credentials.json"))["api_key"])'
 ```
 
-mllm never prints the key. Copy the value to the client machine and keep it
+capyctl never prints the key. Copy the value to the client machine and keep it
 secret. On the client:
 
 ```bash
@@ -49,7 +49,7 @@ request without the key, or with a wrong one, is answered `401`.
 
 The address follows the usual settings rule (see the
 [settings reference](configuration.md#listeners)): `--listen` for one run, then
-`MLLM_INFERENCE_ADDR`, then `listeners.inference.bind` in the document
+`CAPYCTL_INFERENCE_ADDR`, then `listeners.inference.bind` in the document
 (`server.listeners.inference.bind` in a standalone document), then
 `0.0.0.0:8443`. IPv6 is accepted (`[::]:8443`).
 
@@ -60,7 +60,7 @@ there. Binding to the machine's tailnet address keeps the endpoint off the LAN
 and every other interface:
 
 ```bash
-mllm start standalone --listen "$(tailscale ip -4):8443"
+capyctl start standalone --listen "$(tailscale ip -4):8443"
 ```
 
 To keep it, state the same address in the document instead:
@@ -94,19 +94,19 @@ connect, the key decides who can use the models.
 To serve only programs on the GPU machine itself, as releases before 0.1.0 did:
 
 ```bash
-mllm start standalone --listen 127.0.0.1:8443
+capyctl start standalone --listen 127.0.0.1:8443
 ```
 
 or set `listeners.inference.bind: "127.0.0.1:8443"` in the document. The
-`MLLM_INFERENCE_ADDR` variable does the same for a service unit
-(`/etc/mllm/standalone.env` or `server.env`).
+`CAPYCTL_INFERENCE_ADDR` variable does the same for a service unit
+(`/etc/capyctl/standalone.env` or `server.env`).
 
 ## Turning the key off
 
 There are three ways, highest precedence first:
 
 - `--no-inference-auth` for one run;
-- `MLLM_INFERENCE_AUTH=none` in the environment (`api_key` turns it back on);
+- `CAPYCTL_INFERENCE_AUTH=none` in the environment (`api_key` turns it back on);
 - `listeners.inference.authentication: none` in the document
   (`server.listeners.inference.authentication` in standalone).
 
@@ -119,7 +119,7 @@ Anyone who can reach this address can use your models and GPU.
 Set listeners.inference.authentication: api_key, or bind to 127.0.0.1 or a Tailscale address with --listen.
 ```
 
-and `mllm status` shows `inference: unauthenticated on 0.0.0.0:8443`. On a
+and `capyctl status` shows `inference: unauthenticated on 0.0.0.0:8443`. On a
 loopback address nothing is printed.
 
 Do not turn the key off beyond loopback. Anyone who can reach the address can
@@ -129,7 +129,7 @@ fallback key: if the credentials file cannot be read, the role refuses to start.
 
 ## Internet exposure through a TLS reverse proxy
 
-mllm does not terminate TLS. To reach the endpoint from the internet, keep mllm
+capyctl does not terminate TLS. To reach the endpoint from the internet, keep capyctl
 on `127.0.0.1:8443` (or on the tailnet address, with the proxy on another
 tailnet machine) and put a TLS reverse proxy in front of it. With Caddy, which
 obtains and renews the certificate itself:
@@ -150,17 +150,17 @@ Open only port 443 to the internet, never 8443.
 
 - **Management.** The management API (deploy, start, stop, status) stays on
   loopback with its own admin token, on every role and in every release. Manage
-  a machine remotely with `ssh` and the local `mllm` commands, which use the
+  a machine remotely with `ssh` and the local `capyctl` commands, which use the
   role running there. A server's
   bootstrap and control listeners keep mutual TLS for enrolled hosts.
 - **Engines.** vLLM and SGLang listen on loopback ports only, each with a key
-  generated for that launch and checked by mllm's guard. The router
+  generated for that launch and checked by capyctl's guard. The router
   is the only path from the network to an engine, and it forwards only the
   allowlisted inference routes.
 
 ## Upgrading from an earlier release
 
-mllm never rewrites your configuration. A document an earlier release
+capyctl never rewrites your configuration. A document an earlier release
 generated keeps its `127.0.0.1:8443` inference bind, so inference stays on the
 machine until you change it. To serve the network, set the bind to
 `0.0.0.0:8443` (or the machine's Tailscale address) or start with

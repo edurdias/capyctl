@@ -2,8 +2,8 @@
 # Snapshot, sync and build for the matrix (plan unit W2).
 #
 #   sync.sh snapshot        copy the worktree to target/live/matrix/snapshot/tree, record its digest
-#   sync.sh push [host..]   rsync the snapshot to ~/mllm-f2 on the hosts and verify the digest there
-#   sync.sh build [host..]  build target/release/mllm from the snapshot on control-host and on the hosts,
+#   sync.sh push [host..]   rsync the snapshot to ~/capyctl-f2 on the hosts and verify the digest there
+#   sync.sh build [host..]  build target/release/capyctl from the snapshot on control-host and on the hosts,
 #                           then scripts/check-release-clean.sh on every binary built
 #   sync.sh runtime [host..] resync only runtime/ and verify files and permissions
 #                           (development only: the matrix host documents declare
@@ -20,10 +20,10 @@
 SNAP_EXCLUDES=(--exclude target --exclude .git --exclude '.*/'
   --exclude '*.log' --exclude __pycache__)
 # Files a host runtime directory must hold before any launch (WE2: vLLM runs
-# through vllm_entry.py; development mode loads mllm_vllm_guard.py; WE3 checkpoint
+# through vllm_entry.py; development mode loads capyctl_vllm_guard.py; WE3 checkpoint
 # identity runs through pinned_file_observation.py; SGLang parking enrolls the
 # saver observation through sglang_observation_enrollment.py).
-RUNTIME_REQUIRED=(sglang_entry.py sglang_device.py sglang_server_args.py vllm_entry.py mllm_vllm_guard.py pinned_file_observation.py
+RUNTIME_REQUIRED=(sglang_entry.py sglang_device.py sglang_server_args.py vllm_entry.py capyctl_vllm_guard.py pinned_file_observation.py
   sglang_observation_enrollment.py sglang_saver_residency.py sglang_observation_server.py sglang_observation_transport.py
   sglang_scheduler_observer.py sglang_saver_binding.py memory_saver_observer.py owner_only.py engine_capabilities.py)
 
@@ -35,7 +35,7 @@ snapshot() {
   # Content comparison, no source mtimes: a file edited in the worktree before the
   # last build but copied after it would otherwise keep an older mtime than the
   # build's fingerprint, and cargo would reuse stale artifacts (found live, M16:
-  # an unresolved `mllm_scheduler::placement` from a stale mllm-scheduler rlib).
+  # an unresolved `capyctl_scheduler::placement` from a stale capyctl-scheduler rlib).
   # Copied files get the copy time; unchanged files keep theirs.
   x rsync -rlpD --checksum --delete --chmod=Dgo-w,Fgo-w "${SNAP_EXCLUDES[@]}" "$REPO/" "$SNAPSHOT/tree/"
   if dry; then log_cmd control-host "(cd $SNAPSHOT/tree && $TREE_DIGEST_SH) > $SNAPSHOT/tree.sha256"; return 0; fi
@@ -53,7 +53,7 @@ push() {
   want=$(snapshot_digest)
   for host in $(hosts_or_all "$@"); do
     # Group/other write is stripped: the protected wrappers refuse any ancestor
-    # or file that others can write (Phase B found mllm_vllm_guard.py at 0664).
+    # or file that others can write (Phase B found capyctl_vllm_guard.py at 0664).
     # Same reason as the snapshot: compare content, never carry mtimes across.
     x rsync -rlpDz --checksum --delete --chmod=Dgo-w,Fgo-w "${SNAP_EXCLUDES[@]}" "$SNAPSHOT/tree/" "$host:$REMOTE_TREE/"
     got=$(rsh_out "$host" "$want" "cd $REMOTE_TREE && $TREE_DIGEST_SH")
@@ -66,15 +66,15 @@ build() {
   local host out
   dry || mkdir -p "$RUNSTATE"
   # control-host: the server binary is built from the snapshot, not the live worktree.
-  x cargo build --release --locked --bin mllm --manifest-path "$SNAPSHOT/tree/Cargo.toml" --target-dir "$LIVE/build"
+  x cargo build --release --locked --bin capyctl --manifest-path "$SNAPSHOT/tree/Cargo.toml" --target-dir "$LIVE/build"
   # The shipped binary carries no test engine (M75's other half); checked on the
   # binary this build produced, as on each host below.
   # shellcheck disable=SC2016  # $1 expands in the inner shell
   x env CARGO_TARGET_DIR="$LIVE/build" bash -c 'cd "$1" && bash scripts/check-release-clean.sh' _ "$SNAPSHOT/tree"
-  if ! dry; then sha256sum "$LIVE/build/release/mllm" | tee "$RUNSTATE/binary-control-host.txt"; fi
+  if ! dry; then sha256sum "$LIVE/build/release/capyctl" | tee "$RUNSTATE/binary-control-host.txt"; fi
   for host in $(hosts_or_all "$@"); do
-    out=$(rsh_out "$host" "<sha256>  $REMOTE_TREE/target/release/mllm" \
-      "export PATH=\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH PROTOC=\$HOME/.local/bin/protoc; cd $REMOTE_TREE && cargo build --release --locked --bin mllm && bash scripts/check-release-clean.sh && sha256sum target/release/mllm")
+    out=$(rsh_out "$host" "<sha256>  $REMOTE_TREE/target/release/capyctl" \
+      "export PATH=\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH PROTOC=\$HOME/.local/bin/protoc; cd $REMOTE_TREE && cargo build --release --locked --bin capyctl && bash scripts/check-release-clean.sh && sha256sum target/release/capyctl")
     dry || printf '%s\n' "$out" | tail -1 | tee "$RUNSTATE/binary-$host.txt"
   done
 }

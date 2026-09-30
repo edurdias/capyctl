@@ -419,7 +419,7 @@ class ObservationTransportTests(unittest.TestCase):
     # so a restarted host (any PID of the service UID) can observe; exactly one
     # of the enrolled peer or the key is accepted at construction.
     def test_key_mode_authenticates_requests_by_proof_not_peer_pid(self):
-        # The same vectors crates/mllm-adapters/src/sglang/observation.rs computes.
+        # The same vectors crates/capyctl-adapters/src/sglang/observation.rs computes.
         vector = self.module.observation_key("admin", "binding", "incarnation")
         self.assertEqual(vector.hex(),
                          "57fccc735da4dbf27df1429ffdd32592821c41c56fa440fe7ed32aa97411581e")
@@ -455,7 +455,7 @@ class ObservationTransportTests(unittest.TestCase):
         with redirect_stderr(stream):
             run()
         return [json.loads(line) for line in stream.getvalue().splitlines()
-                if '"mllm_observation_served"' in line]
+                if '"capyctl_observation_served"' in line]
 
     def test_each_connection_reports_where_it_stopped_and_what_the_scheduler_did(self):
         # Found live 2026-09-24 (rc.2, M28 sa-14): a scheduler that never

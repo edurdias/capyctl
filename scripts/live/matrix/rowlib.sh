@@ -157,14 +157,14 @@ echo '## host.log'; grep -aE 'ERROR|WARN|refus|fail' $RRD/host.log | grep -viE '
 
 # The host holds no engine: no engine process, no GPU compute process, no
 # SGLang rendezvous directory (found live 2026-09-23: a signalled stop left
-# /tmp/mllm-rdzv-*) and, when a port is given, nothing listening on it. Prints LEFTOVER_* on a finding. Rows
+# /tmp/capyctl-rdzv-*) and, when a port is given, nothing listening on it. Prints LEFTOVER_* on a finding. Rows
 # that use it run with no other deployment active on that host.
 host_clean() { # host_clean <host> [port]
   local host=$1 port=${2:-}
   rsh "$host" "echo '## engine procs'; pgrep -af '$ENGINE_PGREP' | grep -vE 'pgrep|tailscaled|bash -c' && echo LEFTOVER_ENGINE; \
 echo '## compute apps'; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | grep . && echo LEFTOVER_GPU; \
 echo '## port ${port:-none}'; [ -n '$port' ] && ss -ltn | grep -E ':$port\\b' && echo LEFTOVER_PORT; \
-echo '## rendezvous'; ls -d /tmp/mllm-rdzv-* $RRD/host/rendezvous/* 2>/dev/null | grep . && echo LEFTOVER_RDZV; true"
+echo '## rendezvous'; ls -d /tmp/capyctl-rdzv-* $RRD/host/rendezvous/* 2>/dev/null | grep . && echo LEFTOVER_RDZV; true"
 }
 
 # host_idle <host>: host_clean as a precondition; fails on any leftover.

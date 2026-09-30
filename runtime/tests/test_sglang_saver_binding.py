@@ -55,7 +55,7 @@ class HostBackedBindingTest(unittest.TestCase):
 class SaverBindingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix="mllm-saver-binding-", dir=Path.home())
+        cls.temp = tempfile.TemporaryDirectory(prefix="capyctl-saver-binding-", dir=Path.home())
         cls.root = Path(cls.temp.name)
         cls.root.chmod(0o700)
         source = cls.root / "fixture.c"
@@ -222,7 +222,7 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
                 self.assertEqual(self.observe().library.sha256, self.digest)
                 self.observe()
             lines = [line for line in log.getvalue().splitlines() if line]
-            self.assertEqual(lines, ['{"event":"mllm_saver_library_permissions",'
+            self.assertEqual(lines, ['{"event":"capyctl_saver_library_permissions",'
                                      '"problem":"writable_by_other","action":"warned"}'])
             self.assertNotIn(str(self.path), log.getvalue())
         finally:

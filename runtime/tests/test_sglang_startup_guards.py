@@ -124,7 +124,7 @@ class StartupGuardsTests(unittest.TestCase):
         child = self.child("""
             from runtime.sglang_startup_guards import preimport_guard, StartupGuardError
             import os
-            os.environ["MLLM_DEBUG_ENGINE_LOGS"] = "1"
+            os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = "1"
             os.environ["SGLANG_PLATFORM"] = "untrusted"
             try:
                 preimport_guard()
@@ -139,12 +139,12 @@ class StartupGuardsTests(unittest.TestCase):
 
     # T21: SPEC §13.3. Debug engine logs keep output but never a credential:
     # log records and Python-level writes are scrubbed of bearer values and
-    # credential-shaped runs (mllm's keys are 64 hex characters).
+    # credential-shaped runs (capyctl's keys are 64 hex characters).
     def test_debug_output_is_scrubbed_of_credentials(self):
         key = "ab" * 32
         child = self.child(f"""
             import logging, os, sys
-            os.environ["MLLM_DEBUG_ENGINE_LOGS"] = "1"
+            os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = "1"
             from runtime.sglang_startup_guards import preimport_guard
             preimport_guard()
             logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")

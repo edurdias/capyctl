@@ -2,7 +2,7 @@
 # Live rows DG1-DG7 on a discrete-GPU machine (plan Task 19). It runs on that
 # machine itself: a standalone role (or a server and a host role for DG7) of the
 # binary under test, the vLLM and SGLang environments registered with
-# `mllm engine add`, and two instruct models in the models directory.
+# `capyctl engine add`, and two instruct models in the models directory.
 #
 #   scripts/live/matrix/discrete_gpu.sh prepare     # register both engines
 #   scripts/live/matrix/discrete_gpu.sh dg1         # one row
@@ -13,7 +13,7 @@
 # DGPU_HOST, DGPU_VLLM_VENV, DGPU_SGLANG_VENV, DGPU_MODEL_A (the larger model)
 # and DGPU_MODEL_B, plus optional DGPU_LISTEN_ADDR (this machine's own
 # tailnet or LAN address, for DG6), DGPU_PREVIOUS_BIN (a previous release, for
-# DG6) and DGPU_STATE (default ~/mllm-dgpu-live; owner-only ancestors).
+# DG6) and DGPU_STATE (default ~/capyctl-dgpu-live; owner-only ancestors).
 #
 # Evidence goes to target/live/dgpu/<row>.log (untracked). The harness records
 # what happened; it does not decide whether a row passed. CPU and Fake-engine
@@ -27,7 +27,7 @@ set -euo pipefail
 
 MATRIX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$MATRIX_DIR/../../.." && pwd)
-HOSTS_ENV=${MLLM_MATRIX_HOSTS_ENV:-$MATRIX_DIR/hosts.local.env}
+HOSTS_ENV=${CAPYCTL_MATRIX_HOSTS_ENV:-$MATRIX_DIR/hosts.local.env}
 die() { echo "discrete_gpu: $*" >&2; exit 2; }
 [ -f "$HOSTS_ENV" ] || die "missing $HOSTS_ENV (copy hosts.example.env and set the DGPU_ values)"
 # shellcheck disable=SC1090
@@ -37,13 +37,13 @@ for _v in DGPU_HOST DGPU_VLLM_VENV DGPU_SGLANG_VENV DGPU_MODEL_A DGPU_MODEL_B; d
 done
 unset _v
 
-MLLM_BIN=${MLLM_BIN:-$REPO/target/release/mllm}
-STATE=${DGPU_STATE:-$HOME/mllm-dgpu-live}
-LIVE=${MLLM_DGPU_LIVE:-$REPO/target/live/dgpu}
+CAPYCTL_BIN=${CAPYCTL_BIN:-$REPO/target/release/capyctl}
+STATE=${DGPU_STATE:-$HOME/capyctl-dgpu-live}
+LIVE=${CAPYCTL_DGPU_LIVE:-$REPO/target/live/dgpu}
 PORT=8443
 PORTS=${DGPU_ENGINE_PORTS:-8300-8399}
 mkdir -p "$LIVE"
-mllm() { "$MLLM_BIN" --state-dir "$STATE" "$@"; }
+capyctl() { "$CAPYCTL_BIN" --state-dir "$STATE" "$@"; }
 ROLE_PID=
 ROLE_LOG=
 CREATED=()
@@ -60,7 +60,7 @@ gpu_apps() {
       echo "pid=$pid gpu_mib=$mib host_mib=$host"
     done
 }
-state_of() { mllm list deployments 2>/dev/null | awk -v n="$1" '$1 == n {print $4}'; }
+state_of() { capyctl list deployments 2>/dev/null | awk -v n="$1" '$1 == n {print $4}'; }
 wait_state() { # wait_state <deployment> <state> [seconds]
   local i
   for i in $(seq $((${3:-120} * 2))); do
@@ -74,7 +74,7 @@ start_role() { # start_role <log name> [start args...]
   local log=$LIVE/$1.log
   ROLE_LOG=$log
   shift
-  setsid "$MLLM_BIN" --state-dir "$STATE" start standalone --engine-ports "$PORTS" "$@" \
+  setsid "$CAPYCTL_BIN" --state-dir "$STATE" start standalone --engine-ports "$PORTS" "$@" \
     >"$log" 2>&1 </dev/null &
   ROLE_PID=$!
   local i
@@ -96,8 +96,8 @@ stop_role() {
 cleanup() {
   local status=$?
   if [ -n "$ROLE_PID" ] && [ "${#CREATED[@]}" -gt 0 ]; then
-    for d in "${CREATED[@]}"; do mllm delete deployment "$d" --stop >/dev/null 2>&1 || true; done
-    mllm drain standalone >/dev/null 2>&1 || true
+    for d in "${CREATED[@]}"; do capyctl delete deployment "$d" --stop >/dev/null 2>&1 || true; done
+    capyctl drain standalone >/dev/null 2>&1 || true
   fi
   stop_role
   exit "$status"
@@ -123,18 +123,18 @@ deploy() {
     for line in "$@"; do echo "$line"; done
   } >"$file"
   say "deploy $name ($engine, $model, ${residency:-default residency})"
-  mllm deploy model --file "$file" 2>&1 | grep -v '^warning' | tail -1 | tee -a "$LOG"
+  capyctl deploy model --file "$file" 2>&1 | grep -v '^warning' | tail -1 | tee -a "$LOG"
   CREATED+=("$name")
   # The checkpoint digest is measured after acceptance; wait for it.
   local i
   for i in $(seq 240); do
-    mllm --json status deployment "$name" 2>/dev/null |
+    capyctl --json status deployment "$name" 2>/dev/null |
       grep -q '"checkpoint_digest":{[^}]*"state":"recorded"' && return 0
     sleep 0.5
   done
   say "$name: checkpoint digest not recorded after 120 s"
 }
-undeploy() { mllm delete deployment "$1" --stop 2>&1 | tail -1 | tee -a "$LOG"; }
+undeploy() { capyctl delete deployment "$1" --stop 2>&1 | tail -1 | tee -a "$LOG"; }
 
 key() { sed -n 's/^api_key: *//p' "$STATE/identity/credentials" | tr -d '"'; }
 # request <row log> <route> [addr]: one chat completion, timed.
@@ -149,7 +149,7 @@ request() {
     printf '%s request %s: HTTP %s in %.2fs\n' "$(date +%T)" "$route" "$code" "$(echo "$EPOCHREALTIME - $t0" | bc)"
     echo "  body: ${out% HTTP*}" | cut -c1-220
     echo "  gpu used MiB: $(gpu_used)"; gpu_apps | sed 's/^/  /'
-    mllm list deployments 2>/dev/null | sed 's/^/  /'
+    capyctl list deployments 2>/dev/null | sed 's/^/  /'
     echo "  MemAvailable MiB: $(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)"
   } | tee -a "$LIVE/$log.log"
   [ "$code" = 200 ]
@@ -160,11 +160,11 @@ switch_notes() { # the switch outcomes this run's role logged
 }
 
 prepare() {
-  mllm engine list 2>/dev/null | awk '{print $1}' | grep -qx vllm || mllm engine add "$DGPU_VLLM_VENV"
+  capyctl engine list 2>/dev/null | awk '{print $1}' | grep -qx vllm || capyctl engine add "$DGPU_VLLM_VENV"
   # An SGLang profile carries no host-fixed arguments; the Triton attention
   # backend goes in each SGLang deployment's extra_args (deploy above).
-  mllm engine list 2>/dev/null | awk '{print $1}' | grep -qx sglang || mllm engine add "$DGPU_SGLANG_VENV"
-  mllm engine list | tee -a "$LOG"
+  capyctl engine list 2>/dev/null | awk '{print $1}' | grep -qx sglang || capyctl engine add "$DGPU_SGLANG_VENV"
+  capyctl engine list | tee -a "$LOG"
 }
 
 # The switching rows share one shape: A cold, B (A released), A (B released), B again.
@@ -181,7 +181,7 @@ switch_row() { # switch_row <row> <engine A> <engine B> <residency>
   undeploy "$b"
   request "$row" "$a" || true
   local t0=$EPOCHREALTIME
-  mllm park deployment "$a" >/dev/null 2>&1 || true
+  capyctl park deployment "$a" >/dev/null 2>&1 || true
   wait_state "$a" parked 120 || say "$a did not park"
   printf '  parked %s in %.2fs: gpu used MiB %s\n' "$a" "$(echo "$EPOCHREALTIME - $t0" | bc)" "$(gpu_used)" |
     tee -a "$LIVE/$row.log"; gpu_apps | sed 's/^/  /' | tee -a "$LIVE/$row.log"
@@ -204,11 +204,11 @@ dg5_refusal() {
   t0=$EPOCHREALTIME
   printf 'name: dg5-big\nengine: vllm\nmodel: %s\nengine_config:\n  memory:\n    kv_cache: 12GiB\n' \
     "$DGPU_MODEL_A" >"$LIVE/deploy-dg5-big.yaml"
-  mllm deploy model --file "$LIVE/deploy-dg5-big.yaml" >"$LIVE/dg5.out" 2>&1 || status=$?
+  capyctl deploy model --file "$LIVE/deploy-dg5-big.yaml" >"$LIVE/dg5.out" 2>&1 || status=$?
   CREATED+=(dg5-big)
   printf 'deploy exit %s after %.2fs\n' "$status" "$(echo "$EPOCHREALTIME - $t0" | bc)" | tee -a "$LIVE/dg5.log"
   status=0
-  mllm start deployment dg5-big --wait >"$LIVE/dg5-start.out" 2>&1 || status=$?
+  capyctl start deployment dg5-big --wait >"$LIVE/dg5-start.out" 2>&1 || status=$?
   {
     printf 'start --wait exit %s, %.2fs after the deploy\n' "$status" "$(echo "$EPOCHREALTIME - $t0" | bc)"
     grep -v '^warning\|^Request identity' "$LIVE/dg5-start.out" | tail -1
@@ -251,7 +251,7 @@ dg6_network() {
   stop_role; start_role role-dg6b --listen "127.0.0.1:$PORT"
   echo "bound to loopback, $addr: HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$addr:$PORT/v1/models" || true)" |
     tee -a "$LIVE/dg6.log"
-  mllm config show 2>&1 | grep -E 'SETTING|inference|models_root|model_store|engine_ports|endpoint_port' | tee -a "$LIVE/dg6.log"
+  capyctl config show 2>&1 | grep -E 'SETTING|inference|models_root|model_store|engine_ports|endpoint_port' | tee -a "$LIVE/dg6.log"
 }
 
 # Upgrade from a previous release: its standalone document keeps the old
@@ -264,13 +264,13 @@ dg6_migration() {
   mkdir -m 700 "$mig"
   "$old" --version | tee -a "$LIVE/dg6.log"
   # A previous release names its state root by variable only.
-  MLLM_STATE_DIR=$mig MLLM_VLLM_BIN=$DGPU_VLLM_VENV/bin/vllm MLLM_MODELS_ROOT=$HOME/models \
+  CAPYCTL_STATE_DIR=$mig CAPYCTL_VLLM_BIN=$DGPU_VLLM_VENV/bin/vllm CAPYCTL_MODELS_ROOT=$HOME/models \
     setsid "$old" start standalone >"$LIVE/dg6-previous.log" 2>&1 </dev/null &
   pid=$!; sleep 8; kill -TERM "$pid"; wait "$pid" 2>/dev/null || true
   grep -n 'bind' "$mig/config/standalone.yaml" | tee -a "$LIVE/dg6.log"
   local i
   for i in 1 2; do
-    setsid "$MLLM_BIN" --state-dir "$mig" start standalone --engine-ports "$PORTS" \
+    setsid "$CAPYCTL_BIN" --state-dir "$mig" start standalone --engine-ports "$PORTS" \
       --listen "127.0.0.1:$PORT" >"$LIVE/dg6-upgrade-$i.log" 2>&1 </dev/null &
     pid=$!; sleep 8; kill -TERM "$pid"; wait "$pid" 2>/dev/null || true
     echo "start $i notices: $(grep -ci 'notice\|0.0.0.0' "$LIVE/dg6-upgrade-$i.log")" | tee -a "$LIVE/dg6.log"

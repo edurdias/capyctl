@@ -52,13 +52,13 @@ jobs:
         run: |
           packaging/release.sh dist
           packaging/release.sh "$RUNNER_TEMP/repeat"
-          for archive in dist/mllm-*.tar.gz; do
+          for archive in dist/capyctl-*.tar.gz; do
             cmp "$archive" "$RUNNER_TEMP/repeat/$(basename "$archive")"
           done
       - name: Verify package and installer
         # The maintainer-only privacy inputs are absent on hosted runners.
         # Their explicit SKIP reports must be reviewed separately before publication.
-        run: scripts/verify-packaging.sh dist/mllm-*.tar.gz
+        run: scripts/verify-packaging.sh dist/capyctl-*.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.arch }}

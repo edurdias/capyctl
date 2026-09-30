@@ -1,7 +1,7 @@
 """Shared HTTP client for the matrix harness (plan unit W2).
 
 Talks only to the server's loopback inference listener; clients never reach a
-host agent or engine directly. The API key comes from MLLM_API_KEY, which
+host agent or engine directly. The API key comes from CAPYCTL_API_KEY, which
 lib.sh fills from server-credentials.json; it is never printed or recorded.
 Standard library only.
 """
@@ -13,15 +13,15 @@ import time
 import urllib.parse
 import uuid
 
-DEFAULT_BASE = os.environ.get("MLLM_INFER_URL", "http://127.0.0.1:8443")
+DEFAULT_BASE = os.environ.get("CAPYCTL_INFER_URL", "http://127.0.0.1:8443")
 # Response headers recorded as evidence; anything credential-shaped is dropped.
 _DROP = ("authorization", "cookie", "set-cookie", "x-api-key")
 
 
 def api_key():
-    key = os.environ.get("MLLM_API_KEY")
+    key = os.environ.get("CAPYCTL_API_KEY")
     if not key:
-        raise SystemExit("MLLM_API_KEY is not set (lib.sh load_api_key)")
+        raise SystemExit("CAPYCTL_API_KEY is not set (lib.sh load_api_key)")
     return key
 
 

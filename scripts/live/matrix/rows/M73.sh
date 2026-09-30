@@ -75,7 +75,7 @@ joined = " ".join(argv)
 missing = []
 if engine == "vllm":
     want = ["vllm_entry.py", "--host", "--served-model-name", "--tensor-parallel-size",
-            "--pipeline-parallel-size", "--port", "--mllm-user-args"]
+            "--pipeline-parallel-size", "--port", "--capyctl-user-args"]
     if fixture.get("residency") == "deep":
         want += ["--enable-sleep-mode", "--middleware"]
     missing = [w for w in want if w not in joined]
@@ -95,7 +95,7 @@ PY
 
 # L3, router half: no key is refused; /metrics is not a router path.
 router_probe() {
-  dry && { log_cmd control-host "GET 127.0.0.1:8443/v1/models without a key (want 401/403); GET /metrics with the key from MLLM_API_KEY (want 404)"; return 0; }
+  dry && { log_cmd control-host "GET 127.0.0.1:8443/v1/models without a key (want 401/403); GET /metrics with the key from CAPYCTL_API_KEY (want 404)"; return 0; }
   python3 - <<'PY'
 import http.client, json, os, sys
 def get(path, key):
@@ -105,7 +105,7 @@ def get(path, key):
     c.close()
     return status
 unkeyed = get("/v1/models", None)
-metrics = get("/metrics", os.environ["MLLM_API_KEY"])
+metrics = get("/metrics", os.environ["CAPYCTL_API_KEY"])
 ok = unkeyed in (401, 403) and metrics == 404
 print(json.dumps({"unkeyed_models": unkeyed, "keyed_metrics": metrics, "ok": ok}))
 sys.exit(0 if ok else 1)

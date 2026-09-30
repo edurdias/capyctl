@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The shipped binary must carry no test engine.
 #
-# The Fake engine, the fake launcher and their fixtures live in mllm-testkit,
+# The Fake engine, the fake launcher and their fixtures live in capyctl-testkit,
 # which every other crate reaches only through [dev-dependencies]. This check is
 # what keeps that true after a careless edit: a release build carrying the Fake
 # would ship a lane in which a deployment reports Ready with no engine behind it.
@@ -18,19 +18,19 @@
 # runner made for live_vllm.rs L10 (matrix row M75 is the other half).
 set -euo pipefail
 
-cargo build --release --bin mllm --offline
+cargo build --release --bin capyctl --offline
 
-artifacts=$(strings "${CARGO_TARGET_DIR:-target}/release/mllm" |
-  grep -E "FakeEngine|FakeLauncher|mllm_testkit|mllm-testkit|src/fake/|fake-engine|fake-lifecycle" || true)
+artifacts=$(strings "${CARGO_TARGET_DIR:-target}/release/capyctl" |
+  grep -E "FakeEngine|FakeLauncher|capyctl_testkit|capyctl-testkit|src/fake/|fake-engine|fake-lifecycle" || true)
 if [ -n "$artifacts" ]; then
   echo "release binary contains test artifacts:" >&2
   echo "$artifacts" >&2
   exit 1
 fi
 
-tree=$(cargo tree -p mllm-cli -e normal --offline)
-if grep -q "mllm-testkit" <<<"$tree"; then
-  echo "mllm-testkit is a normal dependency" >&2
+tree=$(cargo tree -p capyctl-cli -e normal --offline)
+if grep -q "capyctl-testkit" <<<"$tree"; then
+  echo "capyctl-testkit is a normal dependency" >&2
   exit 1
 fi
 

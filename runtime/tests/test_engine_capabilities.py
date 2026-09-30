@@ -1,7 +1,7 @@
 """Capability probes against synthetic engine package trees (ADR 0008).
 
 Owner decision 2026-09-23: engine installation files get no hard-coded hashes
-and no permission rule; the internals mllm hooks are probed by shape at launch
+and no permission rule; the internals capyctl hooks are probed by shape at launch
 and a missing one refuses only the dependent feature. Every tree here is a
 synthetic stand-in written by the test (a "custom build" whose file bytes match
 no stock release). These are CPU fixtures, never evidence that a build serves
@@ -140,12 +140,12 @@ def probe_cli(engine, tree):
 
 class CapabilityProbeTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="mllm-capabilities-")
+        self.directory = tempfile.TemporaryDirectory(prefix="capyctl-capabilities-")
         self.addCleanup(self.directory.cleanup)
         self.tree = Path(self.directory.name) / "site-packages"
 
     # T21 T22: a custom SGLang build (bytes match no stock release) that keeps
-    # the shapes mllm hooks reports every capability available.
+    # the shapes capyctl hooks reports every capability available.
     def test_custom_sglang_build_with_every_shape_is_fully_capable(self):
         sglang_tree(self.tree, saver_hooks=True)
         result = probe_cli("sglang", self.tree)
@@ -258,7 +258,7 @@ class SglangEntryCapabilityTests(unittest.TestCase):
     """The protected entry's launch boundary against synthetic custom builds."""
 
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="mllm-custom-sglang-")
+        self.directory = tempfile.TemporaryDirectory(prefix="capyctl-custom-sglang-")
         self.addCleanup(self.directory.cleanup)
         self.tree = Path(self.directory.name) / "venv" / "site-packages"
 

@@ -22,7 +22,7 @@
 #           requests and the difference is the router + ingress + agent + network path.
 #           vLLM keys /metrics and the harness never reads engine keys, so the scrape
 #           gives vLLM no direct baseline; its periodic throughput log lines are kept.
-#           For both engines the row also saves the server's mllm latency view
+#           For both engines the row also saves the server's capyctl latency view
 #           (`status deployment --format json`, field `latency`) before and after
 #           each cell: router phases, host ingress times and the engine histograms
 #           the host agent forwards (`source: engine`, vLLM included). `bench.py
@@ -36,9 +36,9 @@
 #           a cold start of B; later ones wake a parked B when residency is deep.
 #
 # Evidence: target/live/matrix/M80-<tag>/ with cells/*.json, records.jsonl (per-chunk
-# timestamps), metrics/*.prom, latency/*.json (mllm latency view per cell), lifecycle.jsonl, netfloor.json, pagecache.txt,
+# timestamps), metrics/*.prom, latency/*.json (capyctl latency view per cell), lifecycle.jsonl, netfloor.json, pagecache.txt,
 # switch-states.txt, marks.txt, E0 snapshots, cleanup checks, bench.json and summary.md.
-# The API key is used by bench.py from MLLM_API_KEY only; no engine key is read.
+# The API key is used by bench.py from CAPYCTL_API_KEY only; no engine key is read.
 #
 # Helper copied rather than shared (merge into rowlib.sh later): m80_engine_throughput
 # is engine_log_lines with a narrower credential filter, because engine_log_lines drops
@@ -83,7 +83,7 @@ m80_scrape() { # m80_scrape <host> <port> <file>
     >"$( dry && echo /dev/null || echo "$out")" || true
 }
 
-# The server's mllm latency view for one deployment, through the CLI (the
+# The server's capyctl latency view for one deployment, through the CLI (the
 # harness never reads the admin token). Owner decision 2026-09-23.
 m80_latency() { # m80_latency <deployment> <file>
   dry && return 0
