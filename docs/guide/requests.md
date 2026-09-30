@@ -121,6 +121,15 @@ A request for a parked model waits while mllm wakes it, then answers. It
 takes longer than usual; nothing else changes for the client. See
 [Parking and switching](parking.md).
 
+## The first request after a new engine install
+
+The first request an engine serves after it is installed or upgraded can take
+a minute or more, even when the deployment is `ready`. SGLang, in particular,
+compiles some GPU kernels the first time they run (one laptop RTX 4090 took
+97 s for its first request, then under 0.3 s). The engine caches the build, so
+later requests and later launches are fast. Use a client timeout of a few
+minutes for that first request.
+
 ## From another machine
 
 Use the machine's name, LAN address or Tailscale address instead of
