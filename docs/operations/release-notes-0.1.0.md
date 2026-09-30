@@ -39,6 +39,9 @@ engines or drivers.
   flag or an environment variable; `mllm config show` prints each value and
   where it came from.
 - **systemd units** for the standalone, server and host roles.
+- Commands print readable text by default: tables for lists, and a summary
+  with key-value details for single results. Add `--json` for scripts. Roles
+  print text in a terminal and JSON lines to the journal and log files.
 
 ## Known limits
 

@@ -329,6 +329,11 @@ setuid helper such as `nvidia-modprobe` cannot create missing device nodes from
 inside the service; make sure the driver's device nodes exist at boot
 (for example with `nvidia-persistenced`).
 
+Services log one JSON object per line, because their output is not a
+terminal. Read them as they come with `journalctl -u mllm-host -o cat`, or
+pretty-printed with `journalctl -u mllm-host -o cat | jq`. For text in the
+journal, add `--format text` to `ExecStart=` in a drop-in.
+
 ### Server
 
 ```bash
