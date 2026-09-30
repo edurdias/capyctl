@@ -1,6 +1,6 @@
 # Reaching inference from other machines
 
-capyctl's inference endpoint is the OpenAI-compatible API that clients send
+CapyCTL's inference endpoint is the OpenAI-compatible API that clients send
 requests to. From 0.1.0 it listens on every interface of the machine and
 requires an API key, so a laptop, a phone or a Tailscale peer can use the models
 on your GPU machine without extra software. This page explains where the key is,
@@ -36,7 +36,7 @@ Server (created by `capyctl init server` in the document's `identity_dir`):
 sudo -u capyctl python3 -c 'import json; print(json.load(open("/var/lib/capyctl/server/identity/server-credentials.json"))["api_key"])'
 ```
 
-capyctl never prints the key. Copy the value to the client machine and keep it
+CapyCTL never prints the key. Copy the value to the client machine and keep it
 secret. On the client:
 
 ```bash
@@ -129,7 +129,7 @@ fallback key: if the credentials file cannot be read, the role refuses to start.
 
 ## Internet exposure through a TLS reverse proxy
 
-capyctl does not terminate TLS. To reach the endpoint from the internet, keep capyctl
+CapyCTL does not terminate TLS. To reach the endpoint from the internet, keep CapyCTL
 on `127.0.0.1:8443` (or on the tailnet address, with the proxy on another
 tailnet machine) and put a TLS reverse proxy in front of it. With Caddy, which
 obtains and renews the certificate itself:
@@ -154,13 +154,13 @@ Open only port 443 to the internet, never 8443.
   role running there. A server's
   bootstrap and control listeners keep mutual TLS for enrolled hosts.
 - **Engines.** vLLM and SGLang listen on loopback ports only, each with a key
-  generated for that launch and checked by capyctl's guard. The router
+  generated for that launch and checked by CapyCTL's guard. The router
   is the only path from the network to an engine, and it forwards only the
   allowlisted inference routes.
 
 ## Upgrading from an earlier release
 
-capyctl never rewrites your configuration. A document an earlier release
+CapyCTL never rewrites your configuration. A document an earlier release
 generated keeps its `127.0.0.1:8443` inference bind, so inference stays on the
 machine until you change it. To serve the network, set the bind to
 `0.0.0.0:8443` (or the machine's Tailscale address) or start with

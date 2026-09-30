@@ -26,7 +26,7 @@ Next: [Run on one machine](one-machine.md).
 
 ## Upgrade
 
-Run the same command with the new version, then restart capyctl. Running models
+Run the same command with the new version, then restart CapyCTL. Running models
 keep serving through the restart. With
 [several machines](several-machines.md), upgrade the server first, then the
 GPU machines one at a time.
@@ -37,7 +37,7 @@ Two things to know when upgrading from an earlier release candidate to 0.1.0:
   listen on `0.0.0.0:8443` with the API key, but a file an earlier release
   generated keeps `127.0.0.1:8443`. To open it to the network, set
   `0.0.0.0:8443` in the file or start with `--listen 0.0.0.0:8443`.
-- On a discrete card, capyctl now counts the card's memory apart from host RAM.
+- On a discrete card, CapyCTL now counts the card's memory apart from host RAM.
   The first start stops the engines the earlier release started, re-sizes
   each deployment for the card (its revision goes up by one) and prints which
   ones. The next request for each starts it from scratch. This happens once;

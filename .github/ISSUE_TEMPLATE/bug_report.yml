@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in capyctl.
+description: Report a reproducible problem in CapyCTL.
 title: "[Bug] "
 body:
   - type: markdown
@@ -9,7 +9,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: capyctl version
+      label: CapyCTL version
       description: Output of capyctl --version, or commit if built from source.
     validations:
       required: true

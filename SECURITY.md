@@ -1,7 +1,7 @@
 # Security policy
 
-capyctl is early software. Security fixes target the latest release; older releases
-have no separate maintenance commitment. Run current versions of capyctl and the
+CapyCTL is early software. Security fixes target the latest release; older releases
+have no separate maintenance commitment. Run current versions of CapyCTL and the
 inference engines you use, and review their release notes before upgrading.
 
 ## Report a vulnerability privately
@@ -31,7 +31,7 @@ See [network access](docs/operations/network-access.md) and the
 [configuration reference](docs/operations/configuration.md). Do not expose engine
 control ports as a workaround for connectivity problems.
 
-capyctl does not install or maintain your engines, GPU drivers or model weights.
+CapyCTL does not install or maintain your engines, GPU drivers or model weights.
 Report vulnerabilities in those components to their maintainers; report problems
-in capyctl's integration here. Passing CPU or Fake-engine tests is not native engine
+in CapyCTL's integration here. Passing CPU or Fake-engine tests is not native engine
 qualification or a security audit.

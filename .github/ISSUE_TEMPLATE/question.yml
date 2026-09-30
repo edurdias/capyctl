@@ -21,5 +21,5 @@ body:
   - type: input
     id: version
     attributes:
-      label: capyctl version and relevant environment
+      label: CapyCTL version and relevant environment
       description: Include the engine/version and setup when relevant.

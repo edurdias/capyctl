@@ -1,6 +1,6 @@
 # Configuration files
 
-capyctl reads four kinds of YAML file: deployments, and the files of the
+CapyCTL reads four kinds of YAML file: deployments, and the files of the
 server, a host and standalone. Check any of them with:
 
 ```bash
@@ -8,7 +8,7 @@ capyctl validate config --file <file>
 ```
 
 The examples below are the files in [`docs/examples/`](../examples/), shown
-as they are; a test checks that capyctl accepts every one. They show the format;
+as they are; a test checks that CapyCTL accepts every one. They show the format;
 they are not tuned settings for any model. Every setting of the server, host
 and standalone files can also be given as a flag or an environment variable,
 and `capyctl config show` prints where each value came from: see
@@ -16,7 +16,7 @@ and `capyctl config show` prints where each value came from: see
 
 ## The smallest deployment
 
-Three fields; capyctl fills in the rest from the checkpoint and the machine.
+Three fields; CapyCTL fills in the rest from the checkpoint and the machine.
 
 <!-- include: ../examples/deployment-minimal.yaml -->
 

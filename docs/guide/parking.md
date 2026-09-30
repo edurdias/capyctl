@@ -1,6 +1,6 @@
 # Parking and switching
 
-A GPU holds one or two models at a time. capyctl keeps the others parked: the
+A GPU holds one or two models at a time. CapyCTL keeps the others parked: the
 engine stays up but gives back its GPU memory. A request for a parked model
 wakes it. The time depends on the engine, model and parking tier.
 
@@ -11,7 +11,7 @@ goes in each state.
 
 ## How a model parks
 
-capyctl picks the way from your hardware:
+CapyCTL picks the way from your hardware:
 
 - On a discrete card, a parked model's weights are copied to host RAM, and a
   wake copies them back in seconds. When the copy does not fit in host RAM,
@@ -37,7 +37,7 @@ NAME       STATE    READY   REVISION   HOSTS
 my-model   parked   0/1     1          gpu-box
 ```
 
-Send a request for `my-model` ([Make a request](requests.md)). capyctl wakes the
+Send a request for `my-model` ([Make a request](requests.md)). CapyCTL wakes the
 model and answers; the first answer takes longer. Afterwards:
 
 ```text
@@ -47,7 +47,7 @@ my-model   ready   1/1     1          gpu-box
 
 ## Switch between models
 
-When a model needs memory that another one holds, capyctl parks the idle one.
+When a model needs memory that another one holds, CapyCTL parks the idle one.
 Starting a second model with `--evict` allows that and names what it parked:
 
 ```bash
@@ -75,7 +75,7 @@ other-model   ready    1/1     1          gpu-box
 
 Without `--evict`, a start never parks anything; it waits for memory instead.
 
-A request switches the same way. Ask for `my-model` now and capyctl parks
+A request switches the same way. Ask for `my-model` now and CapyCTL parks
 `other-model`, wakes `my-model` and answers:
 
 ```text
@@ -84,8 +84,8 @@ my-model      ready    1/1     1          gpu-box
 other-model   parked   0/1     1          gpu-box
 ```
 
-capyctl waits for requests in progress to finish before it parks a model; it
-never cuts an answer off. When there is no room to keep a parked copy, capyctl
+CapyCTL waits for requests in progress to finish before it parks a model; it
+never cuts an answer off. When there is no room to keep a parked copy, CapyCTL
 stops the idle model instead and says so:
 `released: stopped (no room to park)`.
 

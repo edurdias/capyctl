@@ -1,10 +1,10 @@
 # How it works
 
-capyctl sits between your apps and the vLLM or SGLang engines on your GPUs. Apps
-see one OpenAI-compatible endpoint. Behind it, capyctl starts engines, decides
+CapyCTL sits between your apps and the vLLM or SGLang engines on your GPUs. Apps
+see one OpenAI-compatible endpoint. Behind it, CapyCTL starts engines, decides
 which models hold GPU memory, and moves the rest out of the way.
 
-![How requests reach a model through capyctl](how-it-works.svg)
+![How requests reach a model through CapyCTL](how-it-works.svg)
 
 ## One machine or several
 
@@ -17,7 +17,7 @@ where each model runs; the hosts start and stop engines when the server asks.
 Hosts and server talk over your private network with mutual TLS. Commands are
 the same in both setups; with several machines you run them on the server.
 
-A discrete card and a unified-memory machine use the same steps. capyctl reads
+A discrete card and a unified-memory machine use the same steps. CapyCTL reads
 the GPU at start. On a discrete card it counts the card's memory and host RAM
 separately; on unified memory it counts the one shared pool.
 
@@ -50,20 +50,20 @@ refused until you start it again.
 
 ## Switching
 
-When a request asks for a parked model and the GPU is full, capyctl parks the
+When a request asks for a parked model and the GPU is full, CapyCTL parks the
 idle model that is in the way, wakes the one asked for, and then answers. It
 waits for requests in progress to finish before it parks anything. If a
-parked copy would not fit in host RAM, capyctl stops that model instead and says
+parked copy would not fit in host RAM, CapyCTL stops that model instead and says
 so.
 
 ## The memory ledger
 
-The memory ledger is capyctl's count of how much GPU memory and host RAM each
-model holds or has been promised. capyctl checks it before every start, wake and
-switch, so two models never count on the same memory. When capyctl cannot tell
+The memory ledger is CapyCTL's count of how much GPU memory and host RAM each
+model holds or has been promised. CapyCTL checks it before every start, wake and
+switch, so two models never count on the same memory. When CapyCTL cannot tell
 whether memory was released, it keeps counting it as used.
 
-## What capyctl never does
+## What CapyCTL never does
 
 - It does not install engines. You register the vLLM or SGLang you already
   have with `capyctl engine add`.

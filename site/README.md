@@ -1,4 +1,4 @@
-# capyctl website
+# CapyCTL website
 
 The project site: a landing page at `/` and the documentation at `/docs/`,
 built with Astro and Starlight into a static `dist/`. Node is only needed
@@ -34,7 +34,7 @@ Astro's telemetry is turned off in every script.
   `node scripts/transcript/capture.mjs ../target/debug/capyctl` runs every
   command the guide shows against a built binary, in private sandbox homes
   under `~/.cache/capyctl-site-docs`, with a stand-in engine
-  (`scripts/transcript/fake-vllm.py`) that answers capyctl's calls and loads
+  (`scripts/transcript/fake-vllm.py`) that answers CapyCTL's calls and loads
   nothing. It prints the transcript to copy from; it is not a test of any
   engine. `npm run check` also checks that every `capyctl` command the guide and
   the landing page show exists in the built CLI's `--help`.

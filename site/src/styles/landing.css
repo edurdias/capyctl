@@ -37,3 +37,6 @@ figcaption { margin-top: 12px; color: var(--capyctl-muted); }
 @media (max-width: 480px) { .terminal { font-size: 12px; } }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; vertical-align: top; padding: 8px; border-top: 1px solid var(--capyctl-rule); }
+.brand { margin: 0; text-align: center; }
+.brand img { max-width: 100%; height: auto; }
+.tagline { margin: 0 0 24px; text-align: center; font-weight: 600; color: var(--capyctl-muted); }

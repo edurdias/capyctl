@@ -1,9 +1,9 @@
-# capyctl — Architecture and Implementation Handoff
+# CapyCTL — Architecture and Implementation Handoff
 
 **Revision:** 0.2  
 **Date:** September 10, 2026  
 **Owner:** Eduardo Rodrigues Dias  
-**Status:** Consolidated design for implementation planning. No capyctl runtime has been implemented or qualified by this document.  
+**Status:** Consolidated design for implementation planning. No CapyCTL runtime has been implemented or qualified by this document.  
 **Supersedes:** `capyctl-initial-design.md`, revision 0.1, and conflicting configuration/CLI sketches in the preceding discussion.  
 **Engine delivery order:** vLLM first; SGLang immediately next.
 
@@ -15,7 +15,7 @@ Read sections 1–5 for the product boundary, sections 6–13 for behavior and s
 
 **MUST / MUST NOT** identify required behavior. **SHOULD** identifies a recommended default that may be changed with a documented architectural decision. Implementation language, internal libraries, numeric default tuning, and the illustrative YAML field names are baseline proposals, not claims of separately approved implementation details. The requirements and ownership boundaries are the established direction.
 
-All capyctl commands, protocol names, and YAML below describe a proposed product. They are not available commands or tested engine recipes. Sources establish specific upstream behavior only. A source-backed engine capability does not establish that a particular patched build, checkpoint, cache layout, or multi-node combination works.
+All CapyCTL commands, protocol names, and YAML below describe a proposed product. They are not available commands or tested engine recipes. Sources establish specific upstream behavior only. A source-backed engine capability does not establish that a particular patched build, checkpoint, cache layout, or multi-node combination works.
 
 ## Navigation
 
@@ -28,7 +28,7 @@ All capyctl commands, protocol names, and YAML below describe a proposed product
 
 ## 1. Purpose and agreed scope
 
-capyctl makes a catalog of model deployments available on hardware that cannot keep all model weights resident simultaneously. A client chooses a public model ID. capyctl admits the request, activates the corresponding deployment when necessary, and routes inference to its engine group. Activation may restore a parked group or start a stopped one.
+CapyCTL makes a catalog of model deployments available on hardware that cannot keep all model weights resident simultaneously. A client chooses a public model ID. CapyCTL admits the request, activates the corresponding deployment when necessary, and routes inference to its engine group. Activation may restore a parked group or start a stopped one.
 
 The project is a fresh, standalone open-source controller, not a fork of an existing proxy or a modification embedded inside an inference engine. Its value is correct lifecycle and residency management, not an assertion that no other project supports routing, unloading, or sleep helpers.
 
@@ -53,11 +53,11 @@ The project is a fresh, standalone open-source controller, not a fork of an exis
 
 ### 1.2 Boundaries and non-goals
 
-capyctl owns routing, admission, deployment intent, reservations, lifecycle coordination, local supervision, and operational visibility. Engines own tokenization, kernels, batching, attention, tensor/pipeline distribution, and inference. Cache backends own KV serialization and block management.
+CapyCTL owns routing, admission, deployment intent, reservations, lifecycle coordination, local supervision, and operational visibility. Engines own tokenization, kernels, batching, attention, tensor/pipeline distribution, and inference. Cache backends own KV serialization and block management.
 
-The initial product does not install drivers, compile kernels, quantize checkpoints, download checkpoints implicitly ([ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md) permits materializing an explicitly declared model source), implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call capyctl, but none is required to operate it. Ray and container runtimes are not mandatory capyctl dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
+The initial product does not install drivers, compile kernels, quantize checkpoints, download checkpoints implicitly ([ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md) permits materializing an explicitly declared model source), implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call CapyCTL, but none is required to operate it. Ray and container runtimes are not mandatory CapyCTL dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
 
-llama-swap and NVIDIA PAIR are reference projects, not dependencies or the implementation base. Do not position capyctl merely as the first router with unloading or sleep. Any later integration must establish one lifecycle owner rather than letting two controllers manage the same engine.
+llama-swap and NVIDIA PAIR are reference projects, not dependencies or the implementation base. Do not position CapyCTL merely as the first router with unloading or sleep. Any later integration must establish one lifecycle owner rather than letting two controllers manage the same engine.
 
 Do not turn one initialized base-model engine into an arbitrary different architecture by swapping a model name. Separate runtime configurations are separate deployments. Adapter-specific LoRA support or compatible weight-update use cases are later features, not a substitute for this ownership model.
 
@@ -122,7 +122,7 @@ Management RPCs MUST NOT become an implicit tunnel for prompts, token streams, w
 
 ### 3.3 Implementation baseline
 
-Recommend Rust throughout the long-lived capyctl components, with one executable per supported OS/architecture. This favors distribution and separation from engine environments; no unmeasured speedup over Python is asserted. Keep Python available for external launch helpers and integration tests, not as a required server runtime.
+Recommend Rust throughout the long-lived CapyCTL components, with one executable per supported OS/architecture. This favors distribution and separation from engine environments; no unmeasured speedup over Python is asserted. Keep Python available for external launch helpers and integration tests, not as a required server runtime.
 
 Recommended baseline: asynchronous I/O, a transactional embedded server store and local agent journal, and versioned gRPC with mutual TLS for remote control. SQLite is a reasonable initial store candidate. Record the language, storage, and transport decisions before scaffolding; do not introduce a second language/runtime or external broker without a specific justification.
 
@@ -157,7 +157,7 @@ Host administrators register trusted runtime profiles, permitted devices and dir
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-Host administrators register runtime profiles with `capyctl engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; capyctl never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). capyctl still installs no engine.
+Host administrators register runtime profiles with `capyctl engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; CapyCTL never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). CapyCTL still installs no engine.
 
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
@@ -169,15 +169,15 @@ Role-start commands stay in the foreground. Provide normal OS service definition
 
 ### 5.1 Managed
 
-The agent launches an approved runtime profile and obtains a verifiable ownership handle. capyctl may drain, park, restore, stop, and recover that group under policy. Engine workers and explicitly managed cache services have separate ownership records when their lifetimes differ.
+The agent launches an approved runtime profile and obtains a verifiable ownership handle. CapyCTL may drain, park, restore, stop, and recover that group under policy. Engine workers and explicitly managed cache services have separate ownership records when their lifetimes differ.
 
 ### 5.2 Attached
 
 Attachment registers and validates an already-running inference service for routing and observation. It grants no implicit permission to sleep, kill, replace weights, restart, or evict resources. An upstream disappearing is not proof that its allocations disappeared.
 
-If the service shares a managed host, its resource usage must be represented conservatively. Uncertain attached usage cannot be treated as reclaimable capacity. Direct external clients may bypass capyctl's in-flight counts; no drain-based lifecycle operation is authorized without exclusive admission control or a validated external quiescence contract.
+If the service shares a managed host, its resource usage must be represented conservatively. Uncertain attached usage cannot be treated as reclaimable capacity. Direct external clients may bypass CapyCTL's in-flight counts; no drain-based lifecycle operation is authorized without exclusive admission control or a validated external quiescence contract.
 
-An externally managed endpoint may use no capyctl agent, but restart guarantees are unavailable unless an equivalent supervisor integration is explicitly configured. Mark that limitation in status.
+An externally managed endpoint may use no CapyCTL agent, but restart guarantees are unavailable unless an equivalent supervisor integration is explicitly configured. Mark that limitation in status.
 
 ### 5.3 Adoption
 
@@ -283,7 +283,7 @@ Track system/agent/router overhead and external workloads through the configured
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-On a discrete-GPU host each GPU's memory is a `device` domain observed from the device; host RAM is a `distinct` system domain. A deployment's derived budget charges both. A device domain without a fresh observation closes admission on that domain (`device_unobserved`) and keeps every reservation charged. One GPU serves one model; capyctl picks the GPU unless the deployment pins one.
+On a discrete-GPU host each GPU's memory is a `device` domain observed from the device; host RAM is a `distinct` system domain. A deployment's derived budget charges both. A device domain without a fresh observation closes admission on that domain (`device_unobserved`) and keeps every reservation charged. One GPU serves one model; CapyCTL picks the GPU unless the deployment pins one.
 
 ### 7.3 Reservation lifecycle
 
@@ -310,7 +310,7 @@ override exclusivity, and shared execution does not promise performance isolatio
 
 If host-KV capacity is 16 GiB, A retains 9 GiB, and B requests 8 GiB, B is blocked: 17 GiB exceeds the boundary. First reclaim A through a supported cache operation, stop an eligible owner, or wait. Do not assume parking released A's private host cache. Do not shrink B's requested allocation silently.
 
-If A and B use the same 16 GiB shared cache service, charge the service's physical allocation once. Client quotas partition its usable capacity; they are not a second physical charge. Account for the service's own metadata/overhead separately from usable cache bytes where necessary. LMCache documents an isolated eviction policy with per-namespace quotas [S7]; capyctl must verify the selected backend's actual quota behavior rather than infer it from a connector name.
+If A and B use the same 16 GiB shared cache service, charge the service's physical allocation once. Client quotas partition its usable capacity; they are not a second physical charge. Account for the service's own metadata/overhead separately from usable cache bytes where necessary. LMCache documents an isolated eviction policy with per-namespace quotas [S7]; CapyCTL must verify the selected backend's actual quota behavior rather than infer it from a connector name.
 
 Remote stores require one shared resource identity and quota authority. Each host must not independently assume ownership of the store's full capacity. Separate logical pools on the same filesystem also share a real free-space boundary.
 
@@ -336,15 +336,15 @@ A managed profile supplies an executable and argument array, controlled environm
 
 A process that backgrounds children and exits without a durable ownership handle is invalid. Container/service launchers must track actual container/service identity; killing a CLI wrapper is not complete cleanup. A host script must not secretly launch remote ranks beyond the participating agents' ownership.
 
-Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse a superseded binding identity. capyctl validates a recipe's shape and the host's capacity to hold it; whether the recipe works is the user's responsibility (ADR 0011).
+Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse a superseded binding identity. CapyCTL validates a recipe's shape and the host's capacity to hold it; whether the recipe works is the user's responsibility (ADR 0011).
 
-Custom and patched engine builds are first-class (ADR 0008, owner decision 2026-09-23). An engine installation is fingerprinted when the host registers it: the engine package's version and a `sha256:` digest over its files. A launch that measures a different fingerprint flags the drift in the host's status and the event journal, and is refused (`installation_drift`) only when the installation's host policy says `installation_drift: refuse`; the default is `warn`. capyctl MUST NOT compare installation files to hard-coded hashes and applies no permission rule to them. The engine internals capyctl hooks are probed by shape at launch (import, attribute or signature presence, record fields, served routes); a missing capability refuses only the feature that depends on it with a closed `capability_missing:<name>` reason, and serving without that feature stays available.
+Custom and patched engine builds are first-class (ADR 0008, owner decision 2026-09-23). An engine installation is fingerprinted when the host registers it: the engine package's version and a `sha256:` digest over its files. A launch that measures a different fingerprint flags the drift in the host's status and the event journal, and is refused (`installation_drift`) only when the installation's host policy says `installation_drift: refuse`; the default is `warn`. CapyCTL MUST NOT compare installation files to hard-coded hashes and applies no permission rule to them. The engine internals CapyCTL hooks are probed by shape at launch (import, attribute or signature presence, record fields, served routes); a missing capability refuses only the feature that depends on it with a closed `capability_missing:<name>` reason, and serving without that feature stays available.
 
 ### 8.2 Parameter ownership
 
 Deployment recipes contain engine tuning; host profiles contain launch context and fixed local constraints. The adapter constructs one effective command, not a blind concatenation of conflicting flags.
 
-capyctl controls or validates device assignment, process ownership, bind addresses, private ports, public/upstream model mapping, distributed ranks, rendezvous data, granted memory/cache settings, and required lifecycle prerequisites. Reject conflicting overrides, duplicate reserved flags, or hidden configuration-file values. Unknown ordinary engine arguments may be passed through subject to operator policy; security-sensitive code-loading or path options are not unrestricted inference-client inputs.
+CapyCTL controls or validates device assignment, process ownership, bind addresses, private ports, public/upstream model mapping, distributed ranks, rendezvous data, granted memory/cache settings, and required lifecycle prerequisites. Reject conflicting overrides, duplicate reserved flags, or hidden configuration-file values. Unknown ordinary engine arguments may be passed through subject to operator policy; security-sensitive code-loading or path options are not unrestricted inference-client inputs.
 
 Preserve the original engine's supported arguments where possible. Do not place every new kernel flag into the generic control-plane schema. `inspect deployment --effective-config` exposes the resolved command and provenance with secrets redacted.
 
@@ -375,7 +375,7 @@ that references in §20 remain stable. Recipe ownership is stated in §8.1.
 
 Current vLLM documentation distinguishes level 1, which keeps a CPU weight backup, from level 2, which discards weights and KV while retaining some buffers. The documented online deep-sleep path is `POST /sleep?level=2`; restoration wakes weight allocations, invokes `reload_weights` through the collective RPC interface, then wakes KV allocations. Online controls require startup configuration including sleep support and development mode [S1].
 
-The vLLM adapter wraps this in capyctl admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
+The vLLM adapter wraps this in CapyCTL admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
 
 **Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It is enabled unless host policy forbids it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes. Owner decision 2026-09-17, reaffirmed 2026-09-22 (ADR 0012): deep parking is enabled by default and a host opts out with `security.deep_park: disabled` on the runtime profile; standalone opts out with `CAPYCTL_DEEP_PARK=off`. Default enablement is not a production-safety claim: development controls stay on loopback behind the per-launch key guard, are never reachable through host ingress or the router, and status marks every profile that uses them.
 
@@ -404,7 +404,7 @@ The first inference surface is `GET /v1/models` and streaming/non-streaming `POS
 
 Resolve model aliases to explicit deployments. A deployment with several instances is served by all of its READY instances; the router selects among instances with open admission using its own in-flight counts and fresh host-reported engine load, and fails over to another instance only before upstream acceptance (ADR 0013). Preserve supported payloads, tool calls, structured-output parameters, reasoning fields, multimodal content, and stream events. Do not tokenize, rewrite prompts, silently substitute models, or execute client tools. Any model-name remapping in responses must be documented and limited.
 
-Note (2026-09-24): capyctl relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser through `engine_config.extra_args` with `accept_extra_args: true` (vLLM `--enable-auto-tool-choice --tool-call-parser <name>`, SGLang `--tool-call-parser <name>`). Without one, the engine rejects the request or answers in plain text, and capyctl relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
+Note (2026-09-24): CapyCTL relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser through `engine_config.extra_args` with `accept_extra_args: true` (vLLM `--enable-auto-tool-choice --tool-call-parser <name>`, SGLang `--tool-call-parser <name>`). Without one, the engine rejects the request or answers in plain text, and CapyCTL relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
 
 Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `capyctl start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
 
@@ -433,7 +433,7 @@ Management operations are durable; queued inference bodies and open streams are 
 
 ## 11. Multi-node groups and failure coordination
 
-Use an agent on every host directly supervised by capyctl. Only the API-facing group member needs ingress. The group may expose one inference endpoint while owning workers on both Sparks. vLLM's documented native multi-node topology includes an API-facing node and headless workers [S10]. capyctl manages the deployment; the engine implements distributed inference.
+Use an agent on every host directly supervised by CapyCTL. Only the API-facing group member needs ingress. The group may expose one inference endpoint while owning workers on both Sparks. vLLM's documented native multi-node topology includes an API-facing node and headless workers [S10]. CapyCTL manages the deployment; the engine implements distributed inference.
 
 Worker agents exist to start missing processes, observe exits, account for local resources, reconcile orphans, and clean up after head failure. They are not inference routers or tensor relays. A head-only integration is allowed only when an explicitly supported external supervisor provides equivalent remote ownership guarantees; it is not the default bare-metal topology.
 
@@ -451,7 +451,7 @@ Model parking reduces inactive weight residency. Persistent KV caching can prese
 
 vLLM documents hierarchical offloading connectors and filesystem storage [S6]. SGLang HiCache documents private per-instance device/host tiers and an external sharing tier [S11]. Cache selection is per deployment and exact build. A path called a cache pool does not enable or convert an engine integration.
 
-capyctl retains cache configuration and namespaces, accounts for all owners, starts/stops explicitly owned cache services, and coordinates supported persistence barriers. Engines/connectors serialize, retrieve, index, and evict blocks. Cross-engine KV conversion is outside scope.
+CapyCTL retains cache configuration and namespaces, accounts for all owners, starts/stops explicitly owned cache services, and coordinates supported persistence barriers. Engines/connectors serialize, retrieve, index, and evict blocks. Cross-engine KV conversion is outside scope.
 
 Namespace isolation includes model/checkpoint revision, engine/layout, quantization, tokenizer/template effects, parallelism/rank, and security domain. Conservatively isolate by deployment until reuse is verified. Public model aliases must not collapse incompatible caches. Secret-bearing prompts and KV are sensitive even when text is not logged.
 
@@ -491,7 +491,7 @@ Run agents with the least privilege needed for their approved processes. Arbitra
 
 Allowlist normalized methods and paths, strip/replace internal routing headers, verify trusted upstream destinations, bound resource-amplifying requests, and prevent public access to administrative RPCs. Remote control and ingress use distinct authenticated identities/roles; do not pass end-user API secrets to unrelated upstream services. Local-only does not mean unauthenticated by default.
 
-Protect credentials, journals, checkpoint permissions, and sensitive cache directories. capyctl's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). capyctl's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. *Amended 2026-09-25 (owner decision):* an engine's environment is closed. Its PATH is the installation's own `bin`, then fixed system directories, never the caller's shell PATH. A runtime profile may name a host-approved CUDA toolkit root, `cuda_home`, approved like `executable`. The host administrator writes it, or `capyctl engine add` detects it from `CUDA_HOME`, else from `/usr/local/cuda` when it holds `bin/nvcc`; standalone environment installations take `CAPYCTL_CUDA_HOME`. When `cuda_home` is set, capyctl puts `<cuda_home>/bin` right after the installation's `bin` and sets `CUDA_HOME`; without it the PATH stays minimal. capyctl also bounds JIT compile parallelism in the engine environment. It sets `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)` and `FLASHINFER_NVCC_THREADS` to 1. A profile's `env` may override either one with a positive integer, and the host log records the chosen value at every launch. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
+Protect credentials, journals, checkpoint permissions, and sensitive cache directories. CapyCTL's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). CapyCTL's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. *Amended 2026-09-25 (owner decision):* an engine's environment is closed. Its PATH is the installation's own `bin`, then fixed system directories, never the caller's shell PATH. A runtime profile may name a host-approved CUDA toolkit root, `cuda_home`, approved like `executable`. The host administrator writes it, or `capyctl engine add` detects it from `CUDA_HOME`, else from `/usr/local/cuda` when it holds `bin/nvcc`; standalone environment installations take `CAPYCTL_CUDA_HOME`. When `cuda_home` is set, CapyCTL puts `<cuda_home>/bin` right after the installation's `bin` and sets `CUDA_HOME`; without it the PATH stays minimal. CapyCTL also bounds JIT compile parallelism in the engine environment. It sets `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)` and `FLASHINFER_NVCC_THREADS` to 1. A profile's `env` may override either one with a positive integer, and the host log records the chosen value at every launch. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
@@ -556,7 +556,7 @@ The management API is the source of semantics for CLI, future UI, and integratio
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-`capyctl engine detect|add|list|remove` and `capyctl list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one capyctl integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, no role is listening on `<state_dir>/control.sock`; `add` still writes `engines.yaml` and the role picks it up at its next start, `remove` writes nothing), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`capyctl engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
+`capyctl engine detect|add|list|remove` and `capyctl list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one CapyCTL integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, no role is listening on `<state_dir>/control.sock`; `add` still writes `engines.yaml` and the role picks it up at its next start, `remove` writes nothing), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`capyctl engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
 
 ## 15. Configuration model and generated defaults
 
@@ -575,11 +575,11 @@ Operator configuration is not mutable runtime state. Server/agent processes writ
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-The engines file is capyctl-owned operational state, not administrator YAML: capyctl writes it only when the operator runs `capyctl engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# capyctl-document-revision: N`. The role's own document is never rewritten.
+The engines file is CapyCTL-owned operational state, not administrator YAML: CapyCTL writes it only when the operator runs `capyctl engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# capyctl-document-revision: N`. The role's own document is never rewritten.
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-capyctl never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
+CapyCTL never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
 
 ### 15.2 No-config behavior
 
@@ -607,7 +607,7 @@ Material default changes affect new deployments only unless an explicit update i
 
 ### 15.3 Validation
 
-Reject unknown capyctl fields, duplicate YAML mapping keys, invalid units, unsatisfied required fields, unsupported role/adapter combinations, conflicting reserved arguments, invalid cache references, and contradictory standalone/remote connections. Secrets use references or protected files. No arbitrary YAML object construction or shell evaluation.
+Reject unknown CapyCTL fields, duplicate YAML mapping keys, invalid units, unsatisfied required fields, unsupported role/adapter combinations, conflicting reserved arguments, invalid cache references, and contradictory standalone/remote connections. Secrets use references or protected files. No arbitrary YAML object construction or shell evaluation.
 
 Validate syntax/schema before side effects. Resolve paths and fingerprints locally, then perform distributed preflight. Editing a profile cannot mutate an active process in place; changes require controlled revision/reconciliation. A decrease in host limits below current reservations blocks new admission and reports the condition rather than killing workloads immediately.
 
@@ -794,7 +794,7 @@ engine_config:
     kv_cache: "8GiB"
 ```
 
-`integration: none` disables an capyctl-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified. `engine_config` is validated for shape; whether the engine supports the combination on this checkpoint is the user's responsibility (ADR 0011).
+`integration: none` disables a CapyCTL-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified. `engine_config` is validated for shape; whether the engine supports the combination on this checkpoint is the user's responsibility (ADR 0011).
 
 ### 16.4 Two-host engine group (one TP2 instance) with private host-cache and persistent storage
 
@@ -967,7 +967,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. A newer host is refused ("upgrade the server first"), an older-than-N-1 or unversioned host is drain-only, and a command needing a capability the host did not declare is refused typed and never sent (ADR 0017). |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
 | T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
-| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. capyctl's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
+| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. CapyCTL's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
@@ -982,7 +982,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
-- 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by capyctl, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
+- 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 
 ### Sources
 

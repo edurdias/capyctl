@@ -1,5 +1,13 @@
 # Current implementation and launch status
 
+## Rename to CapyCTL — 2026-09-30
+
+ADR 0022: the project, binary and repository are CapyCTL (`capyctl`), with no
+aliases for the old names. Crates, variables, paths, units, archives, the
+installer, the site and the docs use the new name; earlier entries below keep
+the old one. `scripts/check-name.sh` keeps it out of everything else. CPU and
+Fake-engine tests are not qualification.
+
 ## Terminal output — 2026-09-29
 
 ADR 0021 is implemented: commands print tables or a summary with key-value

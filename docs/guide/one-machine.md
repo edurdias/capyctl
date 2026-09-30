@@ -2,7 +2,7 @@
 
 `capyctl start standalone` runs everything on one machine, in one process.
 
-You need capyctl ([Install](install.md)), a vLLM or SGLang installation (here
+You need CapyCTL ([Install](install.md)), a vLLM or SGLang installation (here
 `~/venvs/vllm`) and a model: a checkpoint directory in `~/models` (here
 `~/models/Qwen3-4B`), or a Hugging Face repository.
 
@@ -23,7 +23,7 @@ Registered vllm (vllm 0.29.0)
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
 ```
 
-capyctl is not running yet, so it saves the engine for the first start. More in
+CapyCTL is not running yet, so it saves the engine for the first start. More in
 [Add an engine](engines.md).
 
 ## 2. Start
@@ -41,13 +41,13 @@ capyctl 0.1.0 standalone ready
   Credentials   /home/me/.local/state/capyctl/identity/credentials
 ```
 
-On a terminal capyctl prints this text. Started as a service, or with its output
+On a terminal CapyCTL prints this text. Started as a service, or with its output
 piped to a file, it prints one JSON object per line instead; add `--format
 text` or `--format json` to choose.
 
-capyctl reads your GPU, creates `~/models` if it is missing, and writes an API key
+CapyCTL reads your GPU, creates `~/models` if it is missing, and writes an API key
 to the credentials file. The endpoint listens on port 8443 of every interface
-and answers only requests that carry the key. Leave capyctl running and open a
+and answers only requests that carry the key. Leave CapyCTL running and open a
 second terminal.
 
 ## 3. Deploy a model
@@ -61,7 +61,7 @@ model: Qwen3-4B
 ```
 
 `model` is a directory under `~/models`. To download from Hugging Face
-instead, write `model: {hf: Qwen/Qwen3-4B-Instruct-2507}`. capyctl sizes the
+instead, write `model: {hf: Qwen/Qwen3-4B-Instruct-2507}`. CapyCTL sizes the
 memory from the checkpoint and your GPU; [Deploy a model](deploy.md) has
 the details.
 
@@ -91,7 +91,7 @@ NAME       STATE   READY   REVISION   HOSTS
 my-model   ready   1/1     1          gpu-box
 ```
 
-The first start of a new checkpoint takes longer: capyctl reads the files once
+The first start of a new checkpoint takes longer: CapyCTL reads the files once
 to fingerprint them, then starts the engine.
 
 ## 4. Send a request

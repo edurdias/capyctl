@@ -1,7 +1,7 @@
-# capyctl 0.1.0
+# CapyCTL 0.1.0
 
-The first release of capyctl, a model manager for vLLM and SGLang on your own
-NVIDIA GPUs. capyctl runs your inference engines, parks the models nobody is using
+The first release of CapyCTL, a model manager for vLLM and SGLang on your own
+NVIDIA GPUs. CapyCTL runs your inference engines, parks the models nobody is using
 so their memory is freed, and wakes or switches to the one a request asks for,
 behind one OpenAI-compatible endpoint.
 
@@ -14,7 +14,7 @@ capyctl --version
 
 One binary for Linux on x86-64 or ARM64. The installer checks every download
 against the release's `SHA256SUMS`. Add `-s -- --version v0.1.0` to pin this
-release. Bring your own vLLM or SGLang environment; capyctl does not install
+release. Bring your own vLLM or SGLang environment; CapyCTL does not install
 engines or drivers.
 
 ## What is in 0.1.0
@@ -27,7 +27,7 @@ engines or drivers.
 - **Parking and switching.** Idle models are parked to free GPU memory and
   woken on the next request. On a discrete card a model can park its weights in
   host RAM, which wakes much faster than reloading from disk.
-- **Unified-memory and discrete GPUs.** On a discrete card, capyctl counts the
+- **Unified-memory and discrete GPUs.** On a discrete card, CapyCTL counts the
   card's memory apart from host RAM and picks a GPU with room on a machine with
   several. One GPU per model in this release.
 - **Models from a directory or Hugging Face.** Models live in `~/models`;
@@ -47,18 +47,26 @@ engines or drivers.
 
 - Models that span several GPUs (tensor parallelism) are not supported yet.
 - No web UI; everything goes through the CLI and the management API.
-- Parking uses the engines' development controls. capyctl keeps them on loopback
+- Parking uses the engines' development controls. CapyCTL keeps them on loopback
   behind a per-launch key, but they are not production-hardened; a host can opt
   out with `--deep-park off`.
 - SGLang ModelOpt (NVFP4) checkpoints cannot park yet; deploy them
   `restart_only`.
-- capyctl does not terminate TLS. Put a TLS reverse proxy in front before exposing
+- CapyCTL does not terminate TLS. Put a TLS reverse proxy in front before exposing
   the endpoint to the internet.
 
 ## Upgrading from a release candidate
 
-Two things to know when upgrading:
+Three things to know when upgrading:
 
+- The project is now CapyCTL. The binary is `capyctl`, variables start with
+  `CAPYCTL_`, and the services are `capyctl-server`, `capyctl-host` and
+  `capyctl-standalone`. Nothing reads the old `mllm` names. To keep existing
+  state, stop the old services and move `~/.local/state/mllm` to
+  `~/.local/state/capyctl` and `~/.config/mllm` to `~/.config/capyctl` (for a
+  system install, `/etc/mllm` to `/etc/capyctl` and `/var/lib/mllm` to
+  `/var/lib/capyctl`, owned by a `capyctl` user), then install the new units;
+  or start fresh.
 - The inference endpoint of an existing configuration file does not move: a
   file an earlier release generated keeps `127.0.0.1:8443`. New files use
   `0.0.0.0:8443` with the API key. Set the bind or start with

@@ -1,4 +1,4 @@
-# Contributing to capyctl
+# Contributing to CapyCTL
 
 Bug reports, documentation fixes, tests and focused code changes are welcome.
 For questions and feedback, start with [SUPPORT.md](SUPPORT.md). Report suspected
@@ -31,7 +31,7 @@ cargo build --locked -p capyctl-cli
 cargo run --locked -p capyctl-cli -- --help
 ```
 
-See the [installation guide](docs/operations/install.md) for running capyctl with
+See the [installation guide](docs/operations/install.md) for running CapyCTL with
 your own engine. Development checks must not change drivers or shared engine
 environments.
 

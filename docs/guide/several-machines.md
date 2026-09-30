@@ -2,7 +2,7 @@
 
 One machine runs the server; each GPU machine runs a host. Clients send every
 request to the server, which forwards it to the machine running that model.
-Install capyctl on every machine first ([Install](install.md)).
+Install CapyCTL on every machine first ([Install](install.md)).
 
 The machines reach each other over a private network. A GPU machine needs an
 address in `100.64.0.0/10`, as a Tailscale tailnet gives; the server sends
@@ -109,7 +109,7 @@ Wrote host.yaml
   Runtime directory   /home/me/.local/state/capyctl/runtime
 ```
 
-capyctl sets the memory limits in the file from this machine's memory and GPUs,
+CapyCTL sets the memory limits in the file from this machine's memory and GPUs,
 and keeps models in `~/models`, so it validates as written. The file is JSON,
 which is also valid YAML. Change two things in it: set `name` to the one in
 the invitation, and add an `ingress` with this machine's private address, where
@@ -204,7 +204,7 @@ gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
 ## 5. Deploy
 
-Use the file from [Deploy a model](deploy.md). capyctl places the model on a
+Use the file from [Deploy a model](deploy.md). CapyCTL places the model on a
 machine with room; add `host: gpu-box` to choose one. On the server:
 
 ```bash

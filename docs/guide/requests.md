@@ -1,6 +1,6 @@
 # Make a request
 
-capyctl serves the OpenAI chat API on port 8443 of the machine that runs it (the
+CapyCTL serves the OpenAI chat API on port 8443 of the machine that runs it (the
 server, with several machines), on every interface, with an API key. On that
 machine the endpoint is `http://127.0.0.1:8443/v1`. Send the deployment's
 `name` as `model`.
@@ -117,7 +117,7 @@ endpoint and its API key to `$KEY`.
 
 ## When the model is parked
 
-A request for a parked model waits while capyctl wakes it, then answers. It
+A request for a parked model waits while CapyCTL wakes it, then answers. It
 takes longer than usual; nothing else changes for the client. See
 [Parking and switching](parking.md).
 
@@ -141,7 +141,7 @@ curl -s http://gpu-box:8443/v1/models -H "Authorization: Bearer $KEY"
 
 In an OpenAI client, set the base URL to `http://gpu-box:8443/v1`.
 
-To keep the endpoint on the machine itself, start capyctl with
+To keep the endpoint on the machine itself, start CapyCTL with
 `--listen 127.0.0.1:8443`; to limit it to your tailnet, use the machine's
 Tailscale address there. The endpoint is plain HTTP: for the internet, put a
 TLS reverse proxy in front. [Network access](../operations/network-access.md)

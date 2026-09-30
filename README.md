@@ -1,8 +1,12 @@
-# capyctl
+<p align="center"><img src="docs/brand/capyctl-logo.png" alt="CapyCTL" width="480"></p>
+
+# CapyCTL
+
+Control what runs next.
 
 A model manager for vLLM and SGLang on your own GPUs.
 
-Most GPU machines can hold one or two models at a time. capyctl runs your
+Most GPU machines can hold one or two models at a time. CapyCTL runs your
 inference engines for you, parks the models nobody is using so their GPU
 memory is released, and wakes or switches to the one a request asks for. It
 puts one OpenAI-compatible endpoint in front of every machine you enroll, and
@@ -18,7 +22,7 @@ breaking changes between minor versions while the version starts with 0.
 What works in 0.1.0:
 
 - vLLM and SGLang engines, one GPU per model, on unified-memory machines and
-  on discrete NVIDIA cards, where capyctl counts the card's memory apart from
+  on discrete NVIDIA cards, where CapyCTL counts the card's memory apart from
   host RAM and picks the GPU on a machine with several.
 - One machine (standalone) or a server with several GPU hosts.
 - Parking, waking and switching models under a memory budget; on a discrete
@@ -33,12 +37,12 @@ Not there yet:
   but parked until after 0.1.0.
 - No web UI; everything goes through the CLI and the management API.
 - Other GPU vendors and operating systems are not supported.
-- Parking relies on engine development controls. capyctl keeps them on loopback
+- Parking relies on engine development controls. CapyCTL keeps them on loopback
   behind a per-launch key, but they are not production-hardened; a host can
   opt out (`--deep-park off`, see the
   [settings reference](docs/operations/configuration.md#engine-installation)).
 
-capyctl does not install engines or GPU drivers. Bring your own vLLM or SGLang
+CapyCTL does not install engines or GPU drivers. Bring your own vLLM or SGLang
 environment; models come from a directory or from Hugging Face.
 
 ## Install
@@ -95,7 +99,7 @@ model: Qwen3-4B              # a directory under ~/models, an absolute path,
                              # or {hf: Qwen/Qwen3-4B-Instruct-2507}
 ```
 
-capyctl fills in the rest: the route is the name, the engine's memory is sized
+CapyCTL fills in the rest: the route is the name, the engine's memory is sized
 from the checkpoint and the GPU, the GPU is picked, and the park tier follows
 the hardware. A Hugging Face repository is pinned to the commit it names when
 you deploy, then downloaded into `~/models/sources` (500 GiB cap for all
@@ -204,7 +208,7 @@ llama-3.1-8b   parked   0/1     2          gpu-box
 
 A parked deployment releases its GPU memory and wakes on the next request for
 its route. When a request needs a model and
-there is no room, capyctl parks or stops an idle one to make space.
+there is no room, CapyCTL parks or stops an idle one to make space.
 
 Upgrade the server first, then the hosts one at a time.
 

@@ -1,10 +1,10 @@
-# Installing and operating capyctl as a service
+# Installing and operating CapyCTL as a service
 
 This guide covers installing a release with `install.sh`, running each role
-under systemd, upgrading, and rolling back. capyctl is one executable per OS and
+under systemd, upgrading, and rolling back. CapyCTL is one executable per OS and
 architecture; each role runs in the foreground under a service manager.
 
-Every setting capyctl reads, with its YAML field, flag and environment variable,
+Every setting CapyCTL reads, with its YAML field, flag and environment variable,
 is listed in the [settings reference](configuration.md).
 
 ## Restart is not drain
@@ -55,7 +55,7 @@ unit's cgroup. systemd's default `KillMode=control-group`, and `mixed`, signal
 every process in that cgroup on stop, which would kill every engine at each
 restart and turn an ordinary restart into an unaccounted termination.
 `KillMode=process` sends the stop signal, and the final SIGKILL if
-`TimeoutStopSec=` expires, to the capyctl process only. systemd then logs that
+`TimeoutStopSec=` expires, to the CapyCTL process only. systemd then logs that
 processes remain in the stopped unit, which is expected. At system shutdown the
 remaining engines are terminated with everything else; the host reconciles on
 boot.
@@ -83,7 +83,7 @@ sudo systemctl edit capyctl-host
 # TimeoutStopSec=11min        # for drain_timeout: "600s"
 ```
 
-If the timeout expires, systemd kills the capyctl process only; engines survive,
+If the timeout expires, systemd kills the CapyCTL process only; engines survive,
 as with any other restart.
 
 ### Exit codes and restarts
@@ -98,7 +98,7 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 2 | Invalid configuration | all | Fix the role document (`capyctl validate config`). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
 | 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
-| 5 | Unsupported, including state written by a newer capyctl (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
+| 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
 | 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `capyctl engine detect --path DIR`. |
@@ -157,7 +157,7 @@ capyctl-<version>-linux-<arch>/
   SHA256SUMS                digest of every file in the directory
 ```
 
-There is no `runtime/` directory in the release. capyctl's Python helpers (the
+There is no `runtime/` directory in the release. CapyCTL's Python helpers (the
 vLLM guard and entry, the SGLang entry and its modules, the capability
 probes) are compiled into `bin/capyctl` with a manifest of their SHA-256 digests, and each role that launches engines writes
 them to its own state directory; see "The managed runtime directory".
@@ -253,15 +253,15 @@ sudo install -m 0755 capyctl-$V-linux-$A/bin/capyctl /usr/local/bin/capyctl
 |---|---|---|
 | `/usr/local/bin/capyctl` (`~/.local/bin/capyctl`) | root (you), 0755 | The binary. |
 | `/usr/local/share/capyctl/` (`~/.local/share/capyctl/`) | root (you), 0755 | Units, examples, this guide, `BUILDINFO` of the installed release. |
-| `/etc/capyctl/<role>.yaml` | root:capyctl, 0640 | Role documents (operator configuration). |
-| `/etc/capyctl/<role>.env` | root:capyctl, 0640 | Optional environment for the unit. |
+| `/etc/capyctl/<role>.yaml` | root:CapyCTL, 0640 | Role documents (operator configuration). |
+| `/etc/capyctl/<role>.env` | root:CapyCTL, 0640 | Optional environment for the unit. |
 | `/var/lib/capyctl/` | `capyctl:capyctl`, 0700 | State root (`StateDirectory=`); holds `server/`, `host/`, `standalone/`, `tmp/`. |
-| `/var/lib/capyctl/host/runtime/` | `capyctl:capyctl`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/capyctl/standalone/runtime/`). Written by capyctl. |
+| `/var/lib/capyctl/host/runtime/` | `capyctl:capyctl`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/capyctl/standalone/runtime/`). Written by CapyCTL. |
 | model store (`/srv/models`) | readable by `capyctl` | Checkpoints. Read-only to the host unit by default. |
 
 ### The managed runtime directory
 
-The engine imports capyctl's own Python from the runtime directory, so a module
+The engine imports CapyCTL's own Python from the runtime directory, so a module
 another account can rewrite runs as the engine behind the controls it is meant
 to guard. The binary therefore writes that directory
 itself:
@@ -282,9 +282,9 @@ itself:
   the manifest (an edited module, a `__pycache__`, a loosened mode, a deleted
   file) is restored from the embedded copy at start, with a warning naming
   what differed (never contents).
-- **Not capyctl's.** A directory at that path without the marker is refused, not
+- **Not CapyCTL's.** A directory at that path without the marker is refused, not
   overwritten: remove it, or name it as `runtime_dir`. A directory named by
-  `runtime_dir` or `CAPYCTL_RUNTIME_DIR` is never written; capyctl only checks it.
+  `runtime_dir` or `CAPYCTL_RUNTIME_DIR` is never written; CapyCTL only checks it.
 
 Every launch still passes the integrity check: the directory, every subdirectory
 and every `.py` module owned by the service user, nothing writable by other,
@@ -302,7 +302,7 @@ the service user, mode 0700, and every ancestor of the identity directory must
 be owned by root or the service user with no group or other write at all
 (`init` otherwise fails with "Role identity refused:" and names the path
 and the check that failed, for example a parent other users can write, as
-anywhere under `/tmp`). capyctl creates the directories
+anywhere under `/tmp`). CapyCTL creates the directories
 itself; do not place `/var/lib/capyctl` behind a symlink or under a
 group-writable directory.
 
@@ -504,7 +504,7 @@ to `~/.config/capyctl` ("creating compatibility symlink" in the journal). State
 would then land in the configuration directory, behind a symlink the roles'
 identity rules refuse. `install.sh --systemd <role>` creates the empty
 directory for you and warns if the link already exists; to repair a link,
-stop the unit, `rm ~/.local/state/capyctl` (the link only), move anything capyctl
+stop the unit, `rm ~/.local/state/capyctl` (the link only), move anything CapyCTL
 wrote under `~/.config/capyctl` back out, and reinstall. Observed with systemd
 255.
 
@@ -514,13 +514,13 @@ units on shared machines.
 
 ## Discrete NVIDIA GPUs
 
-capyctl runs on machines whose GPU has its own memory (a GeForce, RTX or data
+CapyCTL runs on machines whose GPU has its own memory (a GeForce, RTX or data
 center card) as well as on unified-memory machines such as the GB10, where the
 GPU and the CPU share one pool. The steps are the same on both; this section
 covers what differs.
 
 **Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
-(or `/bin/nvidia-smi`), which every driver package installs. capyctl runs it with
+(or `/bin/nvidia-smi`), which every driver package installs. CapyCTL runs it with
 a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
 address and memory; it needs no other library. A machine that mixes an
 integrated and a discrete GPU is refused at start (`unsupported_gpu_topology`,
@@ -536,7 +536,7 @@ single `unified` domain. Otherwise it publishes two kinds of memory domain:
 | `gpuN` (`memory: device`), one per GPU | the card | total − reserve | the larger of 1 GiB and 8 % of the card | the smaller of 8 GiB and 25 % of the card |
 
 The reserve on the card leaves room for a desktop session on a workstation
-GPU. Memory other programs already hold on the card lowers what capyctl sees as
+GPU. Memory other programs already hold on the card lowers what CapyCTL sees as
 available; it is never hidden. An enrolled host states the same shape in its
 document ([`examples/host-discrete.yaml`](../examples/host-discrete.yaml)), and
 the host refuses to start if a `device` domain does not match the GPU it
@@ -553,10 +553,10 @@ limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
 about 10 GiB or more. On a smaller card the host still starts, and each vLLM
 deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
 name the `system` domain as well as the GPU's (`missing_system_allocation`
-otherwise); leaving them out and letting capyctl derive them is the portable form.
+otherwise); leaving them out and letting CapyCTL derive them is the portable form.
 
-**One GPU per model; capyctl picks it.** On a machine with several GPUs, each GPU
-is its own domain. capyctl places a new instance on the GPU where it fits with the
+**One GPU per model; CapyCTL picks it.** On a machine with several GPUs, each GPU
+is its own domain. CapyCTL places a new instance on the GPU where it fits with the
 most room, and when none has room it parks or stops models on the GPU where the
 fewest need to go. A stopped instance returns to its last GPU when it fits
 there. To pin a GPU, name it in the deployment:
@@ -585,7 +585,7 @@ started through a path that does not place it runs on the lowest-index GPU.
 | `restart_only` | never parks: the engine is stopped | a cold start | none |
 
 `host_backed` is the default on a discrete GPU, because a wake from host RAM is
-several times faster than a reload from disk. capyctl chooses it when the copy
+several times faster than a reload from disk. CapyCTL chooses it when the copy
 plus the engine process fits the `system` domain's parked limit, and `deep`
 otherwise (also while a downloaded model's size is not known yet);
 `restart_only` when the engine's deep parking is off. The copy is charged in
@@ -604,7 +604,7 @@ so choose `restart_only` for it. On a unified machine `host_backed` is refused
 memory it is supposed to free.
 
 **`insufficient_device_memory`** (exit 4) means the GPU cannot hold the
-deployment's card allocation plus its reserve: at deploy, when the size capyctl
+deployment's card allocation plus its reserve: at deploy, when the size CapyCTL
 derived from the checkpoint is larger than the card's managed limit, or at
 launch, when the card has less free memory than the allocation needs (another
 program may be holding it). Use a smaller or quantized checkpoint, a smaller KV
@@ -651,7 +651,7 @@ format.
 
 ## Registering engines
 
-capyctl uses engines you install yourself. Register them on the machine that runs them:
+CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
     capyctl engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
@@ -667,7 +667,7 @@ in your home directory (for example `~/capyctl-vllm-venv2`).
 `engine add` runs the installation only after you name or pick it (a bounded
 version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
-without a restart. capyctl never rewrites `host.yaml` or `standalone.yaml`.
+without a restart. CapyCTL never rewrites `host.yaml` or `standalone.yaml`.
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
 it sits beside the document the host was started with (the host records it),
@@ -711,7 +711,7 @@ detected for it. The engine then gets `<cuda_home>/bin` on its PATH and
 `cuda_home`, the engine PATH has only the engine's own `bin` and the system
 directories.
 
-Each compile job can take several GB. capyctl sets `MAX_JOBS` to the free memory
+Each compile job can take several GB. CapyCTL sets `MAX_JOBS` to the free memory
 at launch divided by 8 GiB, at most the CPU count, and
 `FLASHINFER_NVCC_THREADS=1`. The host log prints the chosen value at every
 launch. To choose other limits, put `MAX_JOBS` or `FLASHINFER_NVCC_THREADS`
@@ -758,7 +758,7 @@ the running role to publish it.
 
 ## Engine logs and troubleshooting
 
-capyctl does not keep an engine's own output by default, because it may contain
+CapyCTL does not keep an engine's own output by default, because it may contain
 secrets (prompts, keys in arguments). `--debug-engine-logs` on `capyctl start
 host` or `capyctl start standalone` keeps it, owner-only, in
 `<state dir>/logs/<deployment id>/<launch id>.log` for launches from then on.
@@ -772,15 +772,15 @@ it.
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
   exited.
-- **SGLang saver permission warning.** Before an SGLang park, capyctl checks
+- **SGLang saver permission warning.** Before an SGLang park, CapyCTL checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable
   environment on a machine whose groups come from a directory service such as
-  `sss`), capyctl parks anyway and writes one line to the engine log:
+  `sss`), CapyCTL parks anyway and writes one line to the engine log:
   `{"event":"capyctl_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
   The line is only in the engine log, so it is visible only with
   `--debug-engine-logs`. To clear it, remove group and other write permission
-  from the engine's environment (`chmod -R go-w <environment>`); capyctl never
+  from the engine's environment (`chmod -R go-w <environment>`); CapyCTL never
   changes engine files itself.
 - **`config show` does not match a running role.** `capyctl config show` reads
   the document, the environment of the shell it runs in and the `--set`
@@ -880,7 +880,7 @@ acting on it.
 ### Upgrading to 0.1.0
 
 Newly generated documents put the inference endpoint on all interfaces,
-`0.0.0.0:8443`, with the API key required. capyctl never rewrites an existing
+`0.0.0.0:8443`, with the API key required. CapyCTL never rewrites an existing
 document: one an earlier release generated keeps `127.0.0.1:8443` until you
 change it. To open it to the network, set `listeners.inference.bind` (under
 `server:` in standalone) to `0.0.0.0:8443` or start with
@@ -919,7 +919,7 @@ keeps the earlier accounting and says so; start it again to retry. A
 deployment that cannot be sized for the card as written is named in the
 notice and must be deployed again with a file for this machine. This runs
 once; later starts re-attach as usual. Unified-memory machines are not
-changed. An enrolled host states its domains in its own document, which capyctl
+changed. An enrolled host states its domains in its own document, which CapyCTL
 never rewrites; for a discrete card, write it in the shape of
 [`examples/host-discrete.yaml`](../examples/host-discrete.yaml).
 
@@ -956,7 +956,7 @@ know. So:
 
 - Back up each role's state directory before an upgrade, with the role
   stopped (the tar above). Engines keep running meanwhile; the backup is
-  consistent because capyctl is not writing.
+  consistent because CapyCTL is not writing.
 - Roll back across a schema change only by restoring that backup together
   with the old binary. A restored store does not know about engines launched
   after the backup was taken; drain the affected hosts first (`capyctl drain
@@ -965,7 +965,7 @@ know. So:
   name: identities are bound to it. Losing a host's identity
   requires re-enrollment, not a copied directory.
 
-Role documents under `/etc/capyctl` are operator configuration; capyctl never
+Role documents under `/etc/capyctl` are operator configuration; CapyCTL never
 rewrites them, with one exception: the one-time inference listener update
 described in "Upgrading to 0.1.0". Validate them with the new binary
 (`capyctl validate config`) before restarting.

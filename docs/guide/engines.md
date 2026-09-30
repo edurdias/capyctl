@@ -1,7 +1,7 @@
 # Add an engine
 
-capyctl runs the vLLM or SGLang you already have. It does not install engines.
-You register each installation once per machine; capyctl calls it an engine
+CapyCTL runs the vLLM or SGLang you already have. It does not install engines.
+You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
 
 ## Find your installations
@@ -40,12 +40,12 @@ Registered vllm (vllm 0.29.0)
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
 ```
 
-The profile is named after the engine: `vllm` or `sglang`. capyctl runs the
+The profile is named after the engine: `vllm` or `sglang`. CapyCTL runs the
 engine once to check its version and whether it supports parking, and records
 the CUDA toolkit it finds for the engine's kernel builds.
 
-That output is from a first run, before capyctl was started: the engine is saved
-and used from the first start. If capyctl is running, it uses the engine at once
+That output is from a first run, before CapyCTL was started: the engine is saved
+and used from the first start. If CapyCTL is running, it uses the engine at once
 and prints `Published      yes`, as below.
 
 On a GPU machine that runs a host, the same command adds the engine to the
@@ -55,7 +55,7 @@ use it.
 ## Custom builds
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 or SGLang 0.5.20, the
-versions this release of capyctl knows. capyctl still runs it. Give it its own
+versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 
 ```bash
@@ -90,7 +90,7 @@ vllm           engines.yaml   vllm     0.29.0      no       enabled     publishe
 vllm-nightly   engines.yaml   vllm     0.30.0rc1   yes      enabled     published   -
 ```
 
-`PUBLISHED` shows whether the running capyctl uses it (`unknown` while capyctl is
+`PUBLISHED` shows whether the running CapyCTL uses it (`unknown` while CapyCTL is
 not running). `capyctl list engines` lists the engines of every host on a server, and of this machine on a standalone.
 
 ```bash
@@ -109,12 +109,12 @@ example `"published":"published"` in the record of `engine add` and
 `engine remove`.
 
 A profile a deployment still uses is not removed; the command names the
-deployment. `--drain` stops those deployments first. Removing needs capyctl
+deployment. `--drain` stops those deployments first. Removing needs CapyCTL
 running.
 
 ## System services
 
-When capyctl runs as a system service, run the engine commands with `sudo` and
+When CapyCTL runs as a system service, run the engine commands with `sudo` and
 the service's configuration file. This is the one place to name it: `sudo`
 runs the command as root, which does not see the service's own records, and
 `--config` makes it change the file the service reads:

@@ -1,6 +1,6 @@
 # Deploy a model
 
-A deployment tells capyctl which model to run, with which engine, and the name
+A deployment tells CapyCTL which model to run, with which engine, and the name
 clients ask for. You write it once as a YAML file.
 
 ## The deployment file
@@ -26,14 +26,14 @@ engine: vllm
 model: {hf: Qwen/Qwen3-4B-Instruct-2507}
 ```
 
-capyctl pins a Hugging Face repository to the commit it points at when you
+CapyCTL pins a Hugging Face repository to the commit it points at when you
 deploy (write `Qwen/Qwen3-4B-Instruct-2507@<commit>` to pick one yourself),
 then downloads it into `~/models/sources` on the machine that runs it. It
 checks free disk space first, and all downloads together are capped at
 500 GiB. See [settings](../operations/configuration.md#models-and-downloads)
 to change the cap or turn downloads off.
 
-capyctl fills in the rest: the GPU, the memory the engine may use (sized from
+CapyCTL fills in the rest: the GPU, the memory the engine may use (sized from
 the checkpoint and the GPU), and how the model parks. To see what it fills
 in:
 
@@ -77,7 +77,7 @@ Deployed my-model: ready
 ```
 
 This saves the deployment, starts it and returns when the model answers. The
-first time capyctl sees a checkpoint it reads the files once to fingerprint
+first time CapyCTL sees a checkpoint it reads the files once to fingerprint
 them, so the first start takes longer.
 
 Without `--activate`, `deploy` only saves it. For a second model,
@@ -152,7 +152,7 @@ INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   parked   active      gpu0      -
 ```
 
-`STARTUP` is the memory capyctl set aside to start the model. When a start fails,
+`STARTUP` is the memory CapyCTL set aside to start the model. When a start fails,
 `LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
 
 ```text

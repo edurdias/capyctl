@@ -1,4 +1,4 @@
-# capyctl — working agreement
+# CapyCTL — working agreement
 
 Rust controller for managing inference-engine deployments on hardware that cannot
 keep all model weights resident. The primary audience is home users and prosumers
@@ -94,7 +94,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
   vLLM 0.29 venv on host B; do not create or modify others.
 - Only one live session runs on the hosts at a time.
-- Fault injection is limited to signals sent to capyctl-owned processes (PIDs taken
+- Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
   firewalls or interfaces.
 - Never read or print engine keys or other secrets. The server's SQLite ledger is
@@ -103,7 +103,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
 - Deep-park / collective-RPC paths are security-gated (SPEC §9.1, T21, ADR 0012):
   enabled by default, a host opts out, controls never leave loopback, and they are
   not production-safe. The protections stay mandatory whenever deep parking is on:
-  loopback-only engine listener, a per-launch engine key, capyctl's key-guard
+  loopback-only engine listener, a per-launch engine key, CapyCTL's key-guard
   middleware, and no engine control path through host ingress or the router. vLLM
   development mode remains an isolated integration, not a production-hardened one.
 

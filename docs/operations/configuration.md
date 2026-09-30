@@ -1,6 +1,6 @@
 # Settings reference
 
-Every setting capyctl reads is listed here, with each of the ways to state it.
+Every setting CapyCTL reads is listed here, with each of the ways to state it.
 Every setting of a role document can be stated three ways: in the YAML role
 document, on the command line that starts the role, and in the environment.
 The settings people change most have their own flag and variable (the tables
@@ -39,7 +39,7 @@ refused: an opt-out that was mistyped must not be read as "on".
 | Registered engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/engines.yaml` | host, standalone, `capyctl engine` |
 
 The role document cannot name itself, so it has no YAML form. The state root
-is where capyctl looks for the implicit role document, so its YAML form is read
+is where CapyCTL looks for the implicit role document, so its YAML form is read
 only from a standalone document named with `--config` or `CAPYCTL_CONFIG` (a
 relative path resolves against the document's directory). A server or host
 document's `state_dir` is where that role keeps its state; `init server` and
@@ -155,7 +155,7 @@ block.
 | Deep parking | `local_engine.deep_park: on\|off` | `--deep-park on\|off` | `CAPYCTL_DEEP_PARK` | `on` | host, standalone |
 | Run checkpoint-supplied Python (`trust_remote_code`) | `local_engine.trust_remote_code` | `--trust-remote-code true\|false` | `CAPYCTL_TRUST_REMOTE_CODE` (`1` or `true`) | `false` | host, standalone |
 | When the installation's files change | `local_engine.installation_drift: warn\|refuse` | `--installation-drift warn\|refuse` | `CAPYCTL_INSTALLATION_DRIFT` | `warn` | host, standalone |
-| capyctl's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `CAPYCTL_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
+| CapyCTL's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `CAPYCTL_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
 | Engine port range (loopback) | `resource_policy.endpoint_port_range` (`start`, `end`) | `--engine-ports <start-end>` | `CAPYCTL_ENGINE_PORTS` (`CAPYCTL_STANDALONE_ENGINE_PORTS` still read, with a warning) | `8100-8199` | host, standalone |
 | CUDA toolkit for engine kernel builds | `local_engine.cuda_home` | `--cuda-home <dir>` | `CAPYCTL_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
 
@@ -163,7 +163,7 @@ A host generates no deployment of its own, so `--kv-cache` exists only on
 `start standalone`; on a host, `local_engine.kv_cache` is refused and each
 deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
 arguments, so `args` applies to the vLLM profile only. Name `runtime_dir` only
-to run from a directory you maintain yourself; capyctl never writes to it.
+to run from a directory you maintain yourself; CapyCTL never writes to it.
 
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other
@@ -173,13 +173,13 @@ change needs a restart.
 
 A secret is never a command-line flag: flags are visible to every user in the
 process list and are kept in shell history. Secrets are protected files that
-capyctl writes or reads, or environment variables.
+CapyCTL writes or reads, or environment variables.
 
 | Secret | File | Variable | Notes |
 |---|---|---|---|
 | Inference API key and management admin token | standalone: `<state root>/identity/credentials` (owner-only, `api_key:` and `admin_token:` lines), generated on first start; server: `<identity_dir>/server-credentials.json` (owner-only JSON), created by `init server` | (none) | Generated, never typed or printed; read the file to use them ([network access](network-access.md#default)). |
 | Server enrollment and host identity | `identity_dir` (`<state dir>/identity`) | (none) | Created by `init server` and `join host`. |
-| Per-launch engine keys | written by capyctl for each launch | (none) | Never an operator setting. |
+| Per-launch engine keys | written by CapyCTL for each launch | (none) | Never an operator setting. |
 | Hugging Face token for a source that names none | `model_sources.huggingface_token_file` (absolute path to an owner-only file) | `CAPYCTL_HF_TOKEN`, else `HF_TOKEN` | The variable wins over the file. The host that downloads reads it; `deploy model` also uses the variable to pin a private repository. |
 | Hugging Face token for one source | `model.source.token_ref: secret://<name>` in the deployment (`type: huggingface`), naming `<state dir>/secrets/<name>` on the host (owner-only) | (none) | Wins over the host's default token. |
 
@@ -329,13 +329,13 @@ is given, even when their output is piped. `start server`, `start host` and
 object per line otherwise, so the journal and log files are JSON; `--format`
 overrides that either way.
 
-## Variables capyctl sets for engines
+## Variables CapyCTL sets for engines
 
-capyctl starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
+CapyCTL starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
 `CAPYCTL_EXTRA_APPROVALS`, `CAPYCTL_RENDEZVOUS_DIR`, `CAPYCTL_OBSERVATION_DIR`,
 `CAPYCTL_VLLM_ADMIN_KEY`, `CAPYCTL_ENGINE_API_KEY` and `CAPYCTL_DEBUG_ENGINE_LOGS` are
-written by capyctl for the engine process; setting them yourself has no effect.
-Other variables in capyctl's own environment do not reach an engine. The CUDA
+written by CapyCTL for the engine process; setting them yourself has no effect.
+Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in
 `runtime_profiles`) puts `<cuda_home>/bin` on the engine's PATH and sets its
