@@ -300,7 +300,9 @@ State directories are stricter still: `state_dir`, its `identity`,
 `observation` and `rendezvous` directories must be canonical paths, owned by
 the service user, mode 0700, and every ancestor of the identity directory must
 be owned by root or the service user with no group or other write at all
-(`init` otherwise fails with "Role identity is unsafe or already in use"). mllm creates the directories
+(`init` otherwise fails with "Role identity refused:" and names the path
+and the check that failed, for example a parent other users can write, as
+anywhere under `/tmp`). mllm creates the directories
 itself; do not place `/var/lib/mllm` behind a symlink or under a
 group-writable directory.
 

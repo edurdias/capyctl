@@ -55,6 +55,19 @@ pub fn host_revoked(host: &str) -> StructuredError {
         ),
     }
 }
+/// SPEC §13.1: identity storage refuses an unsafe or busy directory; the
+/// message names the path and the check that failed so the operator can act.
+fn identity_refused(
+    what: &str,
+    path: &Path,
+    refusal: &mllm_agent::identity_storage::StorageError,
+    hint: &str,
+) -> StructuredError {
+    error(&format!(
+        "{what} refused: {}{hint}",
+        mllm_agent::identity_storage::describe_refusal(path, refusal)
+    ))
+}
 fn unavailable() -> StructuredError {
     StructuredError {
         code: "management_unavailable",
@@ -270,7 +283,7 @@ fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, Str
     private_dir(root)?;
     private_dir(&root.join("identity"))?;
     let storage = IdentityDirectory::open(&root.join("identity"))
-        .map_err(|_| error("Role identity is unsafe or already in use"))?;
+        .map_err(|e| identity_refused("Role identity", &root.join("identity"), &e, ""))?;
     if role == InitTarget::Server {
         if storage
             .read_bundle("server-credentials.json")
@@ -381,8 +394,14 @@ pub(crate) fn wait_limits(
 }
 
 async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
-    let storage = IdentityDirectory::open(&config.identity_dir)
-        .map_err(|_| error("Server identity is missing, unsafe or already in use"))?;
+    let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+        identity_refused(
+            "Server identity",
+            &config.identity_dir,
+            &e,
+            "; run init server first",
+        )
+    })?;
     let credentials = load_credentials(&config)?;
     let ca = enrollment::load_controller_ca(&storage)
         .map_err(|_| error("Server CA is missing or invalid; explicit recovery is required"))?;
@@ -863,8 +882,14 @@ async fn serve_host(
             mllm_agent::gpu_memory::shape(boot_gpu.as_ref()).map_err(|e| error(&e.to_string()))?;
         check_host_device_policy(&config.document, &shape)?;
     }
-    let storage = IdentityDirectory::open(&config.identity_dir)
-        .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
+    let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+        identity_refused(
+            "Host identity",
+            &config.identity_dir,
+            &e,
+            "; run join host before startup",
+        )
+    })?;
     let identity = PendingEnrollment::load(&storage).map_err(|_| {
         error(
             "Host is not enrolled or its identity needs recovery; run join host with an invitation",
@@ -943,8 +968,15 @@ async fn serve_host(
         // SPEC §8.2 / T21: per-launch SGLang file rendezvous directories,
         // removed on gone evidence (0700, this service user).
         private_dir(&config.state_dir.join("rendezvous"))?;
-        let private = IdentityDirectory::open(&config.state_dir.join("ingress-identity"))
-            .map_err(|_| unavailable())?;
+        let private =
+            IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|e| {
+                identity_refused(
+                    "Ingress identity",
+                    &config.state_dir.join("ingress-identity"),
+                    &e,
+                    "",
+                )
+            })?;
         let identities = mllm_agent::ingress_identity::IngressIdentities::new(private);
         let execution = mllm_agent::native_execution::NativeHostExecution::new(
             journal.clone(),
@@ -1356,8 +1388,13 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }
                 _ => {}
             }
-            let storage = IdentityDirectory::open(&config.identity_dir).map_err(|_| {
-                error("Host identity is unsafe or already in use; stop the host role first")
+            let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
+                identity_refused(
+                    "Host identity",
+                    &config.identity_dir,
+                    &e,
+                    "; stop the host role first",
+                )
             })?;
             let mut pending = if *recover {
                 PendingEnrollment::prepare_recovery(&storage, &invitation).map_err(|_| {

@@ -218,3 +218,38 @@ fn directory_replacement_invalidates_the_retained_handle() {
     drop(storage);
     fs::remove_dir_all(moved).unwrap();
 }
+
+// T06/T37: a refused directory is explained by path and failing check: in use,
+// a wrong mode, or a parent other users can write (such as one under /tmp).
+#[test]
+fn a_refused_identity_directory_is_explained() {
+    use mllm_agent::identity_storage::describe_refusal;
+    let dir = directory();
+    let storage = IdentityDirectory::open(dir.path()).unwrap();
+    let busy = IdentityDirectory::open(dir.path()).err().unwrap();
+    assert!(describe_refusal(dir.path(), &busy).contains("in use"));
+    drop(storage);
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+    let invalid = IdentityDirectory::open(dir.path()).err().unwrap();
+    assert!(
+        describe_refusal(dir.path(), &invalid).contains("mode 0750; it must be 0700"),
+        "{}",
+        describe_refusal(dir.path(), &invalid)
+    );
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let open_parent = dir.path().join("shared");
+    fs::create_dir(&open_parent).unwrap();
+    fs::set_permissions(&open_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let identity = open_parent.join("identity");
+    fs::create_dir(&identity).unwrap();
+    fs::set_permissions(&identity, fs::Permissions::from_mode(0o700)).unwrap();
+    let invalid = IdentityDirectory::open(&identity).err().unwrap();
+    let said = describe_refusal(&identity, &invalid);
+    assert!(
+        said.starts_with(&format!("{} (a parent of", open_parent.display()))
+            && said.contains("can be written by other users"),
+        "{said}"
+    );
+}
