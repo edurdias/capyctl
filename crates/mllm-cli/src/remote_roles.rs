@@ -162,23 +162,44 @@ fn private_read(path: &Path) -> Result<Vec<u8>, StructuredError> {
             || ![0, unsafe { libc::geteuid() }].contains(&m.uid())
             || m.mode() & 0o022 != 0
         {
-            return Err(error("Unsafe private file directory"));
+            return Err(error(&format!(
+                "Unsafe private file directory: {} (holding {}) can be written by other users",
+                ancestor.display(),
+                path.display()
+            )));
         }
     }
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|_| unavailable())?;
+        .map_err(|e| StructuredError {
+            code: "management_unavailable",
+            message: format!("Cannot open private file {}: {e}", path.display()),
+        })?;
     let m = file.metadata().map_err(|_| unavailable())?;
-    if !m.is_file()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o7777 != 0o600
-        || m.nlink() != 1
-        || m.len() == 0
-        || m.len() > 131072
-    {
-        return Err(error("Unsafe or incomplete private file"));
+    let refusal = if !m.is_file() {
+        Some("it is not a regular file".to_owned())
+    } else if m.uid() != unsafe { libc::geteuid() } {
+        Some("it is owned by another user".to_owned())
+    } else if m.mode() & 0o7777 != 0o600 {
+        Some(format!(
+            "it has mode {:04o}; run `chmod 600 {}`",
+            m.mode() & 0o7777,
+            path.display()
+        ))
+    } else if m.nlink() != 1 {
+        Some("it has more than one hard link".to_owned())
+    } else if m.len() == 0 || m.len() > 131072 {
+        Some("it is empty or larger than 128 KiB".to_owned())
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        return Err(error(&format!(
+            "Unsafe or incomplete private file {}: {reason}",
+            path.display()
+        )));
     }
     let mut bytes = Vec::new();
     (&mut file)

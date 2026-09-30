@@ -143,7 +143,7 @@ mllm start server --config server.yaml
 mllm invite host gpu-box --output gpu-box.join
 ```
 
-Copy `gpu-box.join` to the GPU machine, then:
+Copy `gpu-box.join` to the GPU machine (`scp -p` keeps its 0600 mode), then:
 
 ```bash
 mllm init host --output host.yaml
