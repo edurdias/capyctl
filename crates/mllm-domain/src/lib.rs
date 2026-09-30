@@ -8,6 +8,7 @@ pub mod launch;
 pub mod lifecycle;
 pub mod park;
 pub mod resources;
+pub mod role_log;
 
 pub use error::TransitionError;
 pub use identity::{
