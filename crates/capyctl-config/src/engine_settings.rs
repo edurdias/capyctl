@@ -496,7 +496,7 @@ pub fn apply_to_host(
         };
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
-            Engine::Vllm => settings.args.clone(),
+            Engine::Vllm | Engine::Tensorfold => settings.args.clone(),
             Engine::Sglang => Vec::new(),
         };
         let mut profile =

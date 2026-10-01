@@ -63,6 +63,7 @@ pub fn capability_names(engine: Engine) -> &'static [&'static str] {
     match engine {
         Engine::Sglang => &["core", "deep_park", "metrics", "observation"],
         Engine::Vllm => &["core", "deep_park", "metrics"],
+        Engine::Tensorfold => &["core", "deep_park", "metrics"],
     }
 }
 
@@ -71,6 +72,7 @@ pub fn package_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Sglang => "sglang",
         Engine::Vllm => "vllm",
+        Engine::Tensorfold => "tensorfold",
     }
 }
 

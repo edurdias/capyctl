@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 pub enum LaunchSettings {
     Vllm(VllmLaunchSettings),
     Sglang(SglangLaunchSettings),
+    Tensorfold(TensorfoldLaunchSettings),
 }
 
 impl LaunchSettings {
@@ -22,6 +23,7 @@ impl LaunchSettings {
         match self {
             Self::Vllm(settings) => &settings.common,
             Self::Sglang(settings) => &settings.common,
+            Self::Tensorfold(settings) => &settings.common,
         }
     }
 
@@ -29,6 +31,7 @@ impl LaunchSettings {
         match self {
             Self::Vllm(settings) => &settings.memory,
             Self::Sglang(settings) => &settings.memory,
+            Self::Tensorfold(settings) => &settings.memory,
         }
     }
 
@@ -36,6 +39,7 @@ impl LaunchSettings {
         match self {
             Self::Vllm(settings) => &mut settings.memory,
             Self::Sglang(settings) => &mut settings.memory,
+            Self::Tensorfold(settings) => &mut settings.memory,
         }
     }
 
@@ -43,6 +47,15 @@ impl LaunchSettings {
         match self {
             Self::Vllm(settings) => &settings.extra_args,
             Self::Sglang(settings) => &settings.extra_args,
+            Self::Tensorfold(settings) => &settings.extra_args,
+        }
+    }
+
+    pub fn provenance_mut(&mut self) -> &mut BTreeMap<String, SettingSource> {
+        match self {
+            Self::Vllm(settings) => &mut settings.provenance,
+            Self::Sglang(settings) => &mut settings.provenance,
+            Self::Tensorfold(settings) => &mut settings.provenance,
         }
     }
 
@@ -50,6 +63,7 @@ impl LaunchSettings {
         match self {
             Self::Vllm(settings) => &settings.provenance,
             Self::Sglang(settings) => &settings.provenance,
+            Self::Tensorfold(settings) => &settings.provenance,
         }
     }
 }
@@ -159,6 +173,20 @@ pub struct SglangLaunchSettings {
     pub memory_saver: bool,
     pub cpu_weight_backup: bool,
     pub weight_restore: String,
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
+}
+
+/// ADR 0023 §4: a TensorFold deployment's resolved settings. TensorFold has
+/// no park strategy, so nothing here is derived from residency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TensorfoldLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
     pub extra_args: Vec<String>,
     pub provenance: BTreeMap<String, SettingSource>,
 }

@@ -53,14 +53,6 @@ pub fn device_limits(memory: &GpuMemory, max_parked: i64) -> DeviceLimits {
     }
 }
 
-/// The name the published table uses for an engine family.
-fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Vllm => "vllm",
-        Engine::Sglang => "sglang",
-    }
-}
-
 /// One installation's published runtime profile.
 ///
 /// SPEC §13.3, §9.1 / T21, ADR 0012: every launch seals two per-launch keys
@@ -81,7 +73,7 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
         security["installation_drift"] = json!("refuse");
     }
     let mut profile = json!({
-        "engine": engine_name(installation.engine),
+        "engine": installation.engine.name(),
         "revision": 1,
         "executable": installation.executable.to_string_lossy(),
         "build_fingerprint": installation.build_fingerprint,
@@ -144,7 +136,7 @@ pub fn host_policy(
         "schema_version": 1,
         "kind": "host",
         "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
-        "hardware_fingerprint": format!("standalone-{}", engine_name(first.engine)),
+        "hardware_fingerprint": format!("standalone-{}", first.engine.name()),
         "environment_fingerprint": environment_fingerprint,
         // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
         // the native launch asserts against. Absent (null) when the host

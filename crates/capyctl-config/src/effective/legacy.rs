@@ -83,10 +83,7 @@ pub fn legacy_engine_config(
     deep_park_enabled: bool,
 ) -> Result<Value, LegacyRefusal> {
     let declared_engine = settings["engine"].as_str();
-    let expected = match engine {
-        Engine::Vllm => "vllm",
-        Engine::Sglang => "sglang",
-    };
+    let expected = engine.name();
     if declared_engine != Some(expected) {
         return Err(refuse(
             "launch_settings.engine does not match the runtime profile's engine",
@@ -104,6 +101,7 @@ pub fn legacy_engine_config(
     }
     let mut block = Map::new();
     match engine {
+        Engine::Tensorfold => return Err(refuse("TensorFold has no legacy launch settings")),
         Engine::Vllm => {
             for field in ["tensor_parallel_size", "pipeline_parallel_size"] {
                 let size = count(settings, field)?;

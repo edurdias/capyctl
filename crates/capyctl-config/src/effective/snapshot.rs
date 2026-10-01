@@ -236,6 +236,7 @@ pub(super) fn declared_engine_config(
             "chunked_prefill_size",
             "tokenizer_workers",
         ],
+        Some("tensorfold") => &["max_tokens", "thinking"],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),
     };
     let prefix = engine.expect("engine checked above");

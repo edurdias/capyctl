@@ -244,11 +244,7 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
         });
     // ADR 0018 §1: `custom` is derived, never declared.
     use capyctl_config::{engine_policy::Engine, registration::is_verified};
-    let custom = match engine.as_str() {
-        "vllm" => !is_verified(Engine::Vllm, &version),
-        "sglang" => !is_verified(Engine::Sglang, &version),
-        _ => true,
-    };
+    let custom = Engine::from_name(&engine).is_none_or(|e| !is_verified(e, &version));
     serde_json::json!({
         "host_id": row.host_id, "host": row.host_name,
         "online": row.online,
