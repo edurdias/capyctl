@@ -1,5 +1,111 @@
 # Current implementation and launch status
 
+## Live follow-ups — 2026-10-01
+
+The four problems the TensorFold run found are fixed
+(`docs/specs/2026-10-01-live-followups-design.md`): Hugging Face link chains
+are measured (ADR 0014 A5) and an unmeasurable checkpoint says why;
+`validate config` without `--host` checks `resources`; a role starts with no
+engine and `engine remove` takes the last profile (ADR 0018 A2); a client
+hang-up mid-stream closes the engine connection and the request stays
+charged until the engine reports quiescence (SPEC §10). TensorFold 0.6.1 is
+verified beside 0.6.0 (ADR 0023).
+
+The live run found two more CapyCTL bugs, both fixed with a failing test
+first:
+
+- `091e3a1`: on a remote host, a park or stop accepted right after a
+  hang-up never settled the cancelling lease. The quiescence check matched
+  the host's load sample only against Ready launches, and an instance stops
+  being one once a park or stop is accepted. On vLLM 0.29 on host B, a park
+  0.04 s after the close was still `parking` after 150 s (it would have
+  waited for its 900 s deadline), and a stop drained its full 30 s. After
+  the fix the same park finished 1.35 s after the close and the stop 1.8 s
+  after its command.
+- `9d47b8f`: `validate config` without `--host` refused the engines guide's
+  TensorFold block (`resources.cold.devices[0].sharing` missing) while
+  `deploy model` accepted it. Offline, a missing `sharing` now takes the
+  deployment's own value for that device, else `exclusive`. The guide-shaped
+  file now validates.
+
+`1467b86` fixes the matrix harness: `roles.sh` parsed `join host` text
+output as JSON.
+
+Live on host A and host B (GB10), with Nemotron 3.5 Lightning 30B-A3B
+4-bit at a 32768-token context, 32 GiB cold and 30 GiB ready:
+
+- TF2 on an unmodified two-hop cache passed on TensorFold 0.6.0 (host B,
+  standalone). A fresh `huggingface_hub` snapshot links each file to
+  `../../blobs/<sha>`, which links again into `hub/blobs/<xx>/<sha>`. The
+  digest was measured (no `unsafe_file`) and the deployment was ready 100 s
+  after the start command, including the measurement and the kernel build.
+  CapyCTL measured a 26.2 GiB startup peak. A plain request answered `42`
+  with the `tensorfold` object (159 tok/s decode), the streaming one `42` in
+  50 events, and a 3343-token request took 29.0 s with `nvidia-smi` at most
+  18.7 GiB.
+- TensorFold 0.6.1 (new venv on host B, an owner exception). TF1 passed:
+  `engine add` on the running empty role printed `Registered tensorfold
+  (tensorfold 0.6.1)`, with custom `no`, deep park disabled and CUDA
+  `/usr/local/cuda`, and published it live. TF2 passed standalone. A new
+  deployment was ready 88.4 s after the start (digest and first 0.6.1 kernel
+  build), with a 26.4 GiB startup peak. It answered `42` plain (158 tok/s)
+  and streaming (50 events), and the 3343-token request took 29.2 s with
+  `nvidia-smi` at most 18.7 GiB. TF2 also passed remote, on host B under the
+  server: ready in 95.9 s, `42` plain and streaming through the router, and
+  the host's load report present for the launch. The router's selection
+  read `load_source: engine` with `engine_running: 1` during a long request
+  and 0 when idle, so the vLLM-named metric mirrors 0.6.1 adds no longer
+  hide the load.
+- TF5 passed on both versions. Before, the engine stayed busy until it had
+  finished all 2048 tokens and read idle 17.2 s after the close. On 0.6.0,
+  standalone, the engine read `busy: false`, `requests_running: 0` 0.07 s
+  after the client closed, having generated 32 tokens. The lease was
+  acknowledged quiescent 0.21 s and closed 0.40 s after the close. A stop
+  sent then finished 1.4 s later, and the process was gone 1.6 s after the
+  close. On 0.6.1, standalone: idle 0.08 s after the close (32 tokens),
+  lease closed 0.40 s, stopped 0.95 s after the stop command, process gone
+  1.2 s after the close. On 0.6.1, remote through host ingress: idle 0.17 s
+  after the close, ingress connection to the engine closed with it, lease
+  acknowledged 0.48 s, a stop accepted 0.04 s after the close finished
+  1.6 s after the close.
+- vLLM 0.29 on host B, remote (server and host agent), passed after the
+  first fix. Host ingress closed its connection to the engine 0.1 to 0.2 s
+  after each hang-up, the engine log showed generation stopping (`Running: 0
+  reqs`), and the lease was acknowledged in 0.46 to 0.96 s. A park after the
+  lease closed (0.61 s) left the deployment `parked` 1.03 s after the park
+  command. A park 0.05 s after the close was acknowledged at 0.60 s and
+  parked 1.35 s after the close.
+- SGLang 0.5.20 passed, remote, on both hosts. On host A, the lease closed
+  0.20 s after the close and a park then took 0.62 s. With the park sent at
+  the close, the lease was acknowledged at 0.98 s and the deployment parked
+  1.41 s after the close. On host B: lease closed after 1.42 s, park then
+  0.57 s; with the park sent at the close, acknowledged 0.85 s, parked 1.32 s.
+- Empty role and last profile passed (host B, standalone). A drained
+  shutdown reported `drained: true` with 0 in flight. On the restarted role,
+  `engine remove tensorfold` removed the last profile (`Published yes`), and
+  `status deployment nemotron` printed `Engine  none: run capyctl engine add
+  <path>`. The role then booted with no engine, showing the banner `Engines
+  none: run capyctl engine add <path>`, and `engine add` of 0.6.1 published
+  live.
+- M75 passed on both hosts: each booted with no engine, published no
+  profiles, started no engine child, and exited 0 in both JSON and text
+  modes.
+
+Found and not fixed: a deployment keeps the executable it was resolved with
+(ADR 0018: deployments are not re-resolved). After the 0.6.0 profile was
+removed and 0.6.1 registered under the same name, starting the existing
+deployment ran the 0.6.0 executable, while `status deployment` showed the
+0.6.1 installation. When the deployment's executable is no longer
+registered, the view falls back to the role's first installation.
+Redeploying picked up 0.6.1.
+
+All roles stopped with a drained shutdown. Deployments and profiles were
+removed, and no capyctl, engine or GPU process is left on either host.
+The venvs, the fresh Hugging Face cache and the model directories are kept.
+Local checks: formatting, Clippy with warnings denied (workspace), core
+suite 1163 passed / 0 failed, workspace 2398 / 0, site check. CPU and
+Fake-engine tests are not qualification.
+
 ## TensorFold engine — 2026-10-01
 
 ADR 0023 is implemented: `tensorfold` is the third engine kind, registered with
@@ -51,14 +157,7 @@ Live on host B (GB10, standalone, TensorFold 0.6.0 venv, Nemotron 3.5 Lightning
   after the idle read; the engine stopped answering 0.3 s and exited 0.7 s
   after the release began.
 
-Found and not fixed: a Hugging Face cache in the shared-blobs layout
-(`snapshots/` links to model blobs that link again into `hub/blobs`) is
-refused `unsafe_file`, and the start then reports "checkpoint does not match
-its recorded digest"; a plain checkpoint directory works. `validate config`
-without `--host` accepts a `resources` block that `deploy model` refuses
-(missing `host_kv_bytes`, `devices`). The last engine profile cannot be removed
-with `engine remove`: a running standalone refuses `publish_rejected`, a
-stopped one `agent_unreachable`.
+Fixed in the live follow-ups entry above.
 
 All roles stopped with a drained shutdown; deployments deleted; no capyctl or
 engine process and no GPU process left on host B. Local checks: formatting,
