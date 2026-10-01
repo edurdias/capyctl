@@ -15,11 +15,10 @@ pub(crate) const MAX_SITE_ENTRIES: usize = 65_536;
 const MAX_METADATA: u64 = 1 << 20;
 
 fn engine_of(package: &str) -> Option<Engine> {
-    match package {
-        "vllm" => Some(Engine::Vllm),
-        "sglang" => Some(Engine::Sglang),
-        _ => None,
-    }
+    // ADR 0018 §1, ADR 0023 §1: the package names of the engine kinds.
+    Engine::ALL
+        .into_iter()
+        .find(|engine| crate::installation::package_name(*engine) == package)
 }
 
 /// The environment's `lib/python3.*/site-packages` directories, sorted.
@@ -51,7 +50,7 @@ fn metadata_version(info: &Path) -> Option<String> {
         .filter(|v| !v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic()))
 }
 
-/// ADR 0018 §1: the vLLM and SGLang packages an environment holds, from
+/// ADR 0018 §1: the vLLM, SGLang and TensorFold packages an environment holds, from
 /// `<name>-<version>.dist-info` directories (not symlinks) and their
 /// `METADATA` `Version:` line. Metadata only; bounded.
 pub fn packages(env: &Path) -> Vec<(Engine, String)> {

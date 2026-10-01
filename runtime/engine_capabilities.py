@@ -23,6 +23,9 @@ Capabilities, per engine family, and the feature each gates:
   `host_backed` (discrete GPU design §5; use `restart_only`) and any Park.
   `host_backed` drives a subset of these shapes (no disk reload, no
   collective RPC), so a build must carry the whole set to park either way.
+- TensorFold (`core`, `deep_park`, `metrics`): `core` checks the `serve`
+  destinations capyctl renders or reserves; `deep_park` is always missing
+  because TensorFold has no release API (ADR 0023 §6).
 - `metrics`: the gauges the host agent scrapes for load reports. Missing
   degrades load reporting only; it never refuses a launch.
 - `observation` (SGLang): the scheduler and saver shapes the allocation
@@ -53,6 +56,7 @@ SCHEMA = "capyctl/engine-capabilities/v1"
 ENGINES = {
     "sglang": ("core", "deep_park", "metrics", "observation"),
     "vllm": ("core", "deep_park", "metrics"),
+    "tensorfold": ("core", "deep_park", "metrics"),
 }
 _MAX_SOURCE = 4 * 1024 * 1024
 
@@ -325,6 +329,33 @@ def probe_vllm(parser, reserved, importer=importlib.import_module):
     ))
 
 
+# ADR 0023 §3, §4: the TensorFold 0.6.0 `serve` destinations capyctl renders,
+# reserves or types (tensorfold/cli_args.py).
+TENSORFOLD_DESTINATIONS = ("host", "port", "name", "alias", "backend", "context",
+                           "drafter", "tp", "rank", "master", "master_port",
+                           "snapshot_dir", "no_update_check", "kv_dtype",
+                           "max_tokens", "thinking")
+# Load gauges the host agent scrapes (crates/capyctl-agent/src/load.rs).
+TENSORFOLD_GAUGES = ("requests_running", "requests_waiting", "kv_cache_usage_ratio")
+
+
+def tensorfold_metrics(importer):
+    module = _import(importer, "tensorfold.server.metrics")
+    if module is None:
+        return ("metrics_module",)
+    return tuple("gauge:" + name for name in _names_in_source(module, TENSORFOLD_GAUGES))
+
+
+def probe_tensorfold(parser, importer=importlib.import_module):
+    destinations = parser_destinations(parser) if parser is not None else frozenset()
+    return Report("tensorfold", (
+        ("core", tuple("destination:" + name for name in TENSORFOLD_DESTINATIONS
+                       if name not in destinations) if parser is not None else ("parser",)),
+        ("deep_park", ("unsupported",)),
+        ("metrics", tensorfold_metrics(importer)),
+    ))
+
+
 def _sglang_reserved_fields():
     try:
         from runtime import sglang_server_args
@@ -342,6 +373,14 @@ def _run(engine):
         from runtime.sglang_startup_guards import enforce_closed_plugins
         enforce_closed_plugins()
         return probe_sglang(reserved_fields=_sglang_reserved_fields())
+    if engine == "tensorfold":
+        try:
+            from tensorfold import cli_args
+            parser = cli_args.build_parser({name: None for name in
+                                            ("serve", "pull", "models", "update", "info")})
+        except Exception:
+            parser = None
+        return probe_tensorfold(parser)
     from runtime import vllm_entry
     try:
         runtime = vllm_entry.InstalledVllm()
@@ -352,7 +391,7 @@ def _run(engine):
 
 
 def main(argv=None):
-    """`python -I -S engine_capabilities.py <sglang|vllm> <site-packages>`.
+    """`python -I -S engine_capabilities.py <sglang|vllm|tensorfold> <site-packages>`.
 
     Prints one JSON report on standard output. Engine imports may write to
     standard output or error themselves, so both are pointed at /dev/null for

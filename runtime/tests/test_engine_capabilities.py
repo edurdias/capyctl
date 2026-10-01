@@ -179,6 +179,21 @@ class CapabilityProbeTests(unittest.TestCase):
         report = json.loads(result.stdout)["capabilities"]
         self.assertTrue(all(report[name] for name in capabilities.ENGINES["sglang"]))
 
+    def test_tensorfold_probe_names_its_destinations_and_never_parks(self):
+        # ADR 0023 §1, T41: core checks the serve destinations capyctl renders
+        # or reserves; deep_park is always missing.
+        import argparse
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers()
+        serve = sub.add_parser("serve")
+        for dest in capabilities.TENSORFOLD_DESTINATIONS:
+            serve.add_argument("--" + dest.replace("_", "-"))
+        report = capabilities.probe_tensorfold(parser, importer=lambda name: None)
+        self.assertEqual(report.missing_labels("core"), ())
+        self.assertEqual(report.missing_labels("deep_park"), ("unsupported",))
+        bare = capabilities.probe_tensorfold(argparse.ArgumentParser(), importer=lambda name: None)
+        self.assertIn("destination:context", bare.missing_labels("core"))
+
     def test_malformed_invocation_is_refused_without_output(self):
         for argv in ([], ["mystery", "/x"], ["sglang", "relative"]):
             with self.subTest(argv=argv):
