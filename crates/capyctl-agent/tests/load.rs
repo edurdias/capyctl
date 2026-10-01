@@ -654,3 +654,52 @@ async fn a_tensorfold_scrape_folds_in_health() {
     assert_eq!(all[1].deployment_id, "idle");
     assert_eq!(all[1].engine.unwrap().running, 0);
 }
+
+// T41: a /health body that never ends is cut at the size bound, not read
+// until the scrape times out, and reads as unknown (busy), never idle.
+#[tokio::test]
+async fn an_oversized_health_body_is_cut_at_the_bound() {
+    let expected = format!("Bearer {}", hex::encode([6; 32]));
+    let router = Router::new()
+        .route(
+            "/metrics",
+            get(move |headers: HeaderMap| {
+                let expected = expected.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&expected)
+                    {
+                        return (StatusCode::UNAUTHORIZED, String::new());
+                    }
+                    (StatusCode::OK, TENSORFOLD_IDLE_METRICS.to_owned())
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(|| async {
+                let chunk = axum::body::Bytes::from(vec![b' '; 64 * 1024]);
+                let endless = futures::stream::repeat_with(move || {
+                    Ok::<_, std::convert::Infallible>(chunk.clone())
+                });
+                axum::body::Body::from_stream(endless)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let ingress = Ingress::new().unwrap();
+    let s = scope("endless", 1);
+    register(&ingress, &s, address, 1, [6; 32]);
+    ingress.bind_handle(&s, "launch-e").unwrap();
+    ingress.open(&s).unwrap();
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    let started = std::time::Instant::now();
+    let all = samples(reporter.reports().await);
+    let elapsed = started.elapsed();
+    assert_eq!(all[0].engine.unwrap().running, 1, "unknown health is busy");
+    assert!(
+        elapsed < load::SCRAPE_TIMEOUT * 2 / 3,
+        "read for {elapsed:?}, the bound is {:?}",
+        load::SCRAPE_TIMEOUT
+    );
+}

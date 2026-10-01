@@ -404,6 +404,18 @@ pub struct LoadReporter {
     baselines: Mutex<EngineBaselines>,
 }
 
+/// A response body, refused as soon as it passes the scrape size bound.
+async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_METRICS_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
 impl LoadReporter {
     pub fn new(ingress: Arc<Ingress>, host_id: String) -> Result<Self, LoadError> {
         Ok(Self {
@@ -433,7 +445,7 @@ impl LoadReporter {
             return None;
         }
         let read = async {
-            let mut response = self
+            let response = self
                 .client
                 .get(format!("http://{}/metrics", target.target))
                 .bearer_auth(hex::encode(target.native))
@@ -443,14 +455,7 @@ impl LoadReporter {
             if response.status() != reqwest::StatusCode::OK {
                 return None;
             }
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.ok()? {
-                if body.len() + chunk.len() > MAX_METRICS_BYTES {
-                    return None;
-                }
-                body.extend_from_slice(&chunk);
-            }
-            String::from_utf8(body).ok()
+            String::from_utf8(bounded_body(response).await?).ok()
         };
         tokio::time::timeout(SCRAPE_TIMEOUT, read)
             .await
@@ -474,10 +479,7 @@ impl LoadReporter {
             if response.status() != reqwest::StatusCode::OK {
                 return None;
             }
-            let body = response.bytes().await.ok()?;
-            if body.len() > MAX_METRICS_BYTES {
-                return None;
-            }
+            let body = bounded_body(response).await?;
             let body: serde_json::Value = serde_json::from_slice(&body).ok()?;
             Some(HealthReport {
                 ok: body["ok"] == true,
