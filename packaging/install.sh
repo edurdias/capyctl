@@ -217,7 +217,7 @@ say "verified $tarball sha256:$got"
 
 tar -xzf "$tmp/$tarball" -C "$tmp" --no-same-owner
 pkg=$tmp/$name
-[ -f "$pkg/bin/capyctl" ] && [ -f "$pkg/SHA256SUMS" ] || die "$tarball does not hold $name/bin/capyctl"
+{ [ -f "$pkg/bin/capyctl" ] && [ -f "$pkg/SHA256SUMS" ]; } || die "$tarball does not hold $name/bin/capyctl"
 # The archive's own manifest: every file it ships.
 while read -r sum path; do
   [ "$(sha256 "$pkg/$path")" = "$sum" ] || die "$path in $tarball does not match its SHA256SUMS; refusing to install"
