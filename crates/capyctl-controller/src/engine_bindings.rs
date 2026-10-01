@@ -31,6 +31,8 @@ pub struct ProfileBindings {
     /// launches keep their file rendezvous in, as on a host. Without one the
     /// entry falls back to its own temporary directory.
     rendezvous: Option<capyctl_agent::rendezvous::RendezvousRoot>,
+    /// ADR 0023 §3: the private root TensorFold launches build extensions in.
+    engine_cache: Option<capyctl_agent::engine_cache::EngineCacheRoot>,
     /// Discrete GPU design §6 (ADR 0019): the total memory of each discrete
     /// GPU on this host, by driver index, as sampled at boot. An engine on a
     /// device domain is sized against its card's total; a card's total does not
@@ -55,6 +57,7 @@ impl ProfileBindings {
             ),
             saver: None,
             rendezvous: None,
+            engine_cache: None,
             device_totals: std::collections::BTreeMap::new(),
         }
     }
@@ -82,6 +85,11 @@ impl ProfileBindings {
     /// SPEC §8.2 / T21 (owner decision 2026-09-25): SGLang launches keep their
     /// rendezvous in `<dir>/<incarnation>` (the role creates `dir` 0700), and
     /// each launch's directory is removed once its group is proved gone.
+    pub fn with_engine_cache_root(mut self, dir: PathBuf) -> Self {
+        self.engine_cache = Some(capyctl_agent::engine_cache::EngineCacheRoot::new(dir));
+        self
+    }
+    /// SPEC §8.2 / T21 rendezvous root, as above.
     pub fn with_rendezvous_root(mut self, dir: PathBuf) -> Self {
         self.rendezvous = Some(capyctl_agent::rendezvous::RendezvousRoot::new(dir));
         self

@@ -98,6 +98,8 @@ pub struct NativeHostExecution {
     /// rendezvous in, removed per launch on gone evidence. `None`: the entry
     /// uses its own temporary directory, removed only at interpreter exit.
     rendezvous: Option<crate::rendezvous::RendezvousRoot>,
+    /// ADR 0023 §3: the private root TensorFold launches build extensions in.
+    engine_cache: Option<crate::engine_cache::EngineCacheRoot>,
     /// SPEC §13.2: commands whose slow admission (checkpoint hashing, the
     /// installation measurement, the capability probe) passed just now,
     /// outside the journal's locks, keyed by their canonical digest. Under the
@@ -219,6 +221,7 @@ impl NativeHostExecution {
             checkpoints: Arc::new(CheckpointVerifier::in_memory()),
             residency: None,
             rendezvous: None,
+            engine_cache: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
             gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
@@ -415,6 +418,12 @@ impl NativeHostExecution {
     /// Terminate removes it once the group is proved gone.
     pub fn with_rendezvous_root(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
         Arc::make_mut(&mut self).rendezvous = Some(crate::rendezvous::RendezvousRoot::new(dir));
+        self
+    }
+    /// ADR 0023 §3: where TensorFold launches keep their extension builds.
+    pub fn with_engine_cache_root(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
+        Arc::make_mut(&mut self).engine_cache =
+            Some(crate::engine_cache::EngineCacheRoot::new(dir));
         self
     }
     /// Attach the SGLang saver observation source residency evidence needs.

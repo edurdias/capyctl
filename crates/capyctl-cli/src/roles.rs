@@ -103,6 +103,27 @@ fn prepare_rendezvous_root(
     Ok(root)
 }
 
+/// Create a private directory (0700, this user) or refuse one that is not.
+fn prepare_private_dir(root: &Path) -> Result<(), StartError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let private = std::fs::symlink_metadata(root).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o7777 == 0o700
+    });
+    if private {
+        Ok(())
+    } else {
+        Err(StartError::Setting(format!(
+            "{} must be a directory owned by this user with mode 0700; no permissions were changed",
+            root.display()
+        )))
+    }
+}
+
 /// A conservative KV grant for a unified-memory host: the ledger's deployment
 /// budget bounds the engine's pool, and a smaller grant keeps two engines from
 /// overcommitting the domain during a stop-start overlap.
@@ -1037,7 +1058,8 @@ impl EngineProvider for EnvEngineProvider {
         let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir)
             .with_device_totals(device_totals)
             .with_checkpoint_cache(cache)
-            .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR));
+            .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR))
+            .with_engine_cache_root(log_dir.with_file_name("engines"));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
         // observation in a private directory beside the logs. One that cannot
         // be made private leaves the source unset, and Park is refused.
@@ -1743,6 +1765,8 @@ async fn start_standalone_in(
             .map_err(|error| StartError::Deploy(format!("retained launches: {error}")))?;
         prepare_rendezvous_root(state_dir, &retained)?;
     }
+    // ADR 0023 §3: the private TensorFold build cache root.
+    prepare_private_dir(&state_dir.join("engines"))?;
     let options = CoordinatorOptions {
         // Spec §4: a cold start reads weights off disk, which this project measured
         // taking a minute on a small model; the protocol bound would give up on a
