@@ -1991,6 +1991,20 @@ mod tests {
         checkpoint_fixture_with(root, identity_dir, |_| {})
     }
 
+    /// Admission reads real host memory; shrink the 48 GiB fixture to fit it.
+    fn host_memory_scale() -> f64 {
+        let memory = crate::memory::read_host_memory().unwrap().memory;
+        let gib = (1u64 << 30) as f64;
+        (memory.capacity_bytes as f64 / 2.0 / (48.0 * gib))
+            .min(memory.available_bytes as f64 / 2.0 / (26.0 * gib))
+            .min(1.0)
+    }
+
+    fn scale_bytes(value: &mut serde_json::Value, scale: f64) {
+        let bytes = capyctl_config::effective::parse_bytes(value.as_str().unwrap()).unwrap();
+        *value = serde_json::json!(format!("{}MiB", (bytes as f64 * scale) as i64 >> 20));
+    }
+
     /// [`checkpoint_fixture`] with an edit of the host document before it is
     /// parsed.
     fn checkpoint_fixture_with(
@@ -2250,7 +2264,30 @@ mod tests {
     async fn slow_admission_runs_before_the_journal_lock() {
         let root = directory();
         let identity_dir = directory();
-        let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let scale = host_memory_scale();
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                let domain = &mut document["resource_policy"]["domains"]["unified"];
+                for field in [
+                    "managed_limit",
+                    "free_reserve",
+                    "parked_limit",
+                    "host_kv_limit",
+                ] {
+                    scale_bytes(&mut domain[field], scale);
+                }
+            });
+        for phase in ["cold", "ready", "parking", "parked", "wake"] {
+            let allocations = deployment["resources"][phase]["allocations"].as_array_mut();
+            for allocation in allocations.into_iter().flatten() {
+                scale_bytes(&mut allocation["bytes"], scale);
+                scale_bytes(&mut allocation["host_kv_bytes"], scale);
+            }
+        }
+        scale_bytes(
+            &mut deployment["engine_config"]["memory"]["kv_cache"],
+            scale,
+        );
         let recorded = crate::checkpoint::CheckpointVerifier::in_memory()
             .measure(&root.path().join("models"), &root.path().join("models/toy"))
             .unwrap()
