@@ -277,3 +277,30 @@ async fn group_commit_bounds_the_latency_a_dispatch_pays() {
     println!("request lease overhead uncontended (grant+close): p50={p50:?} p99={p99:?}");
     assert!(p99 < Duration::from_millis(500), "p99 overhead {p99:?}");
 }
+
+// T17, SPEC §10 (amended 2026-10-01): a hung-up request's lease stays
+// in flight and charged; only the engine's quiescence closes it.
+#[tokio::test]
+async fn closing_as_cancelling_keeps_the_lease_charged() {
+    let f = fixture();
+    // Fixture-only binding: production records it from launch evidence.
+    rusqlite::Connection::open(&f.path)
+        .unwrap()
+        .execute(
+            "INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state,instance_index) VALUES('binding-a',?1,1,'incarnation-a','managed','{}','[]','live',0)",
+            [&f.deployment],
+        )
+        .unwrap();
+    let writer = RequestLeaseWriter::spawn(f.backend(Default::default()));
+    let lease = writer.open(&f.deployment, 8).await.unwrap();
+    writer.close(lease, LeaseEnd::Cancelling).await.unwrap();
+    assert!(f.leases().iter().all(|(_, d)| d == "inflight"));
+    let store = f.store.lock().unwrap();
+    let cancelling = store.cancelling_bindings(&f.session).unwrap();
+    assert_eq!(cancelling.len(), 1);
+    assert_eq!(cancelling[0].binding_id, "binding-a");
+    assert_eq!(
+        store.binding_outstanding_leases("binding-a").unwrap(),
+        Some(1)
+    );
+}

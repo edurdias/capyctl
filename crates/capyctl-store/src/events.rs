@@ -194,6 +194,15 @@ pub(crate) enum EventMetadata {
         victims: Vec<String>,
         detail: String,
     },
+    /// SPEC §10 (amended 2026-10-01): the engine reported quiescence after a
+    /// client hung up, so the binding's cancelling leases closed.
+    #[serde(rename = "1")]
+    RequestCancellationAcknowledged {
+        deployment_id: String,
+        binding_id: String,
+        count: usize,
+        receipt: String,
+    },
 }
 
 /// SPEC §10 (W10): what a request-driven switch recorded.
@@ -334,6 +343,7 @@ impl EventMetadata {
                 SwitchPhase::Completed => "switch_completed",
                 SwitchPhase::Failed => "switch_failed",
             },
+            Self::RequestCancellationAcknowledged { .. } => "request_cancellation_acknowledged",
         }
     }
 
@@ -383,6 +393,9 @@ impl EventMetadata {
             Self::SwitchRecorded {
                 target_deployment, ..
             } => (Some(target_deployment.as_str()), None),
+            Self::RequestCancellationAcknowledged { deployment_id, .. } => {
+                (Some(deployment_id.as_str()), None)
+            }
         }
     }
 }

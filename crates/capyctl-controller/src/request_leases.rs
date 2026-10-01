@@ -89,6 +89,10 @@ pub enum LeaseEnd {
     NotAccepted,
     /// Anything else. The lease stays charged, marked uncertain.
     Uncertain,
+    /// SPEC §10 (amended 2026-10-01): the client hung up and the engine
+    /// connection was closed; the lease stays charged until the engine
+    /// reports quiescence.
+    Cancelling,
 }
 
 /// Why a lease was not granted.
@@ -224,6 +228,7 @@ impl RequestLeaseWriter {
         let write = match end {
             LeaseEnd::Completed | LeaseEnd::NotAccepted => LeaseWrite::Finish(ticket),
             LeaseEnd::Uncertain => LeaseWrite::Uncertain(ticket),
+            LeaseEnd::Cancelling => LeaseWrite::Cancel(ticket),
         };
         self.submit(write).await.map(|_| ())
     }

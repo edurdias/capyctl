@@ -325,6 +325,37 @@ fn settle_in(
     Ok(changed == 1)
 }
 
+/// SPEC §10 (amended 2026-10-01): mark this session's in-flight lease as
+/// cancelling. It stays `inflight`; only the engine's quiescence closes it.
+fn cancel_in(
+    transaction: &Connection,
+    session: &CoordinatorSession,
+    ticket: &DispatchTicket,
+) -> Result<bool, DispatchError> {
+    if ticket.session_id != session.id {
+        return Err(DispatchError::StaleSession);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO request_lease_cancellations(lease_id,cancelled_at_ms)
+         SELECT id,?6 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3
+         AND generation=?4 AND session_id=?5 AND disposition='inflight'",
+        params![
+            ticket.id,
+            ticket.deployment_id,
+            ticket.revision,
+            ticket.generation,
+            ticket.session_id,
+            now
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
 /// One durable request-lease write in a group commit (SPEC §10).
 #[derive(Debug, Clone)]
 pub enum LeaseWrite {
@@ -350,6 +381,10 @@ pub enum LeaseWrite {
     Finish(DispatchTicket),
     /// Keep a lease charged with its outcome unknown.
     Uncertain(DispatchTicket),
+    /// SPEC §10 (amended 2026-10-01): the client hung up and the engine
+    /// connection closed. The lease stays `inflight` and charged until the
+    /// engine reports quiescence.
+    Cancel(DispatchTicket),
 }
 
 /// What one `LeaseWrite` in a batch produced.
@@ -407,6 +442,9 @@ impl crate::Store {
                 }
                 LeaseWrite::Uncertain(ticket) => {
                     settle_in(&transaction, session, ticket, false).map(LeaseWriteOutcome::Settled)
+                }
+                LeaseWrite::Cancel(ticket) => {
+                    cancel_in(&transaction, session, ticket).map(LeaseWriteOutcome::Settled)
                 }
             };
             // A storage error inside the transaction poisons the whole group.
