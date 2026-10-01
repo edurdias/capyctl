@@ -32,7 +32,7 @@ pub use timeouts::{
     derived_initialize_ms, derived_wake_ms, lifecycle_windows, validate_declared_timeouts,
     DeploymentTimeouts, TimeoutBasis, TimeoutSource, INITIALIZE_BASE_MS, INITIALIZE_CAP_MS,
     INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS, PENDING_WAKE_MS,
-    STOP_WINDOW_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
+    STOP_WINDOW_MS, TENSORFOLD_FIRST_BUILD_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
 };
 // ADR 0014 §7 (WE3): checkpoint identity.
 pub use checkpoint::{
@@ -1060,6 +1060,16 @@ pub fn resolve_effective_with_checkpoint(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
+    // ADR 0023 §4: TensorFold has no memory cap, so its reservation is the
+    // operator's explicit statement.
+    if raw_profile.engine == Engine::Tensorfold && d.resources.is_none() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::MissingRequired,
+            "resources",
+            "a TensorFold deployment states resources: TensorFold sizes itself from free \
+             memory and has no flag that caps it",
+        ));
+    }
     let host = core::normalize_host(h)?;
     let devices = d.devices.take().unwrap_or_default();
     // Owner decision 2026-09-25: an undeclared residency follows the host
@@ -1071,8 +1081,9 @@ pub fn resolve_effective_with_checkpoint(
     let residency = d.residency.unwrap_or_else(|| {
         let discrete =
             device_sizing.map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
+        // ADR 0023 §6: TensorFold never parks, so its default is restart_only.
         crate::deployment_defaults::default_residency(
-            raw_profile.security.deep_park.is_enabled(),
+            raw_profile.security.deep_park.is_enabled() && raw_profile.engine != Engine::Tensorfold,
             discrete,
         )
     });
@@ -1145,10 +1156,7 @@ pub fn resolve_effective_with_checkpoint(
     {
         // T14: what capyctl chose is named as its default, so a snapshot
         // re-resolution chooses it again rather than restating it.
-        let provenance = match &mut engine_config {
-            LaunchSettings::Vllm(settings) => &mut settings.provenance,
-            LaunchSettings::Sglang(settings) => &mut settings.provenance,
-        };
+        let provenance = engine_config.provenance_mut();
         if residency_defaulted {
             provenance.insert(
                 "residency".into(),
@@ -1185,16 +1193,22 @@ pub fn resolve_effective_with_checkpoint(
             if !facts.legacy_overhead {
                 engine_config.memory_mut().overhead_bytes = Some(overhead);
             }
-            let provenance = match &mut engine_config {
-                LaunchSettings::Vllm(settings) => &mut settings.provenance,
-                LaunchSettings::Sglang(settings) => &mut settings.provenance,
-            };
-            provenance.insert(
+            engine_config.provenance_mut().insert(
                 "resources".into(),
                 capyctl_domain::launch::SettingSource::Derived,
             );
             derived
         }
+    };
+    // ADR 0023 §4: the first build's bound must not be lowered by
+    // the request deadline, so a TensorFold deployment's deadline, undeclared,
+    // is at least that bound, and may be declared up to it.
+    let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold {
+        host.queue
+            .request_deadline_ms
+            .max(timeouts::TENSORFOLD_FIRST_BUILD_MS)
+    } else {
+        host.queue.request_deadline_ms
     };
     let recipe = core::NormalizedRecipe {
         model,
@@ -1208,11 +1222,15 @@ pub fn resolve_effective_with_checkpoint(
             .as_deref()
             .map(parse_duration_ms)
             .transpose()?
-            .unwrap_or(host.queue.request_deadline_ms),
+            .unwrap_or(deadline_ceiling_ms),
     };
-    core::validate_recipe(&recipe, &host)?;
-    let timeouts =
-        timeouts::resolve_timeouts(d.timeouts.as_ref(), recipe.request_deadline_ms, facts)?;
+    core::validate_recipe(&recipe, &host, deadline_ceiling_ms)?;
+    let timeouts = timeouts::resolve_timeouts(
+        d.timeouts.as_ref(),
+        recipe.request_deadline_ms,
+        facts,
+        raw_profile.engine,
+    )?;
     let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &engine_config, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,

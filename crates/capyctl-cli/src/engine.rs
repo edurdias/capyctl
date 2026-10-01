@@ -49,13 +49,6 @@ fn closed(code: &str) -> &'static str {
     }
 }
 
-fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Vllm => "vllm",
-        Engine::Sglang => "sglang",
-    }
-}
-
 pub fn is_engine_command(command: &Command) -> bool {
     matches!(
         command,
@@ -83,6 +76,18 @@ pub async fn execute_in(
     state_dir: &Path,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<Value, StructuredError> {
+    execute_with(command, config, state_dir, env, &Default::default()).await
+}
+
+/// As [`execute_in`], also reading `CUDA_HOME` through `env`, and looking for
+/// TensorFold's build toolchain in `search` (a test's own directories).
+pub async fn execute_with(
+    command: &Command,
+    config: Option<&Path>,
+    state_dir: &Path,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+    search: &capyctl_config::toolchain::ToolchainSearch,
+) -> Result<Value, StructuredError> {
     match command {
         Command::EngineDetect { paths } => Ok(detected(paths)),
         Command::EngineAdd {
@@ -100,6 +105,10 @@ pub async fn execute_in(
                 *deep_park,
                 *drift,
                 args,
+                Toolchain {
+                    cuda_home_env: env("CUDA_HOME"),
+                    search,
+                },
             )
             .await
         }
@@ -119,7 +128,7 @@ fn detected(paths: &[PathBuf]) -> Value {
     let rows: Vec<Value> = candidates(paths)
         .into_iter()
         .map(|c| {
-            json!({"engine": engine_name(c.engine), "version": c.version, "custom": c.custom,
+            json!({"engine": c.engine.name(), "version": c.version, "custom": c.custom,
             "env": c.env, "entry": c.entry, "source": c.source})
         })
         .collect();
@@ -148,7 +157,7 @@ fn pick() -> Result<PathBuf, StructuredError> {
             stderr,
             "{:>3}  {} {}{}  {}",
             i + 1,
-            engine_name(c.engine),
+            c.engine.name(),
             c.version,
             if c.custom { " (custom)" } else { "" },
             c.env.display()
@@ -289,6 +298,12 @@ fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64,
     write_engines(&engines, &lock, host.as_ref()).map_err(|e| error("invalid_config", e.detail))
 }
 
+/// Where `engine add` looks for TensorFold's build toolchain.
+struct Toolchain<'a> {
+    cuda_home_env: Option<String>,
+    search: &'a capyctl_config::toolchain::ToolchainSearch,
+}
+
 async fn add(
     target: &Target,
     path: Option<&Path>,
@@ -296,13 +311,14 @@ async fn add(
     deep_park: Option<DeepParkChoice>,
     drift: DriftChoice,
     args: &[String],
+    toolchain: Toolchain<'_>,
 ) -> Result<Value, StructuredError> {
     let path = match path {
         Some(path) => path.to_path_buf(),
         None => pick()?,
     };
     let resolved = resolve(&path).map_err(|e| error(e.code(), e.to_string()))?;
-    let name = name.unwrap_or(engine_name(resolved.engine)).to_owned();
+    let name = name.unwrap_or(resolved.engine.name()).to_owned();
     if !valid_profile_name(&name) {
         return Err(error(
             "invalid_config",
@@ -312,7 +328,7 @@ async fn add(
     // Owner rule 2026-09-25: on a host as in standalone, these names are the
     // role's own installation (`local_engine`, `--vllm-bin`, `CAPYCTL_VLLM_BIN`).
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN or local_engine); use --name")));
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     let existing =
@@ -322,6 +338,31 @@ async fn add(
             "profile_exists",
             format!("profile {name} exists; use --name, or remove it first"),
         ));
+    }
+    // SPEC §13.3 amendment (owner decision 2026-09-25).
+    let cuda_home = capyctl_config::registration::detect_cuda_home_in(
+        toolchain.cuda_home_env.as_deref(),
+        &toolchain.search.default_cuda_home,
+        |nvcc| nvcc.is_file(),
+    );
+    if resolved.engine == Engine::Tensorfold {
+        // ADR 0023 §2: TensorFold has no park path; refuse a request for one
+        // before anything runs or is written.
+        if deep_park == Some(DeepParkChoice::Enabled) {
+            return Err(error(
+                "capability_missing",
+                "TensorFold has no sleep or release API; it runs restart_only, so \
+                 --deep-park enabled is refused and nothing was written",
+            ));
+        }
+        let bin = resolved.executable.parent().unwrap_or(&resolved.env);
+        capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
+            .map_err(|missing| {
+                error(
+                    "toolchain_missing",
+                    format!("{}; nothing was written", missing.for_engine_add()),
+                )
+            })?;
     }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
     let registration = tokio::task::spawn_blocking(move || register(&r, &state))
@@ -336,7 +377,10 @@ async fn add(
     let deep = match deep_park {
         Some(DeepParkChoice::Enabled) => true,
         Some(DeepParkChoice::Disabled) => false,
-        None => registration.deep_park_missing != Some(true),
+        // ADR 0023 §2: TensorFold is disabled even when the probe could not run.
+        None => {
+            resolved.engine != Engine::Tensorfold && registration.deep_park_missing != Some(true)
+        }
     };
     let spec = ProfileSpec {
         engine: resolved.engine,
@@ -348,15 +392,11 @@ async fn add(
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
         args: args.to_vec(),
-        // SPEC §13.3 amendment (owner decision 2026-09-25).
-        cuda_home: capyctl_config::registration::detect_cuda_home(
-            std::env::var("CUDA_HOME").ok().as_deref(),
-            |nvcc| nvcc.is_file(),
-        ),
+        cuda_home,
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
-        "profile": name, "engine": engine_name(resolved.engine), "version": registration.version,
+        "profile": name, "engine": resolved.engine.name(), "version": registration.version,
         "custom": resolved.custom(), "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
@@ -444,7 +484,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
     let rows: Vec<Value> = all
         .into_iter()
         .map(|(name, profile, source)| {
-            let engine = match profile["engine"].as_str() { Some("sglang") => Engine::Sglang, _ => Engine::Vllm };
+            let engine = profile["engine"].as_str().and_then(Engine::from_name).unwrap_or(Engine::Vllm);
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
             let version = accepted
                 .clone()
@@ -483,7 +523,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN or local_engine); unset it and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     let engines =

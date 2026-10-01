@@ -378,7 +378,7 @@ impl StandaloneControl {
         if ENVIRONMENT_PROFILES.contains(&profile) {
             return refused(
                 "invalid_config",
-                format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN or host.local_engine); unset it and restart the role"),
+                format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or host.local_engine); unset it and restart the role"),
             );
         }
         // The role keeps at least one engine: refused before anything is retired.
@@ -418,10 +418,7 @@ impl StandaloneControl {
             accepted.insert(
                 n.profile.clone(),
                 json!({
-                    "engine": match n.installation.engine {
-                        capyctl_config::engine_policy::Engine::Vllm => "vllm",
-                        capyctl_config::engine_policy::Engine::Sglang => "sglang",
-                    },
+                    "engine": n.installation.engine.name(),
                     "executable": n.installation.executable,
                     "build_fingerprint": n.installation.build_fingerprint,
                     "installation": {"version": view["version"], "digest": view["digest"], "state": view["state"]},

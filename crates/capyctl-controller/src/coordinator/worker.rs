@@ -2639,6 +2639,54 @@ async fn drain_before_terminate(
     }
 }
 
+/// Spec §5, ADR 0023 §6: after the drain, an engine with its own work counters
+/// (TensorFold) is read before the stop signal. Idle, exited or not listening,
+/// it is signalled at once; hung, once the bound passes. Still answering busy
+/// at the bound, nothing is sent: the cleanup stays uncertain and keeps its
+/// accounting.
+async fn idle_before_terminate(
+    shared: &Arc<Shared>,
+    work: &OrdinaryCleanupReceipt,
+    driver: &Driver,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), CoordinatorError> {
+    let binding = work.binding_id.clone();
+    let deployment_id = shared
+        .read(move |owner, _| owner.store().binding_lane(&binding))
+        .await?
+        .map(|(deployment, _)| deployment)
+        .unwrap_or_default();
+    let member = capyctl_adapters::traits::MemberRef {
+        deployment_id,
+        member_id: work.binding_id.clone(),
+    };
+    // An engine without its own counters answers `None` at once; the lease
+    // drain above alone decides for it.
+    let now = (shared.clock)()?;
+    let budget = u64::try_from(work.deadline_ms.saturating_sub(now).saturating_sub(
+        i64::try_from(shared.options.protocol_timeout.as_millis()).unwrap_or(i64::MAX),
+    ))
+    .unwrap_or(0);
+    let idle = capyctl_adapters::tensorfold::wait_idle(
+        driver.engine.as_ref(),
+        &member,
+        Duration::from_millis(budget),
+        crate::supervised::cancelled(stop),
+    )
+    .await;
+    if idle {
+        Ok(())
+    } else if *stop.borrow() {
+        Err(CoordinatorError::Stopped(
+            "shutdown while waiting for the engine to be idle".into(),
+        ))
+    } else {
+        Err(CoordinatorError::Service(
+            "the engine still reports work in flight; the stop was not sent".into(),
+        ))
+    }
+}
+
 async fn drive_cleanup(
     shared: &Arc<Shared>,
     work: &OrdinaryCleanupReceipt,
@@ -2665,6 +2713,7 @@ async fn drive_cleanup(
         ));
     }
     drain_before_terminate(shared, work, stop).await?;
+    idle_before_terminate(shared, work, &driver, stop).await?;
     let step = work.step_id.clone();
     let (arm, context) = shared
         .read(move |owner, now| {

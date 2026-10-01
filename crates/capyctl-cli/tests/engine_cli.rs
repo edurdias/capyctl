@@ -3,7 +3,7 @@
 mod support;
 
 use capyctl_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
-use capyctl_cli::engine::{execute, resolve_target};
+use capyctl_cli::engine::{execute, execute_with, resolve_target};
 use capyctl_cli::grammar::{Command, DeepParkChoice, DriftChoice};
 use capyctl_config::registration::{engines_beside, EnginesFile};
 use serde_json::{json, Value};
@@ -812,4 +812,99 @@ fn engine_views_print_tables_and_json_on_request() {
         value["engines"].as_array().unwrap().len() + 1,
         "{table}"
     );
+}
+
+/// A TensorFold venv: `tensorfold --version` prints `tensorfold <version>`,
+/// the interpreter answers the probe, and `bin` holds the build tools.
+fn tensorfold_env(root: &Path, version: &str, tools: &[&str]) -> PathBuf {
+    let site = root.join("lib/python3.12/site-packages");
+    std::fs::create_dir_all(site.join("tensorfold")).unwrap();
+    std::fs::create_dir_all(site.join(format!("tensorfold-{version}.dist-info"))).unwrap();
+    std::fs::write(
+        site.join(format!("tensorfold-{version}.dist-info/METADATA")),
+        format!("Name: tensorfold\nVersion: {version}\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    script(
+        &root.join("bin/tensorfold"),
+        &format!("echo tensorfold {version}"),
+    );
+    let report = json!({"schema": "capyctl/engine-capabilities/v1", "engine": "tensorfold",
+        "capabilities": {"core": [], "deep_park": ["unsupported"], "metrics": []}});
+    script(&root.join("bin/python3"), &format!("echo '{report}'"));
+    for tool in tools {
+        script(&root.join("bin").join(tool), "exit 0");
+    }
+    root.to_path_buf()
+}
+
+// T41 T07 T21: TensorFold registers as `tensorfold`, deep park disabled.
+#[tokio::test]
+async fn add_registers_tensorfold_with_deep_park_disabled() {
+    let dir = private_dir();
+    let env = tensorfold_env(&dir.path().join("tf"), "0.6.0", &["ninja", "nvcc", "c++"]);
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = execute(&add(&env), Some(&document), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out["profile"], "tensorfold");
+    assert_eq!(out["engine"], "tensorfold");
+    assert_eq!(out["custom"], false);
+    let profile = &engines_of(&document).profiles["tensorfold"];
+    assert_eq!(
+        profile["executable"],
+        env.join("bin/tensorfold").to_string_lossy().as_ref()
+    );
+    assert_eq!(profile["build_fingerprint"], "0.6.0");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    let asked = Command::EngineAdd {
+        path: Some(env.clone()),
+        name: Some("tf-deep".into()),
+        deep_park: Some(DeepParkChoice::Enabled),
+        drift: DriftChoice::Warn,
+        args: vec![],
+    };
+    let error = execute(&asked, Some(&document), dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "capability_missing");
+    assert!(!engines_of(&document).profiles.contains_key("tf-deep"));
+}
+
+// T41 T03: a missing toolchain is refused before anything runs or is written.
+// The search names no system directory and no CUDA toolkit, so the result does
+// not depend on what this machine has installed.
+#[tokio::test]
+async fn add_refuses_tensorfold_without_its_toolchain() {
+    let dir = private_dir();
+    let env = tensorfold_env(&dir.path().join("tf"), "0.6.0", &["ninja", "c++"]);
+    let document = host_doc(dir.path());
+    let search = capyctl_config::toolchain::ToolchainSearch {
+        system: String::new(),
+        default_cuda_home: dir.path().join("no-cuda"),
+    };
+    let process_env = |key: &str| {
+        (key != "CUDA_HOME")
+            .then(|| std::env::var(key).ok())
+            .flatten()
+            .filter(|v| !v.is_empty())
+    };
+    let error = execute_with(
+        &add(&env),
+        Some(&document),
+        dir.path(),
+        &process_env,
+        &search,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "toolchain_missing", "{error:?}");
+    assert!(error.message.contains("nvcc"), "{}", error.message);
+    assert!(error
+        .message
+        .contains(&env.join("bin").display().to_string()));
+    assert!(!engines_beside(&document).exists());
 }

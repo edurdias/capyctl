@@ -8,6 +8,9 @@ never rewritten).
 (deep parking default-on), ADR 0017 (capability gating). Design:
 `docs/specs/2026-09-25-engine-registration-design.md`.
 
+**Amended by:** ADR 0023 (2026-10-01): detection also reads `tensorfold-*.dist-info`,
+the entry point `<env>/bin/tensorfold`, and the verified set gains TensorFold 0.6.0.
+
 ## Context
 
 mllm runs engines the user already installed, but registering one was manual. Standalone

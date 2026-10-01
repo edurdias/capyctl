@@ -36,7 +36,7 @@ The project is a fresh, standalone open-source controller, not a fork of an exis
 
 | ID | Requirement |
 |---|---|
-| R01 | Multi-engine architecture from the start: vLLM first, SGLang the next engine deliverable. |
+| R01 | Multi-engine architecture from the start: vLLM first, SGLang the next engine deliverable, TensorFold third (ADR 0023). |
 | R02 | One platform-appropriate executable supplies the client CLI, server, host-agent, and standalone roles. |
 | R03 | External stock or patched engines remain independent: native installations, virtual environments, approved scripts, and later supported container/service launchers. |
 | R04 | Support colocated operation and a server on a different machine from the engines. |
@@ -394,7 +394,24 @@ uncertain drain must reconcile or fail within its bound. The approved
 [F2 design](design/milestones/f2-sglang-design.md) defines these requirements and the
 snapshot/event contracts for a future UI; UI implementation remains later work.
 
-### 9.3 Later backends
+### 9.3 TensorFold
+
+> **Added by [ADR 0023](design/adr/0023-tensorfold-engine.md)** (owner decision 2026-10-01).
+
+TensorFold has no sleep, release or unload API and no API key. Its deployments are
+`restart_only`: parking drains, waits for TensorFold's own `/health` to report no
+running request (an engine that has exited, does not listen or does not answer
+within the bound reports none), stops the owned process and verifies its exit;
+waking launches the same pinned contract again. `deep` and `host_backed` fail
+resolution with `capability_missing`. A TensorFold deployment states its
+`resources` and its `context_length`, which fixes the engine's KV allocation;
+TensorFold has no flag that caps its memory. The engine listens on loopback only,
+so local processes can reach its port; CapyCTL's routed path is the only network
+path to it. Its first start builds CUDA extensions into a private per-version
+directory, so registration checks the build toolchain on the engine's closed PATH
+and the first start's bound is 1800 s.
+
+### 9.4 Later backends
 
 A compatible Metal or other server can begin with an approved restart-only profile. Hardware branding does not permanently determine its policy. The agent need not import the engine's runtime libraries simply to control an external process.
 
@@ -971,6 +988,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
+| T41 | TensorFold conformance | Detection reads metadata only; `engine add` refuses a missing toolchain on the closed PATH; launch arguments and reserved flags; readiness from `/health` and the model list; drain waits for `requests_running: 0` and `busy: false`, signals an exited, not listening or unanswering engine, and leaves one still answering busy unsignalled; `restart_only` park and wake; `deep` refused; a drafter repository id refused; `local_engine.tensorfold` three ways (ADR 0023). |
 
 The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a live-verified deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
 
@@ -983,6 +1001,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 ### Later amendments
 
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
+- 2026-10-01, [ADR 0023](design/adr/0023-tensorfold-engine.md): TensorFold as the third engine, `restart_only`, registered with `engine add` (§1, §9.3, §9.4, T41).
 
 ### Sources
 

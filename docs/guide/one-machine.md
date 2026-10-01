@@ -2,7 +2,7 @@
 
 `capyctl start standalone` runs everything on one machine, in one process.
 
-You need CapyCTL ([Install](install.md)), a vLLM or SGLang installation (here
+You need CapyCTL ([Install](install.md)), a vLLM, SGLang or TensorFold installation (here
 `~/venvs/vllm`) and a model: a checkpoint directory in `~/models` (here
 `~/models/Qwen3-4B`), or a Hugging Face repository.
 

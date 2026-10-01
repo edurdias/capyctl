@@ -22,15 +22,17 @@ pub(crate) fn check_session(
         _ => LifecycleError::Stale,
     })
 }
-/// Spec §4: a launch's canonical membership is one `api` identity plus one or
+/// Spec §4: a launch's canonical membership is one `api` identity plus zero or
 /// more workers named contiguously from `worker-0`, all sharing a boot id with
 /// distinct pids. A tensor-parallel launch needs several workers, and vLLM's
-/// EngineCore already numbers them this way.
+/// EngineCore already numbers them this way; ADR 0023 §6: TensorFold serves from
+/// the api process alone. The vLLM and SGLang adapters refuse a group without a
+/// worker before it reaches the store.
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
     if capyctl_domain::group::validate_local_processes(ids).is_err()
-        || ids.len() < 2
+        || ids.is_empty()
         || ids.iter().any(|i| {
             i.role.len() > MAX_DTO_BYTES / 4
                 || i.boot_id.len() > MAX_DTO_BYTES / 4

@@ -957,3 +957,219 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
     w.shutdown().await.unwrap();
 }
+
+/// A Fake engine whose idle check before a stop signal is TensorFold's own,
+/// read from a `/health` the test serves (or nothing listening).
+struct CountedIdle {
+    inner: Arc<FakeEngine>,
+    counters: capyctl_adapters::tensorfold::TensorfoldAdapter,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl EngineAdapter for CountedIdle {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
+        self.inner.execute_persisted(command).await
+    }
+    async fn inspect(&self, m: &MemberRef) -> Result<EngineState, AdapterError> {
+        self.inner.inspect(m).await
+    }
+    async fn render_plan(&self, p: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        self.inner.render_plan(p).await
+    }
+    async fn check_readiness(&self, m: &MemberRef) -> Result<Readiness, AdapterError> {
+        self.inner.check_readiness(m).await
+    }
+    async fn prepare_park(&self, m: &MemberRef) -> Result<Quiescence, AdapterError> {
+        self.inner.prepare_park(m).await
+    }
+    async fn park(&self, m: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        self.inner.park(m, level).await
+    }
+    async fn restore(&self, m: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        self.inner.restore(m).await
+    }
+    async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        self.inner.reload_weights(m).await
+    }
+    async fn observe_work(&self, m: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        self.inner.observe_work(m).await
+    }
+    async fn cancel_work(
+        &self,
+        m: &MemberRef,
+        r: &RequestRef,
+        ack: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
+        self.inner.cancel_work(m, r, ack).await
+    }
+    async fn idle_before_signal(
+        &self,
+        member: &MemberRef,
+    ) -> Option<capyctl_adapters::traits::EngineWork> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.counters.idle_before_signal(member).await
+    }
+}
+
+/// A worker whose engine answers the idle check with `engine.idle`; each
+/// cleanup effect (the stop signal) is counted in `signals`.
+fn idle_checked_worker(
+    owner: SharedCoordinatorState,
+    observations: Vec<MemoryObservation>,
+    engine: Arc<CountedIdle>,
+    signals: Arc<std::sync::atomic::AtomicUsize>,
+) -> OwnedCoordinator {
+    OwnedCoordinator::spawn(
+        owner,
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            // The smallest protocol bound the one-second grace floor fits in;
+            // the stop deadline below leaves the idle check one second.
+            protocol_timeout: Duration::from_secs(7),
+            terminate_grace: Duration::from_secs(1),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            let fake = engine.inner.clone();
+            let signals = signals.clone();
+            Ok(Arc::new(Driver {
+                engine: engine.clone(),
+                cleanup: Arc::new(move |context| {
+                    let fake = fake.clone();
+                    signals.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        fake.lifecycle_cleanup_observed(
+                            &context.binding_id,
+                            &context.incarnation,
+                            &context.identities,
+                        )
+                        .map_err(|e| CoordinatorError::Service(e.to_string()))
+                    })
+                }),
+                tools: None,
+                settle: None,
+            }))
+        }),
+    )
+    .unwrap()
+}
+
+/// What TensorFold's `/health` does in a standalone stop test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Health {
+    Idle,
+    Busy,
+    /// The process exited: nothing listens on its port.
+    Gone,
+    /// Alive, model not loaded yet: 503.
+    Loading,
+    /// Accepts the connection and never answers.
+    Hung,
+}
+
+async fn tensorfold_counters(health: Health) -> capyctl_adapters::tensorfold::TensorfoldAdapter {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(move || async move {
+            use axum::response::IntoResponse;
+            let busy = match health {
+                Health::Loading => {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+                Health::Hung => {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    true
+                }
+                other => other == Health::Busy,
+            };
+            axum::Json(serde_json::json!({
+                "ok": true, "busy": busy, "requests_running": u64::from(busy)
+            }))
+            .into_response()
+        }),
+    );
+    if health == Health::Gone {
+        drop(listener);
+    } else {
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+    let endpoint = format!("http://127.0.0.1:{port}").parse().unwrap();
+    capyctl_adapters::tensorfold::TensorfoldAdapter::new(endpoint, "0.6.0".into(), "toy".into())
+}
+
+// T41 (spec §5, ADR 0023 §6): after the drain, an
+// engine that answers busy at the bound is not signalled; the cleanup does not
+// complete and its binding stays retained. One that reads idle, has exited,
+// has not loaded its model, or hangs on `/health` is terminated: the first
+// three at once, the hung one once the bound passes.
+#[tokio::test]
+async fn only_an_engine_answering_busy_is_not_signalled() {
+    for health in [
+        Health::Idle,
+        Health::Busy,
+        Health::Gone,
+        Health::Loading,
+        Health::Hung,
+    ] {
+        let (_dir, owner, fence, observations) = setup().await;
+        let engine = Arc::new(CountedIdle {
+            inner: Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1900)))),
+            counters: tensorfold_counters(health).await,
+            reads: Default::default(),
+        });
+        let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = idle_checked_worker(owner.clone(), observations, engine.clone(), signals.clone());
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed
+        );
+        let started = std::time::Instant::now();
+        let stop = w.stop("owner", &fence, "idle-check", 9_900).unwrap();
+        let observed = stop.wait(Duration::from_secs(15)).await;
+        assert!(
+            engine.reads.load(Ordering::SeqCst) > 0,
+            "{health:?}: the idle check ran"
+        );
+        if health == Health::Busy {
+            assert!(
+                matches!(observed, Err(CoordinatorError::CallerTimeout)),
+                "{observed:?}"
+            );
+            assert_eq!(signals.load(Ordering::SeqCst), 0, "nothing was signalled");
+            assert_eq!(w.shared.retained.lock().unwrap().len(), 1);
+            assert!(
+                matches!(w.status(), WorkerStatus::Uncertain { ref reason, .. }
+                    if reason.contains("the stop was not sent")),
+                "{:?}",
+                w.status()
+            );
+        } else {
+            assert!(
+                matches!(observed, Ok(OrdinaryCleanupStatus::Completed)),
+                "{health:?}: {observed:?} {:?}",
+                w.status()
+            );
+            assert_eq!(signals.load(Ordering::SeqCst), 1, "{health:?}");
+            assert!(w.shared.retained.lock().unwrap().is_empty());
+            if health == Health::Hung {
+                // The bound (one second here), then the read still in flight.
+                assert!(started.elapsed() >= Duration::from_millis(900));
+            } else {
+                assert!(
+                    started.elapsed() < Duration::from_millis(900),
+                    "{health:?}: {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+        w.shutdown().await.unwrap();
+    }
+}

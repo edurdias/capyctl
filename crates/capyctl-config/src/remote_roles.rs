@@ -570,7 +570,7 @@ impl HostConfig {
         self,
         flags: &crate::engine_settings::EngineOverrides,
         env: &crate::engine_settings::EngineOverrides,
-        probe: &dyn Fn(&Path) -> Result<String, String>,
+        probe: &dyn Fn(crate::engine_policy::Engine, &Path) -> Result<String, String>,
     ) -> Result<Self, ConfigError> {
         let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
         let settings = crate::engine_settings::resolve(flags, env, &stated);

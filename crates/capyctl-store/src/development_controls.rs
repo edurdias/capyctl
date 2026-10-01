@@ -58,6 +58,15 @@ pub const UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces = Unauthentica
     access: "read_only",
 };
 
+/// ADR 0023 §3: TensorFold has no engine key; its whole HTTP surface is
+/// unauthenticated on loopback, reached only through capyctl's routed path.
+pub const TENSORFOLD_UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces =
+    UnauthenticatedSurfaces {
+        surface: &["/v1", "/health", "/metrics"],
+        listener: "loopback",
+        access: "inference",
+    };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureState {
@@ -142,6 +151,9 @@ fn classify(
     if engine == Engine::Sglang {
         controls.unauthenticated_local_surfaces = Some(UNAUTHENTICATED_LOCAL_SURFACES);
     }
+    if engine == Engine::Tensorfold {
+        controls.unauthenticated_local_surfaces = Some(TENSORFOLD_UNAUTHENTICATED_LOCAL_SURFACES);
+    }
     if engine != Engine::Vllm {
         return controls;
     }
@@ -167,7 +179,7 @@ pub fn for_effective(effective: &EffectiveDeployment) -> DevelopmentControls {
     let profile = &effective.profile;
     let sleep = match &effective.engine_config {
         LaunchSettings::Vllm(settings) => Some(settings.enable_sleep_mode),
-        LaunchSettings::Sglang(_) => None,
+        LaunchSettings::Sglang(_) | LaunchSettings::Tensorfold(_) => None,
     };
     classify(
         profile.engine,

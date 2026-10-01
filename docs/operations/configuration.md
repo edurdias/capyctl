@@ -138,7 +138,8 @@ list, which has no flag or variable form: state it in the document.
 ## Engine installation
 
 These describe the role's own engine installation. One executable is published
-as the runtime profile `local`; both as `local-vllm` and `local-sglang`. On a
+as the runtime profile `local`; several as `local-vllm`, `local-sglang` and
+`local-tensorfold`. On a
 host the profile is added to the document the host publishes, beside the
 profiles in `runtime_profiles` and the ones registered with `capyctl engine add`;
 a name stated twice is refused. The switches below apply to the `local`
@@ -149,6 +150,7 @@ block.
 |---|---|---|---|---|---|
 | vLLM executable | `local_engine.vllm` | `--vllm-bin <path>` | `CAPYCTL_VLLM_BIN` | none | host, standalone |
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
+| TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
@@ -157,12 +159,12 @@ block.
 | When the installation's files change | `local_engine.installation_drift: warn\|refuse` | `--installation-drift warn\|refuse` | `CAPYCTL_INSTALLATION_DRIFT` | `warn` | host, standalone |
 | CapyCTL's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `CAPYCTL_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
 | Engine port range (loopback) | `resource_policy.endpoint_port_range` (`start`, `end`) | `--engine-ports <start-end>` | `CAPYCTL_ENGINE_PORTS` (`CAPYCTL_STANDALONE_ENGINE_PORTS` still read, with a warning) | `8100-8199` | host, standalone |
-| CUDA toolkit for engine kernel builds | `local_engine.cuda_home` | `--cuda-home <dir>` | `CAPYCTL_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
+| CUDA toolkit for engine kernel builds (vLLM's FlashInfer, TensorFold's first start) | `local_engine.cuda_home` | `--cuda-home <dir>` | `CAPYCTL_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
 
 A host generates no deployment of its own, so `--kv-cache` exists only on
 `start standalone`; on a host, `local_engine.kv_cache` is refused and each
 deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
-arguments, so `args` applies to the vLLM profile only. Name `runtime_dir` only
+arguments, so `args` applies to the vLLM and TensorFold profiles only. Name `runtime_dir` only
 to run from a directory you maintain yourself; CapyCTL never writes to it.
 
 A running host or standalone takes its engine and model settings at start. A
@@ -196,7 +198,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 |---|---|
 | Role name, fingerprints | `name`, `hardware_fingerprint`, `environment_fingerprint` |
 | Enrollment addresses | server: `enrollment.bootstrap_address`, `enrollment.control_address` |
-| Idle, heartbeat, switching and shutdown bounds | server: `lifecycle_defaults`, `control`, `switching.drain_timeout`; every role: `shutdown.drain_timeout` |
+| Idle, heartbeat, switching and shutdown bounds | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
 | Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, and `endpoint_port_range`) |
@@ -335,6 +337,10 @@ CapyCTL starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
 `CAPYCTL_EXTRA_APPROVALS`, `CAPYCTL_RENDEZVOUS_DIR`, `CAPYCTL_OBSERVATION_DIR`,
 `CAPYCTL_VLLM_ADMIN_KEY`, `CAPYCTL_ENGINE_API_KEY` and `CAPYCTL_DEBUG_ENGINE_LOGS` are
 written by CapyCTL for the engine process; setting them yourself has no effect.
+For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
+`TRANSFORMERS_OFFLINE` and `TORCH_EXTENSIONS_DIR`
+(`<state dir>/engines/tensorfold/<version>/torch_extensions`, private to the
+service user).
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in

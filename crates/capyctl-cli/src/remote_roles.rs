@@ -1023,6 +1023,7 @@ async fn serve_host(
         // SPEC §8.2 / T21: per-launch SGLang file rendezvous directories,
         // removed on gone evidence (0700, this service user).
         private_dir(&config.state_dir.join("rendezvous"))?;
+        private_dir(&config.state_dir.join("engines"))?;
         let private =
             IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|e| {
                 identity_refused(
@@ -1049,6 +1050,7 @@ async fn serve_host(
         // SPEC §8.2 / T21 (found live 2026-09-23): a signalled SGLang stop
         // left its rendezvous directory in /tmp; the host now owns and removes it.
         .with_rendezvous_root(config.state_dir.join("rendezvous"))
+        .with_engine_cache_root(config.state_dir.join("engines"))
         // SPEC §9.2 (W4): the production saver observation source; without it
         // SGLang Park is refused unchanged.
         .with_saver_residency(Arc::new(

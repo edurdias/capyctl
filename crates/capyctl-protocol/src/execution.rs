@@ -689,7 +689,7 @@ pub fn validate_result(
         && (result.state != "completed"
             || !result.claim_retained
             || !named_binding
-            || !live_group(result))
+            || !live_group(result, false))
     {
         return Err(GroupIdentityError);
     }
@@ -710,7 +710,7 @@ pub fn validate_result(
             }
             _ => false,
         };
-        if !bound || !result.claim_retained || !live_group(result) {
+        if !bound || !result.claim_retained || !live_group(result, true) {
             return Err(GroupIdentityError);
         }
     }
@@ -718,8 +718,11 @@ pub fn validate_result(
 }
 
 /// The alive processes of a result form one local group with an api process and
-/// at least one worker, all on one boot with distinct roles and PIDs.
-fn live_group(result: &pb::MemberExecutionResult) -> bool {
+/// at least one worker, all on one boot with distinct roles and PIDs. ADR 0023 §6:
+/// for a readiness claim (`single`), a group of one process is its api process
+/// alone, as TensorFold serves from one; a residency claim keeps its worker, as
+/// only the engines with workers park.
+fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
     let current: Vec<_> = result
         .processes
         .iter()
@@ -731,8 +734,9 @@ fn live_group(result: &pb::MemberExecutionResult) -> bool {
             start_ticks: p.start_ticks,
         })
         .collect();
+    let single = single && result.processes.len() == 1;
     current.iter().any(|p| p.role == "api")
-        && current.iter().any(|p| p.role.starts_with("worker-"))
+        && (single || current.iter().any(|p| p.role.starts_with("worker-")))
         && capyctl_domain::group::validate_local_processes(&current).is_ok()
 }
 

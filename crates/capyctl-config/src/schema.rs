@@ -226,6 +226,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     const LOCAL_ENGINE: FieldSpec = FieldSpec::Struct(&[
         ("vllm", SCALAR),
         ("sglang", SCALAR),
+        ("tensorfold", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),
@@ -326,6 +327,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("tokenizer_workers", SCALAR),
             ]),
         ),
+        // ADR 0023 §4: TensorFold's own typed fields.
+        (
+            "tensorfold",
+            FieldSpec::Struct(&[("max_tokens", SCALAR), ("thinking", SCALAR)]),
+        ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
     ]);
@@ -356,12 +362,20 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("tls", FieldSpec::Struct(TLS)),
         // SPEC §10 (W10): the switch drain bound of the embedded server.
         ("switching", FieldSpec::Struct(SWITCHING)),
+        // SPEC §6.5 (W5), owner rule (standalone is a server and one host): the
+        // embedded server's idle policy, as in a server document.
+        ("lifecycle_defaults", FieldSpec::Struct(LIFECYCLE_DEFAULTS)),
         // SPEC §17 (M80): the router's per-request timing header.
         ("observability", FieldSpec::Struct(OBSERVABILITY)),
     ];
     /// SPEC §4.3 (owner decision P3): a role's shutdown drain bound, role-local
     /// in the server, host and standalone documents.
     const SHUTDOWN: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
+    /// SPEC §6.5, §16.1 (W5): the controller-owned idle policy.
+    const LIFECYCLE_DEFAULTS: &[(&str, FieldSpec)] = &[
+        ("ready_idle_timeout", DURATION),
+        ("parked_idle_timeout", DURATION),
+    ];
     /// SPEC §10 (W10): request-driven and `--evict` switching bounds.
     const SWITCHING: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
     /// SPEC §17 (M80): router observability. `timing_header` adds the
@@ -405,13 +419,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
                 // SPEC §6.5, §16.1 (W5): the controller-owned idle policy.
-                (
-                    "lifecycle_defaults",
-                    FieldSpec::Struct(&[
-                        ("ready_idle_timeout", DURATION),
-                        ("parked_idle_timeout", DURATION),
-                    ]),
-                ),
+                ("lifecycle_defaults", FieldSpec::Struct(LIFECYCLE_DEFAULTS)),
                 // Owner decision 2026-09-23: control-session heartbeat bounds.
                 (
                     "control",

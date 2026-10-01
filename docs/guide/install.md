@@ -1,7 +1,7 @@
 # Install
 
 You need Linux on x86-64 or ARM64, an NVIDIA GPU with its driver
-(`nvidia-smi` works), and a vLLM or SGLang installation. The GPU can be a
+(`nvidia-smi` works), and a vLLM, SGLang or TensorFold installation. The GPU can be a
 discrete card or a unified-memory machine; the steps are the same.
 
 ```bash

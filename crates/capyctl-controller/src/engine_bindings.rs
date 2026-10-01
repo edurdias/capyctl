@@ -31,6 +31,8 @@ pub struct ProfileBindings {
     /// launches keep their file rendezvous in, as on a host. Without one the
     /// entry falls back to its own temporary directory.
     rendezvous: Option<capyctl_agent::rendezvous::RendezvousRoot>,
+    /// ADR 0023 §3: the private root TensorFold launches build extensions in.
+    engine_cache: Option<capyctl_agent::engine_cache::EngineCacheRoot>,
     /// Discrete GPU design §6 (ADR 0019): the total memory of each discrete
     /// GPU on this host, by driver index, as sampled at boot. An engine on a
     /// device domain is sized against its card's total; a card's total does not
@@ -55,6 +57,7 @@ impl ProfileBindings {
             ),
             saver: None,
             rendezvous: None,
+            engine_cache: None,
             device_totals: std::collections::BTreeMap::new(),
         }
     }
@@ -77,6 +80,14 @@ impl ProfileBindings {
             .clone()
             .with_device_total(|index| self.device_totals.get(&index).copied())
             .map_err(|error| CoordinatorError::Service(error.to_string()))
+    }
+
+    /// ADR 0023 §3: TensorFold launches build their extensions under this
+    /// private root (`<dir>/tensorfold/<version>/torch_extensions`). Without
+    /// one a TensorFold launch is refused.
+    pub fn with_engine_cache_root(mut self, dir: PathBuf) -> Self {
+        self.engine_cache = Some(capyctl_agent::engine_cache::EngineCacheRoot::new(dir));
+        self
     }
 
     /// SPEC §8.2 / T21 (owner decision 2026-09-25): SGLang launches keep their
@@ -151,6 +162,45 @@ impl ProfileBindings {
             self.runtime_dir.to_string_lossy().into_owned(),
         )
         .map_err(Self::refuse)
+    }
+
+    /// ADR 0023 §3: the embedded TensorFold plan through the shared builder,
+    /// with the version's private extensions directory, and whether an
+    /// earlier start left a build there.
+    fn tensorfold_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+    ) -> Result<(capyctl_adapters::tensorfold::PlanInputTensorfold, bool), CoordinatorError> {
+        let refuse = |what: String| {
+            CoordinatorError::Service(format!("cannot build a TensorFold launch plan: {what}"))
+        };
+        let endpoint = crate::port::engine_url(work.endpoint())
+            .ok_or_else(|| refuse(format!("endpoint names no address: {}", work.endpoint())))?;
+        let port = endpoint
+            .port()
+            .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
+        // ADR 0023 §3, SPEC §13.3: without a private root nothing is launched.
+        let cache = self
+            .engine_cache
+            .as_ref()
+            .ok_or_else(|| refuse("no private engine cache".into()))?;
+        let dir = cache
+            .torch_extensions(&effective.profile.build_fingerprint)
+            .map_err(|error| refuse(error.to_string()))?;
+        let built = capyctl_agent::engine_cache::has_build(&dir);
+        let plan = capyctl_adapters::tensorfold::plan_from_effective(
+            effective,
+            port,
+            self.log_dir
+                .join(&work.fence().deployment_id)
+                .join(format!("{}.log", work.incarnation()))
+                .to_string_lossy()
+                .into_owned(),
+            Some(dir.to_string_lossy().into_owned()),
+        )
+        .map_err(|error| refuse(error.to_string()))?;
+        Ok((plan, built))
     }
 }
 
@@ -295,6 +345,26 @@ impl EngineBindings for ProfileBindings {
                         .rendezvous
                         .as_ref()
                         .and_then(|root| root.launch_dir(work.incarnation())),
+                })
+            }
+            Engine::Tensorfold => {
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "frozen binding endpoint names no address: {}",
+                        work.endpoint()
+                    ))
+                })?;
+                let (launch, extensions_built) = self.tensorfold_plan(work, &self.sized(work)?)?;
+                Ok(AdapterSpec::Tensorfold {
+                    endpoint,
+                    fingerprint: profile.build_fingerprint.clone(),
+                    model_id: effective
+                        .routes
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| effective.name.clone()),
+                    launch: Some(launch),
+                    extensions_built,
                 })
             }
         }

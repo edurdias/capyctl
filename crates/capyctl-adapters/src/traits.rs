@@ -210,6 +210,29 @@ pub enum WorkObservation {
     Unknown,
 }
 
+/// ADR 0023 §6: what an engine's own work counters say just before a stop
+/// signal, after CapyCTL's own drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineWork {
+    /// The counters were read and agree that nothing runs.
+    Idle,
+    /// Nothing listens, or the engine has not loaded its model: it serves
+    /// nothing, so no work can be in flight.
+    NotListening,
+    /// The engine answered that a request runs (`busy`, or a running count).
+    Busy,
+    /// No usable answer: a read that timed out, an error status, a malformed
+    /// body. It reports no work, but proves no idleness either.
+    Unanswered,
+}
+
+impl EngineWork {
+    /// Whether the stop signal may be sent without waiting for the bound.
+    pub fn signal_now(self) -> bool {
+        matches!(self, Self::Idle | Self::NotListening)
+    }
+}
+
 /// Identifies a request whose work may need cancellation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestRef {
@@ -300,6 +323,12 @@ pub trait EngineAdapter: Send + Sync {
         req: &RequestRef,
         require_ack: bool,
     ) -> Result<CancellationOutcome, AdapterError>;
+    /// ADR 0023 §6: the engine's own account of in-flight work, read by the
+    /// process owner just before a stop signal. `None`: this engine has no
+    /// such account and the router's lease ledger alone decides.
+    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<EngineWork> {
+        None
+    }
 }
 
 /// A boot-unique handle to a spawned engine process.

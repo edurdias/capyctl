@@ -204,6 +204,7 @@ fn spec(engine: Engine) -> ProfileSpec {
         executable: match engine {
             Engine::Vllm => "/home/u/venv/bin/vllm".into(),
             Engine::Sglang => "/home/u/venv/bin/python3".into(),
+            Engine::Tensorfold => "/home/u/venv/bin/tensorfold".into(),
         },
         build_fingerprint: "0.29.0".into(),
         deep_park: true,

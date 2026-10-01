@@ -8,6 +8,7 @@ pub mod policy;
 pub mod protected;
 pub mod resolve;
 pub mod sglang;
+pub mod tensorfold;
 pub mod traits;
 pub mod vllm;
 

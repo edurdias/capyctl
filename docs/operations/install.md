@@ -101,8 +101,8 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
-| 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `capyctl engine detect --path DIR`. |
-| 17 | The package is not a supported engine (`engine_unsupported`) | none | Register a vLLM or SGLang installation. |
+| 16 | The path holds no `vllm`, `sglang` or `tensorfold` package (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm`, `bin/tensorfold` or its `bin/python3`, or scan more with `capyctl engine detect --path DIR`. |
+| 17 | The package is not a supported engine (`engine_unsupported`) | none | Register a vLLM, SGLang or TensorFold installation. |
 | 18 | The version check failed or timed out; nothing is written (`engine_version_failed`) | none | Repair the installation until its version check succeeds and matches its package metadata, then add it again. |
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |

@@ -209,15 +209,23 @@ fn record_launch_refuses_a_mismatched_prior_identity() {
 }
 
 /// Spec §4: a tensor-parallel launch has several workers. The store accepts api plus
-/// worker-0..worker-N and still refuses a set without a worker.
-// T16
+/// worker-0..worker-N, and (ADR 0023 §6) the api process alone, as TensorFold
+/// serves from one process; the engines with workers check them in their adapters.
+// T16 T41
 #[test]
-fn canonical_members_accepts_many_workers_and_refuses_none() {
+fn canonical_members_accepts_many_workers_or_the_api_alone() {
     let api = identity("api", 10);
     let w0 = identity("worker-0", 11);
     let w1 = identity("worker-1", 12);
     assert!(canonical_members(&[api.clone(), w0.clone(), w1.clone()]).is_ok());
-    assert!(canonical_members(std::slice::from_ref(&api)).is_err());
+    assert_eq!(
+        canonical_members(std::slice::from_ref(&api)).unwrap(),
+        vec![api.clone()]
+    );
+    assert!(
+        canonical_members(std::slice::from_ref(&w0)).is_err(),
+        "a launch has an api"
+    );
     assert!(
         canonical_members(&[api, identity("worker-1", 12)]).is_err(),
         "workers are contiguous from 0"

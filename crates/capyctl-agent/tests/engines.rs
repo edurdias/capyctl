@@ -260,6 +260,73 @@ fn a_symlink_escaping_its_root_is_not_followed() {
     );
 }
 
+// T41 T07: a TensorFold venv, its directory or its bin/tensorfold, resolves
+// to <env>/bin/tensorfold from dist-info; 0.6.0 is verified.
+#[test]
+fn a_tensorfold_environment_resolves_to_its_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = fake_env(&dir.path().join("tf"), &[("tensorfold", "0.6.0")]);
+    script(&env.join("bin/tensorfold"), "echo tensorfold 0.6.0");
+    for named in [env.clone(), env.join("bin/tensorfold")] {
+        let resolved = resolve(&named).unwrap();
+        assert_eq!(resolved.engine, Engine::Tensorfold);
+        assert_eq!(resolved.version, "0.6.0");
+        assert_eq!(resolved.executable, env.join("bin/tensorfold"));
+        assert!(!resolved.custom());
+    }
+    let resolved = resolve(&env).unwrap();
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(10)).unwrap(),
+        "0.6.0"
+    );
+}
+
+// T41 T07 (ADR 0023 §2): two engines in one venv named by its directory
+// are refused, naming each entry point.
+#[test]
+fn an_environment_with_two_engines_names_each_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = fake_env(
+        &dir.path().join("both"),
+        &[("vllm", "0.29.0"), ("tensorfold", "0.6.0")],
+    );
+    script(&env.join("bin/vllm"), "echo 0.29.0");
+    script(&env.join("bin/tensorfold"), "echo tensorfold 0.6.0");
+    let error = resolve(&env).unwrap_err();
+    assert_eq!(error.code(), "engine_unsupported");
+    let text = error.to_string();
+    for entry in ["bin/vllm", "bin/tensorfold"] {
+        assert!(text.contains(entry), "{text}");
+    }
+    assert_eq!(
+        resolve(&env.join("bin/tensorfold")).unwrap().engine,
+        Engine::Tensorfold
+    );
+}
+
+// T41 T07 T37: detection lists a TensorFold venv from metadata alone.
+#[test]
+fn detection_finds_a_tensorfold_environment_and_runs_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let env = fake_env(
+        &home.path().join("tensorfold-0.6.0-venv"),
+        &[("tensorfold", "0.6.0")],
+    );
+    let marker = home.path().join("ran");
+    script(
+        &env.join("bin/tensorfold"),
+        &format!("touch {}", marker.display()),
+    );
+    let found = detect(&empty_roots(home.path()), &ScanBounds::default());
+    assert!(
+        found
+            .iter()
+            .any(|c| c.engine == Engine::Tensorfold && c.version == "0.6.0"),
+        "{found:?}"
+    );
+    assert!(!marker.exists(), "detection executes nothing");
+}
+
 // T37: the scan is bounded in environments and depth.
 #[test]
 fn the_scan_is_bounded() {

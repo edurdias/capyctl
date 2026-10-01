@@ -48,6 +48,9 @@ impl ExitCode {
     /// SPEC §6.4: a start refused while the deployment's stop is still
     /// settling; retrying shortly, or `start --wait`, succeeds.
     pub const STILL_STOPPING: Self = Self(25);
+    /// ADR 0023 §2: TensorFold's build toolchain is not on the engine's
+    /// closed PATH; nothing was written.
+    pub const TOOLCHAIN_MISSING: Self = Self(26);
 }
 
 impl From<ExitCode> for u8 {
@@ -231,6 +234,9 @@ impl StructuredError {
             "not_interactive" => ExitCode::NOT_INTERACTIVE,
             "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
             "still_stopping" => ExitCode::STILL_STOPPING,
+            "toolchain_missing" => ExitCode::TOOLCHAIN_MISSING,
+            // ADR 0023 §2: a park asked of an engine that cannot park.
+            "capability_missing" => ExitCode::UNSUPPORTED,
             _ => ExitCode::UNSUPPORTED,
         }
     }

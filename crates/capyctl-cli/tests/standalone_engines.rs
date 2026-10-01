@@ -435,3 +435,81 @@ async fn a_stale_retirement_expires_when_standalone_starts() {
     let _ = id;
     let _ = app.shutdown().await;
 }
+
+fn script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A TensorFold venv as `engine add` finds one (`engine_cli.rs`).
+fn tensorfold_env(root: &std::path::Path, version: &str, tools: &[&str]) -> std::path::PathBuf {
+    let site = root.join("lib/python3.12/site-packages");
+    std::fs::create_dir_all(site.join("tensorfold")).unwrap();
+    std::fs::create_dir_all(site.join(format!("tensorfold-{version}.dist-info"))).unwrap();
+    std::fs::write(
+        site.join(format!("tensorfold-{version}.dist-info/METADATA")),
+        format!("Name: tensorfold\nVersion: {version}\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    script(
+        &root.join("bin/tensorfold"),
+        &format!("echo tensorfold {version}"),
+    );
+    let report = serde_json::json!({"schema": "capyctl/engine-capabilities/v1", "engine": "tensorfold",
+        "capabilities": {"core": [], "deep_park": ["unsupported"], "metrics": []}});
+    script(&root.join("bin/python3"), &format!("echo '{report}'"));
+    for tool in tools {
+        script(&root.join("bin").join(tool), "exit 0");
+    }
+    root.to_path_buf()
+}
+
+// T41 T07 (ADR 0023 §2, ADR 0018 §5): a TensorFold profile registered in
+// engines.yaml is published by the standalone provider as `tensorfold`,
+// engine `tensorfold`, deep park disabled.
+#[test]
+fn standalone_publishes_a_registered_tensorfold_profile() {
+    use capyctl_controller::EngineProvider as _;
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    let env = tensorfold_env(&state.path().join("tf"), "0.6.0", &["ninja", "nvcc", "c++"]);
+    let path = engines_beside(&document);
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert(
+        "tensorfold".into(),
+        capyctl_config::registration::profile_document(&ProfileSpec {
+            engine: capyctl_config::engine_policy::Engine::Tensorfold,
+            executable: env.join("bin/tensorfold"),
+            build_fingerprint: "0.6.0".into(),
+            deep_park: false,
+            installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+            args: vec![],
+            cuda_home: None,
+        }),
+    );
+    write_engines(&engines, &lock, None).unwrap();
+    drop(lock);
+    let registered = EnginesFile::load(&path).unwrap().profiles;
+    let runtime = state.path().join("runtime");
+    let provider = capyctl_cli::roles::EnvEngineProvider::with_managed_runtime(runtime);
+    let all = provider
+        .installations(&registered)
+        .expect("the registered TensorFold profile is an installation");
+    let published = all
+        .iter()
+        .find(|named| named.profile == "tensorfold")
+        .expect("published as `tensorfold`");
+    assert_eq!(
+        published.installation.engine,
+        capyctl_config::engine_policy::Engine::Tensorfold
+    );
+    assert!(!published.installation.deep_park);
+    assert_eq!(published.installation.build_fingerprint, "0.6.0");
+    assert_eq!(
+        published.installation.executable,
+        env.join("bin/tensorfold")
+    );
+}

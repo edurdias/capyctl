@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use capyctl_config::remote_roles::{
-    drain_timeout, switch_drain_timeout, timing_header, HostConfig, ServerConfig,
+    drain_timeout, idle_timeouts, switch_drain_timeout, timing_header, HostConfig, ServerConfig,
 };
 use capyctl_config::setting_overrides::SettingOverrides;
 use capyctl_config::ConfigKind;
@@ -133,6 +133,17 @@ fn document_only_settings_follow_set_env_yaml_default() {
             read: |d| secs(switch_drain_timeout(&d["server"]).unwrap()),
             expected: ["30000ms", "5000ms", "6000ms", "7000ms"],
         },
+        // Owner rule (standalone is a server and one host): the server's idle
+        // policy applies to standalone too.
+        Row {
+            kind: ConfigKind::Standalone,
+            path: "server.lifecycle_defaults.ready_idle_timeout",
+            yaml: "10m",
+            env: "20m",
+            set: "30m",
+            read: |d| format!("{:?}", idle_timeouts(&d["server"]).unwrap().ready_idle),
+            expected: ["None", "Some(600s)", "Some(1200s)", "Some(1800s)"],
+        },
         Row {
             kind: ConfigKind::Standalone,
             path: "server.observability.timing_header",
@@ -205,7 +216,7 @@ fn a_host_keeps_its_overrides_for_reloads() {
     let config =
         HostConfig::load_with_overrides(&document, &dir.path().join("engines.yaml"), &overrides)
             .unwrap()
-            .with_engines(&Default::default(), &Default::default(), &|_| {
+            .with_engines(&Default::default(), &Default::default(), &|_, _| {
                 Ok("fp".into())
             })
             .unwrap();

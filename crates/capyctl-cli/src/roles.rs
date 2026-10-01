@@ -54,6 +54,7 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 /// both set publish two profiles, `local-vllm` and `local-sglang`.
 const ENGINE_BIN: &str = capyctl_config::engine_settings::VLLM_BIN_ENV;
 const SGLANG_BIN: &str = capyctl_config::engine_settings::SGLANG_BIN_ENV;
+const TENSORFOLD_BIN: &str = capyctl_config::engine_settings::TENSORFOLD_BIN_ENV;
 /// The directory model weights live under (Spec §7). Optional (owner decision
 /// 2026-09-25): `~/models` unless `--models-root`, this variable or
 /// `host.model_store.path` names another.
@@ -101,6 +102,27 @@ fn prepare_rendezvous_root(
     }
     capyctl_agent::rendezvous::RendezvousRoot::new(root.clone()).sweep(retained);
     Ok(root)
+}
+
+/// Create a private directory (0700, this user) or refuse one that is not.
+fn prepare_private_dir(root: &Path) -> Result<(), StartError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let private = std::fs::symlink_metadata(root).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o7777 == 0o700
+    });
+    if private {
+        Ok(())
+    } else {
+        Err(StartError::Setting(format!(
+            "{} must be a directory owned by this user with mode 0700; no permissions were changed",
+            root.display()
+        )))
+    }
 }
 
 /// A conservative KV grant for a unified-memory host: the ledger's deployment
@@ -780,6 +802,8 @@ pub struct EnvEngineProvider {
     /// The standalone document's `host:` block settings, the YAML layer
     /// ([`EngineProvider::configure`]).
     document: std::sync::Mutex<EngineOverrides>,
+    /// ADR 0023 §2: where a TensorFold's build toolchain is looked for.
+    toolchain: capyctl_config::toolchain::ToolchainSearch,
 }
 
 impl EnvEngineProvider {
@@ -788,7 +812,18 @@ impl EnvEngineProvider {
             managed_runtime: None,
             flags: EngineOverrides::default(),
             document: Default::default(),
+            toolchain: Default::default(),
         }
+    }
+
+    /// Looks for a TensorFold's build toolchain in `search` (a test's own
+    /// directories) instead of the system's.
+    pub fn with_toolchain_search(
+        mut self,
+        search: capyctl_config::toolchain::ToolchainSearch,
+    ) -> Self {
+        self.toolchain = search;
+        self
     }
 
     /// SPEC §3.3 / ADR 0001: without `CAPYCTL_RUNTIME_DIR`, the engine runs
@@ -889,14 +924,30 @@ impl EnvEngineProvider {
         let settings = self.settings()?;
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
-        let deep_park = deep_park.unwrap_or(settings.deep_park);
+        let mut deep_park = deep_park.unwrap_or(settings.deep_park);
+        // ADR 0023 §2, §6: an environment TensorFold install is checked
+        // for its build toolchain as `engine add` checks it, and never parks.
+        if engine == Engine::Tensorfold {
+            deep_park = false;
+            if fingerprint.is_none() {
+                let bin = executable.parent().unwrap_or(Path::new(""));
+                capyctl_config::toolchain::check(
+                    bin,
+                    settings.cuda_home.as_deref(),
+                    &self.toolchain.system,
+                )
+                .map_err(|missing| {
+                    no_installation(format!("toolchain_missing: {}", missing.for_local_engine()))
+                })?;
+            }
+        }
         let trust_remote_code = settings.trust_remote_code;
         let installation_drift = settings.installation_drift;
         let engine_ports = settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS);
         let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
             (Some(registered), _) => registered.to_owned(),
             (None, Some(declared)) => declared,
-            (None, None) => probe_fingerprint(&executable)?,
+            (None, None) => probe_fingerprint(&executable, engine)?,
         };
         let declared_kv = settings.kv_cache;
         let kv_cache_declared = declared_kv.is_some();
@@ -908,7 +959,7 @@ impl EnvEngineProvider {
         // default; an undeclared context is fitted to the KV grant at launch.
         // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm => settings.args,
+            Engine::Vllm | Engine::Tensorfold => settings.args,
             Engine::Sglang => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
@@ -945,13 +996,13 @@ impl EngineProvider for EnvEngineProvider {
     /// set this is the vLLM one; [`Self::installations`] publishes both.
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
         let settings = self.settings()?;
-        match (settings.vllm, settings.sglang) {
-            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm),
-            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang),
-            (None, None) => Err(no_installation(format!(
+        match settings.installations().into_iter().next() {
+            Some((_, engine, executable)) => self.role_installation(engine, executable),
+            None => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang, or --vllm-bin / --sglang-bin, or host.local_engine) to \
-                 the engine's executable"
+                 for SGLang, {TENSORFOLD_BIN} for TensorFold, or --vllm-bin / \
+                 --sglang-bin / --tensorfold-bin, or host.local_engine) to the \
+                 engine's executable"
             ))),
         }
     }
@@ -986,11 +1037,10 @@ impl EngineProvider for EnvEngineProvider {
             if all.iter().any(|n| &n.profile == name) {
                 return Err(ProviderError::ProfileExists(name.clone()));
             }
-            let engine = if profile["engine"] == "sglang" {
-                Engine::Sglang
-            } else {
-                Engine::Vllm
-            };
+            let engine = profile["engine"]
+                .as_str()
+                .and_then(Engine::from_name)
+                .unwrap_or(Engine::Vllm);
             let executable = PathBuf::from(profile["executable"].as_str().unwrap_or_default());
             let base = self.role_installation_as(
                 engine,
@@ -1005,8 +1055,9 @@ impl EngineProvider for EnvEngineProvider {
         }
         if all.is_empty() {
             return Err(no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} (or \
-                 --vllm-bin / --sglang-bin, or host.local_engine) to the engine's \
+                "this host declares no engine: set {ENGINE_BIN}, {SGLANG_BIN} or \
+                 {TENSORFOLD_BIN} (or --vllm-bin / --sglang-bin / --tensorfold-bin, \
+                 or host.local_engine) to the engine's \
                  executable, or register one with `capyctl engine add`"
             )));
         }
@@ -1038,7 +1089,8 @@ impl EngineProvider for EnvEngineProvider {
         let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir)
             .with_device_totals(device_totals)
             .with_checkpoint_cache(cache)
-            .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR));
+            .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR))
+            .with_engine_cache_root(log_dir.with_file_name("engines"));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
         // observation in a private directory beside the logs. One that cannot
         // be made private leaves the source unset, and Park is refused.
@@ -1143,8 +1195,8 @@ fn runtime_dir(
 
 /// [`probe_fingerprint`] for the host role, which states `local_engine`
 /// profiles in its document (owner rule 2026-09-25).
-pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
-    probe_fingerprint(executable).map_err(|error| error.to_string())
+pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String, String> {
+    probe_fingerprint(executable, engine).map_err(|error| error.to_string())
 }
 
 /// What the installed engine says it is.
@@ -1153,7 +1205,7 @@ pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
 /// than from a constant that would keep claiming the same build after an upgrade.
 /// A probe that fails or hangs is a refusal: an engine that cannot print its own
 /// version is not one this host should publish.
-fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
+fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, ProviderError> {
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
@@ -1194,7 +1246,18 @@ fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
         // The child has exited, so this reads what it left in the pipe and returns.
         let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
     }
-    let fingerprint = printed.trim().to_owned();
+    // ADR 0023 §2: `tensorfold 0.6.0` publishes `0.6.0`, as `engine add`
+    // records it. vLLM and SGLang publish what they print, as before.
+    let fingerprint = match engine {
+        Engine::Tensorfold => printed
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .and_then(|line| line.split_whitespace().last())
+            .unwrap_or_default(),
+        Engine::Vllm | Engine::Sglang => printed.trim(),
+    }
+    .to_owned();
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
             "{} printed no version, so there is nothing to pin this recipe to; set \
@@ -1559,6 +1622,7 @@ async fn start_standalone_in(
     // of the standalone document; 30 s when it names none.
     let (
         switch_drain_timeout,
+        idle,
         timing_header,
         config_notices,
         inference_bind,
@@ -1603,6 +1667,11 @@ async fn start_standalone_in(
             capyctl_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
                 |error| StartError::Deploy(format!("standalone configuration: {error}")),
             )?,
+            // SPEC §6.5 (W5): `server.lifecycle_defaults`, off unless named, as
+            // in a server document.
+            capyctl_config::remote_roles::idle_timeouts(&document["server"]).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             // SPEC §17 (M80): `server.observability.timing_header`, off unless set.
             capyctl_config::remote_roles::timing_header(&document["server"]).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
@@ -1744,6 +1813,8 @@ async fn start_standalone_in(
             .map_err(|error| StartError::Deploy(format!("retained launches: {error}")))?;
         prepare_rendezvous_root(state_dir, &retained)?;
     }
+    // ADR 0023 §3: the private TensorFold build cache root.
+    prepare_private_dir(&state_dir.join("engines"))?;
     let options = CoordinatorOptions {
         // Spec §4: a cold start reads weights off disk, which this project measured
         // taking a minute on a small model; the protocol bound would give up on a
@@ -1757,6 +1828,11 @@ async fn start_standalone_in(
         // SPEC §6.3: a Stop drains accepted requests for the same bound a
         // switch does before it terminates.
         stop_drain_timeout: switch_drain_timeout,
+        // SPEC §6.5 (W5): the document's idle policy, off unless named.
+        idle: capyctl_store::ordinary_lifecycle::park::IdlePolicy {
+            ready_idle_ms: idle.ready_idle.map(|d| d.as_millis() as i64),
+            parked_idle_ms: idle.parked_idle.map(|d| d.as_millis() as i64),
+        },
         ..Default::default()
     };
     // ADR 0008 (owner decision 2026-09-23): register each installation (its
@@ -2159,6 +2235,44 @@ pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T41 T03 (ADR 0023 §2): only TensorFold's version is its last word, as
+    // `engine add` records it; vLLM and SGLang publish what they print, so
+    // the fingerprints pinned by earlier releases still match.
+    #[test]
+    fn only_tensorfold_publishes_the_last_word_of_its_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, printed: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '{printed}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let python = script("python3", "Python 3.12.3\\n");
+        let vllm = script("vllm", "INFO loading\\n0.29.0\\n");
+        let tensorfold = script("tensorfold", "tensorfold 0.6.0\\n\\n");
+        assert_eq!(
+            probe_fingerprint(&python, Engine::Sglang).unwrap(),
+            "Python 3.12.3"
+        );
+        assert_eq!(
+            probe_fingerprint(&vllm, Engine::Vllm).unwrap(),
+            "INFO loading\n0.29.0"
+        );
+        assert_eq!(
+            probe_fingerprint(&tensorfold, Engine::Tensorfold).unwrap(),
+            "0.6.0"
+        );
+        assert_eq!(
+            engine_version(Engine::Tensorfold, &tensorfold).unwrap(),
+            "0.6.0"
+        );
+        assert_eq!(
+            engine_version(Engine::Sglang, &python).unwrap(),
+            "Python 3.12.3"
+        );
+    }
 
     // T37 (design §9): there is no constant key. Freshly created credentials
     // that cannot be read back are a start failure; readable ones give the
