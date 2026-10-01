@@ -1,5 +1,46 @@
 # Current implementation and launch status
 
+## Formal review in Lean 4 — 2026-10-01 (branch `claude/formal-review-lean`)
+
+The resource and dispatch logic now has machine-checked models in `formal/`
+(Lean 4.34.1, core library only, no `sorry`), built by a new `formal` CI job.
+They prove `admit_phase` sound over the post-grant ledger, prove the M27
+`Insufficient` bypass never increases an aggregate, and prove that admitted
+grants and releases preserve device exclusivity. `formal/README.md` maps
+every capability to its coverage and orders the next passes; release and
+epoch fencing come first.
+
+Three bugs the models found were reproduced against the Rust, then fixed,
+each with a regression test that fails on the previous code:
+
+- A park cancelled at its deadline, or refused before any effect, reopened a
+  dispatch gate that a restart had closed. Dispatch then opened over a
+  retired session's lease, without readiness re-proven (SPEC §6.1, §10). The
+  plan now records whether the park closed an open gate, or was handed one by
+  a switch releasing its victim (`reopens_dispatch`). A first version that
+  ignored the switch hand-off left a refused victim closed; the full suite
+  caught it, and the `Gate` model now checks that case.
+- `validate_recipe` compared bytes between phases but not device claims. A
+  start or wake completion, which writes Ready without admission, could put
+  a second exclusive owner on a GPU (SPEC §7.3). Ready's claims must now be
+  held by each peak phase.
+- A granted request lease leaked when its caller was dropped after the
+  reply was sent. That blocked parks of the instance until a stop or restart
+  (SPEC §10). An untaken ticket now queues its own close.
+
+Still open from the review: F0 `admit` credits a claimed parked budget
+(latent, since its only production caller passes an empty ledger), and the
+lifecycle transition table is enforced only by the F0 controller.
+
+Local checks (cloud container, root, no IPv6): formatting, Clippy with
+warnings denied, core suite 1117 passed / 0 failed, and `lake build` in
+`formal/`. The workspace suite had 2285 passed / 4 failed / 1 ignored; the
+four failures are environmental and fail identically on `main` here
+(`another_user_id_is_refused` running as root, two `group_observation`
+tests, `agent_control_roundtrip_over_real_channel` with no IPv6). Hosted CI
+has not run (the repository is private). CPU and Fake-engine tests and
+proofs are not qualification.
+
 ## 0.1.0 release candidate — 2026-10-01
 
 Draft release `v0.1.0` (not published) targets `f224320`, the commit both
