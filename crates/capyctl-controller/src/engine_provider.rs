@@ -74,6 +74,17 @@ pub struct EngineInstallation {
     pub engine_ports: (u16, u16),
 }
 
+/// The settings a role holds whether or not it has an engine: every
+/// installation it publishes shares them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSettings {
+    pub runtime_dir: PathBuf,
+    pub engine_ports: (u16, u16),
+    /// Empty when the role names none (see [`EngineInstallation::models_root`]).
+    pub models_root: PathBuf,
+    pub cuda_home: Option<PathBuf>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// Nothing on this host names an engine that could be started. The message
@@ -135,6 +146,18 @@ pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> E
 pub trait EngineProvider: Send + Sync {
     /// What this host has, or a refusal naming what it expected to find.
     fn installation(&self) -> Result<EngineInstallation, ProviderError>;
+
+    /// The role-level settings, which a role with no engine still has. A
+    /// provider that states one installation takes them from it.
+    fn role_settings(&self) -> Result<RoleSettings, ProviderError> {
+        let base = self.installation()?;
+        Ok(RoleSettings {
+            runtime_dir: base.runtime_dir,
+            engine_ports: base.engine_ports,
+            models_root: base.models_root,
+            cuda_home: base.cuda_home,
+        })
+    }
 
     /// ADR 0018 §5: every installation this host publishes: the environment's
     /// (`local`) and the profiles registered in engines.yaml, which reuse its

@@ -123,11 +123,9 @@ pub fn host_policy(
 ) -> Value {
     // ADR 0018 §5: role-level fields (model store, ports, hardware
     // fingerprint) come from the first installation; every installation is
-    // one profile. The provider never returns an empty list.
-    let first = &installations
-        .first()
-        .expect("a standalone host publishes at least one installation")
-        .installation;
+    // one profile. SPEC §8 (amended 2026-10-01): a role with none publishes no
+    // profile, and its default port range leases nothing.
+    let first = installations.first().map(|named| &named.installation);
     let profiles: serde_json::Map<String, Value> = installations
         .iter()
         .map(|named| (named.profile.clone(), runtime_profile(&named.installation)))
@@ -136,7 +134,7 @@ pub fn host_policy(
         "schema_version": 1,
         "kind": "host",
         "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
-        "hardware_fingerprint": format!("standalone-{}", first.engine.name()),
+        "hardware_fingerprint": format!("standalone-{}", first.map_or("none", |i| i.engine.name())),
         "environment_fingerprint": environment_fingerprint,
         // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
         // the native launch asserts against. Absent (null) when the host
@@ -144,9 +142,14 @@ pub fn host_policy(
         "device_inventory_digest": inventory.map(|published| published.digest.clone()),
         // Spec §7: a relative model path resolves against this, so the host states
         // it rather than having a directory guessed for it.
-        "model_store": {"path": first.models_root.to_string_lossy()},
+        "model_store": {"path": first.map(|i| i.models_root.to_string_lossy())},
         "runtime_profiles": profiles,
-        "resource_policy": resource_policy(capacity_bytes, inventory, shape, first.engine_ports),
+        "resource_policy": resource_policy(
+            capacity_bytes,
+            inventory,
+            shape,
+            first.map_or(capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS, |i| i.engine_ports),
+        ),
     })
 }
 

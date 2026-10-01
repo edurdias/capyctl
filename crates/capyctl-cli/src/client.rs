@@ -1152,6 +1152,9 @@ pub async fn execute_with_start_options(
                         None => None,
                     };
                     view["installation"] = installation_of(&body, executable.as_deref());
+                } else if status.is_success() && body["installation"].is_null() {
+                    // SPEC §8 (amended 2026-10-01): a role with no engine says how to add one.
+                    view["engine"] = json!(NO_ENGINE);
                 }
             }
             // Design §9: the inference listener's bind and authentication,
@@ -1207,6 +1210,9 @@ pub async fn execute_with_start_options(
         )),
     }
 }
+
+/// What `status deployment` says on a role with no engine.
+pub const NO_ENGINE: &str = "none: run `capyctl engine add <path>`";
 
 /// Final review M10: the installation a deployment runs on, from the
 /// embedded host's `/installation` view: the one whose executable its

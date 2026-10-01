@@ -301,6 +301,40 @@ pub async fn boot_with_models(
     .await
 }
 
+/// Boot standalone with the role document `config` on the production
+/// provider with no engine variable set, so it publishes only the profiles
+/// registered beside `config`. The models directory is one under
+/// `state_dir`, never the developer's.
+pub async fn boot_registered_only(
+    state_dir: &std::path::Path,
+    config: &std::path::Path,
+) -> Result<capyctl_cli::roles::App, capyctl_cli::roles::StartError> {
+    for name in [
+        "CAPYCTL_VLLM_BIN",
+        "CAPYCTL_SGLANG_BIN",
+        "CAPYCTL_TENSORFOLD_BIN",
+    ] {
+        std::env::remove_var(name);
+    }
+    let models = state_dir.join("models");
+    std::fs::create_dir_all(&models)?;
+    let flags = capyctl_cli::roles::ModelOverrides {
+        models_root: Some(models),
+        ..Default::default()
+    };
+    capyctl_cli::roles::start_standalone_configured_with_models(
+        state_dir,
+        Some(config),
+        Arc::new(capyctl_cli::roles::EnvEngineProvider::with_managed_runtime(
+            state_dir.join("runtime"),
+        )),
+        test_memory(),
+        Arc::new(|| None),
+        &flags,
+    )
+    .await
+}
+
 /// Owner decision 2026-09-25: boot with the role document `config` (if any)
 /// and this run's generic overrides (`--set`, `CAPYCTL_SET__…`).
 pub async fn boot_with_overrides(
