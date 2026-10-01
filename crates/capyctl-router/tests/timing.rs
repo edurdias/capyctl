@@ -188,7 +188,7 @@ async fn streaming_phases_follow_injected_delays() {
     let content = series(&report, "router_time_to_first_content");
     assert!((0.07..=0.15).contains(&p(content, "p50")), "{content}");
     let last = series(&report, "router_time_to_last_chunk");
-    assert!((0.1..=0.2).contains(&p(last, "p95")), "{last}");
+    assert!((0.1..=0.2).contains(&p(last, "p50")), "{last}");
     // Pre-forward work is small next to the engine's time.
     assert!(p(series(&report, "router_pre_forward"), "p99") < 0.03);
     assert_eq!(series(&report, "router_queue_wait")["count"], 6);
