@@ -71,3 +71,20 @@ fn a_null_resources_block_is_treated_as_absent() {
     assert_eq!(error.path, "resources");
     assert_eq!(error.code, capyctl_config::ConfigErrorCode::MissingRequired);
 }
+
+// T03 T41, found live 2026-10-01: the guide's block names devices without
+// `sharing`, which deploy fills in from the host. Offline it passes too.
+#[test]
+fn the_guides_block_without_sharing_passes() {
+    let gpu = json!([{"id": "gpu0"}]);
+    let r = json!({"cold": phase("32GiB", gpu.clone()), "ready": phase("30GiB", gpu.clone()),
+        "parking": phase("30GiB", gpu.clone()), "parked": phase("0B", json!([])),
+        "wake": phase("32GiB", gpu.clone())});
+    let mut d = deployment("tensorfold", Some(r.clone()));
+    d["devices"] = gpu;
+    validate_declared_resources(&d).unwrap();
+    // A claim that is not the deployment's device is still refused.
+    let mut other = d.clone();
+    other["resources"]["cold"]["devices"] = json!([{"id": "gpu1"}]);
+    assert!(validate_declared_resources(&other).is_err());
+}
