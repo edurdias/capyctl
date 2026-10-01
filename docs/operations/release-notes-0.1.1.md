@@ -2,10 +2,12 @@
 
 ## TensorFold
 
-CapyCTL now runs TensorFold 0.6.0 beside vLLM and SGLang. Register an existing
+CapyCTL now runs TensorFold 0.6.0 and 0.6.1 beside vLLM and SGLang. Register an existing
 TensorFold venv with `capyctl engine add <venv>`, or name it as the role's own
 engine with `--tensorfold-bin` (`CAPYCTL_TENSORFOLD_BIN`, `local_engine.tensorfold`); CapyCTL checks that the CUDA
-build tools TensorFold needs on its first start are on the engine's PATH.
+build tools TensorFold needs on its first start are on the engine's PATH. With
+0.6.1 the CUDA compiler can come from pip (`pip install ninja
+"cuda-toolkit[nvcc,cccl]==13.0.*"`) instead of a system toolkit.
 TensorFold models do not park: CapyCTL stops them when it needs the memory and
 starts them again on the next request. A TensorFold deployment states its
 `resources` and `context_length`. Checked on NVIDIA GB10; discrete GPUs run it

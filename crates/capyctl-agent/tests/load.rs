@@ -556,6 +556,45 @@ tensorfold:time_to_first_token_seconds_count 2
     assert_eq!(histograms[0].0, "engine_time_to_first_token");
 }
 
+// T41: 0.6.1 also mirrors its values under vLLM names; the load is the same
+// as the 0.6.0 body's and the engine is still tensorfold.
+#[test]
+fn tensorfold_061_vllm_mirrors_are_not_read() {
+    let own = "\
+tensorfold:requests_running 1
+tensorfold:requests_waiting 2
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.25
+tensorfold:kv_cache_usage_ratio{pool=\"1\"} 0.5
+tensorfold:request_latency_seconds_bucket{le=\"0.5\"} 1
+tensorfold:request_latency_seconds_bucket{le=\"+Inf\"} 2
+tensorfold:request_latency_seconds_sum 1.5
+tensorfold:request_latency_seconds_count 2
+";
+    let mirrored = format!(
+        "{own}\
+vllm:num_requests_running 7
+vllm:num_requests_waiting 8
+vllm:kv_cache_usage_perc{{stream=\"0\"}} 0.9
+vllm:e2e_request_latency_seconds_bucket{{le=\"+Inf\"}} 9
+vllm:e2e_request_latency_seconds_sum 9
+vllm:e2e_request_latency_seconds_count 9
+num_requests_running 7
+num_requests_waiting 8
+kv_cache_usage_perc{{stream=\"0\"}} 0.9
+"
+    );
+    let load = capyctl_agent::load::parse_engine_load(&mirrored).unwrap();
+    assert_eq!(Some(load), capyctl_agent::load::parse_engine_load(own));
+    assert_eq!(
+        (load.running, load.waiting, load.kv_usage_ppm),
+        (1, 2, 500_000)
+    );
+    let (engine, histograms) = capyctl_agent::load::parse_engine_histograms(&mirrored).unwrap();
+    assert_eq!(engine, "tensorfold");
+    assert_eq!(histograms.len(), 1);
+    assert_eq!(histograms[0].0, "engine_e2e_request_latency");
+}
+
 // T17 T41, ADR 0023 §6 (2026-10-01): a TensorFold sample is quiescent only
 // when /health reads idle too.
 #[test]

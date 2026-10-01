@@ -80,11 +80,19 @@ you added it.
 
 ## TensorFold
 
-CapyCTL runs TensorFold 0.6.0 from a plain venv. TensorFold builds CUDA kernels
-the first time it starts, so the machine needs `nvcc`, `ninja` and a C++
-compiler where the engine can find them: the venv's `bin`, the CUDA toolkit's
-`bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. `engine add` checks this and
-names what is missing; it never uses your shell's `PATH`.
+CapyCTL runs TensorFold 0.6.0 and 0.6.1 from a plain venv. TensorFold builds
+CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
+a C++ compiler where the engine can find them: the venv's `bin`, the CUDA
+toolkit's `bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. Either install a system
+CUDA toolkit, or (0.6.1) put the compiler in the venv with pip:
+
+```bash
+pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"
+```
+
+CapyCTL finds that `nvcc` under the venv's `site-packages/nvidia`. A C++ compiler
+still comes from the system. `engine add` checks all of this and names what is
+missing; it never uses your shell's `PATH`.
 
 ```bash
 capyctl engine add ~/tensorfold-0.6.0-venv

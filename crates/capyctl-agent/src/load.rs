@@ -140,7 +140,7 @@ fn usage_ppm(text: &str, name: &str) -> Option<u32> {
     (usage <= 1.0)
         .then(|| ((usage * f64::from(KV_USAGE_PPM_FULL)).round() as u32).min(KV_USAGE_PPM_FULL))
 }
-/// TensorFold 0.6.0 `tensorfold/server/metrics.py`. The KV ratio has one
+/// TensorFold 0.6.0 and 0.6.1 `tensorfold/server/metrics.py`. The KV ratio has one
 /// series per stream pool; the most pressured pool counts.
 const TENSORFOLD: Family = Family {
     running: "tensorfold:requests_running",
@@ -159,7 +159,12 @@ fn family_load(text: &str, family: &Family) -> Option<EngineLoad> {
 type HistogramTable = &'static [(&'static str, &'static str)];
 
 /// The one family whose three gauges parse, with its name and histograms.
+/// TensorFold 0.6.1 also mirrors its values under vLLM names; its own
+/// `tensorfold:` families win so the mirrors are never read or double counted.
 fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
+    if let Some(load) = family_load(text, &TENSORFOLD) {
+        return Some(("tensorfold", load, TENSORFOLD_HISTOGRAMS));
+    }
     let found: Vec<_> = [
         ("vllm", &VLLM, VLLM_HISTOGRAMS),
         ("sglang", &SGLANG, SGLANG_HISTOGRAMS),
@@ -219,7 +224,7 @@ const SGLANG_HISTOGRAMS: &[(&str, &str)] = &[
         "sglang:inter_token_latency_seconds",
     ),
 ];
-/// TensorFold 0.6.0 has no queue, prefill, decode or inter-token histogram.
+/// TensorFold 0.6.0 and 0.6.1 have no queue, prefill, decode or inter-token histogram.
 const TENSORFOLD_HISTOGRAMS: &[(&str, &str)] = &[
     (
         "engine_time_to_first_token",
