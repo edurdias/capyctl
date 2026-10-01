@@ -44,6 +44,12 @@ fn prepared_document() -> Value {
     let mut host = serde_json::from_str::<Value>(text).unwrap()["input"]["host"].clone();
     host["state_dir"] = json!("/home/operator/.local/state/capyctl");
     host["identity_dir"] = json!("/home/operator/.local/state/capyctl/identity");
+    // The agent reports the machine's real memory; fit a 16 GB CI runner.
+    let domain = &mut host["resource_policy"]["domains"]["unified"];
+    domain["managed_limit"] = json!("4GiB");
+    domain["free_reserve"] = json!("1GiB");
+    domain["parked_limit"] = json!("2GiB");
+    domain["host_kv_limit"] = json!("1GiB");
     host
 }
 

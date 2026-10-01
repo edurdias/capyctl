@@ -43,7 +43,7 @@ jobs:
           -p capyctl-management -p harness --all-targets --no-fail-fast --locked
           -- --test-threads=4
       - name: Workspace suite
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --no-fail-fast --locked
       - name: Core Clippy
         run: >-
           cargo clippy -p capyctl-adapters -p capyctl-store -p capyctl-controller

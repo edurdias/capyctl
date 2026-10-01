@@ -11,7 +11,7 @@
     "build": "npm run sync && npm run gen:cli && npm run gen:hero && ASTRO_TELEMETRY_DISABLED=1 astro build",
     "dev": "npm run sync && npm run gen:cli && npm run gen:hero && ASTRO_TELEMETRY_DISABLED=1 astro dev",
     "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview",
-    "test": "node --test tests/",
+    "test": "node --test tests/*.test.mjs",
     "gen:hero": "node scripts/gen-hero.mjs",
     "check": "npm test && npm run build && node scripts/check-links.mjs && node scripts/check-hero.mjs && node scripts/check-commands.mjs && node scripts/check-size.mjs && node scripts/check-voice.mjs",
     "lighthouse": "node scripts/lighthouse.mjs"
