@@ -1,9 +1,10 @@
 # CapyCTL 0.1.0
 
-The first release of CapyCTL, a model manager for vLLM and SGLang on your own
-NVIDIA GPUs. CapyCTL runs your inference engines, parks the models nobody is using
-so their memory is freed, and wakes or switches to the one a request asks for,
-behind one OpenAI-compatible endpoint.
+The first release of CapyCTL. Control what runs next: run your models on your
+own NVIDIA GPUs, and deploy, park, wake and switch them on vLLM and SGLang behind
+one OpenAI-compatible endpoint, even when they don't all fit at once. CapyCTL
+parks the models nobody is using so their memory is freed, and wakes the one a
+request asks for.
 
 ## Install
 

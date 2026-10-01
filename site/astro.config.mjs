@@ -16,7 +16,7 @@ export default defineConfig({
       title: 'CapyCTL',
       favicon: '/favicon-32.png',
       logo: { light: './public/brand/header-light.webp', dark: './public/brand/header-dark.webp', alt: 'CapyCTL', replacesTitle: true },
-      description: 'A model manager for vLLM and SGLang on your own GPUs.',
+      description: 'Control what runs next: run vLLM and SGLang models on your own GPUs behind one OpenAI-compatible endpoint.',
       social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
       // Website spec, Visual system: code blocks are dark in both themes.
       expressiveCode: { themes: ['github-dark'] },

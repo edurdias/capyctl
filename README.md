@@ -9,7 +9,9 @@
 
 Control what runs next.
 
-A model manager for vLLM and SGLang on your own GPUs.
+Run your models on your own GPUs. Deploy, park, wake and switch models on vLLM
+and SGLang, behind one OpenAI-compatible endpoint, even when they don't all fit
+at once.
 
 Most GPU machines can hold one or two models at a time. CapyCTL runs your
 inference engines for you, parks the models nobody is using so their GPU
