@@ -201,6 +201,7 @@ fn a_start_with_no_eligible_host_exits_15() {
         ExitCode::AGENT_UNREACHABLE,
         ExitCode::NOT_INTERACTIVE,
         ExitCode::PROFILE_NOT_PUBLISHED,
+        ExitCode::TOOLCHAIN_MISSING,
     ] {
         assert_ne!(other, ExitCode::HOST_INELIGIBLE);
     }
@@ -294,4 +295,15 @@ fn discrete_gpu_codes_exit_with_their_spec_class() {
         message: "device_unobserved: x".into(),
     };
     assert_eq!(specific.exit_code(), ExitCode(3));
+}
+
+// T01 T41 (ADR 0023 §2): a missing TensorFold build toolchain exits 26.
+#[test]
+fn toolchain_missing_exits_26() {
+    let error = StructuredError {
+        code: "toolchain_missing",
+        message: String::new(),
+    };
+    assert_eq!(error.exit_code(), ExitCode(26));
+    assert_eq!(ExitCode::TOOLCHAIN_MISSING, ExitCode(26));
 }

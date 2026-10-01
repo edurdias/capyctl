@@ -813,3 +813,98 @@ fn engine_views_print_tables_and_json_on_request() {
         "{table}"
     );
 }
+
+/// A TensorFold venv: `tensorfold --version` prints `tensorfold <version>`,
+/// the interpreter answers the probe, and `bin` holds the build tools.
+fn tensorfold_env(root: &Path, version: &str, tools: &[&str]) -> PathBuf {
+    let site = root.join("lib/python3.12/site-packages");
+    std::fs::create_dir_all(site.join("tensorfold")).unwrap();
+    std::fs::create_dir_all(site.join(format!("tensorfold-{version}.dist-info"))).unwrap();
+    std::fs::write(
+        site.join(format!("tensorfold-{version}.dist-info/METADATA")),
+        format!("Name: tensorfold\nVersion: {version}\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    script(
+        &root.join("bin/tensorfold"),
+        &format!("echo tensorfold {version}"),
+    );
+    let report = json!({"schema": "capyctl/engine-capabilities/v1", "engine": "tensorfold",
+        "capabilities": {"core": [], "deep_park": ["unsupported"], "metrics": []}});
+    script(&root.join("bin/python3"), &format!("echo '{report}'"));
+    for tool in tools {
+        script(&root.join("bin").join(tool), "exit 0");
+    }
+    root.to_path_buf()
+}
+
+// T41 T07 T21: TensorFold registers as `tensorfold`, deep park disabled.
+#[tokio::test]
+async fn add_registers_tensorfold_with_deep_park_disabled() {
+    let dir = private_dir();
+    let env = tensorfold_env(&dir.path().join("tf"), "0.6.0", &["ninja", "nvcc", "c++"]);
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = execute(&add(&env), Some(&document), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out["profile"], "tensorfold");
+    assert_eq!(out["engine"], "tensorfold");
+    assert_eq!(out["custom"], false);
+    let profile = &engines_of(&document).profiles["tensorfold"];
+    assert_eq!(
+        profile["executable"],
+        env.join("bin/tensorfold").to_string_lossy().as_ref()
+    );
+    assert_eq!(profile["build_fingerprint"], "0.6.0");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    let asked = Command::EngineAdd {
+        path: Some(env.clone()),
+        name: Some("tf-deep".into()),
+        deep_park: Some(DeepParkChoice::Enabled),
+        drift: DriftChoice::Warn,
+        args: vec![],
+    };
+    let error = execute(&asked, Some(&document), dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "capability_missing");
+    assert!(!engines_of(&document).profiles.contains_key("tf-deep"));
+}
+
+// T41 T03: a missing toolchain is refused before anything runs or is written.
+// Ruling R8: `nvcc` is the missing tool, which no system directory holds.
+#[tokio::test]
+async fn add_refuses_tensorfold_without_its_toolchain() {
+    let dir = private_dir();
+    let env = tensorfold_env(&dir.path().join("tf"), "0.6.0", &["ninja", "c++"]);
+    let document = host_doc(dir.path());
+    let result = execute(&add(&env), Some(&document), dir.path()).await;
+    if nvcc_outside_the_venv() {
+        // This machine has a CUDA toolkit (CUDA_HOME or /usr/local/cuda): the
+        // closed PATH found nvcc there, which is the documented order.
+        assert!(result.is_ok() || result.unwrap_err().code != "toolchain_missing");
+    } else {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "toolchain_missing", "{error:?}");
+        assert!(error.message.contains("nvcc"), "{}", error.message);
+        assert!(error
+            .message
+            .contains(&env.join("bin").display().to_string()));
+        assert!(!engines_beside(&document).exists());
+    }
+}
+
+/// Whether `nvcc` is on the closed PATH outside the venv's own `bin`.
+fn nvcc_outside_the_venv() -> bool {
+    capyctl_config::registration::detect_cuda_home(
+        std::env::var("CUDA_HOME").ok().as_deref(),
+        |nvcc| nvcc.is_file(),
+    )
+    .is_some()
+        || capyctl_adapters::engine_env::SYSTEM_PATH
+            .split(':')
+            .any(|d| Path::new(d).join("nvcc").is_file())
+}

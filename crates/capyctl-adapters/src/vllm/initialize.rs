@@ -14,6 +14,7 @@ use capyctl_domain::completion::{
     EffectObservation, ExecutionIdentities, Milestone, Presence, ProcessIdentity,
 };
 
+use crate::engine_env::SYSTEM_PATH;
 use crate::traits::{
     ChatForward, EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError,
 };
@@ -45,10 +46,6 @@ const PASS_THROUGH: &[&str] = &[
     "HF_HUB_OFFLINE",
     "TRANSFORMERS_OFFLINE",
 ];
-
-/// Fixed system tool directories after the engine's own bin (and the
-/// profile's `<cuda_home>/bin`, when it names one; engine_env.rs).
-const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Every variable a vLLM engine may be started with (SPEC §13.3 / T21). The
 /// launcher clears the agent's environment, so this is all the engine sees.

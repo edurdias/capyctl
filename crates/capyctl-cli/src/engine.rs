@@ -316,6 +316,34 @@ async fn add(
             format!("profile {name} exists; use --name, or remove it first"),
         ));
     }
+    // SPEC §13.3 amendment (owner decision 2026-09-25).
+    let cuda_home = capyctl_config::registration::detect_cuda_home(
+        std::env::var("CUDA_HOME").ok().as_deref(),
+        |nvcc| nvcc.is_file(),
+    );
+    if resolved.engine == Engine::Tensorfold {
+        // ADR 0023 §2: TensorFold has no park path; refuse a request for one
+        // before anything runs or is written.
+        if deep_park == Some(DeepParkChoice::Enabled) {
+            return Err(error(
+                "capability_missing",
+                "TensorFold has no sleep or release API; it runs restart_only, so \
+                 --deep-park enabled is refused and nothing was written",
+            ));
+        }
+        let bin = resolved.executable.parent().unwrap_or(&resolved.env);
+        capyctl_config::toolchain::check(
+            bin,
+            cuda_home.as_deref(),
+            capyctl_config::toolchain::SYSTEM_PATH,
+        )
+        .map_err(|missing| {
+            error(
+                "toolchain_missing",
+                format!("{missing}; nothing was written"),
+            )
+        })?;
+    }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
     let registration = tokio::task::spawn_blocking(move || register(&r, &state))
         .await
@@ -329,7 +357,10 @@ async fn add(
     let deep = match deep_park {
         Some(DeepParkChoice::Enabled) => true,
         Some(DeepParkChoice::Disabled) => false,
-        None => registration.deep_park_missing != Some(true),
+        // ADR 0023 §2: TensorFold is disabled even when the probe could not run.
+        None => {
+            resolved.engine != Engine::Tensorfold && registration.deep_park_missing != Some(true)
+        }
     };
     let spec = ProfileSpec {
         engine: resolved.engine,
@@ -341,11 +372,7 @@ async fn add(
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
         args: args.to_vec(),
-        // SPEC §13.3 amendment (owner decision 2026-09-25).
-        cuda_home: capyctl_config::registration::detect_cuda_home(
-            std::env::var("CUDA_HOME").ok().as_deref(),
-            |nvcc| nvcc.is_file(),
-        ),
+        cuda_home,
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
