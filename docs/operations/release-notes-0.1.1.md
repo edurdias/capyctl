@@ -15,6 +15,21 @@ unchecked in this release.
 
 - A readiness check now accepts a model that answers with reasoning first.
 - New exit code 26, `toolchain_missing`, from `capyctl engine add`.
+- A client that hangs up in the middle of a streamed answer now stops the
+  engine's work on it, for vLLM, SGLang and TensorFold. CapyCTL keeps the
+  request counted until the engine reports nothing running or waiting, so a
+  park or a switch that follows no longer waits for the whole answer.
+- A model named by its Hugging Face cache directory (`snapshots/<rev>`) is
+  measured even when its files link twice, as recent `huggingface_hub`
+  versions store them. A checkpoint that cannot be measured now says why,
+  instead of reporting a digest mismatch.
+- `capyctl validate config` without `--host` checks a `resources` block and
+  refuses a TensorFold deployment without one, and lists what still needs a
+  host.
+- A role with no engine starts and says how to add one; `capyctl engine
+  remove` can remove the last engine.
+- Idle models are stopped or parked only when `ready_idle_timeout` or
+  `parked_idle_timeout` is set; both are off by default.
 
 ## Upgrade
 

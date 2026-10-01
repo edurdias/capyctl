@@ -102,8 +102,8 @@ saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`cap
 ```
 
 TensorFold has no way to free its memory while it runs, so a TensorFold model
-does not park: when CapyCTL needs the memory, or the model sits idle, CapyCTL
-waits for its requests to finish, stops it, and starts it again on the next
+does not park: when CapyCTL needs the memory, or the model sits idle past
+`ready_idle_timeout` (off unless set), CapyCTL waits for its requests to finish, stops it, and starts it again on the next
 request. `capyctl park deployment` refuses a TensorFold model; use `stop` or let
 CapyCTL switch it. A TensorFold deployment states its memory with `resources`
 and its `context_length`:
@@ -186,6 +186,14 @@ example `"published":"published"` in the record of `engine add` and
 A profile a deployment still uses is not removed; the command names the
 deployment. `--drain` stops those deployments first. Removing needs CapyCTL
 running.
+
+The last engine can be removed too. CapyCTL keeps running with none, keeps its
+deployments and places none until you add one. Its start banner and
+`capyctl status deployment` then say to run `capyctl engine add <path>`. A new deploy that names a
+profile nobody publishes is refused at once.
+
+A model can be named by its Hugging Face cache directory
+(`snapshots/<rev>`) as it is.
 
 ## System services
 
