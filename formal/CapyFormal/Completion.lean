@@ -10,13 +10,13 @@ Two store paths replace an owner's footprint with the recipe's `ready` phase
 
 That is sound only if `ready` never needs anything the held phase did not
 already have admitted. For bytes and host-KV, `validate_recipe` checks exactly
-that (`cold ≥ ready`, `wake ≥ ready`). For **device claims it checks nothing**:
-config validation (`validate_resources_intrinsic`) only requires each phase's
+that (`cold ≥ ready`, `wake ≥ ready`). Until the 2026-10-01 fix it **checked
+nothing for device claims**, and config validation only required each phase's
 claims to be among the deployment's selected devices.
 
-Below: a concrete counterexample in which a completion breaks device
-exclusivity, and a proof that requiring `ready.devices ⊆ held.devices`
-(the missing recipe rule) restores the invariant.
+Below: the concrete counterexample in which a completion broke device
+exclusivity, and a proof that the coverage rule `validate_recipe` now
+enforces (`covers`) preserves it.
 -/
 namespace Capy.Completion
 open Capy.Admission Capy.Grant
