@@ -1776,3 +1776,128 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
     drop(start);
     w.shutdown().await.unwrap();
 }
+
+/// SPEC §10 (amended 2026-10-01), found live 2026-10-01: a park or stop
+/// accepted right after a client hung up left the remote launch out of the
+/// Ready list, so the host's idle sample was never matched and the cancelling
+/// lease held the park until its deadline. The launch's own sample still
+/// settles the lease while the instance is draining for a stop.
+// T17 T18 T38
+#[tokio::test]
+async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
+    use crate::port::LifecyclePort;
+    use capyctl_protocol::reports::{EngineLoad, LoadReport, LoadSample};
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    *gate.association.lock().unwrap() = Some(owner.clone());
+    gate.release.add_permits(1);
+    let engine = Arc::new(RemoteQuiescence {
+        gate,
+        remote: Mutex::new(None),
+    });
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        ScriptedHost::new(true),
+        engine.clone(),
+    );
+    let start = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        start.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    make_remote(&dir, &owner, &fence);
+    let launch = ready_launch(&owner);
+    let authority = Arc::new(crate::enrollment::EnrollmentAuthority::new(
+        owner.clone(),
+        capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+    ));
+    let sessions = crate::agent_sessions::AgentSessions::new(authority);
+    let load = sessions.load_table();
+    *engine.remote.lock().unwrap() = Some(crate::remote_execution::engine(
+        sessions,
+        owner.clone(),
+        crate::remote_execution::RemoteLaunchBinding {
+            controller_id: "controller".into(),
+            host_id: "lab".into(),
+            member_id: "head".into(),
+            profile_fingerprint: "fingerprint".into(),
+            launch_command_id: launch.step_id.clone(),
+            plan: capyctl_protocol::execution::SingleLaunchPlan {
+                deployment_config: "{}".into(),
+                profile_name: "local".into(),
+                checkpoint_fingerprint: "checkpoint".into(),
+                host_policy_fingerprint: "a".repeat(64),
+                binding_id: launch.binding_id.clone(),
+                incarnation: launch.incarnation.clone(),
+                grant_id: "grant".into(),
+                service_port: 30000,
+                issued_at_ms: 1,
+                coordinator_session_id: "session".into(),
+                checkpoint_digest: String::new(),
+                checkpoint_weights_bytes: None,
+                startup_bytes: None,
+            },
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+        },
+        Default::default(),
+    ));
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let leases = || -> i64 {
+        sql.query_row(
+            "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let lifecycle = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    let lease = lifecycle
+        .open_instance_lease(&fence.deployment_id, fence.generation, 8)
+        .await
+        .unwrap()
+        .expect("a durable lease");
+    lifecycle
+        .close_request_lease(lease, crate::request_leases::LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    // The stop is accepted while the lease is still cancelling; its drain
+    // (30 s by default) waits for the lease.
+    let stop = w
+        .stop("owner", &fence, "stop-after-hang-up", 100_000)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let applied = load
+        .accept(
+            "lab",
+            LoadReport {
+                host_id: "lab".into(),
+                samples: vec![LoadSample {
+                    deployment_id: fence.deployment_id.clone(),
+                    generation: fence.generation,
+                    owned_handle: launch.step_id.clone(),
+                    sampled_at_ms: capyctl_protocol::now_unix_ms(),
+                    ingress_in_flight: 0,
+                    engine: Some(EngineLoad {
+                        running: 0,
+                        waiting: 0,
+                        kv_usage_ppm: 0,
+                    }),
+                    latency: None,
+                }],
+            },
+            capyctl_protocol::now_unix_ms(),
+        )
+        .unwrap()
+        .applied;
+    assert_eq!(applied, 1);
+    until(|| leases() == 0).await;
+    assert_eq!(
+        stop.wait(Duration::from_secs(60)).await.unwrap(),
+        capyctl_store::ordinary_lifecycle::cleanup::OrdinaryCleanupStatus::Completed
+    );
+    drop(start);
+    w.shutdown().await.unwrap();
+}

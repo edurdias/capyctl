@@ -604,14 +604,17 @@ impl EngineAdapter for RemoteEngine {
             let Ok(owner) = self.owner.lock() else {
                 return false;
             };
-            let Ok(launches) = owner.store().remote_ready_launches(owner.session()) else {
+            // Not the Ready list: a park or stop accepted after the hang-up
+            // drains on this lease while the instance is no longer Ready.
+            let Ok(launch) = owner
+                .store()
+                .remote_live_launch(owner.session(), &b.plan.binding_id)
+            else {
                 return false;
             };
-            launches
-                .into_iter()
-                .find(|l| l.binding_id == b.plan.binding_id && l.host_id == b.host_id)
+            launch
         };
-        let Some(launch) = launch else {
+        let Some(launch) = launch.filter(|l| l.host_id == b.host_id) else {
             return false;
         };
         let key = crate::load_table::InstanceKey::new(
