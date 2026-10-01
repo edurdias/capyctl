@@ -1,4 +1,9 @@
-<p align="center"><img src="docs/brand/capyctl-logo.png" alt="CapyCTL" width="480"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.png">
+    <img src="docs/brand/logo-light.png" alt="CapyCTL" width="420">
+  </picture>
+</p>
 
 # CapyCTL
 

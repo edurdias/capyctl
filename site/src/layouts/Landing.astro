@@ -15,7 +15,17 @@ const { title, description } = Astro.props;
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={`${SITE_URL}/`} />
-    <link rel="icon" href={href('/favicon.svg')} type="image/svg+xml" />
+    <link rel="icon" href={href('/favicon.ico')} sizes="48x48" />
+    <link rel="icon" href={href('/favicon-32.png')} type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href={href('/apple-touch-icon.png')} />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={`${SITE_URL}/`} />
+    <meta property="og:image" content={`${SITE_URL}/og.jpg`} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
     <script is:inline>
       (() => {
         let t = null;
@@ -28,7 +38,10 @@ const { title, description } = Astro.props;
   <body>
     {PREVIEW && <p class="preview" role="note">{PREVIEW_NOTE}</p>}
     <header class="bar">
-      <a class="wordmark" href={href('/')}>CapyCTL</a>
+      <a class="wordmark" href={href('/')} aria-label="CapyCTL home">
+        <img class="logo-dark" src={href('/brand/header-dark.webp')} alt="CapyCTL" height="32" />
+        <img class="logo-light" src={href('/brand/header-light.webp')} alt="CapyCTL" height="32" />
+      </a>
       <nav aria-label="Site"><a href={href('/docs/')}>Docs</a><a href={REPO_URL}>GitHub</a><ThemeToggle /></nav>
     </header>
     <main><slot /></main>
