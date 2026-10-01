@@ -63,3 +63,32 @@ jobs:
         run: scripts/test-install.sh
       - name: Record scope
         run: echo 'CPU and Fake-engine tests are not native engine recipe qualification.' >> "$GITHUB_STEP_SUMMARY"
+
+  formal:
+    # Keep automatic checks off while the repository is private.
+    if: github.event.repository.private == false
+    name: Formal models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Lean toolchain manager (pinned, verified)
+        run: |
+          ELAN_INIT="$RUNNER_TEMP/elan-init.sh"
+          curl --fail --location --retry 3 --output "$ELAN_INIT" \
+            https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh
+          printf '%s  %s\n' a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53 "$ELAN_INIT" | sha256sum --check -
+          sh "$ELAN_INIT" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Check every proof
+        working-directory: formal
+        run: |
+          lake build
+          if grep -rnw sorry CapyFormal; then
+            echo 'a proof is incomplete' >&2
+            exit 1
+          fi
+      - name: Record scope
+        run: echo 'Formal models are evidence about the modelled logic, not native engine recipe qualification.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,5 @@
+name = "CapyFormal"
+defaultTargets = ["CapyFormal"]
+
+[[lean_lib]]
+name = "CapyFormal"
