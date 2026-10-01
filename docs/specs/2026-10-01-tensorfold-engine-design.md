@@ -29,6 +29,16 @@ A spike on 2026-10-01 ran TensorFold 0.6.0 by hand, outside CapyCTL, on host B
   (4-bit MLX checkpoint).
 - The server accepts any `model` value in a request, has no API key, and checks
   GitHub for updates at every start unless told not to.
+- TensorFold sizes itself from free memory, less `TENSORFOLD_MEMORY_RESERVE_GIB`.
+  It has no flag that caps its memory. An explicit `--context` fixes the KV
+  allocation, and the startup log prints the estimate (27.11 GiB for Nemotron).
+
+The same checks ran on a maintainer laptop (RTX 4090 Laptop GPU, 16 GB, x86-64,
+CUDA 13.4) with Qwen3.8-27B 2-bit (`lukaskremla/Qwen3.8-27B-2bit-MLX-TextOnly`) and
+the `z-lab/Qwen3.8-27B-DFlash2` drafter. It loaded in 11.3 GiB at a 15k context,
+served plain and streaming chat, and SIGTERM released all memory in 2 s. The first
+request took 142 s while kernels finished building. This is raw-engine evidence,
+not qualification.
 
 ## Owner decisions
 
@@ -47,6 +57,10 @@ A spike on 2026-10-01 ran TensorFold 0.6.0 by hand, outside CapyCTL, on host B
 In scope: the `tensorfold` engine kind; detection and `engine add`; launch;
 readiness; drain; `restart_only` park and wake; settings; docs and site; CPU and
 Fake-engine tests; live qualification on host B.
+
+Qualification covers host B (GB10, unified memory) only. Discrete-GPU hosts run
+TensorFold as unqualified until a live row passes on one, and the engines guide
+says so.
 
 Out of scope: deep and host-backed residency for TensorFold; multi-rank
 (`--tp 2`); Apple Silicon and MLX hosts; Docker; the recipes repository; a
@@ -71,9 +85,11 @@ CLI's engine names, and the config schema's `local_engine` keys. The serde name 
   --version` under the bounded version check. The entry point is
   `<env>/bin/tensorfold`; `build_fingerprint` is the checked version.
 - `add` also checks the build toolchain the first start needs and refuses with
-  `toolchain_missing`, naming what is absent: `ninja` in the environment's `bin`
-  or on `PATH`, `nvcc` under `CUDA_HOME` (default `/usr/local/cuda`) or on `PATH`,
-  and a C++ compiler (`c++` or `g++`) on `PATH`. It runs nothing to check them.
+  `toolchain_missing`, naming what is absent. It looks for `ninja`, `nvcc` and a
+  C++ compiler (`c++` or `g++`) only on the engine's closed launch `PATH`
+  (SPEC §13.3): the installation's `bin`, then the approved `<cuda_home>/bin`,
+  then the fixed system directories. The caller's `PATH` is never used. It runs
+  nothing to check them.
 - The verified set gains TensorFold 0.6.0. Any other version lists as `custom`.
 - The capability probe reports no deep-park support, so the profile is written with
   `security.deep_park: disabled` and deployments on it resolve `restart_only`.
@@ -89,17 +105,41 @@ The agent starts:
 
 - The model argument is the resolved local checkpoint directory, as for the other
   engines. CapyCTL never hands TensorFold a Hugging Face id for the target model.
-- The environment adds `TENSORFOLD_NO_UPDATE_CHECK=1`, `CUDA_HOME` (from the
-  profile, default `/usr/local/cuda`), the environment's `bin` and `CUDA_HOME/bin`
-  at the front of `PATH`, and `CUDA_VISIBLE_DEVICES` from the placement.
-- Reserved flags, refused in `engine_config` and in profile `--arg`s: `--host`,
-  `--port`, `--name`, `--alias`, `--backend`, `--tp`, `--rank`, `--master`,
-  `--master-port`, `--snapshot-dir`, and the update-check flags.
-- `engine_config` maps to flags: `context_length` to `--context`, `kv_cache_dtype` to
-  `--kv-dtype`, `drafter` to `--drafter` (a local directory or a pinned
-  repository id; `none` turns drafting off), `max_tokens` to `--max-tokens`, and
-  `thinking` to `--thinking` or `--no-thinking`. Anything else passes through
-  profile `--arg`s, subject to the reserved list.
+- The launch uses the existing closed engine environment (SPEC §13.3) and the
+  existing `cuda_home` profile setting. It adds `TENSORFOLD_NO_UPDATE_CHECK=1`,
+  `CUDA_VISIBLE_DEVICES` from the placement, and `TORCH_EXTENSIONS_DIR`.
+- `TORCH_EXTENSIONS_DIR` is
+  `<state>/engines/tensorfold/<build_fingerprint>/torch_extensions`, owned by the
+  service user with mode 0700, like the other sensitive caches in SPEC §13.3.
+  Whoever can write there can run code in the engine.
+- Reserved flags, set by CapyCTL and refused in `engine_config` and in extra
+  arguments: `--host`, `--port`, `--name`, `--alias`, `--backend`, `--context`,
+  `--drafter`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`,
+  and the update-check flags.
+- `engine_config` maps to flags: `context_length` to `--context` (required for
+  TensorFold), `kv_cache_dtype` to `--kv-dtype`, `drafter` to `--drafter`,
+  `max_tokens` to `--max-tokens`, and `thinking` to `--thinking` or
+  `--no-thinking`.
+- `drafter` is `none` or a local directory inside the profile's approved model
+  paths. A Hugging Face drafter is fetched through CapyCTL's model store, like the
+  target checkpoint, never by TensorFold. Its content digest is recorded when the
+  deployment is accepted and checked again before every launch and wake
+  (ADR 0014 A3). A repository id is refused.
+- Other options pass only as extra arguments under SPEC §8.2
+  (`accept_extra_args` and host approval). These TensorFold 0.6.0 `serve` options
+  are sensitive and need host approval by name:
+
+  | Class | Options |
+  |---|---|
+  | Listener or egress | `--vision-urls` (fetches image URLs) |
+  | Path | `--snapshot-dir` (reserved), `--drafter` (reserved) |
+  | Code | `--lane-kernels` |
+
+  Every other option is an ordinary engine argument.
+- A TensorFold deployment needs an explicit `resources` block. TensorFold has no
+  memory cap, so the fixed `--context` is what keeps its allocation stable. The
+  memory the process uses is checked against the reservation through the same
+  observation path as the other engines.
 - The engine listens on loopback only (SPEC §9.1 protections). TensorFold has no
   API key, so CapyCTL's routed path is the only way in. No engine control path is
   exposed, so the deep-park key guard does not apply.
@@ -108,8 +148,9 @@ The agent starts:
 
 Ready means `GET /health` returns 200 with `"ok": true` and `GET /v1/models` lists
 the served name. A listening port alone is not readiness (SPEC §6.1). The startup
-bound must cover the first-start kernel build. The default is 1800 s for
-TensorFold, and the profile can change it.
+bound is 1800 s for a launch whose `TORCH_EXTENSIONS_DIR` has no build yet (the
+first start after `engine add` or a version change). Later launches and wakes use
+the ordinary startup bound. The profile can change both.
 
 ### 5. Draining
 
@@ -137,10 +178,9 @@ keeps the served name. Responses pass through unchanged, including
 
 ### 8. Settings
 
-Every new setting works three ways (YAML, flag, environment variable). The only
-one is the profile's `cuda_home`: YAML `cuda_home`, flag `--cuda-home` on
-`engine add`, and environment variable `CAPYCTL_CUDA_HOME`. Flag beats
-environment variable, which beats YAML, which beats the default.
+No new setting. TensorFold reuses the existing `cuda_home` profile setting and
+its `engine add` detection (YAML `local_engine.cuda_home`, flag `--cuda-home`,
+environment variable `CAPYCTL_CUDA_HOME`).
 
 ## Errors
 
@@ -155,13 +195,18 @@ environment variable, which beats YAML, which beats the default.
 - CPU and Fake-engine tests for each design section, tagged with a new acceptance
   ID, T41 (TensorFold conformance): detection, `add` with a missing tool, launch
   arguments and reserved flags, readiness from `/health`, drain gating on
-  `requests_running`, `restart_only` park and wake, and `deep` refused.
+  `requests_running: 0` and `busy: false`, `restart_only` park and wake, `deep`
+  refused, a drafter repository id refused, and the toolchain checked on the
+  closed `PATH`.
 - Live rows on host B, using Nemotron 3.5 Lightning 30B-A3B through CapyCTL:
   - TF1: `engine add` lists TensorFold 0.6.0.
-  - TF2: deploy, then plain and streaming chat succeed.
+  - TF2: deploy, then plain and streaming chat succeed. Peak memory stays within
+    the reservation.
   - TF3: park releases memory; a request wakes the deployment and succeeds.
   - TF4: a vLLM deployment and a TensorFold deployment switch under memory
-    pressure.
+    pressure. Peak memory stays within each reservation.
+  - TF5: cancel a streaming request partway, then park. `busy` and
+    `requests_running` return to idle within the drain bound.
 - CPU and Fake-engine tests are not qualification. Only the live rows qualify the
   engine.
 
