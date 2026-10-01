@@ -51,4 +51,5 @@ th, td { text-align: left; vertical-align: top; padding: 8px; border-top: 1px so
 .brand .logo-light { display: none; }
 [data-theme='light'] .brand .logo-dark { display: none; }
 [data-theme='light'] .brand .logo-light { display: inline; }
-.tagline { margin: 0 0 24px; text-align: center; font-weight: 600; color: var(--capyctl-muted); }
+.hero h1 { margin-top: 24px; }
+.accent { color: var(--capyctl-accent-text); }
