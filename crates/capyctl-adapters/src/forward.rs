@@ -287,6 +287,17 @@ impl ChatSink for Collecting<'_> {
     }
 }
 
+/// SPEC §6.1 (ruling 11): a readiness probe's answer is non-empty content
+/// or, for a model that reasons first, non-empty reasoning.
+pub fn probe_answered(answer: &Value) -> bool {
+    let message = &answer["choices"][0]["message"];
+    ["content", "reasoning_content"].iter().any(|field| {
+        message[*field]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    })
+}
+
 /// Assemble one non-streaming response from a completed stream's chunks.
 fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
     // A completed stream always carried a chunk; never index blindly.
@@ -328,6 +339,11 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         // usage object replaces what was collected.
         if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
             response["usage"] = chunk["usage"].clone();
+        }
+        // ADR 0023 §7: TensorFold's statistics ride the final chunk; a
+        // collected response carries them as the engine's own would.
+        if let Some(stats) = chunk.get("tensorfold").filter(|v| v.is_object()) {
+            response["tensorfold"] = stats.clone();
         }
     }
     response["object"] = json!("chat.completion");
@@ -899,8 +915,46 @@ impl<'de> serde::Deserialize<'de> for StrictValue {
 
 #[cfg(test)]
 mod tests {
-    use super::upstream;
+    use super::{assemble, probe_answered, upstream};
     use crate::traits::AdapterError;
+    use serde_json::{json, Value};
+
+    // T41 (ADR 0023 §7): the final chunk's `tensorfold` object survives
+    // collection, beside usage.
+    #[test]
+    fn a_collected_response_keeps_the_tensorfold_object() {
+        let chunk = |delta: Value, finish: Value| {
+            json!({"id": "c", "object": "chat.completion.chunk",
+            "created": 1, "model": "m", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}).to_string()
+        };
+        let mut end: Value = serde_json::from_str(&chunk(json!({}), json!("stop"))).unwrap();
+        end["tensorfold"] = json!({"accepted": 2});
+        end["usage"] = json!({"total_tokens": 4});
+        let response = assemble(vec![
+            chunk(json!({"role": "assistant"}), Value::Null),
+            chunk(json!({"content": "hi"}), Value::Null),
+            end.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(response["tensorfold"], json!({"accepted": 2}));
+        assert_eq!(response["usage"]["total_tokens"], 4);
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
+    }
+
+    // T41 T22 (ruling 11): reasoning alone answers the probe; nothing does not.
+    #[test]
+    fn a_reasoning_only_answer_answers_the_probe() {
+        assert!(probe_answered(
+            &json!({"choices": [{"message": {"content": "", "reasoning_content": "ok"}}]})
+        ));
+        assert!(probe_answered(
+            &json!({"choices": [{"message": {"content": "Ready."}}]})
+        ));
+        assert!(!probe_answered(
+            &json!({"choices": [{"message": {"content": ""}}]})
+        ));
+        assert!(!probe_answered(&json!({})));
+    }
 
     async fn answering(status: u16, body: serde_json::Value) -> reqwest::Url {
         use axum::response::IntoResponse;

@@ -1390,10 +1390,7 @@ async fn fresh_probe(
     .await
     .map_err(|_| SessionError)?
     .map_err(|_| SessionError)?;
-    if answer["choices"][0]["message"]["content"]
-        .as_str()
-        .is_none_or(str::is_empty)
-    {
+    if !capyctl_adapters::forward::probe_answered(&answer) {
         return Err(SessionError);
     }
     Ok(())

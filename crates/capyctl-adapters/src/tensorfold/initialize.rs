@@ -26,16 +26,6 @@ fn now_ms() -> Result<i64, RuntimeError> {
         .map(|d| d.as_millis() as i64)
 }
 
-/// SPEC §6.1, ruling 11: a probe answer is non-empty content or reasoning.
-pub(crate) fn answered(answer: &serde_json::Value) -> bool {
-    let message = &answer["choices"][0]["message"];
-    ["content", "reasoning_content"].iter().any(|field| {
-        message[*field]
-            .as_str()
-            .is_some_and(|text| !text.is_empty())
-    })
-}
-
 pub(super) async fn initialize(
     adapter: &TensorfoldAdapter,
     command: &RuntimeCommand,
@@ -142,7 +132,7 @@ pub(super) async fn initialize(
                 "engine listed the model but did not answer: {e}"
             )))
         })?;
-    if !answered(&answer) {
+    if !crate::forward::probe_answered(&answer) {
         return Err(RuntimeError::Uncertain(
             "engine answered with empty content".into(),
         ));

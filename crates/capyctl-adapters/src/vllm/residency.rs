@@ -206,10 +206,7 @@ async fn step(
                         "vLLM did not answer the readiness probe after waking: {e:?}"
                     )))
                 })?;
-            if answer["choices"][0]["message"]["content"]
-                .as_str()
-                .is_none_or(str::is_empty)
-            {
+            if !crate::forward::probe_answered(&answer) {
                 return Err(RuntimeError::Uncertain(
                     "vLLM answered the readiness probe with empty content".into(),
                 ));

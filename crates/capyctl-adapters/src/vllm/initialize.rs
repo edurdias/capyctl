@@ -236,10 +236,7 @@ pub(super) async fn initialize(
                 "engine listed the model but did not answer: {e:?}"
             )))
         })?;
-    if answer["choices"][0]["message"]["content"]
-        .as_str()
-        .is_none_or(str::is_empty)
-    {
+    if !crate::forward::probe_answered(&answer) {
         return Err(RuntimeError::Uncertain(
             "engine answered with empty content".into(),
         ));
