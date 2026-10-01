@@ -493,6 +493,7 @@ async fn serve_standalone(
             "inference_auth": if matches!(inference_auth, exposure::InferenceAuth::None) { "none" } else { "api_key" },
             "management": management_address.to_string(),
             "state_dir": state_dir, "credentials": roles::credentials_path(state_dir),
+            "profiles": app.profiles(),
         }))
     );
     let failed = tokio::select! {

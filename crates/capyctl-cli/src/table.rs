@@ -406,6 +406,9 @@ fn status(value: &Value, names: &HostNames) -> String {
         ],
         &instances,
     ));
+    if let Some(engine) = d["engine"].as_str() {
+        out.push_str(&format!("\nEngine  {engine}\n"));
+    }
     out
 }
 
@@ -654,6 +657,21 @@ mod tests {
         assert!(row(json!({"host_id": "01X", "online": true,
             "session": {"drain_pending": true}}))
         .contains("draining"));
+    }
+
+    // T02: status on a role with no engine names the command that adds one.
+    #[test]
+    fn status_on_a_role_with_no_engine_names_engine_add() {
+        let out = render(
+            View::Status,
+            &json!({"name": "chat", "observed_state": "stopped", "instances": [],
+                "engine": crate::client::NO_ENGINE}),
+            &HostNames::new(),
+        );
+        assert!(
+            out.ends_with("\nEngine  none: run `capyctl engine add <path>`\n"),
+            "{out}"
+        );
     }
 
     #[test]

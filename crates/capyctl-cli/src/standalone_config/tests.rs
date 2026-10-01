@@ -1238,9 +1238,11 @@ fn registered_profiles_coexist_and_collide_by_name() {
         .installations(&registered(&bin))
         .unwrap();
     assert_eq!(names(&alone), vec!["vllm-patched"]);
+    // T02, SPEC §8 (amended 2026-10-01): nothing declared publishes nothing.
     assert!(crate::roles::EnvEngineProvider::new()
         .installations(&Default::default())
-        .is_err());
+        .unwrap()
+        .is_empty());
 }
 
 // The isolation itself: what an environment test exports stays in its own
