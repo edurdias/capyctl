@@ -55,6 +55,14 @@ became harder to audit than the code they described.
 
 ## Verification
 
+`scripts/ci-local.sh` is the required check before every commit and push. It
+mirrors the CI "CPU checks" job step for step: 4 cores (`taskset`), 16 GB
+(`systemd-run --user --scope` when available), the pinned shellcheck v0.11.0,
+and the pinned `torch_memory_saver` fixture archive (cached under
+`~/.cache/capyctl-ci/`). It builds into `target-ci`. Use `--list` to see steps,
+`--only <step>` to run one, `--no-limits` to skip the limits. The commands it
+runs are:
+
 Core suite (the authoritative run used for integration):
 
 ```bash
