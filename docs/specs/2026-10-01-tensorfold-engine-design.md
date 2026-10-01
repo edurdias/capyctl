@@ -51,6 +51,15 @@ not qualification.
 - Draining works as for the other engines.
 - Recipes (model, drafter and settings per hardware) live in a separate
   `capyctl-recipes` repository after 0.1.1, not in this change.
+- A role's own TensorFold is declared like its own vLLM or SGLang:
+  `local_engine.tensorfold`, `--tensorfold-bin`, `CAPYCTL_TENSORFOLD_BIN`, one
+  precedence, on a host and in standalone (2026-10-01).
+- The drafter follows the rules vLLM and SGLang draft models follow today
+  (2026-10-01): an approved path option, no fetch, no digest.
+- An undeclared `timeouts.initialize` is 1800 s; the deployment's existing
+  `timeouts.initialize` changes it (2026-10-01).
+- A TensorFold stop waits up to 30 s for its counters to read idle and fails
+  closed after that (2026-10-01).
 
 ## Scope
 
@@ -114,17 +123,21 @@ The agent starts:
   Whoever can write there can run code in the engine.
 - Reserved flags, set by CapyCTL and refused in `engine_config` and in extra
   arguments: `--host`, `--port`, `--name`, `--alias`, `--backend`, `--context`,
-  `--drafter`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`,
-  and the update-check flags.
+  `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`, and the
+  update-check flags.
 - `engine_config` maps to flags: `context_length` to `--context` (required for
-  TensorFold), `kv_cache_dtype` to `--kv-dtype`, `drafter` to `--drafter`,
-  `max_tokens` to `--max-tokens`, and `thinking` to `--thinking` or
+  TensorFold), `kv_cache_dtype` to `--kv-dtype`, `max_tokens` to `--max-tokens`, and `thinking` to `--thinking` or
   `--no-thinking`.
-- `drafter` is `none` or a local directory inside the profile's approved model
-  paths. A Hugging Face drafter is fetched through CapyCTL's model store, like the
-  target checkpoint, never by TensorFold. Its content digest is recorded when the
-  deployment is accepted and checked again before every launch and wake
-  (ADR 0014 §7). A repository id is refused.
+- The drafter follows the draft-model rules of the other engines. vLLM takes a
+  draft model only inside `--speculative-config` (ADR 0014 Amendment A3) and
+  SGLang through `--speculative-draft-model-path` (ADR 0014 §8): an extra
+  argument approved by name, whose path must lie inside
+  `security.approved_paths`, checked lexically at deploy time and through
+  symlinks at launch. Neither accepts a Hugging Face id, fetches the draft model
+  or records its digest. TensorFold's `--drafter` is the same: a path option
+  passed in `extra_args`, approved by name, inside the approved paths, checked
+  again through symlinks before launch. A repository id is refused. Without it
+  CapyCTL renders `--drafter none`.
 - Other options pass only as extra arguments under SPEC §8.2
   (`accept_extra_args` and host approval). These TensorFold 0.6.0 `serve` options
   are sensitive and need host approval by name:
@@ -132,7 +145,7 @@ The agent starts:
   | Class | Options |
   |---|---|
   | Listener or egress | `--vision-urls` (fetches image URLs) |
-  | Path | `--snapshot-dir` (reserved), `--drafter` (reserved) |
+  | Path | `--snapshot-dir` (reserved), `--drafter` |
   | Code | `--lane-kernels` |
 
   Every other option is an ordinary engine argument.
@@ -178,9 +191,15 @@ keeps the served name. Responses pass through unchanged, including
 
 ### 8. Settings
 
-No new setting. TensorFold reuses the existing `cuda_home` profile setting and
-its `engine add` detection (YAML `local_engine.cuda_home`, flag `--cuda-home`,
-environment variable `CAPYCTL_CUDA_HOME`).
+One new setting, as vLLM and SGLang have: the role's own TensorFold executable,
+YAML `local_engine.tensorfold`, flag `--tensorfold-bin`, environment variable
+`CAPYCTL_TENSORFOLD_BIN`, with the shared precedence (flag > environment > YAML)
+on a host and in standalone. One `local_engine` executable is the profile
+`local`; several are `local-vllm`, `local-sglang` and `local-tensorfold`. It gets
+the same toolchain check and `deep_park: disabled` as `engine add`. TensorFold
+reuses the existing `cuda_home` profile setting and its `engine add` detection
+(YAML `local_engine.cuda_home`, flag `--cuda-home`, environment variable
+`CAPYCTL_CUDA_HOME`).
 
 ## Errors
 
