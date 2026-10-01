@@ -324,7 +324,7 @@ fn links_inside_the_store_are_followed_as_the_hugging_face_layout() {
         .is_ok());
 }
 
-// T37, ADR 0014 §7: escapes are refused, never followed.
+// T37, ADR 0014 §7: escapes are refused, never followed (chains: A5).
 #[test]
 fn links_that_escape_the_store_or_name_directories_are_refused() {
     let outside = tempfile::tempdir().unwrap();
@@ -348,11 +348,6 @@ fn links_that_escape_the_store_or_name_directories_are_refused() {
         &|checkpoint, store| {
             std::fs::create_dir_all(store.join("other")).unwrap();
             symlink(store.join("other"), checkpoint.join("dir")).unwrap()
-        },
-        &|checkpoint, _| {
-            std::fs::write(checkpoint.join("real.json"), "{}").unwrap();
-            symlink(checkpoint.join("real.json"), checkpoint.join("hop1")).unwrap();
-            symlink(checkpoint.join("hop1"), checkpoint.join("hop2")).unwrap()
         },
         &|checkpoint, _| symlink(checkpoint.join("missing"), checkpoint.join("dangling")).unwrap(),
     ];
@@ -469,4 +464,185 @@ fn hash_throughput() {
         "full: {gib:.1} GiB in {full:?} = {:.2} GiB/s; cached re-verify {cached:?}",
         gib / full.as_secs_f64()
     );
+}
+
+/// The real `huggingface_hub` shared-blob layout: a snapshot file links to a
+/// per-model blob that links again into the hub-wide blob store.
+fn chained_cache(store: &Store) -> PathBuf {
+    let hub = store.root.join("hub");
+    let snapshot = hub.join("models--toy/snapshots/abc");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(hub.join("models--toy/blobs")).unwrap();
+    for (name, bytes) in FILES {
+        let digest = sha(bytes);
+        let shared = hub.join("blobs").join(&digest[..2]);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join(&digest), bytes).unwrap();
+        symlink(
+            format!("../../blobs/{}/{digest}", &digest[..2]),
+            hub.join("models--toy/blobs").join(&digest),
+        )
+        .unwrap();
+        let link = snapshot.join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let up = "../".repeat(name.matches('/').count());
+        symlink(format!("{up}../../blobs/{digest}"), &link).unwrap();
+    }
+    snapshot
+}
+
+// T37, ADR 0014 §7 (A5): a two-hop chain inside the store measures to the
+// digest of the same bytes stored plainly.
+#[test]
+fn a_two_hop_hugging_face_chain_measures_like_a_plain_copy() {
+    let store = Store::new();
+    let snapshot = chained_cache(&store);
+    let plain = Store::new();
+    let copy = plain.checkpoint("toy", FILES);
+    let verifier = CheckpointVerifier::in_memory();
+    assert_eq!(
+        verifier
+            .measure(&store.root, &snapshot)
+            .unwrap()
+            .manifest
+            .digest,
+        verifier
+            .measure(&plain.root, &copy)
+            .unwrap()
+            .manifest
+            .digest,
+    );
+}
+
+// T37, ADR 0014 §7 (A5): the second hop is resolved against the directory
+// holding the first link's target, not against the snapshot.
+#[test]
+fn a_relative_second_hop_resolves_against_its_own_directory() {
+    let store = Store::new();
+    let snapshot = chained_cache(&store);
+    // A decoy where a snapshot-relative resolver would land.
+    let decoy = snapshot.join("../../blobs");
+    for (_, bytes) in FILES {
+        let digest = sha(bytes);
+        std::fs::create_dir_all(decoy.join(&digest[..2])).unwrap();
+        std::fs::write(decoy.join(&digest[..2]).join(&digest), b"decoy").unwrap();
+    }
+    let plain = Store::new();
+    let copy = plain.checkpoint("toy", FILES);
+    let verifier = CheckpointVerifier::in_memory();
+    assert_eq!(
+        verifier
+            .measure(&store.root, &snapshot)
+            .unwrap()
+            .manifest
+            .digest,
+        verifier
+            .measure(&plain.root, &copy)
+            .unwrap()
+            .manifest
+            .digest,
+    );
+}
+
+// T22, ADR 0014 §7 (A5): following chains leaves the digests of plain files
+// and one-hop links exactly as they were recorded before.
+#[test]
+fn plain_and_one_hop_digests_are_unchanged() {
+    const RECORDED: &str =
+        "sha256:cea4cc18b4de2565d4f575cbfea2b281b111015101885a5f2b311845363b4c00";
+    let plain = Store::new();
+    let copy = plain.checkpoint("toy", FILES);
+    let linked = Store::new();
+    let blobs = linked.root.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let snapshot = linked.root.join("toy");
+    for (name, bytes) in FILES {
+        std::fs::write(blobs.join(sha(bytes)), bytes).unwrap();
+        let link = snapshot.join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(blobs.join(sha(bytes)), &link).unwrap();
+    }
+    let verifier = CheckpointVerifier::in_memory();
+    assert_eq!(
+        verifier
+            .measure(&plain.root, &copy)
+            .unwrap()
+            .manifest
+            .digest,
+        RECORDED
+    );
+    assert_eq!(
+        verifier
+            .measure(&linked.root, &snapshot)
+            .unwrap()
+            .manifest
+            .digest,
+        RECORDED
+    );
+}
+
+fn chain(checkpoint: &Path, links: usize) {
+    std::fs::write(checkpoint.join("hop0.json"), "{}").unwrap();
+    for hop in 1..=links {
+        symlink(
+            format!("hop{}.json", hop - 1),
+            checkpoint.join(format!("hop{hop}.json")),
+        )
+        .unwrap();
+    }
+}
+
+// T37, ADR 0014 §7 (A5): eight hops are followed; a ninth is refused.
+#[test]
+fn eight_hops_are_followed_and_a_ninth_is_refused() {
+    for (links, ok) in [(8, true), (9, false)] {
+        let store = Store::new();
+        let checkpoint = store.checkpoint("toy", FILES);
+        chain(&checkpoint, links);
+        let result = CheckpointVerifier::in_memory().measure(&store.root, &checkpoint);
+        if ok {
+            assert!(result.is_ok(), "{links} links: {result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(CheckpointError::UnsafeFile)),
+                "{links} links: {result:?}"
+            );
+        }
+    }
+}
+
+// T37, ADR 0014 §7 (A5): a loop, a chain that leaves the store and a chain
+// that ends at a directory are refused.
+#[test]
+fn chains_that_loop_escape_or_end_at_a_directory_are_refused() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "x").unwrap();
+    type Case<'a> = &'a dyn Fn(&Path, &Path);
+    let cases: &[Case] = &[
+        &|c, _| {
+            symlink("b.json", c.join("a.json")).unwrap();
+            symlink("a.json", c.join("b.json")).unwrap();
+        },
+        &|c, _| {
+            symlink(outside.path().join("secret"), c.join("out1")).unwrap();
+            symlink("out1", c.join("out2")).unwrap();
+        },
+        &|c, s| {
+            std::fs::create_dir_all(s.join("other")).unwrap();
+            symlink(s.join("other"), c.join("d1")).unwrap();
+            symlink("d1", c.join("d2")).unwrap();
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let store = Store::new();
+        let checkpoint = store.checkpoint("toy", FILES);
+        case(&checkpoint, &store.root);
+        let error = CheckpointVerifier::in_memory()
+            .measure(&store.root, &checkpoint)
+            .unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::UnsafeFile),
+            "case {index}: {error:?}"
+        );
+    }
 }
