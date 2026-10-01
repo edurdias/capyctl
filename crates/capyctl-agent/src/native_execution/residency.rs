@@ -826,6 +826,8 @@ impl NativeHostExecution {
                     in_flight: Arc::new(move || ingress.current_requests(&gate).map_err(|_| ())),
                 }
             }
+            // ADR 0023 §6: TensorFold never parks.
+            Engine::Tensorfold => return Err(SessionError),
         })
     }
 

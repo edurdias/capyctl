@@ -49,13 +49,6 @@ fn closed(code: &str) -> &'static str {
     }
 }
 
-fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Vllm => "vllm",
-        Engine::Sglang => "sglang",
-    }
-}
-
 pub fn is_engine_command(command: &Command) -> bool {
     matches!(
         command,
@@ -119,7 +112,7 @@ fn detected(paths: &[PathBuf]) -> Value {
     let rows: Vec<Value> = candidates(paths)
         .into_iter()
         .map(|c| {
-            json!({"engine": engine_name(c.engine), "version": c.version, "custom": c.custom,
+            json!({"engine": c.engine.name(), "version": c.version, "custom": c.custom,
             "env": c.env, "entry": c.entry, "source": c.source})
         })
         .collect();
@@ -148,7 +141,7 @@ fn pick() -> Result<PathBuf, StructuredError> {
             stderr,
             "{:>3}  {} {}{}  {}",
             i + 1,
-            engine_name(c.engine),
+            c.engine.name(),
             c.version,
             if c.custom { " (custom)" } else { "" },
             c.env.display()
@@ -302,7 +295,7 @@ async fn add(
         None => pick()?,
     };
     let resolved = resolve(&path).map_err(|e| error(e.code(), e.to_string()))?;
-    let name = name.unwrap_or(engine_name(resolved.engine)).to_owned();
+    let name = name.unwrap_or(resolved.engine.name()).to_owned();
     if !valid_profile_name(&name) {
         return Err(error(
             "invalid_config",
@@ -356,7 +349,7 @@ async fn add(
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
-        "profile": name, "engine": engine_name(resolved.engine), "version": registration.version,
+        "profile": name, "engine": resolved.engine.name(), "version": registration.version,
         "custom": resolved.custom(), "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
@@ -444,7 +437,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
     let rows: Vec<Value> = all
         .into_iter()
         .map(|(name, profile, source)| {
-            let engine = match profile["engine"].as_str() { Some("sglang") => Engine::Sglang, _ => Engine::Vllm };
+            let engine = profile["engine"].as_str().and_then(Engine::from_name).unwrap_or(Engine::Vllm);
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
             let version = accepted
                 .clone()

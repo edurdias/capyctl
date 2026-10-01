@@ -57,6 +57,7 @@ pub(crate) fn entry(env: &Path, engine: Engine) -> PathBuf {
     match engine {
         Engine::Vllm => env.join("bin/vllm"),
         Engine::Sglang => env.join("bin/python3"),
+        Engine::Tensorfold => env.join("bin/tensorfold"),
     }
 }
 
@@ -196,7 +197,7 @@ impl std::fmt::Display for VersionCheckError {
 pub fn check_version(resolved: &Resolved, timeout: Duration) -> Result<String, VersionCheckError> {
     let mut command = Command::new(&resolved.executable);
     match resolved.engine {
-        Engine::Vllm => command.arg("--version"),
+        Engine::Vllm | Engine::Tensorfold => command.arg("--version"),
         Engine::Sglang => command.args(["-I", "-B", "-c", SGLANG_VERSION, "sglang"]),
     };
     command

@@ -1424,7 +1424,7 @@ fn the_discrete_template_resolves_and_fits_the_card() {
         (Engine::Vllm, false),
     ] {
         let mut host = host.clone();
-        host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+        host["runtime_profiles"]["local"]["engine"] = engine.name().into();
         host["runtime_profiles"]["local"]["security"]["deep_park"] =
             if deep_park { "enabled" } else { "disabled" }.into();
         let doc = deployment_document(
@@ -1490,7 +1490,7 @@ fn hugging_face() -> ModelSource {
 fn discrete_host_allowing_sources(engine: Engine) -> serde_json::Value {
     let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
     let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
-    host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+    host["runtime_profiles"]["local"]["engine"] = engine.name().into();
     host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
     host["model_sources"] = serde_json::json!({"huggingface": "allowed", "max_bytes": "100GiB"});
     host

@@ -110,6 +110,29 @@ pub fn sglang_launch_settings() -> SglangLaunchSettings {
     }
 }
 
+/// ADR 0023: TensorFold settings with a fixed context.
+pub fn tensorfold_launch_settings() -> LaunchSettings {
+    LaunchSettings::Tensorfold(capyctl_domain::launch::TensorfoldLaunchSettings {
+        common: CommonEngineSettings {
+            context_length: Some(8192),
+            ..CommonEngineSettings::default()
+        },
+        memory: MemoryRequest {
+            request_bytes: 30 << 30,
+            kv_cache_bytes: 4 << 30,
+            margin_bytes: 0,
+            weights_bytes: None,
+            startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
+        },
+        max_tokens: None,
+        thinking: None,
+        extra_args: Vec::new(),
+        provenance: Default::default(),
+    })
+}
+
 /// The `engine_config` block a test deployment carries (ADR 0014 §2): JSON,
 /// validated by the configuration layer rather than by a second parser here.
 pub fn vllm_engine_config_json() -> serde_json::Value {

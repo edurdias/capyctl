@@ -297,6 +297,10 @@ impl EngineBindings for ProfileBindings {
                         .and_then(|root| root.launch_dir(work.incarnation())),
                 })
             }
+            // ADR 0023: refused until the embedded TensorFold launch lands (Task 11).
+            Engine::Tensorfold => Err(CoordinatorError::Service(
+                "TensorFold launches are not wired on this path yet".into(),
+            )),
         }
     }
 }

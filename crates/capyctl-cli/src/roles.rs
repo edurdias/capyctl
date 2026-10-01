@@ -908,7 +908,7 @@ impl EnvEngineProvider {
         // default; an undeclared context is fitted to the KV grant at launch.
         // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm => settings.args,
+            Engine::Vllm | Engine::Tensorfold => settings.args,
             Engine::Sglang => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
@@ -986,11 +986,10 @@ impl EngineProvider for EnvEngineProvider {
             if all.iter().any(|n| &n.profile == name) {
                 return Err(ProviderError::ProfileExists(name.clone()));
             }
-            let engine = if profile["engine"] == "sglang" {
-                Engine::Sglang
-            } else {
-                Engine::Vllm
-            };
+            let engine = profile["engine"]
+                .as_str()
+                .and_then(Engine::from_name)
+                .unwrap_or(Engine::Vllm);
             let executable = PathBuf::from(profile["executable"].as_str().unwrap_or_default());
             let base = self.role_installation_as(
                 engine,

@@ -157,7 +157,7 @@ block.
 | When the installation's files change | `local_engine.installation_drift: warn\|refuse` | `--installation-drift warn\|refuse` | `CAPYCTL_INSTALLATION_DRIFT` | `warn` | host, standalone |
 | CapyCTL's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `CAPYCTL_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
 | Engine port range (loopback) | `resource_policy.endpoint_port_range` (`start`, `end`) | `--engine-ports <start-end>` | `CAPYCTL_ENGINE_PORTS` (`CAPYCTL_STANDALONE_ENGINE_PORTS` still read, with a warning) | `8100-8199` | host, standalone |
-| CUDA toolkit for engine kernel builds | `local_engine.cuda_home` | `--cuda-home <dir>` | `CAPYCTL_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
+| CUDA toolkit for engine kernel builds (vLLM's FlashInfer, TensorFold's first start) | `local_engine.cuda_home` | `--cuda-home <dir>` | `CAPYCTL_CUDA_HOME` | none (the engine PATH stays minimal) | host, standalone |
 
 A host generates no deployment of its own, so `--kv-cache` exists only on
 `start standalone`; on a host, `local_engine.kv_cache` is refused and each
@@ -335,6 +335,10 @@ CapyCTL starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
 `CAPYCTL_EXTRA_APPROVALS`, `CAPYCTL_RENDEZVOUS_DIR`, `CAPYCTL_OBSERVATION_DIR`,
 `CAPYCTL_VLLM_ADMIN_KEY`, `CAPYCTL_ENGINE_API_KEY` and `CAPYCTL_DEBUG_ENGINE_LOGS` are
 written by CapyCTL for the engine process; setting them yourself has no effect.
+For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
+`TRANSFORMERS_OFFLINE` and `TORCH_EXTENSIONS_DIR`
+(`<state dir>/engines/tensorfold/<version>/torch_extensions`, private to the
+service user).
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in

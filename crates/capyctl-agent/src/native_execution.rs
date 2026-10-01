@@ -814,6 +814,8 @@ impl NativeHostExecution {
             Engine::Vllm => Ok(PreparedLaunch::Vllm(Box::new(
                 self.vllm_plan(effective, plan).map_err(|_| SessionError)?,
             ))),
+            // ADR 0023: refused until the host's TensorFold launch lands (Task 9).
+            Engine::Tensorfold => Err(SessionError),
         }
     }
 
@@ -893,6 +895,8 @@ impl NativeHostExecution {
                     .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin)),
             ),
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, keys, served)?),
+            // ADR 0023: refused until the host's TensorFold launch lands (Task 9).
+            Engine::Tensorfold => return Err(SessionError),
         })
     }
 
@@ -1495,6 +1499,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
                 Ok(())
             }
             Engine::Sglang => Ok(()),
+            // ADR 0023 §6: TensorFold never parks.
+            Engine::Tensorfold => Err(JournalError::Unauthorized),
         }
     }
     fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {

@@ -98,6 +98,15 @@ pub(super) fn normalize_profile(
              requires security.trust_remote_code: true on this profile",
         ));
     }
+    // ADR 0023 §6, SPEC §9.3: TensorFold has no park path whatever its
+    // profile says.
+    if raw_profile.engine == Engine::Tensorfold && residency.parks() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "residency",
+            "capability_missing: TensorFold supports restart_only only",
+        ));
+    }
     // SPEC §9.1 / T21 / ADR 0012: deep park is on unless the host opts out. A
     // deployment that asks to park on an opted-out profile is refused here rather
     // than launched and then found unable to park, which would surface only under
@@ -635,7 +644,11 @@ fn domain_phase(
     }
 }
 
-pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result<(), ConfigError> {
+pub(super) fn validate_recipe(
+    d: &NormalizedRecipe,
+    host: &HostPolicy,
+    deadline_ceiling_ms: i64,
+) -> Result<(), ConfigError> {
     validate_recipe_intrinsic(d)?;
     let resources = &d.resources;
     for claim in &d.devices {
@@ -682,7 +695,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
         }
     }
     check_host_backed_room(d, host)?;
-    if d.request_deadline_ms > host.queue.request_deadline_ms {
+    if d.request_deadline_ms > deadline_ceiling_ms {
         return Err(invalid(
             "request_deadline",
             "deployment deadline may only shorten host limit",

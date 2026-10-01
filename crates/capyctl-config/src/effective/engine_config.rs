@@ -10,13 +10,15 @@ use crate::engine_policy::{
 };
 use capyctl_domain::launch::{
     CommonEngineSettings, LaunchSettings, MemoryRequest, SettingSource, SglangLaunchSettings,
-    VllmLaunchSettings,
+    TensorfoldLaunchSettings, VllmLaunchSettings,
 };
 
 /// ADR 0014 §5: conservative placeholder overhead margins, per engine family,
 /// until M16 measures peak minus weights minus KV for each model and engine.
 pub const VLLM_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 pub const SGLANG_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
+// ADR 0023 §4: a TensorFold deployment declares its resources, so nothing is derived from a margin.
+pub const TENSORFOLD_OVERHEAD_MARGIN_BYTES: i64 = 0;
 
 /// ADR 0014 §5: the parked phase is the engine's residual floor, also to be
 /// measured. Until then a parking deployment reserves this placeholder (or its
@@ -87,6 +89,7 @@ pub fn overhead_margin(engine: Engine) -> i64 {
     match engine {
         Engine::Vllm => VLLM_OVERHEAD_MARGIN_BYTES,
         Engine::Sglang => SGLANG_OVERHEAD_MARGIN_BYTES,
+        Engine::Tensorfold => TENSORFOLD_OVERHEAD_MARGIN_BYTES,
     }
 }
 
@@ -134,6 +137,8 @@ pub(super) struct RawEngineConfig {
     vllm: Option<RawVllmFields>,
     #[serde(default)]
     sglang: Option<RawSglangFields>,
+    #[serde(default)]
+    tensorfold: Option<RawTensorfoldFields>,
     #[serde(default)]
     accept_extra_args: Option<bool>,
     #[serde(default)]
@@ -186,6 +191,15 @@ struct RawSglangFields {
     tokenizer_workers: Option<u32>,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTensorfoldFields {
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    thinking: Option<bool>,
+}
+
 /// Review decision (discrete GPU design §3): how a memory request derived from
 /// the checkpoint's weights is sized when the deployment's phases derive on a
 /// device domain (a discrete GPU). Absent everywhere else.
@@ -230,7 +244,7 @@ fn device_request_from_weights(
         .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
     let floor = match engine {
         Engine::Vllm => device.declared_total / 100 * 75,
-        Engine::Sglang => 0,
+        Engine::Sglang | Engine::Tensorfold => 0,
     };
     let request = request.max(floor);
     let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
@@ -700,10 +714,45 @@ pub(super) fn normalize_engine_config(
             "this block applies to another engine family than the selected runtime profile",
         )
     };
-    match engine {
-        Engine::Vllm if raw.sglang.is_some() => return Err(family_mismatch("sglang")),
-        Engine::Sglang if raw.vllm.is_some() => return Err(family_mismatch("vllm")),
-        _ => {}
+    let foreign: &[(&str, bool)] = &[
+        ("vllm", raw.vllm.is_some()),
+        ("sglang", raw.sglang.is_some()),
+        ("tensorfold", raw.tensorfold.is_some()),
+    ];
+    for (block, present) in foreign {
+        if *present && *block != engine.name() {
+            return Err(family_mismatch(block));
+        }
+    }
+    // ADR 0023 §4: TensorFold has no flag for these common fields.
+    if engine == Engine::Tensorfold {
+        for (field, set) in [
+            ("dtype", raw.dtype.is_some()),
+            ("quantization", raw.quantization.is_some()),
+            (
+                "max_concurrent_requests",
+                raw.max_concurrent_requests.is_some(),
+            ),
+            ("cuda_graphs", raw.cuda_graphs.is_some()),
+            // `false` is what TensorFold does, and what a snapshot restates.
+            ("language_model_only", raw.language_model_only == Some(true)),
+            ("trust_remote_code", raw.trust_remote_code == Some(true)),
+        ] {
+            if set {
+                return Err(invalid(
+                    format!("engine_config.{field}"),
+                    "TensorFold has no option for this field; remove it",
+                ));
+            }
+        }
+        if raw.context_length.is_none() {
+            return Err(ConfigError::new(
+                ConfigErrorCode::MissingRequired,
+                "engine_config.context_length",
+                "a TensorFold deployment states context_length: it fixes the engine's KV \
+                 allocation, and TensorFold has no flag that caps its memory",
+            ));
+        }
     }
     if let Some(dtype) = &raw.dtype {
         if !DTYPES.contains(&dtype.as_str()) {
@@ -737,7 +786,8 @@ pub(super) fn normalize_engine_config(
         .map_err(|error| invalid("runtime_profiles.args", error.to_string()))?;
     let vllm = raw.vllm.clone().unwrap_or_default();
     let sglang = raw.sglang.clone().unwrap_or_default();
-    let declared: [(&str, bool); 13] = [
+    let tensorfold = raw.tensorfold.clone().unwrap_or_default();
+    let declared: [(&str, bool); 15] = [
         ("dtype", raw.dtype.is_some()),
         ("quantization", raw.quantization.is_some()),
         ("kv_cache_dtype", raw.kv_cache_dtype.is_some()),
@@ -763,6 +813,8 @@ pub(super) fn normalize_engine_config(
             "sglang.tokenizer_workers",
             sglang.tokenizer_workers.is_some(),
         ),
+        ("tensorfold.max_tokens", tensorfold.max_tokens.is_some()),
+        ("tensorfold.thinking", tensorfold.thinking.is_some()),
     ];
     for (field, is_set) in declared {
         if let Some(option) = typed_field_option(engine, field) {
@@ -832,6 +884,14 @@ pub(super) fn normalize_engine_config(
         .map(parse_bytes)
         .transpose()?;
     let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    // ADR 0023 §4: TensorFold is told no KV size; `--context` fixes it inside
+    // the declared reservation, which is all an undeclared KV cache is bounded by.
+    let tensorfold_kv = engine == Engine::Tensorfold && kv_cache.is_none();
+    let kv_cache = if tensorfold_kv {
+        inputs.declared_ready_total
+    } else {
+        kv_cache
+    };
     // Review decision (discrete GPU design §3): a request derived from the
     // weights on a device domain is sized for the card, not with the unified
     // placeholder margin, which would not fit a small card.
@@ -852,6 +912,9 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
+    if tensorfold_kv {
+        provenance.insert("memory.kv_cache".into(), SettingSource::Derived);
+    }
     if let Some(request) = device_request {
         provenance.insert("memory.request".into(), SettingSource::Derived);
         // Design §3: the engine's use of the card is bounded by the fraction
@@ -964,6 +1027,17 @@ pub(super) fn normalize_engine_config(
                 provenance,
             })
         }
+        Engine::Tensorfold => {
+            positive("engine_config.tensorfold.max_tokens", tensorfold.max_tokens)?;
+            LaunchSettings::Tensorfold(TensorfoldLaunchSettings {
+                common,
+                memory,
+                max_tokens: tensorfold.max_tokens,
+                thinking: tensorfold.thinking,
+                extra_args,
+                provenance,
+            })
+        }
     };
     Ok(settings)
 }
@@ -972,7 +1046,7 @@ pub(super) fn normalize_engine_config(
 /// fingerprints: typed and parsed, with nothing derived or defaulted.
 pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, ConfigError> {
     let memory = raw.memory.clone().unwrap_or_default();
-    Ok(serde_json::json!({
+    let mut declared = serde_json::json!({
         "dtype": raw.dtype, "quantization": raw.quantization,
         "kv_cache_dtype": raw.kv_cache_dtype, "context_length": raw.context_length,
         "max_concurrent_requests": raw.max_concurrent_requests,
@@ -988,9 +1062,20 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
             "chunked_prefill_size": s.chunked_prefill_size,
             "tokenizer_workers": s.tokenizer_workers,
         })),
+        "tensorfold": raw.tensorfold.as_ref().map(|t| serde_json::json!({
+            "max_tokens": t.max_tokens, "thinking": t.thinking,
+        })),
         "accept_extra_args": raw.accept_extra_args,
         "extra_args": raw.extra_args,
-    }))
+    });
+    // ADR 0023 §4: the key appears only when declared, so every vLLM and
+    // SGLang command fingerprint keeps its identity.
+    if raw.tensorfold.is_none() {
+        if let Some(object) = declared.as_object_mut() {
+            object.remove("tensorfold");
+        }
+    }
+    Ok(declared)
 }
 
 /// The declared memory block's identity. `startup` appears only when declared,

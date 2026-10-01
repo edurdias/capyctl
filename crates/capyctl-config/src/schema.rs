@@ -326,6 +326,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("tokenizer_workers", SCALAR),
             ]),
         ),
+        // ADR 0023 §4: TensorFold's own typed fields.
+        (
+            "tensorfold",
+            FieldSpec::Struct(&[("max_tokens", SCALAR), ("thinking", SCALAR)]),
+        ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
     ]);

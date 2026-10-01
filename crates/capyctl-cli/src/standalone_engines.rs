@@ -418,10 +418,7 @@ impl StandaloneControl {
             accepted.insert(
                 n.profile.clone(),
                 json!({
-                    "engine": match n.installation.engine {
-                        capyctl_config::engine_policy::Engine::Vllm => "vllm",
-                        capyctl_config::engine_policy::Engine::Sglang => "sglang",
-                    },
+                    "engine": n.installation.engine.name(),
                     "executable": n.installation.executable,
                     "build_fingerprint": n.installation.build_fingerprint,
                     "installation": {"version": view["version"], "digest": view["digest"], "state": view["state"]},
