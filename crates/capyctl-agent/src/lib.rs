@@ -37,6 +37,8 @@ pub mod memory;
 pub mod process_residency;
 // SPEC §8.2 / T21: per-launch SGLang rendezvous directories, removed on gone.
 pub mod rendezvous;
+// ADR 0023 §3: the private per-version TensorFold build cache.
+pub mod engine_cache;
 // SPEC §9.1, §13.3: capyctl's runtime directory is what this account put there.
 pub mod runtime_integrity;
 // ADR 0008: declared model sources materialized into the host's model store.
