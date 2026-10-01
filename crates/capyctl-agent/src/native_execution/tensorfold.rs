@@ -1,0 +1,115 @@
+//! ADR 0023: remote single-rank TensorFold on the host agent. The controller
+//! sends a frozen deployment document and a leased port; the agent resolves
+//! the launch from its own approved document through the shared builder
+//! (`capyctl_adapters::tensorfold::plan_from_effective`), and drains against
+//! TensorFold's own counters before any stop signal (spec §5).
+use super::NativeHostExecution;
+use crate::{journal::JournalError, session::SessionError};
+use capyctl_adapters::tensorfold::{
+    plan_from_effective, wait_idle, PlanInputTensorfold, TensorfoldAdapter,
+};
+use capyctl_adapters::traits::MemberRef;
+use capyctl_config::{effective::EffectiveDeployment, engine_policy::Engine};
+use capyctl_protocol::execution::{MemberAction, MemberCommand, SingleLaunchPlan};
+use std::time::Duration;
+
+/// The idle wait ends this far ahead of the command deadline, so the
+/// controller receives its answer rather than a transport timeout.
+const IDLE_MARGIN_MS: i64 = 1_000;
+
+impl NativeHostExecution {
+    /// The plan, and whether this version's extensions are already built.
+    pub(super) fn tensorfold_plan(
+        &self,
+        effective: &EffectiveDeployment,
+        plan: &SingleLaunchPlan,
+    ) -> Result<(PlanInputTensorfold, bool), JournalError> {
+        // ADR 0023 §3, SPEC §13.3: the build directory is private state; a
+        // host without a private root never launches TensorFold.
+        let cache = self
+            .engine_cache
+            .as_ref()
+            .ok_or(JournalError::Unauthorized)?;
+        let dir = cache
+            .torch_extensions(&effective.profile.build_fingerprint)
+            .map_err(|_| JournalError::Unauthorized)?;
+        let built = crate::engine_cache::has_build(&dir);
+        let input = plan_from_effective(
+            effective,
+            plan.service_port,
+            self.log_dir
+                .join(format!("{}.log", plan.incarnation))
+                .to_string_lossy()
+                .into_owned(),
+            Some(dir.to_string_lossy().into_owned()),
+        )
+        .map_err(|_| JournalError::Unauthorized)?;
+        Ok((input, built))
+    }
+
+    pub(super) fn tensorfold_adapter(
+        &self,
+        effective: &EffectiveDeployment,
+        plan: &SingleLaunchPlan,
+        served: &str,
+    ) -> Result<TensorfoldAdapter, SessionError> {
+        let endpoint = format!("http://{}", Self::endpoint(plan))
+            .parse()
+            .map_err(|_| SessionError)?;
+        Ok(TensorfoldAdapter::new(
+            endpoint,
+            effective.profile.build_fingerprint.clone(),
+            served.into(),
+        ))
+    }
+
+    /// The engine a retained launch runs: from its resolution, or, when that
+    /// no longer resolves (a moved checkpoint, a changed port range), from the
+    /// profile its plan names in the document it was approved under.
+    fn retained_engine(&self, owned: &MemberCommand, plan: &SingleLaunchPlan) -> Option<Engine> {
+        if let Ok(effective) = self.resolve_retained(owned) {
+            return Some(effective.profile.engine);
+        }
+        let set = self
+            .profiles
+            .for_fingerprint(&plan.host_policy_fingerprint)
+            .unwrap_or_else(|| self.profiles.accepted());
+        let profile = &set.config.document["runtime_profiles"][&plan.profile_name];
+        serde_json::from_value(profile["engine"].clone()).ok()
+    }
+
+    /// Spec §5 (ruling 9): `true` once TensorFold reads idle; `false` when it
+    /// does not within `ENGINE_IDLE_BOUND` or the command's remaining time.
+    /// A launch that is not TensorFold's is idle by this check.
+    pub(crate) async fn tensorfold_idle_before_terminate(
+        &self,
+        owned: &MemberCommand,
+        deadline_ms: i64,
+    ) -> bool {
+        let MemberAction::LaunchSingle(plan) = &owned.action else {
+            return true;
+        };
+        if self.retained_engine(owned, plan) != Some(Engine::Tensorfold) {
+            return true;
+        }
+        // Only `/health` is read, which needs the launch's port alone.
+        let Ok(endpoint) = format!("http://{}", Self::endpoint(plan)).parse() else {
+            return false;
+        };
+        let adapter = TensorfoldAdapter::new(
+            endpoint,
+            owned.identity.profile_fingerprint.clone(),
+            String::new(),
+        );
+        let member = MemberRef {
+            deployment_id: owned.identity.deployment_id.clone(),
+            member_id: plan.binding_id.clone(),
+        };
+        let remaining = deadline_ms
+            .saturating_sub(capyctl_protocol::now_unix_ms())
+            .saturating_sub(IDLE_MARGIN_MS);
+        let within = Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+        // The session future is dropped on shutdown, which ends this wait.
+        wait_idle(&adapter, &member, within, std::future::pending()).await
+    }
+}
