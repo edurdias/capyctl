@@ -529,7 +529,11 @@ fn diagnostic_preserves_missing_stale_device_and_category_denials() {
                     sharing: Sharing::Exclusive,
                 }];
                 f.initial.owners.get_mut("A").unwrap().devices = claims.clone();
-                f.owners.get_mut("A").unwrap().recipe.ready.devices = claims.clone();
+                // SPEC §7.3: Ready claims nothing its peak phases do not hold.
+                let a = &mut f.owners.get_mut("A").unwrap().recipe;
+                for phase in [&mut a.cold, &mut a.ready, &mut a.parking, &mut a.wake] {
+                    phase.devices = claims.clone();
+                }
                 f.owners.get_mut("B").unwrap().recipe.cold.devices = claims;
                 ResourceError::DeviceConflict
             }

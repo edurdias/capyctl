@@ -13,9 +13,11 @@ state space is finite and the closure reaches a fixpoint.
 2. **Dispatch gate across a restart** (`crates/capyctl-store/src/dispatch.rs`,
    `ordinary_lifecycle/{local_recovery,park}.rs`): restart closes every gate
    without a closure row; adoption moves the launch to the new session;
-   `reverify_local_dispatch` reopens only after `require_settled`. Before the
-   2026-10-01 fix a cancelled park `reopen`ed subject only to closure rows; now
-   it reopens only a gate it closed (`reopens_dispatch`).
+   `reverify_local_dispatch` reopens only after `require_settled`; a switch
+   records its closure only on an open gate and hands it to the victim's park.
+   Before the 2026-10-01 fix a cancelled park `reopen`ed subject only to
+   closure rows; now it reopens only a gate it closed or was handed
+   (`reopens_dispatch`).
 
 In each model `next false` is the previous code and `next true` the repair.
 -/
@@ -109,40 +111,54 @@ structure St where
   proven : Bool         -- readiness re-proven in the *current* session
   retired : Bool        -- a retired session's lease is still recorded
   adopted : Bool        -- launch belongs to the current session
+  switchClosed : Bool   -- a `switch` row in `dispatch_closures`
   parkPlanned : Bool    -- a park is accepted and not yet armed past drain
-  parkClosedOpen : Bool -- the park closed a gate that was open (fix bookkeeping)
+  reopens : Bool        -- the plan's `reopens_dispatch` (repaired code)
   deriving DecidableEq, Repr
 
-/-- Serving, in a session that launched it, with one request in flight. -/
-def init : St := ⟨true, true, false, true, false, false⟩
+/-- Serving, in a session that launched it. -/
+def init : St := ⟨true, true, false, true, false, false, false⟩
 
+/-- `reopen`/`end_victim_closure`: a gate reopens only when no closure row remains. -/
 def next (fixed : Bool) (s : St) : List St :=
-  -- controller restart: every gate closes, leases become retired, launch unadopted
+  -- controller restart: every gate closes with no closure row, leases become
+  -- retired, switches and their closures are cleared, the launch is unadopted
+  -- (a planned park is cancelled by adoption without reopening)
   [{ s with open_ := false, proven := false, retired := s.retired || s.open_,
-            adopted := false, parkPlanned := false, parkClosedOpen := false }] ++
+            adopted := false, switchClosed := false, parkPlanned := false, reopens := false }] ++
   -- `adopt_retired_local_launch`
   (if !s.adopted then [{ s with adopted := true }] else []) ++
   -- `reverify_local_dispatch`: fresh evidence, `require_settled`, no open park
-  (if s.adopted && !s.retired && !s.parkPlanned then
+  (if s.adopted && !s.retired && !s.parkPlanned && !s.switchClosed then
      [{ s with open_ := true, proven := true }] else []) ++
   -- `abandon_retired_request_leases` on quiescence evidence
   (if s.retired then [{ s with retired := false }] else []) ++
-  -- `accept_instance` (park): needs an adopted Ready launch; closes the gate
-  (if s.adopted && !s.parkPlanned then
-     [{ s with parkPlanned := true, parkClosedOpen := s.open_, open_ := false }] else []) ++
-  -- park cancelled at its deadline: `reopen`
+  -- `close_for_switch`: records its closure only on an open gate
+  (if s.adopted && s.open_ && !s.parkPlanned then
+     [{ s with open_ := false, switchClosed := true }] else []) ++
+  -- `reopen_after_switch` / a terminal switch record: the switch's own closure
+  -- ends; the gate reopens when no run is in flight and nothing else holds it
+  (if s.switchClosed && !s.parkPlanned then
+     [{ s with switchClosed := false, open_ := true }] else []) ++
+  -- `accept_switch_release`: the switch hands its closure to the victim's park
+  (if s.switchClosed && !s.parkPlanned then
+     [{ s with switchClosed := false, parkPlanned := true, reopens := true }] else []) ++
+  -- operator or idle park (`accept_instance`): closes the gate
+  (if s.adopted && !s.parkPlanned && !s.switchClosed then
+     [{ s with parkPlanned := true, reopens := s.open_, open_ := false }] else []) ++
+  -- park cancelled at its deadline, or refused before any effect: `reopen`
   (if s.parkPlanned then
-     [{ s with parkPlanned := false,
-               open_ := if fixed then s.parkClosedOpen else true }] else [])
+     [{ s with parkPlanned := false, reopens := false,
+               open_ := !s.switchClosed && (if fixed then s.reopens else true) }] else [])
 
-def reachable (fixed : Bool) : List St := closure (next fixed) 10 [init]
+def reachable (fixed : Bool) : List St := closure (next fixed) 12 [init]
 
 /-- SPEC §6.1/§10: dispatch is open only on readiness proven in this session and
     with no retired session's request possibly still running. -/
 def safe (s : St) : Bool := !s.open_ || (s.proven && !s.retired)
 
 theorem converged (b : Bool) :
-    (closure (next b) 11 [init]).length = (reachable b).length := by
+    (closure (next b) 13 [init]).length = (reachable b).length := by
   cases b <;> decide
 
 theorem init_safe : safe init = true := by decide
@@ -152,10 +168,22 @@ theorem init_safe : safe init = true := by decide
 theorem previous_unsafe : (reachable false).any (fun s => !safe s) = true := by decide
 
 theorem unsafe_witness :
-    (⟨true, false, true, true, false, false⟩ : St) ∈ reachable false := by decide
+    (⟨true, false, true, true, false, false, false⟩ : St) ∈ reachable false := by decide
 
-/-- **Repaired: a cancelled park reopens only a gate it closed itself.** -/
+/-- **Repaired: a cancelled or refused park reopens only a gate it closed or was
+    handed.** Every reachable state is safe. -/
 theorem fixed_safe : (reachable true).all safe = true := by decide
+
+/-- The repair keeps the switch flow live: a switch closes the victim's gate,
+    hands it to the victim's park, the park is refused, and the victim serves
+    again (the regression the first version of the fix caused, caught by the
+    controller test `a_refused_victim_park_falls_back_to_a_verified_stop`). -/
+theorem fixed_switch_refusal_reopens :
+    let closedBySwitch := { init with open_ := false, switchClosed := true }
+    let handed := { closedBySwitch with switchClosed := false, parkPlanned := true,
+                                        reopens := true }
+    closedBySwitch ∈ next true init ∧ handed ∈ next true closedBySwitch ∧
+      init ∈ next true handed := by decide
 
 end Gate
 end Capy.Protocols

@@ -533,8 +533,10 @@ impl crate::Store {
         // charged until that cleanup's evidence settles it (SPEC §10).
         let unknown_work = uncertain_leases(&tx, deployment, instance)?;
         let may_park = may_park && !unknown_work;
-        // The park or stop accepted below owns the gate from here on.
-        crate::switch_state::clear_closure(
+        // The park or stop accepted below owns the gate from here on. A switch
+        // records its closure only on an open gate of this session, so a park
+        // handed it may reopen the gate if it ends without effect.
+        let handed_gate = crate::switch_state::clear_closure(
             &tx,
             deployment,
             instance,
@@ -547,7 +549,15 @@ impl crate::Store {
             && !park_refused(&tx, deployment, instance, generation)?
         {
             let receipt = Self::instance_park_in_transaction(
-                &tx, s, principal, deployment, instance, key, now, deadline,
+                &tx,
+                s,
+                principal,
+                deployment,
+                instance,
+                key,
+                now,
+                deadline,
+                handed_gate,
             )?;
             journal(
                 &tx,

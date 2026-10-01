@@ -129,10 +129,12 @@ struct ResidencyPlan {
     accepted_at_ms: i64,
     deadline_ms: i64,
     execution: Option<ResidencyExecution>,
-    /// A park closed an open dispatch gate when it was accepted, so a park
-    /// cancelled without effect reopens it. A gate that was already closed
-    /// (a restart, or a closure awaiting its own evidence) stays closed for
-    /// readiness supervision to reopen after `require_settled` (SPEC §10).
+    /// When the park was accepted, the gate was open, or a switch of this
+    /// session handed over the closure it recorded on the open gate
+    /// (`handed_gate`). A park cancelled or refused without effect then
+    /// reopens it once no other closure remains. A gate a restart closed
+    /// records no closure; it stays closed for readiness supervision to reopen
+    /// after `require_settled` (SPEC §10).
     /// Absent in plans stored before this field: they never reopen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     reopens_dispatch: bool,
@@ -671,6 +673,9 @@ fn current_residency(
 
 /// Accept one instance's park or restore, or join the one of that kind already
 /// open. Nothing is sent; the worker arms it.
+/// `handed_gate`: the caller closed this instance's open gate for a reason it
+/// now hands to the park (a switch releasing its drained victim), so the park
+/// owns that closure as if it had closed the open gate itself.
 #[allow(clippy::too_many_arguments)]
 fn accept_instance(
     tx: &Transaction<'_>,
@@ -681,6 +686,7 @@ fn accept_instance(
     principal: &str,
     now: i64,
     deadline: i64,
+    handed_gate: bool,
 ) -> Result<ResidencyReceipt, LifecycleError> {
     // T15: a second request for the same change joins the open one.
     if let Some((operation, open_kind)) = open_run(tx, deployment, instance)? {
@@ -738,7 +744,8 @@ fn accept_instance(
         accepted_at_ms: now,
         deadline_ms: deadline,
         execution: None,
-        reopens_dispatch: kind == ResidencyKind::Park && dispatch_open(tx, deployment, instance)?,
+        reopens_dispatch: kind == ResidencyKind::Park
+            && (handed_gate || dispatch_open(tx, deployment, instance)?),
     };
     let run_plan = serde_json::json!({
         "version": 1,
@@ -853,6 +860,7 @@ impl crate::Store {
                 principal,
                 now,
                 deadline,
+                false,
             ) {
                 Ok(receipt) => {
                     if first.is_some() {
@@ -911,7 +919,7 @@ impl crate::Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let receipt = Self::instance_park_in_transaction(
-            &tx, s, principal, deployment, instance, key, now, deadline,
+            &tx, s, principal, deployment, instance, key, now, deadline, false,
         )?;
         tx.commit()?;
         Ok(receipt)
@@ -927,6 +935,7 @@ impl crate::Store {
         key: &str,
         now: i64,
         deadline: i64,
+        handed_gate: bool,
     ) -> Result<ResidencyReceipt, LifecycleError> {
         let revision: i64 = tx
             .query_row(
@@ -951,6 +960,7 @@ impl crate::Store {
             principal,
             now,
             deadline,
+            handed_gate,
         )?;
         store_receipt(
             tx,
@@ -1082,6 +1092,7 @@ impl crate::Store {
                 principal,
                 now,
                 deadline,
+                false,
             ) {
                 Ok(receipt) => {
                     first.get_or_insert(receipt);
@@ -2427,7 +2438,7 @@ fn idle_one(
     if !parked && parks(&e) && !refused_park {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
-            tx, s, "idle", deployment, instance, &key, now, deadline,
+            tx, s, "idle", deployment, instance, &key, now, deadline, false,
         )?;
         journal(
             tx,
@@ -2700,6 +2711,7 @@ impl crate::Store {
                 &park_key,
                 now,
                 receipt.deadline_ms,
+                false,
             );
             match park {
                 // The same key replays an earlier park: one that failed (a
