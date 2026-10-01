@@ -329,6 +329,13 @@ pub trait EngineAdapter: Send + Sync {
     async fn idle_before_signal(&self, _member: &MemberRef) -> Option<EngineWork> {
         None
     }
+    /// SPEC §10 (amended 2026-10-01): the cancellation acknowledgement for a
+    /// request whose client hung up. `true` only when the engine's own counters,
+    /// observed at or after `after_ms` (Unix ms), show no running and no waiting
+    /// request. Unknown, unreadable or busy is `false`.
+    async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
+        false
+    }
 }
 
 /// A boot-unique handle to a spawned engine process.

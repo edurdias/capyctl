@@ -777,6 +777,9 @@ impl EngineAdapter for CheckpointGate {
     ) -> Option<capyctl_adapters::traits::EngineWork> {
         self.inner.idle_before_signal(member).await
     }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        self.inner.engine_quiescent(member, after_ms).await
+    }
 }
 
 #[cfg(test)]
