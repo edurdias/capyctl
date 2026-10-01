@@ -24,6 +24,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       PYTHONDONTWRITEBYTECODE: "1"
+    # Fast gate only; integration suites run locally via scripts/ci-local.sh --deep.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,17 +47,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Name check
         run: scripts/check-name.sh
-      - name: Authoritative core suite
-        run: >-
-          cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller
-          -p capyctl-management -p harness --all-targets --no-fail-fast --locked
-          -- --test-threads=4
-      - name: Workspace suite
-        run: cargo test --workspace --all-targets --no-fail-fast --locked
-      - name: Core Clippy
-        run: >-
-          cargo clippy -p capyctl-adapters -p capyctl-store -p capyctl-controller
-          -p capyctl-management -p harness --all-targets --locked -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins --locked --no-fail-fast
       - name: Fetch and verify CPU fixture source
         run: |
           TMS_SOURCE_ARCHIVE="$RUNNER_TEMP/torch_memory_saver-0.0.9.post1.tar.gz"

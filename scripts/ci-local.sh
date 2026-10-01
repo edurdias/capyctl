@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run the CI "CPU checks" job locally, in CI's order and with CI's shape
 # (4 cores, 16 GB when systemd-run is usable, pinned shellcheck, fixture archive).
+# --deep adds the integration suites, unlimited by default; --ci-shape limits them too.
 #
-# Usage: scripts/ci-local.sh [--no-limits] [--only STEP] [--list]
+# Usage: scripts/ci-local.sh [--deep] [--ci-shape] [--no-limits] [--only STEP] [--list]
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,27 +15,38 @@ SHELLCHECK_SHA_AARCH64=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e
 TMS_URL=https://files.pythonhosted.org/packages/81/fd/42aad783d433fd69dc108b1b2ee5860fcf33e20e5440b899bc004ff97d70/torch_memory_saver-0.0.9.post1.tar.gz
 TMS_SHA=25fd4b691ed3242c3a18b2bef0dbe9de84d2e7068b96a37686a923d55c274f43
 
-STEPS=(fmt name core workspace clippy runtime shellcheck installer)
+CI_STEPS=(fmt name clippy unit runtime shellcheck installer)
+DEEP_STEPS=(core workspace)
+STEPS=("${CI_STEPS[@]}")
 CORE_PKGS=(-p capyctl-adapters -p capyctl-store -p capyctl-controller -p capyctl-management -p harness)
 SHELL_FILES=(packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh)
 
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-ci"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target-ci}"
+ORIG_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 export CARGO_TERM_COLOR=always
 export PYTHONDONTWRITEBYTECODE=1
 
 use_limits=1
+list=0
+deep=0
+ci_shape=0
 only=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-limits) use_limits=0 ;;
+    --deep) deep=1 ;;
+    --ci-shape) ci_shape=1 ;;
     --only) only="${2:?--only needs a step name}"; shift ;;
-    --list) printf '%s\n' "${STEPS[@]}"; exit 0 ;;
-    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    --list) list=1 ;;
+    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+is_deep() { local d; for d in "${DEEP_STEPS[@]}"; do [ "$d" = "$1" ] && return 0; done; return 1; }
+if [ "$deep" = 1 ] || is_deep "$only"; then STEPS+=("${DEEP_STEPS[@]}"); fi
+if [ "$list" = 1 ]; then printf '%s\n' "${STEPS[@]}"; exit 0; fi
 
 if [ -n "$only" ]; then
   found=0
@@ -43,6 +55,7 @@ if [ -n "$only" ]; then
 fi
 
 # Limits: taskset to 4 cores, systemd-run scope with MemoryMax=16G when usable.
+# CI steps are limited by default; deep steps only with --ci-shape.
 limit_prefix=()
 limit_desc="none"
 if [ "$use_limits" = 1 ]; then
@@ -60,9 +73,11 @@ if [ "$use_limits" = 1 ]; then
     limit_desc="$(IFS=,; echo "${parts[*]}")"
   fi
 fi
-echo "ci-local: limits active: $limit_desc; target dir: $CARGO_TARGET_DIR"
+echo "ci-local: limits: $limit_desc (deep steps: $([ "$ci_shape" = 1 ] && echo same || echo none))"
 
 limited() { "${limit_prefix[@]}" "$@"; }
+# Deep steps run at full machine speed unless --ci-shape.
+deep_limited() { if [ "$ci_shape" = 1 ]; then limited "$@"; else "$@"; fi; }
 
 fetch_verified() { # url sha256 dest
   local url="$1" sha="$2" dest="$3"
@@ -97,13 +112,12 @@ pinned_shellcheck() {
 
 step_fmt() { limited cargo fmt --all --check; }
 step_name() { scripts/check-name.sh; }
+step_clippy() { limited cargo clippy --workspace --all-targets --locked -- -D warnings; }
+step_unit() { limited cargo test --workspace --lib --bins --locked --no-fail-fast; }
 step_core() {
-  limited cargo test "${CORE_PKGS[@]}" --all-targets --no-fail-fast --locked -- --test-threads=4
+  deep_limited cargo test "${CORE_PKGS[@]}" --all-targets --no-fail-fast --locked -- --test-threads=4
 }
-step_workspace() { limited cargo test --workspace --all-targets --no-fail-fast --locked; }
-step_clippy() {
-  limited cargo clippy "${CORE_PKGS[@]}" --all-targets --locked -- -D warnings
-}
+step_workspace() { deep_limited cargo test --workspace --all-targets --no-fail-fast --locked; }
 step_runtime() {
   local archive="$cache_dir/torch_memory_saver-0.0.9.post1.tar.gz"
   fetch_verified "$TMS_URL" "$TMS_SHA" "$archive"
@@ -122,6 +136,12 @@ failed=""
 for s in "${STEPS[@]}"; do
   if [ -n "$only" ] && [ "$s" != "$only" ]; then continue; fi
   echo "== ci-local: $s"
+  # Limited runs keep target-ci; unlimited deep runs use the normal target dir.
+  if is_deep "$s" && { [ "$ci_shape" = 0 ] || [ "$use_limits" = 0 ]; }; then
+    export CARGO_TARGET_DIR="${ORIG_TARGET_DIR:-$root/target}"
+  else
+    export CARGO_TARGET_DIR="${ORIG_TARGET_DIR:-$root/target-ci}"
+  fi
   start=$SECONDS
   if "step_$s"; then r=pass; else r=FAIL; fi
   names+=("$s"); results+=("$r"); durations+=("$((SECONDS - start))s")
