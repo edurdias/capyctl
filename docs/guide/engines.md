@@ -200,6 +200,11 @@ deployments and places none until you add one. Its start banner and
 `capyctl status deployment` then say to run `capyctl engine add <path>`. A new deploy that names a
 profile nobody publishes is refused at once.
 
+`capyctl status deployment` shows the engine a deployment actually runs: its
+profile, version and executable, as the deployment was set up with them. If you
+register the profile again at a new version, an existing deployment keeps the
+old engine, and the status adds a note to redeploy to use the new one.
+
 A model can be named by its Hugging Face cache directory
 (`snapshots/<rev>`) as it is.
 
