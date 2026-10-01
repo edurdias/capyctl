@@ -26,11 +26,6 @@ fn vllm_work(deep_park: Option<&str>) -> InitializeWork {
 
 /// [`vllm_work`] with the deployment's declared residency stated explicitly.
 fn vllm_work_with(deep_park: Option<&str>, residency: &str) -> InitializeWork {
-    let store = Store::open_in_memory().expect("open in-memory store");
-    let session = store
-        .begin_coordinator_session()
-        .expect("begin coordinator session");
-
     let source: Value = serde_json::from_str(include_str!(
         "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
     ))
@@ -50,45 +45,7 @@ fn vllm_work_with(deep_park: Option<&str>, residency: &str) -> InitializeWork {
     let mut deployment = source["input"]["deployment"].clone();
     deployment["residency"] = json!(residency);
 
-    let policy = resolve_effective(&deployment, &host)
-        .expect("fixture resolves")
-        .host;
-    let observations: Vec<_> = policy
-        .domains
-        .keys()
-        .map(|domain| MemoryObservation {
-            domain: domain.clone(),
-            capacity_bytes: 1_i64 << 50,
-            available_bytes: 1_i64 << 50,
-            sampled_at_ms: 1000,
-        })
-        .collect();
-    store
-        .import_resource_policy(&session, &policy, &observations, 1000)
-        .expect("import resource policy");
-
-    let receipt = store
-        .create_stopped_managed_configuration(
-            &session,
-            "owner",
-            "toy",
-            &json!({ "config": deployment }).to_string(),
-            &host,
-            1700,
-        )
-        .expect("create managed configuration");
-    let fence = capyctl_store::lifecycle::DeploymentFence {
-        deployment_id: receipt.deployment_id,
-        revision: receipt.revision,
-        generation: receipt.generation,
-    };
-    store
-        .accept_start(&session, &fence, 1800, 10_000)
-        .expect("accept start");
-    store
-        .next_initialize(&session)
-        .expect("next initialize")
-        .expect("a freshly accepted start plans initialize work")
+    admit(&deployment, &host)
 }
 
 /// Builds a real `InitializeWork` for an SGLang deployment the same way: the
@@ -101,11 +58,6 @@ fn sglang_work() -> InitializeWork {
 /// Same fixture builder with a deployment mutation hook, so a test can shape
 /// the frozen effective configuration before admission.
 fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
-    let store = Store::open_in_memory().expect("open in-memory store");
-    let session = store
-        .begin_coordinator_session()
-        .expect("begin coordinator session");
-
     let source: Value = serde_json::from_str(include_str!(
         "../../../capyctl-config/tests/fixtures/effective-sglang-golden.json"
     ))
@@ -114,7 +66,17 @@ fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
     let mut deployment = source["input"]["deployment"].clone();
     edit(&mut deployment);
 
-    let policy = resolve_effective(&deployment, &host)
+    admit(&deployment, &host)
+}
+
+/// Admits `deployment` against `host` through the real store lifecycle and
+/// returns the Initialize work its accepted start plans.
+fn admit(deployment: &Value, host: &Value) -> InitializeWork {
+    let store = Store::open_in_memory().expect("open in-memory store");
+    let session = store
+        .begin_coordinator_session()
+        .expect("begin coordinator session");
+    let policy = resolve_effective(deployment, host)
         .expect("fixture resolves")
         .host;
     let observations: Vec<_> = policy
@@ -137,7 +99,7 @@ fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
             "owner",
             "toy",
             &json!({ "config": deployment }).to_string(),
-            &host,
+            host,
             1700,
         )
         .expect("create managed configuration");
@@ -153,6 +115,27 @@ fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
         .next_initialize(&session)
         .expect("next initialize")
         .expect("a freshly accepted start plans initialize work")
+}
+
+/// A TensorFold deployment on the vLLM golden fixture, shaped as the config
+/// crate's TensorFold fixture shapes it.
+fn tensorfold_work() -> InitializeWork {
+    let source: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .expect("fixture JSON parses");
+    let mut host = source["input"]["host"].clone();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("tensorfold");
+    profile["executable"] = json!("/opt/tf/bin/tensorfold");
+    profile["build_fingerprint"] = json!("0.6.0");
+    profile["args"] = json!([]);
+    profile["security"]["deep_park"] = json!("disabled");
+    profile["security"]["approved_paths"] = json!(["/srv/drafters"]);
+    let mut deployment = source["input"]["deployment"].clone();
+    deployment["residency"] = json!("restart_only");
+    deployment["engine_config"] = json!({"context_length": 8192});
+    admit(&deployment, &host)
 }
 
 fn bindings() -> ProfileBindings {
@@ -580,5 +563,37 @@ fn an_embedded_discrete_launch_is_sized_against_the_card() {
     assert_eq!(
         frozen.settings().memory.device_total_bytes,
         Some(16376 << 20)
+    );
+}
+
+// T41 (ADR 0023 §3): the embedded path builds the same TensorFold plan the
+// host agent builds, with the private extensions directory, and no key.
+#[test]
+fn a_tensorfold_profile_builds_a_tensorfold_spec() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = tensorfold_work();
+    let dir = tempfile::tempdir().unwrap();
+    let engines = dir.path().join("engines");
+    std::fs::create_dir(&engines).unwrap();
+    std::fs::set_permissions(&engines, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bindings = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"))
+        .with_engine_cache_root(engines);
+    let AdapterSpec::Tensorfold {
+        launch: Some(launch),
+        extensions_built,
+        ..
+    } = bindings.spec(&work).unwrap()
+    else {
+        panic!("a TensorFold spec");
+    };
+    assert!(!extensions_built);
+    assert!(launch
+        .extensions_dir
+        .unwrap()
+        .ends_with("tensorfold/0.6.0/torch_extensions"));
+    let without = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"));
+    assert!(
+        without.spec(&work).is_err(),
+        "no private cache root, no launch"
     );
 }

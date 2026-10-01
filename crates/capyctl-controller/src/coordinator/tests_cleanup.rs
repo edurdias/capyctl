@@ -957,3 +957,148 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
     w.shutdown().await.unwrap();
 }
+
+/// A Fake engine that answers the idle check before a stop signal as an
+/// engine with its own work counters (TensorFold) does.
+struct CountedIdle {
+    inner: Arc<FakeEngine>,
+    idle: bool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl EngineAdapter for CountedIdle {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
+        self.inner.execute_persisted(command).await
+    }
+    async fn inspect(&self, m: &MemberRef) -> Result<EngineState, AdapterError> {
+        self.inner.inspect(m).await
+    }
+    async fn render_plan(&self, p: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        self.inner.render_plan(p).await
+    }
+    async fn check_readiness(&self, m: &MemberRef) -> Result<Readiness, AdapterError> {
+        self.inner.check_readiness(m).await
+    }
+    async fn prepare_park(&self, m: &MemberRef) -> Result<Quiescence, AdapterError> {
+        self.inner.prepare_park(m).await
+    }
+    async fn park(&self, m: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        self.inner.park(m, level).await
+    }
+    async fn restore(&self, m: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        self.inner.restore(m).await
+    }
+    async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        self.inner.reload_weights(m).await
+    }
+    async fn observe_work(&self, m: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        self.inner.observe_work(m).await
+    }
+    async fn cancel_work(
+        &self,
+        m: &MemberRef,
+        r: &RequestRef,
+        ack: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
+        self.inner.cancel_work(m, r, ack).await
+    }
+    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<bool> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Some(self.idle)
+    }
+}
+
+/// A worker whose engine answers the idle check with `engine.idle`; each
+/// cleanup effect (the stop signal) is counted in `signals`.
+fn idle_checked_worker(
+    owner: SharedCoordinatorState,
+    observations: Vec<MemoryObservation>,
+    engine: Arc<CountedIdle>,
+    signals: Arc<std::sync::atomic::AtomicUsize>,
+) -> OwnedCoordinator {
+    OwnedCoordinator::spawn(
+        owner,
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            // The smallest protocol bound the one-second grace floor fits in;
+            // the stop deadline below leaves the idle check one second.
+            protocol_timeout: Duration::from_secs(7),
+            terminate_grace: Duration::from_secs(1),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            let fake = engine.inner.clone();
+            let signals = signals.clone();
+            Ok(Arc::new(Driver {
+                engine: engine.clone(),
+                cleanup: Arc::new(move |context| {
+                    let fake = fake.clone();
+                    signals.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        fake.lifecycle_cleanup_observed(
+                            &context.binding_id,
+                            &context.incarnation,
+                            &context.identities,
+                        )
+                        .map_err(|e| CoordinatorError::Service(e.to_string()))
+                    })
+                }),
+                tools: None,
+                settle: None,
+            }))
+        }),
+    )
+    .unwrap()
+}
+
+// T41 (spec §5, ADR 0023 §6): an engine whose own counters read busy is not
+// signalled; the cleanup does not complete and its binding stays retained.
+// One that reads idle is terminated as before.
+#[tokio::test]
+async fn a_busy_engine_is_not_signalled_and_an_idle_one_is() {
+    for idle in [false, true] {
+        let (_dir, owner, fence, observations) = setup().await;
+        let engine = Arc::new(CountedIdle {
+            inner: Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1900)))),
+            idle,
+            reads: Default::default(),
+        });
+        let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = idle_checked_worker(owner.clone(), observations, engine.clone(), signals.clone());
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed
+        );
+        let stop = w.stop("owner", &fence, "idle-check", 9_900).unwrap();
+        let observed = stop.wait(Duration::from_secs(5)).await;
+        assert!(
+            engine.reads.load(Ordering::SeqCst) > 0,
+            "the idle check ran"
+        );
+        if idle {
+            assert_eq!(observed.unwrap(), OrdinaryCleanupStatus::Completed);
+            assert_eq!(signals.load(Ordering::SeqCst), 1);
+            assert!(w.shared.retained.lock().unwrap().is_empty());
+        } else {
+            assert!(
+                matches!(observed, Err(CoordinatorError::CallerTimeout)),
+                "{observed:?}"
+            );
+            assert_eq!(signals.load(Ordering::SeqCst), 0, "nothing was signalled");
+            assert_eq!(w.shared.retained.lock().unwrap().len(), 1);
+            assert!(
+                matches!(w.status(), WorkerStatus::Uncertain { ref reason, .. }
+                    if reason.contains("the stop was not sent")),
+                "{:?}",
+                w.status()
+            );
+        }
+        w.shutdown().await.unwrap();
+    }
+}
