@@ -33,6 +33,8 @@ pub mod setting_overrides;
 // SPEC §15.3: standalone values the role does not honour are refused.
 pub mod standalone;
 pub mod strict_yaml;
+// ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
+pub mod toolchain;
 
 pub use defaults::{generate_default, resolve_startup, LoadOutcome};
 pub use error::{ConfigError, ConfigErrorCode};

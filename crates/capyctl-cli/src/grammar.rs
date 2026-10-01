@@ -457,7 +457,7 @@ enum EngineArgs {
     },
     /// Register an installation as a runtime profile and publish it.
     Add {
-        /// A venv directory, its bin/vllm, or its bin/python3. Omit to pick interactively.
+        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3. Omit to pick interactively.
         path: Option<PathBuf>,
         /// The profile name (default: the engine's name).
         #[arg(long)]

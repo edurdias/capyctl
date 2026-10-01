@@ -20,6 +20,11 @@
 
 use std::collections::BTreeMap;
 
+/// SPEC §13.3 (amended 2026-09-25): the fixed system tool directories after
+/// the engine's own bin and the profile's `<cuda_home>/bin`. Defined beside
+/// the toolchain check, which looks tools up on the same PATH.
+pub use capyctl_config::toolchain::SYSTEM_PATH;
+
 /// Memory one JIT compile job is budgeted.
 pub const BUILD_JOB_BYTES: u64 = 8 << 30;
 
