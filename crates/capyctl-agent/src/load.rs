@@ -137,6 +137,13 @@ fn usage_ppm(text: &str, name: &str) -> Option<u32> {
     (usage <= 1.0)
         .then(|| ((usage * f64::from(KV_USAGE_PPM_FULL)).round() as u32).min(KV_USAGE_PPM_FULL))
 }
+/// TensorFold 0.6.0 `tensorfold/server/metrics.py`. The KV ratio has one
+/// series per stream pool; the most pressured pool counts.
+const TENSORFOLD: Family = Family {
+    running: "tensorfold:requests_running",
+    waiting: "tensorfold:requests_waiting",
+    kv_usage: "tensorfold:kv_cache_usage_ratio",
+};
 
 fn family_load(text: &str, family: &Family) -> Option<EngineLoad> {
     Some(EngineLoad {
@@ -146,13 +153,28 @@ fn family_load(text: &str, family: &Family) -> Option<EngineLoad> {
     })
 }
 
+type HistogramTable = &'static [(&'static str, &'static str)];
+
+/// The one family whose three gauges parse, with its name and histograms.
+fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
+    let found: Vec<_> = [
+        ("vllm", &VLLM, VLLM_HISTOGRAMS),
+        ("sglang", &SGLANG, SGLANG_HISTOGRAMS),
+        ("tensorfold", &TENSORFOLD, TENSORFOLD_HISTOGRAMS),
+    ]
+    .into_iter()
+    .filter_map(|(name, family, table)| family_load(text, family).map(|l| (name, l, table)))
+    .collect();
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
 /// Engine gauges from one `/metrics` body. `None` unless exactly one engine
 /// family's three gauges are all present and well formed.
 pub fn parse_engine_load(text: &str) -> Option<EngineLoad> {
-    match (family_load(text, &VLLM), family_load(text, &SGLANG)) {
-        (Some(load), None) | (None, Some(load)) => Some(load),
-        _ => None,
-    }
+    family_of(text).map(|(_, load, _)| load)
 }
 
 /// SPEC §17 (owner decision 2026-09-23, M80): the engine latency histograms a
@@ -192,6 +214,17 @@ const SGLANG_HISTOGRAMS: &[(&str, &str)] = &[
     (
         "engine_inter_token_latency",
         "sglang:inter_token_latency_seconds",
+    ),
+];
+/// TensorFold 0.6.0 has no queue, prefill, decode or inter-token histogram.
+const TENSORFOLD_HISTOGRAMS: &[(&str, &str)] = &[
+    (
+        "engine_time_to_first_token",
+        "tensorfold:time_to_first_token_seconds",
+    ),
+    (
+        "engine_e2e_request_latency",
+        "tensorfold:request_latency_seconds",
     ),
 ];
 
@@ -330,11 +363,7 @@ pub fn parse_histogram(text: &str, metric: &str) -> Option<Histogram> {
 /// histograms (cumulative since the engine started). The family is the one
 /// whose load gauges parse; `None` when neither or both do.
 pub fn parse_engine_histograms(text: &str) -> Option<(&'static str, Vec<(String, Histogram)>)> {
-    let (engine, table) = match (family_load(text, &VLLM), family_load(text, &SGLANG)) {
-        (Some(_), None) => ("vllm", VLLM_HISTOGRAMS),
-        (None, Some(_)) => ("sglang", SGLANG_HISTOGRAMS),
-        _ => return None,
-    };
+    let (engine, _, table) = family_of(text)?;
     let histograms = table
         .iter()
         .filter_map(|(series, metric)| {

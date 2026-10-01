@@ -53,6 +53,17 @@ fn latency_round_trips_and_is_optional() {
     assert_eq!(HOST_LATENCY_SERIES.len(), 9);
 }
 
+// T41 (ADR 0023 §8): a TensorFold latency report converts.
+#[test]
+fn tensorfold_latency_round_trips() {
+    let latency = SampleLatency {
+        engine: Some("tensorfold".into()),
+        histograms: vec![("engine_e2e_request_latency".into(), observed(&[0.3]))],
+    };
+    let decoded = LoadReport::try_from(wire(Some(latency.clone()))).unwrap();
+    assert_eq!(decoded.samples[0].latency.as_ref(), Some(&latency));
+}
+
 // SPEC §17: unknown or repeated series, an unknown engine, an empty delta and
 // an inconsistent histogram each refuse the whole report.
 #[test]
