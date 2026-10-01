@@ -96,6 +96,52 @@ fn recipe_peaks_cover_each_adjacent_phase() {
     assert_eq!(validate_recipe(&recipe), Err(ResourceError::Invalid));
 }
 
+// T26 T27, SPEC §7.3: start and wake completions write the Ready footprint
+// without admission, so Ready may claim no device its peak phases lack. Found
+// by the formal review (formal/CapyFormal/Completion.lean): a cold phase with
+// no device and a Ready phase holding gpu0 exclusively put a second exclusive
+// owner on a GPU.
+#[test]
+fn recipe_peaks_cover_each_adjacent_phase_device_claims() {
+    let claim = |sharing| DeviceClaim {
+        device: "gpu0".into(),
+        sharing,
+    };
+    let f = |phase, bytes, devices: Vec<DeviceClaim>| PhaseFootprint {
+        phase,
+        allocations: vec![Allocation {
+            domain: "system".into(),
+            bytes,
+            host_kv_bytes: 0,
+        }],
+        devices,
+    };
+    let ex = || vec![claim(Sharing::Exclusive)];
+    let mut recipe = RecipeFootprints {
+        cold: f(ResourcePhase::Cold, 80, ex()),
+        ready: f(ResourcePhase::Ready, 60, ex()),
+        parking: f(ResourcePhase::Parking, 65, ex()),
+        parked: f(ResourcePhase::Parked, 8, vec![]),
+        wake: f(ResourcePhase::Wake, 70, ex()),
+    };
+    assert_eq!(validate_recipe(&recipe), Ok(()));
+    for drop in [0, 1, 2] {
+        let mut broken = recipe.clone();
+        match drop {
+            0 => broken.cold.devices.clear(),
+            1 => broken.parking.devices.clear(),
+            _ => broken.wake.devices.clear(),
+        }
+        assert_eq!(validate_recipe(&broken), Err(ResourceError::Invalid));
+    }
+    // A peak may hold a claim more strongly than Ready, never more weakly.
+    recipe.ready.devices = vec![claim(Sharing::Shared)];
+    assert_eq!(validate_recipe(&recipe), Ok(()));
+    recipe.ready.devices = ex();
+    recipe.cold.devices = vec![claim(Sharing::Shared)];
+    assert_eq!(validate_recipe(&recipe), Err(ResourceError::Invalid));
+}
+
 #[test]
 fn parked_and_timestamp_limits_are_enforced() {
     let state = LedgerSnapshot {
