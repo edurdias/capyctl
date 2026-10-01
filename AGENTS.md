@@ -55,24 +55,30 @@ became harder to audit than the code they described.
 
 ## Verification
 
-`scripts/ci-local.sh` is the required check before every commit and push. It
-mirrors the CI "CPU checks" job step for step: 4 cores (`taskset`), 16 GB
-(`systemd-run --user --scope` when available), the pinned shellcheck v0.11.0,
-and the pinned `torch_memory_saver` fixture archive (cached under
-`~/.cache/capyctl-ci/`). It builds into `target-ci`. Use `--list` to see steps,
-`--only <step>` to run one, `--no-limits` to skip the limits. The commands it
-runs are:
+CI "CPU checks" is a fast gate on a 4-core runner. Its steps, in order: fmt
+check, `scripts/check-name.sh`, workspace clippy (`cargo clippy --workspace
+--all-targets --locked -- -D warnings`), unit tests (`cargo test --workspace
+--lib --bins --locked --no-fail-fast`), runtime Python tests with the pinned
+`torch_memory_saver` fixture, pinned shellcheck v0.11.0, and
+`scripts/test-install.sh`. The integration suites are too heavy for that runner
+and run locally.
 
-Core suite (the authoritative run used for integration):
+- `scripts/ci-local.sh` (fast) runs exactly the CI steps in order under CI's
+  limits (4 cores via `taskset`, 16 GB via `systemd-run --user --scope` when
+  available, target dir `target-ci`, fixture archive cached under
+  `~/.cache/capyctl-ci/`). Run it before every push.
+- `scripts/ci-local.sh --deep` adds the authoritative core suite
+  (`cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller
+  -p capyctl-management -p harness --all-targets --no-fail-fast --locked --
+  --test-threads=4`) and the full workspace suite (`cargo test --workspace
+  --all-targets --no-fail-fast --locked`). It is required before every merge
+  and in every final review, and its result goes in the PR body. Deep steps run
+  without limits in the normal `target` dir; `--ci-shape` applies the CI limits
+  to them too.
+- Other flags: `--list`, `--only <step>`, `--no-limits`.
 
-```bash
-cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller -p capyctl-management \
-  -p harness --all-targets --no-fail-fast --locked -- --test-threads=4
-```
-
-Also run `cargo test --workspace --all-targets --locked`. Clippy must pass with
-warnings denied across those crates. Formatting must pass: `cargo fmt --all --check`. Installer changes also run
-`scripts/test-install.sh`; packaging changes run `scripts/verify-packaging.sh`.
+Installer changes also run `scripts/test-install.sh`; packaging changes run
+`scripts/verify-packaging.sh`.
 
 One owned-state test spawns a child process that reports a nested summary; the
 distinct test total excludes that duplicate.
