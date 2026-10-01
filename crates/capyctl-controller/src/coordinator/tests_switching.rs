@@ -14,6 +14,11 @@ use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milesto
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicI64;
 
+// SPEC §10 (amended 2026-10-01): cancelling leases of hung-up requests, on
+// this lab's engines.
+#[path = "tests_cancellation.rs"]
+mod cancellation;
+
 /// Every deployment's engine: Initialize through the Fake lifecycle, park and
 /// restore answered with the facts a remote host proves (W4).
 struct Scripted {
@@ -26,6 +31,11 @@ struct Scripted {
     /// Refuse every park before any effect (an engine without a verified
     /// release path).
     refuse_park: AtomicBool,
+    /// SPEC §10 (amended 2026-10-01): whether the engine's own counters read
+    /// no running and no waiting request.
+    quiet: AtomicBool,
+    /// The `after_ms` of every quiescence question.
+    asked: Mutex<Vec<i64>>,
 }
 
 impl Scripted {
@@ -35,6 +45,8 @@ impl Scripted {
             clock,
             calls: Mutex::new(vec![]),
             refuse_park: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
+            asked: Mutex::new(vec![]),
         })
     }
     fn calls(&self, action: RuntimeAction, deployment: &str) -> usize {
@@ -129,6 +141,10 @@ impl EngineAdapter for Scripted {
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
+    }
+    async fn engine_quiescent(&self, _: &MemberRef, after_ms: i64) -> bool {
+        self.asked.lock().unwrap().push(after_ms);
+        self.quiet.load(Ordering::SeqCst)
     }
 }
 
