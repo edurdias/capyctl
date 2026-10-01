@@ -226,6 +226,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     const LOCAL_ENGINE: FieldSpec = FieldSpec::Struct(&[
         ("vllm", SCALAR),
         ("sglang", SCALAR),
+        ("tensorfold", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),

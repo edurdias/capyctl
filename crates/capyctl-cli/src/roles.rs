@@ -54,6 +54,7 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 /// both set publish two profiles, `local-vllm` and `local-sglang`.
 const ENGINE_BIN: &str = capyctl_config::engine_settings::VLLM_BIN_ENV;
 const SGLANG_BIN: &str = capyctl_config::engine_settings::SGLANG_BIN_ENV;
+const TENSORFOLD_BIN: &str = capyctl_config::engine_settings::TENSORFOLD_BIN_ENV;
 /// The directory model weights live under (Spec §7). Optional (owner decision
 /// 2026-09-25): `~/models` unless `--models-root`, this variable or
 /// `host.model_store.path` names another.
@@ -910,7 +911,21 @@ impl EnvEngineProvider {
         let settings = self.settings()?;
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
-        let deep_park = deep_park.unwrap_or(settings.deep_park);
+        let mut deep_park = deep_park.unwrap_or(settings.deep_park);
+        // R1 (ADR 0023 §2, §6): an environment TensorFold install is checked
+        // for its build toolchain as `engine add` checks it, and never parks.
+        if engine == Engine::Tensorfold {
+            deep_park = false;
+            if fingerprint.is_none() {
+                let bin = executable.parent().unwrap_or(Path::new(""));
+                capyctl_config::toolchain::check(
+                    bin,
+                    settings.cuda_home.as_deref(),
+                    capyctl_config::toolchain::SYSTEM_PATH,
+                )
+                .map_err(|missing| no_installation(format!("toolchain_missing: {missing}")))?;
+            }
+        }
         let trust_remote_code = settings.trust_remote_code;
         let installation_drift = settings.installation_drift;
         let engine_ports = settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS);
@@ -966,13 +981,13 @@ impl EngineProvider for EnvEngineProvider {
     /// set this is the vLLM one; [`Self::installations`] publishes both.
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
         let settings = self.settings()?;
-        match (settings.vllm, settings.sglang) {
-            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm),
-            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang),
-            (None, None) => Err(no_installation(format!(
+        match settings.installations().into_iter().next() {
+            Some((_, engine, executable)) => self.role_installation(engine, executable),
+            None => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang, or --vllm-bin / --sglang-bin, or host.local_engine) to \
-                 the engine's executable"
+                 for SGLang, {TENSORFOLD_BIN} for TensorFold, or --vllm-bin / \
+                 --sglang-bin / --tensorfold-bin, or host.local_engine) to the \
+                 engine's executable"
             ))),
         }
     }
@@ -1025,8 +1040,9 @@ impl EngineProvider for EnvEngineProvider {
         }
         if all.is_empty() {
             return Err(no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} (or \
-                 --vllm-bin / --sglang-bin, or host.local_engine) to the engine's \
+                "this host declares no engine: set {ENGINE_BIN}, {SGLANG_BIN} or \
+                 {TENSORFOLD_BIN} (or --vllm-bin / --sglang-bin / --tensorfold-bin, \
+                 or host.local_engine) to the engine's \
                  executable, or register one with `capyctl engine add`"
             )));
         }
@@ -1215,7 +1231,14 @@ fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
         // The child has exited, so this reads what it left in the pipe and returns.
         let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
     }
-    let fingerprint = printed.trim().to_owned();
+    // `tensorfold 0.6.0` publishes `0.6.0`, as `engine add` records it.
+    let fingerprint = printed
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .and_then(|line| line.split_whitespace().last())
+        .unwrap_or_default()
+        .to_owned();
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
             "{} printed no version, so there is nothing to pin this recipe to; set \

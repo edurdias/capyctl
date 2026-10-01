@@ -305,7 +305,7 @@ async fn add(
     // Owner rule 2026-09-25: on a host as in standalone, these names are the
     // role's own installation (`local_engine`, `--vllm-bin`, `CAPYCTL_VLLM_BIN`).
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN or local_engine); use --name")));
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     let existing =
@@ -503,7 +503,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN or local_engine); unset it and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     let engines =

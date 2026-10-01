@@ -138,7 +138,8 @@ list, which has no flag or variable form: state it in the document.
 ## Engine installation
 
 These describe the role's own engine installation. One executable is published
-as the runtime profile `local`; both as `local-vllm` and `local-sglang`. On a
+as the runtime profile `local`; several as `local-vllm`, `local-sglang` and
+`local-tensorfold`. On a
 host the profile is added to the document the host publishes, beside the
 profiles in `runtime_profiles` and the ones registered with `capyctl engine add`;
 a name stated twice is refused. The switches below apply to the `local`
@@ -149,6 +150,7 @@ block.
 |---|---|---|---|---|---|
 | vLLM executable | `local_engine.vllm` | `--vllm-bin <path>` | `CAPYCTL_VLLM_BIN` | none | host, standalone |
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
+| TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
@@ -162,7 +164,7 @@ block.
 A host generates no deployment of its own, so `--kv-cache` exists only on
 `start standalone`; on a host, `local_engine.kv_cache` is refused and each
 deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
-arguments, so `args` applies to the vLLM profile only. Name `runtime_dir` only
+arguments, so `args` applies to the vLLM and TensorFold profiles only. Name `runtime_dir` only
 to run from a directory you maintain yourself; CapyCTL never writes to it.
 
 A running host or standalone takes its engine and model settings at start. A

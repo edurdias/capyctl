@@ -10,6 +10,7 @@
 //! |---|---|---|---|
 //! | vLLM executable | `local_engine.vllm` | `--vllm-bin` | `CAPYCTL_VLLM_BIN` |
 //! | SGLang executable | `local_engine.sglang` | `--sglang-bin` | `CAPYCTL_SGLANG_BIN` |
+//! | TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin` | `CAPYCTL_TENSORFOLD_BIN` |
 //! | build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint` | `CAPYCTL_ENGINE_FINGERPRINT` |
 //! | host-fixed vLLM args | `local_engine.args` | `--engine-args` | `CAPYCTL_ENGINE_ARGS` |
 //! | KV cache (standalone) | `local_engine.kv_cache` | `--kv-cache` | `CAPYCTL_KV_CACHE_BYTES` |
@@ -21,8 +22,8 @@
 //! | CUDA toolkit | `local_engine.cuda_home` | `--cuda-home` | `CAPYCTL_CUDA_HOME` |
 //!
 //! The `local_engine` executables declare the role's unnamed installation:
-//! one of them is the runtime profile `local`, both are `local-vllm` and
-//! `local-sglang` (ADR 0018 §5). The switches in `local_engine` apply to
+//! one of them is the runtime profile `local`; several are `local-vllm`,
+//! `local-sglang` and `local-tensorfold` (ADR 0018 §5, ADR 0023 §2). The switches in `local_engine` apply to
 //! those profiles only; a profile declared in `runtime_profiles` or
 //! registered with `capyctl engine add` states its own. `CAPYCTL_ENGINE_PORTS`
 //! replaces the standalone-only `CAPYCTL_STANDALONE_ENGINE_PORTS`, which is
@@ -38,6 +39,7 @@ use crate::{ConfigError, ConfigErrorCode};
 
 pub const VLLM_BIN_ENV: &str = "CAPYCTL_VLLM_BIN";
 pub const SGLANG_BIN_ENV: &str = "CAPYCTL_SGLANG_BIN";
+pub const TENSORFOLD_BIN_ENV: &str = "CAPYCTL_TENSORFOLD_BIN";
 pub const ENGINE_FINGERPRINT_ENV: &str = "CAPYCTL_ENGINE_FINGERPRINT";
 pub const ENGINE_ARGS_ENV: &str = "CAPYCTL_ENGINE_ARGS";
 pub const KV_CACHE_ENV: &str = "CAPYCTL_KV_CACHE_BYTES";
@@ -68,6 +70,7 @@ fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
 pub struct EngineOverrides {
     pub vllm: Option<PathBuf>,
     pub sglang: Option<PathBuf>,
+    pub tensorfold: Option<PathBuf>,
     pub build_fingerprint: Option<String>,
     pub args: Option<Vec<String>>,
     pub kv_cache: Option<String>,
@@ -85,6 +88,7 @@ impl EngineOverrides {
         Self {
             vllm: self.vllm.or(lower.vllm),
             sglang: self.sglang.or(lower.sglang),
+            tensorfold: self.tensorfold.or(lower.tensorfold),
             build_fingerprint: self.build_fingerprint.or(lower.build_fingerprint),
             args: self.args.or(lower.args),
             kv_cache: self.kv_cache.or(lower.kv_cache),
@@ -99,7 +103,7 @@ impl EngineOverrides {
 
     /// Whether this layer names an engine executable.
     pub fn names_an_engine(&self) -> bool {
-        self.vllm.is_some() || self.sglang.is_some()
+        self.vllm.is_some() || self.sglang.is_some() || self.tensorfold.is_some()
     }
 
     /// The environment's layer, read through `get` (the raw value; `None`
@@ -120,6 +124,7 @@ impl EngineOverrides {
         Ok(Self {
             vllm: text(VLLM_BIN_ENV).map(PathBuf::from),
             sglang: text(SGLANG_BIN_ENV).map(PathBuf::from),
+            tensorfold: text(TENSORFOLD_BIN_ENV).map(PathBuf::from),
             build_fingerprint: text(ENGINE_FINGERPRINT_ENV),
             args: text(ENGINE_ARGS_ENV).map(|value| split_args(&value)),
             kv_cache: text(KV_CACHE_ENV)
@@ -231,6 +236,7 @@ impl EngineOverrides {
         Ok(Self {
             vllm: path_of(local.get("vllm"), "local_engine.vllm")?,
             sglang: path_of(local.get("sglang"), "local_engine.sglang")?,
+            tensorfold: path_of(local.get("tensorfold"), "local_engine.tensorfold")?,
             build_fingerprint: text_of("build_fingerprint")?,
             args,
             kv_cache: text_of("kv_cache")?
@@ -365,6 +371,7 @@ pub fn deprecation_warnings(get: &dyn Fn(&str) -> Option<String>) -> Vec<String>
 pub struct EngineSettings {
     pub vllm: Option<PathBuf>,
     pub sglang: Option<PathBuf>,
+    pub tensorfold: Option<PathBuf>,
     /// Stated, or `None`: the role asks the engine (`<engine> --version`).
     pub build_fingerprint: Option<String>,
     pub args: Vec<String>,
@@ -396,6 +403,7 @@ pub fn resolve(
     EngineSettings {
         vllm: merged.vllm,
         sglang: merged.sglang,
+        tensorfold: merged.tensorfold,
         build_fingerprint: merged.build_fingerprint,
         args: merged.args.unwrap_or_default(),
         kv_cache: merged.kv_cache,
@@ -409,18 +417,31 @@ pub fn resolve(
 }
 
 impl EngineSettings {
-    /// ADR 0018 §5: the role's own installations and their profile names:
-    /// one executable is `local`, both are `local-vllm` and `local-sglang`.
+    /// ADR 0018 §5, ADR 0023 §2: the role's own installations and their
+    /// profile names: one executable is `local`; several are `local-<engine>`.
     pub fn installations(&self) -> Vec<(&'static str, Engine, PathBuf)> {
-        match (&self.vllm, &self.sglang) {
-            (Some(vllm), None) => vec![("local", Engine::Vllm, vllm.clone())],
-            (None, Some(sglang)) => vec![("local", Engine::Sglang, sglang.clone())],
-            (Some(vllm), Some(sglang)) => vec![
-                ("local-vllm", Engine::Vllm, vllm.clone()),
-                ("local-sglang", Engine::Sglang, sglang.clone()),
-            ],
-            (None, None) => Vec::new(),
+        let named: Vec<(Engine, PathBuf)> = [
+            (Engine::Vllm, &self.vllm),
+            (Engine::Sglang, &self.sglang),
+            (Engine::Tensorfold, &self.tensorfold),
+        ]
+        .into_iter()
+        .filter_map(|(engine, path)| path.clone().map(|path| (engine, path)))
+        .collect();
+        if let [(engine, path)] = named.as_slice() {
+            return vec![("local", *engine, path.clone())];
         }
+        named
+            .into_iter()
+            .map(|(engine, path)| {
+                let name = match engine {
+                    Engine::Vllm => "local-vllm",
+                    Engine::Sglang => "local-sglang",
+                    Engine::Tensorfold => "local-tensorfold",
+                };
+                (name, engine, path)
+            })
+            .collect()
     }
 }
 
@@ -430,7 +451,7 @@ impl EngineSettings {
 /// - `runtime_dir` and `resource_policy.endpoint_port_range` are stated when a
 ///   layer names them;
 /// - the `local_engine` executables become the runtime profiles `local` (or
-///   `local-vllm` and `local-sglang`), built exactly as `capyctl engine add`
+///   `local-vllm`, `local-sglang` and `local-tensorfold`), built exactly as `capyctl engine add`
 ///   builds a profile ([`crate::registration::profile_document`]), with the
 ///   fingerprint stated or read by `probe` from `<engine> --version`. A name
 ///   the document already declares is refused (`profile_exists`);
@@ -480,8 +501,8 @@ pub fn apply_to_host(
                 format!("runtime_profiles.{name}"),
                 format!(
                     "profile_exists: {name} is declared in runtime_profiles (or engines.yaml) \
-                     and also named by local_engine, --vllm-bin/--sglang-bin or \
-                     CAPYCTL_VLLM_BIN/CAPYCTL_SGLANG_BIN; remove one"
+                     and also named by local_engine, --vllm-bin/--sglang-bin/--tensorfold-bin or \
+                     CAPYCTL_VLLM_BIN/CAPYCTL_SGLANG_BIN/CAPYCTL_TENSORFOLD_BIN; remove one"
                 ),
             ));
         }
@@ -494,6 +515,23 @@ pub fn apply_to_host(
                 )
             })?,
         };
+        // R1 (ADR 0023 §2): the first start builds CUDA extensions, so the
+        // toolchain is checked here as `engine add` checks it.
+        if engine == Engine::Tensorfold {
+            let bin = executable.parent().unwrap_or(Path::new(""));
+            crate::toolchain::check(
+                bin,
+                settings.cuda_home.as_deref(),
+                crate::toolchain::SYSTEM_PATH,
+            )
+            .map_err(|missing| {
+                ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    format!("runtime_profiles.{name}"),
+                    format!("toolchain_missing: {missing}"),
+                )
+            })?;
+        }
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
             Engine::Vllm | Engine::Tensorfold => settings.args.clone(),
@@ -504,7 +542,8 @@ pub fn apply_to_host(
                 engine,
                 executable,
                 build_fingerprint,
-                deep_park: settings.deep_park,
+                // ADR 0023 §6: TensorFold never parks, whatever local_engine.deep_park says.
+                deep_park: settings.deep_park && engine != Engine::Tensorfold,
                 installation_drift: settings.installation_drift,
                 args,
                 cuda_home: settings.cuda_home.clone(),
@@ -638,6 +677,22 @@ mod tests {
                     "Some(\"/flag/vllm\")",
                     "Some(\"/env/vllm\")",
                     "Some(\"/yaml/vllm\")",
+                    "None",
+                ],
+            ),
+            (
+                "tensorfold",
+                EngineOverrides {
+                    tensorfold: Some("/flag/tensorfold".into()),
+                    ..Default::default()
+                },
+                vec![(TENSORFOLD_BIN_ENV, "/env/tensorfold")],
+                json!({"local_engine": {"tensorfold": "/yaml/tensorfold"}}),
+                |s| format!("{:?}", s.tensorfold),
+                [
+                    "Some(\"/flag/tensorfold\")",
+                    "Some(\"/env/tensorfold\")",
+                    "Some(\"/yaml/tensorfold\")",
                     "None",
                 ],
             ),
@@ -955,6 +1010,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain, before);
+    }
+
+    fn defaults() -> EngineSettings {
+        resolve(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    // T41 T03 (ADR 0023 §2): one executable is `local`; several are named by
+    // their engine.
+    #[test]
+    fn tensorfold_installations_are_named_like_the_others() {
+        let one = EngineSettings {
+            tensorfold: Some("/t/bin/tensorfold".into()),
+            ..defaults()
+        };
+        assert_eq!(
+            one.installations(),
+            vec![("local", Engine::Tensorfold, "/t/bin/tensorfold".into())]
+        );
+        let two = EngineSettings {
+            vllm: Some("/v/bin/vllm".into()),
+            tensorfold: Some("/t/bin/tensorfold".into()),
+            ..defaults()
+        };
+        assert_eq!(
+            two.installations(),
+            vec![
+                ("local-vllm", Engine::Vllm, "/v/bin/vllm".into()),
+                (
+                    "local-tensorfold",
+                    Engine::Tensorfold,
+                    "/t/bin/tensorfold".into()
+                ),
+            ]
+        );
+    }
+
+    // T41 (ADR 0023 §2, §6; ruling R1): a host's own TensorFold needs its
+    // build toolchain and never parks, whatever deep_park says.
+    #[test]
+    fn a_host_tensorfold_is_checked_and_never_parks() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let settings = EngineSettings {
+            tensorfold: Some(bin.join("tensorfold")),
+            build_fingerprint: Some("0.6.0".into()),
+            deep_park: true,
+            ..defaults()
+        };
+        let system_has_ninja = crate::toolchain::SYSTEM_PATH
+            .split(':')
+            .any(|d| Path::new(d).join("ninja").is_file());
+        if !system_has_ninja {
+            let error = apply_to_host(&mut json!({}), &settings, &|_| unreachable!()).unwrap_err();
+            assert!(error.detail.contains("toolchain_missing"), "{error}");
+            assert!(error.detail.contains("ninja"), "{error}");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for tool in ["ninja", "nvcc", "c++"] {
+            let path = bin.join(tool);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut document = json!({});
+        apply_to_host(&mut document, &settings, &|_| unreachable!()).unwrap();
+        let profile = &document["runtime_profiles"]["local"];
+        assert_eq!(profile["engine"], "tensorfold");
+        assert_eq!(profile["security"]["deep_park"], "disabled");
     }
 
     // T03 (ADR 0018 §3): a live reload keeps what the host resolved at start.

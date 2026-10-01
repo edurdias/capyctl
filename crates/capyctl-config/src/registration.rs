@@ -330,8 +330,9 @@ pub fn is_verified(engine: Engine, version: &str) -> bool {
 }
 
 /// ADR 0018 §5: the profile names standalone gives its environment-variable
-/// installations (`CAPYCTL_VLLM_BIN` / `CAPYCTL_SGLANG_BIN`).
-pub const ENVIRONMENT_PROFILES: &[&str] = &["local", "local-vllm", "local-sglang"];
+/// installations (`CAPYCTL_VLLM_BIN`, `CAPYCTL_SGLANG_BIN` and `CAPYCTL_TENSORFOLD_BIN`).
+pub const ENVIRONMENT_PROFILES: &[&str] =
+    &["local", "local-vllm", "local-sglang", "local-tensorfold"];
 
 /// ADR 0018 §1: short lowercase identifiers, safe in a JSON path and a
 /// status table.
