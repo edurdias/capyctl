@@ -449,7 +449,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
             r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string(),
         ] {
             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), sink.send(chunk)).await, Ok(Ok(()))) {
-                break;
+                return Ok(capyctl_adapters::traits::StreamEnded::Cancelled);
             }
         }
         // This ordinary fake generates no external work to reconcile.

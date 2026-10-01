@@ -431,6 +431,11 @@ pub trait OwnedProcessLaunch: Send + Sync {
 pub enum StreamEnded {
     Completed,
     BackendClosed,
+    /// SPEC §10 (amended 2026-10-01): the sink failed, the forwarder stopped
+    /// reading and closed the engine connection, and no terminator was
+    /// observed. Completion is unproven; the closed socket asked the engine
+    /// to abort.
+    Cancelled,
 }
 
 /// Downstream delivery failed; this says nothing about backend completion.
@@ -441,9 +446,9 @@ pub struct DeliveryFailed;
 #[async_trait]
 pub trait ChatSink: Send {
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed>;
-    /// SPEC §10: the backend produced one more event, whether or not it is
-    /// delivered (a stream still drains after its client left). The caller that
-    /// bounds a stream measures idleness from these, never from wall time.
+    /// SPEC §10: the backend produced one more event read by the forwarder.
+    /// No events are read after a failed delivery. The caller that bounds a
+    /// stream measures idleness from these, never from wall time.
     fn progressed(&mut self) {}
 }
 
@@ -452,9 +457,9 @@ pub trait ChatSink: Send {
 /// the router; forwarders return decoded data payloads.
 #[async_trait]
 pub trait ChatForward: Send + Sync {
-    /// Await delivery in order. On sink failure or timeout, stop delivery and
-    /// drain the backend, reporting each backend event through
-    /// [`ChatSink::progressed`]. Completed describes only the backend protocol
+    /// Await delivery in order, reporting each backend event read through
+    /// [`ChatSink::progressed`]. On sink failure or timeout, stop reading and
+    /// close the backend connection, returning StreamEnded::Cancelled. Completed describes only the backend protocol
     /// terminator, never successful downstream delivery. The caller bounds the
     /// stream (SPEC §10: the router's request deadline and idle bound); this
     /// method adds no wall-clock cap of its own.

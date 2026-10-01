@@ -455,7 +455,6 @@ impl ChatHttp {
         }
         let mut stream = response.bytes_stream();
         let mut parser = Parser::new(&self.model, public);
-        let mut delivery_failed = false;
         loop {
             let next = match read_idle {
                 Some(idle) => tokio::time::timeout(idle, stream.next())
@@ -471,14 +470,19 @@ impl ChatHttp {
                 let mut payload = None;
                 let done = parser.byte(byte, &mut |chunk| payload = Some(chunk))?;
                 if payload.is_some() || done {
-                    // Progress is the backend's, delivered or drained.
                     sink.progressed();
                 }
-                if let Some(chunk) = payload.filter(|_| !delivery_failed) {
-                    delivery_failed = !matches!(
+                if let Some(chunk) = payload {
+                    let sink_failed = !matches!(
                         tokio::time::timeout(Duration::from_secs(10), sink.send(chunk)).await,
                         Ok(Ok(()))
                     );
+                    // SPEC §10 (amended 2026-10-01): a client that left is not proof the engine
+                    // stopped, so the engine is asked to stop: the connection closes here and
+                    // the lease stays charged until the engine reports quiescence.
+                    if sink_failed {
+                        return Ok(StreamEnded::Cancelled);
+                    }
                 }
                 if done {
                     return Ok(StreamEnded::Completed);
