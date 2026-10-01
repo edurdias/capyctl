@@ -277,3 +277,42 @@ async fn group_commit_bounds_the_latency_a_dispatch_pays() {
     println!("request lease overhead uncontended (grant+close): p50={p50:?} p99={p99:?}");
     assert!(p99 < Duration::from_millis(500), "p99 overhead {p99:?}");
 }
+
+// T17 T19, SPEC §10: the writer sent the grant, but the caller's future was
+// dropped before it polled the reply (a client disconnect while the answer
+// was in flight). The ticket never reached the router, so its lease is closed
+// as never accepted, with nothing else queued behind it. Found by the formal
+// review (formal/CapyFormal/Protocols.lean, `Lease`).
+#[tokio::test]
+async fn a_grant_sent_but_never_taken_is_closed_as_not_accepted() {
+    let f = fixture();
+    let (applied_tx, applied_rx) = std::sync::mpsc::channel::<()>();
+    let applied_tx = Mutex::new(applied_tx);
+    let inner = f.backend(Default::default());
+    let backend: LeaseBackend = Arc::new(move |writes: &[LeaseWrite]| {
+        let outcome = inner(writes);
+        let _ = applied_tx.lock().unwrap().send(());
+        outcome
+    });
+    let writer = RequestLeaseWriter::spawn(backend);
+    {
+        let mut grant = Box::pin(writer.open(&f.deployment, 8));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // The first poll queues the grant and waits for the reply.
+        assert!(std::future::Future::poll(grant.as_mut(), &mut cx).is_pending());
+        applied_rx.recv().unwrap();
+        // Let the writer send the reply, which succeeds: the receiver lives.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(f.leases().len(), 1, "the grant was committed");
+        // The caller goes away without polling again.
+    }
+    let started = Instant::now();
+    while !f.leases().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an untaken grant stayed charged: {:?}",
+            f.leases()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

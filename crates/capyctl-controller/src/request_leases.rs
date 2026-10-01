@@ -21,7 +21,8 @@
 //! corresponds to a lease already granted and the grants are bounded.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use capyctl_store::dispatch::{DispatchError, DispatchTicket, LeaseWrite, LeaseWriteOutcome};
 
@@ -35,6 +36,8 @@ pub const MAX_QUEUED_GRANTS: usize = 1024;
 /// The bound on outstanding leases across every deployment, inflight and
 /// uncertain together.
 pub const MAX_TOTAL_LEASES: usize = 4096;
+/// How long an idle writer waits before it looks for orphaned grants again.
+const ORPHAN_POLL: Duration = Duration::from_millis(50);
 
 /// One open durable lease. Not `Clone`: a lease is closed exactly once, by
 /// whoever holds it, and dropping it without closing leaves it charged.
@@ -111,9 +114,47 @@ type Outcomes = Result<Vec<Result<LeaseWriteOutcome, DispatchError>>, LifecycleF
 /// store under its current session; tests may supply a store directly.
 pub type LeaseBackend = Arc<dyn Fn(&[LeaseWrite]) -> Outcomes + Send + Sync>;
 
+/// Closes for grants nobody took, applied ahead of the writer's next batch.
+type Orphans = Arc<Mutex<Vec<LeaseWrite>>>;
+
+/// A granted ticket on its way to the caller. SPEC §10: a grant whose caller
+/// went away before taking it was never handed to the router, so nothing was
+/// dispatched under it. That is the evidence `NotAccepted` names, and dropping
+/// an untaken ticket queues its close. This covers a reply the writer could
+/// not send (the caller had already gone) and one it sent that the caller
+/// never polled (its future was dropped in between, for example on a client
+/// disconnect), which would otherwise stay charged until the session retires.
+struct Undelivered {
+    ticket: Option<DispatchTicket>,
+    orphans: Orphans,
+}
+
+impl Undelivered {
+    fn take(mut self) -> Option<DispatchTicket> {
+        self.ticket.take()
+    }
+}
+
+impl Drop for Undelivered {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.orphans
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(LeaseWrite::Finish(ticket));
+        }
+    }
+}
+
+/// The writer's answer to one job.
+enum Answer {
+    Granted(Undelivered),
+    Settled,
+}
+
 struct Job {
     write: LeaseWrite,
-    reply: tokio::sync::oneshot::Sender<Result<LeaseWriteOutcome, LeaseRefused>>,
+    reply: tokio::sync::oneshot::Sender<Result<Answer, LeaseRefused>>,
 }
 
 /// The group-commit writer. Dropping every handle ends its thread once the queue
@@ -207,8 +248,11 @@ impl RequestLeaseWriter {
             ));
         }
         match self.submit(write).await {
-            Ok(LeaseWriteOutcome::Granted(ticket)) => Ok(RequestLease::durable(ticket)),
-            Ok(LeaseWriteOutcome::Settled(_)) => {
+            Ok(Answer::Granted(granted)) => granted
+                .take()
+                .map(RequestLease::durable)
+                .ok_or_else(|| LeaseRefused::Unavailable("unexpected ledger answer".into())),
+            Ok(Answer::Settled) => {
                 Err(LeaseRefused::Unavailable("unexpected ledger answer".into()))
             }
             Err(refused) => Err(refused),
@@ -228,7 +272,7 @@ impl RequestLeaseWriter {
         self.submit(write).await.map(|_| ())
     }
 
-    async fn submit(&self, write: LeaseWrite) -> Result<LeaseWriteOutcome, LeaseRefused> {
+    async fn submit(&self, write: LeaseWrite) -> Result<Answer, LeaseRefused> {
         let grant = is_grant(&write);
         let (reply, answer) = tokio::sync::oneshot::channel();
         let sent = self
@@ -244,7 +288,8 @@ impl RequestLeaseWriter {
         // The writer answers every job it takes, including on a failed batch; a
         // dropped reply means the writer is gone, and the write's fate is then
         // unknown. For a grant that is harmless (nothing is dispatched without
-        // the ticket); a close that did not answer leaves the lease charged.
+        // the ticket, and an untaken ticket queues its own close); a close that
+        // did not answer leaves the lease charged.
         answer
             .await
             .unwrap_or_else(|_| Err(LeaseRefused::Unavailable("request ledger stopped".into())))
@@ -267,12 +312,14 @@ fn refusal(error: DispatchError) -> LeaseRefused {
 }
 
 fn run(receiver: mpsc::Receiver<Job>, backend: LeaseBackend, queued_grants: Arc<AtomicUsize>) {
-    // SPEC §10: closes for grants whose caller went away before the answer
-    // arrived. They join the next batch ahead of anything newly queued.
-    let mut orphaned: Vec<LeaseWrite> = Vec::new();
+    // SPEC §10: closes for grants whose caller went away before taking the
+    // ticket. They join the next batch ahead of anything newly queued.
+    let orphans: Orphans = Arc::default();
+    let mut disconnected = false;
     loop {
-        let mut batch: Vec<Job> = orphaned
-            .drain(..)
+        let pending = std::mem::take(&mut *orphans.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut batch: Vec<Job> = pending
+            .into_iter()
             .map(|write| Job {
                 write,
                 // Nobody waits on an orphan's close; its answer is dropped.
@@ -280,9 +327,19 @@ fn run(receiver: mpsc::Receiver<Job>, backend: LeaseBackend, queued_grants: Arc<
             })
             .collect();
         if batch.is_empty() {
-            match receiver.recv() {
+            if disconnected {
+                break;
+            }
+            // Wake now and then while idle: a ticket can be dropped after its
+            // reply was sent, with nothing else queued behind it.
+            match receiver.recv_timeout(ORPHAN_POLL) {
                 Ok(first) => batch.push(first),
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Flush what is orphaned before the thread ends.
+                    disconnected = true;
+                    continue;
+                }
             }
         }
         while batch.len() < MAX_BATCH {
@@ -298,16 +355,19 @@ fn run(receiver: mpsc::Receiver<Job>, backend: LeaseBackend, queued_grants: Arc<
         match outcomes {
             Ok(outcomes) if outcomes.len() == batch.len() => {
                 for (job, outcome) in batch.into_iter().zip(outcomes) {
-                    // SPEC §10: a grant whose caller dropped its future before
-                    // this answer arrived was never handed to the router, so
-                    // nothing was dispatched under it. That is the evidence
-                    // `NotAccepted` names: the lease is closed rather than left
-                    // charged until the session retires.
-                    if let Err(Ok(LeaseWriteOutcome::Granted(ticket))) =
-                        job.reply.send(outcome.map_err(refusal))
-                    {
-                        orphaned.push(LeaseWrite::Finish(ticket));
-                    }
+                    let answer = match outcome {
+                        Ok(LeaseWriteOutcome::Granted(ticket)) => {
+                            Ok(Answer::Granted(Undelivered {
+                                ticket: Some(ticket),
+                                orphans: orphans.clone(),
+                            }))
+                        }
+                        Ok(LeaseWriteOutcome::Settled(_)) => Ok(Answer::Settled),
+                        Err(error) => Err(refusal(error)),
+                    };
+                    // A reply that cannot be sent comes back and is dropped
+                    // here, which queues a grant's close as an orphan.
+                    let _ = job.reply.send(answer);
                 }
             }
             Ok(_) => {
