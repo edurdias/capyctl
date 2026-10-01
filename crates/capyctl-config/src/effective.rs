@@ -3,12 +3,14 @@
 mod checkpoint;
 mod core;
 mod current_policy;
+mod declared_resources;
 mod engine_config;
 mod legacy;
 mod snapshot;
 mod startup;
 mod timeouts;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
+pub use declared_resources::validate_declared_resources;
 pub use engine_config::{
     default_startup_bytes, host_backed_copy_bytes, overhead_margin, resolve_memory,
     resolve_startup, CheckpointFacts, MemoryInputs, ResolvedMemory,
@@ -929,6 +931,10 @@ struct RawLogPolicy {
     retained_files: u32,
 }
 
+const TENSORFOLD_NEEDS_RESOURCES: &str =
+    "a TensorFold deployment states resources: TensorFold sizes \
+    itself from free memory and has no flag that caps it";
+
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
     path: &str,
@@ -1066,8 +1072,7 @@ pub fn resolve_effective_with_checkpoint(
         return Err(ConfigError::new(
             ConfigErrorCode::MissingRequired,
             "resources",
-            "a TensorFold deployment states resources: TensorFold sizes itself from free \
-             memory and has no flag that caps it",
+            TENSORFOLD_NEEDS_RESOURCES,
         ));
     }
     let host = core::normalize_host(h)?;
