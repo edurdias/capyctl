@@ -1131,10 +1131,9 @@ pub async fn execute_with_start_options(
             // not report one leaves the view as it was.
             if let Ok((status, body)) = api.exchange(Method::GET, "/installation", None).await {
                 if status.is_success() && body["installation"].is_object() {
-                    // Final review M10 (found live): the installation this
-                    // deployment runs on, matched by the executable its
-                    // effective configuration names, not the host's first.
-                    let executable = match view["id"].as_str() {
+                    // Owner decision 2026-10-01: show what actually runs, the
+                    // installation the deployment's pinned profile names.
+                    let pinned = match view["id"].as_str() {
                         Some(deployment_id) => api
                             .exchange(
                                 Method::GET,
@@ -1144,14 +1143,19 @@ pub async fn execute_with_start_options(
                             .await
                             .ok()
                             .filter(|(status, _)| status.is_success())
-                            .and_then(|(_, effective)| {
-                                effective["effective"]["profile"]["executable"]
-                                    .as_str()
-                                    .map(str::to_owned)
-                            }),
+                            .map(|(_, effective)| effective["effective"]["profile"].clone()),
                         None => None,
                     };
-                    view["installation"] = installation_of(&body, executable.as_deref());
+                    if let Some(pinned) = pinned.filter(Value::is_object) {
+                        let (installation, note) = pinned_installation(&body, &pinned);
+                        view["installation"] = installation;
+                        if let Some(note) = note {
+                            view["engine_note"] = json!(note);
+                        }
+                    }
+                } else if status.is_success() && body["installation"].is_null() {
+                    // SPEC §8 (amended 2026-10-01): a role with no engine says how to add one.
+                    view["engine"] = json!(NO_ENGINE);
                 }
             }
             // Design §9: the inference listener's bind and authentication,
@@ -1208,20 +1212,51 @@ pub async fn execute_with_start_options(
     }
 }
 
-/// Final review M10: the installation a deployment runs on, from the
-/// embedded host's `/installation` view: the one whose executable its
-/// effective configuration names, else (an older server, or an unknown
-/// executable) the view's first installation as before.
-pub fn installation_of(view: &Value, executable: Option<&str>) -> Value {
-    executable
-        .and_then(|executable| {
-            view["installations"]
-                .as_array()?
-                .iter()
-                .find(|installation| installation["executable"].as_str() == Some(executable))
-                .cloned()
-        })
-        .unwrap_or_else(|| view["installation"].clone())
+/// What `status deployment` says on a role with no engine.
+pub const NO_ENGINE: &str = "none: run `capyctl engine add <path>`";
+
+/// The installation a deployment actually runs, from the embedded host's
+/// `/installation` view and the deployment's pinned effective profile (ADR
+/// 0018: a deployment is never re-resolved). The registered installation with
+/// the pinned executable, else the pinned engine as it is, marked
+/// `unregistered`, with a note naming the registered version to redeploy to.
+pub fn pinned_installation(view: &Value, pinned: &Value) -> (Value, Option<String>) {
+    let installations = view["installations"].as_array();
+    let executable = pinned["executable"].as_str().unwrap_or_default();
+    if let Some(found) = installations
+        .into_iter()
+        .flatten()
+        .find(|installation| installation["executable"].as_str() == Some(executable))
+    {
+        return (found.clone(), None);
+    }
+    let engine = pinned["engine"].as_str().unwrap_or("unknown");
+    let current = installations
+        .into_iter()
+        .flatten()
+        .find(|installation| installation["profile"].as_str() == Some(engine))
+        .or_else(|| {
+            view["installation"]
+                .is_object()
+                .then_some(&view["installation"])
+        });
+    let profile = current
+        .and_then(|c| c["profile"].as_str())
+        .unwrap_or(engine);
+    let mut note = format!("pinned to an engine no longer registered as {profile}");
+    if let Some(version) = current
+        .and_then(|c| c["version"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        note.push_str(&format!("; redeploy to use {version}"));
+    }
+    let installation = json!({
+        "profile": engine,
+        "executable": executable,
+        "version": pinned["build_fingerprint"],
+        "state": "unregistered",
+    });
+    (installation, Some(note))
 }
 
 /// A deployment document from `--file`, bounded and strictly parsed, with

@@ -283,29 +283,37 @@ fn delete_with_stop_stops_waits_and_deletes(state: &std::path::Path, id: &str) {
     assert!(!gone.status.success());
 }
 
-// T08 (final review M10, found live on the discrete-GPU laptop host): status
-// showed the host's first installation for every deployment. It shows the one
-// whose executable the deployment's effective configuration names, and falls
-// back to the first only when the server reports no match.
+// T08 (final review M10, then owner decision 2026-10-01 "show what actually
+// runs"): status shows the installation the deployment's pinned effective
+// profile names, never another installation. A pinned executable that is no
+// longer registered is shown as pinned, with a note.
 #[test]
-fn status_shows_the_installation_the_deployment_runs_on() {
+fn status_shows_the_engine_the_deployment_actually_runs() {
     let view = serde_json::json!({
         "installation": {"profile": "local", "executable": "/opt/vllm/bin/vllm"},
         "installations": [
-            {"profile": "local", "executable": "/opt/vllm/bin/vllm"},
-            {"profile": "sglang-main", "executable": "/opt/sglang/bin/python3"}
+            {"profile": "local", "executable": "/opt/vllm/bin/vllm", "version": "0.29"},
+            {"profile": "tensorfold", "executable": "/opt/tf061/bin/tensorfold", "version": "0.6.1"}
         ]
     });
+    let registered = serde_json::json!({
+        "engine": "vllm", "executable": "/opt/vllm/bin/vllm", "build_fingerprint": "0.29"
+    });
+    let (installation, note) = capyctl_cli::client::pinned_installation(&view, &registered);
+    assert_eq!(installation["profile"], "local");
+    assert_eq!(note, None);
+
+    let stale = serde_json::json!({
+        "engine": "tensorfold", "executable": "/opt/tf060/bin/tensorfold",
+        "build_fingerprint": "0.6.0"
+    });
+    let (installation, note) = capyctl_cli::client::pinned_installation(&view, &stale);
+    assert_eq!(installation["executable"], "/opt/tf060/bin/tensorfold");
+    assert_eq!(installation["version"], "0.6.0");
+    assert_eq!(installation["profile"], "tensorfold");
+    assert_eq!(installation["state"], "unregistered");
     assert_eq!(
-        capyctl_cli::client::installation_of(&view, Some("/opt/sglang/bin/python3"))["profile"],
-        "sglang-main"
-    );
-    assert_eq!(
-        capyctl_cli::client::installation_of(&view, Some("/elsewhere"))["profile"],
-        "local"
-    );
-    assert_eq!(
-        capyctl_cli::client::installation_of(&view, None)["profile"],
-        "local"
+        note.as_deref(),
+        Some("pinned to an engine no longer registered as tensorfold; redeploy to use 0.6.1")
     );
 }

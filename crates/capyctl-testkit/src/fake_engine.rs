@@ -36,6 +36,8 @@ struct Knobs {
     startup_delay: Option<Duration>,
     fail_at: Option<Phase>,
     ambiguous_park: bool,
+    /// SPEC §10 (amended 2026-10-01): the engine-wide counters read busy.
+    engine_busy: bool,
 }
 
 /// Deterministic engine simulator: one state per member (deployments on
@@ -65,6 +67,7 @@ impl FakeEngine {
                 startup_delay: None,
                 fail_at: None,
                 ambiguous_park: false,
+                engine_busy: false,
             }),
             states: Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
@@ -213,6 +216,12 @@ impl FakeEngine {
     /// lost (ambiguity injection).
     pub fn set_ambiguous_park(&self) {
         self.knobs.lock().unwrap().ambiguous_park = true;
+    }
+
+    /// Whether the engine's own counters read work (default: idle), as
+    /// [`EngineAdapter::engine_quiescent`] reports it.
+    pub fn set_engine_busy(&self, busy: bool) {
+        self.knobs.lock().unwrap().engine_busy = busy;
     }
 
     /// Sets the deep-park policy gate (default: [`ParkPolicy::Enabled`]).
@@ -429,6 +438,10 @@ impl EngineAdapter for FakeEngine {
             Ok(CancellationOutcome::Uncertain)
         }
     }
+
+    async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
+        !self.knobs.lock().unwrap().engine_busy
+    }
 }
 
 #[async_trait]
@@ -449,7 +462,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
             r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string(),
         ] {
             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), sink.send(chunk)).await, Ok(Ok(()))) {
-                break;
+                return Ok(capyctl_adapters::traits::StreamEnded::Cancelled);
             }
         }
         // This ordinary fake generates no external work to reconcile.

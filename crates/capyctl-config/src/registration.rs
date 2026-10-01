@@ -323,6 +323,7 @@ pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Sglang, "0.5.20"),
     // ADR 0023 §1.
     (Engine::Tensorfold, "0.6.0"),
+    (Engine::Tensorfold, "0.6.1"),
 ];
 
 pub fn is_verified(engine: Engine, version: &str) -> bool {

@@ -4,6 +4,9 @@ use capyctl_adapters::RuntimeError;
 use capyctl_adapters::{fake::ParkPolicy, vllm::VllmAdapter, ChatForward, StreamEnded};
 use capyctl_domain::launch::{NativeLaunch, NativeLaunchMetadata};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
 const MODEL: &str = "toy";
@@ -61,8 +64,10 @@ async fn backpressure_stops_parser_before_next_event_even_in_same_http_chunk() {
     }
 }
 
+// T17 T38, SPEC §10 (amended 2026-10-01): a client too slow to take a chunk
+// within the delivery timeout is cancelled like a hang-up.
 #[tokio::test]
-async fn timed_out_sink_is_not_called_again_but_backend_terminal_is_still_verified() {
+async fn a_timed_out_sink_cancels_the_stream() {
     let mut tasks = vec![];
     for sglang in [false, true] {
         tasks.push(tokio::spawn(async move {
@@ -86,7 +91,7 @@ async fn timed_out_sink_is_not_called_again_but_backend_terminal_is_still_verifi
             )
             .await
             .unwrap();
-            assert_eq!(result.unwrap(), StreamEnded::Completed);
+            assert_eq!(result.unwrap(), StreamEnded::Cancelled);
             server.abort();
         }));
     }
@@ -110,8 +115,10 @@ impl capyctl_adapters::traits::ChatSink for SlowSink {
     }
 }
 
+// T17 T38, SPEC §10 (amended 2026-10-01): a failed delivery cancels the
+// stream even when the backend would have finished.
 #[tokio::test]
-async fn async_sink_waits_in_order_and_failure_drains_without_resuming_delivery() {
+async fn async_sink_waits_in_order_and_failure_cancels() {
     for sglang in [false, true] {
         for fail in [false, true] {
             for terminal in [false, true] {
@@ -129,7 +136,11 @@ async fn async_sink_waits_in_order_and_failure_drains_without_resuming_delivery(
                 let result = adapter
                     .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
                     .await;
-                assert_eq!(matches!(result, Ok(StreamEnded::Completed)), terminal);
+                if fail {
+                    assert!(matches!(result, Ok(StreamEnded::Cancelled)), "{result:?}");
+                } else {
+                    assert_eq!(matches!(result, Ok(StreamEnded::Completed)), terminal);
+                }
                 assert_eq!(sink.chunks.len(), if fail { 1 } else { 2 });
                 assert_eq!(
                     serde_json::from_str::<Value>(&sink.chunks[0]).unwrap()["choices"][0]["delta"]
@@ -690,14 +701,11 @@ impl capyctl_adapters::traits::ChatSink for ProgressSink {
     }
 }
 
-/// SPEC §10: the router bounds a stream by idleness between backend events,
-/// never by fixed wall time (found live 2026-09-23, matrix M30: a fixed 300 s
-/// cap cut a progressing stream and left its lease uncertain). A stream that
-/// keeps draining after its client left still reports each backend event,
-/// so the router's idle bound does not cut a drain that is progressing.
-// T17
+/// SPEC §10 (amended 2026-10-01): after a failed delivery the forwarder
+/// reads nothing more, so no further backend progress is reported.
+// T17 T38
 #[tokio::test]
-async fn draining_stream_reports_backend_progress_after_delivery_failed() {
+async fn no_progress_is_reported_after_delivery_failed() {
     for sglang in [false, true] {
         let (adapter, task) = engine(
             sglang,
@@ -716,10 +724,131 @@ async fn draining_stream_reports_backend_progress_after_delivery_failed() {
         let result = adapter
             .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
             .await;
-        assert_eq!(result.unwrap(), StreamEnded::Completed);
+        assert_eq!(result.unwrap(), StreamEnded::Cancelled);
         assert_eq!(sink.delivered, 1, "delivery stops at the first failure");
-        // Three events and the terminator, all observed while draining.
-        assert_eq!(sink.progressed, 4);
+        // Only the failed event itself was observed.
+        assert_eq!(sink.progressed, 1);
         task.abort();
     }
+}
+
+/// An engine streaming `count` chunks 50 ms apart; `dropped` is set when the
+/// response body is dropped, which is how the server sees the socket close.
+async fn slow_engine(count: usize, dropped: Arc<AtomicBool>) -> String {
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let flag = Flag(dropped.clone());
+            async move {
+                let body = futures::stream::unfold((0usize, flag), move |(i, flag)| async move {
+                    if i > count {
+                        return None;
+                    }
+                    if i == count {
+                        return Some((
+                            Ok::<_, std::convert::Infallible>("data: [DONE]\n\n".to_string()),
+                            (i + 1, flag),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let finish = if i + 1 == count {
+                        json!("stop")
+                    } else {
+                        Value::Null
+                    };
+                    Some((Ok(chunk(&format!("t{i}"), finish)), (i + 1, flag)))
+                });
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+fn vllm_forwarder(base: &str) -> VllmAdapter {
+    VllmAdapter::new(
+        base.parse().unwrap(),
+        Some("inference-secret".into()),
+        "pin".into(),
+        ParkPolicy::Disabled,
+        MODEL.into(),
+    )
+}
+
+struct FailingAfter {
+    ok: usize,
+    delivered: usize,
+}
+#[async_trait::async_trait]
+impl capyctl_adapters::traits::ChatSink for FailingAfter {
+    async fn send(
+        &mut self,
+        _chunk: String,
+    ) -> Result<(), capyctl_adapters::traits::DeliveryFailed> {
+        if self.delivered >= self.ok {
+            return Err(capyctl_adapters::traits::DeliveryFailed);
+        }
+        self.delivered += 1;
+        Ok(())
+    }
+}
+
+// T17 T38, SPEC §10 (amended 2026-10-01): a failed delivery stops reading and
+// closes the engine connection; nothing more is delivered or replayed.
+#[tokio::test]
+async fn a_failed_delivery_cancels_upstream_without_draining() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let base = slow_engine(200, dropped.clone()).await;
+    let forward = vllm_forwarder(&base);
+    let mut sink = FailingAfter {
+        ok: 1,
+        delivered: 0,
+    };
+    let started = Instant::now();
+    let ended = forward
+        .forward_chat_stream_async(&json!({"model": "m", "stream": true}), &mut sink)
+        .await;
+    assert!(matches!(ended, Ok(StreamEnded::Cancelled)), "{ended:?}");
+    assert_eq!(sink.delivered, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the stream was not drained"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the engine saw its connection close"
+    );
+}
+
+// T17: a stream whose client stays connected still ends on the terminator.
+#[tokio::test]
+async fn a_connected_stream_still_completes_on_its_terminator() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let base = slow_engine(5, dropped).await;
+    let forward = vllm_forwarder(&base);
+    let mut sink = FailingAfter {
+        ok: usize::MAX,
+        delivered: 0,
+    };
+    let ended = forward
+        .forward_chat_stream_async(&json!({"model": "m", "stream": true}), &mut sink)
+        .await;
+    assert!(matches!(ended, Ok(StreamEnded::Completed)), "{ended:?}");
+    assert_eq!(sink.delivered, 5);
 }

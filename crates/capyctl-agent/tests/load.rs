@@ -555,3 +555,190 @@ tensorfold:time_to_first_token_seconds_count 2
     assert_eq!(engine, "tensorfold");
     assert_eq!(histograms[0].0, "engine_time_to_first_token");
 }
+
+// T41: 0.6.1 also mirrors its values under vLLM names; the load is the same
+// as the 0.6.0 body's and the engine is still tensorfold.
+#[test]
+fn tensorfold_061_vllm_mirrors_are_not_read() {
+    let own = "\
+tensorfold:requests_running 1
+tensorfold:requests_waiting 2
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.25
+tensorfold:kv_cache_usage_ratio{pool=\"1\"} 0.5
+tensorfold:request_latency_seconds_bucket{le=\"0.5\"} 1
+tensorfold:request_latency_seconds_bucket{le=\"+Inf\"} 2
+tensorfold:request_latency_seconds_sum 1.5
+tensorfold:request_latency_seconds_count 2
+";
+    let mirrored = format!(
+        "{own}\
+vllm:num_requests_running 7
+vllm:num_requests_waiting 8
+vllm:kv_cache_usage_perc{{stream=\"0\"}} 0.9
+vllm:e2e_request_latency_seconds_bucket{{le=\"+Inf\"}} 9
+vllm:e2e_request_latency_seconds_sum 9
+vllm:e2e_request_latency_seconds_count 9
+num_requests_running 7
+num_requests_waiting 8
+kv_cache_usage_perc{{stream=\"0\"}} 0.9
+"
+    );
+    let load = capyctl_agent::load::parse_engine_load(&mirrored).unwrap();
+    assert_eq!(Some(load), capyctl_agent::load::parse_engine_load(own));
+    assert_eq!(
+        (load.running, load.waiting, load.kv_usage_ppm),
+        (1, 2, 500_000)
+    );
+    let (engine, histograms) = capyctl_agent::load::parse_engine_histograms(&mirrored).unwrap();
+    assert_eq!(engine, "tensorfold");
+    assert_eq!(histograms.len(), 1);
+    assert_eq!(histograms[0].0, "engine_e2e_request_latency");
+}
+
+// T17 T41, ADR 0023 §6 (2026-10-01): a TensorFold sample is quiescent only
+// when /health reads idle too.
+#[test]
+fn a_tensorfold_sample_is_idle_only_when_health_agrees() {
+    use capyctl_adapters::tensorfold::http::HealthReport;
+    use capyctl_agent::load::fold_tensorfold_health;
+    use capyctl_protocol::reports::EngineLoad;
+    let zero = EngineLoad {
+        running: 0,
+        waiting: 0,
+        kv_usage_ppm: 0,
+    };
+    let busy = HealthReport {
+        ok: true,
+        busy: true,
+        requests_running: 0,
+    };
+    let idle = HealthReport {
+        ok: true,
+        busy: false,
+        requests_running: 0,
+    };
+    assert_eq!(fold_tensorfold_health(zero, Some(&busy)).running, 1);
+    assert_eq!(fold_tensorfold_health(zero, None).running, 1);
+    assert_eq!(fold_tensorfold_health(zero, Some(&idle)), zero);
+}
+
+const TENSORFOLD_IDLE_METRICS: &str = "\
+tensorfold:requests_running 0
+tensorfold:requests_waiting 0
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0
+";
+
+/// A fake TensorFold: keyed `/metrics` reading idle, unkeyed `/health` as given.
+async fn tensorfold(native: [u8; 32], health: &'static str) -> SocketAddr {
+    let expected = format!("Bearer {}", hex::encode(native));
+    let router = Router::new()
+        .route(
+            "/metrics",
+            get(move |headers: HeaderMap| {
+                let expected = expected.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&expected)
+                    {
+                        return (StatusCode::UNAUTHORIZED, String::new());
+                    }
+                    (StatusCode::OK, TENSORFOLD_IDLE_METRICS.to_owned())
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(move || async move {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    health,
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+// T17 T41, SPEC §10 (amended 2026-10-01): the host folds TensorFold's
+// /health into its load sample, so a busy engine never reports 0 running.
+#[tokio::test]
+async fn a_tensorfold_scrape_folds_in_health() {
+    let ingress = Ingress::new().unwrap();
+    let busy = scope("busy", 1);
+    let idle = scope("idle", 1);
+    register(
+        &ingress,
+        &busy,
+        tensorfold([2; 32], r#"{"ok":true,"busy":true,"requests_running":0}"#).await,
+        1,
+        [2; 32],
+    );
+    register(
+        &ingress,
+        &idle,
+        tensorfold([4; 32], r#"{"ok":true,"busy":false,"requests_running":0}"#).await,
+        3,
+        [4; 32],
+    );
+    for (s, handle) in [(&busy, "launch-b"), (&idle, "launch-i")] {
+        ingress.bind_handle(s, handle).unwrap();
+        ingress.open(s).unwrap();
+    }
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    assert_eq!(all[0].deployment_id, "busy");
+    assert_eq!(all[0].engine.unwrap().running, 1);
+    assert_eq!(all[1].deployment_id, "idle");
+    assert_eq!(all[1].engine.unwrap().running, 0);
+}
+
+// T41: a /health body that never ends is cut at the size bound, not read
+// until the scrape times out, and reads as unknown (busy), never idle.
+#[tokio::test]
+async fn an_oversized_health_body_is_cut_at_the_bound() {
+    let expected = format!("Bearer {}", hex::encode([6; 32]));
+    let router = Router::new()
+        .route(
+            "/metrics",
+            get(move |headers: HeaderMap| {
+                let expected = expected.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&expected)
+                    {
+                        return (StatusCode::UNAUTHORIZED, String::new());
+                    }
+                    (StatusCode::OK, TENSORFOLD_IDLE_METRICS.to_owned())
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(|| async {
+                let chunk = axum::body::Bytes::from(vec![b' '; 64 * 1024]);
+                let endless = futures::stream::repeat_with(move || {
+                    Ok::<_, std::convert::Infallible>(chunk.clone())
+                });
+                axum::body::Body::from_stream(endless)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let ingress = Ingress::new().unwrap();
+    let s = scope("endless", 1);
+    register(&ingress, &s, address, 1, [6; 32]);
+    ingress.bind_handle(&s, "launch-e").unwrap();
+    ingress.open(&s).unwrap();
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    let started = std::time::Instant::now();
+    let all = samples(reporter.reports().await);
+    let elapsed = started.elapsed();
+    assert_eq!(all[0].engine.unwrap().running, 1, "unknown health is busy");
+    assert!(
+        elapsed < load::SCRAPE_TIMEOUT * 2 / 3,
+        "read for {elapsed:?}, the bound is {:?}",
+        load::SCRAPE_TIMEOUT
+    );
+}

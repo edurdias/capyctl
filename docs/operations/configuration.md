@@ -198,7 +198,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 |---|---|
 | Role name, fingerprints | `name`, `hardware_fingerprint`, `environment_fingerprint` |
 | Enrollment addresses | server: `enrollment.bootstrap_address`, `enrollment.control_address` |
-| Idle, heartbeat, switching and shutdown bounds | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
+| Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
 | Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, and `endpoint_port_range`) |

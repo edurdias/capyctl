@@ -183,7 +183,7 @@ const SGLANG_RESERVED_ALIASES: &[&str] = &[
     "--grpc-http-sidecar-port",
 ];
 
-/// ADR 0023 §3: TensorFold 0.6.0 `serve` options capyctl renders or forbids
+/// ADR 0023 §3: TensorFold 0.6.0 and 0.6.1 `serve` options capyctl renders or forbids
 /// (`tensorfold/cli_args.py`). `--drafter` is not here: like other engines'
 /// draft model options it is an approved path option. `--tp`, `--rank`,
 /// `--master` and `--master-port` belong to multi-rank, which is out of scope.
@@ -208,7 +208,7 @@ const TENSORFOLD_TYPED_OPTIONS: &[(&str, &str)] = &[
     ("--max-tokens", "tensorfold.max_tokens"),
     ("--thinking", "tensorfold.thinking"),
 ];
-/// ADR 0023 §3: sensitive TensorFold 0.6.0 options. `--snapshot-dir` is
+/// ADR 0023 §3: sensitive TensorFold 0.6.0 and 0.6.1 options. `--snapshot-dir` is
 /// also reserved. `--drafter` is a path option exactly as SGLang's
 /// `--speculative-draft-model-path` (ADR 0014 §8, ADR 0023 §5): named approval,
 /// and a value inside `security.approved_paths`.

@@ -879,3 +879,50 @@ async fn a_separated_trace_with_the_exact_marker_still_passes() {
         .await
         .expect("a separated trace with the exact marker is usable");
 }
+
+/// A loopback SGLang `/metrics` that answers `body` to the inference key only.
+async fn sglang_metrics(body: &'static str) -> SglangAdapter {
+    let app = Router::new().route(
+        "/metrics",
+        axum::routing::get(move |headers: HeaderMap| async move {
+            if headers.get("authorization").and_then(|v| v.to_str().ok())
+                != Some("Bearer inference-secret")
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            body.into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    SglangAdapter::from_frozen(
+        &frozen_with(endpoint, capyctl_testkit::sglang_launch_settings()),
+        None,
+    )
+    .unwrap()
+    .with_credentials("inference-secret".into(), "admin-secret".into())
+}
+
+// T17 T22, SPEC §10 (amended 2026-10-01): a cancelled request is acknowledged
+// only by `sglang:num_running_reqs` and `sglang:num_queue_reqs` both at zero.
+#[tokio::test]
+async fn engine_quiescence_reads_both_sglang_gauges() {
+    let member = MemberRef {
+        deployment_id: "deployment".into(),
+        member_id: "member".into(),
+    };
+    let queued = sglang_metrics("sglang:num_running_reqs 0\nsglang:num_queue_reqs 2\n").await;
+    assert!(!queued.engine_quiescent(&member, now()).await);
+    let idle = sglang_metrics("sglang:num_running_reqs 0\nsglang:num_queue_reqs 0\n").await;
+    assert!(idle.engine_quiescent(&member, now()).await);
+    let unkeyed = SglangAdapter::from_frozen(
+        &frozen_with(
+            "http://127.0.0.1:1".into(),
+            capyctl_testkit::sglang_launch_settings(),
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(!unkeyed.engine_quiescent(&member, 0).await);
+}

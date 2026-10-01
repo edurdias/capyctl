@@ -104,9 +104,18 @@ pub(crate) fn banner_text(value: &Value) -> String {
                 _ => format!("{bind} (API key required)"),
             });
     let s = |key: &str| value[key].as_str().map(str::to_owned);
+    let engines = value["profiles"].as_array().map(|profiles| {
+        let names: Vec<&str> = profiles.iter().filter_map(Value::as_str).collect();
+        if names.is_empty() {
+            "none: run `capyctl engine add <path>`".to_owned()
+        } else {
+            names.join(", ")
+        }
+    });
     Detail::new(format!("capyctl {version} {role} ready"))
         .row_opt("Inference", inference)
         .row_opt("Management", s("management"))
+        .row_opt("Engines", engines)
         .row_opt("Bootstrap", s("bootstrap"))
         .row_opt("Control", s("control"))
         .row_opt("Ingress", s("ingress"))
@@ -205,6 +214,22 @@ mod tests {
         assert_eq!(
             stopped_text(&stopped_value),
             "capyctl standalone stopped: drained, 0 requests in flight; engines kept running\n"
+        );
+    }
+
+    // T02: the banner of a role with no engine names the command that adds one.
+    #[test]
+    fn a_banner_with_no_engine_names_engine_add() {
+        let text = banner_text(
+            &json!({"role": "standalone", "ready": true, "version": "0.1.1",
+            "inference": "0.0.0.0:8443", "inference_auth": "api_key", "management": "127.0.0.1:7443",
+            "state_dir": "/s", "credentials": "/s/identity/credentials", "profiles": []}),
+        );
+        assert!(
+            text.contains("Engines")
+                && text.contains("none")
+                && text.contains("capyctl engine add"),
+            "{text}"
         );
     }
 

@@ -874,6 +874,22 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
     assert!(!engines_of(&document).profiles.contains_key("tf-deep"));
 }
 
+// T41 T07: 0.6.1 is verified beside 0.6.0; an unknown 0.6.2 is custom.
+#[tokio::test]
+async fn tensorfold_061_is_verified_and_062_is_custom() {
+    for (version, custom) in [("0.6.1", false), ("0.6.2", true)] {
+        let dir = private_dir();
+        let env = tensorfold_env(&dir.path().join("tf"), version, &["ninja", "nvcc", "c++"]);
+        let document = host_doc(dir.path());
+        let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+        let out = execute(&add(&env), Some(&document), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out["version"], version, "{out}");
+        assert_eq!(out["custom"], custom, "{out}");
+    }
+}
+
 // T41 T03: a missing toolchain is refused before anything runs or is written.
 // The search names no system directory and no CUDA toolkit, so the result does
 // not depend on what this machine has installed.

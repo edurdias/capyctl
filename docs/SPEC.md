@@ -157,7 +157,7 @@ Host administrators register trusted runtime profiles, permitted devices and dir
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-Host administrators register runtime profiles with `capyctl engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; CapyCTL never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). CapyCTL still installs no engine.
+Host administrators register runtime profiles with `capyctl engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; CapyCTL never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). CapyCTL still installs no engine. *Amended 2026-10-01 (owner decision):* a host or standalone role starts with no engine profile. It publishes an empty profile list, keeps its deployments, places none until a profile exists, and its start banner and `capyctl status deployment <name>` name `capyctl engine add`. `engine remove` may remove the last registered profile through the same retirement.
 
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
@@ -444,7 +444,7 @@ Keep the current model ready across short tool-call gaps. Once another group wai
 
 Bound queues by requests and buffered bytes. Limit body size and memory retained by multimodal payloads. Do not buffer entire streaming responses. A waiting request gets no fake inference tokens or invented successful response. Client deadlines must include activation when appropriate.
 
-Normal switches do not kill live requests. A drain timeout fails the switch by default; force termination is separately authorized. Client disconnect is not proof the engine stopped working. Retain conservative accounting until cancellation acknowledgement, completion observation, or controlled cleanup. Never replay partially streamed inference or silently retry after uncertain backend acceptance.
+Normal switches do not kill live requests. A drain timeout fails the switch by default; force termination is separately authorized. Client disconnect is not proof the engine stopped working. *Amended 2026-10-01 (owner decision):* when a client hangs up mid-stream, the router stops reading and closes the engine connection, which vLLM, SGLang and TensorFold treat as an abort. The request stays charged as `cancelling` until the instance's adapter reports engine-wide quiescence, observed after the hang-up: no running and no waiting requests (vLLM and SGLang from their metrics, TensorFold from `/health` `requests_running: 0` and `busy: false`). That report is the cancellation acknowledgement. Park, idle park and switch drains wait for `cancelling` requests as for in-flight ones, and an engine that never reaches quiescence keeps the charge. Retain conservative accounting until cancellation acknowledgement, completion observation, or controlled cleanup. Never replay partially streamed inference or silently retry after uncertain backend acceptance.
 
 Management operations are durable; queued inference bodies and open streams are not promised to survive a server crash. Requests may fail during a router/server outage. Do not imply that a durable deployment ID makes inference exactly-once or resumable.
 
@@ -949,7 +949,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | ID | Scenario | Required evidence |
 |---|---|---|
 | T01 | Action-first parsing and role startup | Correct role selection; no accidental model start or remote host power-on semantics. |
-| T02 | Missing implicit configuration | Safe files/identity created once; local authenticated listeners; no engine execution. |
+| T02 | Missing implicit configuration | Safe files/identity created once; local authenticated listeners; no engine execution; a role with no engine profile boots with none and places nothing (§8, M75). |
 | T03 | Missing/invalid explicit config or duplicate YAML keys | Clear failure without fallback, file overwrite, or side effects. |
 | T04 | Concurrent initialization | Atomic creation; one state owner; no credential overwrite. |
 | T05 | Invitation enrollment | Server authenticated before secret exchange; one-use/expiry enforced; local key retained. |
@@ -964,7 +964,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T14 | Reserved flags/profile change | Conflicts fail; effective config shows provenance; a superseded binding identity is not reused. |
 | T15 | Simultaneous activation requests | Single activation operation and one group; no duplicate processes. |
 | T16 | A -> B -> A | Correct generations, model readiness, release evidence, and resource retention. |
-| T17 | Active streaming during swap | Drain honors completion/cancellation; no premature park or response replay. |
+| T17 | Active streaming during swap | Drain honors completion/cancellation; a client hang-up closes the engine connection and stays charged until engine quiescence; no premature park or response replay. |
 | T18 | Late ingress request | Stale generation/admission token rejected after closure. |
 | T19 | Fairness and queue bounds | Busy A cannot reset the window forever; byte/count limits and deadlines enforced. |
 | T20 | Park/reload timeout or partial failure | No blind repeated collective; reconcile, quarantine, or verified restart. |
@@ -1002,6 +1002,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 - 2026-10-01, [ADR 0023](design/adr/0023-tensorfold-engine.md): TensorFold as the third engine, `restart_only`, registered with `engine add` (§1, §9.3, §9.4, T41).
+- 2026-10-01, [live follow-ups](specs/2026-10-01-live-followups-design.md): Hugging Face link chains (ADR 0014 A5), a role with no engine (§8, T02, ADR 0018 A2), upstream cancel on client hang-up (§10, T17).
 
 ### Sources
 

@@ -43,7 +43,7 @@ use crate::output::{ExitCode, StructuredError};
 /// without depending on this binary. It is re-exported here because this is where
 /// standalone is wired.
 pub use capyctl_controller::engine_provider::{
-    EngineInstallation, EngineProvider, NamedInstallation, ProviderError,
+    EngineInstallation, EngineProvider, NamedInstallation, ProviderError, RoleSettings,
 };
 
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
@@ -582,7 +582,12 @@ impl App {
             .named()
             .into_iter()
             .next()
-            .ok_or_else(|| StartError::Deploy("the host publishes no engine".into()))?;
+            .ok_or_else(|| {
+                StartError::Deploy(
+                    "this role has no engine: register one with `capyctl engine add <path>`, then deploy"
+                        .into(),
+                )
+            })?;
         // Design §3: a discrete host sizes the deployment from the checkpoint's
         // weights; a unified host from its observed capacity, as before.
         let memory = match &self.gpu_shape {
@@ -668,9 +673,8 @@ pub enum StartError {
     Io(#[from] std::io::Error),
     #[error("credentials missing: refusing to serve without a generated api key")]
     MissingCredentials,
-    /// Spec §8: no engine installation, no boot. The message names what was
-    /// expected, because a host that cannot start an engine should say why rather
-    /// than come up serving nothing.
+    /// The message names what was expected, because a bare refusal leaves an
+    /// operator guessing.
     #[error("no engine installation: {0}")]
     NoEngineInstallation(String),
     /// ADR 0018 §5: an environment-variable profile and a registered one
@@ -899,29 +903,12 @@ impl EnvEngineProvider {
         fingerprint: Option<&str>,
         deep_park: Option<bool>,
     ) -> Result<EngineInstallation, ProviderError> {
-        // Owner decision 2026-09-25: the models directory is optional here.
-        // Unset, the installation names none (an empty path) and the role
-        // resolves `model_store.path` or `~/models` with the shared rule
-        // (`capyctl_config::model_settings`); set, it must be a directory.
-        let models_root = match env_value(MODELS_ROOT) {
-            None => PathBuf::new(),
-            Some(value) => {
-                let root = capyctl_config::model_settings::absolute(MODELS_ROOT, &value)
-                    .map_err(|error| no_installation(error.detail))?;
-                if !root.is_dir() {
-                    return Err(no_installation(format!(
-                        "{MODELS_ROOT} is not a directory: {}",
-                        root.display()
-                    )));
-                }
-                root
-            }
-        };
         // Owner rule 2026-09-25: every setting below is resolved flag >
         // environment > `host:` block > default (`engine_settings`); a
         // malformed value in any layer is refused, even when a registered
         // profile states its own.
         let settings = self.settings()?;
+        let role = self.role_settings()?;
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
         let mut deep_park = deep_park.unwrap_or(settings.deep_park);
@@ -933,7 +920,7 @@ impl EnvEngineProvider {
                 let bin = executable.parent().unwrap_or(Path::new(""));
                 capyctl_config::toolchain::check(
                     bin,
-                    settings.cuda_home.as_deref(),
+                    role.cuda_home.as_deref(),
                     &self.toolchain.system,
                 )
                 .map_err(|missing| {
@@ -943,7 +930,6 @@ impl EnvEngineProvider {
         }
         let trust_remote_code = settings.trust_remote_code;
         let installation_drift = settings.installation_drift;
-        let engine_ports = settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS);
         let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
             (Some(registered), _) => registered.to_owned(),
             (None, Some(declared)) => declared,
@@ -965,6 +951,7 @@ impl EnvEngineProvider {
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
         // cache; its memory request is the Ready allocation it declares.
         let engine_config = serde_json::json!({"memory": {"kv_cache": kv_cache_bytes}});
+        verify_runtime(&role.runtime_dir, engine, deep_park)?;
         Ok(EngineInstallation {
             engine,
             executable,
@@ -973,20 +960,12 @@ impl EnvEngineProvider {
             kv_cache_declared,
             deep_park,
             trust_remote_code,
-            models_root,
-            runtime_dir: runtime_dir(
-                engine,
-                deep_park,
-                settings.runtime_dir,
-                self.managed_runtime.as_deref(),
-            )?,
+            models_root: role.models_root,
+            runtime_dir: role.runtime_dir,
             args,
             installation_drift,
-            // SPEC §13.3 amendment (owner decision 2026-09-25): the role's own
-            // installation names its CUDA toolkit explicitly (`--cuda-home`,
-            // `CAPYCTL_CUDA_HOME` or `local_engine.cuda_home`); nothing is detected.
-            cuda_home: settings.cuda_home,
-            engine_ports,
+            cuda_home: role.cuda_home,
+            engine_ports: role.engine_ports,
         })
     }
 }
@@ -1005,6 +984,37 @@ impl EngineProvider for EnvEngineProvider {
                  engine's executable"
             ))),
         }
+    }
+
+    fn role_settings(&self) -> Result<RoleSettings, ProviderError> {
+        let settings = self.settings()?;
+        // Owner decision 2026-09-25: the models directory is optional here.
+        // Unset, the installation names none (an empty path) and the role
+        // resolves `model_store.path` or `~/models` with the shared rule
+        // (`capyctl_config::model_settings`); set, it must be a directory.
+        let models_root = match env_value(MODELS_ROOT) {
+            None => PathBuf::new(),
+            Some(value) => {
+                let root = capyctl_config::model_settings::absolute(MODELS_ROOT, &value)
+                    .map_err(|error| no_installation(error.detail))?;
+                if !root.is_dir() {
+                    return Err(no_installation(format!(
+                        "{MODELS_ROOT} is not a directory: {}",
+                        root.display()
+                    )));
+                }
+                root
+            }
+        };
+        Ok(RoleSettings {
+            runtime_dir: runtime_dir(settings.runtime_dir, self.managed_runtime.as_deref())?,
+            engine_ports: settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS),
+            models_root,
+            // SPEC §13.3 amendment (owner decision 2026-09-25): the role's own
+            // installation names its CUDA toolkit explicitly (`--cuda-home`,
+            // `CAPYCTL_CUDA_HOME` or `local_engine.cuda_home`); nothing is detected.
+            cuda_home: settings.cuda_home,
+        })
     }
 
     fn configure(&self, host: &serde_json::Value) -> Result<(), ProviderError> {
@@ -1052,14 +1062,6 @@ impl EngineProvider for EnvEngineProvider {
                 name,
                 capyctl_controller::engine_provider::from_profile(&base, profile),
             ));
-        }
-        if all.is_empty() {
-            return Err(no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN}, {SGLANG_BIN} or \
-                 {TENSORFOLD_BIN} (or --vllm-bin / --sglang-bin / --tensorfold-bin, \
-                 or host.local_engine) to the engine's \
-                 executable, or register one with `capyctl engine add`"
-            )));
         }
         Ok(all)
     }
@@ -1126,12 +1128,7 @@ impl EngineProvider for EnvEngineProvider {
 /// runtime embedded in this binary, `<state root>/runtime`, written or
 /// refreshed here; `CAPYCTL_RUNTIME_DIR` names another (development), which is
 /// never written to.
-///
-/// `deep_park` is the host's switch: with it on, a parking vLLM deployment
-/// renders sleep mode, whose entry imports the capability probes (ADR 0008).
 fn runtime_dir(
-    engine: Engine,
-    deep_park: bool,
     declared: Option<PathBuf>,
     managed: Option<&Path>,
 ) -> Result<PathBuf, ProviderError> {
@@ -1172,15 +1169,20 @@ fn runtime_dir(
     // otherwise fail at render with a refusal this boot could have prevented
     // (found live: the default CARGO_MANIFEST_DIR-relative directory carries
     // `..` and every SGLang launch was refused before spawning).
-    let dir = dir.canonicalize().map_err(|error| {
-        no_installation(format!("runtime directory {}: {error}", dir.display()))
-    })?;
+    dir.canonicalize()
+        .map_err(|error| no_installation(format!("runtime directory {}: {error}", dir.display())))
+}
+
+/// The runtime modules one installation of `engine` imports from `dir`.
+/// `deep_park` is the host's switch: with it on, a parking vLLM deployment
+/// renders sleep mode, whose entry imports the capability probes (ADR 0008).
+fn verify_runtime(dir: &Path, engine: Engine, deep_park: bool) -> Result<(), ProviderError> {
     // SPEC §9.1, §13.3 / T21 T37: the same integrity the host agent requires
     // before a launch. The engine imports capyctl's modules from this directory,
     // so one another account could rewrite is refused here, before anything
     // is served.
     capyctl_agent::runtime_integrity::verify(
-        &dir,
+        dir,
         capyctl_agent::runtime_integrity::required_files(engine, deep_park),
     )
     .map_err(|error| {
@@ -1189,8 +1191,7 @@ fn runtime_dir(
              owned by this user, never writable by other, and writable by group \
              only through this user's private group"
         ))
-    })?;
-    Ok(dir)
+    })
 }
 
 /// [`probe_fingerprint`] for the host role, which states `local_engine`
@@ -1537,16 +1538,13 @@ fn no_overrides() -> SettingOverrides {
 /// named directory must already exist.
 fn standalone_models(
     stated_host: &serde_json::Value,
-    named: &[NamedInstallation],
+    role: &RoleSettings,
     flags: &ModelOverrides,
 ) -> Result<capyctl_config::model_settings::ModelSettings, StartError> {
     use capyctl_config::model_settings::{default_models_root, resolve, RootSource};
     let mut env = ModelOverrides::from_process_env()
         .map_err(|error| StartError::Setting(format!("{}: {}", error.path, error.detail)))?;
-    env.models_root = named
-        .first()
-        .map(|first| first.installation.models_root.clone())
-        .filter(|root| !root.as_os_str().is_empty());
+    env.models_root = Some(role.models_root.clone()).filter(|root| !root.as_os_str().is_empty());
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let settings = resolve(
         stated_host,
@@ -1715,9 +1713,9 @@ async fn start_standalone_in(
     let store = Rc::new(Store::open(&db_path)?);
     let api_key = read_api_key(state_dir)?;
 
-    // Spec §8: what this host publishes about its engines is what it has. There
-    // is no fallback installation: a host with none refuses to boot rather than
-    // come up serving an engine nobody configured. ADR 0018 §5: the environment's
+    // SPEC §8 (amended 2026-10-01): what this host publishes about its engines
+    // is what it has. There is no fallback installation: a host with none
+    // starts and publishes none. ADR 0018 §5: the environment's
     // installations and the profiles registered in engines.yaml (beside
     // `--config`, else `<config home>/capyctl/engines.yaml`); a name declared in
     // both is refused `profile_exists`. The standalone document is never written.
@@ -1737,20 +1735,20 @@ async fn start_standalone_in(
     // Owner rule 2026-09-25: the `host:` block's engine settings are the
     // YAML layer of the installation (flag > environment > YAML > default).
     provider.configure(&stated_host)?;
+    // Role-level settings (runtime directory, ports, model store) are the same
+    // for every installation, and a role with none still has them.
+    let role = provider.role_settings()?;
     let mut named = provider.installations(&registered)?;
     // Owner decision 2026-09-25 (standalone is a server plus one host): the
     // models directory and the model-source policy, by the rule a host uses.
-    let models = standalone_models(&stated_host, &named, flags)?;
+    let models = standalone_models(&stated_host, &role, flags)?;
     for n in &mut named {
         n.installation.models_root = models.models_root.clone();
     }
-    // Role-level settings (runtime directory, ports, model store) are the same
-    // for every installation; the first one states them.
-    let installation = named
-        .first()
-        .map(|first| first.installation.clone())
-        .ok_or_else(|| StartError::NoEngineInstallation("this host declares no engine".into()))?;
-    let environment_fingerprint = format!("standalone-{}", installation.build_fingerprint);
+    let environment_fingerprint = match named.first() {
+        Some(first) => format!("standalone-{}", first.installation.build_fingerprint),
+        None => "standalone-none".to_owned(),
+    };
     let capacity_bytes = memory()
         .map(|sample| sample.capacity_bytes)
         .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
@@ -1769,8 +1767,7 @@ async fn start_standalone_in(
     // overruns its bound, publishes nothing, and an SGLang deployment then
     // fails placement honestly at the native gate instead of the host
     // claiming placement it cannot corroborate.
-    let inventory =
-        crate::device_inventory::collect(&installation.runtime_dir, gpu_sample.as_ref());
+    let inventory = crate::device_inventory::collect(&role.runtime_dir, gpu_sample.as_ref());
 
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,
@@ -1782,6 +1779,7 @@ async fn start_standalone_in(
             capacity_bytes,
             inventory.as_ref(),
             &gpu_shape,
+            role.engine_ports,
         );
         models.write_into(&mut host);
         // The host's own policy, normalized exactly as resolution normalizes
@@ -1847,6 +1845,7 @@ async fn start_standalone_in(
             gpu_shape.clone(),
             models.clone(),
         );
+        let engine_ports = role.engine_ports;
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
                 named,
@@ -1855,6 +1854,7 @@ async fn start_standalone_in(
                 inventory,
                 shape,
                 models,
+                engine_ports,
             )
         })
         .await
@@ -1867,7 +1867,7 @@ async fn start_standalone_in(
             provider.bindings_for_devices(
                 system_clock(),
                 state_dir.join("logs"),
-                installation.runtime_dir.clone(),
+                role.runtime_dir.clone(),
                 device_totals(&gpu_shape),
             ),
             embedded.installations(),

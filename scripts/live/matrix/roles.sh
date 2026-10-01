@@ -140,7 +140,7 @@ enroll() {
   rcopy "$LRD/$host.join" "$host:$RRD/$host.join"
   # The host must not be running (identity lock); the join file path is absolute.
   out=$(rsh_out "$host" '{"host_id":"01DRYRUNHOSTID'"$(host_short "$host")"'0000000000","enrolled":true}' \
-    "chmod 600 $RRD/$host.join && $RBIN join host --join-file $RRD/$host.join --config $RRD/host.yaml")
+    "chmod 600 $RRD/$host.join && $RBIN join host --join-file $RRD/$host.join --config $RRD/host.yaml --format json")
   id=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read().strip().splitlines()[-1])["host_id"])')
   save_run_var "HOST_ID_$(host_short "$host")" "$id"
   echo "$host enrolled as $id"

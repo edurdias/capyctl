@@ -90,7 +90,7 @@ fn remote_worker(
     owner: SharedCoordinatorState,
     observations: Vec<MemoryObservation>,
     host: Arc<ScriptedHost>,
-    gate: Arc<Gate>,
+    gate: Arc<dyn EngineAdapter>,
 ) -> OwnedCoordinator {
     OwnedCoordinator::spawn_with_execution_bindings(
         owner,
@@ -1589,6 +1589,315 @@ async fn an_unresponsive_host_reproves_readiness_on_the_same_session() {
         Some("session-1")
     );
     assert!(owns(&owner, &fence));
+    drop(start);
+    w.shutdown().await.unwrap();
+}
+
+/// The scripted remote launch, whose quiescence question is answered by the
+/// real remote engine once the test has built it for the Ready launch.
+struct RemoteQuiescence {
+    gate: Arc<Gate>,
+    remote: Mutex<Option<Arc<dyn EngineAdapter>>>,
+}
+#[async_trait::async_trait]
+impl EngineAdapter for RemoteQuiescence {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
+        self.gate.execute_persisted(command).await
+    }
+    async fn inspect(&self, m: &MemberRef) -> Result<EngineState, AdapterError> {
+        self.gate.inspect(m).await
+    }
+    async fn render_plan(&self, p: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        self.gate.render_plan(p).await
+    }
+    async fn check_readiness(&self, m: &MemberRef) -> Result<Readiness, AdapterError> {
+        self.gate.check_readiness(m).await
+    }
+    async fn prepare_park(&self, m: &MemberRef) -> Result<Quiescence, AdapterError> {
+        self.gate.prepare_park(m).await
+    }
+    async fn park(&self, m: &MemberRef, l: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        self.gate.park(m, l).await
+    }
+    async fn restore(&self, m: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        self.gate.restore(m).await
+    }
+    async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        self.gate.reload_weights(m).await
+    }
+    async fn observe_work(&self, m: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        self.gate.observe_work(m).await
+    }
+    async fn cancel_work(
+        &self,
+        m: &MemberRef,
+        r: &RequestRef,
+        f: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
+        self.gate.cancel_work(m, r, f).await
+    }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        let remote = self.remote.lock().unwrap().clone();
+        match remote {
+            Some(remote) => remote.engine_quiescent(member, after_ms).await,
+            None => false,
+        }
+    }
+}
+
+/// SPEC §10 (amended 2026-10-01): a hung-up request on a remote launch closes
+/// only on the host's load report. A sample is clamped to the time it reached
+/// the controller, so it is always older than a question asked now; the
+/// question is therefore asked about the hang-up itself. An idle sample taken
+/// before the hang-up closes nothing; one taken after it closes the lease.
+// T17 T18 T38
+#[tokio::test]
+async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang_up() {
+    use crate::port::LifecyclePort;
+    use capyctl_protocol::reports::{EngineLoad, LoadReport, LoadSample};
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    *gate.association.lock().unwrap() = Some(owner.clone());
+    gate.release.add_permits(1);
+    let engine = Arc::new(RemoteQuiescence {
+        gate,
+        remote: Mutex::new(None),
+    });
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        ScriptedHost::new(true),
+        engine.clone(),
+    );
+    let start = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        start.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    make_remote(&dir, &owner, &fence);
+    let launch = ready_launch(&owner);
+    let authority = Arc::new(crate::enrollment::EnrollmentAuthority::new(
+        owner.clone(),
+        capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+    ));
+    let sessions = crate::agent_sessions::AgentSessions::new(authority);
+    let load = sessions.load_table();
+    *engine.remote.lock().unwrap() = Some(crate::remote_execution::engine(
+        sessions,
+        owner.clone(),
+        crate::remote_execution::RemoteLaunchBinding {
+            controller_id: "controller".into(),
+            host_id: "lab".into(),
+            member_id: "head".into(),
+            profile_fingerprint: "fingerprint".into(),
+            launch_command_id: launch.step_id.clone(),
+            plan: capyctl_protocol::execution::SingleLaunchPlan {
+                deployment_config: "{}".into(),
+                profile_name: "local".into(),
+                checkpoint_fingerprint: "checkpoint".into(),
+                host_policy_fingerprint: "a".repeat(64),
+                binding_id: launch.binding_id.clone(),
+                incarnation: launch.incarnation.clone(),
+                grant_id: "grant".into(),
+                service_port: 30000,
+                issued_at_ms: 1,
+                coordinator_session_id: "session".into(),
+                checkpoint_digest: String::new(),
+                checkpoint_weights_bytes: None,
+                startup_bytes: None,
+            },
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+        },
+        Default::default(),
+    ));
+    let idle_sample = |at: i64| {
+        load.accept(
+            "lab",
+            LoadReport {
+                host_id: "lab".into(),
+                samples: vec![LoadSample {
+                    deployment_id: fence.deployment_id.clone(),
+                    generation: fence.generation,
+                    owned_handle: launch.step_id.clone(),
+                    sampled_at_ms: at,
+                    ingress_in_flight: 0,
+                    engine: Some(EngineLoad {
+                        running: 0,
+                        waiting: 0,
+                        kv_usage_ppm: 0,
+                    }),
+                    latency: None,
+                }],
+            },
+            capyctl_protocol::now_unix_ms(),
+        )
+        .unwrap()
+    };
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let leases = || -> i64 {
+        sql.query_row(
+            "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let lifecycle = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    let lease = lifecycle
+        .open_instance_lease(&fence.deployment_id, fence.generation, 8)
+        .await
+        .unwrap()
+        .expect("a durable lease");
+    // The host's last idle sample was taken before the client hung up.
+    assert_eq!(idle_sample(capyctl_protocol::now_unix_ms()).applied, 1);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    lifecycle
+        .close_request_lease(lease, crate::request_leases::LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(leases(), 1, "an idle sample before the hang-up");
+    // A sample taken after the hang-up settles it, on the host's receipt.
+    assert_eq!(idle_sample(capyctl_protocol::now_unix_ms()).applied, 1);
+    until(|| leases() == 0).await;
+    let receipt: String = sql
+        .query_row(
+            "SELECT payload_json FROM management_events WHERE kind='request_cancellation_acknowledged' AND deployment_id=?1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(receipt.contains("the host reported"), "{receipt}");
+    drop(start);
+    w.shutdown().await.unwrap();
+}
+
+/// SPEC §10 (amended 2026-10-01), found live 2026-10-01: a park or stop
+/// accepted right after a client hung up left the remote launch out of the
+/// Ready list, so the host's idle sample was never matched and the cancelling
+/// lease held the park until its deadline. The launch's own sample still
+/// settles the lease while the instance is draining for a stop.
+// T17 T18 T38
+#[tokio::test]
+async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
+    use crate::port::LifecyclePort;
+    use capyctl_protocol::reports::{EngineLoad, LoadReport, LoadSample};
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    *gate.association.lock().unwrap() = Some(owner.clone());
+    gate.release.add_permits(1);
+    let engine = Arc::new(RemoteQuiescence {
+        gate,
+        remote: Mutex::new(None),
+    });
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        ScriptedHost::new(true),
+        engine.clone(),
+    );
+    let start = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        start.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    make_remote(&dir, &owner, &fence);
+    let launch = ready_launch(&owner);
+    let authority = Arc::new(crate::enrollment::EnrollmentAuthority::new(
+        owner.clone(),
+        capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+    ));
+    let sessions = crate::agent_sessions::AgentSessions::new(authority);
+    let load = sessions.load_table();
+    *engine.remote.lock().unwrap() = Some(crate::remote_execution::engine(
+        sessions,
+        owner.clone(),
+        crate::remote_execution::RemoteLaunchBinding {
+            controller_id: "controller".into(),
+            host_id: "lab".into(),
+            member_id: "head".into(),
+            profile_fingerprint: "fingerprint".into(),
+            launch_command_id: launch.step_id.clone(),
+            plan: capyctl_protocol::execution::SingleLaunchPlan {
+                deployment_config: "{}".into(),
+                profile_name: "local".into(),
+                checkpoint_fingerprint: "checkpoint".into(),
+                host_policy_fingerprint: "a".repeat(64),
+                binding_id: launch.binding_id.clone(),
+                incarnation: launch.incarnation.clone(),
+                grant_id: "grant".into(),
+                service_port: 30000,
+                issued_at_ms: 1,
+                coordinator_session_id: "session".into(),
+                checkpoint_digest: String::new(),
+                checkpoint_weights_bytes: None,
+                startup_bytes: None,
+            },
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+        },
+        Default::default(),
+    ));
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let leases = || -> i64 {
+        sql.query_row(
+            "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let lifecycle = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    let lease = lifecycle
+        .open_instance_lease(&fence.deployment_id, fence.generation, 8)
+        .await
+        .unwrap()
+        .expect("a durable lease");
+    lifecycle
+        .close_request_lease(lease, crate::request_leases::LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    // The stop is accepted while the lease is still cancelling; its drain
+    // (30 s by default) waits for the lease.
+    let stop = w
+        .stop("owner", &fence, "stop-after-hang-up", 100_000)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let applied = load
+        .accept(
+            "lab",
+            LoadReport {
+                host_id: "lab".into(),
+                samples: vec![LoadSample {
+                    deployment_id: fence.deployment_id.clone(),
+                    generation: fence.generation,
+                    owned_handle: launch.step_id.clone(),
+                    sampled_at_ms: capyctl_protocol::now_unix_ms(),
+                    ingress_in_flight: 0,
+                    engine: Some(EngineLoad {
+                        running: 0,
+                        waiting: 0,
+                        kv_usage_ppm: 0,
+                    }),
+                    latency: None,
+                }],
+            },
+            capyctl_protocol::now_unix_ms(),
+        )
+        .unwrap()
+        .applied;
+    assert_eq!(applied, 1);
+    until(|| leases() == 0).await;
+    assert_eq!(
+        stop.wait(Duration::from_secs(60)).await.unwrap(),
+        capyctl_store::ordinary_lifecycle::cleanup::OrdinaryCleanupStatus::Completed
+    );
     drop(start);
     w.shutdown().await.unwrap();
 }

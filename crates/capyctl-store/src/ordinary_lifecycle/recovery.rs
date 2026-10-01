@@ -46,6 +46,14 @@ pub struct RemoteReadyLaunch {
     pub host_closure_recorded: bool,
 }
 
+/// SPEC §10: the identity a host load sample names for one remote launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteLiveLaunch {
+    pub fence: DeploymentFence,
+    pub step_id: String,
+    pub host_id: String,
+}
+
 /// Authenticated evidence that the retained engine answered a fresh native model
 /// probe. Built only from a host result that the transport validated against the
 /// exact probe command, on a session the caller observed current.
@@ -240,6 +248,42 @@ impl crate::Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// SPEC §10 (amended 2026-10-01): the completed remote launch a live
+    /// binding of this session runs, whatever its instance is doing now. A
+    /// park or stop accepted after a hang-up drains on the cancelling lease,
+    /// so the host's load sample for this launch must still be matched while
+    /// the instance is no longer Ready (found live 2026-10-01). It names the
+    /// launch for matching evidence only and is never a readiness claim.
+    pub fn remote_live_launch(
+        &self,
+        s: &CoordinatorSession,
+        binding_id: &str,
+    ) -> Result<Option<RemoteLiveLaunch>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+                 JOIN runtime_bindings b ON b.id=s.binding_id AND b.state='live'
+                 JOIN remote_binding_ingress r ON r.binding_id=b.id
+                 WHERE o.kind='initialize' AND s.state='completed' AND s.session_id=?1 AND b.id=?2
+                 ORDER BY o.accepted_at,o.id LIMIT 1",
+                params![s.id(), binding_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let (p, _, _) = load(&tx, &id)?;
+        let host_id = remote_host(&tx, &p.binding_id)?;
+        Ok(Some(RemoteLiveLaunch {
+            fence: p.fence(),
+            step_id: p.step_id.clone(),
+            host_id,
+        }))
     }
 
     /// This session's Ready remote launches, for host readiness supervision.

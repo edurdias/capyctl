@@ -289,6 +289,33 @@ impl EngineAdapter for Counting {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    async fn engine_quiescent(&self, _: &MemberRef, _: i64) -> bool {
+        true
+    }
+}
+
+// T17: the gate does not hide the engine's quiescence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gate_forwards_engine_quiescence() {
+    let f = fixture(|_| {});
+    let work = {
+        let o = f.owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &f.fence, 100, 100_100)
+            .unwrap();
+        o.store().next_initialize(o.session()).unwrap().unwrap()
+    };
+    let gate = CheckpointGate::new(
+        Arc::new(Counting::default()),
+        f.owner.clone(),
+        Arc::new(CheckpointVerifier::in_memory()),
+        &work,
+    );
+    let member = MemberRef {
+        deployment_id: "d".into(),
+        member_id: "b".into(),
+    };
+    assert!(gate.engine_quiescent(&member, 0).await);
 }
 
 fn step(f: &Fixture, action: RuntimeAction) -> RuntimeCommand {
@@ -370,6 +397,81 @@ async fn the_embedded_gate_verifies_before_initialize_and_restore() {
         inner.0.load(Ordering::SeqCst),
         2,
         "nothing reached the engine"
+    );
+}
+
+// T37, ADR 0014 §7: a checkpoint that cannot be measured says why; only a
+// measured difference is a digest mismatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unmeasurable_checkpoint_names_its_reason_not_a_mismatch() {
+    let f = fixture(|_| {});
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("config.json"), "{}").unwrap();
+    let config = f.models.path().join("toy/config.json");
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("config.json"), &config).unwrap();
+    let work = {
+        let o = f.owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &f.fence, 100, 100_100)
+            .unwrap();
+        o.store().next_initialize(o.session()).unwrap().unwrap()
+    };
+    let inner = Arc::new(Counting::default());
+    let gate = CheckpointGate::new(
+        inner.clone(),
+        f.owner.clone(),
+        Arc::new(CheckpointVerifier::in_memory()),
+        &work,
+    );
+    let refused = gate
+        .execute_persisted(&step(&f, RuntimeAction::Initialize))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, RuntimeError::Uncertain(text)
+            if text == "the checkpoint could not be measured (unsafe_file)"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        inner.0.load(Ordering::SeqCst),
+        0,
+        "nothing reached the engine"
+    );
+}
+
+// T37, ADR 0014 §7: a host that refuses to measure a first placement passes
+// its reason through; other failures keep the unrecorded text.
+#[tokio::test]
+async fn a_refused_first_placement_measurement_names_its_reason() {
+    let f = fixture(|_| {});
+    let refused = first_placement_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async { Err::<Measured, _>(MeasureError::Refused("unsafe_file".into())) },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&refused, RuntimeError::Uncertain(text)
+            if text == "the checkpoint could not be measured (unsafe_file)"),
+        "{refused:?}"
+    );
+    let unmeasured = first_placement_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async { Err::<Measured, _>(MeasureError::Unavailable) },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&unmeasured, RuntimeError::Uncertain(text)
+            if text == "the checkpoint digest was not recorded before launch"),
+        "{unmeasured:?}"
     );
 }
 

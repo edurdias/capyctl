@@ -85,9 +85,35 @@ other-model   parked   0/1     1          gpu-box
 ```
 
 CapyCTL waits for requests in progress to finish before it parks a model; it
-never cuts an answer off. When there is no room to keep a parked copy, CapyCTL
+never cuts an answer off. When a client hangs up in the middle of an answer,
+CapyCTL stops the engine's work on it instead of letting it run to the end,
+and waits until the engine reports no running or waiting requests before it
+parks or switches. Two more cases end a streamed answer the same way: a client
+that reads nothing for 10 seconds, and a single piece of the answer larger
+than 64 KiB. When there is no room to keep a parked copy, CapyCTL
 stops the idle model instead and says so:
 `released: stopped (no room to park)`.
+
+## Idle models
+
+CapyCTL stops or parks an idle model only when
+`lifecycle_defaults.ready_idle_timeout` (or `parked_idle_timeout` for parked
+ones) is set; both are off by default. In a server document:
+
+```yaml
+lifecycle_defaults:
+  ready_idle_timeout: "5m"
+  parked_idle_timeout: "30m"
+```
+
+In a standalone document the same block sits under `server`:
+
+```yaml
+server:
+  lifecycle_defaults:
+    ready_idle_timeout: "5m"
+    parked_idle_timeout: "30m"
+```
 
 ## Park or stop
 

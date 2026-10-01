@@ -61,6 +61,8 @@ pub const SMALL_FILE_LIMIT: u64 = 64 << 20;
 /// length. A checkpoint beyond them is refused rather than partially measured.
 pub const MAX_FILES: usize = 65_536;
 const MAX_DIRECTORIES: usize = 1_024;
+/// ADR 0014 §7 (A5): the longest link chain a checkpoint file may use.
+const MAX_LINK_HOPS: usize = 8;
 const MAX_DEPTH: usize = 16;
 const MAX_PATH_BYTES: usize = 4_096;
 /// Hashing runs on at most this many threads (one file per thread at a time).
@@ -783,15 +785,33 @@ impl Walker<'_> {
                 }
                 libc::S_IFREG => self.push(path, fd.clone(), leaf, FileIdentity::of(&st))?,
                 libc::S_IFLNK => {
-                    let target = read_link_at(fd.as_raw_fd(), &leaf)?;
-                    let target = Path::new(std::ffi::OsStr::from_bytes(&target));
-                    let resolved = normalize(&canonical.join(target));
-                    let (parent, name) = self.link_target(&resolved)?;
-                    let st = lstat_at(parent.as_raw_fd(), &name).map_err(os_error)?;
-                    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
-                        return Err(CheckpointError::UnsafeFile);
+                    // ADR 0014 §7 (A5): each hop resolves against the directory holding the
+                    // link and must stay inside the store; the chain ends at a regular file.
+                    let mut holder = canonical.to_path_buf();
+                    let mut target = read_link_at(fd.as_raw_fd(), &leaf)?;
+                    let mut hops = 1;
+                    loop {
+                        let resolved = normalize(
+                            &holder.join(Path::new(std::ffi::OsStr::from_bytes(&target))),
+                        );
+                        let (parent, name) = self.link_target(&resolved)?;
+                        let st = lstat_at(parent.as_raw_fd(), &name).map_err(os_error)?;
+                        match st.st_mode & libc::S_IFMT {
+                            libc::S_IFREG => {
+                                self.push(path, parent, name, FileIdentity::of(&st))?;
+                                break;
+                            }
+                            libc::S_IFLNK if hops < MAX_LINK_HOPS => {
+                                target = read_link_at(parent.as_raw_fd(), &name)?;
+                                holder = resolved
+                                    .parent()
+                                    .ok_or(CheckpointError::UnsafeFile)?
+                                    .to_path_buf();
+                                hops += 1;
+                            }
+                            _ => return Err(CheckpointError::UnsafeFile),
+                        }
                     }
-                    self.push(path, parent, name, FileIdentity::of(&st))?;
                 }
                 _ => return Err(CheckpointError::UnsafeFile),
             }

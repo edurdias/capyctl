@@ -899,6 +899,17 @@ CREATE TABLE IF NOT EXISTS host_device_effective_revisions(
 );
 "#;
 
+/// v38 (SPEC §10, amended 2026-10-01): a request whose client hung up. The
+/// router closed the engine connection; the lease stays `inflight` (so every
+/// drain still waits for it) until the engine reports quiescence after
+/// `cancelled_at_ms`. Additive and forward-only.
+pub const SCHEMA_V38: &str = r#"
+CREATE TABLE IF NOT EXISTS request_lease_cancellations(
+  lease_id TEXT PRIMARY KEY REFERENCES request_leases(id) ON DELETE CASCADE,
+  cancelled_at_ms INTEGER NOT NULL CHECK(cancelled_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

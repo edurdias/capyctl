@@ -1,5 +1,5 @@
-//! Starting a deployment standalone created for itself, and refusing to start at
-//! all when this host has no engine to start.
+//! Starting a deployment standalone created for itself, and starting with no
+//! engine at all when this host has none.
 //!
 //! Standalone declares a restart-only deployment, so its binding is identified by
 //! the recipe and host it was admitted against rather than by a qualification. The
@@ -39,38 +39,36 @@ async fn a_declared_deployment_accepts_a_start_command() {
     }
 }
 
-/// Spec §8: no engine installation, no boot. A host that came up serving nothing
-/// would report itself healthy and refuse every deployment later, at the point
-/// where the refusal is hardest to read, so the refusal happens at boot and names
-/// the variable that would fix it.
+/// T02, SPEC §8 (amended 2026-10-01): a role with no engine starts, publishes
+/// no profile and places nothing; it tells the operator how to add one.
 #[tokio::test]
-async fn standalone_refuses_to_boot_without_an_engine_installation() {
+async fn standalone_boots_without_an_engine_and_places_nothing() {
     let dir = safe_state_dir();
     std::env::remove_var("CAPYCTL_VLLM_BIN");
+    std::env::remove_var("CAPYCTL_SGLANG_BIN");
+    std::env::remove_var("CAPYCTL_TENSORFOLD_BIN");
     std::env::remove_var("CAPYCTL_MODELS_ROOT");
-
-    let error = capyctl_cli::roles::start_standalone_with_config_home(
+    let app = capyctl_cli::roles::start_standalone_with_config_home(
         dir.path(),
         &dir.path().join(".config"),
     )
     .await
-    .err()
-    .expect("a host with no engine must refuse to boot");
-
+    .expect("a role with no engine starts");
+    assert!(app.profiles().is_empty());
+    assert_eq!(app.installation_view(), serde_json::Value::Null);
+    let refused = app
+        .deploy(
+            "m",
+            ModelSource::Local {
+                path: "/models/m".into(),
+            },
+        )
+        .expect_err("nothing is placed on a role with no engine");
     assert!(
-        matches!(
-            error,
-            capyctl_cli::roles::StartError::NoEngineInstallation(_)
-        ),
-        "{error:?}"
+        refused.to_string().contains("capyctl engine add"),
+        "{refused}"
     );
-    let said = error.to_string();
-    // Owner decision 2026-09-25: the models directory defaults to ~/models,
-    // so only the engine is demanded.
-    assert!(
-        said.contains("CAPYCTL_VLLM_BIN") && !said.contains("CAPYCTL_MODELS_ROOT"),
-        "the refusal names what it expected: {said}"
-    );
+    let _ = app.shutdown().await;
 }
 
 /// SPEC §7: standalone derives its limits from the host capacity it observes.

@@ -56,3 +56,42 @@ fn the_toolchain_is_found_on_the_closed_path_only() {
     check(&bin, Some(&cuda), &system_path).unwrap();
     assert!(!marker.exists(), "the check executes nothing");
 }
+
+// T41 T03: a pip-only CUDA compiler puts nvcc under the environment's
+// site-packages/nvidia/cu<major>/bin; it counts, nothing runs, and a link
+// pointing out of the environment is not followed.
+#[test]
+fn a_pip_nvcc_in_site_packages_satisfies_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("env");
+    let bin = env.join("bin");
+    let system = dir.path().join("system");
+    let nvidia = env.join("lib/python3.12/site-packages/nvidia");
+    let pip_bin = nvidia.join("cu13/bin");
+    for d in [&bin, &system, &pip_bin] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let marker = dir.path().join("ran");
+    let touch = format!("touch {}", marker.display());
+    script(&bin.join("ninja"), &touch);
+    script(&system.join("c++"), &touch);
+    let system_path = system.to_string_lossy().into_owned();
+    let missing = check(&bin, None, &system_path).unwrap_err();
+    assert_eq!(missing.missing, vec!["nvcc"]);
+    for text in [missing.for_engine_add(), missing.for_local_engine()] {
+        assert!(text.contains("pip install"), "{text}");
+    }
+    script(&pip_bin.join("nvcc"), &touch);
+    check(&bin, None, &system_path).unwrap();
+    assert!(!marker.exists(), "the check executes nothing");
+    // A link leading out of the environment is not followed.
+    std::fs::remove_dir_all(&nvidia).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("cu13/bin")).unwrap();
+    script(&outside.join("cu13/bin/nvcc"), &touch);
+    std::os::unix::fs::symlink(&outside, &nvidia).unwrap();
+    assert_eq!(
+        check(&bin, None, &system_path).unwrap_err().missing,
+        vec!["nvcc"]
+    );
+}

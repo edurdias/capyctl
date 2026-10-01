@@ -23,14 +23,21 @@ extensions with `torch.utils.cpp_extension`.
 profile name is `tensorfold`; the entry point is `<env>/bin/tensorfold`; the
 version check is `<env>/bin/tensorfold --version`. Detection reads
 `tensorfold-*.dist-info` with ADR 0018 §1's bounds and locations and executes
-nothing. The verified set gains TensorFold 0.6.0.
+nothing. The verified set gains TensorFold 0.6.0 and 0.6.1; any other version
+is `custom`.
 
 ### 2. Registration
 
 `capyctl engine add` refuses a TensorFold installation with `toolchain_missing`
 (exit 26) unless `ninja`, `nvcc` and `c++` or `g++` are on the engine's closed
 launch PATH: the installation's `bin`, the profile's `<cuda_home>/bin`, then
-`/usr/local/bin:/usr/bin:/bin`. The caller's PATH is never used and nothing is run.
+`/usr/local/bin:/usr/bin:/bin`. TensorFold 0.6.1 also builds with a pip-only
+compiler (`pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"`), which puts
+`nvcc` in `<env>/lib/python3.*/site-packages/nvidia/cu<major>/bin`; `nvcc` is
+also looked up there, after `<env>/bin` and before `<cuda_home>/bin`. The
+directory pattern is resolved by listing real directories, never following a
+link out of the environment; `ninja` and `c++` or `g++` keep the closed search.
+The caller's PATH is never used and nothing is run.
 The profile is written `security.deep_park: disabled`; `--deep-park enabled` is
 refused `capability_missing`. Like vLLM and SGLang, a role's own TensorFold is
 `local_engine.tensorfold` (`--tensorfold-bin`, `CAPYCTL_TENSORFOLD_BIN`), with the

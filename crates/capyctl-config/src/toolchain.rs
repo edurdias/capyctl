@@ -1,7 +1,10 @@
 //! ADR 0023 §2: the tools TensorFold's first start needs to build its CUDA
 //! extensions, looked up on the engine's closed launch PATH (SPEC §13.3): the
 //! installation's `bin`, the profile's `<cuda_home>/bin`, then the fixed
-//! system directories. The caller's PATH is never read and nothing is run.
+//! system directories. TensorFold 0.6.1 also builds with a pip-only compiler
+//! (`pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"`), so `nvcc` is also
+//! looked up in the environment's `site-packages/nvidia/cu*/bin`, after the
+//! installation's `bin` and before `<cuda_home>/bin`. The caller's PATH is never read and nothing is run.
 //! Shared by `engine add`, the host and standalone, so every role checks alike.
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -53,8 +56,9 @@ impl ToolchainMissing {
     /// The refusal `engine add` gives: it reads the toolkit from `CUDA_HOME`.
     pub fn for_engine_add(&self) -> String {
         format!(
-            "{self}; install {} there, or name a CUDA toolkit with CUDA_HOME, then \
-             add the engine again",
+            "{self}; install {} there, install the compiler into the environment \
+             with pip install ninja \"cuda-toolkit[nvcc,cccl]==13.0.*\", or name a CUDA \
+             toolkit with CUDA_HOME, then add the engine again",
             self.install()
         )
     }
@@ -62,8 +66,9 @@ impl ToolchainMissing {
     /// The refusal a role's own `local_engine` TensorFold gives.
     pub fn for_local_engine(&self) -> String {
         format!(
-            "{self}; install {} there, or name a CUDA toolkit with --cuda-home, \
-             CAPYCTL_CUDA_HOME or local_engine.cuda_home",
+            "{self}; install {} there, install the compiler into the environment \
+             with pip install ninja \"cuda-toolkit[nvcc,cccl]==13.0.*\", or name a CUDA \
+             toolkit with --cuda-home, CAPYCTL_CUDA_HOME or local_engine.cuda_home",
             self.install()
         )
     }
@@ -95,6 +100,49 @@ fn executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// The `bin` directories of a pip-installed CUDA compiler in the environment
+/// that owns `engine_bin`: `<env>/lib/python3.*/site-packages/nvidia/cu*/bin`.
+/// Resolved by listing real directories; a symbolic link is never followed,
+/// so nothing outside the environment is read. Sorted for a stable order.
+fn pip_nvcc_dirs(engine_bin: &Path) -> Vec<PathBuf> {
+    fn dirs(parent: &Path, prefix: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect();
+        found.sort();
+        found
+    }
+    let Some(env) = engine_bin.parent() else {
+        return Vec::new();
+    };
+    let real_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let lib = env.join("lib");
+    if !real_dir(&lib) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for python in dirs(&lib, "python3.") {
+        let nvidia = python.join("site-packages/nvidia");
+        if !real_dir(&python.join("site-packages")) || !real_dir(&nvidia) {
+            continue;
+        }
+        out.extend(dirs(&nvidia, "cu").into_iter().map(|d| d.join("bin")));
+    }
+    out
+}
+
+/// A regular file (not a link) that is executable, for the pip compiler.
+fn own_executable(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 /// `Ok` when every tool is an executable regular file in one of the
 /// directories, searched in launch order; `system` is a `:`-separated list
 /// (normally [`SYSTEM_PATH`]).
@@ -112,12 +160,18 @@ pub fn check(
                 .map(PathBuf::from),
         )
         .collect();
+    let pip = pip_nvcc_dirs(engine_bin);
     let missing: Vec<&'static str> = TOOLS
         .iter()
-        .filter(|(_, names)| {
-            !searched
-                .iter()
-                .any(|dir| names.iter().any(|name| executable(&dir.join(name))))
+        .filter(|(label, names)| {
+            let on_path = |dir: &PathBuf| names.iter().any(|name| executable(&dir.join(name)));
+            if *label == "nvcc" {
+                // Launch order: the installation's bin, the pip compiler, the rest.
+                return !(on_path(&searched[0])
+                    || pip.iter().any(|dir| own_executable(&dir.join("nvcc")))
+                    || searched[1..].iter().any(on_path));
+            }
+            !searched.iter().any(on_path)
         })
         .map(|(label, _)| *label)
         .collect();

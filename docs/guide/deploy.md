@@ -42,7 +42,21 @@ capyctl validate config --file my-model.yaml
 ```
 
 `validate` works offline, so it refuses an `hf:` reference without a commit;
-`deploy` pins it for you.
+`deploy` pins it for you. Without `--host` it checks the document, its
+timeouts, a declared `memory.startup` and a declared `resources` block, and
+lists what needs a host:
+
+```text
+my-model.yaml is a valid deployment document
+
+Not checked
+  resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, the host's devices and capacity, and timeouts, and to see the host's defaults; a TensorFold profile under another name than tensorfold is recognised only there
+  whether each allowed host is enrolled, online and has published (host_unpublished)
+  which runtime profiles the host's role accepted and published after measuring each installation (profile_not_published)
+  the host's current resource policy as the server stores it (resource_policy_unavailable)
+  route and deployment-name conflicts with existing deployments (route_conflict)
+  a new checkpoint's digest, measured on the host after acceptance (checkpoint_digest_pending)
+```
 
 Add a field to choose something yourself, for example:
 

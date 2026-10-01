@@ -406,6 +406,20 @@ fn status(value: &Value, names: &HostNames) -> String {
         ],
         &instances,
     ));
+    if let Some(engine) = d["engine"].as_str() {
+        out.push_str(&format!("\nEngine  {engine}\n"));
+    } else if d["installation"].is_object() {
+        let i = &d["installation"];
+        out.push_str(&format!(
+            "\nEngine  {} {} ({})\n",
+            text(&i["profile"]),
+            text(&i["version"]),
+            text(&i["executable"])
+        ));
+        if let Some(note) = d["engine_note"].as_str() {
+            out.push_str(&format!("note: {note}\n"));
+        }
+    }
     out
 }
 
@@ -654,6 +668,36 @@ mod tests {
         assert!(row(json!({"host_id": "01X", "online": true,
             "session": {"drain_pending": true}}))
         .contains("draining"));
+    }
+
+    // Owner decision 2026-10-01: status names the engine a deployment runs,
+    // and a note when that engine is no longer registered.
+    #[test]
+    fn status_names_the_pinned_engine_and_a_note() {
+        let d = json!({"name": "m", "observed_state": "ready", "instances": [],
+            "installation": {"profile": "tensorfold", "version": "0.6.0",
+                "executable": "/opt/tf060/bin/tensorfold", "state": "unregistered"},
+            "engine_note": "pinned to an engine no longer registered as tensorfold; redeploy to use 0.6.1"});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nEngine  tensorfold 0.6.0 (/opt/tf060/bin/tensorfold)\nnote: pinned to an engine no longer registered as tensorfold; redeploy to use 0.6.1\n"),
+            "{out}"
+        );
+    }
+
+    // T02: status on a role with no engine names the command that adds one.
+    #[test]
+    fn status_on_a_role_with_no_engine_names_engine_add() {
+        let out = render(
+            View::Status,
+            &json!({"name": "chat", "observed_state": "stopped", "instances": [],
+                "engine": crate::client::NO_ENGINE}),
+            &HostNames::new(),
+        );
+        assert!(
+            out.ends_with("\nEngine  none: run `capyctl engine add <path>`\n"),
+            "{out}"
+        );
     }
 
     #[test]

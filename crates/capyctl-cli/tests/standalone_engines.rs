@@ -143,6 +143,45 @@ async fn standalone_add_is_usable_without_restart() {
     let _ = app.shutdown().await;
 }
 
+// T02 T16 T32 (ADR 0018 §4, A2): the last registered profile is removed; the
+// role keeps running with none, and a profile added again is published live.
+#[tokio::test]
+async fn the_last_profile_is_removed_and_a_new_one_is_published_live() {
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    register(&document, "only");
+    let app = support::boot_registered_only(state.path(), &document)
+        .await
+        .expect("standalone boots");
+    assert_eq!(app.profiles(), vec!["only".to_string()]);
+    let socket = state.path().join(SOCKET_NAME);
+    let reply = request(
+        &socket,
+        &ControlRequest::Remove {
+            profile: "only".into(),
+            drain: false,
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply, serde_json::json!({"ok": true, "retired": true}));
+    unregister(&document, "only");
+    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(reload["published"], "published", "{reload}");
+    assert!(app.profiles().is_empty());
+    register(&document, "again");
+    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(reload["published"], "published", "{reload}");
+    let (status, body) = deploy(&app, state.path(), "m", "again").await;
+    assert!(status.is_success(), "{status} {body}");
+    let _ = app.shutdown().await;
+}
+
 // T16 T32 (ADR 0018 §4, §5; review decision C1): an unused registered
 // profile is retired without the role writing anything; the CLI's rewrite
 // and reload unpublish it; an environment profile cannot be removed; the

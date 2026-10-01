@@ -158,7 +158,12 @@ where
 {
     let unrecorded =
         || RuntimeError::Uncertain("the checkpoint digest was not recorded before launch".into());
-    let measured = measure().await.map_err(|_| unrecorded())?;
+    let measured = measure().await.map_err(|error| match error {
+        MeasureError::Refused(code) => {
+            RuntimeError::Uncertain(format!("the checkpoint could not be measured ({code})"))
+        }
+        MeasureError::Unavailable => unrecorded(),
+    })?;
     match record(owner, deployment, revision, host, &measured).map_err(|_| unrecorded())? {
         RecordOutcome::Recorded { digest, .. } if digest == measured.digest => Ok(digest),
         RecordOutcome::Mismatch => Err(RuntimeError::Refused("checkpoint_mismatch".into())),
@@ -633,11 +638,16 @@ impl CheckpointGate {
         })
     }
 
-    /// ADR 0014 §7: before Initialize, any failure to verify is uncertain, as
-    /// before.
+    /// ADR 0014 §7: before Initialize a failure to verify is uncertain; the
+    /// message keeps the walker's reason.
     async fn verified(&self) -> Result<(), RuntimeError> {
-        self.check().await.map_err(|_| {
-            RuntimeError::Uncertain("the checkpoint does not match its recorded digest".into())
+        self.check().await.map_err(|refusal| match refusal {
+            GateRefusal::Mismatch => {
+                RuntimeError::Uncertain("the checkpoint does not match its recorded digest".into())
+            }
+            GateRefusal::Unavailable(reason) => {
+                RuntimeError::Uncertain(format!("the checkpoint could not be measured ({reason})"))
+            }
         })
     }
 
@@ -648,7 +658,7 @@ impl CheckpointGate {
     async fn verified_wake(&self) -> Result<(), RuntimeError> {
         self.check().await.map_err(|refusal| match refusal {
             GateRefusal::Mismatch => RuntimeError::Refused("checkpoint_mismatch".into()),
-            GateRefusal::Unavailable => RuntimeError::Unsupported,
+            GateRefusal::Unavailable(_) => RuntimeError::Unsupported,
         })
     }
 
@@ -656,16 +666,20 @@ impl CheckpointGate {
     /// revision with none recorded (first placement, or a launch parked before
     /// digests existed) records this measurement first, validated as usual.
     async fn check(&self) -> Result<(), GateRefusal> {
+        let unrecorded = || GateRefusal::Unavailable("not_recorded".into());
         let recorded = {
-            let owner = self.owner.lock().map_err(|_| GateRefusal::Unavailable)?;
+            let owner = self.owner.lock().map_err(|_| unrecorded())?;
             owner
                 .store()
                 .recorded_checkpoint(&self.deployment_id, self.revision)
-                .map_err(|_| GateRefusal::Unavailable)?
+                .map_err(|_| unrecorded())?
         };
         let measured = measure_locally(self.checkpoints.clone(), &self.effective)
             .await
-            .map_err(|_| GateRefusal::Unavailable)?;
+            .map_err(|error| match error {
+                MeasureError::Refused(code) => GateRefusal::Unavailable(code),
+                MeasureError::Unavailable => GateRefusal::Unavailable("unavailable".into()),
+            })?;
         match recorded {
             Some(digest) if digest == measured.manifest.digest => Ok(()),
             Some(_) => Err(GateRefusal::Mismatch),
@@ -680,7 +694,7 @@ impl CheckpointGate {
                         weights_bytes: measured.manifest.weights_bytes,
                     },
                 )
-                .map_err(|_| GateRefusal::Unavailable)?;
+                .map_err(|_| unrecorded())?;
                 match outcome {
                     RecordOutcome::Recorded { digest, .. }
                         if digest == measured.manifest.digest =>
@@ -698,8 +712,8 @@ impl CheckpointGate {
 enum GateRefusal {
     /// The checkpoint is known not to be the recorded or declared one.
     Mismatch,
-    /// It could not be measured or recorded now.
-    Unavailable,
+    /// It could not be measured or recorded now, with the reason.
+    Unavailable(String),
 }
 
 #[async_trait::async_trait]
@@ -762,6 +776,9 @@ impl EngineAdapter for CheckpointGate {
         member: &MemberRef,
     ) -> Option<capyctl_adapters::traits::EngineWork> {
         self.inner.idle_before_signal(member).await
+    }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        self.inner.engine_quiescent(member, after_ms).await
     }
 }
 
