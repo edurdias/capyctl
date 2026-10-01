@@ -70,12 +70,11 @@ async fn a_cancelling_lease_closes_on_engine_quiescence() {
     let h = harness_with_ready_instance(false).await;
     let lease = h.open_lease().await;
     h.close_lease(lease, LeaseEnd::Cancelling).await;
-    tokio::time::sleep(TICKS).await;
+    until("a second quiescence question", || {
+        h.lab.engine.asked.lock().unwrap().len() > 1
+    })
+    .await;
     assert_eq!(h.outstanding(), 1, "busy engine: still charged");
-    assert!(
-        h.lab.engine.asked.lock().unwrap().len() > 1,
-        "asked each tick"
-    );
     h.set_quiet(true);
     h.until_outstanding(0).await;
     assert_eq!(h.acknowledged(), 1);
