@@ -37,6 +37,7 @@ capyctl 0.1.0 standalone ready
 
   Inference     0.0.0.0:8443 (API key required)
   Management    127.0.0.1:7443
+  Engines       vllm
   State         /home/me/.local/state/capyctl
   Credentials   /home/me/.local/state/capyctl/identity/credentials
 ```

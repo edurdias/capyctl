@@ -148,6 +148,7 @@ capyctl start host --config ~/host.yaml
 ```text
 capyctl 0.1.0 host ready
 
+  Engines       none: run `capyctl engine add <path>`
   Ingress       100.64.0.21:8444
   Host ID       01M3R7FJRKN5AQMC4EMYSG7KSK
   State         /home/me/.local/state/capyctl
