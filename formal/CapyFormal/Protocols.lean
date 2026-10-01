@@ -7,13 +7,17 @@ reachable set is computed by the kernel. `decide` then checks an invariant over
 state space is finite and the closure reaches a fixpoint.
 
 1. **Request-lease hand-off** (`crates/capyctl-controller/src/request_leases.rs`):
-   the group-commit writer grants a lease and replies over a oneshot; a caller
-   that went away is covered only if `reply.send` *fails*.
+   the group-commit writer grants a lease and replies over a oneshot. Before
+   the 2026-10-01 fix a caller that went away was covered only if
+   `reply.send` *failed*; now an untaken ticket queues its own close.
 2. **Dispatch gate across a restart** (`crates/capyctl-store/src/dispatch.rs`,
    `ordinary_lifecycle/{local_recovery,park}.rs`): restart closes every gate
    without a closure row; adoption moves the launch to the new session;
-   `reverify_local_dispatch` reopens only after `require_settled`; a cancelled
-   park `reopen`s subject only to closure rows.
+   `reverify_local_dispatch` reopens only after `require_settled`. Before the
+   2026-10-01 fix a cancelled park `reopen`ed subject only to closure rows; now
+   it reopens only a gate it closed (`reopens_dispatch`).
+
+In each model `next false` is the previous code and `next true` the repair.
 -/
 namespace Capy.Protocols
 
@@ -77,9 +81,9 @@ theorem converged (b : Bool) :
     (closure (next b) 9 [init]).length = (reachable b).length := by
   cases b <;> decide
 
-/-- **Current protocol: a lease can be leaked.** A reachable state holds an
+/-- **Previous protocol: a lease could be leaked.** A reachable state holds an
     inflight row that no party will ever close (reproduced by a probe test). -/
-theorem current_leaks : (reachable false).any (fun s => !accountable s) = true := by decide
+theorem previous_leaks : (reachable false).any (fun s => !accountable s) = true := by decide
 
 /-- The leaked state is exactly: committed, replied into a live channel, caller
     dropped before polling, no orphan queued. -/
@@ -89,8 +93,8 @@ theorem leak_witness :
 /-- **Repaired protocol: every reachable inflight lease is accountable.** -/
 theorem fixed_no_leak : (reachable true).all accountable = true := by decide
 
-/-- In the current protocol the leak is the *only* unaccountable state. -/
-theorem current_only_leak :
+/-- In the previous protocol the leak was the *only* unaccountable state. -/
+theorem previous_only_leak :
     (reachable false).filter (fun s => !accountable s) =
       [⟨true, true, true, false, .gone, .dropped⟩] := by decide
 
@@ -143,9 +147,9 @@ theorem converged (b : Bool) :
 
 theorem init_safe : safe init = true := by decide
 
-/-- **Current code: unsafe state reachable** (reproduced by a store probe test):
+/-- **Previous code: unsafe state reachable** (reproduced against the Rust):
     restart → adopt → park accepted → deadline cancel → gate open over a retired lease. -/
-theorem current_unsafe : (reachable false).any (fun s => !safe s) = true := by decide
+theorem previous_unsafe : (reachable false).any (fun s => !safe s) = true := by decide
 
 theorem unsafe_witness :
     (⟨true, false, true, true, false, false⟩ : St) ∈ reachable false := by decide
