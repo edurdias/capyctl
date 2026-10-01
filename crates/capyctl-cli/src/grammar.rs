@@ -581,6 +581,11 @@ struct RoleSettingsArgs {
     /// over CAPYCTL_SGLANG_BIN and local_engine.sglang.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     sglang_bin: Option<PathBuf>,
+    /// The TensorFold executable (`<venv>/bin/tensorfold`) this role runs as
+    /// its `local` profile. Wins over CAPYCTL_TENSORFOLD_BIN and
+    /// local_engine.tensorfold.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    tensorfold_bin: Option<PathBuf>,
     /// The build fingerprint the local engine publishes (default: what
     /// `<engine> --version` prints). Wins over CAPYCTL_ENGINE_FINGERPRINT and
     /// local_engine.build_fingerprint.
@@ -650,6 +655,7 @@ impl RoleSettingsArgs {
         capyctl_config::engine_settings::EngineOverrides {
             vllm: self.vllm_bin.clone(),
             sglang: self.sglang_bin.clone(),
+            tensorfold: self.tensorfold_bin.clone(),
             build_fingerprint: self.engine_fingerprint.clone(),
             args: self
                 .engine_args

@@ -703,6 +703,8 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             "/opt/vllm/bin/vllm",
             "--sglang-bin",
             "/opt/sglang/bin/python3",
+            "--tensorfold-bin",
+            "/opt/tensorfold/bin/tensorfold",
             "--engine-fingerprint",
             "vllm 0.29.0",
             "--engine-args",
@@ -730,6 +732,7 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             EngineOverrides {
                 vllm: Some("/opt/vllm/bin/vllm".into()),
                 sglang: Some("/opt/sglang/bin/python3".into()),
+                tensorfold: Some("/opt/tensorfold/bin/tensorfold".into()),
                 build_fingerprint: Some("vllm 0.29.0".into()),
                 args: Some(vec![
                     "--enforce-eager".into(),

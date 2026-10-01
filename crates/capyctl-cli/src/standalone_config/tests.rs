@@ -591,6 +591,69 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
     bin
 }
 
+/// An executable `tensorfold` in a venv `bin` holding `tools`.
+fn fake_tensorfold_bin(dir: &std::path::Path, tools: &[&str]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin_dir = dir.join("tf").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("a bin directory");
+    for (name, body) in std::iter::once(("tensorfold", "echo 'tensorfold 0.6.0'"))
+        .chain(tools.iter().map(|tool| (*tool, "exit 0")))
+    {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("a script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    bin_dir.join("tensorfold")
+}
+
+/// ADR 0023 §2, §6 (ruling R1): a role's own TensorFold is declared by
+/// CAPYCTL_TENSORFOLD_BIN, publishes its probed version with deep park off
+/// whatever the default says, and is refused without its build toolchain.
+// T41
+#[test]
+fn an_environment_tensorfold_is_checked_and_never_parks() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) = isolated("an_environment_tensorfold_is_checked_and_never_parks") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+
+    let bin = fake_tensorfold_bin(dir.path(), &["ninja", "nvcc", "c++"]);
+    std::env::set_var("CAPYCTL_TENSORFOLD_BIN", &bin);
+    let named = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .expect("the environment declares an installation");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].profile, "local");
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::Tensorfold);
+    assert_eq!(installation.build_fingerprint, "0.6.0");
+    assert!(!installation.deep_park);
+
+    std::fs::remove_file(bin.with_file_name("ninja")).expect("remove ninja");
+    let system_has_ninja = capyctl_config::toolchain::SYSTEM_PATH
+        .split(':')
+        .any(|d| std::path::Path::new(d).join("ninja").is_file());
+    if !system_has_ninja {
+        let message = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect_err("a missing build tool refuses the start")
+            .to_string();
+        assert!(message.contains("toolchain_missing"), "{message}");
+        assert!(message.contains("ninja"), "{message}");
+    }
+    for name in [
+        "CAPYCTL_TENSORFOLD_BIN",
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
 /// Spec §7: the host policy built from the environment carries the model store,
 /// the deep-park switch and the flags the profile passes, and the deployment
 /// standalone generates carries the engine configuration (ADR 0014 §1) — and
@@ -622,9 +685,9 @@ fn host_policy_from_env_is_complete() {
     let installation = crate::roles::EnvEngineProvider::new()
         .installation()
         .expect("the environment declares an installation");
-    // The fingerprint is the engine's own report, not a constant that would keep
-    // claiming the same build after an upgrade.
-    assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
+    // The fingerprint is the engine's own report (its last word, as `engine
+    // add` records it), not a constant that would keep claiming one build.
+    assert_eq!(installation.build_fingerprint, "0.29.0");
 
     let host = host_policy(
         &named(&installation),
