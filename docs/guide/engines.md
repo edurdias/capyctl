@@ -1,6 +1,6 @@
 # Add an engine
 
-CapyCTL runs the vLLM or SGLang you already have. It does not install engines.
+CapyCTL runs the vLLM, SGLang or TensorFold you already have. It does not install engines.
 You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
 
@@ -77,6 +77,57 @@ A deployment then uses it with `engine: vllm-nightly`. Other options:
 `--deep-park disabled` turns parking off for this engine, and
 `--drift refuse` refuses a launch if the installation's files changed since
 you added it.
+
+## TensorFold
+
+CapyCTL runs TensorFold 0.6.0 from a plain venv. TensorFold builds CUDA kernels
+the first time it starts, so the machine needs `nvcc`, `ninja` and a C++
+compiler where the engine can find them: the venv's `bin`, the CUDA toolkit's
+`bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. `engine add` checks this and
+names what is missing; it never uses your shell's `PATH`.
+
+```bash
+capyctl engine add ~/tensorfold-0.6.0-venv
+```
+
+```text
+<!-- capture in Task 14 -->
+```
+
+TensorFold has no way to free its memory while it runs, so a TensorFold model
+does not park: when CapyCTL needs the memory, or the model sits idle, CapyCTL
+waits for its requests to finish, stops it, and starts it again on the next
+request. `capyctl park deployment` refuses a TensorFold model; use `stop` or let
+CapyCTL switch it. A TensorFold deployment states its memory with `resources`
+and its `context_length`:
+
+<!-- capture in Task 14: validate this YAML with `capyctl validate config --file` -->
+```yaml
+schema_version: 1
+kind: deployment
+name: nemotron
+engine: tensorfold
+model: nemotron-3.5-lightning-30b-a3b-4bit
+residency: restart_only
+resources:
+  cold:
+    allocations: [{domain: unified, bytes: 32GiB}]
+  ready:
+    allocations: [{domain: unified, bytes: 30GiB}]
+engine_config:
+  context_length: 32768
+```
+
+A drafter works as a draft model does for vLLM and SGLang: allow it on the
+engine (`security.approved_options: [--drafter]` and the drafter's directory in
+`security.approved_paths`), then pass it with
+`accept_extra_args: true` and `extra_args: [--drafter, /path/to/drafter]`.
+CapyCTL does not download drafters; without one it starts TensorFold with
+`--drafter none`. The first start builds kernels and can take several
+minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
+
+TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
+discrete GPU it runs, but no live check has passed there yet.
 
 ## List and remove
 
