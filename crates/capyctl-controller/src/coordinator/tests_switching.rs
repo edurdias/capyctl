@@ -36,6 +36,11 @@ struct Scripted {
     quiet: AtomicBool,
     /// The `after_ms` of every quiescence question.
     asked: Mutex<Vec<i64>>,
+    /// When set, the time of the engine's last idle sample: a question is
+    /// answered quiescent only when that sample is at or after its `after_ms`.
+    idle_at: Mutex<Option<i64>>,
+    /// The engine never answers a quiescence question.
+    wedged: AtomicBool,
 }
 
 impl Scripted {
@@ -47,6 +52,8 @@ impl Scripted {
             refuse_park: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
             asked: Mutex::new(vec![]),
+            idle_at: Mutex::new(None),
+            wedged: AtomicBool::new(false),
         })
     }
     fn calls(&self, action: RuntimeAction, deployment: &str) -> usize {
@@ -144,6 +151,12 @@ impl EngineAdapter for Scripted {
     }
     async fn engine_quiescent(&self, _: &MemberRef, after_ms: i64) -> bool {
         self.asked.lock().unwrap().push(after_ms);
+        if self.wedged.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(at) = *self.idle_at.lock().unwrap() {
+            return at >= after_ms;
+        }
         self.quiet.load(Ordering::SeqCst)
     }
 }

@@ -126,6 +126,15 @@ struct Scheduler {
     /// The stop signal every task watches.
     cancel: watch::Sender<bool>,
     halt: Option<WorkerStatus>,
+    /// SPEC §10 (amended 2026-10-01): quiescence questions in flight, off the
+    /// loop, by task; at most one per binding.
+    quiescence: JoinSet<QuiescenceAnswer>,
+    asking: BTreeMap<tokio::task::Id, String>,
+    /// Answers not yet applied.
+    answers: Vec<QuiescenceAnswer>,
+    /// Bindings whose engine left a question unanswered: when each may be
+    /// asked again, and how many in a row went unanswered.
+    quiescence_held: BTreeMap<String, (tokio::time::Instant, u32)>,
 }
 
 pub(super) async fn run(
@@ -191,6 +200,10 @@ pub(super) async fn run(
         cleanup_slots: Arc::new(Semaphore::new(slots)),
         cancel,
         halt: None,
+        quiescence: JoinSet::new(),
+        asking: BTreeMap::new(),
+        answers: Vec::new(),
+        quiescence_held: BTreeMap::new(),
     };
     let exit = loop {
         while let Some(joined) = scheduler.tasks.try_join_next() {
@@ -265,6 +278,67 @@ impl Scheduler {
                 outcome,
             }
         });
+    }
+
+    /// SPEC §10 (amended 2026-10-01): apply the answers that arrived, then ask
+    /// each binding with a cancelling lease that has no question in flight and
+    /// is not held back. Nothing here waits for an engine; an unanswered
+    /// question leaves its leases charged. Returns whether any lease closed.
+    async fn settle_cancellations(&mut self) -> Result<bool, CoordinatorError> {
+        while let Some(joined) = self.quiescence.try_join_next_with_id() {
+            self.answered(joined);
+        }
+        let mut changed = false;
+        for answer in std::mem::take(&mut self.answers) {
+            changed |= settle_quiescent(&self.shared, answer).await?;
+        }
+        let now = tokio::time::Instant::now();
+        for (cancelling, driver) in cancelling_drivers(&self.shared).await? {
+            let binding = cancelling.binding_id.clone();
+            let held = self
+                .quiescence_held
+                .get(&binding)
+                .is_some_and(|(at, _)| *at > now);
+            if held || self.asking.values().any(|b| *b == binding) {
+                continue;
+            }
+            let id = self
+                .quiescence
+                .spawn(ask_quiescence(cancelling, driver))
+                .id();
+            self.asking.insert(id, binding);
+        }
+        Ok(changed)
+    }
+
+    fn answered(
+        &mut self,
+        joined: Result<(tokio::task::Id, QuiescenceAnswer), tokio::task::JoinError>,
+    ) {
+        let (id, answer) = match joined {
+            Ok((id, answer)) => (id, Some(answer)),
+            Err(error) => (error.id(), None),
+        };
+        let Some(binding) = self.asking.remove(&id) else {
+            return;
+        };
+        match answer {
+            Some(answer) if answer.quiescent.is_some() => {
+                self.quiescence_held.remove(&binding);
+                if answer.quiescent == Some(true) {
+                    self.answers.push(answer);
+                }
+            }
+            // Unanswered (timed out or panicked): ask again later.
+            _ => {
+                let timeouts = self
+                    .quiescence_held
+                    .get(&binding)
+                    .map_or(1, |(_, n)| n.saturating_add(1));
+                let at = tokio::time::Instant::now() + quiescence_backoff(timeouts);
+                self.quiescence_held.insert(binding, (at, timeouts));
+            }
+        }
     }
 
     /// Owner decision 2026-09-23: record that `lane` now runs a task on
@@ -512,6 +586,11 @@ impl Scheduler {
             let task = settlement_task(shared.clone(), launch, self.cancel.subscribe());
             self.spawn(lane, binding, Kind::Settlement, None, task);
         }
+        // SPEC §10 (amended 2026-10-01): cancelled requests settle whether or
+        // not new activations are paused.
+        if self.settle_cancellations().await.map_err(failed)? {
+            shared.changed.notify_waiters();
+        }
         // An uncertain launch pauses every new activation until it is settled.
         if !shared.paused_is_empty() {
             return Ok(());
@@ -635,6 +714,9 @@ impl Scheduler {
             _ = shared.wake.notified() => {},
             Some(joined) = self.tasks.join_next(), if !self.tasks.is_empty() => {
                 self.apply(joined, status_tx);
+            }
+            Some(joined) = self.quiescence.join_next_with_id(), if !self.quiescence.is_empty() => {
+                self.answered(joined);
             }
             _ = tokio::time::sleep(shared.options.poll_interval) => {},
         }

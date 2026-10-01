@@ -82,9 +82,10 @@ async fn a_cancelling_lease_closes_on_engine_quiescence() {
     h.lab.worker.shutdown().await.unwrap();
 }
 
-// T17: quiescence is engine-wide; another request keeps it charged.
+// T17: quiescence is engine-wide. A neighbour completing on the router does
+// not close the cancelled request while the engine itself still reads busy.
 #[tokio::test]
-async fn a_cancelling_lease_waits_for_the_other_requests_on_the_engine() {
+async fn a_completed_neighbour_does_not_close_a_cancelling_lease_on_a_busy_engine() {
     let h = harness_with_ready_instance(false).await;
     let other = h.open_lease().await;
     let hung_up = h.open_lease().await;
@@ -92,28 +93,94 @@ async fn a_cancelling_lease_waits_for_the_other_requests_on_the_engine() {
     tokio::time::sleep(TICKS).await;
     assert_eq!(h.outstanding(), 2);
     h.close_lease(other, LeaseEnd::Completed).await;
+    tokio::time::sleep(TICKS).await;
+    assert_eq!(h.outstanding(), 1, "busy engine: the cancelled one stays");
+    assert_eq!(h.acknowledged(), 0);
     h.set_quiet(true);
     h.until_outstanding(0).await;
     h.lab.worker.shutdown().await.unwrap();
 }
 
-// T17: the question is asked after the hang-up; an earlier idle reading does
-// not count, and an ordinary lease is never closed by quiescence.
+// T17: an idle sample the engine took before the hang-up closes nothing; one
+// taken at or after it closes the lease. An ordinary lease is never closed by
+// quiescence.
 #[tokio::test]
-async fn a_quiescence_sample_before_the_hang_up_closes_nothing() {
+async fn an_idle_sample_before_the_hang_up_closes_nothing() {
     let h = harness_with_ready_instance(true).await;
     let running = h.open_lease().await;
     tokio::time::sleep(TICKS).await;
     assert_eq!(h.outstanding(), 1, "an uncancelled lease stays charged");
     assert!(h.lab.engine.asked.lock().unwrap().is_empty());
     let lease = h.open_lease().await;
-    let before = capyctl_protocol::now_unix_ms();
+    let before = capyctl_protocol::now_unix_ms() - 1;
+    *h.lab.engine.idle_at.lock().unwrap() = Some(before);
+    tokio::time::sleep(Duration::from_millis(5)).await;
     h.close_lease(lease, LeaseEnd::Cancelling).await;
+    tokio::time::sleep(TICKS).await;
+    assert!(!h.lab.engine.asked.lock().unwrap().is_empty());
+    assert_eq!(h.outstanding(), 2, "an idle sample before the hang-up");
+    *h.lab.engine.idle_at.lock().unwrap() = Some(capyctl_protocol::now_unix_ms());
     h.until_outstanding(1).await;
-    let asked = h.lab.engine.asked.lock().unwrap().clone();
-    assert!(!asked.is_empty());
-    assert!(asked.iter().all(|at| *at >= before), "{asked:?} < {before}");
+    assert_eq!(h.acknowledged(), 1);
     h.close_lease(running, LeaseEnd::Completed).await;
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17: an engine that never answers its quiescence question keeps its
+// cancelled lease charged and is asked once at a time; it never delays the
+// scheduler, so another deployment still starts promptly.
+#[tokio::test]
+async fn a_wedged_engine_never_delays_a_start() {
+    let lab = lab(30, 50).await;
+    lab.ready(&lab.a).await;
+    lab.engine.wedged.store(true, Ordering::SeqCst);
+    let generation = lab.instance(&lab.a.deployment_id, 0).2.unwrap();
+    let h = Harness {
+        port: lab.port(Duration::from_secs(10)),
+        lab,
+        generation,
+    };
+    let lease = h.open_lease().await;
+    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    until("a quiescence question", || {
+        !h.lab.engine.asked.lock().unwrap().is_empty()
+    })
+    .await;
+    let started = std::time::Instant::now();
+    h.lab.ready(&h.lab.c).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the start waited {:?} behind a wedged engine",
+        started.elapsed()
+    );
+    assert_eq!(
+        h.lab.engine.asked.lock().unwrap().len(),
+        1,
+        "one question in flight"
+    );
+    assert_eq!(h.outstanding(), 1, "uncertainty retains accounting");
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17: settlement does not wait for an uncertain launch elsewhere; a paused
+// launch pauses new activations, not the closing of cancelled requests.
+#[tokio::test]
+async fn a_cancelling_lease_settles_while_a_launch_is_paused() {
+    let h = harness_with_ready_instance(false).await;
+    let lease = h.open_lease().await;
+    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.lab.worker.shared.pause(Paused {
+        binding: "an-uncertain-launch".into(),
+        status: WorkerStatus::Uncertain {
+            operation_id: "op".into(),
+            reason: "an uncertain launch".into(),
+        },
+        retry: None,
+    });
+    h.set_quiet(true);
+    h.until_outstanding(0).await;
+    assert_eq!(h.acknowledged(), 1);
+    h.lab.worker.shared.unpause("an-uncertain-launch");
     h.lab.worker.shutdown().await.unwrap();
 }
 
@@ -146,4 +213,13 @@ async fn a_switch_waits_for_a_cancelling_lease() {
     assert_eq!(h.lab.state(&b), "ready");
     assert_eq!(h.lab.state(&h.lab.a.deployment_id), "parked");
     h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17: an engine that leaves its question unanswered is asked again after one
+// second, doubling while it stays silent, never more than 30 s apart.
+#[test]
+fn an_unanswered_question_backs_off_up_to_a_cap() {
+    let waits: Vec<u64> = (1..=7).map(|n| quiescence_backoff(n).as_secs()).collect();
+    assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
+    assert_eq!(quiescence_backoff(u32::MAX).as_secs(), 30);
 }

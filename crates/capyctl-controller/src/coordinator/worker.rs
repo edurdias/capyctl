@@ -2553,9 +2553,8 @@ async fn residency_effect(
 /// SPEC §6.5 (W5): advance open preinitializes and, at most once a second,
 /// the idle policy. Returns whether anything was accepted.
 async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
-    let settled = settle_cancellations(shared).await?;
     if !shared.initializing.load(Ordering::Acquire) {
-        return Ok(settled);
+        return Ok(false);
     }
     let eligible = shared.observations.eligible_hosts();
     let progress = shared
@@ -2565,7 +2564,7 @@ async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError
                 .advance_preinitialize(owner.session(), now, eligible.as_ref())
         })
         .await?;
-    let mut changed = settled || !progress.is_empty();
+    let mut changed = !progress.is_empty();
     let idle = shared.options.idle;
     if idle.ready_idle_ms.is_none() && idle.parked_idle_ms.is_none() {
         return Ok(changed);
@@ -2614,18 +2613,50 @@ fn lease_store_error(error: capyctl_store::StoreError) -> LifecycleError {
     }
 }
 
-/// SPEC §10 (amended 2026-10-01): at most every 250 ms, ask each retained
-/// engine with a cancelling lease whether it is quiescent now, and close the
-/// leases cancelled before the question when it is. Quiescence is
-/// engine-wide: another request on the engine keeps the cancelled one charged.
-/// One bounded question per binding per tick; nothing here waits for work.
-async fn settle_cancellations(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+/// The longest a binding waits before it is asked again after its engine
+/// left a quiescence question unanswered.
+const QUIESCENCE_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// After `timeouts` unanswered questions in a row, how long the binding waits
+/// before it is asked again: one second, doubling, up to the cap.
+fn quiescence_backoff(timeouts: u32) -> Duration {
+    Duration::from_secs(1)
+        .saturating_mul(
+            1u32.checked_shl(timeouts.saturating_sub(1).min(16))
+                .unwrap_or(u32::MAX),
+        )
+        .min(QUIESCENCE_BACKOFF_CAP)
+}
+
+/// One quiescence question's answer, applied by the scheduler on a later pass.
+struct QuiescenceAnswer {
+    binding_id: String,
+    /// The newest hang-up the question was about; only leases cancelled at
+    /// or before it close.
+    cutoff_ms: i64,
+    remote: bool,
+    /// `None` when the engine did not answer within the bound.
+    quiescent: Option<bool>,
+}
+
+/// SPEC §10 (amended 2026-10-01): at most every 250 ms, the retained bindings
+/// with a cancelling lease, each with its driver. Reading them waits for no
+/// engine.
+async fn cancelling_drivers(
+    shared: &Arc<Shared>,
+) -> Result<
+    Vec<(
+        capyctl_store::request_lease_cancellations::CancellingBinding,
+        Arc<Driver>,
+    )>,
+    CoordinatorError,
+> {
     // The lease ledger stamps a cancellation on the wall clock, so the
-    // question is asked, and paced, on that same clock.
+    // questions are paced on that same clock.
     let now = capyctl_protocol::now_unix_ms();
     let last = shared.cancel_checked_ms.load(Ordering::Acquire);
     if last != i64::MIN && now.saturating_sub(last) < 250 {
-        return Ok(false);
+        return Ok(vec![]);
     }
     shared.cancel_checked_ms.store(now, Ordering::Release);
     let cancelling = shared
@@ -2637,51 +2668,71 @@ async fn settle_cancellations(shared: &Arc<Shared>) -> Result<bool, CoordinatorE
         })
         .await?;
     if cancelling.is_empty() {
-        return Ok(false);
+        return Ok(vec![]);
     }
-    let drivers: Vec<_> = {
-        let retained = shared
-            .retained
-            .lock()
-            .map_err(|_| shared.fail("runtime registry poisoned"))?;
-        cancelling
-            .into_iter()
-            .filter_map(|c| retained.get(&c.binding_id).cloned().map(|d| (c, d)))
-            .collect()
+    let retained = shared
+        .retained
+        .lock()
+        .map_err(|_| shared.fail("runtime registry poisoned"))?;
+    Ok(cancelling
+        .into_iter()
+        .filter_map(|c| retained.get(&c.binding_id).cloned().map(|d| (c, d)))
+        .collect())
+}
+
+/// SPEC §10 (amended 2026-10-01): ask one engine, bounded, whether it has
+/// been quiescent since the binding's newest hang-up. Quiescence is
+/// engine-wide: another request on the engine keeps the cancelled one charged.
+async fn ask_quiescence(
+    cancelling: capyctl_store::request_lease_cancellations::CancellingBinding,
+    driver: Arc<Driver>,
+) -> QuiescenceAnswer {
+    let member = capyctl_adapters::traits::MemberRef {
+        deployment_id: cancelling.deployment_id.clone(),
+        member_id: cancelling.binding_id.clone(),
     };
-    let mut changed = false;
-    for (cancelling, driver) in drivers {
-        let asked_at = capyctl_protocol::now_unix_ms();
-        let member = capyctl_adapters::traits::MemberRef {
-            deployment_id: cancelling.deployment_id.clone(),
-            member_id: cancelling.binding_id.clone(),
-        };
-        let quiescent = tokio::time::timeout(
-            QUIESCENCE_QUESTION_BOUND,
-            driver.engine.engine_quiescent(&member, asked_at),
-        )
-        .await
-        .unwrap_or(false);
-        if !quiescent {
-            continue;
-        }
-        let receipt = if driver.settle.is_some() {
-            REMOTE_CANCELLATION_RECEIPT
-        } else {
-            LOCAL_CANCELLATION_RECEIPT
-        };
-        let binding = cancelling.binding_id;
-        let settled = shared
-            .read(move |owner, _| {
-                owner
-                    .store()
-                    .settle_cancelled_leases(owner.session(), &binding, asked_at, receipt)
-                    .map_err(lease_store_error)
-            })
-            .await?;
-        changed |= settled > 0;
+    // A remote sample is clamped to the time it reached the controller, so
+    // the question is about the hang-up, not about the time it is asked.
+    let cutoff_ms = cancelling.newest_cancelled_at_ms;
+    let quiescent = tokio::time::timeout(
+        QUIESCENCE_QUESTION_BOUND,
+        driver.engine.engine_quiescent(&member, cutoff_ms),
+    )
+    .await
+    .ok();
+    QuiescenceAnswer {
+        binding_id: cancelling.binding_id,
+        cutoff_ms,
+        remote: driver.settle.is_some(),
+        quiescent,
     }
-    Ok(changed)
+}
+
+/// Close the binding's leases cancelled at or before the answer's cutoff.
+/// Returns whether any closed.
+async fn settle_quiescent(
+    shared: &Arc<Shared>,
+    answer: QuiescenceAnswer,
+) -> Result<bool, CoordinatorError> {
+    let receipt = if answer.remote {
+        REMOTE_CANCELLATION_RECEIPT
+    } else {
+        LOCAL_CANCELLATION_RECEIPT
+    };
+    let settled = shared
+        .read(move |owner, _| {
+            owner
+                .store()
+                .settle_cancelled_leases(
+                    owner.session(),
+                    &answer.binding_id,
+                    answer.cutoff_ms,
+                    receipt,
+                )
+                .map_err(lease_store_error)
+        })
+        .await?;
+    Ok(settled > 0)
 }
 
 /// SPEC §6.3: a Stop drains before it terminates. Admission to the instance
