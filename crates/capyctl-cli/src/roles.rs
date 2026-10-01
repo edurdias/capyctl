@@ -1622,6 +1622,7 @@ async fn start_standalone_in(
     // of the standalone document; 30 s when it names none.
     let (
         switch_drain_timeout,
+        idle,
         timing_header,
         config_notices,
         inference_bind,
@@ -1666,6 +1667,11 @@ async fn start_standalone_in(
             capyctl_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
                 |error| StartError::Deploy(format!("standalone configuration: {error}")),
             )?,
+            // SPEC §6.5 (W5): `server.lifecycle_defaults`, off unless named, as
+            // in a server document.
+            capyctl_config::remote_roles::idle_timeouts(&document["server"]).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             // SPEC §17 (M80): `server.observability.timing_header`, off unless set.
             capyctl_config::remote_roles::timing_header(&document["server"]).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
@@ -1822,6 +1828,11 @@ async fn start_standalone_in(
         // SPEC §6.3: a Stop drains accepted requests for the same bound a
         // switch does before it terminates.
         stop_drain_timeout: switch_drain_timeout,
+        // SPEC §6.5 (W5): the document's idle policy, off unless named.
+        idle: capyctl_store::ordinary_lifecycle::park::IdlePolicy {
+            ready_idle_ms: idle.ready_idle.map(|d| d.as_millis() as i64),
+            parked_idle_ms: idle.parked_idle.map(|d| d.as_millis() as i64),
+        },
         ..Default::default()
     };
     // ADR 0008 (owner decision 2026-09-23): register each installation (its
