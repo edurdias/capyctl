@@ -234,10 +234,11 @@ U9 and U10 close the work.
 - **Files:**
   - Create `docs/design/adr/0023-mcp-remote-operator.md` with the ADR 0021 skeleton: `# ADR 0023 — Remote operator access over MCP`, `**Status:** Accepted (owner decision, 2026-10-01).`, `## Context`, `## Decision` (numbered sections for the operator role, the separate process, the listener, rotation, the usage view, and what stays admin-only), `## Consequences`.
   - Modify `docs/SPEC.md` §13.3: add an "Amended by ADR 0023" paragraph after the ADR 0019 one. It says the management listener keeps its loopback rule, an operator credential distinct from the admin token and inference key may reach operator routes through `capyctl mcp`, and host invitation, revoke and key rotation stay admin-only.
+  - Modify `docs/SPEC.md` §16.5: the defaults paragraph names the MCP listener's bind when `capyctl mcp` runs.
   - Modify `docs/SPEC.md` §20: extend T37 with "operator key refused on admin routes; MCP listener requires the operator key; inference key refused by MCP (ADR 0023)". Add T41 "Remote operator over MCP": usage figures match the CLI, action tools wait with a deadline, repeated idempotency keys do not replay.
   - Modify `docs/SPEC.md` §21: add a 2026-10-01 ADR 0023 entry listing the touched sections and T37, T41.
   - Modify `docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` §10: add one line, "Amended by ADR 0023: remote operator access through `capyctl mcp`."
-  - Modify `AGENTS.md`: add ADR 0023 to the ADR list sentence.
+  - Modify `AGENTS.md` and `docs/README.md`: add ADR 0023 to the ADR list sentence and change the matrix range to T01–T41.
 - **Patterns:** `docs/design/adr/0021-terminal-output.md`; the ADR 0019 amendment paragraph in SPEC §13.3; the §21 ADR 0019 entry.
 - **Test scenarios:** None (documentation). The site's link checks run in U10.
 - **Verification:** `rg -n "ADR 0023" docs/SPEC.md AGENTS.md docs/design/adr` shows each reference; owner sign-off on the ADR text is the gate for U2 onward.
@@ -395,7 +396,7 @@ U9 and U10 close the work.
 
 ## Definition of Done
 
-- ADR 0023 is accepted and SPEC §13.3, §20 and §21 reference it.
+- ADR 0023 is accepted and SPEC §13.3, §16.5, §20 and §21 reference it.
 - Every requirement R1-R30 maps to a unit above, and every acceptance example AE1-AE8 has a test.
 - All Verification Contract checks pass locally, with the commands and totals recorded in the status runbook.
 - The live smoke from a second LAN machine answers the owner's script, and the runbook states that CPU and Fake-engine tests are not qualification.

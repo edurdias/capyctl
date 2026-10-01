@@ -35,7 +35,7 @@ in what order.
 
 | Document | Contents |
 |---|---|
-| [`SPEC.md`](SPEC.md) | The authoritative product requirements: architecture, interfaces, resource rules, configuration, delivery gates and the T01–T40 acceptance matrix. Where any other document disagrees, the spec wins. |
+| [`SPEC.md`](SPEC.md) | The authoritative product requirements: architecture, interfaces, resource rules, configuration, delivery gates and the T01–T41 acceptance matrix. Where any other document disagrees, the spec wins. |
 | [`design/0000-full-picture.md`](design/0000-full-picture.md) | The overall design and how the parts fit together, recorded around the spec. |
 | [`design/adr/`](design/adr/) | Architecture decision records (ADR 0001 onwards). An ADR that amends the spec says so. |
 | [`design/milestones/`](design/milestones/) | Milestone designs and plans (F0 foundation, F1 vLLM path, F2 SGLang and the two-host program). |

@@ -292,6 +292,9 @@ Engine listeners stay on loopback with per-launch keys and mllm's key-guard midd
 the allowlisted inference routes. The router's constant-time key comparison, method and
 path allowlist, header stripping and queue bounds apply unchanged on every bind.
 
+*Amended by ADR 0023 (2026-10-01):* the management listener stays on loopback, and remote
+operator access goes through `capyctl mcp` with a separate operator key.
+
 ### 10a. Upgrading a generated policy whose machine changed shape
 
 Decided 2026-09-25. Standalone generates its host's resource policy from the

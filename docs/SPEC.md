@@ -497,6 +497,10 @@ Protect credentials, journals, checkpoint permissions, and sensitive cache direc
 
 The inference listener may be reachable from the network. It requires the API key by default; turning the key off (`authentication: none`, `--no-inference-auth` or `CAPYCTL_INFERENCE_AUTH=none`) prints a warning at start when the bind is not loopback, and there is no constant or fallback key. The router's allowlists, header stripping and amplification bounds apply on every bind. The management listener, engine listeners and the key-guard protections keep their loopback rules.
 
+> **Amended by [ADR 0023](design/adr/0023-mcp-remote-operator.md)** (owner decision 2026-10-01).
+
+The management listener keeps its loopback rule. The management API authenticates each request to a role: the admin token is `admin`, and a third credential, the operator key, is `operator`. The admin token, the operator key and the inference key are pairwise distinct, and the inference key authorizes no management request. The operator role may use every management route except host invitation, host revoke and operator-key rotation. The operator key may reach operator routes from the network only through `capyctl mcp`, a separate process on the control host that serves MCP over HTTP, requires the operator key on every request, and calls the loopback management API. The key is stored owner-only, is never logged or returned, and rotates without a restart.
+
 ## 14. Action-first CLI and interfaces
 
 Canonical grammar: `capyctl <action> <resource> [identifier] [options]`.
@@ -599,7 +603,7 @@ Defaults: local-only listeners with authentication; no public binding, no arbitr
 
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
-Defaults: the inference listener binds all interfaces (`0.0.0.0:8443`) and requires the API key; `authentication: none` is an explicit opt-out that warns at start when the bind is not loopback. Management listeners stay loopback-only. (Model downloads from Hugging Face and HTTP sources are allowed by default within a bounded store, per the ADR 0008 amendment of 2026-09-25; engines are still never installed automatically.)
+Defaults: the inference listener binds all interfaces (`0.0.0.0:8443`) and requires the API key; `authentication: none` is an explicit opt-out that warns at start when the bind is not loopback. Management listeners stay loopback-only. When the owner runs `capyctl mcp`, its MCP listener binds `0.0.0.0:7444` unless told otherwise and requires the operator key (ADR 0023); nothing listens for MCP until it runs. (Model downloads from Hugging Face and HTTP sources are allowed by default within a bounded store, per the ADR 0008 amendment of 2026-09-25; engines are still never installed automatically.)
 
 `auto` budgets must resolve to finite, versioned, inspectable allocations before launch. Establish a deterministic conservative headroom policy in the implementation ADR; its exact tuned numbers are not inferred from example YAML. Missing recipe estimates require an explicit estimate or controlled verification under a safe reservation, not unbounded startup. If a safe estimate cannot be established, block with a useful diagnostic. This specification does not authorize forced model loading merely to make a generated default appear turnkey.
 
@@ -967,10 +971,11 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. A newer host is refused ("upgrade the server first"), an older-than-N-1 or unversioned host is drain-only, and a command needing a capability the host did not declare is refused typed and never sent (ADR 0017). |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
 | T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
-| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. CapyCTL's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
+| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. CapyCTL's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). The operator key is refused on host invitation, host revoke and key rotation; the MCP listener refuses requests without the operator key, including ones carrying the inference key or the admin token; the operator key never appears in responses, tool results or logs (ADR 0023). |
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
+| T41 | Remote operator over MCP | Usage figures from `capyctl usage` and the MCP usage tool match; action tools wait up to a deadline and report an in-progress operation that a wait resumes; a repeated idempotency key returns the original operation and starts no second action (ADR 0023). |
 
 The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a live-verified deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
 
@@ -983,6 +988,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 ### Later amendments
 
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
+- 2026-10-01, [ADR 0023](design/adr/0023-mcp-remote-operator.md): an operator role and key distinct from the admin token and the inference key, `capyctl mcp` serving MCP over HTTP through the loopback management API, and a management usage view shared by the CLI and MCP (§13.3, §16.5, T37, T41).
 
 ### Sources
 
