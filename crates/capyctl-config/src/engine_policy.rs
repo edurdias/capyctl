@@ -760,6 +760,12 @@ fn typed_option(engine: Engine, name: &str) -> Option<(&'static str, &'static st
     })
 }
 
+/// The typed option (native spelling, field) a pass-through name stands for, in
+/// any spelling: abbreviated, `_` for `-`, `=value`, or `--no-` negated.
+pub fn typed_option_of(engine: Engine, name: &str) -> Option<(&'static str, &'static str)> {
+    typed_option(engine, &normalize_option_name(name))
+}
+
 /// The sensitivity a full option name's shape implies (ADR 0014 open issue 5).
 fn shape(name: &str) -> Option<Sensitivity> {
     let parts: Vec<&str> = name.trim_start_matches('-').split('-').collect();
