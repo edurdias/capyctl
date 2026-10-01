@@ -1,5 +1,37 @@
 # Current implementation and launch status
 
+## 0.1.0 release candidate — 2026-10-01
+
+Draft release `v0.1.0` (not published) targets `f224320`, the commit both
+archives were built from (`dirty: false`, rustc 1.98.1). Each architecture was
+built twice with byte-identical archives: x86_64 on a maintainer laptop,
+aarch64 on host A. The x86_64 strict packaging check passed with no SKIP lines;
+the aarch64 packaging and installer checks passed on host A (42 installer
+checks), and its binary has no private-denylist or lab-host match and no old
+project name. The draft's six assets match the local builds and
+`SHA256SUMS`, and `install.sh --version v0.1.0` installs from the draft with
+GitHub authentication.
+
+Installed-binary live check from these archives:
+
+- Laptop (RTX 4090, standalone): the release notes' upgrade steps (old binary
+  and shared files removed, fresh state), then vLLM 0.29 Qwen3-4B deployed in
+  55 s, served, parked to 1009 MiB and woke on request in 1.4 s; an SGLang
+  0.5.20 Qwen2.5-1.5B deployment switched with it both ways. `list hosts` and
+  `list engines` work on standalone.
+- Laptop server with hosts A (SGLang) and B (vLLM): both joined and online on
+  0.1.0; both deployments served through the server, a request without the key
+  got 401, both parked and woke on request in 47.3 s (SGLang) and 9.0 s
+  (vLLM). A first attempt was refused with `insufficient resources` while
+  another workload held the hosts' memory, as intended.
+
+All roles stopped with a drained shutdown; deployments deleted; no capyctl or
+engine process and no GPU process left on any machine. The history scan finds
+no private names beyond the public owner handle in merge messages and the
+public site URL; planning-tool references were removed from the tree (history
+keeps them, by owner decision). CPU and Fake-engine tests are not
+qualification.
+
 ## Rename to CapyCTL — 2026-09-30
 
 ADR 0022: the project, binary and repository are CapyCTL (`capyctl`), with no
