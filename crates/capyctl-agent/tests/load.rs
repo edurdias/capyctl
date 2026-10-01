@@ -532,3 +532,26 @@ async fn engine_histograms_are_reported_as_deltas() {
         (Some("vllm"), 0)
     );
 }
+
+// T41 (ADR 0023 §8): TensorFold 0.6.0's gauges and histograms
+// (`tensorfold/server/metrics.py`), one KV series per pool.
+#[test]
+fn tensorfold_metrics_parse() {
+    let body = "\
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 1
+tensorfold:requests_waiting 2
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.25
+tensorfold:kv_cache_usage_ratio{pool=\"1\"} 0.5
+tensorfold:time_to_first_token_seconds_bucket{le=\"0.5\"} 1
+tensorfold:time_to_first_token_seconds_bucket{le=\"+Inf\"} 2
+tensorfold:time_to_first_token_seconds_sum 1.5
+tensorfold:time_to_first_token_seconds_count 2
+";
+    let load = capyctl_agent::load::parse_engine_load(body).unwrap();
+    assert_eq!((load.running, load.waiting), (1, 2));
+    assert_eq!(load.kv_usage_ppm, 500_000);
+    let (engine, histograms) = capyctl_agent::load::parse_engine_histograms(body).unwrap();
+    assert_eq!(engine, "tensorfold");
+    assert_eq!(histograms[0].0, "engine_time_to_first_token");
+}

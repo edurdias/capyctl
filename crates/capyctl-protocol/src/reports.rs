@@ -36,8 +36,8 @@ pub const HOST_LATENCY_SERIES: &[(&str, LatencySource)] = &[
     ("engine_decode_time", LatencySource::Engine),
     ("engine_inter_token_latency", LatencySource::Engine),
 ];
-/// Engine families a latency report may name.
-pub const LATENCY_ENGINES: &[&str] = &["vllm", "sglang"];
+/// Engine families a latency report may name (ADR 0023 §8).
+pub const LATENCY_ENGINES: &[&str] = &["vllm", "sglang", "tensorfold"];
 
 /// Where a latency series is measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
