@@ -44,13 +44,28 @@ fn prepared_document() -> Value {
     let mut host = serde_json::from_str::<Value>(text).unwrap()["input"]["host"].clone();
     host["state_dir"] = json!("/home/operator/.local/state/capyctl");
     host["identity_dir"] = json!("/home/operator/.local/state/capyctl/identity");
-    // The agent reports the machine's real memory; fit a 16 GB CI runner.
-    let domain = &mut host["resource_policy"]["domains"]["unified"];
-    domain["managed_limit"] = json!("4GiB");
-    domain["free_reserve"] = json!("1GiB");
-    domain["parked_limit"] = json!("2GiB");
-    domain["host_kv_limit"] = json!("1GiB");
+    fit_to_host(&mut host["resource_policy"]["domains"]["unified"]);
     host
+}
+
+/// The agent reports real host memory; shrink the policy to fit a small runner.
+fn fit_to_host(domain: &mut Value) {
+    let bytes = |v: &Value| capyctl_config::effective::parse_bytes(v.as_str().unwrap()).unwrap();
+    let capacity = capyctl_agent::memory::read_host_memory()
+        .unwrap()
+        .memory
+        .capacity_bytes as f64;
+    let needed = (bytes(&domain["managed_limit"]) + bytes(&domain["free_reserve"])) as f64;
+    let scale = (capacity / 2.0 / needed).min(1.0);
+    for field in [
+        "managed_limit",
+        "free_reserve",
+        "parked_limit",
+        "host_kv_limit",
+    ] {
+        let mib = (bytes(&domain[field]) as f64 * scale) as i64 >> 20;
+        domain[field] = json!(format!("{mib}MiB"));
+    }
 }
 
 /// The inventory a prepared host reports.
