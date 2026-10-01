@@ -657,6 +657,15 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // T41: the TensorFold probe report parses with its three capabilities.
+    #[test]
+    fn a_tensorfold_probe_report_parses() {
+        let good = br#"{"schema":"capyctl/engine-capabilities/v1","engine":"tensorfold","capabilities":{"core":[],"deep_park":["unsupported"],"metrics":[]}}"#;
+        let report = CapabilityReport::parse(Engine::Tensorfold, good).unwrap();
+        assert_eq!(report.available("core"), Some(true));
+        assert_eq!(report.available("deep_park"), Some(false));
+    }
+
     /// A synthetic virtual environment with an engine package tree.
     fn venv(engine: Engine, version: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

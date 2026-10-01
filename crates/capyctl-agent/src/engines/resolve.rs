@@ -97,11 +97,13 @@ pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
             })?;
         let wanted = if name == "vllm" {
             Engine::Vllm
+        } else if name == "tensorfold" {
+            Engine::Tensorfold
         } else if name == "python" || name == "python3" || name.starts_with("python3.") {
             Engine::Sglang
         } else {
             return Err(ResolveError::Unsupported(format!(
-                "{} is neither bin/vllm nor bin/python3",
+                "{} is not bin/vllm, bin/tensorfold or bin/python3",
                 path.display()
             )));
         };
@@ -116,7 +118,7 @@ pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
     let found = packages(&env);
     if found.is_empty() {
         return Err(ResolveError::NotFound(format!(
-            "{} holds no vllm or sglang package",
+            "{} holds no vllm, sglang or tensorfold package",
             env.display()
         )));
     }
@@ -134,12 +136,17 @@ pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
             })?,
         None if found.len() == 1 => found[0].clone(),
         None => {
+            let entries: Vec<String> = found
+                .iter()
+                .map(|(engine, _)| {
+                    format!("{} for {}", entry(&env, *engine).display(), engine.name())
+                })
+                .collect();
             return Err(ResolveError::Unsupported(format!(
-                "{} holds both vllm and sglang; name {} for vLLM or {} for SGLang",
+                "{} holds several engines; name {}",
                 env.display(),
-                entry(&env, Engine::Vllm).display(),
-                entry(&env, Engine::Sglang).display()
-            )))
+                entries.join(", or ")
+            )));
         }
     };
     let executable = entry(&env, engine);
