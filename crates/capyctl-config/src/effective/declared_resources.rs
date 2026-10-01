@@ -9,7 +9,8 @@ use serde_json::Value;
 /// the family is known from `runtime_profile: tensorfold` or an
 /// `engine_config.tensorfold` block.
 pub fn validate_declared_resources(deployment: &Value) -> Result<(), ConfigError> {
-    let Some(resources) = deployment.get("resources") else {
+    // `resources: null` is absent, as the server decodes it.
+    let Some(resources) = deployment.get("resources").filter(|r| !r.is_null()) else {
         let tensorfold = ["runtime_profile", "engine"]
             .iter()
             .any(|key| deployment[*key].as_str() == Some("tensorfold"))

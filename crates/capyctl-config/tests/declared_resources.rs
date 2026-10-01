@@ -61,3 +61,13 @@ fn a_tensorfold_deployment_without_resources_is_refused() {
     }
     validate_declared_resources(&deployment("vllm", None)).unwrap();
 }
+
+// T03: `resources: null` is absent, as the server decodes it.
+#[test]
+fn a_null_resources_block_is_treated_as_absent() {
+    validate_declared_resources(&deployment("vllm", Some(Value::Null))).unwrap();
+    let error =
+        validate_declared_resources(&deployment("tensorfold", Some(Value::Null))).unwrap_err();
+    assert_eq!(error.path, "resources");
+    assert_eq!(error.code, capyctl_config::ConfigErrorCode::MissingRequired);
+}
