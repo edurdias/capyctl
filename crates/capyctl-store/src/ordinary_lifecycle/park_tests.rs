@@ -1563,3 +1563,43 @@ fn a_completed_restore_leaves_a_gate_another_reason_closed() {
     let (state, open, _) = lab.instance(&a.deployment_id);
     assert_eq!((state.as_str(), open), ("ready", false));
 }
+
+// T33 T19, SPEC §10 and §13.2: a restart closes every gate without a closure
+// row. A park accepted on the adopted launch and cancelled at its deadline
+// must not reopen that gate: a retired session's request may still run on
+// the engine and readiness is not yet re-proven in this session, which is
+// what `reverify_local_dispatch` waits for. Found by the formal review
+// (formal/CapyFormal/Protocols.lean, `Gate`).
+#[test]
+fn a_cancelled_park_does_not_reopen_a_gate_a_restart_closed() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    lab.ready(&a, 1_000, 10);
+    let generation = lab.instance(&a.deployment_id).2;
+    lab.store
+        .conn
+        .execute(
+            "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index) VALUES('retired',?1,?2,?3,?4,'inflight',0)",
+            params![a.deployment_id, a.revision, generation, lab.session.id()],
+        )
+        .unwrap();
+    let session = lab.store.begin_coordinator_session().unwrap();
+    for launch in lab.store.retired_local_launches(&session).unwrap() {
+        lab.store
+            .adopt_retired_local_launch(&session, launch.work.step_id())
+            .unwrap();
+    }
+    let lab = Lab { session, ..lab };
+    assert!(!lab.instance(&a.deployment_id).1);
+    let park = lab.park(&a, "p", 1_100);
+    assert_eq!(lab.arm(&park.step_id, 1_200), ResidencyArm::Draining);
+    assert!(lab
+        .store
+        .next_residency_work(&lab.session, 61_200)
+        .unwrap()
+        .is_empty());
+    assert!(
+        !lab.instance(&a.deployment_id).1,
+        "the restart's closure outlives the cancelled park"
+    );
+}
