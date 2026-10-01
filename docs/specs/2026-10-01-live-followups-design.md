@@ -65,8 +65,8 @@ ADR 0018.
 
 **Design.**
 - A host or standalone role starts with no engine profile. It publishes an empty
-  profile list, accepts and keeps deployments, and places none until a profile
-  exists. `capyctl status` and the start banner say the role has no engine and
+  profile list and keeps its existing deployments, placing none until a profile
+  exists. A new deploy naming an unpublished profile still fails fast (ADR 0018). `capyctl status` and the start banner say the role has no engine and
   name `capyctl engine add`.
 - `engine remove` may remove the last registered profile. Retirement follows the
   existing path: deployments on that profile drain and stop first.
