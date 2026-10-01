@@ -757,7 +757,10 @@ impl EngineAdapter for CheckpointGate {
     ) -> Result<CancellationOutcome, AdapterError> {
         self.inner.cancel_work(member, request, require_ack).await
     }
-    async fn idle_before_signal(&self, member: &MemberRef) -> Option<bool> {
+    async fn idle_before_signal(
+        &self,
+        member: &MemberRef,
+    ) -> Option<capyctl_adapters::traits::EngineWork> {
         self.inner.idle_before_signal(member).await
     }
 }

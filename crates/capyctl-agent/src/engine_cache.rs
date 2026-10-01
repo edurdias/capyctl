@@ -69,9 +69,23 @@ impl EngineCacheRoot {
     }
 }
 
-/// ADR 0023 §4: whether an earlier start left a build here (any entry).
+/// ADR 0023 §4: whether an earlier start finished a build here. torch's
+/// `cpp_extension` links `<dir>/<name>/<name>.so` and holds `<name>/lock`
+/// while it builds, so an extension counts only once linked and unlocked; a
+/// start killed mid build leaves the directory and its objects behind.
 pub fn has_build(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+    let finished = |extension: &Path| {
+        let Some(name) = extension.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        std::fs::symlink_metadata(extension.join(format!("{name}.so"))).is_ok_and(|m| m.is_file())
+            && std::fs::symlink_metadata(extension.join("lock")).is_err()
+    };
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir()) && finished(&entry.path())
+        })
+    })
 }
 
 #[cfg(test)]
@@ -105,11 +119,33 @@ mod tests {
         }
         assert_eq!(root.torch_extensions("0.6.0").unwrap(), path);
         assert!(!has_build(&path));
-        std::fs::create_dir(path.join("tensorfold_qmm_v3")).unwrap();
-        assert!(has_build(&path));
     }
 
-    // T37: a fingerprint is a path component, never a path; a widened mode or
+    // T41 (ADR 0023 §4): only a finished build counts. torch's
+    // `cpp_extension` builds `<dir>/<name>/<name>.so`; a start killed mid
+    // build leaves the directory, its `lock`, `build.ninja` and objects.
+    #[test]
+    fn only_a_finished_build_counts() {
+        let (_dir, root) = root();
+        let path = root.torch_extensions("0.6.0").unwrap();
+        let extension = path.join("tensorfold_qmm_v3");
+        std::fs::create_dir(&extension).unwrap();
+        assert!(!has_build(&path), "an empty extension directory");
+        for partial in ["lock", "build.ninja", "qmm.cuda.o"] {
+            std::fs::write(extension.join(partial), "").unwrap();
+        }
+        std::fs::write(path.join("lock"), "").unwrap();
+        assert!(!has_build(&path), "a build that never linked");
+        std::fs::write(extension.join("tensorfold_qmm_v3.so"), "ELF").unwrap();
+        assert!(!has_build(&path), "linked, but a rebuild holds the lock");
+        std::fs::remove_file(extension.join("lock")).unwrap();
+        assert!(has_build(&path));
+        std::fs::create_dir(path.join("other")).unwrap();
+        std::fs::create_dir(path.join("other/other.so")).unwrap();
+        assert!(has_build(&path), "one finished extension is a build");
+    }
+
+    // T41 T37: a fingerprint is a path component, never a path; a widened mode or
     // a symlink anywhere on the way is refused, not repaired.
     #[test]
     fn unsafe_fingerprints_and_directories_are_refused() {

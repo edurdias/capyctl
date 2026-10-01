@@ -205,7 +205,7 @@ fn a_host_keeps_its_overrides_for_reloads() {
     let config =
         HostConfig::load_with_overrides(&document, &dir.path().join("engines.yaml"), &overrides)
             .unwrap()
-            .with_engines(&Default::default(), &Default::default(), &|_| {
+            .with_engines(&Default::default(), &Default::default(), &|_, _| {
                 Ok("fp".into())
             })
             .unwrap();

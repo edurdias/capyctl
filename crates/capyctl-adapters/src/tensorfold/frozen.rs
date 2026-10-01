@@ -20,7 +20,7 @@ pub enum TensorfoldPlanError {
     NoContext,
     #[error("the selected GPU cannot be pinned")]
     UnpinnableDevice,
-    /// ADR 0014 §8, ruling 7: a path option's value resolves outside the
+    /// ADR 0014 §8, ADR 0023 §5: a path option's value resolves outside the
     /// approved paths through a symlink (the launch-time half of the check).
     #[error("{0} names a path outside the approved paths")]
     PathNotApproved(String),
@@ -46,7 +46,7 @@ pub fn plan_from_effective(
         .require_resolved_path()
         .map_err(|error| TensorfoldPlanError::Unresolved(error.to_string()))?
         .to_owned();
-    // Ruling 8: a declared Initialize timeout bounds every launch; a derived
+    // ADR 0023 §4: a declared Initialize timeout bounds every launch; a derived
     // one is the ordinary bound once a build exists.
     let warm_startup_ms = match effective.timeouts.provenance.get("initialize") {
         Some(TimeoutSource::Declared) => effective.timeouts.initialize_ms,
@@ -54,7 +54,7 @@ pub fn plan_from_effective(
             derived_initialize_ms(settings.memory.weights_bytes).min(effective.request_deadline_ms)
         }
     };
-    // ADR 0014 §8, ruling 7: every path option among the extras (the drafter
+    // ADR 0014 §8, ADR 0023 §5: every path option among the extras (the drafter
     // included) must still lie inside an approved path once symlinks resolve.
     let approved: Vec<PathBuf> = profile
         .security

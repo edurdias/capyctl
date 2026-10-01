@@ -40,7 +40,7 @@ fn fixture() -> (Value, Value) {
     (deployment, host)
 }
 
-// T41 T14: the spec's command line, rulings 4's fixed flags, in order.
+// T41 T14: ADR 0023 §3's command line, its fixed flags in order.
 #[test]
 fn the_command_is_serve_with_the_reserved_settings_rendered() {
     let cmd = render_command(&plan()).unwrap();
@@ -85,7 +85,7 @@ fn typed_fields_host_args_and_extras_render_in_order() {
     input.max_tokens = Some(1024);
     input.thinking = Some(false);
     input.engine_args = vec!["--parallel".into(), "2".into()];
-    // Ruling 7: an approved `--drafter` extra replaces capyctl's `--drafter none`.
+    // ADR 0023 §5: an approved `--drafter` extra replaces capyctl's `--drafter none`.
     input.extra_args = vec![
         "--vision".into(),
         "--drafter".into(),
@@ -137,7 +137,7 @@ fn reserved_names_are_refused_again_when_rendering() {
         input.extra_args = extra.iter().map(|s| s.to_string()).collect();
         assert!(render_command(&input).is_err(), "{extra:?}");
     }
-    // Ruling R2: a host-fixed argument may set a typed option the deployment
+    // ADR 0023 §4: a host-fixed argument may set a typed option the deployment
     // left unset, never one it set, in any spelling.
     let mut input = plan();
     input.engine_args = vec!["--max-tokens".into(), "512".into()];
@@ -199,7 +199,7 @@ fn the_plan_comes_from_the_resolved_deployment() {
     assert_eq!(plan.context_length, 8192);
     assert_eq!(plan.port, 8101);
     assert_eq!(plan.engine_log.as_deref(), Some("/var/log/i.log"));
-    // Ruling R3: the derived bound is capped by the request deadline.
+    // ADR 0023 §4: the derived bound is capped by the request deadline.
     assert_eq!(
         plan.warm_startup_ms,
         derived_initialize_ms(None).min(effective.request_deadline_ms)

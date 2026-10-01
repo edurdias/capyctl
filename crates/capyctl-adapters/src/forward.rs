@@ -287,7 +287,7 @@ impl ChatSink for Collecting<'_> {
     }
 }
 
-/// SPEC §6.1 (ruling 11): a readiness probe's answer is non-empty content
+/// SPEC §6.1, ADR 0023 §6: a readiness probe's answer is non-empty content
 /// or, for a model that reasons first, non-empty reasoning.
 pub fn probe_answered(answer: &Value) -> bool {
     let message = &answer["choices"][0]["message"];
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
     }
 
-    // T41 T22 (ruling 11): reasoning alone answers the probe; nothing does not.
+    // T41 T22 (ADR 0023 §6): reasoning alone answers the probe; nothing does not.
     #[test]
     fn a_reasoning_only_answer_answers_the_probe() {
         assert!(probe_answered(

@@ -63,7 +63,7 @@ pub(super) async fn initialize(
     let api = tokio::task::spawn_blocking(move || spawn_tools.spawn_durable(&incarnation, &cmd))
         .await
         .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
-    // ADR 0023 §4 (ruling 8): the ordinary bound once a build exists, the
+    // ADR 0023 §4: the ordinary bound once a build exists, the
     // whole (first-build) deadline otherwise.
     let deadline = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
     let warm = adapter.extensions_built();
@@ -121,7 +121,8 @@ pub(super) async fn initialize(
         "max_tokens": 8,
         "temperature": 0,
     });
-    let budget = Duration::from_millis(u64::try_from(deadline - now_ms()?).unwrap_or(0));
+    // ADR 0023 §4: the probe is part of startup, so the warm bound covers it.
+    let budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
     let answer = tokio::time::timeout(budget, adapter.forward_chat(&body))
         .await
         .map_err(|_| {
@@ -142,7 +143,7 @@ pub(super) async fn initialize(
     let identities = tokio::task::spawn_blocking(move || group_tools.observe_group(&led_by))
         .await
         .map_err(|_| RuntimeError::Uncertain("group task failed".into()))??;
-    // Ruling 13: TensorFold 0.6.0 serves from one process.
+    // ADR 0023 §6: TensorFold 0.6.0 serves from one process.
     if identities.first().map(|i| i.role.as_str()) != Some("api") {
         return Err(RuntimeError::Uncertain(
             "engine group has no API process".into(),

@@ -76,6 +76,18 @@ pub async fn execute_in(
     state_dir: &Path,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<Value, StructuredError> {
+    execute_with(command, config, state_dir, env, &Default::default()).await
+}
+
+/// As [`execute_in`], also reading `CUDA_HOME` through `env`, and looking for
+/// TensorFold's build toolchain in `search` (a test's own directories).
+pub async fn execute_with(
+    command: &Command,
+    config: Option<&Path>,
+    state_dir: &Path,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+    search: &capyctl_config::toolchain::ToolchainSearch,
+) -> Result<Value, StructuredError> {
     match command {
         Command::EngineDetect { paths } => Ok(detected(paths)),
         Command::EngineAdd {
@@ -93,6 +105,10 @@ pub async fn execute_in(
                 *deep_park,
                 *drift,
                 args,
+                Toolchain {
+                    cuda_home_env: env("CUDA_HOME"),
+                    search,
+                },
             )
             .await
         }
@@ -282,6 +298,12 @@ fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64,
     write_engines(&engines, &lock, host.as_ref()).map_err(|e| error("invalid_config", e.detail))
 }
 
+/// Where `engine add` looks for TensorFold's build toolchain.
+struct Toolchain<'a> {
+    cuda_home_env: Option<String>,
+    search: &'a capyctl_config::toolchain::ToolchainSearch,
+}
+
 async fn add(
     target: &Target,
     path: Option<&Path>,
@@ -289,6 +311,7 @@ async fn add(
     deep_park: Option<DeepParkChoice>,
     drift: DriftChoice,
     args: &[String],
+    toolchain: Toolchain<'_>,
 ) -> Result<Value, StructuredError> {
     let path = match path {
         Some(path) => path.to_path_buf(),
@@ -317,8 +340,9 @@ async fn add(
         ));
     }
     // SPEC §13.3 amendment (owner decision 2026-09-25).
-    let cuda_home = capyctl_config::registration::detect_cuda_home(
-        std::env::var("CUDA_HOME").ok().as_deref(),
+    let cuda_home = capyctl_config::registration::detect_cuda_home_in(
+        toolchain.cuda_home_env.as_deref(),
+        &toolchain.search.default_cuda_home,
         |nvcc| nvcc.is_file(),
     );
     if resolved.engine == Engine::Tensorfold {
@@ -332,17 +356,13 @@ async fn add(
             ));
         }
         let bin = resolved.executable.parent().unwrap_or(&resolved.env);
-        capyctl_config::toolchain::check(
-            bin,
-            cuda_home.as_deref(),
-            capyctl_config::toolchain::SYSTEM_PATH,
-        )
-        .map_err(|missing| {
-            error(
-                "toolchain_missing",
-                format!("{missing}; nothing was written"),
-            )
-        })?;
+        capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
+            .map_err(|missing| {
+                error(
+                    "toolchain_missing",
+                    format!("{}; nothing was written", missing.for_engine_add()),
+                )
+            })?;
     }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
     let registration = tokio::task::spawn_blocking(move || register(&r, &state))

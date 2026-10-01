@@ -802,6 +802,8 @@ pub struct EnvEngineProvider {
     /// The standalone document's `host:` block settings, the YAML layer
     /// ([`EngineProvider::configure`]).
     document: std::sync::Mutex<EngineOverrides>,
+    /// ADR 0023 §2: where a TensorFold's build toolchain is looked for.
+    toolchain: capyctl_config::toolchain::ToolchainSearch,
 }
 
 impl EnvEngineProvider {
@@ -810,7 +812,18 @@ impl EnvEngineProvider {
             managed_runtime: None,
             flags: EngineOverrides::default(),
             document: Default::default(),
+            toolchain: Default::default(),
         }
+    }
+
+    /// Looks for a TensorFold's build toolchain in `search` (a test's own
+    /// directories) instead of the system's.
+    pub fn with_toolchain_search(
+        mut self,
+        search: capyctl_config::toolchain::ToolchainSearch,
+    ) -> Self {
+        self.toolchain = search;
+        self
     }
 
     /// SPEC §3.3 / ADR 0001: without `CAPYCTL_RUNTIME_DIR`, the engine runs
@@ -912,7 +925,7 @@ impl EnvEngineProvider {
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
         let mut deep_park = deep_park.unwrap_or(settings.deep_park);
-        // R1 (ADR 0023 §2, §6): an environment TensorFold install is checked
+        // ADR 0023 §2, §6: an environment TensorFold install is checked
         // for its build toolchain as `engine add` checks it, and never parks.
         if engine == Engine::Tensorfold {
             deep_park = false;
@@ -921,9 +934,11 @@ impl EnvEngineProvider {
                 capyctl_config::toolchain::check(
                     bin,
                     settings.cuda_home.as_deref(),
-                    capyctl_config::toolchain::SYSTEM_PATH,
+                    &self.toolchain.system,
                 )
-                .map_err(|missing| no_installation(format!("toolchain_missing: {missing}")))?;
+                .map_err(|missing| {
+                    no_installation(format!("toolchain_missing: {}", missing.for_local_engine()))
+                })?;
             }
         }
         let trust_remote_code = settings.trust_remote_code;
@@ -932,7 +947,7 @@ impl EnvEngineProvider {
         let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
             (Some(registered), _) => registered.to_owned(),
             (None, Some(declared)) => declared,
-            (None, None) => probe_fingerprint(&executable)?,
+            (None, None) => probe_fingerprint(&executable, engine)?,
         };
         let declared_kv = settings.kv_cache;
         let kv_cache_declared = declared_kv.is_some();
@@ -1180,8 +1195,8 @@ fn runtime_dir(
 
 /// [`probe_fingerprint`] for the host role, which states `local_engine`
 /// profiles in its document (owner rule 2026-09-25).
-pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
-    probe_fingerprint(executable).map_err(|error| error.to_string())
+pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String, String> {
+    probe_fingerprint(executable, engine).map_err(|error| error.to_string())
 }
 
 /// What the installed engine says it is.
@@ -1190,7 +1205,7 @@ pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
 /// than from a constant that would keep claiming the same build after an upgrade.
 /// A probe that fails or hangs is a refusal: an engine that cannot print its own
 /// version is not one this host should publish.
-fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
+fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, ProviderError> {
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
@@ -1231,14 +1246,18 @@ fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
         // The child has exited, so this reads what it left in the pipe and returns.
         let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
     }
-    // `tensorfold 0.6.0` publishes `0.6.0`, as `engine add` records it.
-    let fingerprint = printed
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .and_then(|line| line.split_whitespace().last())
-        .unwrap_or_default()
-        .to_owned();
+    // ADR 0023 §2: `tensorfold 0.6.0` publishes `0.6.0`, as `engine add`
+    // records it. vLLM and SGLang publish what they print, as before.
+    let fingerprint = match engine {
+        Engine::Tensorfold => printed
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .and_then(|line| line.split_whitespace().last())
+            .unwrap_or_default(),
+        Engine::Vllm | Engine::Sglang => printed.trim(),
+    }
+    .to_owned();
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
             "{} printed no version, so there is nothing to pin this recipe to; set \
@@ -2205,6 +2224,44 @@ pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T41 T03 (ADR 0023 §2): only TensorFold's version is its last word, as
+    // `engine add` records it; vLLM and SGLang publish what they print, so
+    // the fingerprints pinned by earlier releases still match.
+    #[test]
+    fn only_tensorfold_publishes_the_last_word_of_its_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, printed: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '{printed}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let python = script("python3", "Python 3.12.3\\n");
+        let vllm = script("vllm", "INFO loading\\n0.29.0\\n");
+        let tensorfold = script("tensorfold", "tensorfold 0.6.0\\n\\n");
+        assert_eq!(
+            probe_fingerprint(&python, Engine::Sglang).unwrap(),
+            "Python 3.12.3"
+        );
+        assert_eq!(
+            probe_fingerprint(&vllm, Engine::Vllm).unwrap(),
+            "INFO loading\n0.29.0"
+        );
+        assert_eq!(
+            probe_fingerprint(&tensorfold, Engine::Tensorfold).unwrap(),
+            "0.6.0"
+        );
+        assert_eq!(
+            engine_version(Engine::Tensorfold, &tensorfold).unwrap(),
+            "0.6.0"
+        );
+        assert_eq!(
+            engine_version(Engine::Sglang, &python).unwrap(),
+            "Python 3.12.3"
+        );
+    }
 
     // T37 (design §9): there is no constant key. Freshly created credentials
     // that cannot be read back are a start failure; readable ones give the

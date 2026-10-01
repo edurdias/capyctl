@@ -2639,9 +2639,11 @@ async fn drain_before_terminate(
     }
 }
 
-/// Spec §5 (ruling 9, ADR 0023 §6): an engine with its own work counters
-/// (TensorFold) must read idle before the stop signal. Not idle within the
-/// bound, nothing is sent: the cleanup stays uncertain and keeps its accounting.
+/// Spec §5, ADR 0023 §6: after the drain, an engine with its own work counters
+/// (TensorFold) is read before the stop signal. Idle, exited or not listening,
+/// it is signalled at once; hung, once the bound passes. Still answering busy
+/// at the bound, nothing is sent: the cleanup stays uncertain and keeps its
+/// accounting.
 async fn idle_before_terminate(
     shared: &Arc<Shared>,
     work: &OrdinaryCleanupReceipt,
@@ -2658,12 +2660,8 @@ async fn idle_before_terminate(
         deployment_id,
         member_id: work.binding_id.clone(),
     };
-    // An engine without its own counters answers `None`; the lease drain
-    // above alone decides for it.
-    match driver.engine.idle_before_signal(&member).await {
-        None | Some(true) => return Ok(()),
-        Some(false) => {}
-    }
+    // An engine without its own counters answers `None` at once; the lease
+    // drain above alone decides for it.
     let now = (shared.clock)()?;
     let budget = u64::try_from(work.deadline_ms.saturating_sub(now).saturating_sub(
         i64::try_from(shared.options.protocol_timeout.as_millis()).unwrap_or(i64::MAX),

@@ -370,6 +370,18 @@ pub fn detect_cuda_home(
     cuda_home_env: Option<&str>,
     has_nvcc: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
+    detect_cuda_home_in(cuda_home_env, Path::new(DEFAULT_CUDA_HOME), has_nvcc)
+}
+
+/// The toolkit CUDA's own installer links when `CUDA_HOME` names none.
+pub const DEFAULT_CUDA_HOME: &str = "/usr/local/cuda";
+
+/// As [`detect_cuda_home`], with `default` in place of [`DEFAULT_CUDA_HOME`].
+pub fn detect_cuda_home_in(
+    cuda_home_env: Option<&str>,
+    default: &Path,
+    has_nvcc: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let normalized = |path: &Path| {
         path.is_absolute()
             && path.components().all(|c| {
@@ -382,10 +394,7 @@ pub fn detect_cuda_home(
     cuda_home_env
         .map(|value| PathBuf::from(value.trim_end_matches('/')))
         .filter(|path| normalized(path) && has_nvcc(&path.join("bin/nvcc")))
-        .or_else(|| {
-            let default = PathBuf::from("/usr/local/cuda");
-            has_nvcc(&default.join("bin/nvcc")).then_some(default)
-        })
+        .or_else(|| has_nvcc(&default.join("bin/nvcc")).then(|| default.to_path_buf()))
 }
 
 /// ADR 0018 §1: the profile `engine add` writes. SPEC §13.3, ADR 0012: every

@@ -15,7 +15,7 @@ This file is the working agreement for every contributor, human or coding agent.
 Read these in order when orienting. Lower entries never override higher ones.
 
 1. `docs/SPEC.md` — authoritative product requirements, MUST/MUST NOT, delivery
-   gates (§18) and the T01–T40 acceptance matrix (§20).
+   gates (§18) and the T01–T41 acceptance matrix (§20).
 2. `docs/design/adr/` — architecture decision records. ADR 0012 onward records
    owner decisions made after the F2 design (deep parking default-on, instances and
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,

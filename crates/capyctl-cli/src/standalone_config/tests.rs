@@ -606,7 +606,7 @@ fn fake_tensorfold_bin(dir: &std::path::Path, tools: &[&str]) -> std::path::Path
     bin_dir.join("tensorfold")
 }
 
-/// ADR 0023 §2, §6 (ruling R1): a role's own TensorFold is declared by
+/// ADR 0023 §2, §6: a role's own TensorFold is declared by
 /// CAPYCTL_TENSORFOLD_BIN, publishes its probed version with deep park off
 /// whatever the default says, and is refused without its build toolchain.
 // T41
@@ -634,17 +634,19 @@ fn an_environment_tensorfold_is_checked_and_never_parks() {
     assert!(!installation.deep_park);
 
     std::fs::remove_file(bin.with_file_name("ninja")).expect("remove ninja");
-    let system_has_ninja = capyctl_config::toolchain::SYSTEM_PATH
-        .split(':')
-        .any(|d| std::path::Path::new(d).join("ninja").is_file());
-    if !system_has_ninja {
-        let message = crate::roles::EnvEngineProvider::new()
-            .installation()
-            .expect_err("a missing build tool refuses the start")
-            .to_string();
-        assert!(message.contains("toolchain_missing"), "{message}");
-        assert!(message.contains("ninja"), "{message}");
-    }
+    // No system directory is searched, so the refusal does not depend on what
+    // this machine has installed.
+    let message = crate::roles::EnvEngineProvider::new()
+        .with_toolchain_search(capyctl_config::toolchain::ToolchainSearch {
+            system: String::new(),
+            default_cuda_home: dir.path().join("no-cuda"),
+        })
+        .installation()
+        .expect_err("a missing build tool refuses the start")
+        .to_string();
+    assert!(message.contains("toolchain_missing"), "{message}");
+    assert!(message.contains("ninja"), "{message}");
+    assert!(message.contains("--cuda-home"), "{message}");
     for name in [
         "CAPYCTL_TENSORFOLD_BIN",
         "CAPYCTL_MODELS_ROOT",
@@ -685,9 +687,9 @@ fn host_policy_from_env_is_complete() {
     let installation = crate::roles::EnvEngineProvider::new()
         .installation()
         .expect("the environment declares an installation");
-    // The fingerprint is the engine's own report (its last word, as `engine
-    // add` records it), not a constant that would keep claiming one build.
-    assert_eq!(installation.build_fingerprint, "0.29.0");
+    // The fingerprint is the engine's own report, not a constant that would keep
+    // claiming the same build after an upgrade.
+    assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
     let host = host_policy(
         &named(&installation),

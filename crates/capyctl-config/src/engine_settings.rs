@@ -463,7 +463,17 @@ impl EngineSettings {
 pub fn apply_to_host(
     document: &mut Value,
     settings: &EngineSettings,
-    probe: &dyn Fn(&Path) -> Result<String, String>,
+    probe: &dyn Fn(Engine, &Path) -> Result<String, String>,
+) -> Result<(), ConfigError> {
+    apply_to_host_with(document, settings, probe, &Default::default())
+}
+
+/// As [`apply_to_host`], looking for TensorFold's build toolchain in `search`.
+pub fn apply_to_host_with(
+    document: &mut Value,
+    settings: &EngineSettings,
+    probe: &dyn Fn(Engine, &Path) -> Result<String, String>,
+    search: &crate::toolchain::ToolchainSearch,
 ) -> Result<(), ConfigError> {
     if settings.kv_cache.is_some() {
         return Err(refuse(
@@ -508,29 +518,26 @@ pub fn apply_to_host(
         }
         let build_fingerprint = match &settings.build_fingerprint {
             Some(stated) => stated.clone(),
-            None => probe(&executable).map_err(|detail| {
+            None => probe(engine, &executable).map_err(|detail| {
                 refuse(
                     &format!("runtime_profiles.{name}"),
                     format!("{detail}; state local_engine.build_fingerprint (or {ENGINE_FINGERPRINT_ENV}) to publish one explicitly"),
                 )
             })?,
         };
-        // R1 (ADR 0023 §2): the first start builds CUDA extensions, so the
+        // ADR 0023 §2: the first start builds CUDA extensions, so the
         // toolchain is checked here as `engine add` checks it.
         if engine == Engine::Tensorfold {
             let bin = executable.parent().unwrap_or(Path::new(""));
-            crate::toolchain::check(
-                bin,
-                settings.cuda_home.as_deref(),
-                crate::toolchain::SYSTEM_PATH,
-            )
-            .map_err(|missing| {
-                ConfigError::new(
-                    ConfigErrorCode::UnsupportedCombination,
-                    format!("runtime_profiles.{name}"),
-                    format!("toolchain_missing: {missing}"),
-                )
-            })?;
+            crate::toolchain::check(bin, settings.cuda_home.as_deref(), &search.system).map_err(
+                |missing| {
+                    ConfigError::new(
+                        ConfigErrorCode::UnsupportedCombination,
+                        format!("runtime_profiles.{name}"),
+                        format!("toolchain_missing: {}", missing.for_local_engine()),
+                    )
+                },
+            )?;
         }
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
@@ -940,7 +947,7 @@ mod tests {
             &EngineOverrides::default(),
             &EngineOverrides::from_document(&document).unwrap(),
         );
-        apply_to_host(&mut document, &settings, &|_| Ok("vllm 0.29.0".into())).unwrap();
+        apply_to_host(&mut document, &settings, &|_, _| Ok("vllm 0.29.0".into())).unwrap();
         assert!(document.get("local_engine").is_none());
         let profile = &document["runtime_profiles"]["local"];
         assert_eq!(profile["executable"], "/opt/vllm/bin/vllm");
@@ -968,7 +975,7 @@ mod tests {
             &EngineOverrides::default(),
             &EngineOverrides::default(),
         );
-        apply_to_host(&mut both, &settings, &|_| unreachable!("stated")).unwrap();
+        apply_to_host(&mut both, &settings, &|_, _| unreachable!("stated")).unwrap();
         assert_eq!(both["runtime_profiles"]["local-vllm"]["engine"], "vllm");
         assert_eq!(both["runtime_profiles"]["local-sglang"]["args"], json!([]));
         // A declared `local` is refused; a failed probe names the setting.
@@ -981,10 +988,10 @@ mod tests {
             &EngineOverrides::default(),
             &EngineOverrides::default(),
         );
-        let error = apply_to_host(&mut declared, &settings, &|_| Ok("fp".into())).unwrap_err();
+        let error = apply_to_host(&mut declared, &settings, &|_, _| Ok("fp".into())).unwrap_err();
         assert!(error.detail.contains("profile_exists"), "{error}");
         let error =
-            apply_to_host(&mut json!({}), &settings, &|_| Err("no version".into())).unwrap_err();
+            apply_to_host(&mut json!({}), &settings, &|_, _| Err("no version".into())).unwrap_err();
         assert!(error.detail.contains("build_fingerprint"), "{error}");
         // A host has no generated deployment to give a KV cache.
         let settings = resolve(
@@ -995,7 +1002,7 @@ mod tests {
             &EngineOverrides::default(),
             &EngineOverrides::default(),
         );
-        assert!(apply_to_host(&mut json!({}), &settings, &|_| Ok("fp".into())).is_err());
+        assert!(apply_to_host(&mut json!({}), &settings, &|_, _| Ok("fp".into())).is_err());
         // Nothing named: the document is unchanged apart from the block.
         let mut plain = json!({"name": "h", "runtime_profiles": {"p": {"engine": "vllm"}}});
         let before = plain.clone();
@@ -1006,7 +1013,7 @@ mod tests {
                 &EngineOverrides::default(),
                 &EngineOverrides::default(),
             ),
-            &|_| unreachable!(),
+            &|_, _| unreachable!(),
         )
         .unwrap();
         assert_eq!(plain, before);
@@ -1050,7 +1057,7 @@ mod tests {
         );
     }
 
-    // T41 (ADR 0023 §2, §6; ruling R1): a host's own TensorFold needs its
+    // T41 (ADR 0023 §2, §6): a host's own TensorFold needs its
     // build toolchain and never parks, whatever deep_park says.
     #[test]
     fn a_host_tensorfold_is_checked_and_never_parks() {
@@ -1063,14 +1070,17 @@ mod tests {
             deep_park: true,
             ..defaults()
         };
-        let system_has_ninja = crate::toolchain::SYSTEM_PATH
-            .split(':')
-            .any(|d| Path::new(d).join("ninja").is_file());
-        if !system_has_ninja {
-            let error = apply_to_host(&mut json!({}), &settings, &|_| unreachable!()).unwrap_err();
-            assert!(error.detail.contains("toolchain_missing"), "{error}");
-            assert!(error.detail.contains("ninja"), "{error}");
-        }
+        // No system directory is searched, so the refusal does not depend on
+        // what this machine has installed.
+        let search = crate::toolchain::ToolchainSearch {
+            system: String::new(),
+            default_cuda_home: dir.path().join("no-cuda"),
+        };
+        let error = apply_to_host_with(&mut json!({}), &settings, &|_, _| unreachable!(), &search)
+            .unwrap_err();
+        assert!(error.detail.contains("toolchain_missing"), "{error}");
+        assert!(error.detail.contains("ninja"), "{error}");
+        assert!(error.detail.contains("--cuda-home"), "{error}");
         use std::os::unix::fs::PermissionsExt;
         for tool in ["ninja", "nvcc", "c++"] {
             let path = bin.join(tool);
@@ -1078,7 +1088,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut document = json!({});
-        apply_to_host(&mut document, &settings, &|_| unreachable!()).unwrap();
+        apply_to_host_with(&mut document, &settings, &|_, _| unreachable!(), &search).unwrap();
         let profile = &document["runtime_profiles"]["local"];
         assert_eq!(profile["engine"], "tensorfold");
         assert_eq!(profile["security"]["deep_park"], "disabled");

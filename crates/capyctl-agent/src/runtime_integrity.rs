@@ -56,7 +56,7 @@ pub fn required_files(engine: Engine, sleep_mode: bool) -> &'static [&'static st
         Engine::Vllm if sleep_mode => VLLM_SLEEP_RUNTIME_FILES,
         Engine::Vllm => VLLM_RUNTIME_FILES,
         Engine::Sglang => SGLANG_RUNTIME_FILES,
-        // ADR 0023 (ruling 7): TensorFold needs only the capability probe.
+        // ADR 0023 §2: TensorFold needs only the capability probe.
         Engine::Tensorfold => &[CAPABILITY_PROBE],
     }
 }

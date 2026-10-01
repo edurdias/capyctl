@@ -30,17 +30,62 @@ impl std::fmt::Display for ToolchainMissing {
             .iter()
             .map(|d| d.display().to_string())
             .collect();
-        let one = self.missing.len() == 1;
         write!(
             f,
             "TensorFold builds CUDA extensions on its first start and needs {}, which \
-             {} not on the engine's PATH ({}); install {} there, or name a CUDA toolkit \
-             with CUDA_HOME, then add the engine again",
+             {} not on the engine's PATH ({})",
             self.missing.join(", "),
-            if one { "is" } else { "are" },
+            if self.missing.len() == 1 { "is" } else { "are" },
             searched.join(":"),
-            if one { "it" } else { "them" },
         )
+    }
+}
+
+impl ToolchainMissing {
+    fn install(&self) -> &'static str {
+        if self.missing.len() == 1 {
+            "it"
+        } else {
+            "them"
+        }
+    }
+
+    /// The refusal `engine add` gives: it reads the toolkit from `CUDA_HOME`.
+    pub fn for_engine_add(&self) -> String {
+        format!(
+            "{self}; install {} there, or name a CUDA toolkit with CUDA_HOME, then \
+             add the engine again",
+            self.install()
+        )
+    }
+
+    /// The refusal a role's own `local_engine` TensorFold gives.
+    pub fn for_local_engine(&self) -> String {
+        format!(
+            "{self}; install {} there, or name a CUDA toolkit with --cuda-home, \
+             CAPYCTL_CUDA_HOME or local_engine.cuda_home",
+            self.install()
+        )
+    }
+}
+
+/// Where the check looks beyond the engine's own `bin` and a stated toolkit:
+/// the fixed system directories, and the toolkit `engine add` uses when
+/// `CUDA_HOME` names none. Roles use the default; a test names its own so the
+/// result does not depend on the machine it runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainSearch {
+    /// `:`-separated directories, normally [`SYSTEM_PATH`].
+    pub system: String,
+    pub default_cuda_home: PathBuf,
+}
+
+impl Default for ToolchainSearch {
+    fn default() -> Self {
+        Self {
+            system: SYSTEM_PATH.into(),
+            default_cuda_home: PathBuf::from(crate::registration::DEFAULT_CUDA_HOME),
+        }
     }
 }
 

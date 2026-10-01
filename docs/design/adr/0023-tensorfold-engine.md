@@ -47,7 +47,8 @@ closed (SPEC §13.3) and adds `TENSORFOLD_NO_UPDATE_CHECK=1`, `HF_HUB_OFFLINE=1`
 `TRANSFORMERS_OFFLINE=1`, the placement's `CUDA_VISIBLE_DEVICES` and
 `TORCH_EXTENSIONS_DIR=<state>/engines/tensorfold/<build_fingerprint>/torch_extensions`
 (service user, 0700). Reserved: `--host`, `--port`, `--name`, `--alias`,
-`--backend`, `--context`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`, checked with the
+`--backend`, `--context`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`,
+`--no-update-check`, checked with the
 abbreviation rule at deploy time and again when the command is rendered. There is
 no protected entry: TensorFold's parser accepts abbreviations, and the prefix rule
 is what re-verifies them. `--vision-urls`, `--lane-kernels` and `--drafter` need
@@ -78,9 +79,13 @@ Ready is `GET /health` with `"ok": true` and the served name in `/v1/models`, th
 the chat probe; a non-empty `content` or `reasoning_content` is an answer.
 Parking a TensorFold deployment is the restart-only release: drain, read `/health`
 until `requests_running` is 0 and `busy` is false, SIGTERM the owned group, verify
-exit, then release memory. If the counters are not idle when the bound (30 s or
-the command's remaining time) ends, nothing is signalled and the cleanup is
-uncertain. Waking is a fresh launch of the same pinned effective contract.
+exit, then release memory. A group that is gone, or an engine that does not listen
+or answers 503, serves nothing and is signalled at once. A `/health` that does not
+answer is signalled once the bound (30 s or the command's remaining time) ends.
+Only an engine that still answers `busy` or a running request when the bound ends
+is not signalled; that cleanup is uncertain. On a host the check runs before the
+Terminate is journaled, so a held-back Terminate is answered unresolved and is
+checked again when redelivered (owner decision 2026-10-01). Waking is a fresh launch of the same pinned effective contract.
 `capyctl park deployment` on a TensorFold deployment is refused as unsupported.
 
 ### 7. Requests

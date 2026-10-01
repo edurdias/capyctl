@@ -13,7 +13,7 @@ pub use args::{
     ENGINE_ENV_ALLOWLIST,
 };
 pub use frozen::{plan_from_effective, TensorfoldPlanError};
-pub use http::HealthReport;
+pub use http::{HealthReport, READ_TIMEOUT as HEALTH_READ_TIMEOUT};
 pub use idle::wait_idle;
 
 /// ADR 0023 §6: the longest the process owner waits for TensorFold's own

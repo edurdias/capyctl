@@ -958,11 +958,11 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     w.shutdown().await.unwrap();
 }
 
-/// A Fake engine that answers the idle check before a stop signal as an
-/// engine with its own work counters (TensorFold) does.
+/// A Fake engine whose idle check before a stop signal is TensorFold's own,
+/// read from a `/health` the test serves (or nothing listening).
 struct CountedIdle {
     inner: Arc<FakeEngine>,
-    idle: bool,
+    counters: capyctl_adapters::tensorfold::TensorfoldAdapter,
     reads: std::sync::atomic::AtomicUsize,
 }
 
@@ -1006,9 +1006,12 @@ impl EngineAdapter for CountedIdle {
     ) -> Result<CancellationOutcome, AdapterError> {
         self.inner.cancel_work(m, r, ack).await
     }
-    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<bool> {
+    async fn idle_before_signal(
+        &self,
+        member: &MemberRef,
+    ) -> Option<capyctl_adapters::traits::EngineWork> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        Some(self.idle)
+        self.counters.idle_before_signal(member).await
     }
 }
 
@@ -1056,16 +1059,69 @@ fn idle_checked_worker(
     .unwrap()
 }
 
-// T41 (spec §5, ADR 0023 §6): an engine whose own counters read busy is not
-// signalled; the cleanup does not complete and its binding stays retained.
-// One that reads idle is terminated as before.
+/// What TensorFold's `/health` does in a standalone stop test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Health {
+    Idle,
+    Busy,
+    /// The process exited: nothing listens on its port.
+    Gone,
+    /// Alive, model not loaded yet: 503.
+    Loading,
+    /// Accepts the connection and never answers.
+    Hung,
+}
+
+async fn tensorfold_counters(health: Health) -> capyctl_adapters::tensorfold::TensorfoldAdapter {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(move || async move {
+            use axum::response::IntoResponse;
+            let busy = match health {
+                Health::Loading => {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+                Health::Hung => {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    true
+                }
+                other => other == Health::Busy,
+            };
+            axum::Json(serde_json::json!({
+                "ok": true, "busy": busy, "requests_running": u64::from(busy)
+            }))
+            .into_response()
+        }),
+    );
+    if health == Health::Gone {
+        drop(listener);
+    } else {
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+    let endpoint = format!("http://127.0.0.1:{port}").parse().unwrap();
+    capyctl_adapters::tensorfold::TensorfoldAdapter::new(endpoint, "0.6.0".into(), "toy".into())
+}
+
+// T41 (spec §5, ADR 0023 §6): after the drain, an
+// engine that answers busy at the bound is not signalled; the cleanup does not
+// complete and its binding stays retained. One that reads idle, has exited,
+// has not loaded its model, or hangs on `/health` is terminated: the first
+// three at once, the hung one once the bound passes.
 #[tokio::test]
-async fn a_busy_engine_is_not_signalled_and_an_idle_one_is() {
-    for idle in [false, true] {
+async fn only_an_engine_answering_busy_is_not_signalled() {
+    for health in [
+        Health::Idle,
+        Health::Busy,
+        Health::Gone,
+        Health::Loading,
+        Health::Hung,
+    ] {
         let (_dir, owner, fence, observations) = setup().await;
         let engine = Arc::new(CountedIdle {
             inner: Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1900)))),
-            idle,
+            counters: tensorfold_counters(health).await,
             reads: Default::default(),
         });
         let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1075,17 +1131,14 @@ async fn a_busy_engine_is_not_signalled_and_an_idle_one_is() {
             start.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Completed
         );
+        let started = std::time::Instant::now();
         let stop = w.stop("owner", &fence, "idle-check", 9_900).unwrap();
-        let observed = stop.wait(Duration::from_secs(5)).await;
+        let observed = stop.wait(Duration::from_secs(15)).await;
         assert!(
             engine.reads.load(Ordering::SeqCst) > 0,
-            "the idle check ran"
+            "{health:?}: the idle check ran"
         );
-        if idle {
-            assert_eq!(observed.unwrap(), OrdinaryCleanupStatus::Completed);
-            assert_eq!(signals.load(Ordering::SeqCst), 1);
-            assert!(w.shared.retained.lock().unwrap().is_empty());
-        } else {
+        if health == Health::Busy {
             assert!(
                 matches!(observed, Err(CoordinatorError::CallerTimeout)),
                 "{observed:?}"
@@ -1098,6 +1151,24 @@ async fn a_busy_engine_is_not_signalled_and_an_idle_one_is() {
                 "{:?}",
                 w.status()
             );
+        } else {
+            assert!(
+                matches!(observed, Ok(OrdinaryCleanupStatus::Completed)),
+                "{health:?}: {observed:?} {:?}",
+                w.status()
+            );
+            assert_eq!(signals.load(Ordering::SeqCst), 1, "{health:?}");
+            assert!(w.shared.retained.lock().unwrap().is_empty());
+            if health == Health::Hung {
+                // The bound (one second here), then the read still in flight.
+                assert!(started.elapsed() >= Duration::from_millis(900));
+            } else {
+                assert!(
+                    started.elapsed() < Duration::from_millis(900),
+                    "{health:?}: {:?}",
+                    started.elapsed()
+                );
+            }
         }
         w.shutdown().await.unwrap();
     }

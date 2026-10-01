@@ -524,7 +524,9 @@ fn a_host_states_its_engine_settings_three_ways() {
     let host = |document: &serde_json::Value, flags: &EngineOverrides, env: &EngineOverrides| {
         HostConfig::parse(&document.to_string())
             .unwrap()
-            .with_engines(flags, env, &|path| Ok(format!("probed {}", path.display())))
+            .with_engines(flags, env, &|_, path| {
+                Ok(format!("probed {}", path.display()))
+            })
             .unwrap()
     };
     let published = |config: &HostConfig| {
@@ -591,7 +593,7 @@ fn a_host_states_its_engine_settings_three_ways() {
     kv["local_engine"] = serde_json::json!({"kv_cache": "8GiB"});
     assert!(HostConfig::parse(&kv.to_string())
         .unwrap()
-        .with_engines(&none, &none, &|_| Ok("fp".into()))
+        .with_engines(&none, &none, &|_, _| Ok("fp".into()))
         .is_err());
 }
 

@@ -1200,7 +1200,7 @@ pub fn resolve_effective_with_checkpoint(
             derived
         }
     };
-    // ADR 0023 §4 (ruling 8): the first build's bound must not be lowered by
+    // ADR 0023 §4: the first build's bound must not be lowered by
     // the request deadline, so a TensorFold deployment's deadline, undeclared,
     // is at least that bound, and may be declared up to it.
     let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold {

@@ -97,7 +97,7 @@ fn typed_tensorfold_spellings_are_refused_in_extra_args() {
     }
 }
 
-// T41 T37 (Review Focus 3): `--vision` is ordinary although it is a prefix of
+// T41 T37 (ADR 0023 §3): `--vision` is ordinary although it is a prefix of
 // `--vision-urls`, which needs named approval; `--lane-kernels` loads code.
 #[test]
 fn vision_is_ordinary_and_vision_urls_needs_approval() {
@@ -197,7 +197,7 @@ fn tensorfold_requirements_are_refused_with_their_path() {
     );
 }
 
-// T41 T37 (Review Focus 2, ruling 7): `--drafter` is a path option, as
+// T41 T37 (ADR 0023 §5): `--drafter` is a path option, as
 // SGLang's `--speculative-draft-model-path`: it needs named approval, and its
 // value must lie inside the approved paths; a repository id is refused. The
 // typed block has no drafter field.
@@ -241,7 +241,7 @@ fn a_drafter_repository_id_is_refused() {
     );
 }
 
-// T41 T14 (ruling 8): the first-build bound and the request deadline floor.
+// T41 T14 (ADR 0023 §4): the first-build bound and the request deadline floor.
 #[test]
 fn an_undeclared_initialize_timeout_covers_the_first_build() {
     let (mut deployment, host) = fixture();
@@ -273,7 +273,7 @@ fn a_tensorfold_snapshot_decodes_exactly() {
     );
 }
 
-// T41 T08 T14 (ruling 8): the raised deadline is what a snapshot restates,
+// T41 T08 T14 (ADR 0023 §4): the raised deadline is what a snapshot restates,
 // and it re-resolves; a declared one may reach the first-build bound only.
 #[test]
 fn an_undeclared_deadline_snapshot_decodes_and_the_bound_caps_a_declared_one() {

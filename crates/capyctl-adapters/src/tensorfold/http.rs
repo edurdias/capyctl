@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::traits::AdapterError;
 
 /// A read of TensorFold's own surfaces must finish within this.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest body read (a model list or a health object is small).
 const MAX_BODY: usize = 256 * 1024;
 

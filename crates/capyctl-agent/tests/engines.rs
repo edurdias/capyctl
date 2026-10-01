@@ -281,7 +281,7 @@ fn a_tensorfold_environment_resolves_to_its_entry_point() {
     );
 }
 
-// T41 T07 (Review Focus 4): two engines in one venv named by its directory
+// T41 T07 (ADR 0023 §2): two engines in one venv named by its directory
 // are refused, naming each entry point.
 #[test]
 fn an_environment_with_two_engines_names_each_entry_point() {

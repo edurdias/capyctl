@@ -3,7 +3,7 @@
 mod support;
 
 use capyctl_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
-use capyctl_cli::engine::{execute, resolve_target};
+use capyctl_cli::engine::{execute, execute_with, resolve_target};
 use capyctl_cli::grammar::{Command, DeepParkChoice, DriftChoice};
 use capyctl_config::registration::{engines_beside, EnginesFile};
 use serde_json::{json, Value};
@@ -875,36 +875,36 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
 }
 
 // T41 T03: a missing toolchain is refused before anything runs or is written.
-// Ruling R8: `nvcc` is the missing tool, which no system directory holds.
+// The search names no system directory and no CUDA toolkit, so the result does
+// not depend on what this machine has installed.
 #[tokio::test]
 async fn add_refuses_tensorfold_without_its_toolchain() {
     let dir = private_dir();
     let env = tensorfold_env(&dir.path().join("tf"), "0.6.0", &["ninja", "c++"]);
     let document = host_doc(dir.path());
-    let result = execute(&add(&env), Some(&document), dir.path()).await;
-    if nvcc_outside_the_venv() {
-        // This machine has a CUDA toolkit (CUDA_HOME or /usr/local/cuda): the
-        // closed PATH found nvcc there, which is the documented order.
-        assert!(result.is_ok() || result.unwrap_err().code != "toolchain_missing");
-    } else {
-        let error = result.unwrap_err();
-        assert_eq!(error.code, "toolchain_missing", "{error:?}");
-        assert!(error.message.contains("nvcc"), "{}", error.message);
-        assert!(error
-            .message
-            .contains(&env.join("bin").display().to_string()));
-        assert!(!engines_beside(&document).exists());
-    }
-}
-
-/// Whether `nvcc` is on the closed PATH outside the venv's own `bin`.
-fn nvcc_outside_the_venv() -> bool {
-    capyctl_config::registration::detect_cuda_home(
-        std::env::var("CUDA_HOME").ok().as_deref(),
-        |nvcc| nvcc.is_file(),
+    let search = capyctl_config::toolchain::ToolchainSearch {
+        system: String::new(),
+        default_cuda_home: dir.path().join("no-cuda"),
+    };
+    let process_env = |key: &str| {
+        (key != "CUDA_HOME")
+            .then(|| std::env::var(key).ok())
+            .flatten()
+            .filter(|v| !v.is_empty())
+    };
+    let error = execute_with(
+        &add(&env),
+        Some(&document),
+        dir.path(),
+        &process_env,
+        &search,
     )
-    .is_some()
-        || capyctl_adapters::engine_env::SYSTEM_PATH
-            .split(':')
-            .any(|d| Path::new(d).join("nvcc").is_file())
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "toolchain_missing", "{error:?}");
+    assert!(error.message.contains("nvcc"), "{}", error.message);
+    assert!(error
+        .message
+        .contains(&env.join("bin").display().to_string()));
+    assert!(!engines_beside(&document).exists());
 }

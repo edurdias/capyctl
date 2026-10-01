@@ -436,7 +436,7 @@ fn host_policy_document(
             .with_engines(
                 &Default::default(),
                 &capyctl_config::engine_settings::EngineOverrides::from_process_env()?,
-                &|_| Ok("unknown (validate does not run the engine)".into()),
+                &|_, _| Ok("unknown (validate does not run the engine)".into()),
             )?;
     let local = capyctl_config::remote_resources::local_host_document(&config.document)?;
     capyctl_config::effective::normalize_host_policy(&local)?;

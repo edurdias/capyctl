@@ -154,7 +154,8 @@ The agent starts:
   memory the process uses is checked against the reservation through the same
   observation path as the other engines.
 - The engine listens on loopback only (SPEC §9.1 protections). TensorFold has no
-  API key, so CapyCTL's routed path is the only way in. No engine control path is
+  API key, so any local process can reach its port; CapyCTL's routed path is the
+  only network path to it. No engine control path is
   exposed, so the deep-park key guard does not apply.
 
 ### 4. Readiness
@@ -169,9 +170,13 @@ the ordinary startup bound. The profile can change both.
 
 Draining stays engine-agnostic: the router closes admission and waits for the
 requests it forwarded (SPEC §10). Before it sends a signal, the TensorFold adapter
-also reads `/health` and requires `requests_running: 0` and `busy: false`. If the
-two disagree when the drain bound expires, the drain fails closed, as an uncertain
-drain does today.
+also reads `/health` and requires `requests_running: 0` and `busy: false`. An
+engine whose process group is gone, that does not listen, or that answers 503
+serves nothing and is signalled at once. One whose `/health` does not answer is
+signalled once the bound passes (owner decision 2026-10-01: CapyCTL's own drain
+already counted zero forwarded requests on a loopback-only engine). Only an
+engine that still answers `busy: true` or `requests_running` above 0 when the
+bound expires fails closed, as an uncertain drain does today.
 
 ### 6. Park and wake
 

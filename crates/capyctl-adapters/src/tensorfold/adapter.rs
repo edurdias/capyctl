@@ -146,7 +146,7 @@ impl EngineAdapter for TensorfoldAdapter {
 
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
         Ok(Quiescence {
-            quiescent: self.idle_before_signal(member).await == Some(true),
+            quiescent: self.idle_before_signal(member).await == Some(EngineWork::Idle),
         })
     }
 
@@ -168,7 +168,7 @@ impl EngineAdapter for TensorfoldAdapter {
 
     async fn observe_work(&self, member: &MemberRef) -> Result<WorkObservation, AdapterError> {
         Ok(match self.idle_before_signal(member).await {
-            Some(true) => WorkObservation::Idle,
+            Some(EngineWork::Idle) => WorkObservation::Idle,
             _ => WorkObservation::Unknown,
         })
     }
@@ -183,12 +183,15 @@ impl EngineAdapter for TensorfoldAdapter {
         Ok(CancellationOutcome::Uncertain)
     }
 
-    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<bool> {
-        // Spec §5: unreadable or inconsistent counters are not idle.
-        Some(matches!(
-            self.http.health().await,
-            Ok(Read::Answer(report)) if report.idle() == Some(true)
-        ))
+    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<EngineWork> {
+        // Spec §5: counters that disagree are not idle; either one reporting
+        // work is busy.
+        Some(match self.http.health().await {
+            Ok(Read::NotYet) => EngineWork::NotListening,
+            Ok(Read::Answer(report)) if report.idle() == Some(true) => EngineWork::Idle,
+            Ok(Read::Answer(_)) => EngineWork::Busy,
+            Err(_) => EngineWork::Unanswered,
+        })
     }
 }
 

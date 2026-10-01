@@ -45,7 +45,7 @@ pub struct PlanInputTensorfold {
     pub extensions_dir: Option<String>,
     pub engine_log: Option<String>,
     pub cuda_namespace: Option<capyctl_config::effective::CudaNamespace>,
-    /// ADR 0023 §4 (ruling 8): the bound a launch with an existing build
+    /// ADR 0023 §4: the bound a launch with an existing build
     /// gives up at, in milliseconds.
     pub warm_startup_ms: i64,
 }
@@ -85,7 +85,7 @@ fn option_names(args: &[String]) -> Result<Vec<String>, TensorfoldArgsError> {
         .map_err(|error| TensorfoldArgsError::Malformed(error.to_string()))
 }
 
-/// Ruling R2: a typed option in any spelling is refused in the extra
+/// ADR 0023 §4: a typed option in any spelling is refused in the extra
 /// arguments, and in the host-fixed arguments when the typed field is set.
 fn check_typed(input: &PlanInputTensorfold, typed: &[String]) -> Result<(), TensorfoldArgsError> {
     let rendered: Vec<&str> = typed
@@ -113,7 +113,7 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     if input.context_length == 0 {
         return Err(TensorfoldArgsError::NoContext);
     }
-    // ADR 0023 §3 (ruling 6): no protected entry, so the shared policy's
+    // ADR 0023 §3: no protected entry, so the shared policy's
     // prefix rule is the second check of the complete pass-through vector.
     let pass_through: Vec<String> = input
         .engine_args
@@ -144,14 +144,14 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
         "--port".into(),
         input.port.to_string(),
         "--no-update-check".into(),
-        // Ruling 4: NVIDIA only; prefix snapshots stay in memory.
+        // ADR 0023 §3: NVIDIA only; prefix snapshots stay in memory.
         "--backend".into(),
         "cuda".into(),
         "--snapshot-dir".into(),
         "none".into(),
     ];
     argv.extend(typed);
-    // Ruling 4, 7: TensorFold's default `--drafter auto` would read the
+    // ADR 0023 §3, §5: TensorFold's default `--drafter auto` would read the
     // Hugging Face cache; without an approved `--drafter` extra it is `none`.
     let names_drafter = option_names(&pass_through)?
         .iter()
@@ -162,7 +162,7 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     argv.extend(pass_through);
     let mut env = BTreeMap::new();
     env.insert("TENSORFOLD_NO_UPDATE_CHECK".into(), "1".into());
-    // Ruling 4: the engine fetches nothing; capyctl's model store does.
+    // ADR 0023 §3: the engine fetches nothing; capyctl's model store does.
     env.insert("HF_HUB_OFFLINE".into(), "1".into());
     env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());
     if let Some(dir) = &input.extensions_dir {

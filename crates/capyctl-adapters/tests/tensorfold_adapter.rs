@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use capyctl_adapters::tensorfold::{PlanInputTensorfold, TensorfoldAdapter};
 use capyctl_adapters::traits::{
-    AdapterError, EngineAdapter, MemberRef, OwnedProcessLaunch, ParkLevel, RenderedCommand,
-    RuntimeAction, RuntimeCommand, RuntimeError,
+    AdapterError, EngineAdapter, EngineWork, MemberRef, OwnedProcessLaunch, ParkLevel,
+    RenderedCommand, RuntimeAction, RuntimeCommand, RuntimeError,
 };
 use capyctl_domain::completion::{
     ExecutionIdentities, Milestone, Presence, ProcessIdentity, StepExecutionContext,
@@ -248,7 +248,7 @@ async fn initialize_waits_for_health_and_reports_one_process() {
     assert!(!spawned[0].env.keys().any(|k| k.contains("KEY")));
 }
 
-// T41 (Review Focus 1): reasoning tokens alone are an answer.
+// T41 (ADR 0023 §6): reasoning tokens alone are an answer.
 #[tokio::test]
 async fn a_reasoning_only_probe_answer_is_an_answer() {
     let (_stub, port) = stub_engine("nemotron", 0, true).await;
@@ -261,7 +261,7 @@ async fn a_reasoning_only_probe_answer_is_an_answer() {
         .unwrap();
 }
 
-// T41 (Review Focus 5): with a build present the launch gives up at the
+// T41 (ADR 0023 §4): with a build present the launch gives up at the
 // ordinary bound; without one it waits for the full deadline.
 #[tokio::test]
 async fn a_warm_launch_gives_up_at_the_ordinary_bound() {
@@ -300,21 +300,89 @@ async fn a_warm_launch_gives_up_at_the_ordinary_bound() {
     assert!(error.to_string().contains("deadline"), "{error}");
 }
 
-// T41 (spec §5): idle needs requests_running 0 and busy false; disagreement
-// is not idle; an unreachable engine is not idle.
+// T41 (ADR 0023 §4): with a build present the readiness probe is bounded by
+// the ordinary bound too, not by the whole deadline.
+#[tokio::test]
+async fn a_warm_launch_bounds_its_probe_by_the_ordinary_bound() {
+    let app = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(json!({"ok": true, "busy": false, "requests_running": 0})) }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"object": "list", "data": [{"id": "nemotron"}]})) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                "late"
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let warm = TensorfoldAdapter::new(url(port), "0.6.0".into(), "nemotron".into())
+        .with_launch(plan(port, 1_500))
+        .with_extensions_built(true)
+        .with_tools(Arc::new(ScriptedTool::alive(api_identity(), vec![])));
+    let started = Instant::now();
+    let error = warm
+        .execute_persisted(&initialize_command(20_000))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(error.to_string().contains("probe"), "{error}");
+}
+
+// T41 (spec §5, ADR 0023 §6): idle needs requests_running 0 and busy false;
+// either counter reporting work is busy; an engine that does not listen or
+// answers 503 serves nothing; a malformed answer is unanswered.
 #[tokio::test]
 async fn idle_before_signal_reads_the_engines_own_counters() {
     let (stub, port) = stub_engine("nemotron", 0, false).await;
     let adapter = TensorfoldAdapter::new(url(port), "0.6.0".into(), "nemotron".into());
-    assert_eq!(adapter.idle_before_signal(&member()).await, Some(true));
+    let one = member();
+    let work = || adapter.idle_before_signal(&one);
+    assert_eq!(work().await, Some(EngineWork::Idle));
     stub.running.store(1, Ordering::SeqCst);
-    assert_eq!(adapter.idle_before_signal(&member()).await, Some(false));
+    assert_eq!(work().await, Some(EngineWork::Busy));
+    *stub.busy_override.lock().unwrap() = Some(false);
+    assert_eq!(
+        work().await,
+        Some(EngineWork::Busy),
+        "the counters disagree"
+    );
     stub.running.store(0, Ordering::SeqCst);
     *stub.busy_override.lock().unwrap() = Some(true);
-    assert_eq!(adapter.idle_before_signal(&member()).await, Some(false));
-    let gone = TensorfoldAdapter::new(url(free_port().await), "0.6.0".into(), "nemotron".into());
-    assert_eq!(gone.idle_before_signal(&member()).await, Some(false));
+    assert_eq!(work().await, Some(EngineWork::Busy));
     assert!(!adapter.prepare_park(&member()).await.unwrap().quiescent);
+    let gone = TensorfoldAdapter::new(url(free_port().await), "0.6.0".into(), "nemotron".into());
+    assert_eq!(
+        gone.idle_before_signal(&member()).await,
+        Some(EngineWork::NotListening)
+    );
+    let (_loading, loading_port) = stub_engine("nemotron", usize::MAX, false).await;
+    let loading = TensorfoldAdapter::new(url(loading_port), "0.6.0".into(), "nemotron".into());
+    assert_eq!(
+        loading.idle_before_signal(&member()).await,
+        Some(EngineWork::NotListening)
+    );
+    let malformed =
+        axum::Router::new().route("/health", get(|| async { Json(json!({"ok": true})) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let malformed_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, malformed).await.unwrap() });
+    let malformed = TensorfoldAdapter::new(url(malformed_port), "0.6.0".into(), "nemotron".into());
+    assert_eq!(
+        malformed.idle_before_signal(&member()).await,
+        Some(EngineWork::Unanswered)
+    );
 }
 
 // T41 T21: no park, restore or reload path exists.

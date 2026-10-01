@@ -1155,6 +1155,41 @@ impl NativeHostExecution {
                 Err(LaunchVerdict::Uncertain) => return Err(SessionError),
             }
         }
+        if let MemberAction::Terminate { owned_handle, .. } = &command.action {
+            match fresh {
+                Ok(true) => {
+                    // A restarted host has no in-memory gate. Re-register the
+                    // exact retained scope closed using its protected
+                    // credentials. A handle this host never launched has no
+                    // scope to close. Admission has already closed at the
+                    // controller; close the host gate before termination,
+                    // retaining any active stream count. A scope that cannot
+                    // be registered has no entry here to forward through, so
+                    // there is nothing of it to close.
+                    if let Some(scope) = self
+                        .journal
+                        .retained_command(owned_handle)
+                        .ok()
+                        .and_then(|owned| self.register_retained(&owned).ok())
+                    {
+                        self.ingress.close(&scope).map_err(|_| SessionError)?;
+                    }
+                    // Spec §5, ADR 0023 §6: the engine's own counters are read
+                    // before the Terminate is journaled. One held back is
+                    // answered unresolved and is gated again when redelivered;
+                    // it never ends the session.
+                    if !self
+                        .clear_to_terminate(owned_handle, command.identity.deadline_ms)
+                        .await?
+                    {
+                        return self.unsignalled_terminate(&command, owned_handle);
+                    }
+                }
+                Ok(false) => {}
+                // What `accept` would refuse it with; nothing is closed.
+                Err(_) => return Err(SessionError),
+            }
+        }
         let policy = Arc::new(self.clone());
         let journal = self.journal.clone();
         let accepted_command = command.clone();
@@ -1197,54 +1232,8 @@ impl NativeHostExecution {
                         launch_failed = error.engine;
                     }
                 }
-                MemberAction::Terminate { owned_handle, .. } => {
-                    // A restarted host has no in-memory gate. Re-register the
-                    // exact retained scope closed using its protected credentials.
-                    // A handle this host never launched has no scope to close.
-                    // Admission has already closed at the controller; close the
-                    // host gate before termination, retaining any active stream
-                    // count. A scope that cannot be registered has no entry here
-                    // to forward through, so there is nothing of it to close.
-                    if let Some(scope) = self
-                        .journal
-                        .retained_command(owned_handle)
-                        .ok()
-                        .and_then(|owned| self.register_retained(&owned).ok())
-                    {
-                        self.ingress.close(&scope).map_err(|_| SessionError)?;
-                    }
-                    // Spec §5 (ruling 9): TensorFold's own counters must read
-                    // idle before the signal; otherwise nothing is sent and the
-                    // terminate stays uncertain, accounting retained.
-                    match self.journal.retained_command(owned_handle) {
-                        Ok(owned) => {
-                            if !self
-                                .tensorfold_idle_before_terminate(
-                                    &owned,
-                                    command.identity.deadline_ms,
-                                )
-                                .await
-                            {
-                                return Err(SessionError);
-                            }
-                        }
-                        // ADR 0016: a handle with no launch body (a lost
-                        // journal, a fence) holds no claim and the journal
-                        // signals nothing for it; any other unreadable state
-                        // fails closed.
-                        Err(_) => {
-                            let claimed = self
-                                .journal
-                                .claimed_launches("")
-                                .map_err(|_| SessionError)?;
-                            if claimed
-                                .iter()
-                                .any(|launch| launch.command.identity.command_id == *owned_handle)
-                            {
-                                return Err(SessionError);
-                            }
-                        }
-                    }
+                // Gated before acceptance, above.
+                MemberAction::Terminate { .. } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
                     tokio::task::spawn_blocking(move || {
@@ -2800,7 +2789,7 @@ mod tests {
         ));
     }
 
-    // T41 (ADR 0023 §3, ruling R4): a host without a private cache root
+    // T41 (ADR 0023 §3): a host without a private cache root
     // refuses a new TensorFold launch, yet still resolves a retained one so
     // its Terminate can run.
     #[test]
@@ -2898,45 +2887,191 @@ mod tests {
         );
     }
 
-    // T41 (spec §5, ruling R5): a Terminate whose TensorFold launch does not
-    // read idle sends nothing and stays unresolved; the launch stays owned.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_busy_tensorfold_terminate_signals_nothing() {
-        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = reads.clone();
+    /// Renders a shell that stands in for the TensorFold process.
+    struct Sleeper;
+    impl LocalExecutionPolicy for Sleeper {
+        fn authorize(&self, _: &MemberCommand) -> Result<(), JournalError> {
+            Ok(())
+        }
+        fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {
+            Ok(ApprovedLaunch {
+                command: capyctl_adapters::traits::RenderedCommand {
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+                    env: Default::default(),
+                },
+                descriptors: None,
+            })
+        }
+    }
+
+    /// Kills a stand-in process a test left running.
+    struct KillOnDrop(u32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+        }
+    }
+
+    /// A `/health` on a fresh port: busy for good, or never answering.
+    async fn health_stub(hung: bool) -> u16 {
         let app = axum::Router::new().route(
             "/health",
-            axum::routing::get(move || {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async {
-                    axum::Json(serde_json::json!({"ok": true, "busy": true, "requests_running": 1}))
+            axum::routing::get(move || async move {
+                if hung {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
+                axum::Json(serde_json::json!({"ok": true, "busy": true, "requests_running": 1}))
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    /// A port nobody listens on.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A TensorFold launch on `port`, accepted with its stand-in process
+    /// running and owned by the journal.
+    async fn owned_tensorfold(
+        port: u16,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<NativeHostExecution>,
+        u64,
+        capyctl_domain::completion::ProcessIdentity,
+    ) {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
-        let (launch, _) = tensorfold_launch(&deployment, &policy, port);
+        let (launch, plan) = tensorfold_launch(&deployment, &policy, port);
         let session = executor.journal.connect().unwrap();
         executor.connected(session).unwrap();
-        executor
+        let sleeper = Arc::new(Sleeper);
+        let now = capyctl_protocol::now_unix_ms();
+        let Acceptance::Fresh(ticket) = executor
             .journal
-            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .accept(session, &launch, now, sleeper.as_ref())
+            .unwrap()
+        else {
+            panic!("a fresh launch");
+        };
+        let tools = executor
+            .journal
+            .launch_tools(ticket, now, sleeper.clone())
             .unwrap();
+        let command = sleeper.render_launch(&launch).unwrap().command;
+        let api = tools.spawn_durable(&plan.incarnation, &command).unwrap();
+        (root, identity_dir, executor, session, api)
+    }
+
+    fn tensorfold_terminate(id: &str, deadline_in_ms: i64) -> MemberCommand {
         let mut terminate = MemberCommand {
-            identity: checkpoint_identity("terminate", "retained"),
+            identity: checkpoint_identity(id, "retained"),
             action: MemberAction::Terminate {
                 owned_handle: "launch".into(),
                 recorded: Vec::new(),
             },
         };
-        terminate.identity.deadline_ms = capyctl_protocol::now_unix_ms() + 1_500;
+        terminate.identity.deadline_ms = capyctl_protocol::now_unix_ms() + deadline_in_ms;
+        terminate.identity.profile_fingerprint = "0.6.0".into();
         terminate.identity.payload_digest = terminate.canonical_digest();
-        assert!(executor.execute(session, terminate).await.is_err());
-        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        terminate
+    }
+
+    use capyctl_domain::completion::Presence;
+    fn presence_of(api: &capyctl_domain::completion::ProcessIdentity) -> Presence {
+        capyctl_launchers::process_absence::presence(api)
+    }
+
+    // T41 (spec §5, ADR 0023 §6): a TensorFold launch whose process is gone is
+    // terminated at once, whatever answers on its old port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gone_tensorfold_launch_terminates_at_once() {
+        let port = health_stub(false).await;
+        let (_root, _ids, executor, session, api) = owned_tensorfold(port).await;
+        unsafe { libc::kill(api.pid as i32, libc::SIGKILL) };
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while presence_of(&api) != Presence::Gone {
+            assert!(std::time::Instant::now() < gone_by, "the stand-in exits");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let started = std::time::Instant::now();
+        let result = executor
+            .execute(session, tensorfold_terminate("terminate", 20_000))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(result.state, "completed");
+        assert!(!result.claim_retained);
+    }
+
+    // T41 (spec §5, ADR 0023 §6): an alive engine that does not listen (still
+    // building, or never bound) serves nothing; it is signalled at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tensorfold_launch_that_is_not_listening_terminates_at_once() {
+        let (_root, _ids, executor, session, api) = owned_tensorfold(closed_port()).await;
+        let _kill = KillOnDrop(api.pid);
+        let started = std::time::Instant::now();
+        let result = executor
+            .execute(session, tensorfold_terminate("terminate", 20_000))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(result.state, "completed");
+        assert_eq!(presence_of(&api), Presence::Gone);
+    }
+
+    // T41 (spec §5, ADR 0023 §6): a hung `/health`
+    // is signalled once the bound passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_tensorfold_launch_terminates_at_the_bound() {
+        let port = health_stub(true).await;
+        let (_root, _ids, executor, session, api) = owned_tensorfold(port).await;
+        let _kill = KillOnDrop(api.pid);
+        let started = std::time::Instant::now();
+        let result = executor
+            .execute(session, tensorfold_terminate("terminate", 9_000))
+            .await
+            .unwrap();
+        // The bound (the deadline less its margin), then the read in flight.
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert_eq!(result.state, "completed");
+        assert_eq!(presence_of(&api), Presence::Gone);
+    }
+
+    // T41 (spec §5, ADR 0023 §6): a TensorFold launch that still answers busy
+    // at the bound is not signalled. The Terminate is answered unresolved
+    // (never ending the session), is not journaled, and runs the gate again
+    // when it is redelivered; the launch stays owned and alive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_busy_tensorfold_terminate_signals_nothing() {
+        let port = health_stub(false).await;
+        let (_root, _ids, executor, session, api) = owned_tensorfold(port).await;
+        let _kill = KillOnDrop(api.pid);
+        let terminate = tensorfold_terminate("terminate", 2_500);
+        for _ in 0..2 {
+            let result = executor.execute(session, terminate.clone()).await.unwrap();
+            assert_eq!(result.state, "accepted");
+            assert_eq!(result.owned_handle, "launch");
+            assert!(result.claim_retained);
+            assert!(result.refused.is_empty());
+            assert!(result.processes.iter().any(|p| p.presence == "alive"));
+            capyctl_protocol::execution::validate_result(&terminate, &result).unwrap();
+            assert!(matches!(
+                executor.journal.precheck(session, &terminate),
+                Ok(true)
+            ));
+        }
+        assert_eq!(presence_of(&api), Presence::Alive);
         assert!(executor.journal.retained_command("launch").is_ok());
     }
 
