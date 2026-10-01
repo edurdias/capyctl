@@ -283,7 +283,6 @@ fn probe_result_claims_readiness_only_for_the_owned_live_group() {
         |r| r.binding_id.clear(),
         |r| r.incarnation.clear(),
         |r| r.processes.retain(|p| p.role != "api"),
-        |r| r.processes.retain(|p| p.role == "api"),
         |r| r.processes[1].presence = "gone".into(),
     ];
     for edit in edits {
@@ -291,6 +290,11 @@ fn probe_result_claims_readiness_only_for_the_owned_live_group() {
         edit(&mut result);
         assert!(validate_result(&command, &result).is_err(), "{result:?}");
     }
+    // T41 (ADR 0023 §6): TensorFold serves from one process, so the api
+    // process alone, alive, is a live group.
+    let mut single = good.clone();
+    single.processes.retain(|p| p.role == "api");
+    validate_result(&command, &single).unwrap();
     // An unusable probe answer is ordinary evidence, never a readiness claim.
     let mut unusable = good.clone();
     unusable.model_usable = false;

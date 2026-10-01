@@ -142,12 +142,15 @@ pub enum CompletionError {
     Incomplete,
 }
 
+/// An api process plus its workers, or (ADR 0023 §6: TensorFold serves from one
+/// process) the api process alone.
 fn identities_valid(identities: &[ProcessIdentity]) -> bool {
     crate::group::validate_local_processes(identities).is_ok()
         && identities.iter().any(|identity| identity.role == "api")
-        && identities
-            .iter()
-            .any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
+        && (identities.len() == 1
+            || identities
+                .iter()
+                .any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7))
 }
 
 pub fn verify_completion(

@@ -120,11 +120,12 @@ fn api_survival_does_not_hide_worker_loss_or_pid_reuse() {
         verify_completion(&expected, &duplicate, 151, 60),
         Err(CompletionError::RuntimeChanged)
     );
-    let mut api_only_expected = expected.clone();
-    api_only_expected.identities.truncate(1);
+    // An api process alone is a single-process group (ADR 0023 §6), covered by
+    // `a_single_process_launch_completes_on_its_api_identity`; it never stands
+    // in for a group that had a worker.
     duplicate.identities.truncate(1);
     assert_eq!(
-        verify_completion(&api_only_expected, &duplicate, 151, 60),
+        verify_completion(&expected, &duplicate, 151, 60),
         Err(CompletionError::RuntimeChanged)
     );
 }
@@ -212,5 +213,23 @@ fn missing_process_start_identity_cannot_complete() {
     assert_eq!(
         verify_completion(&expected, &evidence, 151, 60),
         Err(CompletionError::RuntimeChanged)
+    );
+}
+
+// T41 (ADR 0023 §6): TensorFold serves from one process, so a launch whose
+// recorded group is the api process alone completes on that same process.
+#[test]
+fn a_single_process_launch_completes_on_its_api_identity() {
+    let (mut expected, mut evidence) = fixture();
+    expected.identities.truncate(1);
+    evidence.identities.truncate(1);
+    verify_completion(&expected, &evidence, 151, 60).unwrap();
+    let mut worker_only = evidence.clone();
+    worker_only.identities[0].role = "worker-0".into();
+    expected.identities[0].role = "worker-0".into();
+    assert_eq!(
+        verify_completion(&expected, &worker_only, 151, 60),
+        Err(CompletionError::RuntimeChanged),
+        "a group without its api process never completes"
     );
 }
