@@ -1883,3 +1883,20 @@ fn the_cuda_context_is_charged_alike_on_unified_and_discrete_hosts() {
         );
     }
 }
+
+// T26 T27, SPEC §7.3: a declared recipe whose Ready phase claims a device its
+// cold phase does not is refused. The start's completion would otherwise write
+// that exclusive claim into the ledger without the device-conflict check.
+#[test]
+fn a_ready_phase_may_not_claim_a_device_its_cold_phase_lacks() {
+    let (mut deployment, host) = fixture();
+    let exclusive = serde_json::json!([{"id": "gpu0", "sharing": "exclusive"}]);
+    deployment["devices"] = exclusive.clone();
+    for phase in ["cold", "ready", "parking", "wake"] {
+        deployment["resources"][phase]["devices"] = exclusive.clone();
+    }
+    resolve_effective(&deployment, &host).expect("matching claims resolve");
+    deployment["resources"]["cold"]["devices"] = serde_json::json!([]);
+    let error = resolve_effective(&deployment, &host).expect_err("must be refused");
+    assert!(error.to_string().contains("resources"), "{error}");
+}

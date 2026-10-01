@@ -203,6 +203,17 @@ pub fn validate_recipe(r: &RecipeFootprints) -> Result<(), ResourceError> {
                 return Err(ResourceError::Invalid);
             }
         }
+        // SPEC §7.3: a start's or a wake's completion replaces the held peak
+        // with the Ready footprint without admission, so the base phase may
+        // claim no device the peak did not already hold at least as strongly.
+        // Otherwise a second exclusive owner enters the ledger unchecked.
+        if !base.devices.iter().all(|b| {
+            peak.devices.iter().any(|p| {
+                p.device == b.device && (p.sharing == b.sharing || p.sharing == Sharing::Exclusive)
+            })
+        }) {
+            return Err(ResourceError::Invalid);
+        }
     }
     Ok(())
 }
