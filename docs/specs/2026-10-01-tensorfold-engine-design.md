@@ -124,7 +124,7 @@ The agent starts:
   paths. A Hugging Face drafter is fetched through CapyCTL's model store, like the
   target checkpoint, never by TensorFold. Its content digest is recorded when the
   deployment is accepted and checked again before every launch and wake
-  (ADR 0014 A3). A repository id is refused.
+  (ADR 0014 §7). A repository id is refused.
 - Other options pass only as extra arguments under SPEC §8.2
   (`accept_extra_args` and host approval). These TensorFold 0.6.0 `serve` options
   are sensitive and need host approval by name:
