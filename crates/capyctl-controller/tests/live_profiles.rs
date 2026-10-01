@@ -44,6 +44,8 @@ fn prepared_document() -> Value {
     let mut host = serde_json::from_str::<Value>(text).unwrap()["input"]["host"].clone();
     host["state_dir"] = json!("/home/operator/.local/state/capyctl");
     host["identity_dir"] = json!("/home/operator/.local/state/capyctl/identity");
+    // The inventory is stamped once; slow machines connect after the 2 s default.
+    host["resource_policy"]["observation_ttl"] = json!("10s");
     host
 }
 

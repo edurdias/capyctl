@@ -258,7 +258,8 @@ async fn a_retired_or_compacted_instance_is_not_found_never_an_internal_error() 
         .await;
         assert_eq!(status, 404, "{action}: {body}");
     }
-    assert_eq!(stopped(&owner, &id), vec![false, false], "no mark was set");
+    // Compaction may remove the retiring row first; no row may be marked.
+    assert!(stopped(&owner, &id).iter().all(|s| !s), "no mark was set");
     sql.execute(
         "DELETE FROM deployment_instances WHERE deployment_id=?1 AND instance_index=1",
         [&id],
