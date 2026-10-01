@@ -47,7 +47,7 @@ figcaption { margin-top: 12px; color: var(--capyctl-muted); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; vertical-align: top; padding: 8px; border-top: 1px solid var(--capyctl-rule); }
 .brand { margin: 0; text-align: center; }
-.brand img { max-width: min(480px, 100%); height: auto; }
+.brand img { max-width: min(370px, 100%); height: auto; }
 .brand .logo-light { display: none; }
 [data-theme='light'] .brand .logo-dark { display: none; }
 [data-theme='light'] .brand .logo-light { display: inline; }
