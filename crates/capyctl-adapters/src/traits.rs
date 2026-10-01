@@ -300,6 +300,13 @@ pub trait EngineAdapter: Send + Sync {
         req: &RequestRef,
         require_ack: bool,
     ) -> Result<CancellationOutcome, AdapterError>;
+    /// ADR 0023 §6: the engine's own account of in-flight work, read by the
+    /// process owner just before a stop signal. `None`: this engine has no
+    /// such account and the router's lease ledger alone decides. `Some(true)`
+    /// is idle; `Some(false)` is busy, inconsistent or unreadable.
+    async fn idle_before_signal(&self, _member: &MemberRef) -> Option<bool> {
+        None
+    }
 }
 
 /// A boot-unique handle to a spawned engine process.

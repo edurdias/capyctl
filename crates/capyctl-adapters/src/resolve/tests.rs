@@ -83,3 +83,24 @@ async fn the_resolved_adapter_is_the_engine_implementation() {
     // vLLM reports what it can prove about work; a placeholder would not answer.
     assert!(adapter.observe_work(&member).await.is_ok());
 }
+
+fn tensorfold() -> AdapterSpec {
+    AdapterSpec::Tensorfold {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "0.6.0".into(),
+        model_id: "m".into(),
+        launch: None,
+        extensions_built: false,
+    }
+}
+
+// T41: TensorFold resolves for its own family only.
+#[test]
+fn a_tensorfold_spec_resolves_only_as_tensorfold() {
+    assert_eq!(tensorfold().engine(), Engine::Tensorfold);
+    assert!(resolve(Engine::Tensorfold, tensorfold(), None).is_ok());
+    assert!(matches!(
+        resolve(Engine::Vllm, tensorfold(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}

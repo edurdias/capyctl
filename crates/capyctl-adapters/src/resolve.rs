@@ -89,6 +89,17 @@ pub enum AdapterSpec {
         /// makes its own temporary one.
         rendezvous: Option<std::path::PathBuf>,
     },
+    /// ADR 0023: TensorFold talks plain HTTP on loopback and has no key; an
+    /// owned launch carries its plan.
+    Tensorfold {
+        endpoint: reqwest::Url,
+        fingerprint: String,
+        model_id: String,
+        launch: Option<crate::tensorfold::PlanInputTensorfold>,
+        /// ADR 0023 §4: whether a kernel build existed when the launch was
+        /// prepared; decides the startup bound.
+        extensions_built: bool,
+    },
 }
 
 impl AdapterSpec {
@@ -98,6 +109,7 @@ impl AdapterSpec {
         match self {
             Self::Vllm { .. } => Engine::Vllm,
             Self::Sglang { .. } => Engine::Sglang,
+            Self::Tensorfold { .. } => Engine::Tensorfold,
         }
     }
 }
@@ -186,6 +198,24 @@ pub fn resolve(
             }
             if let Some(dir) = rendezvous {
                 adapter = adapter.with_rendezvous_dir(dir);
+            }
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            Box::new(adapter)
+        }
+        AdapterSpec::Tensorfold {
+            endpoint,
+            fingerprint,
+            model_id,
+            launch,
+            extensions_built,
+        } => {
+            let mut adapter =
+                crate::tensorfold::TensorfoldAdapter::new(endpoint, fingerprint, model_id)
+                    .with_extensions_built(extensions_built);
+            if let Some(launch) = launch {
+                adapter = adapter.with_launch(launch);
             }
             if let Some(tools) = tools {
                 adapter = adapter.with_tools(tools);

@@ -104,6 +104,8 @@ pub(super) fn factory(
                     *admin = recorded(SecretRole::Admin)?;
                     *session = Some(owner.session().id().to_owned());
                 }
+                // ADR 0023 §3: TensorFold holds no key to recover.
+                AdapterSpec::Tensorfold { .. } => {}
             }
         }
         let tools = tools_factory(Arc::new(NoLaunch));
