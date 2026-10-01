@@ -129,6 +129,13 @@ struct ResidencyPlan {
     accepted_at_ms: i64,
     deadline_ms: i64,
     execution: Option<ResidencyExecution>,
+    /// A park closed an open dispatch gate when it was accepted, so a park
+    /// cancelled without effect reopens it. A gate that was already closed
+    /// (a restart, or a closure awaiting its own evidence) stays closed for
+    /// readiness supervision to reopen after `require_settled` (SPEC §10).
+    /// Absent in plans stored before this field: they never reopen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reopens_dispatch: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -731,6 +738,7 @@ fn accept_instance(
         accepted_at_ms: now,
         deadline_ms: deadline,
         execution: None,
+        reopens_dispatch: kind == ResidencyKind::Park && dispatch_open(tx, deployment, instance)?,
     };
     let run_plan = serde_json::json!({
         "version": 1,
@@ -1343,9 +1351,9 @@ fn cancel(
         "DELETE FROM lifecycle_claims WHERE operation_id=?1",
         [&p.operation_id],
     )?;
-    if p.kind == ResidencyKind::Park {
+    if p.kind == ResidencyKind::Park && p.reopens_dispatch {
         // Nothing reached the engine or its host's gate: the launch is still
-        // Ready and serves again.
+        // Ready and serves again, through the gate this park closed.
         reopen(tx, p)?;
     }
     journal(
@@ -1362,10 +1370,24 @@ fn cancel(
     record(tx, s, p, Stage::Cancelled, None)
 }
 
+/// Whether the instance's dispatch gate is open now.
+fn dispatch_open(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row(
+        "SELECT dispatch_enabled=1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+        params![deployment, instance],
+        |r| r.get(0),
+    )?)
+}
+
 /// Reopen a Ready instance's dispatch after a park that had no effect on it.
 ///
 /// ADR 0015 amendment (closure reasons), SPEC §13.2: the park reopens only the
-/// gate it closed. A host-session, engine-exit or switch closure recorded for
+/// gate it closed (`reopens_dispatch`), never one a restart closed. A
+/// host-session, engine-exit or switch closure recorded for
 /// the incarnation while the park was in flight keeps it closed until its own
 /// evidence clears it.
 fn reopen(tx: &Transaction<'_>, p: &ResidencyPlan) -> Result<(), LifecycleError> {
@@ -2009,8 +2031,12 @@ fn refuse(
         [&p.operation_id],
     )?)?;
     let gate = if p.kind == ResidencyKind::Park && !remote(tx, &p.binding_id)? {
-        reopen(tx, &p)?;
-        "dispatch reopened"
+        if p.reopens_dispatch {
+            reopen(tx, &p)?;
+            "dispatch reopened"
+        } else {
+            "the gate it found closed stays closed until fresh readiness reopens it"
+        }
     } else if p.kind == ResidencyKind::Park {
         "the host's gate stays closed until a fresh model probe reopens it"
     } else {
