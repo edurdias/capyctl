@@ -6,13 +6,13 @@ mod frozen;
 pub mod http;
 mod initialize;
 
-// pub use adapter::TensorfoldAdapter;
+pub use adapter::TensorfoldAdapter;
 pub use args::{
     engine_environment, render_command, PlanInputTensorfold, TensorfoldArgsError,
     ENGINE_ENV_ALLOWLIST,
 };
 pub use frozen::{plan_from_effective, TensorfoldPlanError};
-// pub use http::HealthReport;
+pub use http::HealthReport;
 
 /// ADR 0023 §6: the longest the process owner waits for TensorFold's own
 /// counters to read idle before a stop signal.

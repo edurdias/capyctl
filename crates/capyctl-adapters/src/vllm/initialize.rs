@@ -31,13 +31,6 @@ const READINESS_POLL: Duration = Duration::from_millis(500);
 /// timeout, so it must be the one that arrives first (Spec §4).
 const BUILDER_MARGIN_MS: i64 = 2_000;
 
-/// Lines of engine log quoted when a launch fails.
-const LOG_TAIL_LINES: usize = 20;
-
-/// The most log bytes read for a tail. An engine that logged a gigabyte before
-/// dying must not be read into memory to explain itself.
-const LOG_TAIL_BYTES: u64 = 64 * 1024;
-
 /// SPEC §13.3 / T21: variables an engine may take from the agent's own
 /// environment. Everything else it sees is named here by capyctl.
 const PASS_THROUGH: &[&str] = &[
@@ -198,7 +191,7 @@ pub(super) async fn initialize(
             // SPEC §§6.4, 13.2: an engine that left before readiness is a
             // launch failure with its own reason, not ownership uncertainty.
             Presence::Gone => {
-                let tail = log_tail(plan.engine_log.as_deref(), LOG_TAIL_LINES);
+                let tail = crate::launch_failure::log_tail(plan.engine_log.as_deref());
                 return Err(RuntimeError::LaunchFailed(format!(
                     "{}; log tail:\n{tail}",
                     crate::launch_failure::summary(&tail, None)
@@ -294,43 +287,6 @@ fn roles(identities: &[ProcessIdentity]) -> String {
         .map(|i| format!("{}:{}", i.role, i.pid))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// The last `lines` lines of the engine's log, bounded and redacted. The tail is
-/// the engine's own account of why it left, and it is quoted into an error that
-/// reaches a journal, so it is passed through redaction first (Spec §3).
-fn log_tail(path: Option<&str>, lines: usize) -> String {
-    let Some(path) = path else {
-        return "(no engine log was configured for this launch)".into();
-    };
-    let text = match read_tail_bytes(path) {
-        Ok(text) => text,
-        Err(e) => return format!("(engine log {path} could not be read: {e})"),
-    };
-    let tail: Vec<&str> = text
-        .lines()
-        .rev()
-        .take(lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if tail.is_empty() {
-        return format!("(engine log {path} is empty)");
-    }
-    redact_text(&tail.join("\n"))
-}
-
-fn read_tail_bytes(path: &str) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > LOG_TAIL_BYTES {
-        file.seek(SeekFrom::Start(len - LOG_TAIL_BYTES))?;
-    }
-    let mut buffer = Vec::new();
-    file.take(LOG_TAIL_BYTES).read_to_end(&mut buffer)?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// Wall-clock milliseconds. A clock that cannot answer leaves the step uncertain
