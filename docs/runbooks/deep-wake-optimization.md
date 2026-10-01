@@ -121,9 +121,8 @@ Raw eager trial: `<temporary-directory>` on host-a.
 Raw baseline reconfirmation: `<temporary-directory>` on host-a.
 Raw eager reconfirmation: `<temporary-directory>` on host-a.
 Reload profile: `<temporary-directory>` on host-a.
-Local detailed log and scripts:
-`.context/compound-engineering/ce-optimize/vllm-deep-wake/` (gitignored;
-local audit/resume only). This tracked report preserves the principal evidence.
+The detailed log and scripts were kept locally (gitignored) for audit
+only. This tracked report preserves the principal evidence.
 
 Workspace tests and all-targets clippy passed. Two unit tests verify the
 opt-in eager flags and the unchanged denied profile. Independent code review

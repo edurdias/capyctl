@@ -1,6 +1,5 @@
 # Terminal Output Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Every mllm command and role prints terminal-friendly text by default; JSON only on request, and role output that does not go to a terminal is JSON.
 
