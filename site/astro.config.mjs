@@ -13,7 +13,9 @@ export default defineConfig({
   prefetch: false,
   integrations: [
     starlight({
-      title: 'capyctl',
+      title: 'CapyCTL',
+      favicon: '/favicon-32.png',
+      logo: { light: './public/brand/header-light.webp', dark: './public/brand/header-dark.webp', alt: 'CapyCTL', replacesTitle: true },
       description: 'A model manager for vLLM and SGLang on your own GPUs.',
       social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
       // Website spec, Visual system: code blocks are dark in both themes.
