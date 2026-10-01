@@ -555,3 +555,102 @@ tensorfold:time_to_first_token_seconds_count 2
     assert_eq!(engine, "tensorfold");
     assert_eq!(histograms[0].0, "engine_time_to_first_token");
 }
+
+// T17 T41, ADR 0023 §6 (2026-10-01): a TensorFold sample is quiescent only
+// when /health reads idle too.
+#[test]
+fn a_tensorfold_sample_is_idle_only_when_health_agrees() {
+    use capyctl_adapters::tensorfold::http::HealthReport;
+    use capyctl_agent::load::fold_tensorfold_health;
+    use capyctl_protocol::reports::EngineLoad;
+    let zero = EngineLoad {
+        running: 0,
+        waiting: 0,
+        kv_usage_ppm: 0,
+    };
+    let busy = HealthReport {
+        ok: true,
+        busy: true,
+        requests_running: 0,
+    };
+    let idle = HealthReport {
+        ok: true,
+        busy: false,
+        requests_running: 0,
+    };
+    assert_eq!(fold_tensorfold_health(zero, Some(&busy)).running, 1);
+    assert_eq!(fold_tensorfold_health(zero, None).running, 1);
+    assert_eq!(fold_tensorfold_health(zero, Some(&idle)), zero);
+}
+
+const TENSORFOLD_IDLE_METRICS: &str = "\
+tensorfold:requests_running 0
+tensorfold:requests_waiting 0
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0
+";
+
+/// A fake TensorFold: keyed `/metrics` reading idle, unkeyed `/health` as given.
+async fn tensorfold(native: [u8; 32], health: &'static str) -> SocketAddr {
+    let expected = format!("Bearer {}", hex::encode(native));
+    let router = Router::new()
+        .route(
+            "/metrics",
+            get(move |headers: HeaderMap| {
+                let expected = expected.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&expected)
+                    {
+                        return (StatusCode::UNAUTHORIZED, String::new());
+                    }
+                    (StatusCode::OK, TENSORFOLD_IDLE_METRICS.to_owned())
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(move || async move {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    health,
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+// T17 T41, SPEC §10 (amended 2026-10-01): the host folds TensorFold's
+// /health into its load sample, so a busy engine never reports 0 running.
+#[tokio::test]
+async fn a_tensorfold_scrape_folds_in_health() {
+    let ingress = Ingress::new().unwrap();
+    let busy = scope("busy", 1);
+    let idle = scope("idle", 1);
+    register(
+        &ingress,
+        &busy,
+        tensorfold([2; 32], r#"{"ok":true,"busy":true,"requests_running":0}"#).await,
+        1,
+        [2; 32],
+    );
+    register(
+        &ingress,
+        &idle,
+        tensorfold([4; 32], r#"{"ok":true,"busy":false,"requests_running":0}"#).await,
+        3,
+        [4; 32],
+    );
+    for (s, handle) in [(&busy, "launch-b"), (&idle, "launch-i")] {
+        ingress.bind_handle(s, handle).unwrap();
+        ingress.open(s).unwrap();
+    }
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    assert_eq!(all[0].deployment_id, "busy");
+    assert_eq!(all[0].engine.unwrap().running, 1);
+    assert_eq!(all[1].deployment_id, "idle");
+    assert_eq!(all[1].engine.unwrap().running, 0);
+}

@@ -440,6 +440,15 @@ impl EngineAdapter for VllmAdapter {
         Ok(Quiescence { quiescent })
     }
 
+    async fn engine_quiescent(&self, member: &MemberRef, _after_ms: i64) -> bool {
+        // SPEC §10 (amended 2026-10-01): read now, so any past `after_ms`
+        // holds. A parked member runs nothing, as in `prepare_park`.
+        if self.is_parked(member) {
+            return true;
+        }
+        matches!(self.http.work_counts().await, Ok(Some((r, w))) if r == 0.0 && w == 0.0)
+    }
+
     async fn park(
         &self,
         member: &MemberRef,

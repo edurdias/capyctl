@@ -289,6 +289,33 @@ impl EngineAdapter for Counting {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    async fn engine_quiescent(&self, _: &MemberRef, _: i64) -> bool {
+        true
+    }
+}
+
+// T17: the gate does not hide the engine's quiescence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gate_forwards_engine_quiescence() {
+    let f = fixture(|_| {});
+    let work = {
+        let o = f.owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &f.fence, 100, 100_100)
+            .unwrap();
+        o.store().next_initialize(o.session()).unwrap().unwrap()
+    };
+    let gate = CheckpointGate::new(
+        Arc::new(Counting::default()),
+        f.owner.clone(),
+        Arc::new(CheckpointVerifier::in_memory()),
+        &work,
+    );
+    let member = MemberRef {
+        deployment_id: "d".into(),
+        member_id: "b".into(),
+    };
+    assert!(gate.engine_quiescent(&member, 0).await);
 }
 
 fn step(f: &Fixture, action: RuntimeAction) -> RuntimeCommand {

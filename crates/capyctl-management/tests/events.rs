@@ -1109,6 +1109,12 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "drain_key":"01BX5ZZKBKACTAV9WEVGEMMVS3","deadline_ms":900000}),
             (None, None),
         ),
+        "request_cancellation_acknowledged" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,
+            "binding_id":"01BX5ZZKBKACTAV9WEVGEMMVS4","count":1,
+            "receipt":"the engine's own counters read no running and no waiting request after the client hung up"}),
+            (Some(DEP.to_owned()), None),
+        ),
         k if k.starts_with("switch_") => (
             serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",

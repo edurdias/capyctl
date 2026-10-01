@@ -593,6 +593,44 @@ impl EngineAdapter for RemoteEngine {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        // SPEC §10 (W12; amended 2026-10-01): the host's load report for this
+        // launch, which folds TensorFold's /health in, is the only evidence.
+        let b = &self.binding;
+        if member.member_id != b.plan.binding_id {
+            return false;
+        }
+        let launch = {
+            let Ok(owner) = self.owner.lock() else {
+                return false;
+            };
+            let Ok(launches) = owner.store().remote_ready_launches(owner.session()) else {
+                return false;
+            };
+            launches
+                .into_iter()
+                .find(|l| l.binding_id == b.plan.binding_id && l.host_id == b.host_id)
+        };
+        let Some(launch) = launch else {
+            return false;
+        };
+        let key = crate::load_table::InstanceKey::new(
+            launch.fence.deployment_id.clone(),
+            launch.fence.generation,
+        );
+        self.sessions
+            .load_table()
+            .sample_at(&key, capyctl_protocol::now_unix_ms())
+            .is_some_and(|view| {
+                crate::load_table::proves_quiescence(
+                    &view,
+                    &launch.host_id,
+                    &launch.step_id,
+                    launch.fence.generation,
+                    after_ms,
+                )
+            })
+    }
 }
 async fn cleanup(
     sessions: &AgentSessions,

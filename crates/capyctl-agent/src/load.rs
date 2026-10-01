@@ -4,12 +4,15 @@
 //! loopback, with that launch's native key, and reports the gauges with the
 //! ingress in-flight count over the control session as W3 `ReportLoad`.
 //!
-//! A sample is a routing hint only: never readiness, admission or release
-//! evidence, never journaled. Metric names are pinned to the recorded engine
+//! A sample is a routing hint, never readiness or admission evidence and never
+//! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
+//! evidence after a restart or a hang-up. A TensorFold sample folds in the
+//! engine's unkeyed `/health`, so it reads idle only when both agree. Metric names are pinned to the recorded engine
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
 use crate::ingress::{Ingress, LoadTarget};
+use capyctl_adapters::tensorfold::http::HealthReport;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
 use capyctl_protocol::{
     pb,
@@ -373,6 +376,20 @@ pub fn parse_engine_histograms(text: &str) -> Option<(&'static str, Vec<(String,
     Some((engine, histograms))
 }
 
+/// T41, ADR 0023 §6 (2026-10-01): TensorFold's gauges read idle only when
+/// its `/health` agrees. Anything but an idle health (busy, disagreeing
+/// counters, unreadable) keeps at least one request running in the sample.
+pub fn fold_tensorfold_health(load: EngineLoad, health: Option<&HealthReport>) -> EngineLoad {
+    if health.and_then(HealthReport::idle) == Some(true) {
+        load
+    } else {
+        EngineLoad {
+            running: load.running.max(1),
+            ..load
+        }
+    }
+}
+
 /// Previous cumulative engine histograms, keyed by scope and series, so each
 /// report carries only what was observed since the last one.
 type EngineBaselines = HashMap<(String, u32, i64, String), Histogram>;
@@ -441,6 +458,39 @@ impl LoadReporter {
             .flatten()
     }
 
+    /// TensorFold's `/health` on the same loopback target, unkeyed (the
+    /// engine has no key there), within the scrape bound.
+    async fn health(&self, target: &LoadTarget) -> Option<HealthReport> {
+        if !target.target.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = self
+                .client
+                .get(format!("http://{}/health", target.target))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
+            }
+            let body = response.bytes().await.ok()?;
+            if body.len() > MAX_METRICS_BYTES {
+                return None;
+            }
+            let body: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            Some(HealthReport {
+                ok: body["ok"] == true,
+                busy: body["busy"].as_bool()?,
+                requests_running: body["requests_running"].as_u64()?,
+            })
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// One tick: a sample per Ready scope, split into reports that each pass
     /// the W3 bounds. Empty when no scope is Ready.
     pub async fn reports(&self) -> Vec<pb::ReportLoad> {
@@ -452,6 +502,16 @@ impl LoadReporter {
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
         let scraped = futures::future::join_all(targets.iter().map(|t| self.scrape(t))).await;
+        // Only a TensorFold scrape is folded with its health.
+        let healths = futures::future::join_all(targets.iter().zip(&scraped).map(
+            |(target, body)| async move {
+                match body.as_deref().and_then(family_of) {
+                    Some(("tensorfold", ..)) => Some(self.health(target).await),
+                    _ => None,
+                }
+            },
+        ))
+        .await;
         let mut baselines = self.baselines.lock().unwrap_or_else(|p| p.into_inner());
         // SPEC §17: baselines of scopes no longer Ready are dropped.
         baselines.retain(|(deployment, instance, generation, _), _| {
@@ -464,8 +524,15 @@ impl LoadReporter {
         let mut samples: Vec<(u32, LoadSample)> = targets
             .into_iter()
             .zip(scraped)
-            .map(|(target, body)| {
-                let engine = body.as_deref().and_then(parse_engine_load);
+            .zip(healths)
+            .map(|((target, body), health)| {
+                let engine =
+                    body.as_deref()
+                        .and_then(parse_engine_load)
+                        .map(|load| match &health {
+                            Some(health) => fold_tensorfold_health(load, health.as_ref()),
+                            None => load,
+                        });
                 let latency = self.latency(&target, body.as_deref(), &mut baselines);
                 (
                     target.scope.instance_index,

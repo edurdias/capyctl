@@ -183,6 +183,11 @@ impl EngineAdapter for TensorfoldAdapter {
         Ok(CancellationOutcome::Uncertain)
     }
 
+    async fn engine_quiescent(&self, member: &MemberRef, _after_ms: i64) -> bool {
+        // SPEC §10 (amended 2026-10-01): /health read now.
+        self.idle_before_signal(member).await == Some(EngineWork::Idle)
+    }
+
     async fn idle_before_signal(&self, _member: &MemberRef) -> Option<EngineWork> {
         // Spec §5: counters that disagree are not idle; either one reporting
         // work is busy.

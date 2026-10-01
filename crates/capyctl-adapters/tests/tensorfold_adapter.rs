@@ -410,3 +410,17 @@ async fn there_is_no_park_path() {
         );
     }
 }
+
+// T17 T41, SPEC §10 (amended 2026-10-01): a cancelled request is acknowledged
+// only when /health reads busy false with requests_running 0.
+#[tokio::test]
+async fn engine_quiescence_reads_health() {
+    let (stub, port) = stub_engine("nemotron", 0, false).await;
+    let adapter = TensorfoldAdapter::new(url(port), "0.6.0".into(), "nemotron".into());
+    *stub.busy_override.lock().unwrap() = Some(true);
+    assert!(!adapter.engine_quiescent(&member(), now_ms()).await);
+    *stub.busy_override.lock().unwrap() = Some(false);
+    assert!(adapter.engine_quiescent(&member(), now_ms()).await);
+    let gone = TensorfoldAdapter::new(url(free_port().await), "0.6.0".into(), "nemotron".into());
+    assert!(!gone.engine_quiescent(&member(), 0).await);
+}

@@ -1,7 +1,7 @@
 //! SSE streaming dispatch (F1 design §5, T17 groundwork): the router
 //! forwards engine chunks as SSE `data:` frames, ends with `data: [DONE]`,
 //! and releases the in-flight guard only on verified backend completion.
-//! Client disconnects do NOT release accounting early (abandon semantics).
+//! A client hang-up closes the engine connection; accounting stays charged until the engine reports quiescence (SPEC §10).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -61,6 +61,22 @@ impl Progress {
 /// Run `forward` until it ends, or until the backend stops progressing within
 /// `bounds`; `Err(())` means the router cut it, which proves nothing about
 /// what the engine accepted.
+/// SPEC §10 (amended 2026-10-01): the lease closes on the backend's own
+/// terminator or on proof the engine never saw the request. A stream whose
+/// client hung up was cancelled upstream and stays charged as cancelling
+/// until the engine reports quiescence. A stream the router cut for missing
+/// its bounds stays uncertain.
+pub fn stream_lease_end(
+    result: &Result<Result<StreamEnded, AdapterError>, ()>,
+) -> capyctl_controller::LeaseEnd {
+    match result {
+        Ok(Ok(StreamEnded::Completed)) => capyctl_controller::LeaseEnd::Completed,
+        Ok(Ok(StreamEnded::Cancelled)) => capyctl_controller::LeaseEnd::Cancelling,
+        Ok(Err(error)) => crate::chat::lease_end(Some(error)),
+        _ => capyctl_controller::LeaseEnd::Uncertain,
+    }
+}
+
 pub(crate) async fn bounded<F: std::future::Future>(
     forward: F,
     progress: &Progress,
@@ -197,10 +213,11 @@ pub fn stream_planned_timed(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
     let pump = tokio::spawn(async move {
         // Accounting was registered BEFORE stream_response (the caller
-        // enforces the in-flight bound synchronously); the guard lives for
-        // the whole backend stream: a client disconnect drops the SSE side
-        // only — accounting stays conservative until the backend ends (F1
-        // design §5: client disconnect is not proof the engine stopped).
+        // enforces the in-flight bound synchronously). SPEC §10 (amended
+        // 2026-10-01): a client hang-up makes the forwarder close the engine
+        // connection, but that is not proof the engine stopped, so the charge
+        // stays until the engine reports quiescence (a cancelling lease) or,
+        // without a durable ledger, for as long as the slot is held.
         let guard = guard.abandon();
         let progress = Progress::default();
         let mut sink = ResponseSink {
@@ -220,16 +237,7 @@ pub fn stream_planned_timed(
                 &bounds,
             )
             .await;
-            // SPEC §10: the lease closes on the backend's own terminator (a client
-            // that left does not cut the backend: the forwarder drains it), on proof
-            // the engine never saw the request, and on nothing else. A stream the
-            // router cut for missing its bounds may have been accepted, so its
-            // lease stays uncertain.
-            let end = match &result {
-                Ok(Ok(StreamEnded::Completed)) => capyctl_controller::LeaseEnd::Completed,
-                Ok(Err(error)) => crate::chat::lease_end(Some(error)),
-                _ => capyctl_controller::LeaseEnd::Uncertain,
-            };
+            let end = stream_lease_end(&result);
             durable = attempt.settle(end).await;
             // SPEC §10, T19: a deterministic refusal decided before sending is
             // answered in-band; another instance would refuse it the same way.
@@ -316,7 +324,7 @@ pub fn stream_planned_timed(
             }
         }
         // SPEC §10, T17: an uncertain end — an error, a premature close, a cut
-        // for missing the bounds — cannot establish backend quiescence. With a
+        // for missing the bounds, a hang-up — cannot establish backend quiescence. With a
         // durable lease that uncertainty stays charged in the ledger until
         // reconciled, so the per-process slot is released; left taken, every
         // uncertain stream would shrink the deployment's bound for the life of

@@ -42,6 +42,8 @@ struct Engine {
     running: u32,
     fail: Option<String>,
     metrics: bool,
+    /// The waiting gauge is absent from `/metrics`.
+    no_waiting: bool,
 }
 
 type Shared = Arc<Mutex<Engine>>;
@@ -147,11 +149,15 @@ async fn metrics(State(engine): State<Shared>, headers: HeaderMap) -> axum::resp
     if !e.metrics {
         return "# no gauges\n".into_response();
     }
+    let waiting = if e.no_waiting {
+        ""
+    } else {
+        "vllm:num_requests_waiting{engine=\"0\",model_name=\"m\"} 0.0\n"
+    };
     format!(
         "# HELP vllm:num_requests_running running\n\
          vllm:num_requests_running{{engine=\"0\",model_name=\"m\"}} {}.0\n\
-         vllm:num_requests_running_total 7\n\
-         vllm:num_requests_waiting{{engine=\"0\",model_name=\"m\"}} 0.0\n",
+         vllm:num_requests_running_total 7\n{waiting}",
         e.running
     )
     .into_response()
@@ -594,4 +600,24 @@ async fn an_opted_out_host_backed_launch_makes_no_residency_call() {
         );
     }
     assert!(engine.lock().unwrap().calls.is_empty());
+}
+
+/// SPEC §10 (amended 2026-10-01): a cancelled request is acknowledged only by
+/// the engine's own gauges, `vllm:num_requests_running` and
+/// `vllm:num_requests_waiting`, both at zero; a missing gauge is not.
+// T17
+#[tokio::test]
+async fn engine_quiescence_reads_both_gauges() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled);
+    engine.lock().unwrap().metrics = true;
+    engine.lock().unwrap().running = 1;
+    assert!(!vllm.engine_quiescent(&member(), now_ms()).await);
+    engine.lock().unwrap().running = 0;
+    assert!(vllm.engine_quiescent(&member(), now_ms()).await);
+    engine.lock().unwrap().no_waiting = true;
+    assert!(!vllm.engine_quiescent(&member(), now_ms()).await);
+    let gone = adapter(1, ParkPolicy::Enabled);
+    assert!(!gone.engine_quiescent(&member(), 0).await);
 }

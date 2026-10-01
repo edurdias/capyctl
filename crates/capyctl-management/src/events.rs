@@ -533,6 +533,14 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("drain_key", Token),
             ("deadline_ms", Number),
         ],
+        // SPEC §10 (amended 2026-10-01): cancelling leases closed on the
+        // engine's quiescence after a client hung up.
+        "request_cancellation_acknowledged" => &[
+            ("deployment_id", Id),
+            ("binding_id", Token),
+            ("count", Number),
+            ("receipt", Text),
+        ],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {

@@ -257,6 +257,8 @@ struct Shared {
     started_ms: i64,
     /// When the idle policy last ran.
     idle_checked_ms: std::sync::atomic::AtomicI64,
+    /// When cancelling leases were last checked against engine quiescence.
+    cancel_checked_ms: std::sync::atomic::AtomicI64,
     options: CoordinatorOptions,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
@@ -1544,6 +1546,7 @@ impl OwnedCoordinator {
             activity: Mutex::new(BTreeMap::new()),
             started_ms,
             idle_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
+            cancel_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             options,
         });
         let (stop, stop_rx) = watch::channel(false);
@@ -2550,8 +2553,9 @@ async fn residency_effect(
 /// SPEC §6.5 (W5): advance open preinitializes and, at most once a second,
 /// the idle policy. Returns whether anything was accepted.
 async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    let settled = settle_cancellations(shared).await?;
     if !shared.initializing.load(Ordering::Acquire) {
-        return Ok(false);
+        return Ok(settled);
     }
     let eligible = shared.observations.eligible_hosts();
     let progress = shared
@@ -2561,7 +2565,7 @@ async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError
                 .advance_preinitialize(owner.session(), now, eligible.as_ref())
         })
         .await?;
-    let mut changed = !progress.is_empty();
+    let mut changed = settled || !progress.is_empty();
     let idle = shared.options.idle;
     if idle.ready_idle_ms.is_none() && idle.parked_idle_ms.is_none() {
         return Ok(changed);
@@ -2592,6 +2596,91 @@ async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError
         })
         .await?;
     changed |= !actions.is_empty();
+    Ok(changed)
+}
+
+/// The receipt a local engine's quiescence leaves on a cancelling lease.
+const LOCAL_CANCELLATION_RECEIPT: &str =
+    "the engine's own counters read no running and no waiting request after the client hung up";
+/// The receipt a remote host's load report leaves on a cancelling lease.
+const REMOTE_CANCELLATION_RECEIPT: &str = "the host reported the launch's engine with 0 running and 0 waiting and 0 in flight at its ingress after the client hung up";
+/// One quiescence question may take no longer than this.
+const QUIESCENCE_QUESTION_BOUND: Duration = Duration::from_secs(3);
+
+fn lease_store_error(error: capyctl_store::StoreError) -> LifecycleError {
+    match error {
+        capyctl_store::StoreError::Sql(error) => LifecycleError::Sql(error),
+        _ => LifecycleError::CorruptStoredData,
+    }
+}
+
+/// SPEC §10 (amended 2026-10-01): at most every 250 ms, ask each retained
+/// engine with a cancelling lease whether it is quiescent now, and close the
+/// leases cancelled before the question when it is. Quiescence is
+/// engine-wide: another request on the engine keeps the cancelled one charged.
+/// One bounded question per binding per tick; nothing here waits for work.
+async fn settle_cancellations(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    // The lease ledger stamps a cancellation on the wall clock, so the
+    // question is asked, and paced, on that same clock.
+    let now = capyctl_protocol::now_unix_ms();
+    let last = shared.cancel_checked_ms.load(Ordering::Acquire);
+    if last != i64::MIN && now.saturating_sub(last) < 250 {
+        return Ok(false);
+    }
+    shared.cancel_checked_ms.store(now, Ordering::Release);
+    let cancelling = shared
+        .read(|owner, _| {
+            owner
+                .store()
+                .cancelling_bindings(owner.session())
+                .map_err(lease_store_error)
+        })
+        .await?;
+    if cancelling.is_empty() {
+        return Ok(false);
+    }
+    let drivers: Vec<_> = {
+        let retained = shared
+            .retained
+            .lock()
+            .map_err(|_| shared.fail("runtime registry poisoned"))?;
+        cancelling
+            .into_iter()
+            .filter_map(|c| retained.get(&c.binding_id).cloned().map(|d| (c, d)))
+            .collect()
+    };
+    let mut changed = false;
+    for (cancelling, driver) in drivers {
+        let asked_at = capyctl_protocol::now_unix_ms();
+        let member = capyctl_adapters::traits::MemberRef {
+            deployment_id: cancelling.deployment_id.clone(),
+            member_id: cancelling.binding_id.clone(),
+        };
+        let quiescent = tokio::time::timeout(
+            QUIESCENCE_QUESTION_BOUND,
+            driver.engine.engine_quiescent(&member, asked_at),
+        )
+        .await
+        .unwrap_or(false);
+        if !quiescent {
+            continue;
+        }
+        let receipt = if driver.settle.is_some() {
+            REMOTE_CANCELLATION_RECEIPT
+        } else {
+            LOCAL_CANCELLATION_RECEIPT
+        };
+        let binding = cancelling.binding_id;
+        let settled = shared
+            .read(move |owner, _| {
+                owner
+                    .store()
+                    .settle_cancelled_leases(owner.session(), &binding, asked_at, receipt)
+                    .map_err(lease_store_error)
+            })
+            .await?;
+        changed |= settled > 0;
+    }
     Ok(changed)
 }
 
