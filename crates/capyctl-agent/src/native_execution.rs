@@ -36,6 +36,8 @@ use std::{
 
 // SPEC §3: vLLM's recipe and guard live in their own module.
 mod vllm;
+// ADR 0023: TensorFold's plan, adapter and idle check before Terminate.
+mod tensorfold;
 // SPEC §§9.1, 10 (W4): remote Park and Restore of a retained launch.
 mod residency;
 pub use residency::{SaverMapped, SaverResidency, SaverScope, SaverUnavailable};
@@ -158,6 +160,8 @@ impl<T: EngineAdapter + ChatForward> NativeEngine for T {}
 enum PreparedLaunch {
     Sglang(Box<capyctl_domain::launch::NativeLaunch>),
     Vllm(Box<capyctl_adapters::vllm::PlanInputVllm>),
+    /// The plan and whether its extensions are already built.
+    Tensorfold(Box<(capyctl_adapters::tensorfold::PlanInputTensorfold, bool)>),
 }
 
 impl NativeHostExecution {
@@ -527,7 +531,10 @@ impl NativeHostExecution {
         ) {
             cold.bytes = startup.max(ready.bytes);
         }
-        if !matches!(effective.profile.engine, Engine::Sglang | Engine::Vllm)
+        if !matches!(
+            effective.profile.engine,
+            Engine::Sglang | Engine::Vllm | Engine::Tensorfold
+        )
             || effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != 1
@@ -558,6 +565,11 @@ impl NativeHostExecution {
         }
         if effective.profile.engine == Engine::Vllm {
             self.admit_vllm(&effective, plan)?;
+        }
+        // ADR 0023 §3: a new launch needs its private build directory; a
+        // retained one is never blocked by it (a Terminate must still run).
+        if effective.profile.engine == Engine::Tensorfold && !retained {
+            self.tensorfold_plan(&effective, plan)?;
         }
         Ok(effective)
     }
@@ -823,8 +835,10 @@ impl NativeHostExecution {
             Engine::Vllm => Ok(PreparedLaunch::Vllm(Box::new(
                 self.vllm_plan(effective, plan).map_err(|_| SessionError)?,
             ))),
-            // ADR 0023: refused until the host's TensorFold launch lands (Task 9).
-            Engine::Tensorfold => Err(SessionError),
+            Engine::Tensorfold => Ok(PreparedLaunch::Tensorfold(Box::new(
+                self.tensorfold_plan(effective, plan)
+                    .map_err(|_| SessionError)?,
+            ))),
         }
     }
 
@@ -885,6 +899,15 @@ impl NativeHostExecution {
                     .with_launch(*launch)
                     .with_tools(tools),
             ),
+            PreparedLaunch::Tensorfold(prepared) => {
+                let (input, built) = *prepared;
+                Box::new(
+                    self.tensorfold_adapter(effective, plan, served)?
+                        .with_launch(input)
+                        .with_extensions_built(built)
+                        .with_tools(tools),
+                )
+            }
         })
     }
 
@@ -904,8 +927,7 @@ impl NativeHostExecution {
                     .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin)),
             ),
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, keys, served)?),
-            // ADR 0023: refused until the host's TensorFold launch lands (Task 9).
-            Engine::Tensorfold => return Err(SessionError),
+            Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
         })
     }
 
@@ -1190,6 +1212,38 @@ impl NativeHostExecution {
                         .and_then(|owned| self.register_retained(&owned).ok())
                     {
                         self.ingress.close(&scope).map_err(|_| SessionError)?;
+                    }
+                    // Spec §5 (ruling 9): TensorFold's own counters must read
+                    // idle before the signal; otherwise nothing is sent and the
+                    // terminate stays uncertain, accounting retained.
+                    match self.journal.retained_command(owned_handle) {
+                        Ok(owned) => {
+                            if !self
+                                .tensorfold_idle_before_terminate(
+                                    &owned,
+                                    command.identity.deadline_ms,
+                                )
+                                .await
+                            {
+                                return Err(SessionError);
+                            }
+                        }
+                        // ADR 0016: a handle with no launch body (a lost
+                        // journal, a fence) holds no claim and the journal
+                        // signals nothing for it; any other unreadable state
+                        // fails closed.
+                        Err(_) => {
+                            let claimed = self
+                                .journal
+                                .claimed_launches("")
+                                .map_err(|_| SessionError)?;
+                            if claimed
+                                .iter()
+                                .any(|launch| launch.command.identity.command_id == *owned_handle)
+                            {
+                                return Err(SessionError);
+                            }
+                        }
                     }
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
@@ -2679,6 +2733,211 @@ mod tests {
         let (mut owner, _) = launch_with(&deployment, &policy, "");
         owner.identity.payload_digest = owner.canonical_digest();
         deep.authorize_residency(&park, &owner).unwrap();
+    }
+
+    /// A TensorFold profile on the lab document, restart_only, with a cache root.
+    fn tensorfold_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let (executor, mut deployment, policy) =
+            sglang_fixture_with(root, identity_dir, "restart_only", |document| {
+                document["resource_policy"]["endpoint_port_range"] =
+                    serde_json::json!({"start": 1024, "end": 65535});
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["engine"] = "tensorfold".into();
+                profile["executable"] = "/opt/tf/bin/tensorfold".into();
+                profile["build_fingerprint"] = "0.6.0".into();
+                profile["args"] = serde_json::json!([]);
+                profile["security"]["deep_park"] = "disabled".into();
+                profile["security"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admin_credential_ref");
+            });
+        deployment["engine_config"] = serde_json::json!({"context_length": 8192});
+        let engines = root.join("engines");
+        std::fs::create_dir(&engines).unwrap();
+        std::fs::set_permissions(&engines, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = executor.with_engine_cache_root(engines);
+        (executor, deployment, policy)
+    }
+
+    /// A TensorFold launch command for the fixture, on `port`.
+    fn tensorfold_launch(
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut launch, mut plan) = launch_with(deployment, policy, "");
+        plan.service_port = port;
+        launch.action = MemberAction::LaunchSingle(plan.clone());
+        launch.identity.profile_fingerprint = "0.6.0".into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (launch, plan)
+    }
+
+    // T41 (ADR 0023 §3): the host resolves and prepares a TensorFold launch
+    // from its own document; the plan renders with a private extensions
+    // directory and no build yet.
+    #[test]
+    fn a_tensorfold_launch_prepares_from_local_policy() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        let (launch, plan) = tensorfold_launch(&deployment, &policy, 8100);
+        let effective = executor.resolve(&launch).unwrap();
+        let (input, built) = executor.tensorfold_plan(&effective, &plan).unwrap();
+        assert!(!built);
+        assert!(input
+            .extensions_dir
+            .unwrap()
+            .ends_with("engines/tensorfold/0.6.0/torch_extensions"));
+        assert_eq!(input.context_length, 8192);
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy"),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+    }
+
+    // T41 (ADR 0023 §3, ruling R4): a host without a private cache root
+    // refuses a new TensorFold launch, yet still resolves a retained one so
+    // its Terminate can run.
+    #[test]
+    fn a_missing_cache_root_refuses_launch_but_not_retained() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        std::fs::set_permissions(
+            root.path().join("engines"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let (launch, _) = tensorfold_launch(&deployment, &policy, 8100);
+        assert!(matches!(
+            executor.resolve(&launch),
+            Err(JournalError::Unauthorized)
+        ));
+        assert!(executor.resolve_retained(&launch).is_ok());
+    }
+
+    // T41 T21 (ADR 0023 §6): a Park of a TensorFold launch is refused by its
+    // tier before anything is journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tensorfold_park_is_refused_unchanged() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        let (launch, _) = tensorfold_launch(&deployment, &policy, 8100);
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let mut park = MemberCommand {
+            identity: checkpoint_identity("park", "ready"),
+            action: MemberAction::Park {
+                owned_handle: "launch".into(),
+            },
+        };
+        park.identity.payload_digest = park.canonical_digest();
+        let refused = executor.execute(session, park).await.unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
+    }
+
+    // T41 (spec §5): before Terminate the host waits for TensorFold's own
+    // counters; busy at the bound is not idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_waits_for_tensorfold_to_be_idle() {
+        // A stub /health on the launch's service port, idle after two reads.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    axum::Json(serde_json::json!({
+                        "ok": true, "busy": n < 2, "requests_running": if n < 2 { 1 } else { 0 }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        let (launch, _) = tensorfold_launch(&deployment, &policy, port);
+        let deadline = capyctl_protocol::now_unix_ms() + 10_000;
+        assert!(
+            executor
+                .tensorfold_idle_before_terminate(&launch, deadline)
+                .await
+        );
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        // Busy for good: the wait ends at the command's remaining time.
+        let short = capyctl_protocol::now_unix_ms() + 1_200;
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"ok": true, "busy": true, "requests_running": 1}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (busy_launch, _) = tensorfold_launch(&deployment, &policy, busy_port);
+        assert!(
+            !executor
+                .tensorfold_idle_before_terminate(&busy_launch, short)
+                .await
+        );
+    }
+
+    // T41 (spec §5, ruling R5): a Terminate whose TensorFold launch does not
+    // read idle sends nothing and stays unresolved; the launch stays owned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_busy_tensorfold_terminate_signals_nothing() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    axum::Json(serde_json::json!({"ok": true, "busy": true, "requests_running": 1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        let (launch, _) = tensorfold_launch(&deployment, &policy, port);
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let mut terminate = MemberCommand {
+            identity: checkpoint_identity("terminate", "retained"),
+            action: MemberAction::Terminate {
+                owned_handle: "launch".into(),
+                recorded: Vec::new(),
+            },
+        };
+        terminate.identity.deadline_ms = capyctl_protocol::now_unix_ms() + 1_500;
+        terminate.identity.payload_digest = terminate.canonical_digest();
+        assert!(executor.execute(session, terminate).await.is_err());
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(executor.journal.retained_command("launch").is_ok());
     }
 
     /// A prepared host's runtime directory for SGLang: the agent user's
