@@ -1,5 +1,71 @@
 # Current implementation and launch status
 
+## TensorFold engine — 2026-10-01
+
+ADR 0023 is implemented: `tensorfold` is the third engine kind, registered with
+`capyctl engine add` after a closed-PATH toolchain check, launched restart-only
+with a private per-version build cache, ready on `/health` and the model list,
+drained on its own counters before a stop, and part of the switch planner like
+the other engines. A role's own TensorFold is `local_engine.tensorfold`
+(`--tensorfold-bin`, `CAPYCTL_TENSORFOLD_BIN`); a drafter is an approved path
+extra argument, as vLLM's and SGLang's draft models are.
+
+Live on host B (GB10, standalone, TensorFold 0.6.0 venv, Nemotron 3.5 Lightning
+30B-A3B 4-bit, 32768-token context, 32 GiB cold and 30 GiB ready):
+
+- TF1 passed: `engine add` registered `tensorfold 0.6.0` with deep park
+  disabled and the CUDA toolkit found at `/usr/local/cuda`, which the profile
+  records as its `cuda_home`; `engine list` showed it. The guide carries the
+  captured output.
+- TF2 passed after a fix. The first start built the kernels and answered the
+  readiness probe about 88 s after the start command (TensorFold reported the
+  model loaded in 50.7 s), then failed Ready with `invalid lifecycle input`: the store, the completion check and
+  the protocol required a worker process, and TensorFold serves from one.
+  Fixed in `7c3a4f3` (a single api process is a group; parked or restored
+  claims still need a worker). The next start was ready in 8.1 s. A plain
+  request answered `42` with the `tensorfold` object (161 tok/s decode); the
+  streaming one answered `42` in 50 events; a 6000-token request ran at
+  132 tok/s. Peak memory stayed inside the reservation: CapyCTL measured a
+  20.2 GiB startup peak, `nvidia-smi` showed at most 19.3 GiB and
+  MemAvailable dropped at most 25.1 GiB (first start, with the build).
+- TF3 passed after a fix: a standalone document refused
+  `server.lifecycle_defaults` and its coordinator had no idle policy. Fixed in
+  `c5ef90c`. With `ready_idle_timeout: 60s` the deployment stopped 56 to 61 s after
+  the role restarted with it Ready, its process was gone and the GPU showed no process. One request
+  woke it in 8.4 s with the answer (warm start: no kernel build, loaded in
+  6.9 s). `park deployment nemotron` was refused `unsupported_capability`
+  (exit 5).
+- TF4 passed: with Qwen3-4B on vLLM 0.29 (KV cache 26 GiB, 42.7 GiB startup
+  reservation; the standalone managed limit is half of the 121.7 GiB) the two
+  do not fit together. Three switches each way all answered 200: vLLM
+  `released: parked` and TensorFold `released: stopped` in the role's switch
+  events, nemotron answered in 9.9 to 11.2 s and Qwen in 18.4 to 22.3 s; the
+  largest `nvidia-smi` total was 35.1 GiB (vLLM ready).
+- TF5 passed: a stream closed by the client after 2000 bytes left TensorFold
+  `busy: true` until it finished the 2048 tokens, and `/health` read
+  `busy: false`, `requests_running: 0` 17.2 s after the close, inside the
+  30 s drain bound. The router drains a disconnected stream rather than
+  cancelling it (SPEC §10: a client disconnect is not proof the engine
+  stopped); the same disconnect sent to the engine directly stopped it after
+  29 tokens. The release (`start deployment qwen --evict --wait`) came 2.1 s
+  after the idle read; the engine stopped answering 0.3 s and exited 0.7 s
+  after the release began.
+
+Found and not fixed: a Hugging Face cache in the shared-blobs layout
+(`snapshots/` links to model blobs that link again into `hub/blobs`) is
+refused `unsafe_file`, and the start then reports "checkpoint does not match
+its recorded digest"; a plain checkpoint directory works. `validate config`
+without `--host` accepts a `resources` block that `deploy model` refuses
+(missing `host_kv_bytes`, `devices`). The last engine profile cannot be removed
+with `engine remove`: a running standalone refuses `publish_rejected`, a
+stopped one `agent_unreachable`.
+
+All roles stopped with a drained shutdown; deployments deleted; no capyctl or
+engine process and no GPU process left on host B. Local checks: formatting,
+Clippy with warnings denied, core suite 1139 passed / 0 failed, workspace
+2347 / 0, Python runtime 302 OK, site check. Discrete GPUs run TensorFold
+unqualified. CPU and Fake-engine tests are not qualification.
+
 ## 0.1.0 release candidate — 2026-10-01
 
 Draft release `v0.1.0` (not published) targets `f224320`, the commit both

@@ -91,7 +91,14 @@ capyctl engine add ~/tensorfold-0.6.0-venv
 ```
 
 ```text
-<!-- capture in Task 14 -->
+Registered tensorfold (tensorfold 0.6.0)
+
+  Executable     /home/me/tensorfold-0.6.0-venv/bin/tensorfold
+  Deep park      disabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
+  Published      when capyctl starts
+saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
 ```
 
 TensorFold has no way to free its memory while it runs, so a TensorFold model
@@ -101,7 +108,6 @@ request. `capyctl park deployment` refuses a TensorFold model; use `stop` or let
 CapyCTL switch it. A TensorFold deployment states its memory with `resources`
 and its `context_length`:
 
-<!-- capture in Task 14: validate this YAML with `capyctl validate config --file` -->
 ```yaml
 schema_version: 1
 kind: deployment
@@ -109,14 +115,32 @@ name: nemotron
 engine: tensorfold
 model: nemotron-3.5-lightning-30b-a3b-4bit
 residency: restart_only
+devices: [{id: gpu0}]
 resources:
   cold:
-    allocations: [{domain: unified, bytes: 32GiB}]
+    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
   ready:
-    allocations: [{domain: unified, bytes: 30GiB}]
+    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+  parking:
+    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+  parked:
+    allocations: [{domain: unified, bytes: 0B, host_kv_bytes: 0B}]
+    devices: []
+  wake:
+    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
 engine_config:
   context_length: 32768
 ```
+
+`cold` covers the start, `ready` the running engine; a TensorFold model never
+parks, so `parked` holds nothing and `parking` and `wake` repeat `ready` and
+`cold`. The values above fit Nemotron 3.5 Lightning 30B-A3B 4-bit with a
+32768-token context on a GB10: TensorFold estimated 27.7 GiB at startup and
+CapyCTL measured a 20.2 GiB peak.
 
 A drafter works as a draft model does for vLLM and SGLang: allow it on the
 engine (`security.approved_options: [--drafter]` and the drafter's directory in
