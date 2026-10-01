@@ -97,10 +97,10 @@ pub struct NamedInstallation {
 /// (models root, ports, KV default, runtime directory). The profile states the
 /// engine, its executable, its version, its security switches and its args.
 pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> EngineInstallation {
-    let engine = match profile["engine"].as_str() {
-        Some("sglang") => Engine::Sglang,
-        _ => Engine::Vllm,
-    };
+    let engine = profile["engine"]
+        .as_str()
+        .and_then(Engine::from_name)
+        .unwrap_or(Engine::Vllm);
     EngineInstallation {
         engine,
         executable: profile["executable"].as_str().unwrap_or_default().into(),

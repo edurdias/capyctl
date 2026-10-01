@@ -26,6 +26,9 @@ pub const INITIALIZE_CAP_MS: i64 = 1_800_000;
 pub const WAKE_BASE_MS: i64 = 60_000;
 pub const WAKE_PER_GB_MS: i64 = 5_000;
 pub const WAKE_CAP_MS: i64 = 900_000;
+/// ADR 0023 §4: the first TensorFold start builds its CUDA extensions; the
+/// host gives up earlier once a build exists (`capyctl-adapters::tensorfold`).
+pub const TENSORFOLD_FIRST_BUILD_MS: i64 = 1_800_000;
 /// While the checkpoint digest (and so the weights bytes) is pending, the
 /// conservative Initialize timeout. Wake uses its cap: nothing wakes before a
 /// launch, and a launch waits for the digest.
@@ -162,6 +165,7 @@ pub(super) fn resolve_timeouts(
     raw: Option<&RawTimeouts>,
     request_deadline_ms: i64,
     facts: CheckpointFacts,
+    engine: Engine,
 ) -> Result<DeploymentTimeouts, ConfigError> {
     let raw = raw.cloned().unwrap_or_default();
     refuse_short_request_deadline(request_deadline_ms)?;
@@ -192,7 +196,11 @@ pub(super) fn resolve_timeouts(
             derived.min(request_deadline_ms)
         }
     };
-    let initialize_ms = pick("initialize", initialize, derived_initialize_ms(weights));
+    let derived_initialize = match engine {
+        Engine::Tensorfold => TENSORFOLD_FIRST_BUILD_MS,
+        Engine::Vllm | Engine::Sglang => derived_initialize_ms(weights),
+    };
+    let initialize_ms = pick("initialize", initialize, derived_initialize);
     let wake_ms = pick("wake", wake, derived_wake_ms(weights));
     let basis = (initialize.is_none() || wake.is_none()).then_some(match weights {
         Some(_) => TimeoutBasis::CheckpointWeights,
@@ -218,7 +226,13 @@ pub fn validate_declared_timeouts(deployment: &serde_json::Value) -> Result<(), 
         return refuse_short_request_deadline(ceiling);
     };
     let raw: RawTimeouts = decode(block, "timeouts")?;
-    resolve_timeouts(Some(&raw), ceiling, CheckpointFacts::default()).map(|_| ())
+    resolve_timeouts(
+        Some(&raw),
+        ceiling,
+        CheckpointFacts::default(),
+        Engine::Vllm,
+    )
+    .map(|_| ())
 }
 
 /// The lifecycle windows a caller that names none asks for, in milliseconds:
@@ -262,6 +276,7 @@ mod tests {
                 weights_bytes: Some(60 * GB),
                 ..Default::default()
             },
+            Engine::Vllm,
         )
         .unwrap();
         assert_eq!((t.initialize_ms, t.wake_ms), (300_000, 300_000));
@@ -283,8 +298,13 @@ mod tests {
                 initialize: Some(initialize.into()),
                 wake: Some(wake.into()),
             };
-            let error =
-                resolve_timeouts(Some(&raw), 600_000, CheckpointFacts::default()).unwrap_err();
+            let error = resolve_timeouts(
+                Some(&raw),
+                600_000,
+                CheckpointFacts::default(),
+                Engine::Vllm,
+            )
+            .unwrap_err();
             assert_eq!(error.path, path, "{initialize} {wake}");
         }
     }
@@ -299,6 +319,7 @@ mod tests {
                 weights_bytes: Some(0),
                 ..Default::default()
             },
+            Engine::Vllm,
         )
         .unwrap();
         assert_eq!(
@@ -315,11 +336,18 @@ mod tests {
     #[test]
     fn a_request_deadline_below_the_activation_floors_is_refused() {
         for deadline in [5_000, MIN_WAKE_MS, MIN_INITIALIZE_MS - 1] {
-            let error = resolve_timeouts(None, deadline, CheckpointFacts::default()).unwrap_err();
+            let error = resolve_timeouts(None, deadline, CheckpointFacts::default(), Engine::Vllm)
+                .unwrap_err();
             assert_eq!(error.path, "request_deadline", "{deadline}");
             assert!(error.detail.contains("30s"), "{}", error.detail);
         }
-        let t = resolve_timeouts(None, MIN_INITIALIZE_MS, CheckpointFacts::default()).unwrap();
+        let t = resolve_timeouts(
+            None,
+            MIN_INITIALIZE_MS,
+            CheckpointFacts::default(),
+            Engine::Vllm,
+        )
+        .unwrap();
         assert_eq!(
             (t.initialize_ms, t.wake_ms),
             (MIN_INITIALIZE_MS, MIN_INITIALIZE_MS)

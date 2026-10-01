@@ -339,6 +339,7 @@ pub fn fit_for_launch(
             VLLM_RESERVED_BLOCKS,
         ),
         LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
+        LaunchSettings::Tensorfold(s) => (&s.common, &s.memory, None, 0),
     };
     if common.context_length.is_none() {
         if let Some(option) = typed_field_option(engine, "context_length") {
@@ -387,6 +388,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
     let declared = match &effective.engine_config {
         LaunchSettings::Vllm(s) => s.common.context_length,
         LaunchSettings::Sglang(s) => s.common.context_length,
+        LaunchSettings::Tensorfold(s) => s.common.context_length,
     };
     let fit = fit_for_launch(
         effective.profile.engine,

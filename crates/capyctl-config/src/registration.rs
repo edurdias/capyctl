@@ -318,7 +318,12 @@ pub fn write_engines(
 
 /// ADR 0018 §1: the versions the live matrix qualifies. Any other version is
 /// shown `custom`; nothing is written for it.
-pub const VERIFIED: &[(Engine, &str)] = &[(Engine::Vllm, "0.29.0"), (Engine::Sglang, "0.5.20")];
+pub const VERIFIED: &[(Engine, &str)] = &[
+    (Engine::Vllm, "0.29.0"),
+    (Engine::Sglang, "0.5.20"),
+    // ADR 0023 §1.
+    (Engine::Tensorfold, "0.6.0"),
+];
 
 pub fn is_verified(engine: Engine, version: &str) -> bool {
     VERIFIED.iter().any(|(e, v)| *e == engine && *v == version)
@@ -397,7 +402,7 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
         security["installation_drift"] = "refuse".into();
     }
     let mut profile = serde_json::json!({
-        "engine": match spec.engine { Engine::Vllm => "vllm", Engine::Sglang => "sglang" },
+        "engine": spec.engine.name(),
         "revision": 1,
         "executable": spec.executable.to_string_lossy(),
         "build_fingerprint": spec.build_fingerprint,

@@ -16,6 +16,27 @@ use std::path::{Component, Path, PathBuf};
 pub enum Engine {
     Vllm,
     Sglang,
+    /// ADR 0023: TensorFold, restart-only, registered with `engine add`.
+    Tensorfold,
+}
+
+impl Engine {
+    /// Every engine kind, in the order lists show them.
+    pub const ALL: [Engine; 3] = [Engine::Vllm, Engine::Sglang, Engine::Tensorfold];
+
+    /// The serde, CLI and profile name of the kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Vllm => "vllm",
+            Engine::Sglang => "sglang",
+            Engine::Tensorfold => "tensorfold",
+        }
+    }
+
+    /// The kind a name stands for; exact, lowercase.
+    pub fn from_name(name: &str) -> Option<Engine> {
+        Self::ALL.into_iter().find(|engine| engine.name() == name)
+    }
 }
 
 /// ADR 0014 §3: vLLM options capyctl renders from the grant, placement and binding.
@@ -161,6 +182,53 @@ const SGLANG_RESERVED_ALIASES: &[&str] = &[
     "--moe-data-parallel-size",
     "--grpc-http-sidecar-port",
 ];
+
+/// ADR 0023 §3: TensorFold 0.6.0 `serve` options capyctl renders or forbids
+/// (`tensorfold/cli_args.py`). `--drafter` is not here: like other engines'
+/// draft model options it is an approved path option. `--tp`, `--rank`,
+/// `--master` and `--master-port` belong to multi-rank, which is out of scope.
+pub const TENSORFOLD_RESERVED_FLAGS: &[&str] = &[
+    "--host",
+    "--port",
+    "--name",
+    "--alias",
+    "--backend",
+    "--context",
+    "--tp",
+    "--rank",
+    "--master",
+    "--master-port",
+    "--snapshot-dir",
+    "--no-update-check",
+];
+const TENSORFOLD_RESERVED_FAMILIES: &[&str] = &["--capyctl-"];
+/// ADR 0023 §4: the native spelling of each typed TensorFold field.
+const TENSORFOLD_TYPED_OPTIONS: &[(&str, &str)] = &[
+    ("--kv-dtype", "kv_cache_dtype"),
+    ("--max-tokens", "tensorfold.max_tokens"),
+    ("--thinking", "tensorfold.thinking"),
+];
+/// ADR 0023 §3: sensitive TensorFold 0.6.0 options. `--snapshot-dir` is
+/// also reserved. `--drafter` is a path option exactly as SGLang's
+/// `--speculative-draft-model-path` (ADR 0014 §8, ruling 7): named approval,
+/// and a value inside `security.approved_paths`.
+const TENSORFOLD_SENSITIVE: &[(&str, Sensitivity)] = &[
+    ("--vision-urls", Sensitivity::ListenerOrEgress),
+    ("--lane-kernels", Sensitivity::Code),
+    (
+        "--snapshot-dir",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--drafter",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+];
+const TENSORFOLD_SHAPED: &[&str] = &[];
 
 /// Whole option families reserved for SGLang: every `ssl_*` field, the
 /// `modelopt_*_path` fields (quantization is out of scope, SPEC §1.2), and the
@@ -493,7 +561,8 @@ const VLLM_SHAPED: &[&str] = &[
 /// Ordinary options whose full name happens to be a prefix of a sensitive one
 /// (`--reasoning-parser` of `--reasoning-parser-plugin`). The parser resolves an
 /// exact name before any abbreviation, so these are what they say they are.
-const ORDINARY_EXACT: &[&str] = &["--reasoning-parser"];
+// ADR 0023 §3: TensorFold's --vision is a prefix of --vision-urls.
+const ORDINARY_EXACT: &[&str] = &["--reasoning-parser", "--vision"];
 
 const SAFE_ENV: &[&str] = &[
     "RUST_LOG",
@@ -607,6 +676,10 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
                     .map(|name| (*name).to_owned()),
             )
             .collect(),
+        Engine::Tensorfold => TENSORFOLD_RESERVED_FLAGS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
     }
 }
 
@@ -615,6 +688,7 @@ pub fn reserved_families(engine: Engine) -> &'static [&'static str] {
     match engine {
         Engine::Vllm => VLLM_RESERVED_FAMILIES,
         Engine::Sglang => SGLANG_RESERVED_FAMILIES,
+        Engine::Tensorfold => TENSORFOLD_RESERVED_FAMILIES,
     }
 }
 
@@ -622,6 +696,7 @@ fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] {
     match engine {
         Engine::Vllm => VLLM_TYPED_OPTIONS,
         Engine::Sglang => SGLANG_TYPED_OPTIONS,
+        Engine::Tensorfold => TENSORFOLD_TYPED_OPTIONS,
     }
 }
 
@@ -720,6 +795,7 @@ pub fn sensitivity(engine: Engine, name: &str) -> Option<Sensitivity> {
     let (explicit, shaped) = match engine {
         Engine::Vllm => (VLLM_SENSITIVE, VLLM_SHAPED),
         Engine::Sglang => (SGLANG_SENSITIVE, SGLANG_SHAPED),
+        Engine::Tensorfold => (TENSORFOLD_SENSITIVE, TENSORFOLD_SHAPED),
     };
     for candidate in candidate_names(name) {
         let abbreviation_ok = ORDINARY_EXACT.contains(&candidate.as_str());
@@ -791,7 +867,7 @@ pub fn parse_options(args: &[String]) -> Result<Vec<ParsedOption>, ProfileArgErr
 
 /// A path value inside `root`, compared lexically. Relative paths and any `.`
 /// or `..` component are refused so a value cannot climb out of an approval.
-fn path_within(value: &str, root: &Path) -> bool {
+pub(crate) fn path_within(value: &str, root: &Path) -> bool {
     let path = Path::new(value);
     path.is_absolute()
         && root.is_absolute()

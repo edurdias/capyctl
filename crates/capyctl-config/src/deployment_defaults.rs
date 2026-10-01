@@ -44,9 +44,6 @@ pub const DEFAULT_MODEL_REVISION: &str = "1";
 /// the host (ADR 0014 §7) and records it. A stated `sha256:<64 hex>` is an
 /// expectation the measurement must match.
 pub const MEASURED_FINGERPRINT: &str = "measured";
-/// The engine families an `engine:` value may name instead of a profile.
-const ENGINE_FAMILIES: &[&str] = &["vllm", "sglang"];
-
 fn invalid(path: &str, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
 }
@@ -232,16 +229,15 @@ fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
 
 /// The runtime profile `requested` names on the host document `host`: the
 /// profile of that name, else, when `requested` is an engine family (`vllm`,
-/// `sglang`), the one profile of that family the host publishes. `None` when
+/// `sglang`, `tensorfold`), the one profile of that family the host publishes. `None` when
 /// neither (or several profiles of the family) exist.
 pub fn profile_on_host(requested: &str, host: &Value) -> Option<String> {
     let profiles = host.get("runtime_profiles")?.as_object()?;
     if profiles.contains_key(requested) {
         return Some(requested.to_owned());
     }
-    if !ENGINE_FAMILIES.contains(&requested) {
-        return None;
-    }
+    // An `engine:` value may name an engine family instead of a profile.
+    crate::engine_policy::Engine::from_name(requested)?;
     let mut family = profiles
         .iter()
         .filter(|(_, profile)| profile["engine"].as_str() == Some(requested))
