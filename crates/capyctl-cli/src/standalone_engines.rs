@@ -48,6 +48,9 @@ pub struct EmbeddedHost {
     /// The models directory and model-source policy resolved at boot (owner
     /// decision 2026-09-25), stated in every document and installation.
     models: ModelSettings,
+    /// The role's configured engine port range, published with or without
+    /// an installation.
+    engine_ports: (u16, u16),
 }
 
 impl EmbeddedHost {
@@ -60,6 +63,7 @@ impl EmbeddedHost {
         inventory: Option<InventoryPublication>,
         shape: HostShape,
         models: ModelSettings,
+        engine_ports: (u16, u16),
     ) -> Arc<Self> {
         let named = with_models(named, &models);
         let mut document = crate::standalone_config::host_policy(
@@ -68,6 +72,7 @@ impl EmbeddedHost {
             capacity_bytes,
             inventory.as_ref(),
             &shape,
+            engine_ports,
         );
         models.write_into(&mut document);
         let installations = EmbeddedInstallations::new();
@@ -87,6 +92,7 @@ impl EmbeddedHost {
             inventory,
             shape,
             models,
+            engine_ports,
         })
     }
 
@@ -128,6 +134,7 @@ impl EmbeddedHost {
             self.capacity_bytes,
             self.inventory.as_ref(),
             &self.shape,
+            self.engine_ports,
         );
         self.models.write_into(&mut document);
         document

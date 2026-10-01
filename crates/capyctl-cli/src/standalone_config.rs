@@ -120,11 +120,12 @@ pub fn host_policy(
     capacity_bytes: i64,
     inventory: Option<&InventoryPublication>,
     shape: &HostShape,
+    engine_ports: (u16, u16),
 ) -> Value {
     // ADR 0018 §5: role-level fields (model store, ports, hardware
     // fingerprint) come from the first installation; every installation is
     // one profile. SPEC §8 (amended 2026-10-01): a role with none publishes no
-    // profile, and its default port range leases nothing.
+    // profile, and its configured port range leases nothing.
     let first = installations.first().map(|named| &named.installation);
     let profiles: serde_json::Map<String, Value> = installations
         .iter()
@@ -148,7 +149,7 @@ pub fn host_policy(
             capacity_bytes,
             inventory,
             shape,
-            first.map_or(capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS, |i| i.engine_ports),
+            first.map_or(engine_ports, |i| i.engine_ports),
         ),
     })
 }

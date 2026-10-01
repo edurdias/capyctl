@@ -1779,6 +1779,7 @@ async fn start_standalone_in(
             capacity_bytes,
             inventory.as_ref(),
             &gpu_shape,
+            role.engine_ports,
         );
         models.write_into(&mut host);
         // The host's own policy, normalized exactly as resolution normalizes
@@ -1844,6 +1845,7 @@ async fn start_standalone_in(
             gpu_shape.clone(),
             models.clone(),
         );
+        let engine_ports = role.engine_ports;
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
                 named,
@@ -1852,6 +1854,7 @@ async fn start_standalone_in(
                 inventory,
                 shape,
                 models,
+                engine_ports,
             )
         })
         .await

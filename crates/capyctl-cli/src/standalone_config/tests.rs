@@ -8,6 +8,8 @@ use capyctl_controller::{EngineInstallation, EngineProvider as _};
 use capyctl_domain::launch::{LaunchSettings, SettingSource};
 
 const CAPACITY: i64 = 128 * 1024 * 1024 * 1024;
+/// The engine port range a test role is configured with.
+const PORTS: (u16, u16) = capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS;
 
 /// The environment is process-wide, so the tests that read it take turns. Running
 /// them concurrently would let one test's exports decide another's result.
@@ -97,6 +99,7 @@ fn the_host_declares_exactly_one_engine_installation() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let profiles = host["runtime_profiles"]
         .as_object()
@@ -131,6 +134,7 @@ fn an_installation_cuda_home_is_published_only_when_named() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     assert_eq!(
         host["runtime_profiles"]["local-vllm"]["cuda_home"],
@@ -156,6 +160,7 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
             CAPACITY,
             None,
             &HostShape::NoGpu,
+            PORTS,
         );
         assert_eq!(
             host["runtime_profiles"][STANDALONE_PROFILE]["security"]["deep_park"],
@@ -177,6 +182,7 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
             CAPACITY,
             None,
             &HostShape::NoGpu,
+            PORTS,
         );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         assert_eq!(
@@ -202,6 +208,7 @@ fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
@@ -224,6 +231,7 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             CAPACITY,
             None,
             &HostShape::NoGpu,
+            PORTS,
         );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         match policy {
@@ -262,6 +270,7 @@ fn the_published_host_names_the_store_its_weights_live_under() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     assert_eq!(host["model_store"]["path"], "/data/checkpoints");
 }
@@ -277,6 +286,7 @@ fn limits_scale_with_observed_capacity() {
         16 << 30,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let large = host_policy(
         &named(&installation),
@@ -284,6 +294,7 @@ fn limits_scale_with_observed_capacity() {
         128 << 30,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let managed = |h: &Value| {
         h["resource_policy"]["domains"][DOMAIN]["managed_limit"]
@@ -311,6 +322,7 @@ fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let bytes = |field: &str| {
         host["resource_policy"]["domains"][DOMAIN][field]
@@ -473,6 +485,7 @@ fn the_published_host_declares_one_memory_pool() {
         1 << 40,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     assert_eq!(
         host["resource_policy"]["domains"]["unified"]["memory"],
@@ -496,6 +509,7 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let deployment = deployment_document(
         "m",
@@ -534,6 +548,7 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let deployment = deployment_document(
         "m",
@@ -697,6 +712,7 @@ fn host_policy_from_env_is_complete() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     // ADR 0014 §1: the published profile carries no engine tuning.
     assert!(host["runtime_profiles"][STANDALONE_PROFILE]
@@ -895,6 +911,7 @@ fn the_engine_port_range_can_be_named_for_one_run() {
             CAPACITY,
             None,
             &HostShape::NoGpu,
+            PORTS,
         );
         let range = &host["resource_policy"]["endpoint_port_range"];
         assert_eq!(
@@ -1002,6 +1019,7 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
         CAPACITY,
         None,
         &HostShape::NoGpu,
+        PORTS,
     );
     let mut deployment = deployment_document(
         "m",
@@ -1284,7 +1302,7 @@ fn rtx(index: u32, total_mib: i64, used_mib: i64) -> GpuDevice {
 #[test]
 fn a_discrete_standalone_host_has_system_and_device_domains() {
     let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
-    let doc = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let doc = host_policy(&installations(), "env", 61 * GIB, None, &shape, PORTS);
     let domains = &doc["resource_policy"]["domains"];
     assert!(domains.get("unified").is_none());
     assert_eq!(domains["system"]["memory"], "distinct");
@@ -1313,12 +1331,20 @@ fn a_unified_standalone_host_is_unchanged() {
         128 * GIB,
         None,
         &HostShape::Unified,
+        PORTS,
     );
     assert_eq!(
         serde_json::to_string_pretty(&doc).unwrap(),
         before.trim_end()
     );
-    let no_gpu = host_policy(&installations(), "env", 128 * GIB, None, &HostShape::NoGpu);
+    let no_gpu = host_policy(
+        &installations(),
+        "env",
+        128 * GIB,
+        None,
+        &HostShape::NoGpu,
+        PORTS,
+    );
     assert_eq!(no_gpu, doc);
 }
 
@@ -1326,7 +1352,7 @@ fn a_unified_standalone_host_is_unchanged() {
 #[test]
 fn two_gpus_publish_two_device_domains() {
     let shape = HostShape::Discrete(vec![rtx(0, 24576, 0), rtx(1, 32768, 0)]);
-    let doc = host_policy(&installations(), "env", 64 * GIB, None, &shape);
+    let doc = host_policy(&installations(), "env", 64 * GIB, None, &shape, PORTS);
     assert_eq!(doc["resource_policy"]["devices"]["gpu1"]["domain"], "gpu1");
     assert_eq!(doc["resource_policy"]["domains"]["gpu1"]["device"], "gpu1");
     capyctl_config::effective::normalize_host_policy(&doc).expect("a valid two-GPU host policy");
@@ -1481,7 +1507,7 @@ fn the_unified_template_is_unchanged() {
 #[test]
 fn the_discrete_template_resolves_and_fits_the_card() {
     let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
-    let host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let host = host_policy(&installations(), "env", 61 * GIB, None, &shape, PORTS);
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     let limits = device_limits(&gpu, MAX_PARKED);
     let system_parked = 61 * GIB / 100 * PARKED_FRACTION;
@@ -1556,7 +1582,7 @@ fn hugging_face() -> ModelSource {
 /// Hugging Face sources (ADR 0008).
 fn discrete_host_allowing_sources(engine: Engine) -> serde_json::Value {
     let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
-    let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape, PORTS);
     host["runtime_profiles"]["local"]["engine"] = engine.name().into();
     host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
     host["model_sources"] = serde_json::json!({"huggingface": "allowed", "max_bytes": "100GiB"});
@@ -1914,4 +1940,24 @@ fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
     // vLLM is still told the request, not the charge: the overhead is what it
     // holds beyond the fraction capyctl renders.
     assert_eq!(effective.engine_config.memory().request_bytes, request);
+}
+
+/// SPEC §8 (amended 2026-10-01): a role with no engine still publishes the
+/// engine port range it was configured with, so status shows the real range
+/// before a profile is added.
+#[test]
+fn a_role_with_no_engine_publishes_its_configured_port_range() {
+    let host = host_policy(
+        &[],
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+        (20400, 20409),
+    );
+    let range = &host["resource_policy"]["endpoint_port_range"];
+    assert_eq!(
+        (range["start"].as_u64(), range["end"].as_u64()),
+        (Some(20400), Some(20409))
+    );
 }
