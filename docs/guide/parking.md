@@ -88,7 +88,9 @@ CapyCTL waits for requests in progress to finish before it parks a model; it
 never cuts an answer off. When a client hangs up in the middle of an answer,
 CapyCTL stops the engine's work on it instead of letting it run to the end,
 and waits until the engine reports no running or waiting requests before it
-parks or switches. When there is no room to keep a parked copy, CapyCTL
+parks or switches. Two more cases end a streamed answer the same way: a client
+that reads nothing for 10 seconds, and a single piece of the answer larger
+than 64 KiB. When there is no room to keep a parked copy, CapyCTL
 stops the idle model instead and says so:
 `released: stopped (no room to park)`.
 

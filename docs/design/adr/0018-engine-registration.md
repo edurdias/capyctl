@@ -213,7 +213,7 @@ reload carries the start-time settings over (§3): they change on restart only.
 
 A host or standalone role starts with no profile and publishes an empty profile list. It
 keeps its existing deployments and places none until a profile is published. Its start
-banner and `capyctl status` say to run `capyctl engine add <path>`.
+banner and `capyctl status deployment <name>` say to run `capyctl engine add <path>`.
 
 `engine remove` may remove the last registered profile. It retires the profile through §4:
 deployments using it drain and stop first. The `agent_unreachable` rule of §4 stands, so

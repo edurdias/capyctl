@@ -18,7 +18,10 @@ unchecked in this release.
 - A client that hangs up in the middle of a streamed answer now stops the
   engine's work on it, for vLLM, SGLang and TensorFold. CapyCTL keeps the
   request counted until the engine reports nothing running or waiting, so a
-  park or a switch that follows no longer waits for the whole answer.
+  park or a switch that follows no longer waits for the whole answer. A
+  client that reads nothing for 10 seconds, and a single piece of an answer
+  larger than 64 KiB, now end the answer the same way; before, the engine ran
+  the answer to its end.
 - A model named by its Hugging Face cache directory (`snapshots/<rev>`) is
   measured even when its files link twice, as recent `huggingface_hub`
   versions store them. A checkpoint that cannot be measured now says why,
