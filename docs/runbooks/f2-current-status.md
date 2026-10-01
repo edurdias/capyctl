@@ -1,6 +1,6 @@
 # Current implementation and launch status
 
-## Formal review in Lean 4 — 2026-10-01 (branch `claude/formal-review-lean`)
+## Formal review in Lean 4 — 2026-10-01
 
 The resource and dispatch logic now has machine-checked models in `formal/`
 (Lean 4.34.1, core library only, no `sorry`), built by a new `formal` CI job.
