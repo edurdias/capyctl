@@ -323,7 +323,8 @@ impl StandaloneControl {
         .unwrap_or_else(|_| refused("internal", "reloading the engines failed"))
     }
 
-    /// engines.yaml without `profile`, checked to still publish something.
+    /// engines.yaml without `profile`, checked to still resolve. An empty
+    /// result is a valid publication (SPEC §8, amended 2026-10-01).
     async fn without(&self, profile: &str) -> Result<(), Value> {
         let (engines, provider, name) = (
             self.engines.clone(),
@@ -381,7 +382,7 @@ impl StandaloneControl {
                 format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or host.local_engine); unset it and restart the role"),
             );
         }
-        // The role keeps at least one engine: refused before anything is retired.
+        // What remains must still publish: refused before anything is retired.
         if let Err(reply) = self.without(profile).await {
             return reply;
         }
