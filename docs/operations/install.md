@@ -748,8 +748,11 @@ use (owner-only, mode 0700) if it does not exist yet, writes `engines.yaml`, and
 exits 0 with `published: role_not_running` and the line `saved to
 <engines.yaml> (revision N); start capyctl (…) to use it`: no role is running (no
 control socket, or a stale one nobody listens on), so the profile takes effect
-at the role's first start. Only a role that is running but does not take or
-answer the request exits 22 (`agent_unreachable`).
+at the role's first start. A second line names the control socket it tried.
+A role started with another `--state-dir` or `--config` listens on another
+socket, so it looks absent: restart it to publish the profile, and pass the
+same option to `capyctl engine` from then on. Only a role that is running but
+does not take or answer the request exits 22 (`agent_unreachable`).
 
 `--config` and `$CAPYCTL_CONFIG` may be relative: every command and role resolves
 them against its working directory first, so `capyctl engine add … --config

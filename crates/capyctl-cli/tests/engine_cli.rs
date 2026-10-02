@@ -210,6 +210,15 @@ async fn add_without_a_running_role_saves_and_succeeds() {
         notice.contains("revision 1") && notice.contains("capyctl start host"),
         "{notice}"
     );
+    // Release live check 0.1.1: a role running with another state directory
+    // is not found here; the notice names the socket it looked for and how to
+    // point at the running role.
+    assert!(
+        notice.contains(&format!("{}", dir.path().join("s/control.sock").display()))
+            && notice.contains("--state-dir")
+            && notice.contains("restart it"),
+        "{notice}"
+    );
     assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 

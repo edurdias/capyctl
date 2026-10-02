@@ -422,13 +422,20 @@ async fn add(
         // ADR 0018 §3.
         Err(ClientError::NotRunning(_)) => {
             out["published"] = json!("role_not_running");
+            // Release live check 0.1.1: a role started with another
+            // --state-dir or --config listens on another socket, so it looks
+            // absent here. Say which socket was tried and how to reach it.
             out["notice"] = json!(format!(
-                "saved to {} (revision {revision}); start capyctl (`{}`) to use it",
+                "saved to {} (revision {revision}); start capyctl (`{}`) to use it\n\
+                 no capyctl answered on {}; if it is already running with another \
+                 --state-dir or --config, restart it to publish this profile, and pass \
+                 the same option to `capyctl engine`",
                 target.engines.display(),
                 match target.kind {
                     RoleKind::Standalone => "capyctl start standalone",
                     RoleKind::Host => "capyctl start host",
-                }
+                },
+                target.socket.display()
             ));
             Ok(out)
         }

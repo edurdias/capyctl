@@ -38,6 +38,7 @@ Registered vllm (vllm 0.29.0)
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
   Published      when capyctl starts
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
+no capyctl answered on /home/me/.local/state/capyctl/control.sock; if it is already running with another --state-dir or --config, restart it to publish this profile, and pass the same option to `capyctl engine`
 ```
 
 The profile is named after the engine: `vllm` or `sglang`. CapyCTL runs the
@@ -107,6 +108,7 @@ Registered tensorfold (tensorfold 0.6.0)
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
   Published      when capyctl starts
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
+no capyctl answered on /home/me/.local/state/capyctl/control.sock; if it is already running with another --state-dir or --config, restart it to publish this profile, and pass the same option to `capyctl engine`
 ```
 
 TensorFold has no way to free its memory while it runs, so a TensorFold model
