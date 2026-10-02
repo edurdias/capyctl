@@ -6,6 +6,7 @@ export const PAGES = [
   { source: 'docs/guide/install.md', slug: 'docs/install' },
   { source: 'docs/guide/one-machine.md', slug: 'docs/one-machine' },
   { source: 'docs/guide/several-machines.md', slug: 'docs/several-machines' },
+  { source: 'docs/guide/install-engines.md', slug: 'docs/install-engines' },
   { source: 'docs/guide/engines.md', slug: 'docs/engines' },
   { source: 'docs/guide/deploy.md', slug: 'docs/deploy' },
   { source: 'docs/guide/requests.md', slug: 'docs/requests' },

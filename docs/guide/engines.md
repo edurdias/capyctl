@@ -1,6 +1,7 @@
 # Add an engine
 
 CapyCTL runs the vLLM, SGLang or TensorFold you already have. It does not install engines.
+To install one first, see [Install an engine](install-engines.md).
 You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
 

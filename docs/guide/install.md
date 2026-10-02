@@ -22,7 +22,8 @@ release's checksums. Make sure `~/.local/bin` is on your `PATH`, then check:
 capyctl --version
 ```
 
-Next: [Run on one machine](one-machine.md).
+Next: if you have no engine yet, [Install an engine](install-engines.md);
+then [Run on one machine](one-machine.md).
 
 ## Upgrade
 

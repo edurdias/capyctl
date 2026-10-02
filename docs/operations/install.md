@@ -163,7 +163,8 @@ probes) are compiled into `bin/capyctl` with a manifest of their SHA-256 digests
 them to its own state directory; see "The managed runtime directory".
 
 Engines, engine Python environments, model weights and GPU drivers are not in
-the release and are never installed by it.
+the release and are never installed by it. To install an engine yourself, see
+[Install an engine](../guide/install-engines.md).
 
 ### Building a release
 
