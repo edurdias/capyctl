@@ -173,7 +173,7 @@ fn detection_finds_the_documented_locations_and_runs_nothing() {
     script(&dot.join("bin/python3"), &run_marker);
     let conda = fake_env(&home.join("miniconda3/envs/sg"), &[("sglang", "0.5.21")]);
     script(&conda.join("bin/python3"), &run_marker);
-    let listed = fake_env(&dir.path().join("elsewhere/env"), &[("vllm", "0.30.0")]);
+    let listed = fake_env(&dir.path().join("elsewhere/env"), &[("vllm", "0.30.1")]);
     script(&listed.join("bin/vllm"), &run_marker);
     std::fs::create_dir_all(home.join(".conda")).unwrap();
     std::fs::write(
@@ -204,7 +204,7 @@ fn detection_finds_the_documented_locations_and_runs_nothing() {
         .filter(|c| c.custom)
         .map(|c| c.version.clone())
         .collect();
-    assert!(custom.contains(&"0.5.21".to_string()) && custom.contains(&"0.30.0".to_string()));
+    assert!(custom.contains(&"0.5.21".to_string()) && custom.contains(&"0.30.1".to_string()));
     assert!(!marker.exists(), "detection executed an installation");
 }
 

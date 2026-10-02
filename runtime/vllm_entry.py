@@ -34,10 +34,10 @@ MARKER = "--capyctl-user-args"
 # gate exactly the destinations they set, as vLLM's parser resolved them.
 EXTRA_MARKER = "--capyctl-extra-args"
 
-# ADR 0014 §3: vLLM 0.29.0 parser destinations capyctl owns. Names were read from
+# ADR 0014 §3: vLLM 0.29.0 and 0.30.0 parser destinations capyctl owns. Names were read from
 # the installed build (vllm/engine/arg_utils.py, vllm/entrypoints/launchers/
 # cli_args.py). `--device`, `--swap-space` and `--disable-log-requests` no
-# longer exist in 0.29.0; the parser itself refuses them as unknown.
+# longer exist in 0.29.0 or 0.30.0; the parser itself refuses them as unknown.
 RESERVED = (
     "model_tag", "model", "host", "port", "uds", "root_path", "api_key", "middleware",
     "served_model_name", "tensor_parallel_size", "pipeline_parallel_size",
@@ -50,7 +50,9 @@ RESERVED = (
 # SPEC §8.2 / T21: multi-node rendezvous (0.26+ `ParallelConfig`). Compared
 # whenever the installed parser defines them; unlike RESERVED, a build without
 # them is not drift, since no argument can then reach them.
-RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port")
+# vLLM 0.30 scale-out (extra serving routes) is reserved the same way.
+RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
+                       "enable_scale_out")
 # ADR 0014 §2: destinations the typed fields render (engine_policy.rs
 # VLLM_TYPED_OPTIONS); an extra argument may not restate or reverse them.
 TYPED = ("dtype", "quantization", "kv_cache_dtype", "max_model_len", "max_num_seqs",
@@ -246,7 +248,7 @@ def check_plugins(entry_points=None):
 
 
 class InstalledVllm:
-    """The installed build's own `vllm serve` parser and server (0.29.0).
+    """The installed build's own `vllm serve` parser and server (0.29.0, 0.30.0).
 
     Mirrors vllm/entrypoints/cli/main.py for the serve subcommand only:
     environment setup, a FlexibleArgumentParser with the serve subparser,

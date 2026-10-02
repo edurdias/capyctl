@@ -188,7 +188,8 @@ pub fn parse_engine_load(text: &str) -> Option<EngineLoad> {
 /// SPEC §17 (owner decision 2026-09-23, M80): the engine latency histograms a
 /// host forwards, as `(reported series, engine metric)`. Pinned to the
 /// installed engine sources, read on host-a on 2026-09-23:
-/// vLLM 0.29.0 `vllm/v1/metrics/loggers.py` (labels `model_name`, `engine`).
+/// vLLM 0.29.0 `vllm/v1/metrics/loggers.py` (labels `model_name`, `engine`);
+/// the names are unchanged in 0.30.0.
 const VLLM_HISTOGRAMS: &[(&str, &str)] = &[
     (
         "engine_time_to_first_token",

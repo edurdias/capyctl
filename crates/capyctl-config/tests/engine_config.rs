@@ -428,6 +428,12 @@ fn sensitive_shapes_and_abbreviations_need_approval() {
         ("vllm", json!(["--future-peer-ip", "10.0.0.1"])),
         ("vllm", json!(["--numa-bind"])),
         ("vllm", json!(["--kv-events", "{}"])),
+        // vLLM 0.30.0: watermarking and Engram JSON configurations, and
+        // abbreviations of them.
+        ("vllm", json!(["--watermark-config", "{}"])),
+        ("vllm", json!(["--watermark", "{}"])),
+        ("vllm", json!(["--engram-config", "{}"])),
+        ("vllm", json!(["--engram", "{}"])),
         // Code loading: a class, a plugin or a loader, and abbreviations.
         ("vllm", json!(["--scheduler-cls", "pkg.Scheduler"])),
         ("vllm", json!(["--scheduler-c", "pkg.Scheduler"])),
@@ -447,6 +453,10 @@ fn sensitive_shapes_and_abbreviations_need_approval() {
         json!(["--node-rank", "1"]),
         json!(["--grpc"]),
         json!(["--enable-ssl-refresh"]),
+        // vLLM 0.30.0: scale-out registers extra serving routes.
+        json!(["--enable-scale-out"]),
+        json!(["--enable-scale"]),
+        json!(["--no-enable-scale-out"]),
     ] {
         let text = extra_args_error("vllm", args.clone());
         assert!(text.contains("reserved"), "{args}: {text}");

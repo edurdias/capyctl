@@ -91,6 +91,9 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     "--node-rank",
     "--master-addr",
     "--master-port",
+    // SPEC §8.2 / T21: vLLM 0.30 scale-out registers extra serving routes
+    // (`/render`, `/derender`, `/inference/v1/generate`); capyctl never enables it.
+    "--enable-scale-out",
 ];
 
 /// Whole option families reserved for vLLM: any option whose name starts here.
@@ -535,6 +538,7 @@ const VLLM_SHAPED: &[&str] = &[
     "--diffusion-config",
     "--download-dir",
     "--ec-transfer-config",
+    "--engram-config",
     "--eplb-config",
     "--generation-config",
     "--hf-config-path",
@@ -555,6 +559,7 @@ const VLLM_SHAPED: &[&str] = &[
     "--reasoning-config",
     "--speculative-config",
     "--structured-outputs-config",
+    "--watermark-config",
     "--weight-transfer-config",
 ];
 

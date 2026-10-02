@@ -55,7 +55,7 @@ use it.
 
 ## Custom builds
 
-`CUSTOM yes` means a version other than vLLM 0.29.0, SGLang 0.5.20 or
+`CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 or
 TensorFold 0.6.0 and 0.6.1, the versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 

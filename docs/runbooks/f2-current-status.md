@@ -1,5 +1,33 @@
 # Current implementation and launch status
 
+## vLLM 0.30.0 verified — 2026-10-02 (branch `feat/vllm-0.30`)
+
+vLLM 0.30.0 joins 0.29.0 in the verified set (ADR 0018), so `engine add`
+shows it `custom no`; 0.30.1 and later stay custom. The upgrade renames or
+removes nothing CapyCTL drives: the development routes, the
+`VLLM_SERVER_DEV_MODE` switch, every reserved and typed destination and the
+metric names are unchanged. New options are covered: `--enable-scale-out`
+(registers `/render`, `/derender` and `/inference/v1/generate`) is reserved
+on both sides of the launch, compared whenever the installed parser has it;
+`--watermark-config` and `--engram-config` need named host approval like
+every other `*-config` option; `--load-format ipc_cache` already needs
+approval, as any `--load-format` does. The removed environment variables
+(`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`, `VLLM_MM_HASHER_ALGORITHM`,
+`VLLM_NIXL_EP_MAX_NUM_RANKS`) were never set or documented by CapyCTL.
+
+Live on host B (standalone from this branch, fresh 0700 state and config
+directories, a new `~/vllm-0.30-venv` with vLLM 0.30.0 and torch 2.13.0
+cu130, owner-approved): `engine add` registered `vllm 0.30.0`, custom no,
+deep park enabled. Qwen3-4B (`docs/examples/deployment-vllm.yaml`, checkpoint
+already downloaded) was ready in 109 s and answered with Jupiter. Park was a
+level-2 sleep (11.9 GiB freed, none backed up in CPU), parked in about 2 s;
+MemAvailable went 116.7 GiB idle, 100.5 GiB ready, 112.8 GiB parked. A
+request woke it (`wake_up` weights, `collective_rpc` `reload_weights` in
+7.3 s, `wake_up` kv_cache) and answered in 9.2 s end to end. A stream hung up
+after 2 s and a park right after it settled `parked` in 0.6 s. Deployment
+deleted, profile removed, drained shutdown, state removed, no CapyCTL,
+engine or GPU process left. No CapyCTL bug found.
+
 ## First model on each engine — 2026-10-02 (branch `docs/engine-examples`)
 
 `docs/examples/deployment-{vllm,sglang,tensorfold}.yaml` and the "First model
