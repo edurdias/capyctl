@@ -215,7 +215,7 @@ actual="$work/actual"
   printf '%s\n' bin/capyctl BUILDINFO SHA256SUMS
   git ls-files -- LICENSE packaging/systemd docs/examples docs/operations/install.md \
     docs/operations/configuration.md docs/operations/network-access.md \
-    docs/operations/release-notes-0.1.0.md
+    docs/operations/release-notes-0.1.0.md docs/operations/release-notes-0.1.1.md
 } >"$work/files"
 # Every file plus each of its parent directories, under the package directory.
 {

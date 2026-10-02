@@ -146,7 +146,7 @@ copy_tracked() {
 # I12); scripts/verify-packaging.sh checks every relative link resolves.
 copy_tracked 0644 LICENSE packaging/systemd docs/examples docs/operations/install.md \
   docs/operations/configuration.md docs/operations/network-access.md \
-  docs/operations/release-notes-0.1.0.md
+  docs/operations/release-notes-0.1.0.md docs/operations/release-notes-0.1.1.md
 
 if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l \) -print -quit | grep -q .; then
   echo "staged tree contains bytecode or symlinks" >&2

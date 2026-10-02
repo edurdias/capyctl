@@ -4,7 +4,7 @@ Rust controller for managing inference-engine deployments on hardware that canno
 keep all model weights resident. The primary audience is home users and prosumers
 running models on GPU machines they own.
 
-Current phase: 0.1.0 on `main` (two-host, single-rank vLLM and SGLang; TP2 is
+Current phase: 0.1.1 on `main` (two-host, single-rank vLLM and SGLang; TP2 is
 parked). Releases are published as GitHub releases; release candidates as
 pre-releases.
 
