@@ -13,7 +13,13 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     let (engine_config, resources_derived, facts) =
         declared_engine_config(&value["engine_config"])?;
     let (deployment, host) = snapshot_inputs(&value, engine_config, resources_derived)?;
-    let effective = resolve_effective_with_checkpoint(&deployment, &host, facts)?;
+    let mut effective = resolve_effective_with_checkpoint(&deployment, &host, facts)?;
+    // ADR 0014 amendment A7 (2026-10-02): a vLLM or SGLang revision frozen
+    // before the first-start allowance keeps the derived Initialize window it
+    // was frozen with, the load term alone; any other claimed value is refused.
+    if let Some(frozen) = frozen_load_term_initialize(&effective, &value) {
+        effective.timeouts.initialize_ms = frozen;
+    }
     let mut encoded =
         serde_json::to_value(&effective).map_err(|_| invalid("snapshot", "encoding failed"))?;
     // ADR 0014 amendment A1: a revision frozen before `timeouts` existed has
@@ -31,6 +37,24 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
         ));
     }
     Ok(effective)
+}
+
+/// The Initialize window a snapshot claims, when it is the one derived before
+/// the first-start allowance existed: derived, for vLLM or SGLang, from known
+/// weights, and equal to the load term lowered to the request deadline.
+fn frozen_load_term_initialize(effective: &EffectiveDeployment, value: &Value) -> Option<i64> {
+    let claimed = value["timeouts"]["initialize_ms"].as_i64()?;
+    let weights = effective
+        .engine_config
+        .memory()
+        .weights_bytes
+        .filter(|bytes| *bytes > 0)?;
+    let load_term = derived_initialize_ms(Some(weights)).min(effective.request_deadline_ms);
+    (matches!(effective.profile.engine, Engine::Vllm | Engine::Sglang)
+        && effective.timeouts.provenance.get("initialize") == Some(&TimeoutSource::Derived)
+        && claimed == load_term
+        && claimed != effective.timeouts.initialize_ms)
+        .then_some(claimed)
 }
 
 /// Rebuild the deployment and host documents a normalized snapshot was resolved
