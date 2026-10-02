@@ -227,7 +227,9 @@ A request for a stopped deployment is refused; it does not start it:
 {"code":"deployment_stopped","message":"deployment 01M3R7A6YJW402N962HH17A66W was stopped by an operator; inference does not start it; start it with `capyctl start deployment 01M3R7A6YJW402N962HH17A66W`"}
 ```
 
-Deleting never touches the model files.
+A plain `delete deployment` right after `stop` is refused the same way
+(`delete_requires_cleanup`) until the stop finishes; `delete deployment --stop`
+waits for it. Deleting never touches the model files.
 
 To change a deployment, edit the file and deploy it again with its current
 revision, the `REVISION` column of `capyctl list deployments`:

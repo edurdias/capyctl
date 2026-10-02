@@ -259,6 +259,13 @@ sudo install -m 0755 capyctl-$V-linux-$A/bin/capyctl /usr/local/bin/capyctl
 | `/var/lib/capyctl/host/runtime/` | `capyctl:capyctl`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/capyctl/standalone/runtime/`). Written by CapyCTL. |
 | model store (`/srv/models`) | readable by `capyctl` | Checkpoints. Read-only to the host unit by default. |
 
+The state directory and every directory above it must be owned by root or the
+user the role runs as, and must not be group- or world-writable. A role refuses
+any other location with `unsafe controller lock path`, by design: another user
+who can write there could replace the lock. That rules out `/tmp`; for a test
+run, use a directory under your home, such as `mkdir -m 700 ~/capyctl-test` with
+`--state-dir ~/capyctl-test/state`.
+
 ### The managed runtime directory
 
 The engine imports CapyCTL's own Python from the runtime directory, so a module
@@ -653,7 +660,7 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
@@ -748,8 +755,11 @@ use (owner-only, mode 0700) if it does not exist yet, writes `engines.yaml`, and
 exits 0 with `published: role_not_running` and the line `saved to
 <engines.yaml> (revision N); start capyctl (…) to use it`: no role is running (no
 control socket, or a stale one nobody listens on), so the profile takes effect
-at the role's first start. Only a role that is running but does not take or
-answer the request exits 22 (`agent_unreachable`).
+at the role's first start. A second line names the control socket it tried.
+A role started with another `--state-dir` or `--config` listens on another
+socket, so it looks absent: restart it to publish the profile, and pass the
+same option to `capyctl engine` from then on. Only a role that is running but
+does not take or answer the request exits 22 (`agent_unreachable`).
 
 `--config` and `$CAPYCTL_CONFIG` may be relative: every command and role resolves
 them against its working directory first, so `capyctl engine add … --config

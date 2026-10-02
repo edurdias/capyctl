@@ -1,5 +1,20 @@
 # Current implementation and launch status
 
+## 0.1.1 published — 2026-10-02
+
+0.1.1 is published; tag `v0.1.1` is at the #19 merge (`bf13c72`). The
+Release build workflow built both architectures, and the strict privacy scan
+passed on both with no skips. The live check on host B ran from the release
+artifacts: TensorFold 0.6.1, Nemotron ready in about 97 s, and a chat request
+answered. A fresh-user curl install worked.
+
+Follow-ups from that check are on `fix/post-0.1.1`: `engine add` names the
+control socket it tried when no role answers (a role started with another
+`--state-dir` looked absent, so the profile stayed unpublished until a
+restart); the install guide says the state directory and its ancestors must
+not be group- or world-writable; a refused delete says a stop may still be in
+progress.
+
 ## 0.1.1 release preparation — 2026-10-01
 
 Version bumped to 0.1.1 with release notes in

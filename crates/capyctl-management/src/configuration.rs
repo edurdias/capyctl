@@ -236,7 +236,7 @@ impl ConfigurationFailure {
             DeleteRequiresCleanup => (
                 StatusCode::CONFLICT,
                 "delete_requires_cleanup",
-                "The deployment still holds a runtime, reservation, lease or unresolved step on some instance; stop the deployment (or use delete deployment --stop) and retry the delete after the stop completes with verified cleanup",
+                "The deployment still holds a runtime, reservation, lease or unresolved step on some instance; stop the deployment (or use delete deployment --stop) and retry the delete after the stop completes with verified cleanup; a stop already sent may still be in progress, so wait for it (`capyctl status deployment <name>` shows when it is stopped)",
                 false,
             ),
             ReconciliationRequired => (

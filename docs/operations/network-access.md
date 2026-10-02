@@ -153,8 +153,9 @@ Open only port 443 to the internet, never 8443.
   a machine remotely with `ssh` and the local `capyctl` commands, which use the
   role running there. A server's
   bootstrap and control listeners keep mutual TLS for enrolled hosts.
-- **Engines.** vLLM and SGLang listen on loopback ports only, each with a key
-  generated for that launch and checked by CapyCTL's guard. The router
+- **Engines.** Every engine listens on loopback ports only. vLLM and SGLang
+  each get a key generated for that launch and checked by CapyCTL's guard;
+  TensorFold has no key. The router
   is the only path from the network to an engine, and it forwards only the
   allowlisted inference routes.
 
