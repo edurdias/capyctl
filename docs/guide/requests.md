@@ -119,7 +119,7 @@ endpoint and its API key to `$KEY`.
 
 A request for a parked model waits while CapyCTL wakes it, then answers. It
 takes longer than usual; nothing else changes for the client. See
-[Parking and switching](parking.md).
+[How requests wait and models switch](parking.md#how-requests-wait-and-models-switch).
 
 ## The first request after a new engine install
 

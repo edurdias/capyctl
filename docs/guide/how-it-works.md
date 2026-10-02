@@ -55,6 +55,8 @@ idle model that is in the way, wakes the one asked for, and then answers. It
 waits for requests in progress to finish before it parks anything. If a
 parked copy would not fit in host RAM, CapyCTL stops that model instead and says
 so.
+[How requests wait and models switch](parking.md#how-requests-wait-and-models-switch)
+gives the order of events, the settings and the errors.
 
 ## The memory ledger
 

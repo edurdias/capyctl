@@ -22,6 +22,8 @@ Tasks:
 - [Make a request](requests.md): curl, streaming, the Python client, other
   machines.
 - [Parking and switching](parking.md): more models than your GPU holds.
+- [How requests wait and models switch](parking.md#how-requests-wait-and-models-switch):
+  two apps, two models, one GPU.
 
 Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [settings](../operations/configuration.md),
