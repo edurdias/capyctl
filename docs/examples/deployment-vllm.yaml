@@ -1,0 +1,8 @@
+# Qwen3-4B on vLLM 0.29 on one machine (docs/guide/engines.md, "First model on
+# each engine"): `capyctl deploy model --file deployment-vllm.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-vllm.yaml`.
+name: qwen3-4b-vllm
+# The profile `capyctl engine add ~/venvs/vllm` registered.
+engine: vllm
+# Downloaded into <models>/sources on first deploy, pinned to this commit.
+model: {hf: Qwen/Qwen3-4B@1cfa9a7208912126459214e8b04321603b3df60c}

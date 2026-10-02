@@ -437,9 +437,11 @@ fn every_documented_example_passes_validate_config() {
         // The quickstart's standalone deployment names standalone's `local`
         // engine, which host.yaml does not publish; `site_quickstart.rs`
         // places it on a fresh standalone instead.
-        let standalone = file
-            .file_name()
-            .is_some_and(|n| n == "deployment-standalone.yaml");
+        // The TensorFold example names the `tensorfold` profile, which
+        // host.yaml does not declare either; it is checked on its own.
+        let standalone = file.file_name().is_some_and(|n| {
+            n == "deployment-standalone.yaml" || n == "deployment-tensorfold.yaml"
+        });
         if kind == "deployment" && !standalone {
             let host = examples().join("host.yaml");
             let (code, value, raw) = validate(&[
@@ -476,6 +478,14 @@ fn every_documented_example_passes_validate_config() {
         minimal,
         "docs/examples/deployment-minimal.yaml is validated"
     );
+    // The per-engine examples of docs/guide/engines.md are among them.
+    for engine in ["vllm", "sglang", "tensorfold"] {
+        let name = format!("deployment-{engine}.yaml");
+        assert!(
+            files.iter().any(|f| f.ends_with(&name)),
+            "docs/examples/{name} is validated"
+        );
+    }
 }
 
 // T03 T26 (ADR 0019): the discrete-GPU host example validates, and the

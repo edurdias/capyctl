@@ -116,6 +116,7 @@ That's it: one model behind an OpenAI-compatible endpoint.
 
 ## See also
 
+- [First model on each engine](engines.md#first-model-on-each-engine): vLLM, SGLang and TensorFold, with their deployment files.
 - [Make a request](requests.md): streaming, the Python client, other machines.
 - [Parking and switching](parking.md): more models than your GPU holds.
 - [Run on several machines](several-machines.md).

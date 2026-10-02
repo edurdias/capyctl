@@ -1,0 +1,8 @@
+# Qwen3-4B on SGLang 0.5.20 on one machine (docs/guide/engines.md, "First model
+# on each engine"): `capyctl deploy model --file deployment-sglang.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-sglang.yaml`.
+name: qwen3-4b-sglang
+# The profile `capyctl engine add ~/venvs/sglang` registered.
+engine: sglang
+# Downloaded into <models>/sources on first deploy, pinned to this commit.
+model: {hf: Qwen/Qwen3-4B@1cfa9a7208912126459214e8b04321603b3df60c}
