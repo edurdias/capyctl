@@ -522,7 +522,7 @@ warm, is shorter; the longer window only delays noticing an engine that is alive
 stuck, never one that exited. A revision frozen before this amendment keeps the
 window it was frozen with (it still decodes exactly).
 
-## Amendment A8: the startup placeholder covers graphs and the load transient (2026-10-02)
+## Amendment A8: the startup placeholder covers graphs and the load transient (owner decision 2026-10-02)
 
 Problem: found live on 2026-10-02. A first start must never exceed what CapyCTL
 reserved, and two placeholders did, both for Qwen3.8-27B NVFP4 on vLLM 0.30.
@@ -557,6 +557,8 @@ Rule:
 - As before, the first measured peak replaces the placeholder for later starts of the
   revision on that host and installation.
 - Both terms are placeholders, not measurements.
+- Owner decision 2026-10-02: new revisions use the 2.25 factor; revisions frozen
+  before this amendment keep 1.6.
 
 ## Amendment A9: the fitted context counts the draft model's KV (2026-10-02)
 
