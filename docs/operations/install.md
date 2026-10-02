@@ -259,6 +259,13 @@ sudo install -m 0755 capyctl-$V-linux-$A/bin/capyctl /usr/local/bin/capyctl
 | `/var/lib/capyctl/host/runtime/` | `capyctl:capyctl`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/capyctl/standalone/runtime/`). Written by CapyCTL. |
 | model store (`/srv/models`) | readable by `capyctl` | Checkpoints. Read-only to the host unit by default. |
 
+The state directory and every directory above it must be owned by root or the
+user the role runs as, and must not be group- or world-writable. A role refuses
+any other location with `unsafe controller lock path`, by design: another user
+who can write there could replace the lock. That rules out `/tmp`; for a test
+run, use a directory under your home, such as `mkdir -m 700 ~/capyctl-test` with
+`--state-dir ~/capyctl-test/state`.
+
 ### The managed runtime directory
 
 The engine imports CapyCTL's own Python from the runtime directory, so a module
