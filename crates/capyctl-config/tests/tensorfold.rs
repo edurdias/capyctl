@@ -53,7 +53,8 @@ fn tensorfold_is_a_named_engine_with_a_verified_version() {
     assert_eq!(Engine::from_name("TensorFold"), None);
     assert!(is_verified(Engine::Tensorfold, "0.6.0"));
     assert!(is_verified(Engine::Tensorfold, "0.6.1"));
-    assert!(!is_verified(Engine::Tensorfold, "0.6.2"));
+    assert!(is_verified(Engine::Tensorfold, "0.6.2"));
+    assert!(!is_verified(Engine::Tensorfold, "0.6.3"));
 }
 
 // T41 T14: every reserved flag is refused, abbreviated and as a value form.

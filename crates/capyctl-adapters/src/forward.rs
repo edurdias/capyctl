@@ -289,8 +289,9 @@ impl ChatSink for Collecting<'_> {
 
 /// SPEC §6.1, ADR 0023 §4: the readiness probe, bounded by what remains of the
 /// startup budget and by nothing shorter. The probe is part of startup: an
-/// engine may build kernels on its first request (TensorFold 0.6.1 builds four
-/// CUDA extensions there, found live 2026-10-02), so the transport's 60 s read
+/// engine may build kernels on its first request (TensorFold 0.6.1 and 0.6.2
+/// build four CUDA extensions there for Qwen3.8 dense from an empty cache, found
+/// live 2026-10-02), so the transport's 60 s read
 /// bound would cut a healthy start short and have it killed mid build. `None`
 /// when the budget passed first. Ordinary forwarding keeps its own bounds.
 pub(crate) async fn startup_probe(
