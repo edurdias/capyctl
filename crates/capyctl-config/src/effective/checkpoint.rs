@@ -24,6 +24,50 @@ pub struct CheckpointLocation {
     pub checkpoint: PathBuf,
     /// The deployment's declared `model.content_fingerprint`.
     pub content_fingerprint: String,
+    /// ADR 0014 §5 amendment A6: the draft model the launch loads beside the
+    /// checkpoint, whose weights are counted with the checkpoint's.
+    pub drafter: Option<DrafterLocation>,
+}
+
+/// ADR 0014 §5 amendment A6: a draft model directory and the approved root
+/// (`security.approved_paths`) it lies in. Containment is checked again by
+/// whoever opens it, on the opened descriptors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrafterLocation {
+    pub root: PathBuf,
+    pub path: PathBuf,
+}
+
+/// ADR 0014 §5 amendment A6: where the draft model the arguments name lies,
+/// when it lies inside an approved root. Resolution refuses a draft model
+/// outside them, so `None` then only means nothing is counted for it.
+pub fn drafter_location(
+    engine: Engine,
+    profile_args: &[String],
+    extra_args: &[String],
+    approved_paths: &[String],
+) -> Option<DrafterLocation> {
+    let args: Vec<String> = profile_args.iter().chain(extra_args).cloned().collect();
+    let path = crate::engine_policy::draft_model_path(engine, &args)?;
+    let root = approved_paths
+        .iter()
+        .find(|root| crate::engine_policy::path_within(&path, Path::new(root)))?;
+    Some(DrafterLocation {
+        root: root.into(),
+        path: path.into(),
+    })
+}
+
+impl EffectiveDeployment {
+    /// ADR 0014 §5 amendment A6: the draft model this launch loads, if any.
+    pub fn drafter_location(&self) -> Option<DrafterLocation> {
+        drafter_location(
+            self.profile.engine,
+            &self.profile.args,
+            self.engine_config.extra_args(),
+            &self.profile.security.approved_paths,
+        )
+    }
 }
 
 /// ADR 0014 §7: locate a deployment's checkpoint from its `model` block and the
@@ -40,6 +84,25 @@ pub fn checkpoint_location(
         return Err(invalid("host.model_store.path", "must be absolute"));
     }
     let sources = crate::model_source::ModelSourcePolicy::from_raw(host.model_sources)?;
+    let drafter = host
+        .runtime_profiles
+        .get(deployment["runtime_profile"].as_str().unwrap_or_default())
+        .and_then(|profile| {
+            let extra: Vec<String> = deployment["engine_config"]["extra_args"]
+                .as_array()
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            drafter_location(
+                profile.engine,
+                &profile.args,
+                &extra,
+                &profile.security.approved_paths,
+            )
+        });
     let model = normalize_model(raw, Some(&store), Some(sources.root(&store)))?;
     let checkpoint = PathBuf::from(model.require_resolved_path()?);
     let root = match model.source {
@@ -50,6 +113,7 @@ pub fn checkpoint_location(
         model_store: root,
         checkpoint,
         content_fingerprint: model.content_fingerprint,
+        drafter,
     })
 }
 

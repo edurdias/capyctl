@@ -38,8 +38,9 @@ pub use timeouts::{
 };
 // ADR 0014 §7 (WE3): checkpoint identity.
 pub use checkpoint::{
-    checkpoint_location, declared_checkpoint_digest, is_checkpoint_digest,
-    resolve_snapshot_with_checkpoint, CheckpointLocation, CHECKPOINT_DIGEST_PREFIX,
+    checkpoint_location, declared_checkpoint_digest, drafter_location, is_checkpoint_digest,
+    resolve_snapshot_with_checkpoint, CheckpointLocation, DrafterLocation,
+    CHECKPOINT_DIGEST_PREFIX,
 };
 
 use crate::engine_policy::{
