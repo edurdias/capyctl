@@ -646,3 +646,25 @@ fn chains_that_loop_escape_or_end_at_a_directory_are_refused() {
         );
     }
 }
+
+// ADR 0014 §5 amendment A6 (found live 2026-10-02): a draft model's weight
+// files are counted with the same confined walk; none counts nothing, and a
+// draft directory that escapes its approved root is refused, not counted.
+#[test]
+fn a_draft_models_weights_are_sized_inside_its_approved_root() {
+    let store = Store::new();
+    let drafter = store.checkpoint("drafter", FILES);
+    let verifier = CheckpointVerifier::in_memory();
+    let location = capyctl_config::effective::DrafterLocation {
+        root: store.root.clone(),
+        path: drafter.clone(),
+    };
+    assert_eq!(verifier.drafter_weights(Some(&location)).unwrap(), 11 + 12);
+    assert_eq!(verifier.drafter_weights(None).unwrap(), 0);
+    let outside = Store::new();
+    let escaping = capyctl_config::effective::DrafterLocation {
+        root: outside.root.clone(),
+        path: drafter,
+    };
+    assert!(verifier.drafter_weights(Some(&escaping)).is_err());
+}

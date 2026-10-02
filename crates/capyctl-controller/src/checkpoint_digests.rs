@@ -400,21 +400,33 @@ impl LocalDigests {
     }
 }
 
-/// Measure an effective revision's checkpoint on this machine.
+/// Measure an effective revision's checkpoint on this machine, with the
+/// weight bytes of the draft model it loads beside it (ADR 0014 §5 amendment
+/// A4). The digest is the checkpoint's own.
 async fn measure_locally(
     checkpoints: Arc<CheckpointVerifier>,
     effective: &capyctl_config::effective::EffectiveDeployment,
-) -> Result<capyctl_agent::checkpoint::Verification, MeasureError> {
+) -> Result<(capyctl_agent::checkpoint::Verification, i64), MeasureError> {
     let store = effective.checkpoint_store().to_path_buf();
     let checkpoint = effective
         .model
         .require_resolved_path()
         .map_err(|_| MeasureError::Refused("not_materializable".into()))?
         .to_owned();
-    tokio::task::spawn_blocking(move || checkpoints.measure(&store, Path::new(&checkpoint)))
-        .await
-        .map_err(|_| MeasureError::Unavailable)?
-        .map_err(|error| MeasureError::Refused(error.code().into()))
+    let drafter = effective.drafter_location();
+    tokio::task::spawn_blocking(move || {
+        let verified = checkpoints.measure(&store, Path::new(&checkpoint))?;
+        let weights = checkpoints
+            .drafter_weights(drafter.as_ref())?
+            .checked_add(verified.manifest.weights_bytes)
+            .ok_or(capyctl_agent::checkpoint::CheckpointError::TooLarge)?;
+        Ok((verified, weights))
+    })
+    .await
+    .map_err(|_| MeasureError::Unavailable)?
+    .map_err(|error: capyctl_agent::checkpoint::CheckpointError| {
+        MeasureError::Refused(error.code().into())
+    })
 }
 
 impl DigestSource for LocalDigests {
@@ -424,10 +436,11 @@ impl DigestSource for LocalDigests {
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {
         let checkpoints = self.checkpoints.clone();
         Box::pin(async move {
-            let verified = measure_locally(checkpoints, &pending.effective).await?;
+            let (verified, weights_bytes) =
+                measure_locally(checkpoints, &pending.effective).await?;
             Ok(Measured {
                 digest: verified.manifest.digest,
-                weights_bytes: verified.manifest.weights_bytes,
+                weights_bytes,
             })
         })
     }
@@ -441,11 +454,17 @@ impl DigestSource for LocalDigests {
                 .require_resolved_path()
                 .map_err(|_| MeasureError::Refused("not_materializable".into()))?
                 .to_owned();
-            tokio::task::spawn_blocking(move || checkpoints.size(&store, Path::new(&checkpoint)))
-                .await
-                .map_err(|_| MeasureError::Unavailable)?
-                .map(|size| size.weights_bytes)
-                .map_err(|error| MeasureError::Refused(error.code().into()))
+            let drafter = pending.effective.drafter_location();
+            tokio::task::spawn_blocking(move || {
+                let size = checkpoints.size(&store, Path::new(&checkpoint))?;
+                checkpoints
+                    .drafter_weights(drafter.as_ref())?
+                    .checked_add(size.weights_bytes)
+                    .ok_or(capyctl_agent::checkpoint::CheckpointError::TooLarge)
+            })
+            .await
+            .map_err(|_| MeasureError::Unavailable)?
+            .map_err(|error| MeasureError::Refused(error.code().into()))
         })
     }
 }
@@ -674,7 +693,7 @@ impl CheckpointGate {
                 .recorded_checkpoint(&self.deployment_id, self.revision)
                 .map_err(|_| unrecorded())?
         };
-        let measured = measure_locally(self.checkpoints.clone(), &self.effective)
+        let (measured, weights_bytes) = measure_locally(self.checkpoints.clone(), &self.effective)
             .await
             .map_err(|error| match error {
                 MeasureError::Refused(code) => GateRefusal::Unavailable(code),
@@ -691,7 +710,7 @@ impl CheckpointGate {
                     &self.effective.host.name,
                     &Measured {
                         digest: measured.manifest.digest.clone(),
-                        weights_bytes: measured.manifest.weights_bytes,
+                        weights_bytes,
                     },
                 )
                 .map_err(|_| unrecorded())?;

@@ -3,6 +3,7 @@
 use capyctl_config::effective::{
     checkpoint_location, declared_checkpoint_digest, resolve_effective,
     resolve_effective_with_checkpoint, resolve_snapshot_with_checkpoint, CheckpointFacts,
+    DrafterLocation,
 };
 use capyctl_config::ConfigErrorCode;
 use serde_json::{json, Value};
@@ -139,4 +140,80 @@ fn a_downloaded_checkpoint_is_located_in_the_sources_store() {
     deployment["model"]["path"] = json!("toy");
     let local = checkpoint_location(&deployment, &host).unwrap();
     assert_eq!(local.model_store, std::path::Path::new(&store));
+}
+
+// ADR 0014 §5 amendment A6 (found live 2026-10-02): a launch loads its draft
+// model beside the checkpoint, so the checkpoint's location names the draft
+// model's directory and the approved root it lies in, for each engine's
+// spelling. Nothing else is a draft model.
+#[test]
+fn a_checkpoint_location_names_the_draft_model_it_loads_beside() {
+    let located = |engine: &str, args: Value| {
+        let (mut deployment, mut host) = fixture();
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = json!(engine);
+        profile["args"] = json!([]);
+        profile["security"]["approved_paths"] = json!(["/srv/other", "/srv/drafters"]);
+        deployment["engine_config"]["accept_extra_args"] = json!(true);
+        deployment["engine_config"]["extra_args"] = args;
+        checkpoint_location(&deployment, &host).unwrap().drafter
+    };
+    let expected = Some(DrafterLocation {
+        root: "/srv/drafters".into(),
+        path: "/srv/drafters/d".into(),
+    });
+    assert_eq!(
+        located(
+            "vllm",
+            json!([
+                "--speculative-config",
+                r#"{"method":"dflash","model":"/srv/drafters/d"}"#
+            ])
+        ),
+        expected
+    );
+    assert_eq!(
+        located(
+            "vllm",
+            json!([r#"--speculative-config={"model":"/srv/drafters/d"}"#])
+        ),
+        expected
+    );
+    assert_eq!(
+        located(
+            "sglang",
+            json!(["--speculative-draft-model-path", "/srv/drafters/d"])
+        ),
+        expected
+    );
+    assert_eq!(
+        located("tensorfold", json!(["--drafter", "/srv/drafters/d"])),
+        expected
+    );
+    // MTP heads live in the checkpoint; no draft directory.
+    assert_eq!(
+        located(
+            "vllm",
+            json!([
+                "--speculative-config",
+                r#"{"method":"mtp","num_speculative_tokens":3}"#
+            ])
+        ),
+        None
+    );
+    assert_eq!(located("tensorfold", json!(["--no-drafts"])), None);
+    // Another engine's spelling names nothing for this one.
+    assert_eq!(
+        located("vllm", json!(["--drafter", "/srv/drafters/d"])),
+        None
+    );
+    // A path outside every approved root is not located (resolution refuses it).
+    assert_eq!(
+        located(
+            "sglang",
+            json!(["--speculative-draft-model-path", "/etc/d"])
+        ),
+        None
+    );
+    assert_eq!(located("vllm", json!([])), None);
 }

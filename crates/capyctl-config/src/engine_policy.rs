@@ -346,6 +346,36 @@ pub const SPECULATIVE_CONFIG_KEYS: &[&str] = &[
     "moe_backend",
 ];
 
+/// ADR 0014 §5 amendment A6: the draft model directory a launch's arguments
+/// (host-fixed then the deployment's) name for `engine`: vLLM's
+/// `--speculative-config` `model`, SGLang's `--speculative-draft-model-path`,
+/// TensorFold's `--drafter`. The last one named wins, as in the engines'
+/// parsers; only an absolute path is a directory. `None` when the arguments
+/// name none (MTP heads live in the checkpoint) or do not parse.
+pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
+    let option = match engine {
+        Engine::Vllm => "--speculative-config",
+        Engine::Sglang => "--speculative-draft-model-path",
+        Engine::Tensorfold => "--drafter",
+    };
+    let mut named = None;
+    for parsed in parse_options(args).ok()? {
+        if !matches_name(&parsed.name, option) {
+            continue;
+        }
+        let Some(value) = parsed.value else {
+            continue;
+        };
+        named = match engine {
+            Engine::Vllm => serde_json::from_str::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|config| config["model"].as_str().map(str::to_owned)),
+            Engine::Sglang | Engine::Tensorfold => Some(value),
+        };
+    }
+    named.filter(|path| Path::new(path).is_absolute())
+}
+
 /// Whether a `--speculative-config` value is admissible under the host's
 /// approved directories (ADR 0014 §8).
 fn speculative_config_admitted(value: &str, approved_paths: &[PathBuf]) -> bool {

@@ -16,6 +16,11 @@ struct Fixture {
 /// An owned store with one accepted deployment whose checkpoint is a real
 /// directory in a real model store.
 fn fixture(edit: impl FnOnce(&mut Value)) -> Fixture {
+    fixture_on(|deployment, _, _| edit(deployment))
+}
+
+/// [`fixture`], editing the deployment and host documents given the model store.
+fn fixture_on(edit: impl FnOnce(&mut Value, &mut Value, &Path)) -> Fixture {
     use std::os::unix::fs::PermissionsExt;
     let source: Value = serde_json::from_str(include_str!(
         "../../../capyctl-config/tests/fixtures/f2-deployment.json"
@@ -29,7 +34,7 @@ fn fixture(edit: impl FnOnce(&mut Value)) -> Fixture {
     host["model_store"]["path"] = json!(models.path());
     let mut deployment = source["deployment"].clone();
     deployment["model"]["path"] = json!("toy");
-    edit(&mut deployment);
+    edit(&mut deployment, &mut host, models.path());
     let state = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
     std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let owner = Arc::new(Mutex::new(
@@ -173,6 +178,49 @@ async fn the_embedded_source_measures_the_local_checkpoint() {
     assert_eq!(record.state, DigestState::Recorded);
     assert_eq!(record.digest, Some(expected.digest));
     assert_eq!(record.weights_bytes, Some(expected.weights_bytes));
+}
+
+// ADR 0014 §5 amendment A6 (found live 2026-10-02): the embedded host counts
+// the draft model's weight files with the checkpoint's, when sizing and when
+// measuring, so a speculative deployment is sized for both.
+#[tokio::test]
+async fn the_embedded_source_counts_the_draft_models_weights() {
+    let f = fixture_on(|deployment, host, models| {
+        // The drafter lives in the approved store beside the checkpoint.
+        let drafter = models.join("drafter");
+        std::fs::create_dir_all(&drafter).unwrap();
+        std::fs::write(drafter.join("config.json"), "{}").unwrap();
+        std::fs::write(drafter.join("model.safetensors"), "draft-weights").unwrap();
+        let config = json!({"method": "dflash", "model": drafter, "num_speculative_tokens": 7});
+        deployment["engine_config"]["accept_extra_args"] = json!(true);
+        deployment["engine_config"]["extra_args"] =
+            json!(["--speculative-config", config.to_string()]);
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["security"]["approved_options"] = json!(["--speculative-config"]);
+        profile["security"]["approved_paths"] = json!([models]);
+    });
+    let checkpoints = Arc::new(CheckpointVerifier::in_memory());
+    let target = checkpoints
+        .measure(f.models.path(), &f.models.path().join("toy"))
+        .unwrap()
+        .manifest;
+    let pending = f
+        .owner
+        .lock()
+        .unwrap()
+        .store()
+        .pending_checkpoint_digests()
+        .unwrap()
+        .remove(0);
+    let local = LocalDigests::new(checkpoints.clone());
+    let sized = local.size(pending.clone()).await.unwrap();
+    assert_eq!(sized, target.weights_bytes + 13);
+    let measured = local.measure(pending).await.unwrap();
+    assert_eq!(
+        measured.digest, target.digest,
+        "the digest is the checkpoint's own"
+    );
+    assert_eq!(measured.weights_bytes, target.weights_bytes + 13);
 }
 
 /// Sizes first, then hashes: the sizing is recorded while the full digest has

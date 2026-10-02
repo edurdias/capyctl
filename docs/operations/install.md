@@ -769,20 +769,29 @@ the running role to publish it.
 
 ## Engine logs and troubleshooting
 
-CapyCTL does not keep an engine's own output by default, because it may contain
-secrets (prompts, keys in arguments). `--debug-engine-logs` on `capyctl start
-host` or `capyctl start standalone` keeps it, owner-only, in
-`<state dir>/logs/<deployment id>/<launch id>.log` for launches from then on.
-It is a flag only: a variable left in a unit file must not turn it on. For a
-unit, add it to `ExecStart=` in a drop-in while you investigate, then remove
-it.
+Each launch has an owner-only log, `<state dir>/logs/<deployment id>/<launch
+id>.log`. What it holds depends on the engine:
+
+- **vLLM and TensorFold.** The engine's own output at its default log level is
+  kept. It logs no prompts, and CapyCTL never puts a key in an engine's
+  arguments. When a launch fails, CapyCTL reads the end
+  of this log, with credentials redacted, to name the refused option or the
+  missing drafter in status.
+- **SGLang.** CapyCTL discards the engine's output from the moment it imports
+  SGLang, so the file stays empty, even when a launch fails after that point.
+
+`--debug-engine-logs` on `capyctl start host` or `capyctl start standalone`
+keeps SGLang's output too, at debug level and with credentials scrubbed, for
+launches from then on. That output may contain prompts. It is a flag only: a
+variable left in a unit file must not turn it on. For a unit, add it to
+`ExecStart=` in a drop-in while you investigate, then remove it.
 
 - **A launch fails.** `capyctl status deployment <name>` shows the reason in
   `LAST OPERATION` (for example `initialize failed (launch_failed)`); the
   instance's `LAST ERROR` column can still read `-`. `--format json` has the
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
-  exited.
+  exited (for SGLang, only with `--debug-engine-logs`).
 - **SGLang saver permission warning.** Before an SGLang park, CapyCTL checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable

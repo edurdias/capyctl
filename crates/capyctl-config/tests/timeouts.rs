@@ -85,12 +85,41 @@ fn snapshots_round_trip_and_rederive_only_derived_timeouts() {
     )
     .unwrap();
     assert_eq!(measured.timeouts.wake_ms, 90_000);
-    // 120 s + 10 s per GB of 3 GB.
-    assert_eq!(measured.timeouts.initialize_ms, 150_000);
+    // 120 s + 10 s per GB of 3 GB + the 480 s first-start allowance, lowered
+    // to the fixture's 600 s request deadline.
+    assert_eq!(measured.timeouts.initialize_ms, 600_000);
     // A snapshot claiming a derived value other than the derivation is refused.
     let mut forged: Value = serde_json::from_str(&text).unwrap();
     forged["timeouts"]["initialize_ms"] = json!(1);
     assert!(decode_effective_snapshot(&forged.to_string()).is_err());
+}
+
+/// T14, ADR 0014 amendment A7 (2026-10-02): a revision frozen before the
+/// first-start allowance keeps the derived Initialize window it was frozen
+/// with; any other claimed value is still refused.
+// T14
+#[test]
+fn a_revision_frozen_before_the_first_start_allowance_still_decodes() {
+    let (mut deployment, host) = fixture();
+    deployment["request_deadline"] = json!("600s");
+    let effective = resolve_effective_with_checkpoint(
+        &deployment,
+        &host,
+        CheckpointFacts {
+            weights_bytes: Some(3 * GB),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(effective.timeouts.initialize_ms, 600_000);
+    let mut frozen = serde_json::to_value(&effective).unwrap();
+    // What the load term alone derived: 120 s + 10 s per GB of 3 GB.
+    frozen["timeouts"]["initialize_ms"] = json!(150_000);
+    let decoded = decode_effective_snapshot(&frozen.to_string()).unwrap();
+    assert_eq!(decoded.timeouts.initialize_ms, 150_000);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), frozen);
+    frozen["timeouts"]["initialize_ms"] = json!(160_000);
+    assert!(decode_effective_snapshot(&frozen.to_string()).is_err());
 }
 
 /// T14: a revision frozen before `timeouts` existed still decodes; its

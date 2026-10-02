@@ -303,15 +303,23 @@ pub(crate) async fn startup_probe(
         .ok()
 }
 
+/// The fields an engine streams a reasoning trace in: SGLang and TensorFold
+/// send `reasoning_content`; vLLM 0.29 and 0.30 send `reasoning`
+/// (`DeltaMessage.reasoning`, vllm/entrypoints/generate/base/protocol.py).
+/// SPEC §10: each is relayed, and collected, under the name the engine used.
+const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
+
 /// SPEC §6.1, ADR 0023 §6: a readiness probe's answer is non-empty content
-/// or, for a model that reasons first, non-empty reasoning.
+/// or, for a model that reasons first, non-empty reasoning in either field.
 pub fn probe_answered(answer: &Value) -> bool {
     let message = &answer["choices"][0]["message"];
-    ["content", "reasoning_content"].iter().any(|field| {
-        message[*field]
-            .as_str()
-            .is_some_and(|text| !text.is_empty())
-    })
+    ["content", REASONING_FIELDS[0], REASONING_FIELDS[1]]
+        .iter()
+        .any(|field| {
+            message[*field]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
 }
 
 /// Assemble one non-streaming response from a completed stream's chunks.
@@ -320,7 +328,7 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
     let first = chunks.first().ok_or_else(uncertain)?;
     let mut response = serde_json::from_str::<Value>(first).map_err(|_| uncertain())?;
     let mut content = String::new();
-    let mut reasoning = String::new();
+    let mut reasoning = [String::new(), String::new()];
     let mut tool_calls = std::collections::BTreeMap::new();
     let mut finish = Value::Null;
     // SPEC §10 "Preserve supported payloads": per-token log probabilities
@@ -333,8 +341,10 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
             content.push_str(text);
         }
-        if let Some(text) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
-            reasoning.push_str(text);
+        for (field, trace) in REASONING_FIELDS.iter().zip(reasoning.iter_mut()) {
+            if let Some(text) = chunk["choices"][0]["delta"][*field].as_str() {
+                trace.push_str(text);
+            }
         }
         fold_tool_calls(&mut tool_calls, &chunk["choices"][0]["delta"]["tool_calls"]);
         match &chunk["choices"][0]["logprobs"] {
@@ -367,8 +377,10 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
     // have received. The field is omitted entirely when the engine sent none,
     // so a non-reasoning response keeps its existing shape.
     let mut message = json!({"role":"assistant","content":content});
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = json!(reasoning);
+    for (field, trace) in REASONING_FIELDS.iter().zip(reasoning) {
+        if !trace.is_empty() {
+            message[*field] = json!(trace);
+        }
     }
     // SPEC §10 preserves tool calls: the collected message carries them in
     // the OpenAI non-streaming shape, with `content` null when the engine
@@ -767,7 +779,8 @@ impl<'a> Parser<'a> {
             }
             let delta = choices[0]["delta"].as_object().ok_or_else(uncertain)?;
             // SPEC §10 requires reasoning fields to be preserved. A reasoning model
-            // streams its trace as `reasoning_content` deltas, so rejecting the key
+            // streams its trace as `reasoning_content` deltas (SGLang, TensorFold)
+            // or `reasoning` deltas (vLLM 0.29 and 0.30), so rejecting the key
             // fails every chunk and the whole stream, even though the engine is
             // behaving correctly. It is relayed unchanged and validated like
             // `content`; the allowlist stays closed to everything else so unknown
@@ -779,16 +792,18 @@ impl<'a> Parser<'a> {
             if delta.keys().any(|k| {
                 !matches!(
                     k.as_str(),
-                    "role" | "content" | "reasoning_content" | "tool_calls"
+                    "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls"
                 )
             }) || delta
                 .get("role")
                 .is_some_and(|r| !r.is_null() && r != "assistant")
-                || ["content", "reasoning_content"].iter().any(|key| {
-                    delta
-                        .get(*key)
-                        .is_some_and(|value| !value.is_null() && !value.is_string())
-                })
+                || ["content", REASONING_FIELDS[0], REASONING_FIELDS[1]]
+                    .iter()
+                    .any(|key| {
+                        delta
+                            .get(*key)
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                    })
                 || delta
                     .get("tool_calls")
                     .is_some_and(|calls| !calls.is_null() && !valid_tool_call_deltas(calls))
@@ -974,6 +989,13 @@ mod tests {
             &json!({"choices": [{"message": {"content": ""}}]})
         ));
         assert!(!probe_answered(&json!({})));
+        // vLLM 0.29 and 0.30 name the trace `reasoning` (found live 2026-10-02).
+        assert!(probe_answered(
+            &json!({"choices": [{"message": {"content": "", "reasoning": "ok"}}]})
+        ));
+        assert!(!probe_answered(
+            &json!({"choices": [{"message": {"content": "", "reasoning": ""}}]})
+        ));
     }
 
     async fn answering(status: u16, body: serde_json::Value) -> reqwest::Url {

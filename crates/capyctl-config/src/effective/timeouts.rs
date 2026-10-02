@@ -26,6 +26,15 @@ pub const INITIALIZE_CAP_MS: i64 = 1_800_000;
 pub const WAKE_BASE_MS: i64 = 60_000;
 pub const WAKE_PER_GB_MS: i64 = 5_000;
 pub const WAKE_CAP_MS: i64 = 900_000;
+/// ADR 0014 amendment A7 (found live 2026-10-02): a vLLM or SGLang first start
+/// on a host warms up before it serves (torch.compile, FlashInfer autotuning,
+/// CUDA graph capture) and caches the result for later starts. vLLM 0.30 took
+/// 235 s for it on Qwen3.8-27B NVFP4 (22 GB) with DFlash2, 79 s on the next
+/// start, past the 340 s the load term alone gave the first. The derived
+/// Initialize window adds this allowance, about twice that warmup, to the load
+/// term (still capped). A longer window only delays noticing an engine that is
+/// alive but stuck, never one that exited (its exit ends the wait at once).
+pub const STARTUP_WARMUP_MS: i64 = 480_000;
 /// ADR 0023 §4: the first TensorFold start builds its CUDA extensions; the
 /// host gives up earlier once a build exists (`capyctl-adapters::tensorfold`).
 pub const TENSORFOLD_FIRST_BUILD_MS: i64 = 1_800_000;
@@ -198,7 +207,12 @@ pub(super) fn resolve_timeouts(
     };
     let derived_initialize = match engine {
         Engine::Tensorfold => TENSORFOLD_FIRST_BUILD_MS,
-        Engine::Vllm | Engine::Sglang => derived_initialize_ms(weights),
+        Engine::Vllm | Engine::Sglang => match weights {
+            None => derived_initialize_ms(None),
+            Some(_) => derived_initialize_ms(weights)
+                .saturating_add(STARTUP_WARMUP_MS)
+                .min(INITIALIZE_CAP_MS),
+        },
     };
     let initialize_ms = pick("initialize", initialize, derived_initialize);
     let wake_ms = pick("wake", wake, derived_wake_ms(weights));
@@ -264,6 +278,36 @@ mod tests {
         assert_eq!(derived_wake_ms(Some(8 * GB)), 100_000);
         assert_eq!(derived_wake_ms(Some(500 * GIB)), WAKE_CAP_MS);
         assert_eq!(derived_wake_ms(None), PENDING_WAKE_MS);
+    }
+
+    // T14 (found live 2026-10-02): a vLLM or SGLang first start warms up
+    // (torch.compile, autotuning, CUDA graph capture) before it serves, so the
+    // derived Initialize window carries a first-start allowance beside the
+    // per-GB load term. vLLM 0.30 took 235 s for it on Qwen3.8-27B NVFP4
+    // (22 GB), past the 340 s the load term alone gave.
+    #[test]
+    fn a_derived_initialize_window_allows_for_a_first_start_compile() {
+        for engine in [Engine::Vllm, Engine::Sglang] {
+            let t = resolve_timeouts(
+                None,
+                3_600_000,
+                CheckpointFacts {
+                    weights_bytes: Some(22 * GB),
+                    ..Default::default()
+                },
+                engine,
+            )
+            .unwrap();
+            assert_eq!(
+                t.initialize_ms,
+                derived_initialize_ms(Some(22 * GB)) + STARTUP_WARMUP_MS
+            );
+            assert_eq!(t.initialize_ms, 820_000);
+        }
+        // The pending value is already the conservative one.
+        let pending =
+            resolve_timeouts(None, 3_600_000, CheckpointFacts::default(), Engine::Vllm).unwrap();
+        assert_eq!(pending.initialize_ms, PENDING_INITIALIZE_MS);
     }
 
     // T14

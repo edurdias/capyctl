@@ -34,12 +34,14 @@ pub use timeouts::{
     derived_initialize_ms, derived_wake_ms, lifecycle_windows, validate_declared_timeouts,
     DeploymentTimeouts, TimeoutBasis, TimeoutSource, INITIALIZE_BASE_MS, INITIALIZE_CAP_MS,
     INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS, PENDING_WAKE_MS,
-    STOP_WINDOW_MS, TENSORFOLD_FIRST_BUILD_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
+    STARTUP_WARMUP_MS, STOP_WINDOW_MS, TENSORFOLD_FIRST_BUILD_MS, WAKE_BASE_MS, WAKE_CAP_MS,
+    WAKE_PER_GB_MS,
 };
 // ADR 0014 §7 (WE3): checkpoint identity.
 pub use checkpoint::{
-    checkpoint_location, declared_checkpoint_digest, is_checkpoint_digest,
-    resolve_snapshot_with_checkpoint, CheckpointLocation, CHECKPOINT_DIGEST_PREFIX,
+    checkpoint_location, declared_checkpoint_digest, drafter_location, is_checkpoint_digest,
+    resolve_snapshot_with_checkpoint, CheckpointLocation, DrafterLocation,
+    CHECKPOINT_DIGEST_PREFIX,
 };
 
 use crate::engine_policy::{

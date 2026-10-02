@@ -595,10 +595,16 @@ impl NativeHostExecution {
             &plan.checkpoint_digest,
         )?;
         // The same manifest yields the same weights; a plan naming others was
-        // resolved against something else.
+        // resolved against something else. ADR 0014 §5 amendment A6: the
+        // weights count the draft model too; a revision recorded before they
+        // did names the checkpoint's alone, which is what it was sized with.
+        let drafter = self
+            .checkpoints
+            .drafter_weights(effective.drafter_location().as_ref())?;
+        let target = verified.manifest.weights_bytes;
         if plan
             .checkpoint_weights_bytes
-            .is_some_and(|bytes| bytes != verified.manifest.weights_bytes)
+            .is_some_and(|bytes| bytes != target && Some(bytes) != target.checked_add(drafter))
         {
             return Err(CheckpointError::Mismatch);
         }
@@ -633,14 +639,16 @@ impl NativeHostExecution {
             Ok(location) if plan.size_only => {
                 let checkpoints = self.checkpoints.clone();
                 let sized = tokio::task::spawn_blocking(move || {
-                    checkpoints.size(&location.model_store, &location.checkpoint)
+                    let size = checkpoints.size(&location.model_store, &location.checkpoint)?;
+                    let weights = with_drafter(&checkpoints, &location, size.weights_bytes)?;
+                    Ok::<_, CheckpointError>((size, weights))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match sized {
-                    Ok(size) => pb::CheckpointDigestEvidence {
+                    Ok((size, weights_bytes)) => pb::CheckpointDigestEvidence {
                         state: "sized".into(),
-                        weights_bytes: size.weights_bytes,
+                        weights_bytes,
                         file_count: size.file_count,
                         total_bytes: size.total_bytes,
                         ..Default::default()
@@ -651,12 +659,16 @@ impl NativeHostExecution {
             Ok(location) => {
                 let checkpoints = self.checkpoints.clone();
                 let measured = tokio::task::spawn_blocking(move || {
-                    checkpoints.measure(&location.model_store, &location.checkpoint)
+                    let verified =
+                        checkpoints.measure(&location.model_store, &location.checkpoint)?;
+                    let weights =
+                        with_drafter(&checkpoints, &location, verified.manifest.weights_bytes)?;
+                    Ok::<_, CheckpointError>((verified, weights))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok(verified) => {
+                    Ok((verified, weights_bytes)) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -665,7 +677,7 @@ impl NativeHostExecution {
                         pb::CheckpointDigestEvidence {
                             state: if mismatch { "mismatch" } else { "computed" }.into(),
                             digest: manifest.digest,
-                            weights_bytes: manifest.weights_bytes,
+                            weights_bytes,
                             file_count: manifest.entries.len() as u64,
                             total_bytes: manifest.total_bytes,
                             reason: String::new(),
@@ -1820,6 +1832,19 @@ fn device_domains(document: &serde_json::Value) -> std::collections::BTreeMap<St
         .collect()
 }
 
+/// ADR 0014 §5 amendment A6: a checkpoint's weights plus those of the draft
+/// model its launch loads beside it.
+fn with_drafter(
+    checkpoints: &crate::checkpoint::CheckpointVerifier,
+    location: &capyctl_config::effective::CheckpointLocation,
+    weights: i64,
+) -> Result<i64, CheckpointError> {
+    checkpoints
+        .drafter_weights(location.drafter.as_ref())?
+        .checked_add(weights)
+        .ok_or(CheckpointError::TooLarge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2379,6 +2404,75 @@ mod tests {
             executor.pre_admit(&other),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         ));
+    }
+
+    /// ADR 0014 §5 amendment A6 (found live 2026-10-02): a host counts the
+    /// draft model's weight files with the checkpoint's, sized or measured;
+    /// the digest stays the checkpoint's own.
+    // T34
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digest_checkpoint_counts_the_draft_models_weights() {
+        let root = directory();
+        let identity_dir = directory();
+        let models = root.path().join("models");
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                let security = &mut document["runtime_profiles"]["local"]["security"];
+                security["approved_options"] = serde_json::json!(["--speculative-config"]);
+                security["approved_paths"] = serde_json::json!([models]);
+            });
+        std::fs::create_dir_all(models.join("drafter")).unwrap();
+        std::fs::write(models.join("drafter/model.safetensors"), "draft-weights").unwrap();
+        let config = serde_json::json!({"method": "dflash", "model": models.join("drafter")});
+        deployment["engine_config"]["accept_extra_args"] = serde_json::json!(true);
+        deployment["engine_config"]["extra_args"] =
+            serde_json::json!(["--speculative-config", config.to_string()]);
+        for size_only in [false, true] {
+            let mut command = MemberCommand {
+                identity: checkpoint_identity("digest", "checkpoint"),
+                action: MemberAction::DigestCheckpoint(DigestCheckpointPlan {
+                    size_only,
+                    deployment_config: deployment.to_string(),
+                    host_policy_fingerprint: policy.clone(),
+                    expected_digest: None,
+                }),
+            };
+            command.identity.payload_digest = command.canonical_digest();
+            let result = executor.execute(1, command.clone()).await.unwrap();
+            let evidence = result.checkpoint.unwrap();
+            assert_eq!(evidence.weights_bytes, 7 + 13, "size_only {size_only}");
+            if !size_only {
+                let target = crate::checkpoint::CheckpointVerifier::in_memory()
+                    .measure(&models, &models.join("toy"))
+                    .unwrap()
+                    .manifest;
+                assert_eq!(evidence.digest, target.digest);
+            }
+        }
+        // A launch resolved with both weights verifies; so does one recorded
+        // before the draft model was counted; any other weights do not.
+        let recorded = crate::checkpoint::CheckpointVerifier::in_memory()
+            .measure(&models, &models.join("toy"))
+            .unwrap()
+            .manifest
+            .digest;
+        for (weights, verifies) in [(20, true), (7, true), (13, false)] {
+            let (launch, plan) = launch_with(&deployment, &policy, &recorded);
+            let plan = SingleLaunchPlan {
+                checkpoint_weights_bytes: Some(weights),
+                ..plan
+            };
+            let launch = MemberCommand {
+                action: MemberAction::LaunchSingle(plan.clone()),
+                ..launch
+            };
+            let effective = executor.resolve(&launch).unwrap();
+            assert_eq!(
+                executor.verify_checkpoint(&effective, &plan).is_ok(),
+                verifies,
+                "{weights}"
+            );
+        }
     }
 
     /// ADR 0014 §7 (WE3): DigestCheckpoint measures on this host from its own

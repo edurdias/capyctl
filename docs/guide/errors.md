@@ -50,11 +50,12 @@ fix: 2, 3 and 5, and 14 for a host.
 `LAST OPERATION`, for example `initialize failed (launch_failed)`, and the
 instance's `LAST ERROR` column gives the reason, for example
 `launch_failed: launch failed: engine launch failed: the engine exited before readiness`.
-The engine's own output is
-not kept by default, because it may contain secrets. To see it, restart CapyCTL
-with `--debug-engine-logs` and start the model again; each launch then writes
+Each launch writes
 `~/.local/state/capyctl/logs/<deployment id>/<launch id>.log` (under the host's
-state directory on a GPU machine of several).
+state directory on a GPU machine of several). For vLLM and TensorFold it holds
+the engine's own output. For SGLang it stays empty unless CapyCTL was started
+with `--debug-engine-logs`: restart CapyCTL with it and start the model again to
+see why SGLang stopped. That output may contain prompts.
 
 **SGLang: a permissions warning in the engine log.** CapyCTL checks that the SGLang
 library it uses to park and wake is not writable by other users. When the

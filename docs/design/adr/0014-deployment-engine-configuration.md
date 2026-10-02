@@ -311,7 +311,8 @@ timeouts:
   identity (normalized to milliseconds) only when declared.
 - **Derivation (placeholder).** When a field is omitted, it is derived from the
   checkpoint's weights bytes (§7), counted in decimal GB and rounded up:
-  Initialize = 120 s + 10 s per GB, capped at 1800 s; wake = 60 s + 5 s per GB, capped
+  Initialize = 120 s + 10 s per GB (plus a first-start allowance for vLLM and SGLang,
+  amendment A7), capped at 1800 s; wake = 60 s + 5 s per GB, capped
   at 900 s. While the digest is pending (including the zero-weight placeholder a
   provisional revision is frozen with), Initialize is 900 s and wake 900 s. The
   formula is recomputed after the M16 measurements.
@@ -466,3 +467,57 @@ Manifest identity: an entry records the first link's path and the final file's i
 Gate wording: a checkpoint that cannot be read or resolved reports `could not be measured
 (<reason>)`; `does not match its recorded digest` is kept for a measured digest that
 differs from the recorded one.
+
+## Amendment A6: draft model weights count with the checkpoint's (2026-10-02)
+
+Problem: found live on 2026-10-02 with vLLM 0.30, Qwen3.8-27B NVFP4 and the DFlash2
+draft model. §5 derives the memory request, the KV cache and the startup placeholder
+from the checkpoint's weights. A speculative deployment also loads a draft model, and
+its weights were counted nowhere: the engine was given a KV cache sized as if the
+draft model took no memory, and its peak (53.0 GiB) went above its 49.2 GiB
+reservation.
+
+Rule: the weights a revision is sized with are the checkpoint's weight files plus the
+draft model's: the directory named by vLLM's `--speculative-config` `model`, SGLang's
+`--speculative-draft-model-path` or TensorFold's `--drafter`, in the profile's or the
+deployment's arguments (the last one named wins). The draft model must already lie
+inside `security.approved_paths` (§8); it is sized with the same confined stat walk as
+the checkpoint, inside the approved directory that holds it. Both the embedded host
+(standalone) and a remote host count it, whether sizing or measuring. The digest stays
+the checkpoint's own; the draft model is not digested. MTP heads live in the checkpoint
+and add nothing.
+
+Everything §5 and amendment A2 derive from the weights follows: a derived request grows
+by the draft model's weights, a derived KV cache (declared request) shrinks by them, so
+the engine's explicit KV budget (`--kv-cache-memory-bytes`, SGLang's static fraction)
+leaves room for the draft model, and the startup placeholder grows with them. A
+deployment that declares both `memory.request` and `memory.kv_cache` states its own
+budget and must leave room for the draft model itself. A host launching a revision
+whose plan names the checkpoint's weights alone (recorded before this amendment)
+accepts it, as it was sized then.
+
+Live (2026-10-02, vLLM 0.30, Qwen3.8-27B NVFP4 with DFlash2, `kv_cache: 16GiB`): the
+recorded weights were 25.77 GB (21.92 GB checkpoint plus 3.85 GB draft model), the
+derived request 48.0 GiB and the derived cold phase 49.25 GiB. The first start peaked
+at 50.46 GiB (status' measured peak), 1.2 GiB above the placeholder; the CUDA graphs
+alone took 1.64 GiB against the 1.25 GiB overhead placeholder. As amendment A2
+provides, the next start reserved the measured 50.46 GiB and peaked at 50.18 GiB;
+steady use was 48.97 GiB against the 49.25 GiB Ready charge. Without the draft model
+counted, every phase would have been 3.58 GiB smaller.
+
+## Amendment A7: first-start allowance in the derived Initialize window (2026-10-02)
+
+Problem: amendment A1 derives Initialize as 120 s plus 10 s per GB of weights. vLLM 0.30
+warms up on a first start (torch.compile, FlashInfer autotuning, CUDA graph capture) and
+caches the result: its first start of Qwen3.8-27B NVFP4 (22 GB) spent 236 s warming up
+after loading, past the 340 s the formula gave, while recipes declared 900 s. Rerun on
+2026-10-02 with DFlash2: warmup 235 s (41.6 s of it compilation) on the first start,
+79 s on the next.
+
+Rule: for vLLM and SGLang the derived Initialize window is the load term plus a
+first-start allowance of 480 s (about twice that warmup), capped at 1800 s and lowered
+to the request deadline as before. The pending value (900 s) and TensorFold's
+first-build bound (ADR 0023 §4) are unchanged. A later start, with the compile cache
+warm, is shorter; the longer window only delays noticing an engine that is alive but
+stuck, never one that exited. A revision frozen before this amendment keeps the
+window it was frozen with (it still decodes exactly).
