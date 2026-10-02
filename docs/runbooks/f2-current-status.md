@@ -23,22 +23,24 @@ CapyCTL (`model: {hf: ...}`):
 | | 0.6.1 (recipes) | 0.6.2 |
 |---|---|---|
 | Nemotron 3.5 Lightning 30B-A3B 4-bit, ready cold (after download) | 104 s | 101 s |
-| Qwen3.8-27B NVFP4 + DFlash2, ready cold (after download) | 119 s | 78 s |
+| Qwen3.8-27B NVFP4 + DFlash2, ready cold (after download) | 119 s | 116 s |
 | Nemotron decode, median of 3 streams, 512 tokens | 132 tok/s | 143 tok/s (125 to 149) |
 | Qwen3.8-27B DFlash2 decode | 48.2 tok/s | 45.2 tok/s (34.0 to 46.5) |
 | Qwen3.8-27B `--no-drafts` decode | 11.9 tok/s | 12.0 tok/s |
 | Warm start (`start` after `stop`) | 8 s / 10 s | 8.1 s / 9.7 s |
 
-The 0.6.1 cold starts include verifying the weights already in the store; the
-0.6.2 ones start when the download was verified, and include the checkpoint
-digest, the load and the kernel builds. Prompts differ from the recipes', so
+Every cold start above is from an empty kernel cache. The 0.6.1 ones include
+verifying the weights already in the store; the 0.6.2 Nemotron one starts when
+its download was verified and the Qwen3.8 one at `start deployment` with the
+weights verified, and both include the checkpoint digest, the load and the
+kernel builds. Prompts differ from the recipes', so
 the medians are not paired; the one
 request both runs share (354 of 2355 drafts accepted, the same `token_sha`)
-decoded at 33.8 tok/s on 0.6.1 and 34.0 on 0.6.2. Kernel builds: Nemotron
-built `experts_v7` and `qmm_v5` at startup and `nemotron_scan_rows` and
-`prefill_attention_v1` on its first request (probe TTFT 34 s); Qwen3.8 then
-built `nvfp4_ck_v6` at startup and `qwen_b16_v4` and `gdn_v2` on its first
-request (25 s). Both answered Jupiter plain and streaming, with
+decoded at 33.8 tok/s on 0.6.1 and 34.0 on 0.6.2. Kernel builds from an empty cache: Qwen3.8 builds `nvfp4_ck_v6` at startup
+and `qwen_b16_v4`, `gdn_v2`, `prefill_attention_v1` and `qmm_v5` on its first
+request (probe TTFT 65 s); Nemotron builds `experts_v7` and `qmm_v5` at
+startup and `nemotron_scan_rows` and `prefill_attention_v1` on its first
+request (34 s). Both answered Jupiter plain and streaming, with
 `reasoning_content` passed through and the `tensorfold` record kept. With
 both deployed (32 + 36 GiB over the half-memory standalone limit), each
 request for the stopped one switched (`released: stopped`) and answered in
@@ -49,6 +51,9 @@ the pinned families (the live body is now a parser fixture); standalone has
 no host load report, so its latency view shows the router tier only, by
 design (`roles.rs`). Deployments deleted, profile removed, drained shutdown,
 state removed, no CapyCTL, engine or GPU process left. No CapyCTL bug found.
+After rebasing onto the vLLM 0.30 findings fix, a second run from a fresh
+state (empty kernel cache) gave the same results: Qwen3.8 DFlash2 44.6 tok/s,
+Nemotron 141 tok/s, Nemotron started by a request in 48 s with its builds.
 
 ## vLLM 0.30 live findings fixed — 2026-10-02 (branch `fix/vllm-030-findings`)
 
