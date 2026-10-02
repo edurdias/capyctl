@@ -70,18 +70,47 @@ pub fn host_backed_copy_bytes(weights: i64) -> i64 {
 /// of the factor 1.6.
 pub const STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
 
+/// ADR 0014 amendment A8 (found live 2026-10-02): the first-start graph
+/// allowance, per model whose CUDA graphs the engine captures (the checkpoint,
+/// and the draft model of a speculative deployment). Graphs are captured after
+/// the KV cache is allocated, so the allowance stacks on the request. vLLM 0.30
+/// with Qwen3.8-27B NVFP4 and DFlash2 captured 1.64 GiB of graphs against the
+/// 1.25 GiB `ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES` and its first start
+/// peaked 1.21 GiB above a cold phase without this allowance. A placeholder
+/// until a first run measures the peak, which then replaces it.
+pub const STARTUP_GRAPH_ALLOWANCE_BYTES: i64 = 5 << 28;
+
+/// ADR 0014 amendment A8: the graph allowance a derived startup placeholder
+/// carries: one `STARTUP_GRAPH_ALLOWANCE_BYTES` per captured model for vLLM
+/// and SGLang, nothing for TensorFold (which declares its resources).
+pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
+    match engine {
+        Engine::Vllm | Engine::Sglang => {
+            STARTUP_GRAPH_ALLOWANCE_BYTES * if draft_model { 2 } else { 1 }
+        }
+        Engine::Tensorfold => 0,
+    }
+}
+
 /// Owner decision 2026-09-23: the placeholder startup peak for a request,
-/// the checkpoint's weights (when known) and the family margin.
-pub fn default_startup_bytes(request: i64, weights: Option<i64>, margin: i64) -> Option<i64> {
+/// the checkpoint's weights (when known), the family margin and (amendment
+/// A8) the graph allowance: `max(request + graphs, weights × 1.6 + margin)`.
+pub fn default_startup_bytes(
+    request: i64,
+    weights: Option<i64>,
+    margin: i64,
+    graphs: i64,
+) -> Option<i64> {
+    let floor = request.checked_add(graphs)?;
     let Some(weights) = weights else {
-        return Some(request);
+        return Some(floor);
     };
     let (numerator, denominator) = STARTUP_WEIGHTS_FACTOR;
     weights
         .checked_mul(numerator)
         .map(|scaled| scaled / denominator)
         .and_then(|scaled| scaled.checked_add(margin))
-        .map(|peak| peak.max(request))
+        .map(|peak| peak.max(floor))
 }
 
 /// The per-family overhead margin a derived memory request adds.
@@ -110,6 +139,11 @@ pub struct CheckpointFacts {
     /// charged records no `overhead_bytes`; it re-resolves exactly as it was,
     /// without them. Never set for a new resolution.
     pub legacy_overhead: bool,
+    /// ADR 0014 amendment A8: a snapshot frozen before the first-start graph
+    /// allowance records no `startup_graphs_bytes`; its placeholder startup
+    /// re-resolves exactly as it was, without it. Never set for a new
+    /// resolution.
+    pub legacy_startup_graphs: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -412,6 +446,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             startup_bytes: None,
             device_total_bytes: None,
             overhead_bytes: None,
+            startup_graphs_bytes: None,
         },
         derived,
     ))
@@ -432,6 +467,7 @@ pub fn resolve_startup(
     resources_declared: bool,
     facts: CheckpointFacts,
     margin: i64,
+    graphs: i64,
 ) -> Result<(Option<i64>, Option<SettingSource>), ConfigError> {
     const PATH: &str = "engine_config.memory.startup";
     if let Some(peak) = declared {
@@ -456,7 +492,7 @@ pub fn resolve_startup(
     if resources_declared || facts.legacy_startup {
         return Ok((None, None));
     }
-    let peak = default_startup_bytes(memory.request_bytes, memory.weights_bytes, margin)
+    let peak = default_startup_bytes(memory.request_bytes, memory.weights_bytes, margin, graphs)
         .ok_or_else(|| invalid(PATH, "memory arithmetic overflows"))?;
     Ok((Some(peak), Some(SettingSource::Derived)))
 }
@@ -942,16 +978,39 @@ pub(super) fn normalize_engine_config(
             provenance.insert("memory.startup".into(), SettingSource::Derived);
         }
     }
+    // ADR 0014 amendment A8: a derived placeholder covers the CUDA graphs the
+    // first start captures, the draft model's too; a revision frozen before
+    // the allowance re-resolves without it.
+    let graphs = if inputs.facts.legacy_startup_graphs {
+        0
+    } else {
+        let all: Vec<String> = inputs
+            .profile_args
+            .iter()
+            .chain(&extra_args)
+            .cloned()
+            .collect();
+        startup_graph_allowance(
+            engine,
+            crate::engine_policy::draft_model_path(engine, &all).is_some(),
+        )
+    };
     let (startup, startup_source) = resolve_startup(
         declared_startup,
         &memory,
         inputs.declared_ready_total.is_some(),
         inputs.facts,
         overhead_margin(engine),
+        graphs,
     )?;
     memory.startup_bytes = startup;
     if let Some(source) = startup_source {
         provenance.insert("memory.startup".into(), source);
+        // Only the placeholder default is derived here; a device request's
+        // startup was set above as declared.
+        if !inputs.facts.legacy_startup_graphs {
+            memory.startup_graphs_bytes = Some(graphs);
+        }
     }
 
     let mut common = CommonEngineSettings {

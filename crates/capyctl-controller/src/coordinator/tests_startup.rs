@@ -9,6 +9,8 @@ use super::*;
 /// The engine's CUDA context and graphs, charged beside the request on every
 /// host shape (re-review parity rule).
 const OVERHEAD: i64 = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+/// ADR 0014 amendment A8: the first start's graph allowance in a placeholder.
+const GRAPHS: i64 = capyctl_config::effective::STARTUP_GRAPH_ALLOWANCE_BYTES;
 use capyctl_domain::resources::PhaseFootprint;
 use std::sync::atomic::AtomicI64;
 
@@ -445,10 +447,11 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     .unwrap();
     let first = w.start(&fence, 60_000).unwrap();
     gate.entered().await;
-    // The placeholder: weights unknown, so the startup peak is the request.
+    // The placeholder: weights unknown, so the startup peak is the request
+    // and the graph allowance.
     assert_eq!(
         footprint(&owner, &fence.deployment_id).unwrap().allocations[0].bytes,
-        8 * GIB + OVERHEAD
+        8 * GIB + GRAPHS + OVERHEAD
     );
     // The engine's load drops availability by 12 GiB, then it settles.
     available.store(baseline - 12 * GIB, Ordering::SeqCst);
@@ -506,7 +509,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     assert_eq!(instance["provenance"], "measured");
     let deployment = serde_json::to_value(status.startup.as_ref().unwrap()).unwrap();
     assert_eq!(deployment["provenance"], "default");
-    assert_eq!(deployment["bytes"], 8 * GIB + OVERHEAD);
+    assert_eq!(deployment["bytes"], 8 * GIB + GRAPHS + OVERHEAD);
     assert_eq!(deployment["measured"][0]["peak_bytes"], 12 * GIB);
     again.release.add_permits(1);
     until("the second start to reach Ready", || {
@@ -807,7 +810,7 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
             .unwrap();
         serde_json::to_value(d.startup.unwrap()).unwrap()
     };
-    assert_eq!(startup(&owner)["bytes"], 30 * GIB + OVERHEAD);
+    assert_eq!(startup(&owner)["bytes"], 30 * GIB + GRAPHS + OVERHEAD);
     // The host sized 24 GiB of weights; the digest itself is still pending.
     {
         let o = owner.lock().unwrap();

@@ -175,6 +175,7 @@ fn frozen_at(endpoint: String, executable: &str) -> NativeLaunch {
                 startup_bytes: None,
                 device_total_bytes: None,
                 overhead_bytes: None,
+                startup_graphs_bytes: None,
             },
             max_total_tokens: None,
             chunked_prefill_size: None,

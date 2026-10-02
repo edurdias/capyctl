@@ -452,8 +452,10 @@ fn eviction_frees_one_gpu_by_least_recent_use() {
     }
     assert_eq!(t.devices(&a), vec![Some("gpu1".to_string())]);
     assert_eq!(t.devices(&b), vec![Some("gpu0".to_string())]);
-    // 20 GiB fits either card only once its one instance is released.
-    let c = one("c", "20GiB");
+    // 19 GiB (21.5 GiB starting, with the first start's graph allowance,
+    // ADR 0014 amendment A8) fits either card only once its one instance is
+    // released.
+    let c = one("c", "19GiB");
     let victims = |a_used: i64, b_used: i64| {
         let (a, b) = (a.clone(), b.clone());
         let activity = move |deployment: &str, _: i64| {

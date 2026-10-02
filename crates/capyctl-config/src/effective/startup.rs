@@ -19,7 +19,8 @@ pub enum StartupProvenance {
     Declared,
     /// The peak a first run on this host measured (the store's record).
     Measured,
-    /// The placeholder `max(request, weights × 1.6 + margin)`.
+    /// The placeholder `max(request + graphs, weights × 1.6 + margin)`
+    /// (ADR 0014 amendment A8).
     Default,
     /// The cold phase of a declared `resources:` block.
     Resources,

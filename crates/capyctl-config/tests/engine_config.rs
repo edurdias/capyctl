@@ -636,6 +636,13 @@ fn phases_derive_from_the_memory_request_and_snapshot_exactly() {
         deployment["residency"] = residency.into();
         deployment["engine_config"]["memory"] = json!({"request": "12GiB", "kv_cache": "4GiB"});
         let effective = resolve_effective(&deployment, &host).unwrap();
+        let overhead = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+        // ADR 0014 amendment A8: the cold phase adds the first start's graphs.
+        assert_eq!(
+            effective.resources.cold.allocations[0].bytes,
+            12 * GIB + capyctl_config::effective::STARTUP_GRAPH_ALLOWANCE_BYTES + overhead,
+            "{residency}"
+        );
         for phase in [
             &effective.resources.cold,
             &effective.resources.ready,
@@ -643,11 +650,13 @@ fn phases_derive_from_the_memory_request_and_snapshot_exactly() {
             &effective.resources.wake,
         ] {
             // The request and the engine's CUDA context and graphs.
-            assert_eq!(
-                phase.allocations[0].bytes,
-                12 * GIB + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
-                "{residency}"
-            );
+            if !std::ptr::eq(phase, &effective.resources.cold) {
+                assert_eq!(
+                    phase.allocations[0].bytes,
+                    12 * GIB + overhead,
+                    "{residency}"
+                );
+            }
             assert_eq!(phase.allocations[0].domain, "unified");
             assert_eq!(phase.devices.len(), 1);
         }
