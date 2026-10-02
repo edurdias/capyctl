@@ -1,5 +1,35 @@
 # Current implementation and launch status
 
+## vLLM 0.30 live findings fixed — 2026-10-02 (branch `fix/vllm-030-findings`)
+
+Four findings from the Qwen3.8-27B NVFP4 runs on vLLM 0.30.0 and SGLang 0.5.20:
+
+1. **vLLM's `reasoning` delta.** vLLM 0.29 and 0.30 stream a trace as
+   `delta.reasoning`; the streamed-delta allowlist named only
+   `reasoning_content`, so with `--reasoning-parser` the readiness probe failed
+   (`chat terminal result unverified`) and the engine was stopped. `reasoning` is
+   now relayed unchanged, collected under its own name, and counts as a probe
+   answer.
+2. **Draft model memory** (ADR 0014 amendment A6). The draft model's weight files
+   are counted with the checkpoint's, so the request, KV cache and startup
+   placeholder cover it.
+3. **First-start Initialize window** (ADR 0014 amendment A7). vLLM and SGLang
+   derive Initialize as the load term plus a 480 s first-start allowance.
+4. **Engine logs.** Behaviour kept, docs corrected: vLLM and TensorFold output is
+   kept owner-only (launch-failure summaries read it); SGLang's is discarded once
+   SGLang is imported unless `--debug-engine-logs`, so its file is empty.
+
+Live on host B (standalone, fresh 0700 state and config directories): vLLM 0.30
+Qwen3-4B with `--reasoning-parser qwen3` reached Ready and streamed 199
+`reasoning` deltas through CapyCTL; the collected response carried `reasoning`.
+Derived Initialize 690 s. Qwen3.8-27B NVFP4 with DFlash2: weights recorded
+25.77 GB (checkpoint plus draft model), cold 49.25 GiB, first-start peak
+50.46 GiB (1.2 GiB above the placeholder, CUDA graphs), second start reserved the
+measured peak and peaked at 50.18 GiB, steady 48.97 GiB against a 49.25 GiB
+Ready charge; warmup 235 s first, 79 s next; derived Initialize 860 s. SGLang
+Qwen3-4B: Ready, log file 0 bytes. Cleanup complete. CPU and Fake-engine tests
+are not qualification.
+
 ## vLLM 0.30.0 verified — 2026-10-02 (branch `feat/vllm-0.30`)
 
 vLLM 0.30.0 joins 0.29.0 in the verified set (ADR 0018), so `engine add`
