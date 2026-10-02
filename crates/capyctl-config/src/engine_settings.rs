@@ -1081,11 +1081,9 @@ mod tests {
         assert!(error.detail.contains("toolchain_missing"), "{error}");
         assert!(error.detail.contains("ninja"), "{error}");
         assert!(error.detail.contains("--cuda-home"), "{error}");
-        use std::os::unix::fs::PermissionsExt;
         for tool in ["ninja", "nvcc", "c++"] {
             let path = bin.join(tool);
-            std::fs::write(&path, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&path, "#!/bin/sh\n", 0o755).unwrap();
         }
         let mut document = json!({});
         apply_to_host_with(&mut document, &settings, &|_, _| unreachable!(), &search).unwrap();

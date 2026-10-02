@@ -4,12 +4,15 @@
 //! loopback, with that launch's native key, and reports the gauges with the
 //! ingress in-flight count over the control session as W3 `ReportLoad`.
 //!
-//! A sample is a routing hint only: never readiness, admission or release
-//! evidence, never journaled. Metric names are pinned to the recorded engine
+//! A sample is a routing hint, never readiness or admission evidence and never
+//! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
+//! evidence after a restart or a hang-up. A TensorFold sample folds in the
+//! engine's unkeyed `/health`, so it reads idle only when both agree. Metric names are pinned to the recorded engine
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
 use crate::ingress::{Ingress, LoadTarget};
+use capyctl_adapters::tensorfold::http::HealthReport;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
 use capyctl_protocol::{
     pb,
@@ -137,7 +140,7 @@ fn usage_ppm(text: &str, name: &str) -> Option<u32> {
     (usage <= 1.0)
         .then(|| ((usage * f64::from(KV_USAGE_PPM_FULL)).round() as u32).min(KV_USAGE_PPM_FULL))
 }
-/// TensorFold 0.6.0 `tensorfold/server/metrics.py`. The KV ratio has one
+/// TensorFold 0.6.0 and 0.6.1 `tensorfold/server/metrics.py`. The KV ratio has one
 /// series per stream pool; the most pressured pool counts.
 const TENSORFOLD: Family = Family {
     running: "tensorfold:requests_running",
@@ -156,7 +159,12 @@ fn family_load(text: &str, family: &Family) -> Option<EngineLoad> {
 type HistogramTable = &'static [(&'static str, &'static str)];
 
 /// The one family whose three gauges parse, with its name and histograms.
+/// TensorFold 0.6.1 also mirrors its values under vLLM names; its own
+/// `tensorfold:` families win so the mirrors are never read or double counted.
 fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
+    if let Some(load) = family_load(text, &TENSORFOLD) {
+        return Some(("tensorfold", load, TENSORFOLD_HISTOGRAMS));
+    }
     let found: Vec<_> = [
         ("vllm", &VLLM, VLLM_HISTOGRAMS),
         ("sglang", &SGLANG, SGLANG_HISTOGRAMS),
@@ -216,7 +224,7 @@ const SGLANG_HISTOGRAMS: &[(&str, &str)] = &[
         "sglang:inter_token_latency_seconds",
     ),
 ];
-/// TensorFold 0.6.0 has no queue, prefill, decode or inter-token histogram.
+/// TensorFold 0.6.0 and 0.6.1 have no queue, prefill, decode or inter-token histogram.
 const TENSORFOLD_HISTOGRAMS: &[(&str, &str)] = &[
     (
         "engine_time_to_first_token",
@@ -373,6 +381,20 @@ pub fn parse_engine_histograms(text: &str) -> Option<(&'static str, Vec<(String,
     Some((engine, histograms))
 }
 
+/// T41, ADR 0023 §6 (2026-10-01): TensorFold's gauges read idle only when
+/// its `/health` agrees. Anything but an idle health (busy, disagreeing
+/// counters, unreadable) keeps at least one request running in the sample.
+pub fn fold_tensorfold_health(load: EngineLoad, health: Option<&HealthReport>) -> EngineLoad {
+    if health.and_then(HealthReport::idle) == Some(true) {
+        load
+    } else {
+        EngineLoad {
+            running: load.running.max(1),
+            ..load
+        }
+    }
+}
+
 /// Previous cumulative engine histograms, keyed by scope and series, so each
 /// report carries only what was observed since the last one.
 type EngineBaselines = HashMap<(String, u32, i64, String), Histogram>;
@@ -385,6 +407,18 @@ pub struct LoadReporter {
     interval: Duration,
     /// SPEC §17: bounded by the Ready scopes of this tick (pruned each tick).
     baselines: Mutex<EngineBaselines>,
+}
+
+/// A response body, refused as soon as it passes the scrape size bound.
+async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_METRICS_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
 }
 
 impl LoadReporter {
@@ -416,7 +450,7 @@ impl LoadReporter {
             return None;
         }
         let read = async {
-            let mut response = self
+            let response = self
                 .client
                 .get(format!("http://{}/metrics", target.target))
                 .bearer_auth(hex::encode(target.native))
@@ -426,14 +460,37 @@ impl LoadReporter {
             if response.status() != reqwest::StatusCode::OK {
                 return None;
             }
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.ok()? {
-                if body.len() + chunk.len() > MAX_METRICS_BYTES {
-                    return None;
-                }
-                body.extend_from_slice(&chunk);
+            String::from_utf8(bounded_body(response).await?).ok()
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// TensorFold's `/health` on the same loopback target, unkeyed (the
+    /// engine has no key there), within the scrape bound.
+    async fn health(&self, target: &LoadTarget) -> Option<HealthReport> {
+        if !target.target.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = self
+                .client
+                .get(format!("http://{}/health", target.target))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
             }
-            String::from_utf8(body).ok()
+            let body = bounded_body(response).await?;
+            let body: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            Some(HealthReport {
+                ok: body["ok"] == true,
+                busy: body["busy"].as_bool()?,
+                requests_running: body["requests_running"].as_u64()?,
+            })
         };
         tokio::time::timeout(SCRAPE_TIMEOUT, read)
             .await
@@ -452,6 +509,16 @@ impl LoadReporter {
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
         let scraped = futures::future::join_all(targets.iter().map(|t| self.scrape(t))).await;
+        // Only a TensorFold scrape is folded with its health.
+        let healths = futures::future::join_all(targets.iter().zip(&scraped).map(
+            |(target, body)| async move {
+                match body.as_deref().and_then(family_of) {
+                    Some(("tensorfold", ..)) => Some(self.health(target).await),
+                    _ => None,
+                }
+            },
+        ))
+        .await;
         let mut baselines = self.baselines.lock().unwrap_or_else(|p| p.into_inner());
         // SPEC §17: baselines of scopes no longer Ready are dropped.
         baselines.retain(|(deployment, instance, generation, _), _| {
@@ -464,8 +531,15 @@ impl LoadReporter {
         let mut samples: Vec<(u32, LoadSample)> = targets
             .into_iter()
             .zip(scraped)
-            .map(|(target, body)| {
-                let engine = body.as_deref().and_then(parse_engine_load);
+            .zip(healths)
+            .map(|((target, body), health)| {
+                let engine =
+                    body.as_deref()
+                        .and_then(parse_engine_load)
+                        .map(|load| match &health {
+                            Some(health) => fold_tensorfold_health(load, health.as_ref()),
+                            None => load,
+                        });
                 let latency = self.latency(&target, body.as_deref(), &mut baselines);
                 (
                     target.scope.instance_index,

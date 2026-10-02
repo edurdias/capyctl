@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 /// from `VLLM_API_KEY`, every `/v1` route keyed, one forked worker child in the
 /// same process group, SSE chat. Each start appends its pid to `launches.log`,
 /// which is how the tests tell a re-attached engine from a relaunched one. A chat
-/// whose last message is `slow` or `slower` streams for about 3 s or 12 s.
+/// whose last message is `slow` or `slower` streams for about 3 s or 12 s. A
+/// stream whose connection closed under it is logged in `aborts.log`.
 const FAKE_VLLM: &str = r#"
 import json, os, sys, time, threading, http.server
 args = sys.argv[1:]
@@ -101,16 +102,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            self.wfile.write(("data: " + json.dumps(chunk({"role": "assistant", "content": ""}, None)) + "\n\n").encode())
-            self.wfile.flush()
-            for i in range(count):
-                if count > 1:
-                    time.sleep(0.1)
-                self.wfile.write(("data: " + json.dumps(chunk({"content": "fake-vllm-answer " + str(i) + " "}, None)) + "\n\n").encode())
+            try:
+                self.wfile.write(("data: " + json.dumps(chunk({"role": "assistant", "content": ""}, None)) + "\n\n").encode())
                 self.wfile.flush()
-            self.wfile.write(("data: " + json.dumps(chunk({}, "stop")) + "\n\n").encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+                for i in range(count):
+                    if count > 1:
+                        time.sleep(0.1)
+                    self.wfile.write(("data: " + json.dumps(chunk({"content": "fake-vllm-answer " + str(i) + " "}, None)) + "\n\n").encode())
+                    self.wfile.flush()
+                self.wfile.write(("data: " + json.dumps(chunk({}, "stop")) + "\n\n").encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                with open(os.path.join(here, "aborts.log"), "a") as f:
+                    f.write("aborted\n")
+                return
         else:
             self.send_json({"id": "c1", "object": "chat.completion", "created": 1, "model": served,
                             "choices": [{"index": 0, "finish_reason": "stop",
@@ -180,8 +186,12 @@ impl Installation {
         let bin = root.path().join("engine");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
-        std::fs::write(&engine, format!("#!{}\n{FAKE_VLLM}", python3().display())).unwrap();
-        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        capyctl_config::test_support::write_executable(
+            &engine,
+            format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
+        )
+        .unwrap();
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(runtime.join("capyctl_vllm_guard.py"), "# test guard\n").unwrap();
@@ -609,7 +619,11 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     let first = streaming.chunk().await.unwrap().unwrap();
     assert!(!first.is_empty());
     role.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // T18: late work is refused with a retryable answer once admission closed.
     let refused = chat_request(&installation, "hello", false)
@@ -753,6 +767,74 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     assert!(status.success(), "{status:?}");
     assert_eq!(report["engines"], "retained", "{report}");
     assert!(alive(launches[1]));
+}
+
+/// T17 T38, SPEC §10 (amended 2026-10-01): a client that hangs up mid-stream
+/// cancels the engine's request; the lease closes on the engine's own
+/// counters and a stop follows at once instead of after the whole answer.
+/// This host opted out of deep parking (its deployment is restart_only, so a
+/// park is refused), so the Stop's drain is what waits on the lease here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hang_up_cancels_the_engine_request_and_a_stop_follows() {
+    let installation = Installation::new();
+    let role = installation.start(Some(20));
+    let deployed = deploy(&installation);
+    assert_eq!(deployed["deployment"]["observed_state"], "ready");
+    let deployment = deployed["deployment"]["id"].as_str().unwrap().to_owned();
+    served_within(&installation, Duration::from_secs(10)).await;
+    let aborts = installation.root.path().join("engine/aborts.log");
+
+    // `slower` streams for about 12 s; the client reads one chunk and leaves.
+    let mut streaming = chat_request(&installation, "slower", true)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), 200);
+    assert!(!streaming.chunk().await.unwrap().unwrap().is_empty());
+    drop(streaming);
+    let dropped = Instant::now();
+
+    while std::fs::read_to_string(&aborts)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        != 1
+    {
+        assert!(
+            dropped.elapsed() < Duration::from_secs(3),
+            "the engine saw its request cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Without the cancellation the Stop's drain waits for the whole answer.
+    let stopped = installation.cli(&["stop", "deployment", &deployment, "--format", "json"]);
+    assert!(
+        stopped.status.success(),
+        "stop: {} {}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    loop {
+        let status = installation.cli(&["status", "deployment", &deployment, "--format", "json"]);
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        if status["observed_state"] == "stopped" {
+            break;
+        }
+        assert!(
+            dropped.elapsed() < Duration::from_secs(5),
+            "the stop followed the hang-up at once: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&aborts).unwrap().lines().count(),
+        1,
+        "nothing was replayed"
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(40));
+    assert!(status.success(), "{status:?}");
 }
 
 /// SPEC §4.3, §6: `capyctl drain standalone` bounds its drain at 900 s, and a
@@ -1412,13 +1494,12 @@ impl TwoRoles {
         // test machine can satisfy.
         let engine = path.join("engine");
         std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(
-            engine.join("vllm"),
+        capyctl_config::test_support::write_executable(
+            &engine.join("vllm"),
             format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(engine.join("vllm"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         let runtime = path.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1696,7 +1777,11 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
     assert_eq!(streaming.status(), 200);
     streaming.chunk().await.unwrap().unwrap();
     host.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     // Phase B follow-up (T17 T18 T38): the host told the controller first, so a
     // new request while the host drains is a retryable 503, never a 500.
     let refused = roles.chat("hello", false).send().await.unwrap();
@@ -1733,7 +1818,11 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
     assert_eq!(streaming.status(), 200);
     streaming.chunk().await.unwrap().unwrap();
     server.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let refused = roles.chat("hello", false).send().await.unwrap();
     assert_eq!(refused.status(), 503);
     let refusal: Value = refused.json().await.unwrap();

@@ -15,6 +15,8 @@ struct Forward {
     chunk_bytes: usize,
     finish: Result<StreamEnded, AdapterError>,
     finish_gate: Option<Arc<Notify>>,
+    /// Return `Cancelled` at the first failed send, as the real forwarder does.
+    cancel_on_failure: bool,
 }
 
 #[async_trait]
@@ -37,6 +39,9 @@ impl ChatForward for Forward {
                 .await
                 .is_err()
             {
+                if self.cancel_on_failure {
+                    return Ok(StreamEnded::Cancelled);
+                }
                 break;
             }
         }
@@ -73,6 +78,7 @@ async fn unverified_backend_end_never_sends_done_or_releases_accounting() {
                 chunk_bytes: 4,
                 finish,
                 finish_gate: None,
+                cancel_on_failure: false,
             },
             &counts,
         );
@@ -98,6 +104,7 @@ async fn slow_consumer_receives_all_chunks_before_success() {
             chunk_bytes: 4,
             finish: Ok(StreamEnded::Completed),
             finish_gate: Some(gate.clone()),
+            cancel_on_failure: false,
         },
         &counts,
     );
@@ -134,6 +141,7 @@ async fn oversized_chunk_fails_delivery_without_fake_terminal() {
             chunk_bytes: 65536,
             finish: Ok(StreamEnded::Completed),
             finish_gate: None,
+            cancel_on_failure: false,
         },
         &counts,
     );
@@ -153,6 +161,7 @@ async fn successful_bounded_delivery_is_ordered_and_releases_once() {
             chunk_bytes: 1,
             finish: Ok(StreamEnded::Completed),
             finish_gate: None,
+            cancel_on_failure: false,
         },
         &counts,
     );
@@ -196,6 +205,7 @@ async fn ready_deps(pending: bool) -> (capyctl_router::RouterDeps, String) {
         chunk_bytes: 0,
         finish: Ok(StreamEnded::Completed),
         finish_gate: pending.then(|| Arc::new(Notify::new())),
+        cancel_on_failure: false,
     });
     (
         capyctl_router::RouterDeps {
@@ -245,6 +255,7 @@ async fn full_final_queue_waits_for_delivery_of_done() {
             chunk_bytes: 1,
             finish: Ok(StreamEnded::Completed),
             finish_gate: None,
+            cancel_on_failure: false,
         },
         &counts,
     );
@@ -263,7 +274,7 @@ async fn full_final_queue_waits_for_delivery_of_done() {
 }
 
 #[tokio::test]
-async fn client_disconnect_waits_for_backend_completion_before_release() {
+async fn a_backend_that_completes_after_a_hang_up_releases_on_completion() {
     let counts = Arc::new(InFlight::default());
     let gate = Arc::new(Notify::new());
     drop(response(
@@ -272,12 +283,13 @@ async fn client_disconnect_waits_for_backend_completion_before_release() {
             chunk_bytes: 1,
             finish: Ok(StreamEnded::Completed),
             finish_gate: Some(gate.clone()),
+            cancel_on_failure: false,
         },
         &counts,
     ));
     assert_eq!(counts.current("d"), 1);
     gate.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while counts.current("d") != 0 {
             tokio::task::yield_now().await;
         }
@@ -295,6 +307,7 @@ async fn stalled_delivery_times_out_without_done_but_settles_verified_backend() 
             chunk_bytes: 1,
             finish: Ok(StreamEnded::Completed),
             finish_gate: None,
+            cancel_on_failure: false,
         },
         &counts,
     );
@@ -420,8 +433,10 @@ async fn progressing_stream_is_never_cut_at_a_fixed_wall_time() {
             deliver: true,
         },
         &counts,
-        300,
-        400,
+        // The first event is due well inside the 1.2 s the stream runs, and
+        // the idle bound leaves a slow runner room between 100 ms chunks.
+        500,
+        1_000,
     );
     let started = std::time::Instant::now();
     let bytes = axum::body::to_bytes(response.into_body(), 4096)
@@ -493,29 +508,43 @@ async fn silent_stream_is_cut_at_the_request_deadline() {
     assert_eq!(counts.current("d"), 1);
 }
 
-/// SPEC §10: after the client left, backend progress still counts; a drain
-/// that keeps producing is not cut by the idle bound and its completion
-/// releases the charge.
-// T17
+/// SPEC §10 (amended 2026-10-01): a hung-up stream is cancelled upstream.
+/// Without a durable ledger the in-memory slot is its only record, so it
+/// stays charged, as for an uncertain end.
+// T17 T38
 #[tokio::test]
-async fn draining_stream_after_disconnect_is_bounded_by_backend_progress() {
+async fn a_hung_up_stream_without_a_ledger_keeps_its_slot() {
     let counts = Arc::new(InFlight::default());
-    drop(paced(
-        Paced {
-            chunks: 12,
-            gap: std::time::Duration::from_millis(100),
-            stall: std::time::Duration::ZERO,
-            deliver: false,
+    let response = response(
+        Forward {
+            chunks: 100,
+            chunk_bytes: 1,
+            finish: Ok(StreamEnded::Completed),
+            finish_gate: None,
+            cancel_on_failure: true,
         },
         &counts,
-        300,
-        400,
-    ));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while counts.current("d") != 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the drain completes and releases");
+    );
+    let mut body = response.into_body().into_data_stream();
+    assert!(body.next().await.unwrap().is_ok());
+    drop(body);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(counts.current("d"), 1);
+}
+
+// T17 T38, SPEC §10 (amended): the lease of a stream whose client hung up
+// is cancelling, never completed; a cut stream stays uncertain.
+#[test]
+fn a_hung_up_stream_closes_its_lease_as_cancelling() {
+    use capyctl_controller::LeaseEnd;
+    use capyctl_router::stream::stream_lease_end;
+    assert_eq!(
+        stream_lease_end(&Ok(Ok(StreamEnded::Cancelled))),
+        LeaseEnd::Cancelling
+    );
+    assert_eq!(
+        stream_lease_end(&Ok(Ok(StreamEnded::Completed))),
+        LeaseEnd::Completed
+    );
+    assert_eq!(stream_lease_end(&Err(())), LeaseEnd::Uncertain);
 }

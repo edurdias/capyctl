@@ -243,6 +243,26 @@ impl LoadTable {
     }
 }
 
+/// SPEC §10 (W12; amended 2026-10-01): a host sample that proves the launch's
+/// engine and ingress hold no work: this launch, fresh, taken at or after
+/// `after_ms`, nothing in flight at the ingress, the engine scrape read 0
+/// running and 0 waiting. Missing gauges are unknown, never zero.
+pub fn proves_quiescence(
+    view: &LoadView,
+    host_id: &str,
+    owned_handle: &str,
+    generation: i64,
+    after_ms: i64,
+) -> bool {
+    view.host_id == host_id
+        && view.owned_handle == owned_handle
+        && view.generation == generation
+        && view.fresh
+        && view.sampled_at_ms >= after_ms
+        && view.ingress_in_flight == 0
+        && view.engine_queue() == Some(0)
+}
+
 fn view(key: &InstanceKey, entry: &Entry, age_ms: i64) -> LoadView {
     LoadView {
         deployment_id: key.deployment_id.clone(),
@@ -283,6 +303,60 @@ mod tests {
         LoadReport {
             host_id: host.into(),
             samples,
+        }
+    }
+
+    // T17, SPEC §10 (W12; amended 2026-10-01): only a fresh sample of this
+    // launch, taken after the question, with no work anywhere, proves quiescence.
+    #[test]
+    fn only_a_fresh_idle_sample_after_the_question_proves_quiescence() {
+        let idle = LoadView {
+            deployment_id: "d".into(),
+            generation: 2,
+            host_id: "h1".into(),
+            owned_handle: "launch".into(),
+            sampled_at_ms: NOW,
+            age_ms: 0,
+            fresh: true,
+            ingress_in_flight: 0,
+            engine: Some(EngineGauges {
+                running: 0,
+                waiting: 0,
+                kv_usage_ppm: 0,
+            }),
+        };
+        let proves = |view: &LoadView| proves_quiescence(view, "h1", "launch", 2, NOW);
+        assert!(proves(&idle));
+        let older = LoadView {
+            sampled_at_ms: NOW - 1,
+            ..idle.clone()
+        };
+        let stale = LoadView {
+            fresh: false,
+            ..idle.clone()
+        };
+        let in_flight = LoadView {
+            ingress_in_flight: 1,
+            ..idle.clone()
+        };
+        let unscraped = LoadView {
+            engine: None,
+            ..idle.clone()
+        };
+        let waiting = LoadView {
+            engine: Some(EngineGauges {
+                running: 0,
+                waiting: 1,
+                kv_usage_ppm: 0,
+            }),
+            ..idle.clone()
+        };
+        let other_launch = LoadView {
+            owned_handle: "other".into(),
+            ..idle.clone()
+        };
+        for view in [older, stale, in_flight, unscraped, waiting, other_launch] {
+            assert!(!proves(&view), "{view:?}");
         }
     }
 

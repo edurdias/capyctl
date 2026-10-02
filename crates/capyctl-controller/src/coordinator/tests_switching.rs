@@ -14,6 +14,11 @@ use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milesto
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicI64;
 
+// SPEC §10 (amended 2026-10-01): cancelling leases of hung-up requests, on
+// this lab's engines.
+#[path = "tests_cancellation.rs"]
+mod cancellation;
+
 /// Every deployment's engine: Initialize through the Fake lifecycle, park and
 /// restore answered with the facts a remote host proves (W4).
 struct Scripted {
@@ -26,6 +31,16 @@ struct Scripted {
     /// Refuse every park before any effect (an engine without a verified
     /// release path).
     refuse_park: AtomicBool,
+    /// SPEC §10 (amended 2026-10-01): whether the engine's own counters read
+    /// no running and no waiting request.
+    quiet: AtomicBool,
+    /// The `after_ms` of every quiescence question.
+    asked: Mutex<Vec<i64>>,
+    /// When set, the time of the engine's last idle sample: a question is
+    /// answered quiescent only when that sample is at or after its `after_ms`.
+    idle_at: Mutex<Option<i64>>,
+    /// The engine never answers a quiescence question.
+    wedged: AtomicBool,
 }
 
 impl Scripted {
@@ -35,6 +50,10 @@ impl Scripted {
             clock,
             calls: Mutex::new(vec![]),
             refuse_park: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
+            asked: Mutex::new(vec![]),
+            idle_at: Mutex::new(None),
+            wedged: AtomicBool::new(false),
         })
     }
     fn calls(&self, action: RuntimeAction, deployment: &str) -> usize {
@@ -129,6 +148,16 @@ impl EngineAdapter for Scripted {
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
+    }
+    async fn engine_quiescent(&self, _: &MemberRef, after_ms: i64) -> bool {
+        self.asked.lock().unwrap().push(after_ms);
+        if self.wedged.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(at) = *self.idle_at.lock().unwrap() {
+            return at >= after_ms;
+        }
+        self.quiet.load(Ordering::SeqCst)
     }
 }
 
@@ -1123,7 +1152,9 @@ async fn a_stop_terminates_after_its_drain_bound_and_the_lease_settles_on_eviden
         50,
         None,
         CoordinatorOptions {
-            stop_drain_timeout: Duration::from_millis(300),
+            // Long next to the 150 ms check below, so a slow runner still
+            // checks inside the bound.
+            stop_drain_timeout: Duration::from_millis(1_000),
             ..Default::default()
         },
     )
@@ -1157,7 +1188,7 @@ async fn a_stop_terminates_after_its_drain_bound_and_the_lease_settles_on_eviden
     assert_eq!(leases(&lab, &id), 1, "the lease is kept while draining");
     until_succeeded(&lab, stop.operation_id(), &id).await;
     assert!(
-        started.elapsed() >= Duration::from_millis(300),
+        started.elapsed() >= Duration::from_millis(1_000),
         "terminated before the drain bound"
     );
     assert_eq!(

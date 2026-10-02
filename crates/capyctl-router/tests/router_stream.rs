@@ -100,8 +100,8 @@ async fn streaming_chat_returns_sse_events_in_order() {
 #[tokio::test]
 async fn abandoned_request_keeps_inflight_until_confirmed() {
     let inflight = InFlight::default();
-    // Client disconnect = abandon; accounting stays conservative until the
-    // backend completes or the cancellation is confirmed.
+    // Client disconnect = abandon; the guard is held until the backend
+    // completes or the engine reports quiescence (SPEC §10, amended 2026-10-01).
     let guard = inflight.guard("d1");
     assert_eq!(inflight.current("d1"), 1);
     // Simulate the client leaving mid-stream: the request is abandoned but

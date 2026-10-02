@@ -305,6 +305,19 @@ mod tests {
         }
     }
 
+    /// The group once the leader has started its worker, which a slow runner
+    /// does later.
+    fn until_group(tool: &DurableProcessLaunch, api: &ProcessIdentity) -> Vec<ProcessIdentity> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let members = tool.observe_group(api).unwrap();
+            if members.len() >= 2 || Instant::now() >= deadline {
+                return members;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The group is enumerated with the API process first and workers in start
     /// order, and terminating it leaves nothing behind.
     // T12: owned descendants are handled, not just the process that was launched.
@@ -312,8 +325,7 @@ mod tests {
     fn a_group_is_observed_and_terminated_completely() {
         let tool = DurableProcessLaunch::new(Arc::new(Accept));
         let api = tool.spawn_durable("grp", &sleeper(60)).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let members = tool.observe_group(&api).unwrap();
+        let members = until_group(&tool, &api);
         assert_eq!(members[0].role, "api");
         assert!(members.len() >= 2, "{members:?}");
         assert_eq!(members[1].role, "worker-0");
@@ -333,8 +345,7 @@ mod tests {
     fn a_worker_that_outlives_its_leader_is_still_terminated() {
         let tool = DurableProcessLaunch::new(Arc::new(Accept));
         let api = tool.spawn_durable("outlives", &sleeper(60)).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let members = tool.observe_group(&api).unwrap();
+        let members = until_group(&tool, &api);
         assert!(members.len() >= 2, "{members:?}");
         // End the leader alone. Its workers keep running in the group it started.
         nix::sys::signal::kill(

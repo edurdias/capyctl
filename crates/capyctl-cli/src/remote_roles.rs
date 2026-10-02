@@ -1134,12 +1134,18 @@ async fn serve_host(
     // it, naming the owner-only identity file and never its contents.
     print!(
         "{}",
-        crate::role_text::banner(&json!({"role": "host", "ready": true,
-            "version": env!("CARGO_PKG_VERSION"),
-            "host_id": host,
-            "state_dir": config.state_dir,
-            "ingress": config.ingress.as_ref().map(|settings| settings.bind.to_string()),
-            "credentials": config.identity_dir.join(capyctl_agent::enrollment::HOST_FILE)}))
+        crate::role_text::banner(&host_banner(
+            &host,
+            &config.state_dir,
+            config
+                .ingress
+                .as_ref()
+                .map(|settings| settings.bind.to_string()),
+            &config
+                .identity_dir
+                .join(capyctl_agent::enrollment::HOST_FILE),
+            &config.document,
+        ))
     );
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
@@ -1630,4 +1636,55 @@ pub async fn management_call(
         });
     }
     serde_json::from_slice(&bytes).map_err(|_| unavailable())
+}
+
+/// The host role's ready banner; ADR 0018 A2: it names its engines, or the
+/// command that adds one.
+fn host_banner(
+    host: &str,
+    state_dir: &std::path::Path,
+    ingress: Option<String>,
+    credentials: &std::path::Path,
+    document: &serde_json::Value,
+) -> serde_json::Value {
+    let mut profiles: Vec<&str> = document["runtime_profiles"]
+        .as_object()
+        .map(|profiles| profiles.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    profiles.sort_unstable();
+    json!({"role": "host", "ready": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "host_id": host,
+        "state_dir": state_dir,
+        "ingress": ingress,
+        "credentials": credentials,
+        "profiles": profiles})
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    // T02: a host with no engine names the command that adds one; one with
+    // engines names them.
+    #[test]
+    fn a_host_banner_names_its_engines_or_engine_add() {
+        let banner = |document: serde_json::Value| {
+            crate::role_text::banner_text(&host_banner(
+                "h1",
+                std::path::Path::new("/s"),
+                None,
+                std::path::Path::new("/s/identity/host"),
+                &document,
+            ))
+        };
+        let empty = banner(json!({"runtime_profiles": {}}));
+        assert!(
+            empty.contains("Engines") && empty.contains("capyctl engine add"),
+            "{empty}"
+        );
+        let named = banner(json!({"runtime_profiles": {"sglang": {}, "vllm": {}}}));
+        assert!(named.contains("sglang, vllm"), "{named}");
+        assert!(!named.contains("engine add"), "{named}");
+    }
 }

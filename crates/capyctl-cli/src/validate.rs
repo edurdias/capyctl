@@ -152,6 +152,9 @@ pub fn validate_config_at(
             // Owner decision 2026-09-23: a declared startup peak.
             capyctl_config::effective::validate_declared_startup(&deployment)
                 .map_err(|e| named(file, Some(kind), &e))?;
+            // SPEC §15.3, ADR 0023 §4: `resources` is decoded as the server decodes it.
+            capyctl_config::effective::validate_declared_resources(&deployment)
+                .map_err(|e| named(file, Some(kind), &e))?;
             match host {
                 // Owner decision 2026-09-25: the document with the defaults a
                 // minimal file leaves out, as deploy sends it.
@@ -165,7 +168,7 @@ pub fn validate_config_at(
                         "document": deployment,
                     });
                     let mut unchecked = vec![
-                        "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts, and to see the host's defaults",
+                        "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, the host's devices and capacity, and timeouts, and to see the host's defaults; a TensorFold profile under another name than tensorfold is recognised only there",
                     ];
                     unchecked.extend_from_slice(REQUIRES_SERVER);
                     out["requires_server"] = json!(unchecked);

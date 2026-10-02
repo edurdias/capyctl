@@ -1878,7 +1878,9 @@ async fn store_work_for_a_result_does_not_hold_the_session_table() {
         let host = host.clone();
         std::thread::spawn(move || answer.send(sessions.current_session(&host)));
     }
-    let current = answered.recv_timeout(Duration::from_secs(1));
+    // The retain holds for up to 10 s; a table held by it would answer only
+    // then.
+    let current = answered.recv_timeout(Duration::from_secs(5));
     release.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         current

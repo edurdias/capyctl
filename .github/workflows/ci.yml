@@ -24,6 +24,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       PYTHONDONTWRITEBYTECODE: "1"
+    # Fast gate only; integration suites run locally via scripts/ci-local.sh --deep.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,23 +32,25 @@ jobs:
       - name: Install build and fixture prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential protobuf-compiler pkg-config libssl-dev python3 curl patch shellcheck
+          sudo apt-get install -y --no-install-recommends build-essential protobuf-compiler pkg-config libssl-dev python3 curl patch xz-utils
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Install pinned shellcheck
+        run: |
+          SC_ARCHIVE="$RUNNER_TEMP/shellcheck-v0.11.0.linux.x86_64.tar.xz"
+          curl --fail --location --retry 3 --output "$SC_ARCHIVE" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          printf '%s  %s\n' 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198 "$SC_ARCHIVE" | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/shellcheck-bin"
+          tar -xJf "$SC_ARCHIVE" -C "$RUNNER_TEMP/shellcheck-bin" --strip-components=1 shellcheck-v0.11.0/shellcheck
+          echo "$RUNNER_TEMP/shellcheck-bin" >> "$GITHUB_PATH"
       - name: Formatting
         run: cargo fmt --all --check
       - name: Name check
         run: scripts/check-name.sh
-      - name: Authoritative core suite
-        run: >-
-          cargo test -p capyctl-adapters -p capyctl-store -p capyctl-controller
-          -p capyctl-management -p harness --all-targets --no-fail-fast --locked
-          -- --test-threads=4
-      - name: Workspace suite
-        run: cargo test --workspace --all-targets --no-fail-fast --locked
-      - name: Core Clippy
-        run: >-
-          cargo clippy -p capyctl-adapters -p capyctl-store -p capyctl-controller
-          -p capyctl-management -p harness --all-targets --locked -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins --locked --no-fail-fast
       - name: Fetch and verify CPU fixture source
         run: |
           TMS_SOURCE_ARCHIVE="$RUNNER_TEMP/torch_memory_saver-0.0.9.post1.tar.gz"

@@ -593,6 +593,47 @@ impl EngineAdapter for RemoteEngine {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        // SPEC §10 (W12; amended 2026-10-01): the host's load report for this
+        // launch, which folds TensorFold's /health in, is the only evidence.
+        let b = &self.binding;
+        if member.member_id != b.plan.binding_id {
+            return false;
+        }
+        let launch = {
+            let Ok(owner) = self.owner.lock() else {
+                return false;
+            };
+            // Not the Ready list: a park or stop accepted after the hang-up
+            // drains on this lease while the instance is no longer Ready.
+            let Ok(launch) = owner
+                .store()
+                .remote_live_launch(owner.session(), &b.plan.binding_id)
+            else {
+                return false;
+            };
+            launch
+        };
+        let Some(launch) = launch.filter(|l| l.host_id == b.host_id) else {
+            return false;
+        };
+        let key = crate::load_table::InstanceKey::new(
+            launch.fence.deployment_id.clone(),
+            launch.fence.generation,
+        );
+        self.sessions
+            .load_table()
+            .sample_at(&key, capyctl_protocol::now_unix_ms())
+            .is_some_and(|view| {
+                crate::load_table::proves_quiescence(
+                    &view,
+                    &launch.host_id,
+                    &launch.step_id,
+                    launch.fence.generation,
+                    after_ms,
+                )
+            })
+    }
 }
 async fn cleanup(
     sessions: &AgentSessions,

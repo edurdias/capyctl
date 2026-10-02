@@ -185,6 +185,7 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
         1 << 40,
         Some(&published),
         &HostShape::Unified,
+        capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
     );
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
@@ -256,6 +257,7 @@ fn a_boot_without_an_inventory_publishes_nothing() {
         1 << 40,
         None,
         &HostShape::NoGpu,
+        capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
     );
     assert!(
         host["device_inventory_digest"].is_null(),
@@ -292,6 +294,7 @@ fn a_multi_device_inventory_publishes_the_digest_but_names_no_device() {
         1 << 40,
         Some(&published),
         &HostShape::Unified,
+        capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
     );
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
@@ -378,6 +381,7 @@ fn a_two_device_inventory_publishes_both_uuids_and_the_same_digest() {
         1 << 40,
         Some(&published),
         &HostShape::Discrete(observed.devices.clone()),
+        capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
     );
     assert_eq!(host["device_inventory_digest"], DIGEST);
     let devices = &host["resource_policy"]["devices"];
@@ -448,6 +452,7 @@ fn a_sampled_single_device_publishes_gpu0_identically() {
             1 << 40,
             Some(published),
             &HostShape::Unified,
+            capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
         )
     };
     assert_eq!(document(&sampled), document(&unsampled));
@@ -497,6 +502,7 @@ fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() 
             1 << 40,
             Some(&published),
             &HostShape::Unified,
+            capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
         );
         assert_eq!(host["device_inventory_digest"], DIGEST);
         assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());
@@ -524,6 +530,7 @@ fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() 
                 1 << 40,
                 Some(&published),
                 &HostShape::Unified,
+                capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
             ),
         )
         .expect("the host without a UUID still resolves");

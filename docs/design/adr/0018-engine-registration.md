@@ -133,7 +133,7 @@ retirements at start and every 30 s, and its startup publication clears confirme
 retirements of profiles it no longer lists, so a role stopped mid-drain never wedges a name. `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone still
 gives profile `local`; both give `local-vllm` and `local-sglang`. They coexist with added
 profiles; a name collision is refused at start with `profile_exists`. Environment profiles are
-not removable with `engine remove`.
+not removable with `engine remove`. (A2: the last profile may be removed.)
 
 ### 6. Errors
 
@@ -208,3 +208,14 @@ the `local_engine` block itself is not published. The names in
 `engine add` refuses them, and a name declared in `runtime_profiles` or
 `engines.yaml` and also by the local installation is refused at start. A live
 reload carries the start-time settings over (§3): they change on restart only.
+
+## Amendment A2: a role with no engine (owner decision 2026-10-01)
+
+A host or standalone role starts with no profile and publishes an empty profile list. It
+keeps its existing deployments and places none until a profile is published. Its start
+banner and `capyctl status deployment <name>` say to run `capyctl engine add <path>`.
+
+`engine remove` may remove the last registered profile. It retires the profile through §4:
+deployments using it drain and stop first. The `agent_unreachable` rule of §4 stands, so
+the operator starts the role, removes the profile and stops it again. A new deploy that
+names a profile no host publishes still fails fast (§7).

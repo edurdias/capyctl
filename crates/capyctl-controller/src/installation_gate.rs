@@ -280,6 +280,9 @@ impl EngineAdapter for InstallationGate {
     ) -> Option<capyctl_adapters::traits::EngineWork> {
         self.inner.idle_before_signal(member).await
     }
+    async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
+        self.inner.engine_quiescent(member, after_ms).await
+    }
 }
 
 /// Any embedded bindings, carrying the installations the embedded host
@@ -437,5 +440,71 @@ mod tests {
         all.retain(&[python.as_path()]);
         assert!(all.for_executable(&vllm).is_none());
         assert_eq!(all.views().len(), 1);
+    }
+
+    // T17: the gate does not hide the engine's quiescence.
+    #[tokio::test]
+    async fn the_gate_forwards_engine_quiescence() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Quiet;
+        #[async_trait::async_trait]
+        impl EngineAdapter for Quiet {
+            async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn cancel_work(
+                &self,
+                _: &MemberRef,
+                _: &RequestRef,
+                _: bool,
+            ) -> Result<CancellationOutcome, AdapterError> {
+                Err(AdapterError::UnsupportedCapability)
+            }
+            async fn engine_quiescent(&self, _: &MemberRef, _: i64) -> bool {
+                true
+            }
+        }
+        let state = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = Arc::new(std::sync::Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(state.path()).unwrap(),
+        ));
+        let gate = InstallationGate {
+            inner: Arc::new(Quiet),
+            owner,
+            installation: Arc::new(EmbeddedInstallation::register(
+                "local",
+                Engine::Vllm,
+                &state.path().join("vllm"),
+            )),
+            policy: InstallationDrift::Warn,
+            host: "host".into(),
+        };
+        let member = MemberRef {
+            deployment_id: "d".into(),
+            member_id: "b".into(),
+        };
+        assert!(gate.engine_quiescent(&member, 0).await);
     }
 }

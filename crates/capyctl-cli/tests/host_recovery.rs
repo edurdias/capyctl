@@ -221,13 +221,12 @@ impl Cluster {
         ));
         let engine = path.join("engine");
         std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(
-            engine.join("vllm"),
+        capyctl_config::test_support::write_executable(
+            &engine.join("vllm"),
             format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(engine.join("vllm"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         std::os::unix::fs::symlink(python3(), engine.join("python3")).unwrap();
         // SPEC §13.3: the runtime directory the host trusts is its own and
         // writable by it alone.

@@ -187,8 +187,8 @@ resolved reserved fields with the values it rendered; any difference is a closed
 ### 7. Checkpoint identity
 
 The checkpoint digest is `sha256:` over a canonical manifest: every regular file under
-the model directory, sorted by relative path, with size and SHA-256. Symbolic links are
-followed only when they resolve inside the host's model store (Hugging Face snapshot
+the model directory, sorted by relative path, with size and SHA-256. Symbolic links, and chains of up to 8 links (A5), are
+followed only when every hop resolves inside the host's model store (Hugging Face snapshot
 layout). The manifest also supplies weights bytes for §5.
 
 - **Recorded at deploy.** A declared `model.content_fingerprint` is the expectation.
@@ -448,3 +448,21 @@ Consequences: a minimal deployment is always provisional at acceptance, since it
 request derives from weights not yet measured, and activation waits for the digest
 (`checkpoint_digest_pending`). Tests are CPU and Fake-engine tests; nothing here
 qualifies an engine recipe.
+
+## Amendment A5: Hugging Face link chains (owner decision 2026-10-01)
+
+Problem: recent `huggingface_hub` versions store a snapshot file as a link to a shared
+blob, which can itself be a link, so a two-hop chain was refused as `unsafe_file` and the
+model could not be measured.
+
+Rule: a link chain of at most 8 hops is followed. Each hop is resolved lexically against
+the directory holding the current link and opened from the store descriptor with
+`O_NOFOLLOW`. Every hop must stay inside the store and the chain must end at a regular
+file. A directory, an escape from the store, a loop or a ninth hop is `unsafe_file`.
+
+Manifest identity: an entry records the first link's path and the final file's identity
+(size and SHA-256), so digests recorded before this amendment are unchanged.
+
+Gate wording: a checkpoint that cannot be read or resolved reports `could not be measured
+(<reason>)`; `does not match its recorded digest` is kept for a measured digest that
+differs from the recorded one.

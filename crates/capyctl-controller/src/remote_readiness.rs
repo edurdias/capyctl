@@ -503,13 +503,13 @@ impl RemoteReadiness {
 /// successful engine scrape showing nothing running or waiting and nothing in
 /// flight at the ingress. Missing engine gauges are unknown, never zero.
 fn quiescent(view: &LoadView, launch: &RemoteReadyLaunch, probed_at: i64) -> bool {
-    view.host_id == launch.host_id
-        && view.owned_handle == launch.step_id
-        && view.generation == launch.fence.generation
-        && view.fresh
-        && view.sampled_at_ms >= probed_at
-        && view.ingress_in_flight == 0
-        && view.engine_queue() == Some(0)
+    crate::load_table::proves_quiescence(
+        view,
+        &launch.host_id,
+        &launch.step_id,
+        launch.fence.generation,
+        probed_at,
+    )
 }
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {

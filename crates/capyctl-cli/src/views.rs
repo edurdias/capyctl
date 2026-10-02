@@ -216,13 +216,26 @@ fn invite(value: &Value) -> String {
 }
 
 fn validate(value: &Value) -> String {
-    Detail::new(format!(
+    let mut text = Detail::new(format!(
         "{} is a valid {} document",
         s(&value["file"]),
         s(&value["kind"])
     ))
     .row_opt("Resolved against", opt(&value["resolved_against"]))
-    .render()
+    .render();
+    // SPEC §15.3: without a host, say what was not checked.
+    if value["resolved_against"].is_null() {
+        if let Some(items) = value["requires_server"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            text.push_str("\nNot checked\n");
+            for item in items {
+                text.push_str(&format!("  {}\n", s(item)));
+            }
+        }
+    }
+    text
 }
 
 fn published(value: &Value) -> String {

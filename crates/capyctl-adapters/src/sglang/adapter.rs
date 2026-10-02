@@ -692,6 +692,14 @@ impl EngineAdapter for SglangAdapter {
         };
         Ok(Quiescence { quiescent })
     }
+    async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
+        // SPEC §10 (amended 2026-10-01): the engine's own running and queued
+        // gauges, read now with the launch's inference key. No key is unknown.
+        let Some(key) = &self.inference_key else {
+            return false;
+        };
+        crate::sglang::observation::engine_idle(self.base.as_str(), key).await == Ok(true)
+    }
     async fn park(
         &self,
         _member: &MemberRef,

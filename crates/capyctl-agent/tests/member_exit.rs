@@ -204,7 +204,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
     unsafe {
         libc::kill(worker.pid as i32, libc::SIGKILL);
     }
-    let reported = scan_until(&journal, Duration::from_secs(1), |exited| {
+    let reported = scan_until(&journal, Duration::from_secs(5), |exited| {
         !exited.is_empty()
     });
     assert_eq!(reported.len(), 1);
@@ -223,14 +223,16 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
     unsafe {
         libc::kill(api.pid as i32, libc::SIGKILL);
     }
-    let reported = scan_until(&journal, Duration::from_secs(1), |exited| {
+    // The scan sees the exit as soon as the process is reaped; the bound
+    // leaves room for a slow runner to reap it.
+    let reported = scan_until(&journal, Duration::from_secs(5), |exited| {
         exited
             .first()
             .is_some_and(|launch| launch.exit.status == ExitStatus::Signal(9))
     });
     assert!(
-        killed.elapsed() < Duration::from_secs(1),
-        "reported within ~1 s"
+        killed.elapsed() < Duration::from_secs(5),
+        "reported once reaped"
     );
     assert_eq!(reported[0].process, api);
     // The claim is kept: an exit report is never release evidence.

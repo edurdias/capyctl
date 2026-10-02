@@ -614,3 +614,45 @@ fn unknown_weights_are_reported_unknown_not_zero() {
     assert_eq!(effective["residency"], unknown, "{raw}");
     assert_ne!(effective["residency"], "host_backed");
 }
+
+// T03, SPEC §15.3: a resources block the server would refuse fails offline.
+#[test]
+fn an_incomplete_resources_block_fails_without_a_host() {
+    let root = tempfile::tempdir().unwrap();
+    let file = write(
+        root.path(),
+        "d.yaml",
+        "name: m\nengine: vllm\nmodel: toy\nresources:\n  cold:\n    allocations: [{domain: unified, bytes: 32GiB}]\n",
+    );
+    let (code, out, raw) = validate(&["--file", file.to_str().unwrap()]);
+    assert_eq!(code, 2, "{raw}");
+    assert!(raw.contains("resources.cold"), "{out}");
+}
+
+// T03 T41, ADR 0023 §4: a TensorFold deployment without resources fails offline.
+#[test]
+fn a_tensorfold_deployment_without_resources_fails_without_a_host() {
+    let root = tempfile::tempdir().unwrap();
+    let file = write(
+        root.path(),
+        "d.yaml",
+        "name: m\nengine: tensorfold\nmodel: toy\nengine_config: {context_length: 32768}\n",
+    );
+    let (code, _, raw) = validate(&["--file", file.to_str().unwrap()]);
+    assert_eq!(code, 2, "{raw}");
+    assert!(raw.contains("resources"), "{raw}");
+}
+
+// T03, SPEC §15.3: the text output names what was not checked.
+#[test]
+fn the_text_output_names_what_still_needs_a_host() {
+    let root = tempfile::tempdir().unwrap();
+    let file = write(root.path(), "d.yaml", "name: m\nengine: vllm\nmodel: toy\n");
+    let out = support::capyctl()
+        .args(["validate", "config", "--file", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Not checked"), "{text}");
+    assert!(text.contains("--host"), "{text}");
+}

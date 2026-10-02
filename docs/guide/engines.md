@@ -80,11 +80,19 @@ you added it.
 
 ## TensorFold
 
-CapyCTL runs TensorFold 0.6.0 from a plain venv. TensorFold builds CUDA kernels
-the first time it starts, so the machine needs `nvcc`, `ninja` and a C++
-compiler where the engine can find them: the venv's `bin`, the CUDA toolkit's
-`bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. `engine add` checks this and
-names what is missing; it never uses your shell's `PATH`.
+CapyCTL runs TensorFold 0.6.0 and 0.6.1 from a plain venv. TensorFold builds
+CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
+a C++ compiler where the engine can find them: the venv's `bin`, the CUDA
+toolkit's `bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. Either install a system
+CUDA toolkit, or (0.6.1) put the compiler in the venv with pip:
+
+```bash
+pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"
+```
+
+CapyCTL finds that `nvcc` under the venv's `site-packages/nvidia`. A C++ compiler
+still comes from the system. `engine add` checks all of this and names what is
+missing; it never uses your shell's `PATH`.
 
 ```bash
 capyctl engine add ~/tensorfold-0.6.0-venv
@@ -102,8 +110,8 @@ saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`cap
 ```
 
 TensorFold has no way to free its memory while it runs, so a TensorFold model
-does not park: when CapyCTL needs the memory, or the model sits idle, CapyCTL
-waits for its requests to finish, stops it, and starts it again on the next
+does not park: when CapyCTL needs the memory, or the model sits idle past
+`ready_idle_timeout` (off unless set), CapyCTL waits for its requests to finish, stops it, and starts it again on the next
 request. `capyctl park deployment` refuses a TensorFold model; use `stop` or let
 CapyCTL switch it. A TensorFold deployment states its memory with `resources`
 and its `context_length`:
@@ -186,6 +194,19 @@ example `"published":"published"` in the record of `engine add` and
 A profile a deployment still uses is not removed; the command names the
 deployment. `--drain` stops those deployments first. Removing needs CapyCTL
 running.
+
+The last engine can be removed too. CapyCTL keeps running with none, keeps its
+deployments and places none until you add one. Its start banner and
+`capyctl status deployment` then say to run `capyctl engine add <path>`. A new deploy that names a
+profile nobody publishes is refused at once.
+
+`capyctl status deployment` shows the engine a deployment actually runs: its
+profile, version and executable, as the deployment was set up with them. If you
+register the profile again at a new version, an existing deployment keeps the
+old engine, and the status adds a note to redeploy to use the new one.
+
+A model can be named by its Hugging Face cache directory
+(`snapshots/<rev>`) as it is.
 
 ## System services
 

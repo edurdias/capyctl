@@ -42,17 +42,26 @@ fn terminate_reports_signal_when_grace_expires() {
     // `sleep` ignores nothing special, but SIGTERM default-kills it; use a
     // process that ignores TERM to exercise escalation: `sh -c 'trap "" TERM; sleep 5'`.
     let l = ExecLauncher::new();
+    let dir = tempfile::tempdir().unwrap();
+    let trapped = dir.path().join("trapped");
     let cmd = RenderedCommand {
         argv: vec![
             "sh".into(),
             "-c".into(),
-            "trap \"\" TERM; while :; do sleep 1; done".into(),
+            format!(
+                "trap \"\" TERM; : > '{}'; while :; do sleep 1; done",
+                trapped.display()
+            ),
         ],
         env: Default::default(),
     };
     let h = l.spawn(&cmd).unwrap();
-    // Let the shell install its TERM trap before we signal (race otherwise).
-    std::thread::sleep(Duration::from_millis(200));
+    // Signal only once the shell says its TERM trap is installed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !trapped.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(trapped.exists(), "the shell installed its TERM trap");
     let rep = l.terminate(&h, Duration::from_millis(300)).unwrap();
     assert!(rep.killed, "escalated to SIGKILL after grace expiry");
     assert_eq!(rep.signal, Some(9), "SIGKILL");

@@ -46,6 +46,9 @@ name that profile instead.
 
 ## Server
 
+Unset, a timer in `lifecycle_defaults` is off: no idle model is stopped or
+parked.
+
 <!-- include: ../examples/server.yaml -->
 
 ## Standalone
