@@ -38,6 +38,7 @@ Registered vllm (vllm 0.29.0)
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
   Published      when capyctl starts
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
+no capyctl answered on /home/me/.local/state/capyctl/control.sock; if it is already running with another --state-dir or --config, restart it to publish this profile, and pass the same option to `capyctl engine`
 ```
 
 The profile is named after the engine: `vllm` or `sglang`. CapyCTL runs the
@@ -54,8 +55,8 @@ use it.
 
 ## Custom builds
 
-`CUSTOM yes` means a version other than vLLM 0.29.0 or SGLang 0.5.20, the
-versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
+`CUSTOM yes` means a version other than vLLM 0.29.0, SGLang 0.5.20 or
+TensorFold 0.6.0 and 0.6.1, the versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 
 ```bash
@@ -107,6 +108,7 @@ Registered tensorfold (tensorfold 0.6.0)
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
   Published      when capyctl starts
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
+no capyctl answered on /home/me/.local/state/capyctl/control.sock; if it is already running with another --state-dir or --config, restart it to publish this profile, and pass the same option to `capyctl engine`
 ```
 
 TensorFold has no way to free its memory while it runs, so a TensorFold model

@@ -21,6 +21,7 @@ Registered vllm (vllm 0.29.0)
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
   Published      when capyctl starts
 saved to /home/me/.config/capyctl/engines.yaml (revision 1); start capyctl (`capyctl start standalone`) to use it
+no capyctl answered on /home/me/.local/state/capyctl/control.sock; if it is already running with another --state-dir or --config, restart it to publish this profile, and pass the same option to `capyctl engine`
 ```
 
 CapyCTL is not running yet, so it saves the engine for the first start. More in

@@ -325,6 +325,12 @@ async fn delete_is_refused_while_an_instance_holds_a_runtime() {
         .as_str()
         .unwrap()
         .contains("stop the deployment"));
+    // Release live check 0.1.1: a delete right after `stop deployment` is
+    // refused while the stop runs; the message says so and how to watch it.
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("capyctl status deployment"));
     assert_eq!(receipts(), before, "a refusal records nothing");
     assert_eq!(routed(&s.owner, "ordinary").as_deref(), Some(s.id.as_str()));
     assert!(listed(&s.owner, &s.id));

@@ -274,7 +274,7 @@ impl Command {
 #[command(
     name = "capyctl",
     version,
-    about = "Run vLLM and SGLang models on your own GPUs",
+    about = "Run vLLM, SGLang and TensorFold models on your own GPUs",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -439,7 +439,7 @@ enum CliCommand {
         #[command(subcommand)]
         resource: PruneArgs,
     },
-    /// Register, list or remove the vLLM and SGLang installations on this
+    /// Register, list or remove the vLLM, SGLang and TensorFold installations on this
     /// machine. Each one becomes a runtime profile deployments can name.
     Engine {
         #[command(subcommand)]
@@ -449,7 +449,8 @@ enum CliCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum EngineArgs {
-    /// List vLLM and SGLang installations on this machine (reads metadata only).
+    /// List vLLM, SGLang and TensorFold installations on this machine (reads
+    /// metadata only).
     Detect {
         /// Also scan this directory (repeatable).
         #[arg(long = "path")]
