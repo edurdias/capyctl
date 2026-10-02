@@ -597,6 +597,30 @@ kv_cache_usage_perc{{stream=\"0\"}} 0.9
     assert_eq!(histograms[0].0, "engine_e2e_request_latency");
 }
 
+// T41: the /metrics body TensorFold 0.6.2 served on a GB10 after its first
+// request (live, 2026-10-02), as recorded. Its vLLM-named mirrors carry the
+// `tensorfold:` prefix; only the pinned families are read, and both latency
+// histograms are forwarded.
+#[test]
+fn tensorfold_062_live_metrics_parse() {
+    let body = include_str!("fixtures/tensorfold-0.6.2-metrics.prom");
+    let load = capyctl_agent::load::parse_engine_load(body).unwrap();
+    assert_eq!((load.running, load.waiting, load.kv_usage_ppm), (0, 0, 0));
+    let (engine, histograms) = capyctl_agent::load::parse_engine_histograms(body).unwrap();
+    assert_eq!(engine, "tensorfold");
+    let series: Vec<_> = histograms
+        .iter()
+        .map(|(name, h)| (name.as_str(), h.count()))
+        .collect();
+    assert_eq!(
+        series,
+        [
+            ("engine_time_to_first_token", 1),
+            ("engine_e2e_request_latency", 1)
+        ]
+    );
+}
+
 // T17 T41, ADR 0023 §6 (2026-10-01): a TensorFold sample is quiescent only
 // when /health reads idle too.
 #[test]
