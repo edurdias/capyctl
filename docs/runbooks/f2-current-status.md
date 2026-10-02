@@ -1,5 +1,55 @@
 # Current implementation and launch status
 
+## TensorFold 0.6.2 verified — 2026-10-02 (branch `feat/tensorfold-0.6.2`)
+
+TensorFold 0.6.2 joins 0.6.0 and 0.6.1 in the verified set (ADR 0023 §1), so
+`engine add` shows it `custom no`; 0.6.3 and later stay custom. Between the
+0.6.1 and 0.6.2 tags, `cli_args.py`, `server/metrics.py` and `cuda/build.py`
+are unchanged, so the reserved, sensitive and typed options, the metric
+names and the build toolchain are the same. One kernel source changed
+(`gdn.cu`, now `tensorfold_gdn_v2`); every extension builds again on the
+first start because CapyCTL keys the extension cache by version. The engine
+now prints one line per request and a `done` line per reply (prompt and
+reply token counts, a token hash, tok/s, TTFT, accepted/drafted; no prompt
+or reply text); successful `GET /health` and `/metrics` are not logged.
+
+Live on host A (standalone from this branch, fresh 0700 state and config
+directories, a new `~/tensorfold-0.6.2-venv` with torch 2.13.0 cu130,
+owner-approved; system CUDA 13.0): `engine add --approve-option=--drafter
+--approve-path <drafters>` registered `tensorfold 0.6.2`, custom no, deep
+park disabled. The recipe deployments ran with the models downloaded by
+CapyCTL (`model: {hf: ...}`):
+
+| | 0.6.1 (recipes) | 0.6.2 |
+|---|---|---|
+| Nemotron 3.5 Lightning 30B-A3B 4-bit, ready cold (after download) | 104 s | 101 s |
+| Qwen3.8-27B NVFP4 + DFlash2, ready cold (after download) | 119 s | 78 s |
+| Nemotron decode, median of 3 streams, 512 tokens | 132 tok/s | 143 tok/s (125 to 149) |
+| Qwen3.8-27B DFlash2 decode | 48.2 tok/s | 45.2 tok/s (34.0 to 46.5) |
+| Qwen3.8-27B `--no-drafts` decode | 11.9 tok/s | 12.0 tok/s |
+| Warm start (`start` after `stop`) | 8 s / 10 s | 8.1 s / 9.7 s |
+
+The 0.6.1 cold starts include verifying the weights already in the store; the
+0.6.2 ones start when the download was verified, and include the checkpoint
+digest, the load and the kernel builds. Prompts differ from the recipes', so
+the medians are not paired; the one
+request both runs share (354 of 2355 drafts accepted, the same `token_sha`)
+decoded at 33.8 tok/s on 0.6.1 and 34.0 on 0.6.2. Kernel builds: Nemotron
+built `experts_v7` and `qmm_v5` at startup and `nemotron_scan_rows` and
+`prefill_attention_v1` on its first request (probe TTFT 34 s); Qwen3.8 then
+built `nvfp4_ck_v6` at startup and `qwen_b16_v4` and `gdn_v2` on its first
+request (25 s). Both answered Jupiter plain and streaming, with
+`reasoning_content` passed through and the `tensorfold` record kept. With
+both deployed (32 + 36 GiB over the half-memory standalone limit), each
+request for the stopped one switched (`released: stopped`) and answered in
+11.1 to 13.3 s. `park deployment` stays refused (ADR 0023 §6); a deployment
+without a drafter still fails to start Qwen3.8 dense with the `--drafter`
+or `--no-drafts` hint. `/health` and `/metrics` answered on loopback with
+the pinned families (the live body is now a parser fixture); standalone has
+no host load report, so its latency view shows the router tier only, by
+design (`roles.rs`). Deployments deleted, profile removed, drained shutdown,
+state removed, no CapyCTL, engine or GPU process left. No CapyCTL bug found.
+
 ## vLLM 0.30 live findings fixed — 2026-10-02 (branch `fix/vllm-030-findings`)
 
 Four findings from the Qwen3.8-27B NVFP4 runs on vLLM 0.30.0 and SGLang 0.5.20:
