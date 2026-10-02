@@ -50,13 +50,16 @@ test('an explicit page title wins over the H1', () => {
   assert.match(out, /^---\ntitle: "Overview"\n---\n\nBody\n$/);
 });
 
-test('every docs/examples file is embedded verbatim on the configuration page', () => {
+test('every docs/examples file is embedded verbatim on the configuration page or the engines page', () => {
   const root = new URL('../../', import.meta.url);
   const read = (p) => readFileSync(new URL(p, root), 'utf8');
-  const page = { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration' };
-  const out = toStarlight(read(page.source), page, [page], REPO, read);
+  const pages = [
+    { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration' },
+    { source: 'docs/guide/engines.md', slug: 'docs/engines' },
+  ];
+  const out = pages.map((page) => toStarlight(read(page.source), page, pages, REPO, read)).join('\n');
   const files = readdirSync(new URL('docs/examples/', root)).filter((f) => f.endsWith('.yaml'));
-  assert.equal(files.length, 8);
+  assert.equal(files.length, 11);
   for (const f of files) assert.ok(out.includes(read(`docs/examples/${f}`)), f);
 });
 

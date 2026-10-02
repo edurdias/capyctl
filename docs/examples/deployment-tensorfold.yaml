@@ -1,0 +1,34 @@
+# Nemotron 3.5 Lightning 30B-A3B 4-bit on TensorFold 0.6.1 on one GB10 machine
+# (docs/guide/engines.md, "First model on each engine"):
+# `capyctl deploy model --file deployment-tensorfold.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-tensorfold.yaml`.
+schema_version: 1
+kind: deployment
+name: nemotron-30b
+# The profile `capyctl engine add ~/venvs/tensorfold` registered.
+engine: tensorfold
+# Downloaded into <models>/sources on first deploy, pinned to this commit.
+model: {hf: Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit@d9d758fb83953437f7263256b0d96157e2a348b8}
+# TensorFold cannot free its memory while it runs, so the model never parks.
+residency: restart_only
+devices: [{id: gpu0}]
+# TensorFold states its memory: `cold` covers the start, `ready` the running
+# engine; `parking` and `wake` repeat them and `parked` holds nothing.
+resources:
+  cold:
+    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+  ready:
+    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+  parking:
+    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+  parked:
+    allocations: [{domain: unified, bytes: 0B, host_kv_bytes: 0B}]
+    devices: []
+  wake:
+    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
+    devices: [{id: gpu0}]
+engine_config:
+  context_length: 32768

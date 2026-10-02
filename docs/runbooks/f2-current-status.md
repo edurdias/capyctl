@@ -1,5 +1,18 @@
 # Current implementation and launch status
 
+## First model on each engine — 2026-10-01 (branch `docs/engine-examples`)
+
+`docs/examples/deployment-{vllm,sglang,tensorfold}.yaml` and the "First model
+on each engine" section of `docs/guide/engines.md`, with output captured live
+on host B (standalone, published 0.1.1 binary from the one-line installer,
+fresh state and config directories): `engine add`, `deploy model`,
+`start deployment --wait` and one chat request per engine, run one at a time.
+vLLM 0.29 Qwen3-4B ready in 55 s, SGLang 0.5.20 Qwen3-4B in 61 s (checkpoint
+already downloaded), TensorFold 0.6.1 Nemotron 3.5 Lightning 30B-A3B 4-bit in
+17.5 min including its 18.5 GB download, 10 s on a later restart. Each answered
+with Jupiter. Deployments deleted, profiles removed, drained shutdown, no
+CapyCTL or engine process left. No CapyCTL bug found.
+
 ## 0.1.1 release preparation — 2026-10-01
 
 Version bumped to 0.1.1 with release notes in

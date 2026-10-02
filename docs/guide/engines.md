@@ -161,6 +161,212 @@ minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
 discrete GPU it runs, but no live check has passed there yet.
 
+## First model on each engine
+
+One example per engine, from adding it to a first answer, on one GB10 machine
+running `capyctl start standalone` ([Run on one machine](one-machine.md)).
+The deployment files are in [`docs/examples/`](../examples/). Each run below
+started after the previous engine's deployment was deleted and its profile
+removed, which is why the engines file revision grows. All three use the
+same request; the API key comes from the credentials file the start banner
+names:
+
+```bash
+KEY=$(sed -n 's/^api_key: //p' ~/.local/state/capyctl/identity/credentials)
+```
+
+### vLLM 0.29: Qwen3-4B
+
+<!-- include: ../examples/deployment-vllm.yaml -->
+
+```bash
+capyctl engine add ~/venvs/vllm
+```
+
+```text
+Registered vllm (vllm 0.29.0)
+
+  Executable     /home/me/venvs/vllm/bin/vllm
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
+  Published      yes
+```
+
+```bash
+capyctl deploy model --file docs/examples/deployment-vllm.yaml
+```
+
+```text
+Request identity: 01M3X7VR7MVTJ5DG7AMY6YA1P8 (reuse --request-id 01M3X7VR7MVTJ5DG7AMY6YA1P8 to recover this command)
+Deployment qwen3-4b-vllm created (revision 1)
+
+  Deployment ID       01M3X7VR8K2W783VV2JBJ195XW
+  Operation           01M3X7VR8KYB08K0H8FXHBCM6G
+  Checkpoint digest   being measured
+the checkpoint digest of qwen3-4b-vllm is being measured; `capyctl start deployment qwen3-4b-vllm --wait` waits for it and starts the deployment
+```
+
+```bash
+capyctl start deployment qwen3-4b-vllm --wait
+```
+
+```text
+Request identity: 01M3X7VWFWGMFA1STYQDZ70SCQ (reuse --request-id 01M3X7VWFWGMFA1STYQDZ70SCQ to recover this command)
+Waiting for the checkpoint digest of qwen3-4b-vllm to be measured (at most 900s)
+Started qwen3-4b-vllm: ready
+
+  Ready       1/1
+  Hosts       host-b
+  Operation   initialize succeeded
+```
+
+It was ready 55 seconds later, the checkpoint already downloaded. `/no_think`
+turns off Qwen3's thinking for one message:
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-4b-vllm", "messages": [{"role": "user", "content": "Name the largest planet in one sentence. /no_think"}]}' \
+  | jq -r '.choices[0].message.content'
+```
+
+```text
+<think>
+
+</think>
+
+The largest planet in our solar system is Jupiter.
+```
+
+### SGLang 0.5.20: Qwen3-4B
+
+<!-- include: ../examples/deployment-sglang.yaml -->
+
+```bash
+capyctl engine add ~/venvs/sglang
+```
+
+```text
+Registered sglang (sglang 0.5.20)
+
+  Executable     /home/me/venvs/sglang/bin/python3
+  Deep park      enabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/capyctl/engines.yaml (revision 3)
+  Published      yes
+```
+
+```bash
+capyctl deploy model --file docs/examples/deployment-sglang.yaml
+```
+
+```text
+Request identity: 01M3X7YHH59FJKZP0WG1D9C4QG (reuse --request-id 01M3X7YHH59FJKZP0WG1D9C4QG to recover this command)
+Deployment qwen3-4b-sglang created (revision 1)
+
+  Deployment ID       01M3X7YHJ3Y9V6NDPSEAF48SXF
+  Operation           01M3X7YHJ36M809539GJNNS8V8
+  Checkpoint digest   being measured
+the checkpoint digest of qwen3-4b-sglang is being measured; `capyctl start deployment qwen3-4b-sglang --wait` waits for it and starts the deployment
+```
+
+```bash
+capyctl start deployment qwen3-4b-sglang --wait
+```
+
+```text
+Request identity: 01M3X7YHJDDR6WARHDZDJEFP5N (reuse --request-id 01M3X7YHJDDR6WARHDZDJEFP5N to recover this command)
+Waiting for the checkpoint digest of qwen3-4b-sglang to be measured (at most 900s)
+Started qwen3-4b-sglang: ready
+
+  Ready       1/1
+  Hosts       host-b
+  Operation   initialize succeeded
+```
+
+Ready after 61 seconds.
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-4b-sglang", "messages": [{"role": "user", "content": "Name the largest planet in one sentence. /no_think"}]}' \
+  | jq -r '.choices[0].message.content'
+```
+
+```text
+<think>
+
+</think>
+
+The largest planet in our solar system is Jupiter.
+```
+
+### TensorFold 0.6.1: Nemotron 3.5 Lightning 30B-A3B 4-bit
+
+<!-- include: ../examples/deployment-tensorfold.yaml -->
+
+```bash
+capyctl engine add ~/venvs/tensorfold
+```
+
+```text
+Registered tensorfold (tensorfold 0.6.1)
+
+  Executable     /home/me/venvs/tensorfold/bin/tensorfold
+  Deep park      disabled
+  CUDA           /usr/local/cuda
+  Engines file   /home/me/.config/capyctl/engines.yaml (revision 5)
+  Published      yes
+```
+
+```bash
+capyctl deploy model --file docs/examples/deployment-tensorfold.yaml
+```
+
+```text
+Request identity: 01M3X817ZABXRW67CQ2EY9KW4W (reuse --request-id 01M3X817ZABXRW67CQ2EY9KW4W to recover this command)
+Deployment nemotron-30b created (revision 1)
+
+  Deployment ID       01M3X817ZXRQP97RZQ3JDJQJ6F
+  Operation           01M3X817ZXY1R64CTYQ51NPSHP
+  Checkpoint digest   being measured
+the checkpoint digest of nemotron-30b is being measured; `capyctl start deployment nemotron-30b --wait` waits for it and starts the deployment
+```
+
+```bash
+capyctl start deployment nemotron-30b --wait
+```
+
+```text
+Request identity: 01M3X818098DHVZCS7JH936A5W (reuse --request-id 01M3X818098DHVZCS7JH936A5W to recover this command)
+Waiting for the model source of nemotron-30b to be downloaded and verified (at most 1800s)
+Started nemotron-30b: ready
+
+  Ready       1/1
+  Hosts       host-b
+  Operation   initialize succeeded
+```
+
+This first start downloaded the 18.5 GB checkpoint and was ready after
+17.5 minutes; a later `start` after `stop` was ready in 10 seconds. Nemotron
+thinks before it answers and returns the thinking in `reasoning_content`:
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "nemotron-30b", "messages": [{"role": "user", "content": "Name the largest planet in one sentence."}]}' \
+  | jq -r '.choices[0].message.content'
+```
+
+```text
+Jupiter is the largest planet in our solar system.
+```
+
+To clean up after each one, `capyctl delete deployment <name> --stop`, then
+`capyctl engine remove <profile>` once the stop has finished. Neither touches
+the downloaded weights.
+
 ## List and remove
 
 ```bash
