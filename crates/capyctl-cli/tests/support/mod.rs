@@ -342,11 +342,22 @@ pub async fn boot_with_overrides(
     config: Option<&std::path::Path>,
     overrides: &capyctl_cli::roles::SettingOverrides,
 ) -> Result<capyctl_cli::roles::App, capyctl_cli::roles::StartError> {
+    boot_with_overrides_on(state_dir, config, overrides, engine_ports()).await
+}
+
+/// As [`boot_with_overrides`], on the engine port range `ports`, so a restart
+/// keeps the published policy's shape.
+pub async fn boot_with_overrides_on(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    overrides: &capyctl_cli::roles::SettingOverrides,
+    ports: (u16, u16),
+) -> Result<capyctl_cli::roles::App, capyctl_cli::roles::StartError> {
     capyctl_cli::roles::start_standalone_configured_with_overrides(
         state_dir,
         config,
         Arc::new(PortedProvider {
-            ports: engine_ports(),
+            ports,
             deep_park: false,
             members: None,
             models_root: None,

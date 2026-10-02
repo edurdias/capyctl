@@ -584,7 +584,16 @@ impl crate::Store {
         observations: &[MemoryObservation],
         now_ms: i64,
     ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
-        self.import_policy(session, host, observations, now_ms, None)
+        let imported = self.import_policy(session, host, observations, now_ms, None)?;
+        // Found live 2026-10-02 (standalone, as M32 on a host): a standalone
+        // restarted with changed queue bounds kept its first imported ones,
+        // silently. The queue bounds are operator settings of the standalone
+        // document, so they follow it as a host's do; the persisted memory
+        // limits are kept.
+        let mut published = imported.controls.clone();
+        published.queue = ResourceControls::from_host(host).queue;
+        let host_id = imported.context.host_id.clone();
+        self.apply_publication(session, &host_id, imported, published, observations, now_ms)
     }
 
     /// Import an enrolled host's local policy using collision-free durable keys.
@@ -647,13 +656,31 @@ impl crate::Store {
             now_ms,
             Some((host_id, &local)),
         )?;
-        // Found live 2026-09-23 (matrix M32): a host restarted with changed
-        // limits (normal to tight) kept its first imported limits here,
-        // silently. The host's document governs its limits, so a changed
-        // publication is applied as a revision through the ordinary update,
-        // which refuses a limit the current charges already exceed (the
-        // publication then fails closed rather than keeping stale limits).
-        let published = ResourceControls::from_host(&scoped);
+        self.apply_publication(
+            session,
+            host_id,
+            imported,
+            ResourceControls::from_host(&scoped),
+            &observations,
+            now_ms,
+        )
+    }
+
+    /// Found live 2026-09-23 (matrix M32): a host restarted with changed limits
+    /// (normal to tight) kept its first imported limits, silently. The host's
+    /// document governs its limits, so a changed publication is applied as a
+    /// revision through the ordinary update, which refuses a limit the current
+    /// charges already exceed (the publication then fails closed rather than
+    /// keeping stale limits).
+    fn apply_publication(
+        &self,
+        session: &CoordinatorSession,
+        host_id: &str,
+        imported: ResourcePolicyImport,
+        published: ResourceControls,
+        observations: &[MemoryObservation],
+        now_ms: i64,
+    ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
         if imported.changed || imported.controls == published {
             return Ok(imported);
         }
@@ -674,7 +701,7 @@ impl crate::Store {
             imported.revision,
             &key,
             &published,
-            &observations,
+            observations,
             now_ms,
         )?;
         Ok(ResourcePolicyImport {

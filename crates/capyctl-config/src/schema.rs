@@ -143,6 +143,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             "endpoint_port_range",
             FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
         ),
+        // SPEC §10, §16.2 (owner rule 2026-09-25: standalone is a server and
+        // one host): the queue bounds, as on a host.
+        ("queue", FieldSpec::Struct(QUEUE)),
     ];
     const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
     const ALLOCATION: FieldSpec = FieldSpec::Struct(&[

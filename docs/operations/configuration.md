@@ -201,7 +201,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
-| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, and `endpoint_port_range`) |
+| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 
@@ -233,6 +233,18 @@ CAPYCTL_SET__LOAD_REPORT_INTERVAL=2s
 # Standalone: the switch drain bound and the response timing header.
 capyctl start standalone --set server.switching.drain_timeout=45s \
   --set server.observability.timing_header=true
+
+# Standalone: a longer silence bound between a reply's outputs, from the environment.
+CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__STREAM_IDLE_TIMEOUT=600s
+```
+
+The same standalone setting in its document:
+
+```yaml
+host:
+  resource_policy:
+    queue:
+      stream_idle_timeout: "600s"
 ```
 
 How a value is read and checked:

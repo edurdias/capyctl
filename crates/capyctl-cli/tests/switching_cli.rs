@@ -168,4 +168,69 @@ async fn standalone_waiting_bounds_follow_the_host_queue_policy() {
     assert_eq!(limits.max_pending_per_deployment, 64);
     assert_eq!(limits.max_pending_total, 256);
     assert_eq!(limits.max_buffered_bytes_total, 64 << 20);
+    assert_eq!(limits.stream_idle, std::time::Duration::from_secs(120));
+}
+
+// T19 (SPEC §10, §16.2; owner rule 2026-09-25: standalone is a server and one
+// host, every setting three ways; found live 2026-10-02): the standalone
+// document's `host.resource_policy.queue` bounds the router as a host's does,
+// and `--set` and `CAPYCTL_SET__…` override it (`--set` > environment > YAML).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_queue_bounds_follow_the_document_and_its_overrides() {
+    use capyctl_cli::roles::SettingOverrides;
+    use capyctl_config::ConfigKind;
+    let dir = support::safe_state_dir();
+    let config = dir.path().join("standalone.yaml");
+    std::fs::write(
+        &config,
+        "schema_version: 1\nkind: standalone\nname: s\nhost:\n  resource_policy:\n    queue:\n      stream_idle_timeout: 300s\n      request_deadline: 900s\n",
+    )
+    .unwrap();
+    // One port range for every boot, so the restarts below keep the stored
+    // policy's shape and only its queue bounds change.
+    let ports = support::engine_ports();
+    let app = support::boot_with_overrides_on(
+        dir.path(),
+        Some(&config),
+        &SettingOverrides::none(ConfigKind::Standalone),
+        ports,
+    )
+    .await
+    .expect("standalone boots with its queue bounds");
+    let limits = app.deps().inflight.waiting.limits();
+    assert_eq!(limits.stream_idle, std::time::Duration::from_secs(300));
+    assert_eq!(limits.deadline, std::time::Duration::from_secs(900));
+    // Unstated bounds keep the standalone defaults.
+    assert_eq!(limits.max_pending_per_deployment, 64);
+    let _ = app.shutdown().await;
+    let overrides = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.queue.stream_idle_timeout=600s".to_owned()],
+        &[(
+            "CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__STREAM_IDLE_TIMEOUT".to_owned(),
+            "450s".to_owned(),
+        )],
+    )
+    .unwrap();
+    // A restart applies the changed bounds to the stored policy.
+    let app = support::boot_with_overrides_on(dir.path(), Some(&config), &overrides, ports)
+        .await
+        .expect("standalone boots with its overrides");
+    let limits = app.deps().inflight.waiting.limits();
+    assert_eq!(limits.stream_idle, std::time::Duration::from_secs(600));
+    assert_eq!(limits.deadline, std::time::Duration::from_secs(900));
+    let _ = app.shutdown().await;
+    // A bound outside the host's range is refused at boot, as on a host.
+    let refused = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.queue.stream_idle_timeout=999ms".to_owned()],
+        &[],
+    )
+    .unwrap();
+    let error =
+        match support::boot_with_overrides_on(dir.path(), Some(&config), &refused, ports).await {
+            Ok(_) => panic!("an out-of-range stream idle bound booted"),
+            Err(error) => error.to_string(),
+        };
+    assert!(error.contains("resource_policy"), "{error}");
 }

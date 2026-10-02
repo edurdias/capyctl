@@ -88,6 +88,41 @@ fn bootstrap_is_durable_and_reopen_prefers_persisted_policy() {
     assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
 }
 
+// T19 (SPEC §10, §16.2; found live 2026-10-02): the embedded host's queue
+// bounds follow its document at every import, as a host's publication does
+// (M32), while its persisted memory limits are kept.
+#[test]
+fn reopen_applies_changed_queue_bounds_and_keeps_memory_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite3");
+    let store = crate::Store::open(&path).unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    drop(store);
+    let store = crate::Store::open(&path).unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let mut local = host();
+    local.domains.get_mut("system").unwrap().managed_limit = 99;
+    local.queue.stream_idle_ms = 600_000;
+    let reopened = store
+        .import_resource_policy(&session, &local, &observations(), 11_000)
+        .unwrap();
+    assert!(reopened.changed);
+    assert_eq!(reopened.revision, 2);
+    assert_eq!(reopened.controls.queue.stream_idle_ms, 600_000);
+    assert_eq!(reopened.controls.domains["system"].managed_limit, 80);
+    let queue = store.tightest_queue_policy().unwrap().unwrap();
+    assert_eq!(queue.stream_idle_ms, 600_000);
+    // The same bounds again change nothing.
+    let again = store
+        .import_resource_policy(&session, &local, &observations(), 11_000)
+        .unwrap();
+    assert!(!again.changed);
+    assert_eq!(again.revision, 2);
+}
+
 #[test]
 fn bootstrap_rejects_untrusted_observation_shapes_and_capacity() {
     for bad in [
