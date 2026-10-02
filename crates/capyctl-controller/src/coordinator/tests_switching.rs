@@ -644,6 +644,92 @@ async fn busy_a_keeps_admission_only_for_the_non_resetting_window() {
     lab.worker.shutdown().await.unwrap();
 }
 
+// T15 T19 (SPEC §10: select the oldest waiting group): A is busy and holds
+// the host. A group for B arrives, then one for C while B's switch is still
+// inside A's admission window. B goes first and is served; only then does
+// C's switch run, with B (no longer waiting) as its victim. C never jumps
+// ahead of the older group, and neither group is refused.
+#[tokio::test]
+async fn the_oldest_waiting_group_switches_first() {
+    let lab = lab(15, 400).await;
+    lab.ready(&lab.a).await;
+    let (_, _, generation, _) = lab.instance(&lab.a.deployment_id, 0);
+    let b = lab.deploy("sglang-b", SGLANG, |_| {});
+    let c = lab.c.deployment_id.clone();
+    let port = Arc::new(lab.port(Duration::from_secs(5)));
+    let commands = lab.worker.commands();
+    let a = lab.a.deployment_id.clone();
+    let traffic = tokio::spawn(async move {
+        loop {
+            commands.note_activity(&a, generation);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let group = |target: String| {
+        let (port, finished) = (port.clone(), finished.clone());
+        tokio::spawn(async move {
+            let outcome = port.activate_for_request(&target).await;
+            finished.lock().unwrap().push(target);
+            outcome
+        })
+    };
+    let first = group(b.clone());
+    until("B's switch is planned", || {
+        lab.kinds().iter().any(|k| k == "switch_planned")
+    })
+    .await;
+    assert!(
+        lab.instance(&lab.a.deployment_id, 0).1,
+        "C arrives while A still admits inside B's window"
+    );
+    let second = group(c.clone());
+    for outcome in [first, second] {
+        tokio::time::timeout(Duration::from_secs(30), outcome)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    traffic.abort();
+    assert_eq!(*finished.lock().unwrap(), [b.clone(), c.clone()]);
+    let targets: Vec<(String, Value)> = lab
+        .switch_events()
+        .into_iter()
+        .filter(|(kind, _)| kind == "switch_planned" || kind == "switch_completed")
+        .map(|(kind, payload)| (kind, payload["target_deployment"].clone()))
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            ("switch_planned".to_owned(), json!(b)),
+            ("switch_completed".to_owned(), json!(b)),
+            ("switch_planned".to_owned(), json!(c)),
+            ("switch_completed".to_owned(), json!(c)),
+        ],
+        "one switch per group, the older group's first"
+    );
+    let planned: Vec<Value> = lab
+        .switch_events()
+        .into_iter()
+        .filter(|(kind, _)| kind == "switch_planned")
+        .map(|(_, payload)| payload["victims"].clone())
+        .collect();
+    assert_eq!(
+        planned,
+        [
+            json!([format!("{}/0", lab.a.deployment_id)]),
+            json!([format!("{b}/0")]),
+        ]
+    );
+    assert_eq!(lab.state(&c), "ready");
+    assert_eq!(lab.state(&b), "parked");
+    assert_eq!(lab.state(&lab.a.deployment_id), "parked");
+    assert_eq!(lab.engine.calls(RuntimeAction::Initialize, &b), 1);
+    assert_eq!(lab.engine.calls(RuntimeAction::Initialize, &c), 1);
+    lab.worker.shutdown().await.unwrap();
+}
+
 // T17 (SPEC §10: a drain timeout fails the switch by default): a request
 // accepted by A before the switch stays in flight past the drain bound. The
 // switch fails, nothing is parked or killed, A serves again and B was never
