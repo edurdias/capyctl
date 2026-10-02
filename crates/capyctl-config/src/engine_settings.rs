@@ -554,6 +554,8 @@ pub fn apply_to_host_with(
                 installation_drift: settings.installation_drift,
                 args,
                 cuda_home: settings.cuda_home.clone(),
+                approved_options: Vec::new(),
+                approved_paths: Vec::new(),
             });
         profile["security"]["trust_remote_code"] = json!(settings.trust_remote_code);
         crate::registration::check_profile(name, &profile)?;

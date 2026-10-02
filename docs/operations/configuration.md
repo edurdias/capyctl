@@ -202,7 +202,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
 | Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, and `endpoint_port_range`) |
-| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`) |
+| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 
 ## Any setting by its path

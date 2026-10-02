@@ -500,6 +500,8 @@ mod tests {
             deep_park: None,
             drift: crate::grammar::DriftChoice::default(),
             args: vec![],
+            approved_options: vec![],
+            approved_paths: vec![],
         };
         let value = json!({"profile": "vllm", "engine": "vllm", "version": "0.29.0", "executable": "/v/bin/vllm",
             "deep_park": "enabled", "cuda_home": "/usr/local/cuda", "engines_file": "/c/engines.yaml",
@@ -632,6 +634,8 @@ mod tests {
                 deep_park: None,
                 drift: crate::grammar::DriftChoice::default(),
                 args: vec![],
+                approved_options: vec![],
+                approved_paths: vec![],
             },
             Command::EngineList,
             Command::EngineRemove {

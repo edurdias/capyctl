@@ -179,6 +179,9 @@ pub enum Command {
         deep_park: Option<DeepParkChoice>,
         drift: DriftChoice,
         args: Vec<String>,
+        /// ADR 0014 §8: `security.approved_options` and `approved_paths`.
+        approved_options: Vec<String>,
+        approved_paths: Vec<PathBuf>,
     },
     /// ADR 0018 §1: this machine's runtime profiles.
     EngineList,
@@ -474,6 +477,20 @@ enum EngineArgs {
         /// (repeatable).
         #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
+        /// A security-sensitive engine option deployments may pass in
+        /// engine_config.extra_args, such as --drafter (repeatable). Written as
+        /// security.approved_options.
+        #[arg(
+            long = "approve-option",
+            value_name = "OPTION",
+            allow_hyphen_values = true
+        )]
+        approved_options: Vec<String>,
+        /// A directory an approved path option may name, such as a drafter's
+        /// parent directory (repeatable, absolute). Written as
+        /// security.approved_paths.
+        #[arg(long = "approve-path", value_name = "DIR")]
+        approved_paths: Vec<PathBuf>,
     },
     /// This machine's runtime profiles and whether the server accepted them.
     List,
@@ -1090,12 +1107,16 @@ impl From<CliCommand> for Command {
                     deep_park,
                     drift,
                     args,
+                    approved_options,
+                    approved_paths,
                 } => Command::EngineAdd {
                     path,
                     name,
                     deep_park,
                     drift,
                     args,
+                    approved_options,
+                    approved_paths,
                 },
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },

@@ -966,6 +966,7 @@ impl EnvEngineProvider {
             installation_drift,
             cuda_home: role.cuda_home,
             engine_ports: role.engine_ports,
+            registered: None,
         })
     }
 }

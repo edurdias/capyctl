@@ -267,6 +267,8 @@ fn with_vllm(host: &str) -> pb::ReportInventory {
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
         },
     );
     inventory.approved_host_config_json = document.to_string();

@@ -360,6 +360,24 @@ pub struct ProfileSpec {
     /// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root
     /// `engine add` detected ([`detect_cuda_home`]); written as `cuda_home`.
     pub cuda_home: Option<PathBuf>,
+    /// ADR 0014 §8: the security-sensitive options this installation approves
+    /// (`--approve-option`), written as `security.approved_options`.
+    pub approved_options: Vec<String>,
+    /// ADR 0014 §8: the directories an approved path option may name
+    /// (`--approve-path`), written as `security.approved_paths`.
+    pub approved_paths: Vec<String>,
+}
+
+/// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
+/// each stated only when non-empty so a default profile is unchanged. One
+/// rule wherever a profile is written.
+pub fn put_approvals(security: &mut Value, options: &[String], paths: &[String]) {
+    if !options.is_empty() {
+        security["approved_options"] = serde_json::json!(options);
+    }
+    if !paths.is_empty() {
+        security["approved_paths"] = serde_json::json!(paths);
+    }
 }
 
 /// The CUDA toolkit `capyctl engine add` records (SPEC §13.3 amendment, owner
@@ -413,6 +431,7 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
     if spec.installation_drift == InstallationDrift::Refuse {
         security["installation_drift"] = "refuse".into();
     }
+    put_approvals(&mut security, &spec.approved_options, &spec.approved_paths);
     let mut profile = serde_json::json!({
         "engine": spec.engine.name(),
         "revision": 1,

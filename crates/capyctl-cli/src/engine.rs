@@ -96,6 +96,8 @@ pub async fn execute_with(
             deep_park,
             drift,
             args,
+            approved_options,
+            approved_paths,
         } => {
             let target = resolve_target(config, state_dir, env)?;
             add(
@@ -104,7 +106,11 @@ pub async fn execute_with(
                 name.as_deref(),
                 *deep_park,
                 *drift,
-                args,
+                Extras {
+                    args,
+                    options: approved_options,
+                    paths: approved_paths,
+                },
                 Toolchain {
                     cuda_home_env: env("CUDA_HOME"),
                     search,
@@ -298,6 +304,15 @@ fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64,
     write_engines(&engines, &lock, host.as_ref()).map_err(|e| error("invalid_config", e.detail))
 }
 
+/// What `engine add` writes beside the installation: host-fixed args
+/// (`--arg`) and, ADR 0014 §8, what it approves (`--approve-option`,
+/// `--approve-path`).
+struct Extras<'a> {
+    args: &'a [String],
+    options: &'a [String],
+    paths: &'a [PathBuf],
+}
+
 /// Where `engine add` looks for TensorFold's build toolchain.
 struct Toolchain<'a> {
     cuda_home_env: Option<String>,
@@ -310,7 +325,7 @@ async fn add(
     name: Option<&str>,
     deep_park: Option<DeepParkChoice>,
     drift: DriftChoice,
-    args: &[String],
+    extras: Extras<'_>,
     toolchain: Toolchain<'_>,
 ) -> Result<Value, StructuredError> {
     let path = match path {
@@ -391,8 +406,14 @@ async fn add(
             DriftChoice::Warn => InstallationDrift::Warn,
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
-        args: args.to_vec(),
+        args: extras.args.to_vec(),
         cuda_home,
+        approved_options: extras.options.to_vec(),
+        approved_paths: extras
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
