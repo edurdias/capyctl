@@ -33,8 +33,12 @@ unchecked in this release.
   host.
 - A role with no engine starts and says how to add one; `capyctl engine
   remove` can remove the last engine.
+- `capyctl status deployment` shows the engine a deployment actually runs, with a note
+  when that engine is no longer registered.
 - Idle models are stopped or parked only when `ready_idle_timeout` or
   `parked_idle_timeout` is set; both are off by default.
+- CI is a fast gate; the integration suites run with `scripts/ci-local.sh --deep`
+  before a merge, and tests no longer depend on runner speed.
 
 ## Upgrade
 

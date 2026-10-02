@@ -1,5 +1,15 @@
 # Current implementation and launch status
 
+## 0.1.1 release preparation — 2026-10-01
+
+Version bumped to 0.1.1 with release notes in
+`docs/operations/release-notes-0.1.1.md` (TensorFold 0.6.0 and 0.6.1, the live
+follow-ups, `ci-local.sh`). The verification result is in the release pull
+request. Nothing is built, tagged or published yet: next are the manual
+Release build workflow, the strict local packaging check, a draft release and
+the live check from the draft (docs/operations/releasing.md). The owner
+publishes.
+
 ## Live follow-ups — 2026-10-01
 
 The four problems the TensorFold run found are fixed

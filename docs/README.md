@@ -1,6 +1,6 @@
 # capyctl documentation
 
-This directory holds the user documentation for capyctl 0.1.0 and the design and
+This directory holds the user documentation for capyctl 0.1.1 and the design and
 process records its contributors work from. The project overview and
 quickstart are in the repository [`README.md`](../README.md).
 
@@ -12,6 +12,7 @@ quickstart are in the repository [`README.md`](../README.md).
 | [`operations/configuration.md`](operations/configuration.md) | Every setting with its YAML field, flag and environment variable, `--set` and `capyctl config show`. |
 | [`operations/network-access.md`](operations/network-access.md) | Reaching the inference endpoint from other machines: the API key, narrowing to loopback or a Tailscale address, turning the key off, a TLS reverse proxy. |
 | [`operations/release-notes-0.1.0.md`](operations/release-notes-0.1.0.md) | Release notes for 0.1.0. |
+| [`operations/release-notes-0.1.1.md`](operations/release-notes-0.1.1.md) | Release notes for 0.1.1. |
 | [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management, inference on all interfaces behind the API key, networked enrollment and control listeners. |
 | [`examples/host.yaml`](examples/host.yaml) | Host role document: private ingress, unified-memory resource policy, placement labels, and vLLM and SGLang installations. |
 | [`examples/host-discrete.yaml`](examples/host-discrete.yaml) | Host role document for a discrete-GPU host (one 24 GB NVIDIA card): a `system` host-RAM domain and a `gpu0` device domain. |
