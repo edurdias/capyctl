@@ -597,26 +597,28 @@ fn private_runtime(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// An executable that prints a version, as an engine installation's would.
 fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin_dir = dir.join("venv").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("a bin directory");
     let bin = bin_dir.join("vllm");
-    std::fs::write(&bin, "#!/bin/sh\necho 'vllm 0.29.0'\n").expect("the engine script");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("executable");
+    capyctl_config::test_support::write_executable(&bin, "#!/bin/sh\necho 'vllm 0.29.0'\n", 0o700)
+        .expect("the engine script");
     bin
 }
 
 /// An executable `tensorfold` in a venv `bin` holding `tools`.
 fn fake_tensorfold_bin(dir: &std::path::Path, tools: &[&str]) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin_dir = dir.join("tf").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("a bin directory");
     for (name, body) in std::iter::once(("tensorfold", "echo 'tensorfold 0.6.0'"))
         .chain(tools.iter().map(|tool| (*tool, "exit 0")))
     {
         let path = bin_dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("a script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        capyctl_config::test_support::write_executable(
+            &path,
+            format!("#!/bin/sh\n{body}\n"),
+            0o700,
+        )
+        .expect("a script");
     }
     bin_dir.join("tensorfold")
 }

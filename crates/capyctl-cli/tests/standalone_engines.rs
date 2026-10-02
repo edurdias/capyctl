@@ -476,8 +476,8 @@ async fn a_stale_retirement_expires_when_standalone_starts() {
 }
 
 fn script(path: &std::path::Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
+        .unwrap();
 }
 
 /// A TensorFold venv as `engine add` finds one (`engine_cli.rs`).

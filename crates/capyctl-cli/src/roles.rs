@@ -2241,12 +2241,15 @@ mod tests {
     // the fingerprints pinned by earlier releases still match.
     #[test]
     fn only_tensorfold_publishes_the_last_word_of_its_version() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = |name: &str, printed: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\nprintf '{printed}'\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            capyctl_config::test_support::write_executable(
+                &path,
+                format!("#!/bin/sh\nprintf '{printed}'\n"),
+                0o700,
+            )
+            .unwrap();
             path
         };
         let python = script("python3", "Python 3.12.3\\n");

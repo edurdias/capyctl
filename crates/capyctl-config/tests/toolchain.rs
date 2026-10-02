@@ -1,12 +1,11 @@
 //! ADR 0023 §2: TensorFold's build toolchain, looked up on the closed launch
 //! PATH. CPU tests only; they are not qualification.
 use capyctl_config::toolchain::check;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
+        .unwrap();
 }
 
 // T41 T37: the toolchain is looked up on the closed launch PATH only, in

@@ -35,6 +35,9 @@ pub mod standalone;
 pub mod strict_yaml;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
+// Tests across the workspace write executables through this.
+#[doc(hidden)]
+pub mod test_support;
 
 pub use defaults::{generate_default, resolve_startup, LoadOutcome};
 pub use error::{ConfigError, ConfigErrorCode};

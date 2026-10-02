@@ -2,7 +2,6 @@
 //! check. Fake environments only: CPU evidence, never qualification.
 use capyctl_agent::engines::*;
 use capyctl_config::engine_policy::Engine;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,8 +25,8 @@ pub fn fake_env(root: &Path, packages: &[(&str, &str)]) -> PathBuf {
 }
 
 pub fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
+        .unwrap();
 }
 
 // T07 T22: a venv directory, its bin/vllm and its bin/python3 all resolve to
