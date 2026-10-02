@@ -68,8 +68,7 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         installation_drift: Default::default(),
         cuda_home: None,
         engine_ports: (8100, 8199),
-        approved_options: Vec::new(),
-        approved_paths: Vec::new(),
+        registered: None,
     }
 }
 
@@ -2064,4 +2063,36 @@ fn an_unapproved_drafter_is_still_refused_on_standalone() {
     let security = &host["runtime_profiles"]["tf-drafter"]["security"];
     assert!(security.get("approved_options").is_none());
     assert!(security.get("approved_paths").is_none());
+}
+
+/// Owner rule (standalone is a server and one host): standalone publishes a
+/// registered profile exactly as a host merges it from engines.yaml, so no
+/// field the operator stated is dropped (security, env, log policy).
+// T03 T37
+#[test]
+fn a_registered_profile_is_published_as_a_host_publishes_it() {
+    let mut profile = drafter_profile(&["--drafter"], &["/srv/drafters"]);
+    profile["env"] = serde_json::json!({"MAX_JOBS": "4", "TOKENIZERS_PARALLELISM": "false"});
+    profile["log_policy"] = serde_json::json!({"max_file_bytes": "8MiB", "retained_files": 5});
+    let (host, _) = drafter_on_standalone(&profile, "/srv/drafters/d");
+    assert_eq!(host["runtime_profiles"]["tf-drafter"], profile);
+}
+
+/// ADR 0014 §6: a registered profile's `security.extra_args: denied` holds on
+/// standalone; a deployment's extra arguments are refused, approved or not.
+// T14 T37
+#[test]
+fn a_registered_denial_of_extra_args_holds_on_standalone() {
+    let mut profile = drafter_profile(&["--drafter"], &["/srv/drafters"]);
+    profile["security"]["extra_args"] = serde_json::json!("denied");
+    let (host, resolved) = drafter_on_standalone(&profile, "/srv/drafters/d");
+    assert_eq!(
+        host["runtime_profiles"]["tf-drafter"]["security"]["extra_args"],
+        "denied"
+    );
+    let refused = resolved.expect_err("denied extra arguments are refused");
+    assert!(
+        refused.contains("denies extra engine arguments"),
+        "{refused}"
+    );
 }

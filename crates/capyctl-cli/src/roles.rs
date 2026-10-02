@@ -966,8 +966,7 @@ impl EnvEngineProvider {
             installation_drift,
             cuda_home: role.cuda_home,
             engine_ports: role.engine_ports,
-            approved_options: Vec::new(),
-            approved_paths: Vec::new(),
+            registered: None,
         })
     }
 }

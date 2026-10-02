@@ -72,13 +72,11 @@ pub struct EngineInstallation {
     /// (`resource_policy.endpoint_port_range`). A second role on the same
     /// machine names its own range so their engines never collide.
     pub engine_ports: (u16, u16),
-    /// ADR 0014 §8: `security.approved_options` of a registered profile, the
-    /// security-sensitive options a deployment's extra arguments may name.
-    /// Empty for an environment installation.
-    pub approved_options: Vec<String>,
-    /// ADR 0014 §8: `security.approved_paths`, the directories an approved
-    /// path option may name. Empty for an environment installation.
-    pub approved_paths: Vec<String>,
+    /// ADR 0018 §2, owner rule (standalone is a server and one host): the
+    /// engines.yaml profile this installation was registered as, kept whole so
+    /// standalone publishes every field a host's merge keeps (security,
+    /// `env`, `log_policy`). `None` for an environment installation.
+    pub registered: Option<serde_json::Value>,
 }
 
 /// The settings a role holds whether or not it has an engine: every
@@ -116,7 +114,6 @@ pub struct NamedInstallation {
 /// engine, its executable, its version, its security switches and its args.
 pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> EngineInstallation {
     // ADR 0014 §8: the profile's approvals are its own, never the base's.
-    let (approved_options, approved_paths) = capyctl_config::registration::approvals_of(profile);
     let engine = profile["engine"]
         .as_str()
         .and_then(Engine::from_name)
@@ -146,8 +143,7 @@ pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> E
             })
             .unwrap_or_default(),
         cuda_home: profile["cuda_home"].as_str().map(PathBuf::from),
-        approved_options,
-        approved_paths,
+        registered: Some(profile.clone()),
         ..base.clone()
     }
 }

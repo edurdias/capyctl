@@ -370,7 +370,7 @@ pub struct ProfileSpec {
 
 /// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
 /// each stated only when non-empty so a default profile is unchanged. One
-/// rule for the profile `engine add` writes and the one standalone publishes.
+/// rule wherever a profile is written.
 pub fn put_approvals(security: &mut Value, options: &[String], paths: &[String]) {
     if !options.is_empty() {
         security["approved_options"] = serde_json::json!(options);
@@ -378,22 +378,6 @@ pub fn put_approvals(security: &mut Value, options: &[String], paths: &[String])
     if !paths.is_empty() {
         security["approved_paths"] = serde_json::json!(paths);
     }
-}
-
-/// The approvals a profile document states, as [`put_approvals`] writes them.
-pub fn approvals_of(profile: &Value) -> (Vec<String>, Vec<String>) {
-    let list = |key: &str| -> Vec<String> {
-        profile["security"][key]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    (list("approved_options"), list("approved_paths"))
 }
 
 /// The CUDA toolkit `capyctl engine add` records (SPEC §13.3 amendment, owner

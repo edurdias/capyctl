@@ -474,6 +474,7 @@ fn approvals_are_written_and_reach_the_host_document() {
     write_engines(&engines, &lock, Some(&host_value(&host))).unwrap();
     drop(lock);
     let config = HostConfig::load(&host).unwrap();
+    assert_eq!(config.document["runtime_profiles"]["tf-drafter"], profile);
     let security = &config.document["runtime_profiles"]["tf-drafter"]["security"];
     assert_eq!(
         security["approved_options"],

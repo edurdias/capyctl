@@ -60,40 +60,73 @@ pub fn device_limits(memory: &GpuMemory, max_parked: i64) -> DeviceLimits {
 /// references; the coordinator resolves them per launch, never from the
 /// profile itself. A vLLM launch keys its development and control routes with
 /// the admin key, apart from the inference key ingress holds.
+///
+/// ADR 0018 §2, owner rule (standalone is a server and one host): a
+/// registered installation starts from its engines.yaml profile, whole, as a
+/// host's merge keeps it, so every field the operator stated (`env`,
+/// `log_policy`, `security.extra_args`, `security.approved_*`, ...) is
+/// published. Only what the installation itself states is written over it.
 fn runtime_profile(installation: &EngineInstallation) -> Value {
-    let mut security = json!({
-        "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
-        "trust_remote_code": installation.trust_remote_code,
-        "credential_ref": "secret://engine-key",
-        "admin_credential_ref": "secret://admin-key"
+    let mut profile = installation
+        .registered
+        .clone()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let defaults = json!({
+        "revision": 1,
+        "env": {},
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+        "security": {},
     });
+    for (key, value) in defaults.as_object().expect("an object") {
+        profile
+            .as_object_mut()
+            .expect("an object")
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    profile["engine"] = json!(installation.engine.name());
+    profile["executable"] = json!(installation.executable.to_string_lossy());
+    profile["build_fingerprint"] = json!(installation.build_fingerprint);
+    profile["args"] = json!(installation.args);
+    // SPEC §13.3 amendment (owner decision 2026-09-25): stated only when the
+    // installation names one, so a default document is unchanged.
+    match &installation.cuda_home {
+        Some(cuda_home) => profile["cuda_home"] = json!(cuda_home.to_string_lossy()),
+        None => {
+            profile
+                .as_object_mut()
+                .expect("an object")
+                .remove("cuda_home");
+        }
+    }
+    let security = profile["security"]
+        .as_object_mut()
+        .expect("security is a mapping");
+    security.insert(
+        "deep_park".into(),
+        json!(if installation.deep_park {
+            "enabled"
+        } else {
+            "disabled"
+        }),
+    );
+    security.insert(
+        "trust_remote_code".into(),
+        json!(installation.trust_remote_code),
+    );
+    security
+        .entry("credential_ref")
+        .or_insert_with(|| json!("secret://engine-key"));
+    security
+        .entry("admin_credential_ref")
+        .or_insert_with(|| json!("secret://admin-key"));
     // ADR 0008 (owner decision 2026-09-23): stated only when the host refuses
     // drift, so a default document is unchanged.
     if installation.installation_drift == capyctl_config::effective::InstallationDrift::Refuse {
-        security["installation_drift"] = json!("refuse");
-    }
-    // ADR 0014 §8: a registered profile's approvals are published with it, as
-    // a host publishes engines.yaml; without this a deployment's approved
-    // path option is refused on standalone only.
-    capyctl_config::registration::put_approvals(
-        &mut security,
-        &installation.approved_options,
-        &installation.approved_paths,
-    );
-    let mut profile = json!({
-        "engine": installation.engine.name(),
-        "revision": 1,
-        "executable": installation.executable.to_string_lossy(),
-        "build_fingerprint": installation.build_fingerprint,
-        "args": installation.args,
-        "env": {},
-        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
-        "security": security
-    });
-    // SPEC §13.3 amendment (owner decision 2026-09-25): stated only when the
-    // installation names one, so a default document is unchanged.
-    if let Some(cuda_home) = &installation.cuda_home {
-        profile["cuda_home"] = json!(cuda_home.to_string_lossy());
+        security.insert("installation_drift".into(), json!("refuse"));
+    } else {
+        security.remove("installation_drift");
     }
     profile
 }
