@@ -177,7 +177,8 @@ impl Cluster {
             String::from_utf8_lossy(&out.stderr)
         );
         let mut server: Value =
-            serde_json::from_slice(&std::fs::read(&server_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&server_config).unwrap())
+                .unwrap();
         let mut inference = String::new();
         for name in ["management", "inference", "bootstrap", "control"] {
             let address = format!("127.0.0.1:{}", free_port());
@@ -237,7 +238,8 @@ impl Cluster {
                     ),
                 );
                 let template: Value =
-                    serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+                    capyctl_config::parse_document(&std::fs::read_to_string(&config).unwrap())
+                        .unwrap();
                 let mut host = golden["input"]["host"].clone();
                 host["name"] = name.into();
                 host["state_dir"] = template["state_dir"].clone();
@@ -359,7 +361,8 @@ impl Cluster {
     /// `PUT /management/v1/deployments/{id}`: a new revision of the deployment.
     async fn replace(&self, id: &str, revision: i64, config: &Value) -> (u16, Value) {
         let server: Value =
-            serde_json::from_slice(&std::fs::read(&self.server_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&self.server_config).unwrap())
+                .unwrap();
         let management = server["listeners"]["management"]["bind"].as_str().unwrap();
         let response = reqwest::Client::new()
             .put(format!(

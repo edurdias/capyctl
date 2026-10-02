@@ -1159,7 +1159,8 @@ fn server_installation(inference: &str) -> (tempfile::TempDir, PathBuf, PathBuf)
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut server: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    let mut server: Value =
+        capyctl_config::parse_document(&std::fs::read_to_string(&config).unwrap()).unwrap();
     for name in ["management", "bootstrap", "control"] {
         let address = format!("127.0.0.1:{}", free_port());
         server["listeners"][name]["bind"] = address.clone().into();
@@ -1472,7 +1473,8 @@ impl TwoRoles {
             );
         }
         let mut server: Value =
-            serde_json::from_slice(&std::fs::read(&roles.server_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&roles.server_config).unwrap())
+                .unwrap();
         let mut inference = String::new();
         for name in ["management", "inference", "bootstrap", "control"] {
             let address = format!("127.0.0.1:{}", free_port());
@@ -1513,7 +1515,8 @@ impl TwoRoles {
         ))
         .unwrap();
         let template: Value =
-            serde_json::from_slice(&std::fs::read(&roles.host_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&roles.host_config).unwrap())
+                .unwrap();
         let mut host = golden["input"]["host"].clone();
         host["name"] = "w11-host".into();
         host["state_dir"] = template["state_dir"].clone();
@@ -2128,7 +2131,8 @@ async fn start_host_prints_a_ready_line_and_its_first_session_is_accepted() {
         Duration::from_secs(30),
     );
     let document: Value =
-        serde_json::from_slice(&std::fs::read(&roles.host_config).unwrap()).unwrap();
+        capyctl_config::parse_document(&std::fs::read_to_string(&roles.host_config).unwrap())
+            .unwrap();
     let state_dir = document["state_dir"].as_str().unwrap();
     let ingress = document["ingress"]["bind"].as_str().unwrap();
     assert!(

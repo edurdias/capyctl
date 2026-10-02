@@ -110,20 +110,16 @@ Wrote host.yaml
 ```
 
 CapyCTL sets the memory limits in the file from this machine's memory and GPUs,
-and keeps models in `~/models`, so it validates as written. The file is JSON,
-which is also valid YAML. Change two things in it: set `name` to the one in
-the invitation, and add an `ingress` with this machine's private address, where
-the server sends requests:
+and keeps models in `~/models`, so it validates as written. Change two things in
+it: set `name` to the one in the invitation, and add an `ingress` with this
+machine's private address, where the server sends requests:
 
-```json title="host.yaml (the two changes)"
-{
-  "name": "gpu-box",
-  "ingress": {
-    "transport": "trusted_private_link",
-    "address": "http://100.64.0.21:8444",
-    "bind": "100.64.0.21:8444"
-  }
-}
+```yaml title="host.yaml (the two changes)"
+name: gpu-box
+ingress:
+  transport: trusted_private_link
+  address: "http://100.64.0.21:8444"
+  bind: "100.64.0.21:8444"
 ```
 
 To change the memory limits or the models directory, see

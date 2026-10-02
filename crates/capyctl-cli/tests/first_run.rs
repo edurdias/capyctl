@@ -514,7 +514,8 @@ fn init_host_writes_a_document_that_validates_with_the_shared_defaults() {
     let output = capyctl(root.path(), root.path(), &["init", "host"], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     let config = root.path().join("state/config/host.yaml");
-    let document: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    let document: Value =
+        capyctl_config::parse_document(&std::fs::read_to_string(&config).unwrap()).unwrap();
     assert!(
         document["model_store"]["path"]
             .as_str()

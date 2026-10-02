@@ -46,14 +46,14 @@ server_init() {
   # is run as it is; only the run's own copy is replaced by the snapshot build
   # (found live 2026-09-25: ENG4's rc.3 server binary was overwritten).
   if [ -z "${CAPYCTL_LOCAL_BIN:-}" ]; then x install -m 755 "$LIVE/build/release/capyctl" "$CAPYCTL"; fi
-  x env "CAPYCTL_STATE_DIR=$LRD/server" "$CAPYCTL" init server --output "$SERVER_CFG"
+  x env "CAPYCTL_STATE_DIR=$LRD/server" "$CAPYCTL" init server --output "$LRD/server-init.json"
   # Bootstrap and control listen on control-host's Tailscale address; management and
   # inference stay on loopback (ServerConfig::parse refuses anything else).
   # CAPYCTL_TIMING_HEADER=1 turns on `observability.timing_header` (M80, SPEC 17).
-  x python3 - "$SERVER_CFG" "$SERVER_IP" "${CAPYCTL_TIMING_HEADER:-0}" <<'PY'
+  x python3 - "$SERVER_CFG" "$SERVER_IP" "${CAPYCTL_TIMING_HEADER:-0}" "$LRD/server-init.json" <<'PY'
 import json, os, sys
-path, ip, timing = sys.argv[1], sys.argv[2], sys.argv[3]
-doc = json.load(open(path))
+path, ip, timing, init = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+doc = json.load(open(init))
 doc["listeners"]["bootstrap"]["bind"] = f"{ip}:7444"
 doc["listeners"]["control"]["bind"] = f"{ip}:7445"
 doc["enrollment"] = {"bootstrap_address": f"https://{ip}:7444", "control_address": f"https://{ip}:7445"}
