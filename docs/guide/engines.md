@@ -179,10 +179,28 @@ capyctl engine add ~/venvs/tensorfold --name tensorfold-drafter \
 then pass it in the deployment with
 `accept_extra_args: true` and `extra_args: [--drafter, /srv/drafters/my-drafter]`.
 CapyCTL does not download drafters; without one it starts TensorFold with
-`--drafter none`. That turns off an external draft model only: a checkpoint
-with built-in MTP heads, such as Nemotron, still drafts (the response's
-`tensorfold` record shows `"drafts":true`). TensorFold's `--mtp-drafts 0`
-turns that off, passed the same way as `--drafter`. The first start builds kernels and can take several
+`--drafter none`, so TensorFold never picks one from a cache. That turns off an
+external draft model only: a checkpoint with built-in MTP heads, such as
+Nemotron, still drafts (the response's `tensorfold` record shows
+`"drafts":true`).
+
+Some models need an explicit choice. TensorFold 0.6.1 refuses to start Qwen3.8
+dense (Qwen3.8-27B) on an NVIDIA GPU without a drafter, and the start fails
+with `TensorFold needs a drafter for this model: name one with --drafter, or
+add --no-drafts to turn drafts off`. To run it without drafts, turn them off;
+`--no-drafts` needs no approval when you add the engine:
+
+```yaml
+engine_config:
+  context_length: 32768
+  accept_extra_args: true
+  extra_args: [--no-drafts]
+```
+
+CapyCTL then passes `--no-drafts` in place of `--drafter none`. `--no-drafts`
+also turns off built-in MTP drafts; `--mtp-drafts 0` does the same and is
+ordinary too. A deployment that passes both `--no-drafts` and `--drafter` is
+refused. The first start builds kernels and can take several
 minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a

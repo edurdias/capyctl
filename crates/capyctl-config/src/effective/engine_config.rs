@@ -875,6 +875,24 @@ pub(super) fn normalize_engine_config(
         )
         .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
     }
+    // ADR 0023 §5: drafts off and a named drafter contradict each other,
+    // whether the host-fixed or the extra arguments say either.
+    if engine == Engine::Tensorfold {
+        let all: Vec<String> = inputs
+            .profile_args
+            .iter()
+            .chain(&extra_args)
+            .cloned()
+            .collect();
+        let drafts = crate::engine_policy::tensorfold_drafts(&all)
+            .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
+        if drafts.names_drafter && drafts.drafts_off {
+            return Err(invalid(
+                "engine_config.extra_args",
+                crate::engine_policy::TENSORFOLD_DRAFTS_CONFLICT,
+            ));
+        }
+    }
 
     let raw_memory = raw.memory.clone().unwrap_or_default();
     let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;

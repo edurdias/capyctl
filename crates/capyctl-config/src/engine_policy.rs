@@ -233,6 +233,31 @@ const TENSORFOLD_SENSITIVE: &[(&str, Sensitivity)] = &[
 ];
 const TENSORFOLD_SHAPED: &[&str] = &[];
 
+/// ADR 0023 §3, §5: what a TensorFold pass-through vector says about drafts:
+/// whether it names a `--drafter`, and whether it turns drafts off with
+/// `--no-drafts` (both in any spelling TensorFold's parser expands). capyctl
+/// renders `--drafter none` only when it says neither, so TensorFold never
+/// picks a drafter itself; saying both is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TensorfoldDrafts {
+    pub names_drafter: bool,
+    pub drafts_off: bool,
+}
+
+/// Why a TensorFold argument vector's drafter choice is refused.
+pub const TENSORFOLD_DRAFTS_CONFLICT: &str =
+    "`--no-drafts` turns drafts off and `--drafter` names a drafter; keep one of them";
+
+pub fn tensorfold_drafts(args: &[String]) -> Result<TensorfoldDrafts, ProfileArgError> {
+    let mut drafts = TensorfoldDrafts::default();
+    for option in parse_options(args)? {
+        let name = option.name.as_str();
+        drafts.names_drafter |= matches_name(name, "--drafter");
+        drafts.drafts_off |= name.len() > "--no-".len() && "--no-drafts".starts_with(name);
+    }
+    Ok(drafts)
+}
+
 /// Whole option families reserved for SGLang: every `ssl_*` field, the
 /// `modelopt_*_path` fields (quantization is out of scope, SPEC §1.2), and the
 /// disaggregation, hierarchical-cache and external-cache integrations (SPEC §12).

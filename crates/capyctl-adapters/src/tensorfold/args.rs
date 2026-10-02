@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use capyctl_config::engine_policy::{
-    parse_options, typed_option_of, validate_rendered_args, Engine, ProfileArgError,
+    parse_options, tensorfold_drafts, typed_option_of, validate_rendered_args, Engine,
+    ProfileArgError, TENSORFOLD_DRAFTS_CONFLICT,
 };
 
 use crate::traits::RenderedCommand;
@@ -60,6 +61,8 @@ pub enum TensorfoldArgsError {
     Malformed(String),
     #[error("a TensorFold launch needs a context length")]
     NoContext,
+    #[error("{}", TENSORFOLD_DRAFTS_CONFLICT)]
+    DraftsConflict,
 }
 
 /// The typed flags, in TensorFold's own spelling (`tensorfold/cli_args.py`).
@@ -152,11 +155,15 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     ];
     argv.extend(typed);
     // ADR 0023 §3, §5: TensorFold's default `--drafter auto` would read the
-    // Hugging Face cache; without an approved `--drafter` extra it is `none`.
-    let names_drafter = option_names(&pass_through)?
-        .iter()
-        .any(|name| name.len() > 2 && "--drafter".starts_with(name.as_str()));
-    if !names_drafter {
+    // Hugging Face cache; without an approved `--drafter` or `--no-drafts` it
+    // is `none`. Some families refuse `none` on CUDA (Qwen3.8 dense), so drafts
+    // turned off render `--no-drafts` alone.
+    let drafts = tensorfold_drafts(&pass_through)
+        .map_err(|error| TensorfoldArgsError::Malformed(error.to_string()))?;
+    if drafts.names_drafter && drafts.drafts_off {
+        return Err(TensorfoldArgsError::DraftsConflict);
+    }
+    if !drafts.names_drafter && !drafts.drafts_off {
         argv.extend(["--drafter".to_owned(), "none".to_owned()]);
     }
     argv.extend(pass_through);
