@@ -274,13 +274,17 @@ pub async fn dispatch_timed(
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
             let mut observer = crate::stream::ProgressOnly(progress.clone());
-            let result = crate::stream::bounded(
+            let bounded = crate::stream::bounded(
                 attempt.forward.forward_chat_observed(&body, &mut observer),
                 &progress,
                 &bounds,
             )
-            .await
-            .unwrap_or_else(|()| {
+            .await;
+            // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
+            // closes the engine connection, so the lease is cancelling, as for
+            // a stream whose client hung up.
+            let cut = bounded.is_err();
+            let result = bounded.unwrap_or_else(|()| {
                 Err(AdapterError::Uncertain(
                     "the backend missed the request's deadline or idle bound".into(),
                 ))
@@ -288,7 +292,11 @@ pub async fn dispatch_timed(
             if result.is_ok() {
                 timing.response();
             }
-            let end = lease_end(result.as_ref().err());
+            let end = if cut {
+                LeaseEnd::Cancelling
+            } else {
+                lease_end(result.as_ref().err())
+            };
             let durable = attempt.settle(end).await;
             match result {
                 // SPEC §10, T38: nothing reached the engine, so the request may

@@ -59,6 +59,7 @@ resource_policy:
     max_pending_total: 256
     max_buffered_bytes_total: "64MiB"
     request_deadline: "1800s"
+    stream_idle_timeout: "120s"
   # Deployments select hosts by these labels (`placement.selector`).
   labels:
     site: lab

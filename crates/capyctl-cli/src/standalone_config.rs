@@ -296,6 +296,22 @@ pub fn resource_policy(
     })
 }
 
+/// SPEC §10, §16.2 (owner rule 2026-09-25: standalone is a server and one
+/// host): each queue bound the standalone document states under
+/// `host.resource_policy.queue` (after `--set` and `CAPYCTL_SET__…`) replaces
+/// the derived default in the embedded host's policy, as a host document's
+/// would. The values are checked when the policy is normalized.
+pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
+    let Some(stated) = stated_host["resource_policy"]["queue"].as_object() else {
+        return;
+    };
+    if let Some(queue) = host["resource_policy"]["queue"].as_object_mut() {
+        for (bound, value) in stated {
+            queue.insert(bound.clone(), value.clone());
+        }
+    }
+}
+
 /// The request deadline a deployment carries unless its caller names another.
 ///
 /// It bounds how far ahead an operation's deadline may be set, so it has to be at

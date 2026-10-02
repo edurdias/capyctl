@@ -498,7 +498,13 @@ impl ChatHttp {
                 // events into a second queue.
                 let mut payload = None;
                 let done = parser.byte(byte, &mut |chunk| payload = Some(chunk))?;
-                if payload.is_some() || done {
+                // SPEC §10: an event is progress, except a chunk that only
+                // opens the reply (`opens_reply_only`).
+                if done
+                    || payload
+                        .as_deref()
+                        .is_some_and(|chunk| !opens_reply_only(chunk))
+                {
                     sink.progressed();
                 }
                 if let Some(chunk) = payload {
@@ -521,6 +527,39 @@ impl ChatHttp {
         // Even a finish_reason without the protocol terminator is uncertain.
         Err(uncertain())
     }
+}
+
+/// SPEC §10 (found live 2026-10-02): whether `chunk` only opens the reply: every
+/// choice's delta states the `role` and nothing else that is not null or empty,
+/// with no finish reason, no log probabilities and no usage. TensorFold sends
+/// this chunk as soon as it accepts a request, before it prefills the prompt;
+/// vLLM and SGLang send it with their first output. It is relayed like any
+/// chunk, but it is not progress: until the first output, the request deadline
+/// bounds the stream, whatever the engine sent first.
+pub fn opens_reply_only(chunk: &str) -> bool {
+    if !chunk.contains("\"role\"") {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(chunk) else {
+        return false;
+    };
+    let empty = |value: &Value| value.is_null() || value.as_str() == Some("");
+    value.get("usage").is_none_or(Value::is_null)
+        && value["choices"]
+            .as_array()
+            .filter(|choices| !choices.is_empty())
+            .is_some_and(|choices| {
+                choices.iter().all(|choice| {
+                    choice["finish_reason"].is_null()
+                        && choice["logprobs"].is_null()
+                        && choice["delta"].as_object().is_some_and(|delta| {
+                            delta.get("role").is_some_and(|role| !role.is_null())
+                                && delta
+                                    .iter()
+                                    .all(|(field, value)| field == "role" || empty(value))
+                        })
+                })
+            })
 }
 
 /// SPEC §10: the statuses an OpenAI-compatible engine answers when it rejects a
@@ -1439,6 +1478,88 @@ mod tests {
                 upstream(&base, path).is_none(),
                 "{path} must not be reachable through a forwarder"
             );
+        }
+    }
+
+    /// Counts the progress reports and the chunks a forward delivers.
+    #[derive(Default)]
+    struct Counting {
+        progressed: usize,
+        chunks: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::ChatSink for Counting {
+        fn progressed(&mut self) {
+            self.progressed += 1;
+        }
+        async fn send(&mut self, chunk: String) -> Result<(), crate::traits::DeliveryFailed> {
+            self.chunks.push(chunk);
+            Ok(())
+        }
+    }
+
+    /// SPEC §10 (found live 2026-10-02, TensorFold 0.6.1 and 0.6.2): TensorFold
+    /// sends its `role` chunk before it prefills the prompt, so counting that
+    /// chunk as progress put a long prefill under the stream idle bound and cut
+    /// a 256k-token prompt at 120 s. The opening chunk is relayed but is not
+    /// progress; the first output and every event after it are, collected or
+    /// streamed.
+    // T17 T19
+    #[tokio::test]
+    async fn the_role_opening_chunk_is_relayed_but_is_not_progress() {
+        let sse = [
+            tool_chunk(json!({"role":"assistant"}), Value::Null),
+            tool_chunk(json!({"content":"hi"}), Value::Null),
+            tool_chunk(json!({}), json!("stop")),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat();
+        let (url, _) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let request = json!({"model":"public","messages":[]});
+        let mut sink = Counting::default();
+        let end = forward
+            .forward_chat_stream_async(&request, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(end, crate::traits::StreamEnded::Completed);
+        assert_eq!(sink.chunks.len(), 3, "the opening chunk is still relayed");
+        // The content chunk, the finish chunk and the terminator.
+        assert_eq!(sink.progressed, 3);
+        let mut observer = Counting::default();
+        let response = forward
+            .forward_chat_observed(&request, &mut observer)
+            .await
+            .unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
+        assert_eq!(observer.progressed, 3);
+        // Only a chunk that opens the reply and carries nothing else qualifies.
+        use super::opens_reply_only;
+        let chunk = |delta: Value, finish: Value| {
+            json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]}).to_string()
+        };
+        assert!(opens_reply_only(&chunk(
+            json!({"role":"assistant"}),
+            Value::Null
+        )));
+        assert!(opens_reply_only(&chunk(
+            json!({"role":"assistant","content":"","reasoning_content":null}),
+            Value::Null
+        )));
+        for output in [
+            chunk(json!({"role":"assistant","content":"hi"}), Value::Null),
+            chunk(
+                json!({"role":"assistant","tool_calls":[{"index":0}]}),
+                Value::Null,
+            ),
+            chunk(json!({"role":"assistant"}), json!("stop")),
+            chunk(json!({"content":""}), Value::Null),
+            json!({"choices":[{"delta":{"role":"assistant"}}],"usage":{"total_tokens":1}})
+                .to_string(),
+            json!({"choices":[]}).to_string(),
+            "not json".to_owned(),
+        ] {
+            assert!(!opens_reply_only(&output), "{output}");
         }
     }
 }

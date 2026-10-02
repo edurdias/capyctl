@@ -20,7 +20,9 @@ const MAX_CHUNK_BYTES: usize = 64 * 1024;
 /// still producing and left its lease uncertain, so a park never armed. A
 /// stream is now cut only when its first event misses the request's deadline
 /// (activation included) or a later event misses the idle bound; a stream that
-/// keeps producing runs as long as it produces.
+/// keeps producing runs as long as it produces. A chunk that only opens the
+/// reply is not an event here (`capyctl_adapters::forward::opens_reply_only`,
+/// found live 2026-10-02): the deadline bounds a prefill that follows it.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamBounds {
     /// When the first backend event must have arrived.
@@ -65,15 +67,16 @@ impl Progress {
 /// terminator or on proof the engine never saw the request. A stream whose
 /// client hung up was cancelled upstream and stays charged as cancelling
 /// until the engine reports quiescence. A stream the router cut for missing
-/// its bounds stays uncertain.
+/// its bounds was cancelled the same way: dropping the forward closed the
+/// engine connection (found live 2026-10-02), so it is cancelling too.
 pub fn stream_lease_end(
     result: &Result<Result<StreamEnded, AdapterError>, ()>,
 ) -> capyctl_controller::LeaseEnd {
     match result {
         Ok(Ok(StreamEnded::Completed)) => capyctl_controller::LeaseEnd::Completed,
-        Ok(Ok(StreamEnded::Cancelled)) => capyctl_controller::LeaseEnd::Cancelling,
+        Ok(Ok(StreamEnded::Cancelled)) | Err(()) => capyctl_controller::LeaseEnd::Cancelling,
         Ok(Err(error)) => crate::chat::lease_end(Some(error)),
-        _ => capyctl_controller::LeaseEnd::Uncertain,
+        Ok(Ok(StreamEnded::BackendClosed)) => capyctl_controller::LeaseEnd::Uncertain,
     }
 }
 
@@ -109,8 +112,10 @@ impl ChatSink for ProgressOnly {
         self.0.mark();
     }
 
-    async fn send(&mut self, _chunk: String) -> Result<(), DeliveryFailed> {
-        self.0.mark();
+    async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
+        if !capyctl_adapters::forward::opens_reply_only(&chunk) {
+            self.0.mark();
+        }
         Ok(())
     }
 }
@@ -131,7 +136,12 @@ impl ChatSink for ResponseSink {
     }
 
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
-        self.progress.mark();
+        // SPEC §10 (found live 2026-10-02): a chunk that only opens the reply is
+        // relayed, but until the first output the request deadline bounds the
+        // stream, not the idle bound.
+        if !capyctl_adapters::forward::opens_reply_only(&chunk) {
+            self.progress.mark();
+        }
         if self.failed {
             return Err(DeliveryFailed);
         }
@@ -325,8 +335,8 @@ pub fn stream_planned_timed(
         }
         // SPEC §10, T17: an uncertain end — an error, a premature close, a cut
         // for missing the bounds, a hang-up — cannot establish backend quiescence. With a
-        // durable lease that uncertainty stays charged in the ledger until
-        // reconciled, so the per-process slot is released; left taken, every
+        // durable lease it stays charged in the ledger (cancelling or uncertain)
+        // until settled, so the per-process slot is released; left taken, every
         // uncertain stream would shrink the deployment's bound for the life of
         // the process. Without a durable ledger the slot is the only record
         // and stays taken. A panic retains it either way.

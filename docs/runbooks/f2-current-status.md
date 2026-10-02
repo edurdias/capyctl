@@ -1,5 +1,57 @@
 # Current implementation and launch status
 
+## Long prompts, stream bounds and standalone queue settings — 2026-10-02 (branch `fix/stream-idle-cancel`)
+
+Found in the TensorFold 0.6.1 and 0.6.2 context sweep (Qwen3.8-27B NVFP4,
+DFlash2, standalone): every 256k-token prompt ended at 120 s with no token.
+
+1. **A prefill was cut by the idle bound.** TensorFold sends the reply's
+   `role` chunk as soon as it accepts a request, before it prefills. The
+   router counted that chunk as backend progress, so the stream idle bound
+   (120 s) applied to the prefill instead of the request deadline (1800 s in
+   standalone). A chunk that only opens the reply is now relayed but is not
+   progress (`opens_reply_only`, SPEC §10 amendment 2026-10-02), streamed or
+   collected.
+2. **Standalone refused the queue settings.** `host.resource_policy.queue`
+   (every bound a host has, `stream_idle_timeout` included) is now honoured
+   in a standalone document, by `--set` and by `CAPYCTL_SET__…`. A restart
+   with changed bounds applies them to the stored policy as a new revision;
+   before, an existing standalone kept its first bounds silently. The
+   persisted memory limits are kept as before.
+3. **A cut request stayed uncertain.** A stream or collected response the
+   router cuts for its bounds closed the engine connection already; its lease
+   is now `cancelling`, as for a client hang-up, and settles on engine
+   quiescence.
+
+Root cause of the slow stop: TensorFold 0.6.1 and 0.6.2 (CUDA server) notice a
+closed connection only between decode rounds, so an abandoned prefill runs to
+its end. The stop waits for `/health` idle by design (ADR 0023 §6), so it lasts
+as long as the remaining prefill. CapyCTL cannot shorten that without
+signalling a busy engine, which ADR 0023 refuses (owner decision).
+
+Live on host A (standalone, TensorFold 0.6.2, fresh 0700 state and config
+directories, 262144-token context):
+- Before (commit `74a9b9b`): a 247.5k-token prompt got its `role` chunk at
+  0.3 s and was cut at 120.3 s; the engine kept prefilling for 130 s more, and
+  the stop took 120.9 s. A start of another deployment during that stop was
+  refused `capacity_blocked` at 15 s and `reconciliation_required` at 73 s.
+- After, `--set host.resource_policy.queue.stream_idle_timeout=600s`: the
+  same prompt (247569 tokens) got its first token at 246.6 s and `[DONE]`.
+- After, default bounds: first token at 246.9 s and `[DONE]`.
+- After, `CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__REQUEST_DEADLINE=30s` on
+  a restart (policy revision 2): a 121k-token prompt was cut at 30.0 s with
+  its lease `cancelling`; the stop sent then took 46.7 s, the rest of the
+  prefill. A restart without the variable went back to 1800 s (revision 3).
+
+Not fixed (noted for the owner): a start during a stop that waits on a busy
+TensorFold is refused `reconciliation_required` ("Current owned state or
+resource policy is unavailable") once the cleanup pauses the worker
+(`start_scoped`, `CoordinatorError::Stopped`); a clearer retryable answer
+needs a new coordinator error. A client that hangs up during a prefill is
+noticed only at the next chunk.
+
+CPU and Fake-engine tests are not qualification.
+
 ## Draft model memory gaps closed — 2026-10-02 (branch `fix/drafter-memory-gaps`)
 
 Gaps left by the vLLM 0.30 findings (Qwen3.8-27B NVFP4 with DFlash2):

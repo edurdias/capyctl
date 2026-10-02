@@ -1092,7 +1092,8 @@ async fn at_the_in_flight_bound_requests_wait_in_arrival_order() {
 // T19 T17 (SPEC §10): a non-streaming request is bounded like a stream — its
 // first backend event by the request deadline, later ones by the idle bound —
 // not by a fixed 300 s / 60 s cap. A backend that stalls after its first event
-// is cut at the idle bound and its lease stays uncertain.
+// is cut at the idle bound; the cut closed the engine connection, so its lease
+// is cancelling until the engine reports quiescence (found live 2026-10-02).
 #[tokio::test]
 async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     let first = format!(
@@ -1135,7 +1136,7 @@ async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     assert_eq!(answer["code"], "engine_error");
     assert_eq!(
         ends(&authority),
-        vec![Some(capyctl_controller::LeaseEnd::Uncertain)]
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling)]
     );
 }
 

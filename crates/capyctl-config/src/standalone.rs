@@ -17,8 +17,9 @@
 //! server) with `api_key` or the explicit `none` authentication, an `embedded` connection, `auto` resource values and no
 //! runtime profiles. The models directory and model sources, the engine
 //! installation (`host.local_engine`), the runtime directory
-//! (`host.runtime_dir`) and the engines' port range
-//! (`host.resource_policy.endpoint_port_range`) are honoured as on a host
+//! (`host.runtime_dir`), the engines' port range
+//! (`host.resource_policy.endpoint_port_range`) and the queue bounds
+//! (`host.resource_policy.queue`) are honoured as on a host
 //! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` /
 //! `CAPYCTL_INFERENCE_ADDR` or `--management-listen` / `CAPYCTL_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
@@ -377,6 +378,9 @@ pub fn check_honoured(
         let mut policy = policy.clone();
         if let Some(map) = policy.as_object_mut() {
             map.remove("endpoint_port_range");
+            // The queue bounds are honoured as on a host; their values are
+            // checked when the embedded host's policy is normalized.
+            map.remove("queue");
         }
         only_auto(&policy, "host.resource_policy")?;
     }
@@ -627,6 +631,38 @@ mod tests {
 
     fn check(document: &Value) -> Result<Vec<IgnoredSetting>, ConfigError> {
         check_honoured(document, Path::new("/s/config"), Path::new("/s"))
+    }
+
+    // T03 (owner rule 2026-09-25: standalone is a server and one host, every
+    // setting three ways; found live 2026-10-02): the host queue bounds,
+    // `host.resource_policy.queue`, are honoured in a standalone document and
+    // set by `--set` and `CAPYCTL_SET__…`, as on a host.
+    #[test]
+    fn the_host_queue_bounds_are_accepted() {
+        use crate::setting_overrides::SettingOverrides;
+        let mut doc = generated("/s");
+        doc["host"]["resource_policy"]["queue"] =
+            json!({"stream_idle_timeout": "600s", "request_deadline": "3600s"});
+        crate::validate(
+            &serde_json::to_string(&doc).unwrap(),
+            crate::ConfigKind::Standalone,
+        )
+        .unwrap();
+        check(&doc).unwrap();
+        let overrides = SettingOverrides::parse(
+            crate::ConfigKind::Standalone,
+            &["host.resource_policy.queue.stream_idle_timeout=900s".to_owned()],
+            &[(
+                "CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__STREAM_IDLE_TIMEOUT".to_owned(),
+                "450s".to_owned(),
+            )],
+        )
+        .unwrap();
+        let applied = overrides.apply_and_validate(doc).unwrap();
+        let queue = &applied["host"]["resource_policy"]["queue"];
+        assert_eq!(queue["stream_idle_timeout"], "900s", "--set wins");
+        assert_eq!(queue["request_deadline"], "3600s", "YAML kept");
+        check(&applied).unwrap();
     }
 
     // T03 (design §9): a document an older capyctl generated, with inference on

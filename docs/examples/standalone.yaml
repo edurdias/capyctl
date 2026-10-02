@@ -35,6 +35,10 @@ host:
       system:
         managed_limit: auto
         free_reserve: auto
+    # Optional request queue bounds, as on a host (defaults shown):
+    # queue:
+    #   request_deadline: "1800s"     # until the first output, prefill included
+    #   stream_idle_timeout: "120s"   # longest silence after the first output
   runtime_profiles: {}
   # Optional (defaults shown in comments):
   # model_store:
