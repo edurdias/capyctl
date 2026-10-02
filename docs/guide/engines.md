@@ -157,7 +157,10 @@ engine (`security.approved_options: [--drafter]` and the drafter's directory in
 `security.approved_paths`), then pass it with
 `accept_extra_args: true` and `extra_args: [--drafter, /path/to/drafter]`.
 CapyCTL does not download drafters; without one it starts TensorFold with
-`--drafter none`. The first start builds kernels and can take several
+`--drafter none`. That turns off an external draft model only: a checkpoint
+with built-in MTP heads, such as Nemotron, still drafts (the response's
+`tensorfold` record shows `"drafts":true`). TensorFold's `--mtp-drafts 0`
+turns that off, passed the same way as `--drafter`. The first start builds kernels and can take several
 minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
