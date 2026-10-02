@@ -150,19 +150,33 @@ next switch.
 
 | What | Standalone | Server and hosts |
 |---|---|---|
-| Admission window | 2 s, fixed | host: `resource_policy.queue.admission_window`, default 2 s, 1 ms to 30 s, not above the request deadline |
+| Admission window | `host.resource_policy.queue.admission_window`, default 2 s | host: `resource_policy.queue.admission_window`, default 2 s, 1 ms to 30 s, not above the request deadline |
 | Drain bound | `server.switching.drain_timeout`, default 30 s, 1 s to 600 s | server: `switching.drain_timeout`, default 30 s, 1 s to 600 s |
-| How long a request may wait, the switch included | 1800 s, fixed | host: `resource_policy.queue.request_deadline`, default 600 s, up to 3600 s |
-| Waiting requests per model | 64, fixed | host: `resource_policy.queue.max_pending_per_deployment`, default 64 |
-| Waiting requests in total | 256, fixed | host: `resource_policy.queue.max_pending_total`, default 256 |
-| Bodies of waiting requests, in total | 64 MiB, fixed | host: `resource_policy.queue.max_buffered_bytes_total`, default 64 MiB |
+| How long a request may wait for its first output, the switch and the prompt's prefill included | `host.resource_policy.queue.request_deadline`, default 1800 s | host: `resource_policy.queue.request_deadline`, default 600 s, up to 3600 s |
+| Longest silence in a reply after its first output | `host.resource_policy.queue.stream_idle_timeout`, default 120 s | host: `resource_policy.queue.stream_idle_timeout`, default 120 s, 1 s to 3600 s |
+| Waiting requests per model | `host.resource_policy.queue.max_pending_per_deployment`, default 64 | host: `resource_policy.queue.max_pending_per_deployment`, default 64 |
+| Waiting requests in total | `host.resource_policy.queue.max_pending_total`, default 256 | host: `resource_policy.queue.max_pending_total`, default 256 |
+| Bodies of waiting requests, in total | `host.resource_policy.queue.max_buffered_bytes_total`, default 64 MiB | host: `resource_policy.queue.max_buffered_bytes_total`, default 64 MiB |
 | Requests running at once per model | 32, fixed | 32, fixed |
+
+The standalone bounds have the host ranges. A reply's opening chunk, which
+only names the assistant role, is not output: TensorFold sends it before it
+reads the prompt, so a long prompt is bounded by the request deadline, not by
+the silence bound.
 
 The admission window that applies is the one of the host where the switch
 happens. With several hosts, the waiting limits and the request deadline are
 the tightest any host sets. Each setting that is not fixed can also be given
 with `--set` or a `CAPYCTL_SET__…` variable
-([Settings](../operations/configuration.md)).
+([Settings](../operations/configuration.md)):
+
+```yaml
+# standalone.yaml: allow up to an hour before a reply's first output.
+host:
+  resource_policy:
+    queue:
+      request_deadline: "3600s"
+```
 
 ### Errors while waiting
 

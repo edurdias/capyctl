@@ -454,7 +454,7 @@ async fn progressing_stream_is_never_cut_at_a_fixed_wall_time() {
 /// stays conservative.
 // T17 T19
 #[tokio::test]
-async fn stalled_stream_is_cut_after_the_idle_bound_and_stays_uncertain() {
+async fn stalled_stream_is_cut_after_the_idle_bound_and_stays_charged() {
     let counts = Arc::new(InFlight::default());
     let response = paced(
         Paced {
@@ -478,6 +478,75 @@ async fn stalled_stream_is_cut_after_the_idle_bound_and_stays_uncertain() {
     assert!(text.contains("data: 0\n\n"), "{text}");
     assert!(!text.contains("[DONE]"), "{text}");
     assert_eq!(counts.current("d"), 1);
+}
+
+/// Sends a reply's opening `role` chunk, stays silent for `prefill`, then
+/// answers, reporting progress as the real forwarder does.
+struct Prefilling {
+    prefill: std::time::Duration,
+}
+
+#[async_trait]
+impl ChatForward for Prefilling {
+    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+        unreachable!()
+    }
+    async fn forward_chat_stream_async(
+        &self,
+        _: &Value,
+        sink: &mut dyn capyctl_adapters::traits::ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        let chunk = |delta: Value| {
+            json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}).to_string()
+        };
+        // `opens_reply_only`: the forwarder reports no progress for it.
+        let _ = sink.send(chunk(json!({"role":"assistant"}))).await;
+        tokio::time::sleep(self.prefill).await;
+        sink.progressed();
+        let _ = sink.send(chunk(json!({"content":"hi"}))).await;
+        sink.progressed();
+        Ok(StreamEnded::Completed)
+    }
+}
+
+/// SPEC §10 (found live 2026-10-02, TensorFold): an engine that sends the
+/// reply's opening `role` chunk before it prefills is still bounded by the
+/// request deadline until its first output, not by the idle bound, so a long
+/// prompt is not cut while it prefills.
+// T17 T19
+#[tokio::test]
+async fn a_prefill_after_the_opening_chunk_is_bounded_by_the_deadline_not_the_idle_bound() {
+    let counts = Arc::new(InFlight::default());
+    let bounds = capyctl_router::stream::StreamBounds {
+        first_event_by: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        idle: std::time::Duration::from_millis(300),
+    };
+    let response = capyctl_router::stream::stream_planned_timed(
+        capyctl_router::balance::Attempt::direct(
+            Arc::new(Prefilling {
+                prefill: std::time::Duration::from_millis(900),
+            }),
+            None,
+        ),
+        None,
+        json!({"model":"m"}),
+        counts.guard_arc("d"),
+        capyctl_router::timing::RequestTiming::untracked(),
+        bounds,
+    )
+    .into_response();
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 4096),
+    )
+    .await
+    .expect("the stream ends")
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("\"role\":\"assistant\""), "{text}");
+    assert!(text.contains("\"content\":\"hi\""), "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(counts.current("d"), 0, "completion closes the accounting");
 }
 
 /// SPEC §10: a backend that never produces a first event is cut at the
@@ -533,7 +602,9 @@ async fn a_hung_up_stream_without_a_ledger_keeps_its_slot() {
 }
 
 // T17 T38, SPEC §10 (amended): the lease of a stream whose client hung up
-// is cancelling, never completed; a cut stream stays uncertain.
+// is cancelling, never completed. A stream the router cut for missing its
+// bounds is cancelled the same way (found live 2026-10-02): dropping the
+// forward closed the engine connection, so it is cancelling too.
 #[test]
 fn a_hung_up_stream_closes_its_lease_as_cancelling() {
     use capyctl_controller::LeaseEnd;
@@ -546,5 +617,5 @@ fn a_hung_up_stream_closes_its_lease_as_cancelling() {
         stream_lease_end(&Ok(Ok(StreamEnded::Completed))),
         LeaseEnd::Completed
     );
-    assert_eq!(stream_lease_end(&Err(())), LeaseEnd::Uncertain);
+    assert_eq!(stream_lease_end(&Err(())), LeaseEnd::Cancelling);
 }
