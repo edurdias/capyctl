@@ -18,8 +18,8 @@ fn private_dir() -> tempfile::TempDir {
 }
 
 fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
+        .unwrap();
 }
 
 /// A vLLM venv: `vllm --version` prints `reported`; the interpreter answers
@@ -79,6 +79,22 @@ async fn role(document: &Path, reply: Value) -> (Arc<Role>, tokio::sync::watch::
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     tokio::spawn(server.serve(handler.clone(), unsafe { libc::geteuid() }, shutdown));
     (handler, stop)
+}
+
+/// Waits until the stopped role has removed its socket, which it does as it
+/// stops; a slow runner gets there later.
+async fn until_role_stopped(document: &Path) {
+    let target = resolve_target(Some(document), Path::new("/nonexistent"), &|k| {
+        (k == "HOME").then(|| "/home/u".into())
+    })
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while target.socket.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stopped role removed its socket");
 }
 
 fn add(path: &Path) -> Command {
@@ -503,7 +519,7 @@ async fn list_merges_the_files_and_the_role() {
         .await
         .unwrap();
     stop.send(true).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    until_role_stopped(&document).await;
     let offline = execute(&Command::EngineList, Some(&document), dir.path())
         .await
         .unwrap();
@@ -730,7 +746,7 @@ async fn a_rerun_remove_finishes_a_removal_the_file_already_shows() {
     assert_eq!(out["published"], "published", "{out}");
     assert_eq!(role.seen.lock().unwrap().len(), 2);
     stop.send(true).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    until_role_stopped(&document).await;
     let (_role, stop) = role_by_op(
         &document,
         json!({"ok": true, "retired": false}),

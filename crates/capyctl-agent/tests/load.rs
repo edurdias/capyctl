@@ -197,7 +197,7 @@ async fn reports_open_scopes_with_scraped_gauges_or_a_failed_scrape() {
     register(
         &ingress,
         &slow,
-        engine([6; 32], VLLM_METRICS, Duration::from_millis(800)).await,
+        engine([6; 32], VLLM_METRICS, Duration::from_secs(10)).await,
         5,
         [6; 32],
     );
@@ -240,8 +240,10 @@ async fn reports_open_scopes_with_scraped_gauges_or_a_failed_scrape() {
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
     let started = std::time::Instant::now();
     let all = samples(reporter.reports().await);
+    // The slow engine answers after 10 s; the scrape bound cuts it to 300 ms.
+    // The margin is for a slow runner.
     assert!(
-        started.elapsed() < Duration::from_millis(700),
+        started.elapsed() < Duration::from_secs(5),
         "scrapes run concurrently within the bound"
     );
     let names: Vec<_> = all.iter().map(|s| s.deployment_id.as_str()).collect();

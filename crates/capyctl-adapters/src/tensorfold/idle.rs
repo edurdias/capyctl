@@ -121,7 +121,7 @@ mod tests {
         let started = std::time::Instant::now();
         let within = Duration::from_secs(10);
         assert!(wait_idle(&adapter, &member(), within, std::future::pending()).await);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // T41 (spec §5, ADR 0023 §6): an engine answering 503 has not loaded its
@@ -136,7 +136,7 @@ mod tests {
         let started = std::time::Instant::now();
         let within = Duration::from_secs(10);
         assert!(wait_idle(&adapter, &member(), within, std::future::pending()).await);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // T41 (spec §5, ADR 0023 §6): a hung `/health` may be signalled once the

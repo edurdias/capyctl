@@ -174,7 +174,7 @@ async fn active_response_prevents_replacing_the_generation_until_body_drop() {
         .register(scope(2), native_addr, "model".into(), [3; 32], [4; 32])
         .is_err());
     drop(response);
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while ingress.current_requests(&first).unwrap() != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

@@ -186,8 +186,12 @@ impl Installation {
         let bin = root.path().join("engine");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
-        std::fs::write(&engine, format!("#!{}\n{FAKE_VLLM}", python3().display())).unwrap();
-        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        capyctl_config::test_support::write_executable(
+            &engine,
+            format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
+        )
+        .unwrap();
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(runtime.join("capyctl_vllm_guard.py"), "# test guard\n").unwrap();
@@ -615,7 +619,11 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     let first = streaming.chunk().await.unwrap().unwrap();
     assert!(!first.is_empty());
     role.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // T18: late work is refused with a retryable answer once admission closed.
     let refused = chat_request(&installation, "hello", false)
@@ -1486,13 +1494,12 @@ impl TwoRoles {
         // test machine can satisfy.
         let engine = path.join("engine");
         std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(
-            engine.join("vllm"),
+        capyctl_config::test_support::write_executable(
+            &engine.join("vllm"),
             format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(engine.join("vllm"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         let runtime = path.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1770,7 +1777,11 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
     assert_eq!(streaming.status(), 200);
     streaming.chunk().await.unwrap().unwrap();
     host.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     // Phase B follow-up (T17 T18 T38): the host told the controller first, so a
     // new request while the host drains is a retryable 503, never a 500.
     let refused = roles.chat("hello", false).send().await.unwrap();
@@ -1807,7 +1818,11 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
     assert_eq!(streaming.status(), 200);
     streaming.chunk().await.unwrap().unwrap();
     server.signal();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Time for the role to handle the signal and close admission. The slow
+    // stream runs about 3 s, so it is still in flight when the next request
+    // is sent. No probe request is sent: one admitted before the close would
+    // change the drain report.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let refused = roles.chat("hello", false).send().await.unwrap();
     assert_eq!(refused.status(), 503);
     let refusal: Value = refused.json().await.unwrap();

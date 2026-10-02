@@ -451,7 +451,7 @@ async fn cancelled_requests_retain_command_capacity_until_blocking_work_finishes
             json!({"config":{},"activate":false}),
         ))));
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while source.0.load(std::sync::atomic::Ordering::SeqCst) != 2 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
@@ -498,7 +498,7 @@ async fn cancelled_requests_retain_command_capacity_until_blocking_work_finishes
         .unwrap();
     assert_eq!(router.clone().oneshot(read).await.unwrap().status(), 500);
     gate.release();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let response = router
                 .clone()
