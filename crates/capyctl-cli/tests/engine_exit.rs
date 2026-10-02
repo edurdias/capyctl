@@ -526,7 +526,8 @@ impl TwoRoles {
             );
         }
         let mut server: Value =
-            serde_json::from_slice(&std::fs::read(&roles.server_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&roles.server_config).unwrap())
+                .unwrap();
         for name in ["management", "inference", "bootstrap", "control"] {
             let address = format!("127.0.0.1:{}", free_port());
             server["listeners"][name]["bind"] = address.clone().into();
@@ -547,7 +548,8 @@ impl TwoRoles {
         ))
         .unwrap();
         let template: Value =
-            serde_json::from_slice(&std::fs::read(&roles.host_config).unwrap()).unwrap();
+            capyctl_config::parse_document(&std::fs::read_to_string(&roles.host_config).unwrap())
+                .unwrap();
         let mut host = golden["input"]["host"].clone();
         host["name"] = "w13-host".into();
         host["state_dir"] = template["state_dir"].clone();

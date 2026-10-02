@@ -32,6 +32,44 @@ fn cli(root: &Path, args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+// `init` writes YAML to a .yaml path and JSON to a .json path, and both validate.
+#[test]
+fn init_writes_yaml_for_yaml_paths_and_json_for_json_paths() {
+    let temp = root();
+    for role in ["server", "host"] {
+        let yaml = temp.path().join(format!("{role}.yaml"));
+        let json = temp.path().join(format!("{role}.json"));
+        for (n, out) in [&yaml, &json].into_iter().enumerate() {
+            let state = temp.path().join(format!("state-{role}-{n}"));
+            let result = cli(&state, &["init", role, "--output", out.to_str().unwrap()]);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let yaml_text = fs::read_to_string(&yaml).unwrap();
+        assert!(!yaml_text.trim_start().starts_with('{'), "{yaml_text}");
+        assert!(serde_json::from_str::<serde_json::Value>(&yaml_text).is_err());
+        assert!(fs::read_to_string(&json)
+            .unwrap()
+            .trim_start()
+            .starts_with('{'));
+        let parsed = capyctl_config::parse_document(&yaml_text).unwrap();
+        assert_eq!(parsed["kind"], role);
+        for file in [&yaml, &json] {
+            let check = cli(
+                temp.path(),
+                &["validate", "config", "--file", file.to_str().unwrap()],
+            );
+            assert!(
+                check.status.success(),
+                "{}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+}
 // T02, T04: initialization protects identity and never overwrites existing files.
 #[test]
 fn initialize_server_and_host_without_engines_or_secret_output() {
@@ -149,7 +187,7 @@ fn the_host_runtime_is_managed_unless_the_document_declares_one() {
     fs::create_dir(&operator).unwrap();
     fs::write(operator.join("vllm_entry.py"), b"# operator copy\n").unwrap();
     let mut document: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        capyctl_config::parse_document(&fs::read_to_string(&config).unwrap()).unwrap();
     document["runtime_dir"] = serde_json::json!(operator);
     let declared = temp.path().join("declared.yaml");
     fs::write(&declared, document.to_string()).unwrap();
@@ -407,7 +445,7 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
         );
     }
     let mut document: serde_json::Value =
-        serde_json::from_slice(&fs::read(&server_config).unwrap()).unwrap();
+        capyctl_config::parse_document(&std::fs::read_to_string(&server_config).unwrap()).unwrap();
     // Chosen below the ephemeral range, where no outbound connection of a
     // parallel test can take them before the server binds (support::process).
     let ports = free_ports(4, false);
@@ -548,7 +586,7 @@ fn enrolled_server(
         );
     }
     let mut document: serde_json::Value =
-        serde_json::from_slice(&fs::read(&server_config).unwrap()).unwrap();
+        capyctl_config::parse_document(&std::fs::read_to_string(&server_config).unwrap()).unwrap();
     let ports = free_ports(4, false);
     for (i, name) in ["management", "inference", "bootstrap", "control"]
         .iter()
@@ -794,7 +832,7 @@ fn a_started_host_serves_its_control_socket() {
     let mut host = Service::start(&host_root, "host", &host_config);
     hosts(&server_root, &server_config, true, 1);
     let state: serde_json::Value =
-        serde_json::from_slice(&fs::read(&host_config).unwrap()).unwrap();
+        capyctl_config::parse_document(&std::fs::read_to_string(&host_config).unwrap()).unwrap();
     let socket = Path::new(state["state_dir"].as_str().unwrap()).join("control.sock");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !socket.exists() && std::time::Instant::now() < deadline {

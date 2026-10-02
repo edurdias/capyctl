@@ -375,6 +375,17 @@ fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, Str
     if let Some(dir) = &runtime {
         crate::managed_runtime::prepare_for_role(dir)?;
     }
+    // A `.yaml` or `.yml` document is written as YAML; any other name keeps
+    // the JSON the templates are built as.
+    let text = if matches!(
+        output.extension().and_then(|e| e.to_str()),
+        Some("yaml" | "yml")
+    ) {
+        let tree: Value = serde_json::from_str(&text).map_err(|_| unavailable())?;
+        capyctl_config::yaml_emit::to_block_yaml(&tree)
+    } else {
+        text
+    };
     write_new(output, text.as_bytes())?;
     let mut result = json!({"config":output,"state_dir":root,"initialized":true});
     if let Some(dir) = runtime {

@@ -33,6 +33,7 @@ pub mod setting_overrides;
 // SPEC §15.3: standalone values the role does not honour are refused.
 pub mod standalone;
 pub mod strict_yaml;
+pub mod yaml_emit;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
 // Tests across the workspace write executables through this.
