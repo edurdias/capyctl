@@ -1,5 +1,31 @@
 # Current implementation and launch status
 
+## Draft model memory gaps closed — 2026-10-02 (branch `fix/drafter-memory-gaps`)
+
+Two gaps left by the vLLM 0.30 findings (Qwen3.8-27B NVFP4 with DFlash2):
+
+1. **First-start graphs** (ADR 0014 amendment A8). The derived startup
+   placeholder is now `max(request + graphs, weights × 1.6 + margin)` for vLLM
+   and SGLang, with a 1.25 GiB graph allowance per captured model (checkpoint,
+   plus the draft model). Recorded as `startup_graphs_bytes`; older revisions
+   decode unchanged.
+2. **Draft model KV in the fitted context** (ADR 0014 amendment A9). The fit
+   adds the draft model's KV per token, read from its `config.json`.
+   Open issue for the owner: on a hybrid checkpoint vLLM also needs one
+   recurrent-state block per sequence, which the default 4 GiB KV cache cannot
+   hold for this model (83 blocks without DFlash2, 254 with it, for 256
+   sequences); such a deployment declares `memory.kv_cache`.
+
+Live on host B (standalone, fresh 0700 state and config directories, fresh
+vLLM compile cache): with no memory stated vLLM 0.30 first refused the
+32752-token context (4.2 GiB needed, 3.98 GiB available); with the draft KV
+counted it reached the Mamba block limit above, as did the checkpoint without
+DFlash2. With `kv_cache: 16GiB`: context fitted to 121552 tokens (131056
+before), cold phase 51.75 GiB, first-start peak 50.59 GiB (graphs 1.71 GiB,
+warmup 233 s), answered Jupiter. SGLang 0.5.20 with DFlash2 at 16 GiB: context
+121568, peak 44.63 GiB against 51.75 GiB, answered Jupiter. Cleanup complete.
+CPU and Fake-engine tests are not qualification.
+
 ## vLLM 0.30 live findings fixed — 2026-10-02 (branch `fix/vllm-030-findings`)
 
 Four findings from the Qwen3.8-27B NVFP4 runs on vLLM 0.30.0 and SGLang 0.5.20:

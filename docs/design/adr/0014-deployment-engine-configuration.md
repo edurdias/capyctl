@@ -547,7 +547,9 @@ later starts of the revision on that host and installation.
 
 For the A6 deployment the cold phase becomes 51.75 GiB (48.0 + 2 × 1.25 + 1.25), 1.29 GiB
 above the measured first-start peak; without a draft model it is 1.25 GiB larger than
-before. The allowance is a placeholder, not a measurement.
+before. The allowance is a placeholder, not a measurement. Live after the change (fresh
+vLLM compile cache, graphs 1.71 GiB): the first start peaked at 50.59 GiB against the
+51.75 GiB cold phase; SGLang 0.5.20 with DFlash2 peaked at 44.63 GiB.
 
 ## Amendment A9: the fitted context counts the draft model's KV (2026-10-02)
 
