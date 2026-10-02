@@ -312,3 +312,44 @@ fn an_undeclared_residency_is_restart_only() {
         capyctl_config::effective::Residency::RestartOnly
     );
 }
+
+// T41 T37 (ADR 0023 §3, §5): `--no-drafts` is ordinary: it passes with no host
+// approval, `_`-spelled too. It cannot be combined with a
+// `--drafter`, in the extras or the host-fixed arguments.
+#[test]
+fn no_drafts_is_ordinary_and_refused_beside_a_drafter() {
+    let none = BTreeSet::new();
+    assert_eq!(sensitivity(Engine::Tensorfold, "--no-drafts"), None);
+    assert_eq!(sensitivity(Engine::Tensorfold, "--mtp-drafts"), None);
+    let off: Vec<String> = vec!["--no-drafts".into()];
+    validate_extra_args(&off, &context(&none, &none)).unwrap();
+
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["accept_extra_args"] = true.into();
+    deployment["engine_config"]["extra_args"] = json!(["--no-drafts"]);
+    resolve_effective(&deployment, &host).expect("--no-drafts needs no approval");
+    deployment["engine_config"]["extra_args"] = json!(["--no_drafts"]);
+    resolve_effective(&deployment, &host).expect("the `_` spelling needs no approval");
+
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["approved_options"] = json!(["--drafter"]);
+    deployment["engine_config"]["accept_extra_args"] = true.into();
+    deployment["engine_config"]["extra_args"] =
+        json!(["--no-drafts", "--drafter", "/srv/drafters/d"]);
+    let error = resolve_effective(&deployment, &host)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("--no-drafts") && error.contains("--drafter"),
+        "{error}"
+    );
+    deployment["engine_config"]["extra_args"] = json!(["--no-drafts"]);
+    host["runtime_profiles"]["local"]["args"] = json!(["--drafter", "/srv/drafters/d"]);
+    let error = resolve_effective(&deployment, &host)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("--no-drafts") && error.contains("--drafter"),
+        "{error}"
+    );
+}

@@ -49,7 +49,13 @@ another engine).
 `<env>/bin/tensorfold serve <model dir> --name <served> --host 127.0.0.1
 --port <port> --no-update-check --backend cuda --snapshot-dir none --context <n>
 [--drafter none] [typed flags] [host args] [extra args]`, with `--drafter none`
-only when the extra arguments name no `--drafter`. The environment is
+only when the host or extra arguments name neither `--drafter` nor
+`--no-drafts`: TensorFold's default `--drafter auto` would pick a drafter from
+the Hugging Face cache. `--no-drafts` is ordinary and renders alone, since
+TensorFold 0.6.1 refuses `--drafter none` for a family whose CUDA engine needs
+a drafter (Qwen3.8 dense); naming both is refused at deploy time and again when
+rendering, and a launch TensorFold refuses for a missing drafter reports that
+fix (found live 2026-10-02). The environment is
 closed (SPEC §13.3) and adds `TENSORFOLD_NO_UPDATE_CHECK=1`, `HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`, the placement's `CUDA_VISIBLE_DEVICES` and
 `TORCH_EXTENSIONS_DIR=<state>/engines/tensorfold/<build_fingerprint>/torch_extensions`

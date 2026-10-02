@@ -118,6 +118,61 @@ fn typed_fields_host_args_and_extras_render_in_order() {
         .contains(&"--thinking".to_string()));
 }
 
+// T41 T14 (ADR 0023 §3, §5): the drafter choice. Nothing said renders
+// `--drafter none`, so TensorFold never picks one from a cache; a named drafter
+// renders as given; `--no-drafts` renders alone, without `--drafter none`.
+#[test]
+fn the_drafter_choice_renders_once() {
+    let drafter_none = |argv: &[String]| {
+        argv.windows(2)
+            .any(|pair| pair[0] == "--drafter" && pair[1] == "none")
+    };
+    let argv = render_command(&plan()).unwrap().argv;
+    assert!(drafter_none(&argv), "{argv:?}");
+
+    let mut input = plan();
+    input.extra_args = vec!["--drafter".into(), "/srv/drafters/d".into()];
+    let argv = render_command(&input).unwrap().argv;
+    assert!(!drafter_none(&argv), "{argv:?}");
+    assert!(argv.ends_with(&["--drafter".to_string(), "/srv/drafters/d".to_string()]));
+
+    for off in ["--no-drafts", "--no_drafts", "--no-draft"] {
+        let mut input = plan();
+        input.extra_args = vec![off.into()];
+        let argv = render_command(&input).unwrap().argv;
+        assert!(!argv.iter().any(|a| a == "--drafter"), "{off}: {argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some(off));
+    }
+    // A host-fixed `--no-drafts` turns them off too.
+    let mut input = plan();
+    input.engine_args = vec!["--no-drafts".into()];
+    assert!(!render_command(&input)
+        .unwrap()
+        .argv
+        .iter()
+        .any(|a| a == "--drafter"));
+}
+
+// T41 T14: drafts off and a named drafter contradict each other, wherever
+// each comes from.
+#[test]
+fn no_drafts_beside_a_drafter_is_refused() {
+    for (fixed, extra) in [
+        (vec![], vec!["--no-drafts", "--drafter", "/srv/drafters/d"]),
+        (vec!["--drafter", "/srv/drafters/d"], vec!["--no-drafts"]),
+        (vec!["--no-drafts"], vec!["--drafter=/srv/drafters/d"]),
+    ] {
+        let mut input = plan();
+        input.engine_args = fixed.iter().map(|s| s.to_string()).collect();
+        input.extra_args = extra.iter().map(|s| s.to_string()).collect();
+        let error = render_command(&input).unwrap_err().to_string();
+        assert!(
+            error.contains("--no-drafts") && error.contains("--drafter"),
+            "{error}"
+        );
+    }
+}
+
 // T41 T14: a reserved or typed name in the pass-through vector is refused
 // again at render time, abbreviations included.
 #[test]

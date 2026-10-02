@@ -117,6 +117,20 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         Some(EngineExit::Signal(signal)) => text.push_str(&format!(" on signal {signal}")),
         None => {}
     }
+    // ADR 0023 §3: TensorFold refuses a family that needs a drafter when it
+    // has none (Qwen3.8 dense on CUDA); its line names a repository, so the
+    // summary names the fix in fixed words instead.
+    if engine_output.lines().any(|line| {
+        line.contains("drafts with")
+            && line.contains("which is not here")
+            && line.contains("--no-drafts")
+    }) {
+        text.push_str(
+            "; TensorFold needs a drafter for this model: name one with --drafter, \
+             or add --no-drafts to turn drafts off",
+        );
+        return text;
+    }
     // Name as many refused options as the bound allows.
     let mut options = rejected_options(engine_output);
     while !options.is_empty() {
@@ -181,5 +195,20 @@ mod tests {
         let text = summary(&long, Some(EngineExit::Code(i32::MIN)));
         assert!(text.len() <= MAX_SUMMARY_BYTES, "{text}");
         assert!(text.contains(&"a".repeat(64)));
+    }
+
+    // T20 T29 (ADR 0023 §3): TensorFold's refusal to start a model that needs
+    // a drafter is named with the fix, never with the repository or a path.
+    #[test]
+    fn a_tensorfold_drafter_refusal_names_the_fix() {
+        let output = "[tensorfold] precision: checkpoint\ntensorfold: Qwen3.8 dense's CUDA engine drafts with z-lab/Qwen3.8-27B-DFlash2, which is not here: without it every round would decode one token. Run `tensorfold pull z-lab/Qwen3.8-27B-DFlash2` once (on both machines for --tp 2), or pass --no-drafts for the serial reference\n";
+        let text = summary(output, Some(EngineExit::Code(1)));
+        assert_eq!(
+            text,
+            "the engine exited before readiness with exit code 1; TensorFold needs a drafter \
+             for this model: name one with --drafter, or add --no-drafts to turn drafts off"
+        );
+        assert!(!text.contains("z-lab"));
+        assert!(text.len() <= MAX_SUMMARY_BYTES);
     }
 }
