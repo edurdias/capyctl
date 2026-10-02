@@ -1007,3 +1007,21 @@ async fn add_refuses_tensorfold_without_its_toolchain() {
         .contains(&env.join("bin").display().to_string()));
     assert!(!engines_beside(&document).exists());
 }
+
+#[test]
+fn a_missing_config_file_is_named_with_what_to_do() {
+    let dir = private_dir();
+    let missing = dir.path().join("nope.yaml");
+    let error = resolve_target(Some(&missing), Path::new("/nonexistent"), &|k| {
+        (k == "HOME").then(|| "/home/u".into())
+    })
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_config");
+    assert_eq!(
+        error.message,
+        format!(
+            "config file {} does not exist; create it or leave out --config",
+            missing.display()
+        )
+    );
+}

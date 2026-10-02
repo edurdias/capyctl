@@ -120,8 +120,16 @@ pub fn resolve_target(
             }
         }
     };
-    let text = std::fs::read_to_string(&chosen)
-        .map_err(|e| invalid(format!("{}: {e}", chosen.display())))?;
+    let text = std::fs::read_to_string(&chosen).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            invalid(format!(
+                "config file {} does not exist; create it or leave out --config",
+                chosen.display()
+            ))
+        } else {
+            invalid(format!("{}: {e}", chosen.display()))
+        }
+    })?;
     let (kind, state) = match capyctl_config::remote_roles::HostConfig::parse(&text) {
         Ok(host) => (RoleKind::Host, host.state_dir),
         Err(host_error) => {

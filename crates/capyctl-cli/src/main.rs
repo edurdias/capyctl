@@ -253,7 +253,7 @@ fn main() -> ExitCode {
         return match capyctl_cli::settings::config_show(&invocation, *role, sets, &state_root) {
             Ok(value) => {
                 if format == OutputFormat::Json {
-                    println!("{value}");
+                    output::print_json_result(&value);
                 } else {
                     print!("{}", capyctl_cli::settings::render_table(&value));
                 }
@@ -326,7 +326,7 @@ fn emit(
     context: &capyctl_cli::views::Context,
 ) {
     match format {
-        OutputFormat::Json => println!("{value}"),
+        OutputFormat::Json => output::print_json_result(value),
         OutputFormat::Text => print!("{}", capyctl_cli::views::render(command, value, context)),
     }
 }

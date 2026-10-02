@@ -194,6 +194,11 @@ at the release tag.
    Name `~/venvs/sglang` or `~/venvs/tensorfold` for the others.
    [Add an engine](engines.md) shows what it prints.
 
+   `engine add` writes `engines.yaml` beside the role's config file, not under
+   `--state-dir`. For a separate test setup, set both `--config` (or
+   `XDG_CONFIG_HOME`) and `--state-dir`, and give the CLI and the running role
+   the same ones.
+
 3. Run a first model: [First model on each engine](engines.md#first-model-on-each-engine)
    has a deployment file and a request for each engine. More deployment files,
    each with the engine version, GPU and numbers it was measured with, are in

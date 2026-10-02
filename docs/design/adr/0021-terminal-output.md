@@ -23,7 +23,7 @@ The audience reads mllm in a terminal first.
   files, pipes); an explicit `--format` wins. Services therefore log JSON.
 - `--output json` still means JSON, and `table` stays a hidden synonym of
   `text`.
-- JSON output keeps its fields and bytes; role JSON events keep their fields.
+- JSON output keeps its fields; role JSON events keep their fields. A command result is indented (two spaces) when stdout is a terminal and one compact line when piped or redirected, so files hold plain JSON.
 - Role output goes through one sink in `mllm-domain`; library code does not
   print.
 
