@@ -1,6 +1,6 @@
 """ASGI middleware that closes vLLM's unguarded development routes.
 
-vLLM 0.29 authenticates only the `/v1`, `/v2`, `/inference`, and `/cohere`
+vLLM 0.29 and 0.30 authenticate only the `/v1`, `/v2`, `/inference`, and `/cohere`
 prefixes (`vllm/entrypoints/serve/middleware/authenticate.py`,
 `GUARDED_PREFIX`); the parking control routes capyctl depends on for deep-park
 (`/sleep`, `/wake_up`, `/is_sleeping`, `/collective_rpc`) are left open to any

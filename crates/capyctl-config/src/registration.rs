@@ -320,6 +320,7 @@ pub fn write_engines(
 /// shown `custom`; nothing is written for it.
 pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Vllm, "0.29.0"),
+    (Engine::Vllm, "0.30.0"),
     (Engine::Sglang, "0.5.20"),
     // ADR 0023 §1.
     (Engine::Tensorfold, "0.6.0"),

@@ -71,6 +71,10 @@ def fake_parser(drop=()):
     option("--master-port", type=int, default=29501)
     option("--nnodes", "-n", type=int, default=1)
     option("--node-rank", "-r", type=int, default=0)
+    # vLLM 0.30.0 scale-out routes and JSON configurations.
+    option("--enable-scale-out", action=argparse.BooleanOptionalAction, default=False)
+    option("--watermark-config", type=json.loads, default=None)
+    option("--engram-config", type=json.loads, default=None)
     option("--worker-extension-cls", default="")
     option("--compilation-config", "-cc", type=json.loads, default=None)
     option("--download-dir", default=None)
@@ -257,12 +261,21 @@ class ExtraArgumentTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.refused(extra, "effective_args_mismatch")
 
+    # T21: vLLM 0.30.0 scale-out registers extra routes; capyctl never enables it.
+    # (The deploy-time check also refuses `--no-enable-scale-out`; here it
+    # leaves the destination at capyctl's value, so it changes nothing.)
+    def test_scale_out_is_reserved_however_spelled(self):
+        for extra in (["--enable-scale-out"], ["--enable-scale"], ["--enable-scale-o"]):
+            with self.subTest(extra=extra):
+                self.refused(extra, "effective_args_mismatch")
+
     # T21: sensitive destinations need the host's named approval.
     def test_sensitive_destinations_need_named_approval(self):
         from runtime import extra_args_policy as policy
         for extra in (["--worker-extension", "pkg.Ext"], ["--compilation-config", "{}"],
                       ["-cc", '{"level": 3}'], ["--download-dir", "/srv/cache"],
-                      ["--chat-template", "/tmp/t.jinja"]):
+                      ["--chat-template", "/tmp/t.jinja"], ["--watermark-config", "{}"],
+                      ["--engram-config", "{}"]):
             with self.subTest(extra=extra):
                 self.refused(extra, "sensitive_option_refused")
         approved = policy.parse_approvals(json.dumps({
