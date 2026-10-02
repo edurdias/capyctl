@@ -287,6 +287,22 @@ impl ChatSink for Collecting<'_> {
     }
 }
 
+/// SPEC §6.1, ADR 0023 §4: the readiness probe, bounded by what remains of the
+/// startup budget and by nothing shorter. The probe is part of startup: an
+/// engine may build kernels on its first request (TensorFold 0.6.1 builds four
+/// CUDA extensions there, found live 2026-10-02), so the transport's 60 s read
+/// bound would cut a healthy start short and have it killed mid build. `None`
+/// when the budget passed first. Ordinary forwarding keeps its own bounds.
+pub(crate) async fn startup_probe(
+    engine: &(dyn crate::traits::ChatForward + '_),
+    body: &Value,
+    budget: Duration,
+) -> Option<Result<Value, AdapterError>> {
+    tokio::time::timeout(budget, engine.forward_chat_observed(body, &mut NoObserver))
+        .await
+        .ok()
+}
+
 /// SPEC §6.1, ADR 0023 §6: a readiness probe's answer is non-empty content
 /// or, for a model that reasons first, non-empty reasoning.
 pub fn probe_answered(answer: &Value) -> bool {

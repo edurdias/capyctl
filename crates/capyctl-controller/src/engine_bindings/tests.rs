@@ -597,3 +597,68 @@ fn a_tensorfold_profile_builds_a_tensorfold_spec() {
         "no private cache root, no launch"
     );
 }
+
+/// This test process: certainly alive while the test runs.
+fn own_identity() -> capyctl_domain::completion::ProcessIdentity {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let close = stat.rfind(')').unwrap();
+    capyctl_domain::completion::ProcessIdentity {
+        role: "api".into(),
+        pid: std::process::id(),
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned(),
+        start_ticks: stat[close + 2..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    }
+}
+
+// T41 (ADR 0023 §3, found live 2026-10-02): on the embedded path a build
+// killed mid way left its lock. With no retained launch whose recorded
+// process may still run, the next launch clears it and reads the build state
+// again; a retained launch that may be building keeps it.
+#[test]
+fn an_embedded_launch_clears_a_killed_builds_lock_only_without_a_live_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = tensorfold_work();
+    let dir = tempfile::tempdir().unwrap();
+    let engines = dir.path().join("engines");
+    std::fs::create_dir(&engines).unwrap();
+    std::fs::set_permissions(&engines, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bindings = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"))
+        .with_engine_cache_root(engines);
+    let mut spec = bindings.spec(&work).unwrap();
+    let AdapterSpec::Tensorfold {
+        launch: Some(launch),
+        ..
+    } = &spec
+    else {
+        panic!("a TensorFold spec");
+    };
+    let extension = PathBuf::from(launch.extensions_dir.clone().unwrap()).join("tensorfold_qmm_v5");
+    std::fs::create_dir(&extension).unwrap();
+    std::fs::write(extension.join("tensorfold_qmm_v5.so"), "ELF").unwrap();
+    std::fs::write(extension.join("lock"), "").unwrap();
+    clear_stale_build_locks(&mut spec, &[own_identity()]);
+    assert!(
+        extension.join("lock").exists(),
+        "a live owner may be building"
+    );
+    clear_stale_build_locks(&mut spec, &[]);
+    assert!(!extension.join("lock").exists());
+    let AdapterSpec::Tensorfold {
+        extensions_built, ..
+    } = spec
+    else {
+        unreachable!()
+    };
+    assert!(
+        extensions_built,
+        "the build state is read after the lock goes"
+    );
+}

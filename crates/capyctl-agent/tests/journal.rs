@@ -578,6 +578,46 @@ fn adapter_launch_tools_preserve_gate_ownership_and_disconnect_fence() {
         .any(|r| r.command_id == "fenced-adapter" && r.claim_retained));
 }
 
+// T41 (ADR 0023 §3): the evidence a TensorFold build lock is cleared on is
+// every process recorded for a launch this host still claims. A claimed
+// launch's running child keeps the lock; once the launch is stopped and its
+// claim released, a lock it left is cleared.
+#[test]
+fn a_claimed_launchs_running_child_keeps_a_build_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = directory();
+    let policy = std::sync::Arc::new(ChildPolicy {
+        marker: d.path().join("build-lock-launch"),
+    });
+    let cache = d.path().join("torch_extensions");
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir(cache.join("tensorfold_qmm_v5")).unwrap();
+    let lock = cache.join("tensorfold_qmm_v5/lock");
+    std::fs::write(&lock, "").unwrap();
+    let clear = |j: &HostJournal| {
+        j.with_claimed_processes(|recorded| {
+            capyctl_agent::engine_cache::clear_stale_locks(&cache, recorded)
+        })
+        .unwrap()
+    };
+    let j = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let s = j.connect().unwrap();
+    let c = launch("building");
+    let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
+    let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let rendered = policy.render_launch(&c).unwrap();
+    let api = tools.spawn_durable("building", &rendered.command).unwrap();
+    let _cleanup = ChildCleanup(api.clone());
+    assert_eq!(j.with_claimed_processes(|p| p.to_vec()).unwrap(), vec![api]);
+    assert_eq!(clear(&j), 0);
+    assert!(lock.exists(), "a launch that may be building holds it");
+    drop(tools);
+    stop(&j, s, "building", policy.as_ref());
+    assert_eq!(clear(&j), 1);
+    assert!(!lock.exists());
+}
+
 // T16 / T33: durable model evidence remains tied to the exact owned launch;
 // reading current process presence cannot refresh an old native readiness probe.
 #[tokio::test]

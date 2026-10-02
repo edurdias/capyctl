@@ -204,6 +204,32 @@ impl ProfileBindings {
     }
 }
 
+/// ADR 0023 §3: before a TensorFold launch, clear the build locks a killed
+/// build left in its version's private directory, then read the build state
+/// again. `recorded` is every process recorded for a launch this role still
+/// retains; while any of them may run, it may be building there and nothing
+/// is removed. Called under the owner, so no launch records a process (and
+/// so starts) meanwhile. Any other spec is left alone.
+pub(crate) fn clear_stale_build_locks(
+    spec: &mut AdapterSpec,
+    recorded: &[capyctl_domain::completion::ProcessIdentity],
+) {
+    let AdapterSpec::Tensorfold {
+        launch: Some(launch),
+        extensions_built,
+        ..
+    } = spec
+    else {
+        return;
+    };
+    let Some(dir) = launch.extensions_dir.as_deref().map(std::path::Path::new) else {
+        return;
+    };
+    if capyctl_agent::engine_cache::clear_stale_locks(dir, recorded) > 0 {
+        *extensions_built = capyctl_agent::engine_cache::has_build(dir);
+    }
+}
+
 impl EngineBindings for ProfileBindings {
     /// SPEC §8.2 / T21: a signalled stop never runs the entry's exit handler,
     /// so the gone launch's rendezvous directory is removed here, on the same

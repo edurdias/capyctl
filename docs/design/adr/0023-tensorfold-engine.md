@@ -53,7 +53,13 @@ only when the extra arguments name no `--drafter`. The environment is
 closed (SPEC §13.3) and adds `TENSORFOLD_NO_UPDATE_CHECK=1`, `HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`, the placement's `CUDA_VISIBLE_DEVICES` and
 `TORCH_EXTENSIONS_DIR=<state>/engines/tensorfold/<build_fingerprint>/torch_extensions`
-(service user, 0700). Reserved: `--host`, `--port`, `--name`, `--alias`,
+(service user, 0700). torch holds `<extension>/lock` in that directory while it
+builds, and a build killed mid way leaves it, so the next start waits on it
+forever. Before a launch, CapyCTL removes those lock files, and nothing else,
+only when every process recorded for a launch the role still retains (host
+journal claims, or the standalone's unreleased bindings) is proved gone: a
+concurrent start of the same version shares the directory, and the lock of a
+launch that may be building stands (found live 2026-10-02). Reserved: `--host`, `--port`, `--name`, `--alias`,
 `--backend`, `--context`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`,
 `--no-update-check`, checked with the
 abbreviation rule at deploy time and again when the command is rendered. There is
@@ -83,7 +89,12 @@ engines' draft models.
 ### 6. Readiness, drain, park and wake
 
 Ready is `GET /health` with `"ok": true` and the served name in `/v1/models`, then
-the chat probe; a non-empty `content` or `reasoning_content` is an answer.
+the chat probe; a non-empty `content` or `reasoning_content` is an answer. The
+probe is part of startup: it is bounded by what remains of the startup bound
+(§4: the whole deadline on a first build, the ordinary bound once a build
+exists) and by no shorter read bound, because TensorFold 0.6.1 builds more
+extensions on its first request (found live 2026-10-02). vLLM and SGLang
+probes are bounded the same way.
 Parking a TensorFold deployment is the restart-only release: drain, read `/health`
 until `requests_running` is 0 and `busy` is false, SIGTERM the owned group, verify
 exit, then release memory. A group that is gone, or an engine that does not listen

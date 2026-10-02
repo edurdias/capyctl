@@ -1319,6 +1319,17 @@ impl OwnedCoordinator {
                         CoordinatorError::Service("ownership mutex poisoned".into())
                     })?;
                     let store = owner.store();
+                    if matches!(
+                        spec,
+                        capyctl_adapters::resolve::AdapterSpec::Tensorfold { .. }
+                    ) {
+                        let recorded = store.retained_processes().map_err(|error| {
+                            CoordinatorError::Service(format!(
+                                "retained launches could not be read: {error}"
+                            ))
+                        })?;
+                        crate::engine_bindings::clear_stale_build_locks(&mut spec, &recorded);
+                    }
                     match &mut spec {
                         capyctl_adapters::resolve::AdapterSpec::Vllm {
                             engine_key: Some(key),

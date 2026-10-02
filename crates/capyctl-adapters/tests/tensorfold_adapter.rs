@@ -424,3 +424,92 @@ async fn engine_quiescence_reads_health() {
     let gone = TensorfoldAdapter::new(url(free_port().await), "0.6.0".into(), "nemotron".into());
     assert!(!gone.engine_quiescent(&member(), 0).await);
 }
+
+/// An engine that is ready at once, opens its probe's stream, and then says
+/// nothing for `pause` before it answers: TensorFold 0.6.1 builds more CUDA
+/// extensions on the first request (found live 2026-10-02, a Qwen3.8 27B
+/// NVFP4 start whose first request took more than 60 s).
+async fn first_request_builds(pause: Duration) -> u16 {
+    let chat = move || async move {
+        let chunk = |delta: Value, finish: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1,
+                    "model": "nemotron", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+            )
+        };
+        let opened = chunk(json!({"role": "assistant"}), Value::Null);
+        let rest = chunk(json!({"content": "Ready."}), Value::Null)
+            + &chunk(json!({}), json!("length"))
+            + "data: [DONE]\n\n";
+        let body = futures::stream::unfold(0, move |step| {
+            let (opened, rest) = (opened.clone(), rest.clone());
+            async move {
+                match step {
+                    0 => Some((Ok::<_, std::io::Error>(opened), 1)),
+                    1 => {
+                        tokio::time::sleep(pause).await;
+                        Some((Ok(rest), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from_stream(body))
+            .unwrap()
+    };
+    let app = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(json!({"ok": true, "busy": false, "requests_running": 0})) }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"object": "list", "data": [{"id": "nemotron"}]})) }),
+        )
+        .route("/v1/chat/completions", post(chat));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+fn cold_adapter(port: u16) -> TensorfoldAdapter {
+    TensorfoldAdapter::new(url(port), "0.6.1".into(), "nemotron".into())
+        .with_launch(plan(port, 60_000))
+        .with_extensions_built(false)
+        .with_tools(Arc::new(ScriptedTool::alive(api_identity(), vec![])))
+}
+
+// T41 (ADR 0023 §4, found live 2026-10-02): the probe is part of startup, so a
+// first request that builds kernels for longer than the transport's 60 s read
+// bound is waited out within the startup budget, not cut off and killed. Real
+// time: paused tokio time skips ahead while the loopback request is in flight.
+#[tokio::test]
+async fn a_first_request_that_builds_kernels_is_waited_out() {
+    let port = first_request_builds(Duration::from_secs(65)).await;
+    let observation = cold_adapter(port)
+        .execute_persisted(&initialize_command(1_800_000))
+        .await
+        .unwrap();
+    assert!(observation.facts.contains(&Milestone::ModelUsable));
+}
+
+// T41 (ADR 0023 §4): the probe still ends with the startup budget.
+#[tokio::test]
+async fn a_first_request_build_is_still_bounded_by_the_startup_budget() {
+    let port = first_request_builds(Duration::from_secs(3_600)).await;
+    let started = Instant::now();
+    let error = cold_adapter(port)
+        .execute_persisted(&initialize_command(4_000))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(error.to_string().contains("probe deadline"), "{error}");
+}

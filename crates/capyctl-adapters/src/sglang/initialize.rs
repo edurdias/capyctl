@@ -18,9 +18,7 @@ use capyctl_domain::completion::{
 use capyctl_domain::launch::LaunchSettings;
 
 use crate::protected::ProtectedLaunchDescriptors;
-use crate::traits::{
-    ChatForward, EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError,
-};
+use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
 use super::adapter::SglangAdapter;
@@ -301,13 +299,12 @@ pub(super) async fn initialize(
     });
     // Spec §4: every wait is bounded by the context deadline, and the builder's own
     // waits end first so its reason, not a bare coordinator timeout, is what gets
-    // recorded. The chat client carries its own much longer bounds, so a model that
-    // lists itself and then stalls on its first completion would otherwise hand the
-    // outcome to `drive`.
+    // recorded. The probe is bounded by the remaining budget alone, never by the
+    // transport's shorter read bound (a slow first completion is still startup).
     let probe_budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
-    let answer = tokio::time::timeout(probe_budget, adapter.forward_chat(&body))
+    let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
         })?
         .map_err(|e| {
