@@ -303,6 +303,9 @@ pub(super) fn declared_engine_config(
             // Re-review parity rule: a snapshot frozen before the engine's
             // CUDA context was charged re-derives without it.
             legacy_overhead: memory.get("overhead_bytes").is_none(),
+            // ADR 0014 amendment A8: a snapshot frozen before the first-start
+            // graph allowance re-derives its placeholder startup without it.
+            legacy_startup_graphs: memory.get("startup_graphs_bytes").is_none(),
         },
     ))
 }

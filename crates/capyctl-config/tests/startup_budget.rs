@@ -116,8 +116,8 @@ fn an_impossible_startup_peak_is_refused() {
     assert!(parse_strict(ConfigKind::Deployment, &bad.to_string()).is_err());
 }
 
-/// Undeclared, the startup peak is the placeholder `max(request, weights ×
-/// 1.6 + margin)` when the weights are known and the request otherwise; the
+/// Undeclared, the startup peak is the placeholder `max(request + graphs,
+/// weights × 2.25 + margin)` (ADR 0014 amendment A8) when the weights are known and the request otherwise; the
 /// provenance names it derived so a snapshot cannot claim another value.
 // T14 T26 T29
 #[test]
@@ -126,8 +126,8 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
     let effective =
         resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    let expected = 30 * GIB * 8 / 5 + VLLM_OVERHEAD_MARGIN_BYTES;
-    assert_eq!(expected, 56 * GIB);
+    let expected = 30 * GIB * 9 / 4 + VLLM_OVERHEAD_MARGIN_BYTES;
+    assert_eq!(expected, 75 * GIB + GIB / 2);
     assert_eq!(cold(&effective), expected + OVERHEAD);
     assert_eq!(ready(&effective), 40 * GIB + OVERHEAD);
     assert_eq!(
@@ -148,18 +148,19 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     forged["resources"]["cold"]["allocations"][0]["bytes"] = json!(41 * GIB);
     assert!(decode_effective_snapshot(&forged.to_string()).is_err());
 
-    // Small weights: the request is already above the placeholder.
+    // Small weights: the request and the graph allowance (amendment A8) are
+    // already above the placeholder.
     let small = resolve_effective_with_checkpoint(&deployment, &host, weights(GIB)).unwrap();
-    assert_eq!(cold(&small), 40 * GIB + OVERHEAD);
-    // Unknown weights: the request.
+    assert_eq!(cold(&small), 40 * GIB + GRAPHS + OVERHEAD);
+    // Unknown weights: the request and the graph allowance.
     let unknown = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(cold(&unknown), 40 * GIB + OVERHEAD);
+    assert_eq!(cold(&unknown), 40 * GIB + GRAPHS + OVERHEAD);
     assert_eq!(
-        default_startup_bytes(40 * GIB, None, 8 * GIB),
-        Some(40 * GIB)
+        default_startup_bytes(40 * GIB, None, 8 * GIB, Some(GRAPHS)),
+        Some(40 * GIB + GRAPHS)
     );
     assert_eq!(
-        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB),
+        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB, Some(GRAPHS)),
         None
     );
 }
@@ -179,6 +180,7 @@ fn a_revision_frozen_before_the_budget_still_decodes_with_its_request() {
             weights_bytes: Some(30 * GIB),
             legacy_startup: true,
             legacy_overhead: true,
+            legacy_startup_graphs: true,
         },
     )
     .unwrap();
@@ -210,4 +212,128 @@ fn a_declared_cold_phase_is_the_startup_budget() {
     let budget = startup_budget(&effective);
     assert_eq!(budget.provenance, StartupProvenance::Resources);
     assert_eq!(budget.bytes, cold(&effective));
+}
+
+/// ADR 0014 amendment A8: the first-start graph allowance per captured model.
+const GRAPHS: i64 = 5 << 28;
+
+/// The fixture deployment on `engine`, with a draft model when `draft` names
+/// one, and a declared request so the request dominates the placeholder.
+fn speculative(engine: &str, draft: bool) -> (Value, Value) {
+    let (mut deployment, mut host) = fixture();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!(engine);
+    profile["args"] = json!([]);
+    profile["security"]["approved_options"] =
+        json!(["--speculative-config", "--speculative-draft-model-path"]);
+    profile["security"]["approved_paths"] = json!(["/srv/drafters"]);
+    if engine == "sglang" {
+        profile["security"]["admin_credential_ref"] = json!("secret://engine-admin");
+    }
+    deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
+    if draft {
+        deployment["engine_config"]["accept_extra_args"] = json!(true);
+        deployment["engine_config"]["extra_args"] = match engine {
+            "vllm" => json!([
+                "--speculative-config",
+                r#"{"method":"dflash","model":"/srv/drafters/d","num_speculative_tokens":7}"#
+            ]),
+            _ => json!([
+                "--speculative-draft-model-path",
+                "/srv/drafters/d",
+                "--speculative-algorithm",
+                "DFLASH"
+            ]),
+        };
+    }
+    (deployment, host)
+}
+
+/// ADR 0014 amendment A8 (found live 2026-10-02): vLLM 0.30 with Qwen3.8-27B
+/// NVFP4 and DFlash2 peaked at 50.46 GiB on its first start against a
+/// 49.25 GiB cold phase: the CUDA graphs it captured (1.64 GiB, the draft
+/// model's included) sat above the request. The placeholder startup now
+/// carries one graph allowance per captured model, on vLLM and SGLang, and
+/// a snapshot records and re-derives it. Ready is unchanged.
+// T14 T26
+#[test]
+fn the_placeholder_startup_covers_the_first_starts_graphs() {
+    for engine in ["vllm", "sglang"] {
+        for (draft, models) in [(false, 1), (true, 2)] {
+            let (deployment, host) = speculative(engine, draft);
+            let effective =
+                resolve_effective_with_checkpoint(&deployment, &host, weights(GIB)).unwrap();
+            assert_eq!(
+                cold(&effective),
+                40 * GIB + models * GRAPHS + OVERHEAD,
+                "{engine} draft {draft}"
+            );
+            assert_eq!(ready(&effective), 40 * GIB + OVERHEAD);
+            let memory = effective.engine_config.memory();
+            assert_eq!(memory.startup_bytes, Some(40 * GIB + models * GRAPHS));
+            assert_eq!(memory.startup_graphs_bytes, Some(models * GRAPHS));
+            let snapshot = serde_json::to_value(&effective).unwrap();
+            assert_eq!(
+                decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+                effective
+            );
+            // A claimed allowance other than the derived one is refused.
+            let mut forged = snapshot.clone();
+            forged["engine_config"]["memory"]["startup_graphs_bytes"] = json!(0);
+            assert!(decode_effective_snapshot(&forged.to_string()).is_err());
+        }
+    }
+    // Large weights: the load term still wins when it is larger.
+    let (deployment, host) = speculative("vllm", true);
+    let heavy = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
+    assert_eq!(cold(&heavy), 75 * GIB + GIB / 2 + OVERHEAD);
+    // A declared startup peak is the operator's and carries no allowance.
+    let (mut declared, host) = speculative("vllm", true);
+    declared["engine_config"]["memory"]["startup"] = json!("45GiB");
+    let declared = resolve_effective(&declared, &host).unwrap();
+    assert_eq!(cold(&declared), 45 * GIB + OVERHEAD);
+    assert_eq!(declared.engine_config.memory().startup_graphs_bytes, None);
+}
+
+/// ADR 0014 amendment A8: a revision frozen before the graph allowance
+/// records none; it still decodes, with the placeholder it was frozen with.
+// T14 T34
+#[test]
+fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
+    let (deployment, host) = speculative("vllm", true);
+    // What the previous release wrote: no allowance, and no record of one.
+    let frozen = CheckpointFacts {
+        weights_bytes: Some(GIB),
+        legacy_startup_graphs: true,
+        ..Default::default()
+    };
+    let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
+    let snapshot = serde_json::to_value(&old).unwrap();
+    assert!(snapshot["engine_config"]["memory"]
+        .get("startup_graphs_bytes")
+        .is_none());
+    assert_eq!(
+        snapshot["engine_config"]["memory"]["startup_bytes"],
+        json!(40 * GIB)
+    );
+    let decoded = decode_effective_snapshot(&snapshot.to_string()).unwrap();
+    assert_eq!(decoded, old);
+    assert_eq!(cold(&decoded), 40 * GIB + OVERHEAD);
+    // With heavy weights it keeps the 1.6 factor it was frozen with.
+    let frozen = CheckpointFacts {
+        weights_bytes: Some(30 * GIB),
+        legacy_startup_graphs: true,
+        ..Default::default()
+    };
+    let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
+    assert_eq!(cold(&old), 56 * GIB + OVERHEAD);
+    let snapshot = serde_json::to_value(&old).unwrap();
+    assert_eq!(
+        decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+        old
+    );
+    assert_eq!(
+        default_startup_bytes(40 * GIB, Some(30 * GIB), 8 * GIB, None),
+        Some(56 * GIB)
+    );
 }

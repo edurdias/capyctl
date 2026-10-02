@@ -148,7 +148,15 @@ pub fn plan_from_effective(
         // read here where the checkpoint is; a host-fixed `--max-model-len`
         // wins and nothing is passed.
         context_length: capyctl_config::context_fit::fit_for_effective(effective).tokens,
-        max_concurrent_requests: common.max_concurrent_requests,
+        // Owner decision 2026-10-02: undeclared, vLLM runs as many sequences
+        // as CapyCTL keeps in flight for the deployment; a host-fixed
+        // `--max-num-seqs` wins and nothing is passed.
+        max_concurrent_requests: common.max_concurrent_requests.or_else(|| {
+            capyctl_config::context_fit::vllm_default_max_num_seqs(
+                &effective.engine_config,
+                &profile.args,
+            )
+        }),
         max_num_batched_tokens: settings.max_num_batched_tokens,
         enforce_eager: common.cuda_graphs == Some(false),
         language_model_only: common.language_model_only,

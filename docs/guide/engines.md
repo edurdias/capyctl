@@ -100,6 +100,13 @@ SGLang's draft model is `--approve-option=--speculative-draft-model-path`.
 They are written to `engines.yaml` as `security.approved_options` and
 `security.approved_paths`, which you can also edit there.
 
+CapyCTL counts a draft model when it sizes a deployment: its weights in the
+memory request, its CUDA graphs in the memory reserved for the first start,
+and its KV cache layers in the context it fits to the KV cache. A hybrid
+model (one with linear-attention layers) with a draft model on SGLang needs a
+larger KV cache than the 4 GiB default: set `memory.kv_cache` (16 GiB works
+for Qwen3.8-27B with DFlash2).
+
 ## TensorFold
 
 CapyCTL runs TensorFold 0.6.0, 0.6.1 and 0.6.2 from a plain venv. TensorFold builds

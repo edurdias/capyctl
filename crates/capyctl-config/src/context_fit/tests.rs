@@ -20,6 +20,8 @@ fn inputs(kv: i64) -> FitInputs<'static> {
         dtype: None,
         block_tokens: None,
         reserved_blocks: 0,
+        draft: None,
+        vllm: None,
     }
 }
 
@@ -212,5 +214,140 @@ fn a_vllm_fit_leaves_the_engines_reserved_blocks() {
     assert_eq!(
         fit_context(tiny, Ok(&dense())).source,
         ContextSource::Fallback
+    );
+}
+
+/// The DFlash2 draft model of Qwen3.8-27B as its `config.json` states it:
+/// five sliding-window layers, 8 KV heads of 128, bfloat16. 2 × 5 × 8 × 128
+/// = 10240 elements per token.
+fn dflash_drafter() -> Value {
+    json!({
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3",
+        "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "hidden_size": 5120, "max_position_embeddings": 262144,
+        "dtype": "bfloat16", "sliding_window": 2048, "use_sliding_window": true,
+        "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention"],
+    })
+}
+
+// T14 (found live 2026-10-02): vLLM 0.30 keeps the draft model's KV layers
+// in the same pool as the checkpoint's, so a context fitted to the
+// checkpoint's layers alone does not fit the grant with DFlash2. The draft
+// model's KV per token is counted with the checkpoint's.
+#[test]
+fn a_draft_models_kv_layers_are_counted_with_the_checkpoints() {
+    let drafter = dflash_drafter();
+    let mut with_draft = inputs(4 * GIB);
+    with_draft.draft = Some(Ok(&drafter));
+    // 512 KiB (checkpoint) + 2 × 5 × 8 × 128 × 2 = 20 KiB (draft) per token.
+    let per_token = 512 * 1024 + 20 * 1024;
+    let raw = (4 * GIB) as u64 / per_token;
+    let fit = fit_context(with_draft, Ok(&dense()));
+    assert_eq!(fit.tokens, Some((raw - raw % 16) as u32));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    assert!(fit.reason.unwrap().contains("draft model"));
+    // One KV dtype applies to both: fp8 halves both.
+    with_draft.kv_cache_dtype = Some("fp8");
+    let raw = (4 * GIB) as u64 / (per_token / 2);
+    assert_eq!(
+        fit_context(with_draft, Ok(&dense())).tokens,
+        Some((raw - raw % 16) as u32)
+    );
+    // A draft model whose configuration cannot be read falls back.
+    let mut unreadable = inputs(4 * GIB);
+    unreadable.draft = Some(Err("the draft model has no readable config.json"));
+    let fit = fit_context(unreadable, Ok(&dense()));
+    assert_eq!(fit.source, ContextSource::Fallback);
+    assert!(fit.reason.unwrap().contains("draft model"));
+    // A declared context the pair cannot hold warns only for an exact shape;
+    // the sliding draft model is approximate, so no warning.
+    let mut declared = inputs(4 * GIB);
+    declared.declared = Some(8192);
+    declared.draft = Some(Ok(&drafter));
+    assert_eq!(fit_context(declared, Ok(&dense())).warning, None);
+}
+
+/// Qwen3.8-27B NVFP4's language model as its `config.json` states it: 48
+/// gated-delta-net (linear attention) layers and 16 attention layers with 4
+/// KV heads of 256.
+fn qwen38_27b() -> Value {
+    let mut types = Vec::new();
+    for _ in 0..16 {
+        types.extend(["linear_attention", "linear_attention", "linear_attention"]);
+        types.push("full_attention");
+    }
+    json!({"model_type": "qwen3_5", "text_config": {
+        "model_type": "qwen3_5_text", "num_hidden_layers": 64, "num_attention_heads": 24,
+        "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 5120,
+        "max_position_embeddings": 262144, "dtype": "bfloat16", "layer_types": types,
+        "full_attention_interval": 4, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+    }})
+}
+
+fn vllm_hybrid(kv: i64, speculative_tokens: Option<u32>, sequences: u32) -> FitInputs<'static> {
+    let mut fit = inputs(kv);
+    fit.kv_cache_dtype = Some("fp8");
+    fit.reserved_blocks = VLLM_RESERVED_BLOCKS;
+    fit.vllm = Some(VllmFit {
+        sequences,
+        speculative_tokens,
+    });
+    fit
+}
+
+// T14 (owner decision 2026-10-02, found live): on a hybrid checkpoint vLLM
+// sizes its pool in blocks shared by every layer group, padded so an
+// attention page holds one recurrent state, and needs one state block per
+// sequence plus 2 + speculative-blocks per recurrent group for a request. At
+// the default 4 GiB with fp8 KV, vLLM 0.30 held 83 blocks without DFlash2
+// (block 1568 tokens) and 254 with it (block 1648 tokens), and the 32752
+// tokens fitted per token were refused with DFlash2 (26368 at most). The fit
+// follows vLLM's block layout for such a checkpoint, for 32 sequences.
+#[test]
+fn a_hybrid_model_on_vllm_is_fitted_to_its_block_layout() {
+    let target = qwen38_27b();
+    let drafter = dflash_drafter();
+    // Without a draft model: 16-layer groups (1 attention, 3 recurrent),
+    // 82 usable blocks of 1568 tokens, two state blocks per recurrent group.
+    let fit = fit_context(vllm_hybrid(4 * GIB, None, 32), Ok(&target));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    assert_eq!(fit.tokens, Some(75 * 1568));
+    assert!(fit.reason.unwrap().contains("vLLM"));
+    // With DFlash2 at 7 speculative tokens: 5-layer groups (4 attention, 10
+    // recurrent, 1 draft), 1648-token blocks, 2 + 16 state blocks per
+    // recurrent group.
+    let mut with_draft = vllm_hybrid(4 * GIB, Some(7), 32);
+    with_draft.draft = Some(Ok(&drafter));
+    let fit = fit_context(with_draft, Ok(&target));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    let tokens = fit.tokens.unwrap();
+    assert_eq!(tokens, 14 * 1648);
+    assert!(tokens <= 26368, "vLLM held at most 26368");
+    // More sequences than the pool holds state blocks for: refused with the
+    // KV cache that would hold them.
+    let fit = fit_context(vllm_hybrid(4 * GIB, None, 256), Ok(&target));
+    assert_eq!(fit.source, ContextSource::Fallback);
+    let reason = fit.reason.unwrap();
+    assert!(
+        reason.contains("256 sequences") && reason.contains("memory.kv_cache"),
+        "{reason}"
+    );
+    // SGLang (no vLLM layout) and a non-hybrid model keep the per-token fit.
+    let mut sglang = inputs(4 * GIB);
+    sglang.kv_cache_dtype = Some("fp8");
+    assert_eq!(fit_context(sglang, Ok(&target)).tokens, Some(32768));
+    assert_eq!(
+        fit_context(vllm_hybrid(4 * GIB, None, 32), Ok(&dense())).tokens,
+        fit_context(
+            FitInputs {
+                vllm: None,
+                ..vllm_hybrid(4 * GIB, None, 32)
+            },
+            Ok(&dense())
+        )
+        .tokens
     );
 }

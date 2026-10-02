@@ -15,6 +15,13 @@
 //! fields, an unknown KV dtype) falls back to [`FALLBACK_CONTEXT`] with the
 //! reason recorded for status.
 //!
+//! A speculative deployment's draft model keeps its own KV layers in the
+//! engine's pool (vLLM groups them with the checkpoint's; SGLang sizes a draft
+//! pool beside the target's), so its KV per token, read from the draft
+//! model's own `config.json`, is added to the checkpoint's (found live
+//! 2026-10-02: vLLM 0.30 with DFlash2 refused the context fitted to the
+//! checkpoint's layers alone).
+//!
 //! The fit is made where the checkpoint is read, at launch render: on the
 //! embedded host for standalone and on the host agent for a remote host. It is
 //! not part of the effective configuration, so re-resolving a stored revision
@@ -27,6 +34,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
+
+mod vllm_hybrid;
+pub use vllm_hybrid::VllmFit;
 
 /// The context used when the KV bytes per token cannot be computed reliably.
 pub const FALLBACK_CONTEXT: u32 = 4096;
@@ -203,6 +213,12 @@ pub struct FitInputs<'a> {
     /// Whole blocks of the grant the engine keeps for itself
     /// ([`VLLM_RESERVED_BLOCKS`] for vLLM).
     pub reserved_blocks: u32,
+    /// The draft model's parsed `config.json` (or why it could not be read),
+    /// when the launch loads one beside the checkpoint.
+    pub draft: Option<Result<&'a Value, &'a str>>,
+    /// The launch is vLLM's: a hybrid checkpoint is fitted to its block
+    /// layout (owner decision 2026-10-02).
+    pub vllm: Option<VllmFit>,
 }
 
 /// The width of one cached element: an explicit KV dtype (fp8 variants are one
@@ -233,12 +249,37 @@ fn fallback(reason: impl Into<String>) -> ContextFit {
     }
 }
 
-/// The largest block-aligned context the grant holds for `shape`, capped at
-/// the model's maximum position.
-fn fitted_tokens(inputs: &FitInputs<'_>, shape: &KvShape) -> Result<u64, String> {
-    let per_token = shape
+/// The draft model's KV shape, when the launch loads one.
+fn draft_shape(inputs: &FitInputs<'_>) -> Result<Option<KvShape>, String> {
+    match inputs.draft {
+        None => Ok(None),
+        Some(config) => config
+            .map_err(str::to_owned)
+            .and_then(KvShape::from_config)
+            .map(Some)
+            .map_err(|reason| format!("the draft model: {reason}")),
+    }
+}
+
+/// The largest block-aligned context the grant holds for `shape` (and the
+/// draft model's `draft`, whose KV shares the grant), capped at the model's
+/// maximum position.
+fn fitted_tokens(
+    inputs: &FitInputs<'_>,
+    shape: &KvShape,
+    draft: Option<&KvShape>,
+) -> Result<u64, String> {
+    let mut per_token = shape
         .bytes_per_token(element_bytes(inputs, shape)?)
         .ok_or("the KV bytes per token overflow")?;
+    if let Some(draft) = draft {
+        // One KV dtype applies to both models' layers.
+        let element = element_bytes(inputs, draft).map_err(|e| format!("the draft model: {e}"))?;
+        per_token = draft
+            .bytes_per_token(element)
+            .and_then(|bytes| bytes.checked_add(per_token))
+            .ok_or("the KV bytes per token overflow")?;
+    }
     let grant = u64::try_from(inputs.kv_cache_bytes)
         .ok()
         .filter(|bytes| *bytes > 0)
@@ -259,13 +300,21 @@ fn fitted_tokens(inputs: &FitInputs<'_>, shape: &KvShape) -> Result<u64, String>
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context for a
 /// launch, from the parsed model configuration (or why it could not be read).
 pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> ContextFit {
+    let config_value = config.as_ref().ok().copied();
     let shape = config.and_then(KvShape::from_config);
+    let draft = draft_shape(&inputs);
     if let Some(declared) = inputs.declared {
         // An explicit context always wins. When the shape is exact and the
         // grant provably cannot hold it, say so; the engine still decides.
-        let warning = match &shape {
-            Ok(shape) if shape.approximation.is_none() => {
-                match (fitted_tokens(&inputs, shape), u64::from(declared)) {
+        let warning = match (&shape, &draft) {
+            (Ok(shape), Ok(draft))
+                if shape.approximation.is_none()
+                    && draft.as_ref().is_none_or(|d| d.approximation.is_none()) =>
+            {
+                match (
+                    fitted_tokens(&inputs, shape, draft.as_ref()),
+                    u64::from(declared),
+                ) {
                     (Ok(fits), declared_tokens)
                         if declared_tokens > fits && declared_tokens <= shape.max_position =>
                     {
@@ -292,11 +341,59 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
         Ok(shape) => shape,
         Err(reason) => return fallback(reason),
     };
-    match fitted_tokens(&inputs, &shape) {
+    let draft = match draft {
+        Ok(draft) => draft,
+        Err(reason) => return fallback(reason),
+    };
+    let reason = match &draft {
+        None => shape.approximation.map(str::to_owned),
+        Some(draft) => {
+            let mut parts: Vec<String> =
+                shape.approximation.map(str::to_owned).into_iter().collect();
+            parts.push("the draft model's KV layers are counted with the checkpoint's".into());
+            parts.extend(draft.approximation.map(|a| format!("draft model: {a}")));
+            Some(parts.join("; "))
+        }
+    };
+    // Owner decision 2026-10-02: a hybrid checkpoint on vLLM follows vLLM's
+    // block layout rather than the per-token count.
+    let hybrid = match (
+        inputs.vllm,
+        config_value,
+        u64::try_from(inputs.kv_cache_bytes),
+    ) {
+        (Some(vllm), Some(config), Ok(grant)) if grant > 0 => element_bytes(&inputs, &shape)
+            .ok()
+            .and_then(|element| {
+                vllm_hybrid::fitted_tokens(config, &shape, draft.as_ref(), element, grant, vllm)
+            })
+            .map(|fit| (fit, vllm.sequences)),
+        _ => None,
+    };
+    if let Some((fit, sequences)) = hybrid {
+        return match fit {
+            Ok(tokens) => ContextFit {
+                tokens: Some(u32::try_from(tokens).unwrap_or(u32::MAX)),
+                source: ContextSource::Fitted,
+                reason: Some(format!(
+                    "hybrid model: fitted to vLLM's recurrent-state block layout for {sequences} \
+                     sequences{}",
+                    if draft.is_some() {
+                        ", the draft model's layers included"
+                    } else {
+                        ""
+                    }
+                )),
+                warning: None,
+            },
+            Err(reason) => fallback(reason),
+        };
+    }
+    match fitted_tokens(&inputs, &shape, draft.as_ref()) {
         Ok(tokens) => ContextFit {
             tokens: Some(u32::try_from(tokens).unwrap_or(u32::MAX)),
             source: ContextSource::Fitted,
-            reason: shape.approximation.map(str::to_owned),
+            reason,
             warning: None,
         },
         Err(reason) => fallback(reason),
@@ -356,6 +453,25 @@ pub fn fit_for_launch(
     let config = checkpoint_root
         .ok_or_else(|| "the deployment resolves to no checkpoint directory".to_owned())
         .and_then(read_model_config);
+    // The draft model is read where the checkpoint is: never by a server
+    // fitting for a remote host. Resolution already confined its path to the
+    // installation's approved directories (ADR 0014 §8).
+    let args: Vec<String> = profile_args
+        .iter()
+        .chain(settings.extra_args())
+        .cloned()
+        .collect();
+    let draft = match (engine, checkpoint_root) {
+        (Engine::Vllm | Engine::Sglang, Some(_)) => {
+            crate::engine_policy::draft_model_path(engine, &args)
+                .map(|path| read_model_config(Path::new(&path)))
+        }
+        _ => None,
+    };
+    let vllm = (engine == Engine::Vllm).then(|| VllmFit {
+        sequences: vllm_sequences(settings, profile_args),
+        speculative_tokens: speculative_tokens(&args),
+    });
     fit_context(
         FitInputs {
             declared: common.context_length,
@@ -364,9 +480,70 @@ pub fn fit_for_launch(
             dtype: common.dtype.as_deref(),
             block_tokens: block,
             reserved_blocks,
+            draft: draft
+                .as_ref()
+                .map(|config| config.as_ref().map_err(String::as_str)),
+            vllm,
         },
         config.as_ref().map_err(Clone::clone),
     )
+}
+
+/// Owner decision 2026-10-02: the `--max-num-seqs` CapyCTL passes vLLM when
+/// neither the deployment (`max_concurrent_requests`) nor the installation's
+/// host-fixed arguments set it: the router's per-deployment bound.
+pub fn vllm_default_max_num_seqs(
+    settings: &LaunchSettings,
+    profile_args: &[String],
+) -> Option<u32> {
+    let declared = match settings {
+        LaunchSettings::Vllm(s) => s.common.max_concurrent_requests,
+        _ => return None,
+    };
+    let host_fixed = option_names(profile_args).is_ok_and(|names| names.contains("--max-num-seqs"));
+    (declared.is_none() && !host_fixed)
+        .then_some(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
+}
+
+/// The sequences a vLLM launch runs with: declared, host-fixed, or the
+/// default above. A host-fixed value that does not parse counts as vLLM's own
+/// default (256).
+fn vllm_sequences(settings: &LaunchSettings, profile_args: &[String]) -> u32 {
+    if let LaunchSettings::Vllm(s) = settings {
+        if let Some(declared) = s.common.max_concurrent_requests {
+            return declared;
+        }
+    }
+    if let Some(default) = vllm_default_max_num_seqs(settings, profile_args) {
+        return default;
+    }
+    crate::engine_policy::parse_options(profile_args)
+        .ok()
+        .and_then(|options| {
+            options
+                .into_iter()
+                .rev()
+                .find(|o| o.name == "--max-num-seqs")
+                .and_then(|o| o.value)
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
+
+/// `num_speculative_tokens` of vLLM's `--speculative-config`, when given.
+fn speculative_tokens(args: &[String]) -> Option<u32> {
+    crate::engine_policy::parse_options(args)
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|o| o.name == "--speculative-config")
+        .and_then(|o| o.value)
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .map(|config| {
+            config["num_speculative_tokens"]
+                .as_u64()
+                .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX))
+        })
 }
 
 /// The effective context of a resolved deployment on the machine that reads

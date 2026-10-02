@@ -67,10 +67,13 @@ fn validate_shows_the_startup_reservation_and_its_provenance() {
             (12_i64 << 30) + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "declared",
         ),
-        // Weights pending: the placeholder is the request.
+        // Weights pending: the placeholder is the request and the first
+        // start's graph allowance (ADR 0014 amendment A8).
         (
             derived(json!({"request": "8GiB", "kv_cache": "4GiB"})),
-            (8_i64 << 30) + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
+            (8_i64 << 30)
+                + capyctl_config::effective::STARTUP_GRAPH_ALLOWANCE_BYTES
+                + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "default",
         ),
         (

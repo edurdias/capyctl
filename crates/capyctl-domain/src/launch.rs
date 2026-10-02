@@ -10,6 +10,13 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+/// Owner decision 2026-10-02: the requests CapyCTL keeps in flight per
+/// deployment (the router's bound), and so the sequences vLLM is started for
+/// (`--max-num-seqs`) unless the deployment sets `max_concurrent_requests` or
+/// the installation's host-fixed arguments set it. One constant, so the
+/// router's bound and the engine's cannot drift apart.
+pub const MAX_REQUESTS_PER_DEPLOYMENT: u32 = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "engine", rename_all = "lowercase")]
 pub enum LaunchSettings {
@@ -138,6 +145,13 @@ pub struct MemoryRequest {
     /// `resources:` are declared), which re-derives without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overhead_bytes: Option<i64>,
+    /// ADR 0014 amendment A8: the first-start graph allowance a derived
+    /// startup placeholder carries (the CUDA graphs of the checkpoint and of a
+    /// draft model). Absent when the startup is declared or follows a device
+    /// request, when `resources:` are declared, and in a revision frozen
+    /// before the allowance existed, which re-derives without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_graphs_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

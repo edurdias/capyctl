@@ -1,5 +1,40 @@
 # Current implementation and launch status
 
+## Draft model memory gaps closed — 2026-10-02 (branch `fix/drafter-memory-gaps`)
+
+Gaps left by the vLLM 0.30 findings (Qwen3.8-27B NVFP4 with DFlash2):
+
+1. **First start above its reservation** (ADR 0014 amendment A8). The derived
+   startup placeholder is now `max(request + graphs, weights × 2.25 + margin)`
+   for vLLM and SGLang, with a 1.25 GiB graph allowance per captured model.
+   Recorded as `startup_graphs_bytes`; older revisions decode unchanged (1.6,
+   no allowance).
+2. **Draft model KV in the fitted context** (amendment A9).
+3. **Hybrid checkpoints on vLLM** (amendment A10, owner decision 2026-10-02).
+   vLLM gets `--max-num-seqs` 32, the router's per-deployment bound (one
+   shared constant), unless the deployment or installation sets it. The fit
+   follows vLLM's recurrent-state block layout for those sequences.
+   SGLang is unchanged: with DFlash2 at the default 4 GiB it refuses (state
+   cache), so such a deployment declares `memory.kv_cache`.
+
+Live on host B (standalone, fresh 0700 state and config directories, fresh
+engine caches), vLLM 0.30, no memory stated (4 GiB KV derived):
+- Without DFlash2: context 117600 tokens, reservation 55.19 GiB, first-start
+  peak 49.88 GiB, answered Jupiter.
+- With DFlash2: context 23072 tokens, reservation 63.25 GiB, peak 49.89 GiB,
+  answered Jupiter.
+
+Before the factor change the same starts peaked at 47.86 GiB and 50.49 GiB
+against 41.92 GiB and 50.08 GiB.
+
+With `kv_cache: 16GiB` and DFlash2: vLLM peaked at 50.59 GiB and SGLang at
+44.63 GiB (both reserved 51.75 GiB then); both answered.
+
+SGLang 0.5.20 with no memory stated: without DFlash2 it started, answering
+with running requests capped at 1; with DFlash2 it refused to start.
+
+Cleanup complete. CPU and Fake-engine tests are not qualification.
+
 ## TensorFold 0.6.2 verified — 2026-10-02 (branch `feat/tensorfold-0.6.2`)
 
 TensorFold 0.6.2 joins 0.6.0 and 0.6.1 in the verified set (ADR 0023 §1), so

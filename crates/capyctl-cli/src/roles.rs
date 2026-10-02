@@ -2099,7 +2099,8 @@ async fn start_standalone_in(
             controller.clone(),
         )),
         limits: capyctl_router::QueueLimits {
-            max_requests_per_deployment: 32,
+            max_requests_per_deployment: capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT
+                as usize,
             max_buffered_bytes_total: 64 * 1024 * 1024,
         },
         api_key: Some(api_key.clone()),
