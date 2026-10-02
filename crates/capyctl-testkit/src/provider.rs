@@ -73,6 +73,8 @@ pub fn fake_installation() -> EngineInstallation {
         installation_drift: Default::default(),
         cuda_home: None,
         engine_ports: (8100, 8199),
+        approved_options: Vec::new(),
+        approved_paths: Vec::new(),
     }
 }
 

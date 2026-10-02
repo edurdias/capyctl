@@ -38,6 +38,8 @@ fn register(document: &std::path::Path, name: &str) {
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -527,6 +529,8 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

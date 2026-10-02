@@ -68,6 +68,8 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         installation_drift: Default::default(),
         cuda_home: None,
         engine_ports: (8100, 8199),
+        approved_options: Vec::new(),
+        approved_paths: Vec::new(),
     }
 }
 
@@ -1194,6 +1196,8 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             installation_drift: capyctl_config::effective::InstallationDrift::Warn,
             args: vec![],
             cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
         },
     );
     [("vllm-patched".to_string(), profile)]
@@ -1962,4 +1966,102 @@ fn a_role_with_no_engine_publishes_its_configured_port_range() {
         (range["start"].as_u64(), range["end"].as_u64()),
         (Some(20400), Some(20409))
     );
+}
+
+/// A TensorFold profile as `capyctl engine add --approve-option --drafter
+/// --approve-path /srv/drafters` writes it into engines.yaml.
+fn drafter_profile(options: &[&str], paths: &[&str]) -> serde_json::Value {
+    capyctl_config::registration::profile_document(&capyctl_config::registration::ProfileSpec {
+        engine: Engine::Tensorfold,
+        executable: "/opt/tf/bin/tensorfold".into(),
+        build_fingerprint: "0.6.0".into(),
+        deep_park: false,
+        installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+        args: vec![],
+        cuda_home: None,
+        approved_options: options.iter().map(|o| o.to_string()).collect(),
+        approved_paths: paths.iter().map(|p| p.to_string()).collect(),
+    })
+}
+
+/// What standalone publishes for `profile`, registered as `tf-drafter`, and
+/// whether a deployment on it with `--drafter <drafter>` resolves.
+fn drafter_on_standalone(
+    profile: &serde_json::Value,
+    drafter: &str,
+) -> (serde_json::Value, Result<(), String>) {
+    let base = installed(Engine::Tensorfold, "/bin/true");
+    let installation = capyctl_controller::engine_provider::from_profile(&base, profile);
+    let host = host_policy(
+        &[capyctl_controller::engine_provider::NamedInstallation {
+            profile: "tf-drafter".into(),
+            installation,
+        }],
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+        PORTS,
+    );
+    let mut deployment = deployment_document(
+        "d",
+        "d",
+        &local("/srv/models/d"),
+        Engine::Tensorfold,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
+        DEFAULT_REQUEST_DEADLINE,
+        false,
+        "tf-drafter",
+    )
+    .expect("the unified template");
+    deployment["engine_config"] = serde_json::json!({
+        "context_length": 8192,
+        "accept_extra_args": true,
+        "extra_args": ["--drafter", drafter],
+    });
+    let resolved = capyctl_config::effective::resolve_effective(&deployment, &host)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {}", e.path, e.detail));
+    (host, resolved)
+}
+
+/// ADR 0014 §8, owner rule (standalone is a server and one host): the
+/// approvals a registered profile declares in engines.yaml are published with
+/// it, so a deployment naming an approved drafter directory resolves on
+/// standalone as it does on a host.
+// T37 T41
+#[test]
+fn a_registered_profile_keeps_its_approvals_on_standalone() {
+    let profile = drafter_profile(&["--drafter"], &["/srv/drafters"]);
+    let (host, resolved) = drafter_on_standalone(&profile, "/srv/drafters/d");
+    let security = &host["runtime_profiles"]["tf-drafter"]["security"];
+    assert_eq!(
+        security["approved_options"],
+        serde_json::json!(["--drafter"])
+    );
+    assert_eq!(
+        security["approved_paths"],
+        serde_json::json!(["/srv/drafters"])
+    );
+    resolved.expect("an approved drafter directory resolves on standalone");
+}
+
+/// ADR 0014 §8: approval names a directory; a drafter outside it, and a
+/// profile that approves nothing, are still refused.
+// T37 T41
+#[test]
+fn an_unapproved_drafter_is_still_refused_on_standalone() {
+    let profile = drafter_profile(&["--drafter"], &["/srv/drafters"]);
+    let (_, outside) = drafter_on_standalone(&profile, "/srv/elsewhere/d");
+    let outside = outside.expect_err("a path outside approved_paths is refused");
+    assert!(outside.contains("approved_paths"), "{outside}");
+
+    let (host, unapproved) = drafter_on_standalone(&drafter_profile(&[], &[]), "/srv/drafters/d");
+    let unapproved = unapproved.expect_err("an unapproved option is refused");
+    assert!(unapproved.contains("approved_options"), "{unapproved}");
+    let security = &host["runtime_profiles"]["tf-drafter"]["security"];
+    assert!(security.get("approved_options").is_none());
+    assert!(security.get("approved_paths").is_none());
 }

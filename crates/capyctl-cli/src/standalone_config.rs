@@ -72,6 +72,14 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
     if installation.installation_drift == capyctl_config::effective::InstallationDrift::Refuse {
         security["installation_drift"] = json!("refuse");
     }
+    // ADR 0014 §8: a registered profile's approvals are published with it, as
+    // a host publishes engines.yaml; without this a deployment's approved
+    // path option is refused on standalone only.
+    capyctl_config::registration::put_approvals(
+        &mut security,
+        &installation.approved_options,
+        &installation.approved_paths,
+    );
     let mut profile = json!({
         "engine": installation.engine.name(),
         "revision": 1,

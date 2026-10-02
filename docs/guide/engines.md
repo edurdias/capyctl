@@ -79,6 +79,21 @@ A deployment then uses it with `engine: vllm-nightly`. Other options:
 `--drift refuse` refuses a launch if the installation's files changed since
 you added it.
 
+Some engine options read a path or run code, so a deployment may pass them in
+`extra_args` only if the engine allows them. `--approve-option` allows one by
+name and `--approve-path` names a directory its path may be inside (both
+repeatable; the directory must be absolute). For a vLLM build that serves a
+local draft model:
+
+```bash
+capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly \
+  --approve-option=--speculative-config --approve-path /srv/drafters
+```
+
+SGLang's draft model is `--approve-option=--speculative-draft-model-path`.
+They are written to `engines.yaml` as `security.approved_options` and
+`security.approved_paths`, which you can also edit there.
+
 ## TensorFold
 
 CapyCTL runs TensorFold 0.6.0 and 0.6.1 from a plain venv. TensorFold builds
@@ -152,10 +167,16 @@ parks, so `parked` holds nothing and `parking` and `wake` repeat `ready` and
 32768-token context on a GB10: TensorFold estimated 27.7 GiB at startup and
 CapyCTL measured a 20.2 GiB peak.
 
-A drafter works as a draft model does for vLLM and SGLang: allow it on the
-engine (`security.approved_options: [--drafter]` and the drafter's directory in
-`security.approved_paths`), then pass it with
-`accept_extra_args: true` and `extra_args: [--drafter, /path/to/drafter]`.
+A drafter works as a draft model does for vLLM and SGLang: allow it when you
+add the engine, with the directory that holds your drafters,
+
+```bash
+capyctl engine add ~/venvs/tensorfold --name tensorfold-drafter \
+  --approve-option=--drafter --approve-path /srv/drafters
+```
+
+then pass it in the deployment with
+`accept_extra_args: true` and `extra_args: [--drafter, /srv/drafters/my-drafter]`.
 CapyCTL does not download drafters; without one it starts TensorFold with
 `--drafter none`. That turns off an external draft model only: a checkpoint
 with built-in MTP heads, such as Nemotron, still drafts (the response's

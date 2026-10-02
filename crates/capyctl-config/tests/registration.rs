@@ -211,6 +211,8 @@ fn spec(engine: Engine) -> ProfileSpec {
         installation_drift: InstallationDrift::Warn,
         args: vec![],
         cuda_home: None,
+        approved_options: vec![],
+        approved_paths: vec![],
     }
 }
 
@@ -428,4 +430,57 @@ fn engine_add_detects_and_writes_the_cuda_home() {
     assert!(profile_document(&spec(Engine::Vllm))
         .get("cuda_home")
         .is_none());
+}
+
+// T37 (ADR 0014 §8): approvals `engine add` records are written only when
+// named, pass the resolution rules, and survive into the host document a host
+// role loads and publishes (engines.yaml merged unchanged).
+#[test]
+fn approvals_are_written_and_reach_the_host_document() {
+    let profile = profile_document(&spec(Engine::Tensorfold));
+    assert!(profile["security"].get("approved_options").is_none());
+    assert!(profile["security"].get("approved_paths").is_none());
+
+    let mut approving = spec(Engine::Tensorfold);
+    approving.deep_park = false;
+    approving.build_fingerprint = "0.6.0".into();
+    approving.approved_options = vec!["--drafter".into()];
+    approving.approved_paths = vec!["/srv/drafters".into()];
+    let profile = profile_document(&approving);
+    assert_eq!(
+        profile["security"]["approved_options"],
+        serde_json::json!(["--drafter"])
+    );
+    assert_eq!(
+        profile["security"]["approved_paths"],
+        serde_json::json!(["/srv/drafters"])
+    );
+    check_profile("tf-drafter", &profile).unwrap();
+    let mut relative = approving.clone();
+    relative.approved_paths = vec!["drafters".into()];
+    assert!(check_profile("tf-drafter", &profile_document(&relative)).is_err());
+    let mut bare = approving.clone();
+    bare.approved_options = vec!["drafter".into()];
+    assert!(check_profile("tf-drafter", &profile_document(&bare)).is_err());
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let path = engines_beside(&host);
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines
+        .profiles
+        .insert("tf-drafter".into(), profile.clone());
+    let lock = lock_engines(&path).unwrap();
+    write_engines(&engines, &lock, Some(&host_value(&host))).unwrap();
+    drop(lock);
+    let config = HostConfig::load(&host).unwrap();
+    let security = &config.document["runtime_profiles"]["tf-drafter"]["security"];
+    assert_eq!(
+        security["approved_options"],
+        serde_json::json!(["--drafter"])
+    );
+    assert_eq!(
+        security["approved_paths"],
+        serde_json::json!(["/srv/drafters"])
+    );
 }

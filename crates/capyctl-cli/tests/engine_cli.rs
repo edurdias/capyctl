@@ -104,6 +104,8 @@ fn add(path: &Path) -> Command {
         deep_park: None,
         drift: DriftChoice::Warn,
         args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
     }
 }
 
@@ -138,6 +140,54 @@ async fn add_writes_the_profile_and_publishes() {
     assert_eq!(*role.0.lock().unwrap(), vec![ControlRequest::Add]);
 }
 
+// T37 (ADR 0014 §8): `--approve-option` and `--approve-path` are written into
+// the profile's security block; an invalid one writes nothing.
+#[tokio::test]
+async fn add_records_approved_options_and_paths() {
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let approving = Command::EngineAdd {
+        path: Some(env.clone()),
+        name: None,
+        deep_park: None,
+        drift: DriftChoice::Warn,
+        args: vec![],
+        approved_options: vec!["--speculative-config".into()],
+        approved_paths: vec!["/srv/drafters".into()],
+    };
+    execute(&approving, Some(&document), dir.path())
+        .await
+        .unwrap();
+    let security = &engines_of(&document).profiles["vllm"]["security"];
+    assert_eq!(
+        security["approved_options"],
+        json!(["--speculative-config"])
+    );
+    assert_eq!(security["approved_paths"], json!(["/srv/drafters"]));
+
+    let relative = Command::EngineAdd {
+        path: Some(env.clone()),
+        name: Some("relative".into()),
+        deep_park: None,
+        drift: DriftChoice::Warn,
+        args: vec![],
+        approved_options: vec!["--speculative-config".into()],
+        approved_paths: vec!["drafters".into()],
+    };
+    let error = execute(&relative, Some(&document), dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_config");
+    assert!(
+        error.message.contains("approved_paths"),
+        "{}",
+        error.message
+    );
+    assert!(!engines_of(&document).profiles.contains_key("relative"));
+}
+
 // T03 (owner decision 2026-09-25): a name registered already, or declared in
 // the host document, is refused and nothing is written.
 #[tokio::test]
@@ -165,6 +215,8 @@ async fn add_refuses_an_existing_name() {
         deep_park: None,
         drift: DriftChoice::Warn,
         args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
     };
     assert_eq!(
         execute(&named, Some(&document), dir.path())
@@ -309,6 +361,8 @@ async fn add_disables_deep_park_when_the_probe_reports_it_missing() {
         deep_park: Some(DeepParkChoice::Enabled),
         drift: DriftChoice::Warn,
         args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
     };
     execute(&asked, Some(&document), dir.path()).await.unwrap();
     assert_eq!(
@@ -333,6 +387,8 @@ async fn add_without_a_path_needs_a_terminal() {
         deep_park: None,
         drift: DriftChoice::Warn,
         args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
     };
     assert_eq!(
         execute(&command, Some(&document), dir.path())
@@ -891,6 +947,8 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
         deep_park: Some(DeepParkChoice::Enabled),
         drift: DriftChoice::Warn,
         args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
     };
     let error = execute(&asked, Some(&document), dir.path())
         .await

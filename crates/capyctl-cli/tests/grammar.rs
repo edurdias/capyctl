@@ -532,7 +532,13 @@ fn engine_commands_parse() {
             "--arg",
             "--max-num-seqs",
             "--arg",
-            "8"
+            "8",
+            "--approve-option",
+            "--speculative-config",
+            "--approve-path",
+            "/srv/drafters",
+            "--approve-path",
+            "/srv/other"
         ])
         .unwrap(),
         Command::EngineAdd {
@@ -541,6 +547,8 @@ fn engine_commands_parse() {
             deep_park: Some(DeepParkChoice::Disabled),
             drift: DriftChoice::Refuse,
             args: vec!["--max-num-seqs".into(), "8".into()],
+            approved_options: vec!["--speculative-config".into()],
+            approved_paths: vec!["/srv/drafters".into(), "/srv/other".into()],
         }
     );
     assert_eq!(
@@ -550,7 +558,9 @@ fn engine_commands_parse() {
             name: None,
             deep_park: None,
             drift: DriftChoice::Warn,
-            args: vec![]
+            args: vec![],
+            approved_options: vec![],
+            approved_paths: vec![]
         }
     );
     assert_eq!(
