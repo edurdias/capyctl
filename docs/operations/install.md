@@ -660,7 +660,7 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list

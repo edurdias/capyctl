@@ -49,8 +49,8 @@ Not there yet:
   opt out (`--deep-park off`, see the
   [settings reference](docs/operations/configuration.md#engine-installation)).
 
-CapyCTL does not install engines or GPU drivers. Bring your own vLLM or SGLang
-environment; models come from a directory or from Hugging Face.
+CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or
+TensorFold environment; models come from a directory or from Hugging Face.
 
 ## Install
 
@@ -76,7 +76,7 @@ Standalone runs the server and one host in a single process. Register the
 engine you have, then start:
 
 ```bash
-capyctl engine add ~/venvs/vllm   # a vLLM or SGLang environment
+capyctl engine add ~/venvs/vllm   # a vLLM, SGLang or TensorFold environment
 capyctl start standalone          # inference on 0.0.0.0:8443, API key required
 ```
 
