@@ -23,7 +23,7 @@
 
 [Unit]
 Description=capyctl standalone (server and embedded host)
-Documentation=file://%h/.local/share/capyctl/docs/operations/install.md
+Documentation=https://edurdias.github.io/capyctl/docs/install/
 
 [Service]
 Type=simple

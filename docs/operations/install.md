@@ -150,8 +150,7 @@ capyctl-<version>-linux-<arch>/
                             capyctl's Python runtime helpers (embedded)
   packaging/systemd/system/ system units
   packaging/systemd/user/   user units
-  docs/examples/            example role and deployment documents
-  docs/operations/install.md
+  LICENSE                   Apache-2.0 license
   BUILDINFO                 version, commit, dirty flag, toolchain, source date,
                             embedded runtime manifest digest
   SHA256SUMS                digest of every file in the directory
@@ -226,7 +225,7 @@ or a pre-release is installed only by naming it. The installer:
    file in it matches the archive's own `SHA256SUMS`, and the binary reports
    the requested version;
 4. replaces `<prefix>/bin/capyctl` atomically (a running role keeps its open
-   executable) and keeps the units, examples and this guide under
+   executable) and keeps the units, `LICENSE` and `BUILDINFO` under
    `<prefix>/share/capyctl/`;
 5. with `--systemd <server|host|standalone>`, writes that role's unit to
    `~/.config/systemd/user/` (or `/etc/systemd/system/` with `--system`),
@@ -253,7 +252,7 @@ sudo install -m 0755 capyctl-$V-linux-$A/bin/capyctl /usr/local/bin/capyctl
 | Path | Owner, mode | Holds |
 |---|---|---|
 | `/usr/local/bin/capyctl` (`~/.local/bin/capyctl`) | root (you), 0755 | The binary. |
-| `/usr/local/share/capyctl/` (`~/.local/share/capyctl/`) | root (you), 0755 | Units, examples, this guide, `BUILDINFO` of the installed release. |
+| `/usr/local/share/capyctl/` (`~/.local/share/capyctl/`) | root (you), 0755 | Units, `LICENSE`, `BUILDINFO` of the installed release. |
 | `/etc/capyctl/<role>.yaml` | root:CapyCTL, 0640 | Role documents (operator configuration). |
 | `/etc/capyctl/<role>.env` | root:CapyCTL, 0640 | Optional environment for the unit. |
 | `/var/lib/capyctl/` | `capyctl:capyctl`, 0700 | State root (`StateDirectory=`); holds `server/`, `host/`, `standalone/`, `tmp/`. |

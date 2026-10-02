@@ -10,7 +10,8 @@
 # bash --posix). Cases:
 #
 #   - file:// install (CAPYCTL_INSTALL_BASE_URL) of the binary and a user unit,
-#     with the unit's ExecStart pointed at the installed binary;
+#     with the unit's ExecStart pointed at the installed binary, over an
+#     earlier layout whose share/capyctl/docs is removed;
 #   - --system with PREFIX/UNIT_DIR (system unit, no --user reload);
 #   - the private-repository API path (GITHUB_TOKEN, a fake curl standing in
 #     for api.github.com, gh unavailable);
@@ -48,12 +49,11 @@ else
   version=0.0.0-test
   name=capyctl-$version-linux-$arch
   pkg=$work/build/$name
-  mkdir -p "$pkg/bin" "$pkg/docs/operations"
+  mkdir -p "$pkg/bin"
   printf '#!/bin/sh\necho "capyctl %s"\n' "$version" >"$pkg/bin/capyctl"
   chmod 0755 "$pkg/bin/capyctl"
   mkdir -p "$pkg/packaging"
   cp -R "$root/packaging/systemd" "$pkg/packaging/"
-  cp "$root/docs/operations/install.md" "$pkg/docs/operations/"
   cp "$root/LICENSE" "$pkg/LICENSE"
   printf 'name: capyctl\nversion: %s\n' "$version" >"$pkg/BUILDINFO"
   (cd "$pkg" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum) >"$work/sums"
@@ -106,7 +106,10 @@ for shell in "${shells[@]}"; do
   label="[$shell]"
 
   # --- user install over file:// --------------------------------------------
+  # Over an earlier layout that kept the guides in share/capyctl/docs.
   fresh_home
+  mkdir -p "$home/.local/share/capyctl/docs/operations"
+  echo old >"$home/.local/share/capyctl/docs/operations/install.md"
   if out=$(run "$shell" CAPYCTL_INSTALL_BASE_URL="file://$release" -- --version "v$version" --systemd host 2>&1); then
     bin=$home/.local/bin/capyctl
     unit=$home/.config/systemd/user/capyctl-host.service
@@ -116,9 +119,11 @@ for shell in "${shells[@]}"; do
     [ "$("$bin" --version 2>/dev/null)" = "capyctl $version" ] || problems+=("binary does not report $version")
     grep -qx "ExecStart=$bin start host --config \${CAPYCTL_CONFIG}" "$unit" 2>/dev/null ||
       problems+=("unit ExecStart does not run the installed binary")
-    grep -q "^Documentation=file://$home/.local/share/capyctl/docs/operations/install.md" "$unit" 2>/dev/null ||
-      problems+=("unit Documentation does not point at the installed guide")
-    [ -f "$home/.local/share/capyctl/docs/operations/install.md" ] || problems+=("guide not installed")
+    grep -qx "Documentation=https://edurdias.github.io/capyctl/docs/install/" "$unit" 2>/dev/null ||
+      problems+=("unit Documentation does not point at the site")
+    [ -e "$home/.local/share/capyctl/docs" ] && problems+=("the old share/capyctl/docs was not removed")
+    printf '%s\n' "$out" | grep -qx "next: https://edurdias.github.io/capyctl/docs/install/" ||
+      problems+=("no next: line naming the site")
     [ -f "$home/.local/share/capyctl/LICENSE" ] || problems+=("license not installed")
     [ -f "$home/.local/share/capyctl/packaging/systemd/system/capyctl-server.service" ] || problems+=("units not kept")
     grep -qx -- '--user daemon-reload' "$log" || problems+=("no systemctl --user daemon-reload")
@@ -274,8 +279,8 @@ EOF
   if [ ! -d "$inner" ]; then
     mkdir -p "$inner/x"
     tar -xzf "$release/$name.tar.gz" -C "$inner/x"
-    chmod u+w "$inner/x/$name/docs/operations/install.md"
-    echo tampered >>"$inner/x/$name/docs/operations/install.md"
+    chmod u+w "$inner/x/$name/packaging/systemd/user/capyctl-host.service"
+    echo tampered >>"$inner/x/$name/packaging/systemd/user/capyctl-host.service"
     tar -C "$inner/x" -czf "$inner/$name.tar.gz" "$name"
     (cd "$inner" && sha256sum "$name.tar.gz" >SHA256SUMS)
   fi
