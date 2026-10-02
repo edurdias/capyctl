@@ -195,3 +195,33 @@ fn a_draft_models_kv_layers_shorten_the_fitted_context() {
         }
     }
 }
+
+fn max_num_seqs(argv: &[String]) -> Option<&str> {
+    argv.windows(2)
+        .find(|w| w[0] == "--max-num-seqs")
+        .map(|w| w[1].as_str())
+}
+
+// T14 (owner decision 2026-10-02): vLLM runs as many sequences as CapyCTL
+// keeps in flight per deployment unless the deployment or the installation
+// sets its own.
+#[test]
+fn vllm_runs_the_routers_in_flight_bound_unless_told_otherwise() {
+    let bound = capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT.to_string();
+    let (_store, effective) = resolved("vllm", Some(&dense()), |_, _| {});
+    assert_eq!(max_num_seqs(&vllm_argv(&effective)), Some(bound.as_str()));
+    let (_store, effective) = resolved("vllm", Some(&dense()), |d, _| {
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    assert_eq!(max_num_seqs(&vllm_argv(&effective)), Some("8"));
+    let (_store, effective) = resolved("vllm", Some(&dense()), |_, host| {
+        host["runtime_profiles"]["local"]["args"] = json!(["--max-num-seqs", "64"]);
+    });
+    let argv = vllm_argv(&effective);
+    assert_eq!(
+        argv.iter().filter(|a| *a == "--max-num-seqs").count(),
+        1,
+        "{argv:?}"
+    );
+    assert_eq!(max_num_seqs(&argv), Some("64"));
+}

@@ -678,7 +678,7 @@ async fn a_discrete_standalone_sizes_its_deployment_from_the_checkpoint() {
         assert_eq!(ready[0]["bytes"], on_card, "{effective}");
         assert_eq!(ready[1]["domain"], "system", "{effective}");
         // The startup peak on the card is the request: a derived peak of
-        // weights x 1.6 plus a margin would not fit a 16 GB card.
+        // weights x 2.25 plus a margin would not fit a 16 GB card.
         let cold = &effective["resources"]["cold"]["allocations"];
         assert_eq!(cold[0]["bytes"], on_card, "{effective}");
         let _ = app.shutdown().await;

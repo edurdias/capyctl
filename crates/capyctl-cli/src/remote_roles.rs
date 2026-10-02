@@ -653,7 +653,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         controller: controller.clone(),
         forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(controller)),
         limits: capyctl_router::QueueLimits {
-            max_requests_per_deployment: 32,
+            max_requests_per_deployment: capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT
+                as usize,
             max_buffered_bytes_total: 64 * 1024 * 1024,
         },
         // Design §9: the key check is off only when the operator chose

@@ -13,7 +13,7 @@
 //! 2. measured by a first run on the host: the largest drop in the host's
 //!    published memory availability while an uncontended Initialize ran,
 //!    recorded per (revision, host, engine installation) when it reached Ready;
-//! 3. the placeholder `max(request + graphs, weights × 1.6 + margin)` the
+//! 3. the placeholder `max(request + graphs, weights × 2.25 + margin)` the
 //!    revision was resolved with (ADR 0014 amendment A8 adds the graphs) (`capyctl_config::effective::default_startup_bytes`).
 //!
 //! A start freezes the measured peak it will reserve into its plan when it is
@@ -82,7 +82,7 @@ pub(super) fn frozen_startup(
 }
 
 /// Owner decision 2026-09-23 (solo first start): the placeholder startup peak
-/// `max(request + graphs, weights × 1.6 + margin)` recomputed with the weights recorded
+/// `max(request + graphs, weights × 2.25 + margin)` recomputed with the weights recorded
 /// for the revision since it was frozen, when it was frozen without them and
 /// the recomputed value is larger. Found live 2026-09-23: a revision accepted
 /// while its checkpoint digest was pending was frozen with the request as its
@@ -124,7 +124,7 @@ fn weighed_placeholder(
                 memory.request_bytes,
                 Some(weights),
                 memory.margin_bytes,
-                memory.startup_graphs_bytes.unwrap_or(0),
+                memory.startup_graphs_bytes,
             )
         })
         .and_then(|estimate| {

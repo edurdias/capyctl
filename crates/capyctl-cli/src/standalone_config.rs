@@ -676,7 +676,7 @@ fn discrete_document(
             // Design §3: the device holds the startup peak in the cold phase.
             // The engine's use of the card is bounded by the fraction capyctl
             // renders from this request, so the device peak is the request; the
-            // unified placeholder (weights x 1.6 plus a margin) models load
+            // unified placeholder (weights x 2.25 plus a margin) models load
             // buffers in the one pool, which on a discrete host sit in host RAM,
             // and would size a 4B model beyond a 16 GB card.
             "startup": format!("{request}B")

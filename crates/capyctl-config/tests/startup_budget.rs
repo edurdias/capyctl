@@ -116,8 +116,8 @@ fn an_impossible_startup_peak_is_refused() {
     assert!(parse_strict(ConfigKind::Deployment, &bad.to_string()).is_err());
 }
 
-/// Undeclared, the startup peak is the placeholder `max(request, weights ×
-/// 1.6 + margin)` when the weights are known and the request otherwise; the
+/// Undeclared, the startup peak is the placeholder `max(request + graphs,
+/// weights × 2.25 + margin)` (ADR 0014 amendment A8) when the weights are known and the request otherwise; the
 /// provenance names it derived so a snapshot cannot claim another value.
 // T14 T26 T29
 #[test]
@@ -126,8 +126,8 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
     let effective =
         resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    let expected = 30 * GIB * 8 / 5 + VLLM_OVERHEAD_MARGIN_BYTES;
-    assert_eq!(expected, 56 * GIB);
+    let expected = 30 * GIB * 9 / 4 + VLLM_OVERHEAD_MARGIN_BYTES;
+    assert_eq!(expected, 75 * GIB + GIB / 2);
     assert_eq!(cold(&effective), expected + OVERHEAD);
     assert_eq!(ready(&effective), 40 * GIB + OVERHEAD);
     assert_eq!(
@@ -156,11 +156,11 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     let unknown = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(cold(&unknown), 40 * GIB + GRAPHS + OVERHEAD);
     assert_eq!(
-        default_startup_bytes(40 * GIB, None, 8 * GIB, GRAPHS),
+        default_startup_bytes(40 * GIB, None, 8 * GIB, Some(GRAPHS)),
         Some(40 * GIB + GRAPHS)
     );
     assert_eq!(
-        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB, GRAPHS),
+        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB, Some(GRAPHS)),
         None
     );
 }
@@ -286,7 +286,7 @@ fn the_placeholder_startup_covers_the_first_starts_graphs() {
     // Large weights: the load term still wins when it is larger.
     let (deployment, host) = speculative("vllm", true);
     let heavy = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    assert_eq!(cold(&heavy), 56 * GIB + OVERHEAD);
+    assert_eq!(cold(&heavy), 75 * GIB + GIB / 2 + OVERHEAD);
     // A declared startup peak is the operator's and carries no allowance.
     let (mut declared, host) = speculative("vllm", true);
     declared["engine_config"]["memory"]["startup"] = json!("45GiB");
@@ -319,4 +319,21 @@ fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
     let decoded = decode_effective_snapshot(&snapshot.to_string()).unwrap();
     assert_eq!(decoded, old);
     assert_eq!(cold(&decoded), 40 * GIB + OVERHEAD);
+    // With heavy weights it keeps the 1.6 factor it was frozen with.
+    let frozen = CheckpointFacts {
+        weights_bytes: Some(30 * GIB),
+        legacy_startup_graphs: true,
+        ..Default::default()
+    };
+    let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
+    assert_eq!(cold(&old), 56 * GIB + OVERHEAD);
+    let snapshot = serde_json::to_value(&old).unwrap();
+    assert_eq!(
+        decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+        old
+    );
+    assert_eq!(
+        default_startup_bytes(40 * GIB, Some(30 * GIB), 8 * GIB, None),
+        Some(56 * GIB)
+    );
 }

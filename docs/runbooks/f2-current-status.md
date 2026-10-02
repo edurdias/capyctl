@@ -2,29 +2,38 @@
 
 ## Draft model memory gaps closed — 2026-10-02 (branch `fix/drafter-memory-gaps`)
 
-Two gaps left by the vLLM 0.30 findings (Qwen3.8-27B NVFP4 with DFlash2):
+Gaps left by the vLLM 0.30 findings (Qwen3.8-27B NVFP4 with DFlash2):
 
-1. **First-start graphs** (ADR 0014 amendment A8). The derived startup
-   placeholder is now `max(request + graphs, weights × 1.6 + margin)` for vLLM
-   and SGLang, with a 1.25 GiB graph allowance per captured model (checkpoint,
-   plus the draft model). Recorded as `startup_graphs_bytes`; older revisions
-   decode unchanged.
-2. **Draft model KV in the fitted context** (ADR 0014 amendment A9). The fit
-   adds the draft model's KV per token, read from its `config.json`.
-   Open issue for the owner: on a hybrid checkpoint vLLM also needs one
-   recurrent-state block per sequence, which the default 4 GiB KV cache cannot
-   hold for this model (83 blocks without DFlash2, 254 with it, for 256
-   sequences); such a deployment declares `memory.kv_cache`.
+1. **First start above its reservation** (ADR 0014 amendment A8). The derived
+   startup placeholder is now `max(request + graphs, weights × 2.25 + margin)`
+   for vLLM and SGLang, with a 1.25 GiB graph allowance per captured model.
+   Recorded as `startup_graphs_bytes`; older revisions decode unchanged (1.6,
+   no allowance).
+2. **Draft model KV in the fitted context** (amendment A9).
+3. **Hybrid checkpoints on vLLM** (amendment A10, owner decision 2026-10-02).
+   vLLM gets `--max-num-seqs` 32, the router's per-deployment bound (one
+   shared constant), unless the deployment or installation sets it. The fit
+   follows vLLM's recurrent-state block layout for those sequences.
+   SGLang is unchanged: with DFlash2 at the default 4 GiB it refuses (state
+   cache), so such a deployment declares `memory.kv_cache`.
 
 Live on host B (standalone, fresh 0700 state and config directories, fresh
-vLLM compile cache): with no memory stated vLLM 0.30 first refused the
-32752-token context (4.2 GiB needed, 3.98 GiB available); with the draft KV
-counted it reached the Mamba block limit above, as did the checkpoint without
-DFlash2. With `kv_cache: 16GiB`: context fitted to 121552 tokens (131056
-before), cold phase 51.75 GiB, first-start peak 50.59 GiB (graphs 1.71 GiB,
-warmup 233 s), answered Jupiter. SGLang 0.5.20 with DFlash2 at 16 GiB: context
-121568, peak 44.63 GiB against 51.75 GiB, answered Jupiter. Cleanup complete.
-CPU and Fake-engine tests are not qualification.
+engine caches), vLLM 0.30, no memory stated (4 GiB KV derived):
+- Without DFlash2: context 117600 tokens, reservation 55.19 GiB, first-start
+  peak 49.88 GiB, answered Jupiter.
+- With DFlash2: context 23072 tokens, reservation 63.25 GiB, peak 49.89 GiB,
+  answered Jupiter.
+
+Before the factor change the same starts peaked at 47.86 GiB and 50.49 GiB
+against 41.92 GiB and 50.08 GiB.
+
+With `kv_cache: 16GiB` and DFlash2: vLLM peaked at 50.59 GiB and SGLang at
+44.63 GiB (both reserved 51.75 GiB then); both answered.
+
+SGLang 0.5.20 with no memory stated: without DFlash2 it started, answering
+with running requests capped at 1; with DFlash2 it refused to start.
+
+Cleanup complete. CPU and Fake-engine tests are not qualification.
 
 ## vLLM 0.30 live findings fixed — 2026-10-02 (branch `fix/vllm-030-findings`)
 

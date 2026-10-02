@@ -67,8 +67,14 @@ pub fn host_backed_copy_bytes(weights: i64) -> i64 {
 /// margin)`. A conservative placeholder, not a measurement: loading reads the
 /// weights through transient buffers, and M16 saw JIT compilation at startup
 /// drop MemAvailable far below the steady footprint. Numerator and denominator
-/// of the factor 1.6.
-pub const STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
+/// of the factor: 2.25 since ADR 0014 amendment A8 (found live 2026-10-02:
+/// vLLM 0.30 loading Qwen3.8-27B NVFP4, 20.42 GiB of weights, at a 4 GiB KV
+/// cache dropped MemAvailable by up to 50.49 GiB, 2.08 × weights + 8 GiB,
+/// against the 41.92 GiB the 1.6 factor reserved).
+pub const STARTUP_WEIGHTS_FACTOR: (i64, i64) = (9, 4);
+
+/// The factor of a revision frozen before amendment A8 (1.6), which it keeps.
+pub const LEGACY_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
 
 /// ADR 0014 amendment A8 (found live 2026-10-02): the first-start graph
 /// allowance, per model whose CUDA graphs the engine captures (the checkpoint,
@@ -94,18 +100,24 @@ pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
 
 /// Owner decision 2026-09-23: the placeholder startup peak for a request,
 /// the checkpoint's weights (when known), the family margin and (amendment
-/// A8) the graph allowance: `max(request + graphs, weights × 1.6 + margin)`.
+/// A8) the graph allowance: `max(request + graphs, weights × 2.25 + margin)`.
+/// `graphs` is `None` for a revision frozen before amendment A8, which keeps
+/// `max(request, weights × 1.6 + margin)`.
 pub fn default_startup_bytes(
     request: i64,
     weights: Option<i64>,
     margin: i64,
-    graphs: i64,
+    graphs: Option<i64>,
 ) -> Option<i64> {
-    let floor = request.checked_add(graphs)?;
+    let floor = request.checked_add(graphs.unwrap_or(0))?;
     let Some(weights) = weights else {
         return Some(floor);
     };
-    let (numerator, denominator) = STARTUP_WEIGHTS_FACTOR;
+    let (numerator, denominator) = if graphs.is_some() {
+        STARTUP_WEIGHTS_FACTOR
+    } else {
+        LEGACY_STARTUP_WEIGHTS_FACTOR
+    };
     weights
         .checked_mul(numerator)
         .map(|scaled| scaled / denominator)
@@ -467,7 +479,7 @@ pub fn resolve_startup(
     resources_declared: bool,
     facts: CheckpointFacts,
     margin: i64,
-    graphs: i64,
+    graphs: Option<i64>,
 ) -> Result<(Option<i64>, Option<SettingSource>), ConfigError> {
     const PATH: &str = "engine_config.memory.startup";
     if let Some(peak) = declared {
@@ -982,7 +994,7 @@ pub(super) fn normalize_engine_config(
     // first start captures, the draft model's too; a revision frozen before
     // the allowance re-resolves without it.
     let graphs = if inputs.facts.legacy_startup_graphs {
-        0
+        None
     } else {
         let all: Vec<String> = inputs
             .profile_args
@@ -990,10 +1002,10 @@ pub(super) fn normalize_engine_config(
             .chain(&extra_args)
             .cloned()
             .collect();
-        startup_graph_allowance(
+        Some(startup_graph_allowance(
             engine,
             crate::engine_policy::draft_model_path(engine, &all).is_some(),
-        )
+        ))
     };
     let (startup, startup_source) = resolve_startup(
         declared_startup,
@@ -1008,9 +1020,7 @@ pub(super) fn normalize_engine_config(
         provenance.insert("memory.startup".into(), source);
         // Only the placeholder default is derived here; a device request's
         // startup was set above as declared.
-        if !inputs.facts.legacy_startup_graphs {
-            memory.startup_graphs_bytes = Some(graphs);
-        }
+        memory.startup_graphs_bytes = graphs;
     }
 
     let mut common = CommonEngineSettings {

@@ -590,7 +590,8 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     use capyctl_store::lifecycle::LifecycleError;
     let (dir, owner, fence, observations) = setup().await;
     // Weights 20 GiB, KV 4 GiB: request 20 + 4 + 8 (margin) = 32 GiB; the
-    // placeholder peak is 20 × 1.6 + 8 = 40 GiB, above the 36 GiB limit.
+    // placeholder peak is 20 × 2.25 + 8 = 53 GiB (ADR 0014 amendment A8),
+    // above the 36 GiB limit.
     managed_limit(&owner, &observations, 36 * GIB);
     let big = {
         let o = owner.lock().unwrap();
@@ -690,7 +691,7 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     assert!(footprint(&owner, &id).is_none());
     let before = serde_json::to_value(status(&owner).startup.unwrap()).unwrap();
     assert_eq!(before["provenance"], "default");
-    assert_eq!(before["bytes"], 40 * GIB + OVERHEAD);
+    assert_eq!(before["bytes"], 53 * GIB + OVERHEAD);
 
     // Alone on the host it starts and holds the whole managed limit.
     let stop = w.stop("owner", &fence, "stop-small", 60_000).unwrap();
@@ -828,7 +829,7 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
             serde_json::json!("pending")
         );
     }
-    // 24 × 1.6 = 38.4 GiB (plus any margin): above the 36 GiB limit.
+    // 24 × 2.25 = 54 GiB (plus the margin): above the 36 GiB limit.
     let estimate = startup(&owner);
     assert_eq!(estimate["provenance"], "default");
     assert!(estimate["bytes"].as_i64().unwrap() > 36 * GIB, "{estimate}");

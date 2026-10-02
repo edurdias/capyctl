@@ -35,6 +35,9 @@ use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
 
+mod vllm_hybrid;
+pub use vllm_hybrid::VllmFit;
+
 /// The context used when the KV bytes per token cannot be computed reliably.
 pub const FALLBACK_CONTEXT: u32 = 4096;
 
@@ -213,6 +216,9 @@ pub struct FitInputs<'a> {
     /// The draft model's parsed `config.json` (or why it could not be read),
     /// when the launch loads one beside the checkpoint.
     pub draft: Option<Result<&'a Value, &'a str>>,
+    /// The launch is vLLM's: a hybrid checkpoint is fitted to its block
+    /// layout (owner decision 2026-10-02).
+    pub vllm: Option<VllmFit>,
 }
 
 /// The width of one cached element: an explicit KV dtype (fp8 variants are one
@@ -294,6 +300,7 @@ fn fitted_tokens(
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context for a
 /// launch, from the parsed model configuration (or why it could not be read).
 pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> ContextFit {
+    let config_value = config.as_ref().ok().copied();
     let shape = config.and_then(KvShape::from_config);
     let draft = draft_shape(&inputs);
     if let Some(declared) = inputs.declared {
@@ -348,6 +355,40 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
             Some(parts.join("; "))
         }
     };
+    // Owner decision 2026-10-02: a hybrid checkpoint on vLLM follows vLLM's
+    // block layout rather than the per-token count.
+    let hybrid = match (
+        inputs.vllm,
+        config_value,
+        u64::try_from(inputs.kv_cache_bytes),
+    ) {
+        (Some(vllm), Some(config), Ok(grant)) if grant > 0 => element_bytes(&inputs, &shape)
+            .ok()
+            .and_then(|element| {
+                vllm_hybrid::fitted_tokens(config, &shape, draft.as_ref(), element, grant, vllm)
+            })
+            .map(|fit| (fit, vllm.sequences)),
+        _ => None,
+    };
+    if let Some((fit, sequences)) = hybrid {
+        return match fit {
+            Ok(tokens) => ContextFit {
+                tokens: Some(u32::try_from(tokens).unwrap_or(u32::MAX)),
+                source: ContextSource::Fitted,
+                reason: Some(format!(
+                    "hybrid model: fitted to vLLM's recurrent-state block layout for {sequences} \
+                     sequences{}",
+                    if draft.is_some() {
+                        ", the draft model's layers included"
+                    } else {
+                        ""
+                    }
+                )),
+                warning: None,
+            },
+            Err(reason) => fallback(reason),
+        };
+    }
     match fitted_tokens(&inputs, &shape, draft.as_ref()) {
         Ok(tokens) => ContextFit {
             tokens: Some(u32::try_from(tokens).unwrap_or(u32::MAX)),
@@ -427,6 +468,10 @@ pub fn fit_for_launch(
         }
         _ => None,
     };
+    let vllm = (engine == Engine::Vllm).then(|| VllmFit {
+        sequences: vllm_sequences(settings, profile_args),
+        speculative_tokens: speculative_tokens(&args),
+    });
     fit_context(
         FitInputs {
             declared: common.context_length,
@@ -438,9 +483,67 @@ pub fn fit_for_launch(
             draft: draft
                 .as_ref()
                 .map(|config| config.as_ref().map_err(String::as_str)),
+            vllm,
         },
         config.as_ref().map_err(Clone::clone),
     )
+}
+
+/// Owner decision 2026-10-02: the `--max-num-seqs` CapyCTL passes vLLM when
+/// neither the deployment (`max_concurrent_requests`) nor the installation's
+/// host-fixed arguments set it: the router's per-deployment bound.
+pub fn vllm_default_max_num_seqs(
+    settings: &LaunchSettings,
+    profile_args: &[String],
+) -> Option<u32> {
+    let declared = match settings {
+        LaunchSettings::Vllm(s) => s.common.max_concurrent_requests,
+        _ => return None,
+    };
+    let host_fixed = option_names(profile_args).is_ok_and(|names| names.contains("--max-num-seqs"));
+    (declared.is_none() && !host_fixed)
+        .then_some(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
+}
+
+/// The sequences a vLLM launch runs with: declared, host-fixed, or the
+/// default above. A host-fixed value that does not parse counts as vLLM's own
+/// default (256).
+fn vllm_sequences(settings: &LaunchSettings, profile_args: &[String]) -> u32 {
+    if let LaunchSettings::Vllm(s) = settings {
+        if let Some(declared) = s.common.max_concurrent_requests {
+            return declared;
+        }
+    }
+    if let Some(default) = vllm_default_max_num_seqs(settings, profile_args) {
+        return default;
+    }
+    crate::engine_policy::parse_options(profile_args)
+        .ok()
+        .and_then(|options| {
+            options
+                .into_iter()
+                .rev()
+                .find(|o| o.name == "--max-num-seqs")
+                .and_then(|o| o.value)
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
+
+/// `num_speculative_tokens` of vLLM's `--speculative-config`, when given.
+fn speculative_tokens(args: &[String]) -> Option<u32> {
+    crate::engine_policy::parse_options(args)
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|o| o.name == "--speculative-config")
+        .and_then(|o| o.value)
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .map(|config| {
+            config["num_speculative_tokens"]
+                .as_u64()
+                .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX))
+        })
 }
 
 /// The effective context of a resolved deployment on the machine that reads
