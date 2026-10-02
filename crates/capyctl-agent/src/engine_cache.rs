@@ -6,6 +6,8 @@
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use capyctl_domain::completion::ProcessIdentity;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EngineCacheError {
     #[error("the build fingerprint is not a plain path component")]
@@ -88,6 +90,32 @@ pub fn has_build(dir: &Path) -> bool {
     })
 }
 
+/// ADR 0023 §3: remove the `<name>/lock` files a killed build left in this
+/// version's private `dir`, so the next start does not wait on them forever.
+/// torch's `cpp_extension` holds that file while it builds and nothing else
+/// records who holds it, so the only evidence that no build is running is
+/// that no recorded process of any launch this host still retains may be
+/// running: `recorded` is every such process, and unless each one is proved
+/// gone nothing is removed (a concurrent start of the same version shares the
+/// directory, and its lock must stand). Only plain files named `lock` one
+/// level down are removed. Returns how many were.
+pub fn clear_stale_locks(dir: &Path, recorded: &[ProcessIdentity]) -> usize {
+    use capyctl_launchers::process_absence::{presence, Presence};
+    if !private(dir) || recorded.iter().any(|p| presence(p) != Presence::Gone) {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path().join("lock"))
+        .filter(|lock| std::fs::symlink_metadata(lock).is_ok_and(|m| m.is_file()))
+        .filter(|lock| std::fs::remove_file(lock).is_ok())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +189,79 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dir.path().join("engines/tensorfold/0.7.0"))
             .unwrap();
         assert!(root.torch_extensions("0.7.0").is_err());
+    }
+
+    fn own_identity() -> ProcessIdentity {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let close = stat.rfind(')').unwrap();
+        ProcessIdentity {
+            role: "api".into(),
+            pid: std::process::id(),
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+                .to_owned(),
+            start_ticks: stat[close + 2..]
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        }
+    }
+
+    // T41 (ADR 0023 §3, found live 2026-10-02): a build killed mid way leaves
+    // `<name>/lock`, and the next start waits on it forever. With no recorded
+    // process of a retained launch still possibly running, the locks go and
+    // nothing else does.
+    #[test]
+    fn a_killed_builds_lock_is_cleared_when_no_launch_may_run() {
+        let (_dir, root) = root();
+        let path = root.torch_extensions("0.6.1").unwrap();
+        let extension = path.join("tensorfold_qmm_v5");
+        std::fs::create_dir(&extension).unwrap();
+        for file in ["lock", "build.ninja", "qmm.cuda.o"] {
+            std::fs::write(extension.join(file), "").unwrap();
+        }
+        let linked = path.join("tensorfold_gdn_v2");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::create_dir(linked.join("lock")).unwrap();
+        let mut gone = own_identity();
+        gone.start_ticks += 1;
+        assert_eq!(clear_stale_locks(&path, &[]), 1);
+        assert!(!extension.join("lock").exists());
+        assert!(extension.join("build.ninja").exists());
+        assert!(
+            linked.join("lock").is_dir(),
+            "only a plain lock file is removed"
+        );
+        std::fs::write(extension.join("lock"), "").unwrap();
+        assert_eq!(
+            clear_stale_locks(&path, &[gone]),
+            1,
+            "a gone launch holds nothing"
+        );
+    }
+
+    // T41 (ADR 0023 §3): a launch that may still run may be building in the
+    // same directory (two starts of one version share it), so its lock stays.
+    #[test]
+    fn a_lock_stays_while_a_retained_launch_may_run() {
+        let (_dir, root) = root();
+        let path = root.torch_extensions("0.6.1").unwrap();
+        let extension = path.join("tensorfold_qmm_v5");
+        std::fs::create_dir(&extension).unwrap();
+        std::fs::write(extension.join("lock"), "").unwrap();
+        let mut unknown = own_identity();
+        unknown.boot_id = String::new();
+        let mut gone = own_identity();
+        gone.start_ticks += 1;
+        assert_eq!(clear_stale_locks(&path, &[gone, own_identity()]), 0);
+        assert_eq!(
+            clear_stale_locks(&path, &[unknown]),
+            0,
+            "unknown is not gone"
+        );
+        assert!(extension.join("lock").exists());
     }
 }

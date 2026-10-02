@@ -835,10 +835,24 @@ impl NativeHostExecution {
             Engine::Vllm => Ok(PreparedLaunch::Vllm(Box::new(
                 self.vllm_plan(effective, plan).map_err(|_| SessionError)?,
             ))),
-            Engine::Tensorfold => Ok(PreparedLaunch::Tensorfold(Box::new(
-                self.tensorfold_plan(effective, plan)
-                    .map_err(|_| SessionError)?,
-            ))),
+            Engine::Tensorfold => {
+                // ADR 0023 §3: a build killed mid way left its lock; cleared
+                // only while no claimed launch here may still run.
+                if let Some(cache) = &self.engine_cache {
+                    let dir = cache
+                        .torch_extensions(&effective.profile.build_fingerprint)
+                        .map_err(|_| SessionError)?;
+                    self.journal
+                        .with_claimed_processes(|recorded| {
+                            crate::engine_cache::clear_stale_locks(&dir, recorded)
+                        })
+                        .map_err(|_| SessionError)?;
+                }
+                Ok(PreparedLaunch::Tensorfold(Box::new(
+                    self.tensorfold_plan(effective, plan)
+                        .map_err(|_| SessionError)?,
+                )))
+            }
         }
     }
 
@@ -2788,6 +2802,28 @@ mod tests {
             executor.prepare(&effective, &plan, "toy"),
             Ok(PreparedLaunch::Tensorfold(..))
         ));
+    }
+
+    // T41 (ADR 0023 §3, found live 2026-10-02): a build killed mid way left
+    // its lock; with no launch claimed here that may still run, preparing the
+    // next launch clears it, and the start does not wait on it forever.
+    #[test]
+    fn a_host_launch_clears_a_killed_builds_lock() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
+        let (launch, plan) = tensorfold_launch(&deployment, &policy, 8100);
+        let effective = executor.resolve(&launch).unwrap();
+        let (input, _) = executor.tensorfold_plan(&effective, &plan).unwrap();
+        let extension =
+            std::path::Path::new(&input.extensions_dir.unwrap()).join("tensorfold_qmm_v5");
+        std::fs::create_dir(&extension).unwrap();
+        std::fs::write(extension.join("lock"), "").unwrap();
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy"),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+        assert!(!extension.join("lock").exists());
     }
 
     // T41 (ADR 0023 §3): a host without a private cache root

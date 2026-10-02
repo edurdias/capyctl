@@ -1063,6 +1063,24 @@ impl crate::Store {
             .collect::<Result<_, _>>()?)
     }
 
+    /// ADR 0023 §3: every process recorded for a retained (not released)
+    /// binding. A binding is released only once its processes were proved
+    /// gone, so any other may still run; one with none recorded started none.
+    pub fn retained_processes(&self) -> Result<Vec<ProcessIdentity>, LifecycleError> {
+        let ids: Vec<String> = self
+            .conn
+            .prepare("SELECT id FROM runtime_bindings WHERE state!='released'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut processes = Vec::new();
+        for id in ids {
+            if let Some(binding) = self.retained_binding(&id)? {
+                processes.extend(binding.identities);
+            }
+        }
+        Ok(processes)
+    }
+
     /// One retained (not released) binding, by its id.
     pub fn retained_binding(
         &self,
@@ -1745,6 +1763,53 @@ mod tests {
         stale.fence.revision = 2;
         assert!(store.reserve_runtime_binding(&session, &stale).is_err());
         assert_eq!(store.runtime_binding(&deployment_a).unwrap().unwrap(), a);
+    }
+
+    // T41 (ADR 0023 §3): the processes recorded for retained bindings are the
+    // evidence a TensorFold build lock is cleared on; a reserved binding that
+    // started nothing contributes none.
+    #[test]
+    fn retained_processes_are_every_retained_bindings_recorded_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let deployment = accepted(&store, "deployment-a");
+        let session = store.begin_coordinator_session().unwrap();
+        let fence = DeploymentFence {
+            deployment_id: deployment.clone(),
+            revision: 1,
+            generation: 1,
+        };
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        store
+            .reserve_runtime_binding(
+                &session,
+                &ReserveBinding {
+                    id: "binding-a".into(),
+                    fence: fence.clone(),
+                    incarnation: "incarnation-a".into(),
+                    identity_id: "qualified".into(),
+                    ownership: "managed".into(),
+                    endpoint_host: "127.0.0.1".into(),
+                    endpoint_port: port,
+                    credential_ref: "credential-a".into(),
+                    binding_payload: "recipe-reference".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.retained_processes().unwrap().is_empty());
+        let api = ProcessIdentity {
+            role: "api".into(),
+            pid: 4242,
+            boot_id: "boot".into(),
+            start_ticks: 99,
+        };
+        store
+            .record_api_identity(&session, &fence, "binding-a", &api)
+            .unwrap();
+        assert_eq!(store.retained_processes().unwrap(), vec![api]);
     }
 
     // T24: a remote host's endpoint port is that host's; a port busy on the

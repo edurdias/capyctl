@@ -11,9 +11,7 @@ use super::{
     adapter::TensorfoldAdapter,
     args::{engine_environment, render_command},
 };
-use crate::traits::{
-    ChatForward, EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError,
-};
+use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
 const READINESS_POLL: Duration = Duration::from_millis(500);
@@ -121,11 +119,12 @@ pub(super) async fn initialize(
         "max_tokens": 8,
         "temperature": 0,
     });
-    // ADR 0023 §4: the probe is part of startup, so the warm bound covers it.
+    // ADR 0023 §4: the probe is part of startup, so the startup bound (the warm
+    // bound, or the whole deadline on a first build) is its only bound.
     let budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
-    let answer = tokio::time::timeout(budget, adapter.forward_chat(&body))
+    let answer = crate::forward::startup_probe(adapter, &body, budget)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
         })?
         .map_err(|e| {

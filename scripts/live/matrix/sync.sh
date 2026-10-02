@@ -17,7 +17,7 @@
 
 # Excluded from the snapshot: build output, VCS, hidden directories (local
 # working notes, an owner rule), logs and bytecode.
-SNAP_EXCLUDES=(--exclude target --exclude .git --exclude '.*/'
+SNAP_EXCLUDES=(--exclude target --exclude target-ci --exclude .git --exclude '.*/'
   --exclude '*.log' --exclude __pycache__)
 # Files a host runtime directory must hold before any launch (WE2: vLLM runs
 # through vllm_entry.py; development mode loads capyctl_vllm_guard.py; WE3 checkpoint

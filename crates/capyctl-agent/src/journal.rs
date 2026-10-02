@@ -746,6 +746,23 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         claimed_launches(&db, except)
     }
+    /// ADR 0023 §3: run `f` over every process recorded for a launch this host
+    /// still claims, holding the journal so no launch records a process (and
+    /// so starts) until `f` returns. A claimed launch with no recorded process
+    /// has started nothing: the launcher holds a child at its gate until the
+    /// child is recorded.
+    pub fn with_claimed_processes<T>(
+        &self,
+        f: impl FnOnce(&[ProcessIdentity]) -> T,
+    ) -> Result<T, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let mut processes = Vec::new();
+        for claimed in claimed_launches(&db, "")? {
+            processes.extend(record(&db, &claimed.command.identity.command_id)?.processes);
+        }
+        Ok(f(&processes))
+    }
     /// Read a retained immutable request, never a new execution capability.
     pub fn retained_command(&self, command_id: &str) -> Result<MemberCommand, JournalError> {
         self.validate()?;
