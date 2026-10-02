@@ -54,6 +54,11 @@ On a GPU machine that runs a host, the same command adds the engine to the
 host: the host records the file it was started with, and the engine commands
 use it.
 
+The engines file lives beside the role's config file, not under `--state-dir`
+(which only picks the role's state and control socket). For a separate test
+setup, set both `--config` (or `XDG_CONFIG_HOME`) and `--state-dir`, and give
+the CLI and the running role the same ones.
+
 ## Custom builds
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 or

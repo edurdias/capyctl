@@ -650,7 +650,7 @@ development-control marks) is only in the JSON.
     gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
 Scripts pass `--json`: the command then prints its JSON result, the same
-document earlier releases printed, and reports errors as JSON on stderr.
+document earlier releases printed (indented on a terminal, one compact line when piped or redirected), and reports errors as JSON on stderr.
 `--output json` is still accepted and means the same. `--format text` asks for
 the default explicitly. The roles (`start server`, `start host`, `start
 standalone`) print text on a terminal and one JSON object per line otherwise,

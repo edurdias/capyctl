@@ -291,6 +291,24 @@ impl OutputFormat {
     }
 }
 
+/// A command's JSON result: indented (two spaces) on a terminal, compact on
+/// one line otherwise, so files and pipes keep plain JSON.
+pub fn json_result(value: &serde_json::Value, stdout_is_terminal: bool) -> String {
+    if stdout_is_terminal {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        value.to_string()
+    }
+}
+
+/// Prints a command's JSON result on stdout.
+pub fn print_json_result(value: &serde_json::Value) {
+    println!(
+        "{}",
+        json_result(value, std::io::IsTerminal::is_terminal(&std::io::stdout()))
+    );
+}
+
 pub fn print_error(err: &StructuredError, format: OutputFormat) {
     match format {
         OutputFormat::Text => eprintln!("{err}"),
@@ -460,6 +478,19 @@ pub fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod format_tests {
     use super::OutputFormat;
+
+    // ADR 0021: a command result is indented on a terminal and one compact
+    // line when piped or redirected.
+    #[test]
+    fn json_result_is_indented_only_on_a_terminal() {
+        let value = serde_json::json!({"a": 1, "b": {"c": [1, 2]}});
+        assert_eq!(super::json_result(&value, false), value.to_string());
+        assert_eq!(
+            super::json_result(&value, true),
+            serde_json::to_string_pretty(&value).unwrap()
+        );
+        assert!(super::json_result(&value, true).contains("\n  \"a\": 1"));
+    }
 
     // T02 (ADR 0021): commands never detect; roles follow stderr unless told.
     #[test]
