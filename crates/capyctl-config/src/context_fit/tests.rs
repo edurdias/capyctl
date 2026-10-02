@@ -20,6 +20,7 @@ fn inputs(kv: i64) -> FitInputs<'static> {
         dtype: None,
         block_tokens: None,
         reserved_blocks: 0,
+        draft: None,
     }
 }
 
@@ -213,4 +214,55 @@ fn a_vllm_fit_leaves_the_engines_reserved_blocks() {
         fit_context(tiny, Ok(&dense())).source,
         ContextSource::Fallback
     );
+}
+
+/// The DFlash2 draft model of Qwen3.8-27B as its `config.json` states it:
+/// five sliding-window layers, 8 KV heads of 128, bfloat16. 2 × 5 × 8 × 128
+/// = 10240 elements per token.
+fn dflash_drafter() -> Value {
+    json!({
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3",
+        "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "hidden_size": 5120, "max_position_embeddings": 262144,
+        "dtype": "bfloat16", "sliding_window": 2048, "use_sliding_window": true,
+        "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention"],
+    })
+}
+
+// T14 (found live 2026-10-02): vLLM 0.30 keeps the draft model's KV layers
+// in the same pool as the checkpoint's, so a context fitted to the
+// checkpoint's layers alone does not fit the grant with DFlash2. The draft
+// model's KV per token is counted with the checkpoint's.
+#[test]
+fn a_draft_models_kv_layers_are_counted_with_the_checkpoints() {
+    let drafter = dflash_drafter();
+    let mut with_draft = inputs(4 * GIB);
+    with_draft.draft = Some(Ok(&drafter));
+    // 512 KiB (checkpoint) + 2 × 5 × 8 × 128 × 2 = 20 KiB (draft) per token.
+    let per_token = 512 * 1024 + 20 * 1024;
+    let raw = (4 * GIB) as u64 / per_token;
+    let fit = fit_context(with_draft, Ok(&dense()));
+    assert_eq!(fit.tokens, Some((raw - raw % 16) as u32));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    assert!(fit.reason.unwrap().contains("draft model"));
+    // One KV dtype applies to both: fp8 halves both.
+    with_draft.kv_cache_dtype = Some("fp8");
+    let raw = (4 * GIB) as u64 / (per_token / 2);
+    assert_eq!(
+        fit_context(with_draft, Ok(&dense())).tokens,
+        Some((raw - raw % 16) as u32)
+    );
+    // A draft model whose configuration cannot be read falls back.
+    let mut unreadable = inputs(4 * GIB);
+    unreadable.draft = Some(Err("the draft model has no readable config.json"));
+    let fit = fit_context(unreadable, Ok(&dense()));
+    assert_eq!(fit.source, ContextSource::Fallback);
+    assert!(fit.reason.unwrap().contains("draft model"));
+    // A declared context the pair cannot hold warns only for an exact shape;
+    // the sliding draft model is approximate, so no warning.
+    let mut declared = inputs(4 * GIB);
+    declared.declared = Some(8192);
+    declared.draft = Some(Ok(&drafter));
+    assert_eq!(fit_context(declared, Ok(&dense())).warning, None);
 }

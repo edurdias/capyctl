@@ -15,6 +15,13 @@
 //! fields, an unknown KV dtype) falls back to [`FALLBACK_CONTEXT`] with the
 //! reason recorded for status.
 //!
+//! A speculative deployment's draft model keeps its own KV layers in the
+//! engine's pool (vLLM groups them with the checkpoint's; SGLang sizes a draft
+//! pool beside the target's), so its KV per token, read from the draft
+//! model's own `config.json`, is added to the checkpoint's (found live
+//! 2026-10-02: vLLM 0.30 with DFlash2 refused the context fitted to the
+//! checkpoint's layers alone).
+//!
 //! The fit is made where the checkpoint is read, at launch render: on the
 //! embedded host for standalone and on the host agent for a remote host. It is
 //! not part of the effective configuration, so re-resolving a stored revision
@@ -203,6 +210,9 @@ pub struct FitInputs<'a> {
     /// Whole blocks of the grant the engine keeps for itself
     /// ([`VLLM_RESERVED_BLOCKS`] for vLLM).
     pub reserved_blocks: u32,
+    /// The draft model's parsed `config.json` (or why it could not be read),
+    /// when the launch loads one beside the checkpoint.
+    pub draft: Option<Result<&'a Value, &'a str>>,
 }
 
 /// The width of one cached element: an explicit KV dtype (fp8 variants are one
@@ -233,12 +243,37 @@ fn fallback(reason: impl Into<String>) -> ContextFit {
     }
 }
 
-/// The largest block-aligned context the grant holds for `shape`, capped at
-/// the model's maximum position.
-fn fitted_tokens(inputs: &FitInputs<'_>, shape: &KvShape) -> Result<u64, String> {
-    let per_token = shape
+/// The draft model's KV shape, when the launch loads one.
+fn draft_shape(inputs: &FitInputs<'_>) -> Result<Option<KvShape>, String> {
+    match inputs.draft {
+        None => Ok(None),
+        Some(config) => config
+            .map_err(str::to_owned)
+            .and_then(KvShape::from_config)
+            .map(Some)
+            .map_err(|reason| format!("the draft model: {reason}")),
+    }
+}
+
+/// The largest block-aligned context the grant holds for `shape` (and the
+/// draft model's `draft`, whose KV shares the grant), capped at the model's
+/// maximum position.
+fn fitted_tokens(
+    inputs: &FitInputs<'_>,
+    shape: &KvShape,
+    draft: Option<&KvShape>,
+) -> Result<u64, String> {
+    let mut per_token = shape
         .bytes_per_token(element_bytes(inputs, shape)?)
         .ok_or("the KV bytes per token overflow")?;
+    if let Some(draft) = draft {
+        // One KV dtype applies to both models' layers.
+        let element = element_bytes(inputs, draft).map_err(|e| format!("the draft model: {e}"))?;
+        per_token = draft
+            .bytes_per_token(element)
+            .and_then(|bytes| bytes.checked_add(per_token))
+            .ok_or("the KV bytes per token overflow")?;
+    }
     let grant = u64::try_from(inputs.kv_cache_bytes)
         .ok()
         .filter(|bytes| *bytes > 0)
@@ -260,12 +295,19 @@ fn fitted_tokens(inputs: &FitInputs<'_>, shape: &KvShape) -> Result<u64, String>
 /// launch, from the parsed model configuration (or why it could not be read).
 pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> ContextFit {
     let shape = config.and_then(KvShape::from_config);
+    let draft = draft_shape(&inputs);
     if let Some(declared) = inputs.declared {
         // An explicit context always wins. When the shape is exact and the
         // grant provably cannot hold it, say so; the engine still decides.
-        let warning = match &shape {
-            Ok(shape) if shape.approximation.is_none() => {
-                match (fitted_tokens(&inputs, shape), u64::from(declared)) {
+        let warning = match (&shape, &draft) {
+            (Ok(shape), Ok(draft))
+                if shape.approximation.is_none()
+                    && draft.as_ref().is_none_or(|d| d.approximation.is_none()) =>
+            {
+                match (
+                    fitted_tokens(&inputs, shape, draft.as_ref()),
+                    u64::from(declared),
+                ) {
                     (Ok(fits), declared_tokens)
                         if declared_tokens > fits && declared_tokens <= shape.max_position =>
                     {
@@ -292,11 +334,25 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
         Ok(shape) => shape,
         Err(reason) => return fallback(reason),
     };
-    match fitted_tokens(&inputs, &shape) {
+    let draft = match draft {
+        Ok(draft) => draft,
+        Err(reason) => return fallback(reason),
+    };
+    let reason = match &draft {
+        None => shape.approximation.map(str::to_owned),
+        Some(draft) => {
+            let mut parts: Vec<String> =
+                shape.approximation.map(str::to_owned).into_iter().collect();
+            parts.push("the draft model's KV layers are counted with the checkpoint's".into());
+            parts.extend(draft.approximation.map(|a| format!("draft model: {a}")));
+            Some(parts.join("; "))
+        }
+    };
+    match fitted_tokens(&inputs, &shape, draft.as_ref()) {
         Ok(tokens) => ContextFit {
             tokens: Some(u32::try_from(tokens).unwrap_or(u32::MAX)),
             source: ContextSource::Fitted,
-            reason: shape.approximation.map(str::to_owned),
+            reason,
             warning: None,
         },
         Err(reason) => fallback(reason),
@@ -356,6 +412,21 @@ pub fn fit_for_launch(
     let config = checkpoint_root
         .ok_or_else(|| "the deployment resolves to no checkpoint directory".to_owned())
         .and_then(read_model_config);
+    // The draft model is read where the checkpoint is: never by a server
+    // fitting for a remote host. Resolution already confined its path to the
+    // installation's approved directories (ADR 0014 §8).
+    let args: Vec<String> = profile_args
+        .iter()
+        .chain(settings.extra_args())
+        .cloned()
+        .collect();
+    let draft = match (engine, checkpoint_root) {
+        (Engine::Vllm | Engine::Sglang, Some(_)) => {
+            crate::engine_policy::draft_model_path(engine, &args)
+                .map(|path| read_model_config(Path::new(&path)))
+        }
+        _ => None,
+    };
     fit_context(
         FitInputs {
             declared: common.context_length,
@@ -364,6 +435,9 @@ pub fn fit_for_launch(
             dtype: common.dtype.as_deref(),
             block_tokens: block,
             reserved_blocks,
+            draft: draft
+                .as_ref()
+                .map(|config| config.as_ref().map_err(String::as_str)),
         },
         config.as_ref().map_err(Clone::clone),
     )

@@ -152,3 +152,46 @@ fn a_host_fixed_context_is_kept() {
         capyctl_config::context_fit::ContextSource::HostFixed
     );
 }
+
+// T14 (found live 2026-10-02): with a draft model, the fitted context counts
+// the draft model's KV layers too, on both engines: vLLM 0.30 with DFlash2
+// failed to start at the context fitted to the checkpoint's layers alone.
+#[test]
+fn a_draft_models_kv_layers_shorten_the_fitted_context() {
+    let drafters = tempfile::tempdir().unwrap();
+    let draft = drafters.path().join("d");
+    std::fs::create_dir(&draft).unwrap();
+    // 2 × 4 × 8 × 128 × 2 = 16 KiB of bfloat16 KV per token.
+    let draft_config = json!({
+        "num_hidden_layers": 4, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "max_position_embeddings": 32768, "torch_dtype": "bfloat16",
+    });
+    std::fs::write(draft.join("config.json"), draft_config.to_string()).unwrap();
+    let raw = (4u64 << 30) / (512 * 1024 + 16 * 1024);
+    let fitted = raw - raw % 16;
+    for engine in ["vllm", "sglang"] {
+        let (_store, effective) = resolved(engine, Some(&dense()), |d, host| {
+            let profile = &mut host["runtime_profiles"]["local"];
+            profile["security"]["approved_options"] =
+                json!(["--speculative-config", "--speculative-draft-model-path"]);
+            profile["security"]["approved_paths"] = json!([drafters.path()]);
+            d["engine_config"]["accept_extra_args"] = json!(true);
+            d["engine_config"]["extra_args"] = match engine {
+                "vllm" => json!([
+                    "--speculative-config",
+                    json!({"method": "draft_model", "model": draft, "num_speculative_tokens": 3})
+                        .to_string()
+                ]),
+                _ => json!(["--speculative-draft-model-path", draft]),
+            };
+        });
+        match engine {
+            // vLLM keeps one 16-token block.
+            "vllm" => assert_eq!(
+                max_model_len(&vllm_argv(&effective)),
+                Some((fitted - 16).to_string().as_str())
+            ),
+            _ => assert_eq!(sglang_context(&effective), Some(fitted as u32)),
+        }
+    }
+}

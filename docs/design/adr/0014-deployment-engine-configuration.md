@@ -521,3 +521,56 @@ first-build bound (ADR 0023 §4) are unchanged. A later start, with the compile 
 warm, is shorter; the longer window only delays noticing an engine that is alive but
 stuck, never one that exited. A revision frozen before this amendment keeps the
 window it was frozen with (it still decodes exactly).
+
+## Amendment A8: first-start graph allowance in the startup placeholder (2026-10-02)
+
+Problem: found live on 2026-10-02 (amendment A6's run). The first start of vLLM 0.30
+with Qwen3.8-27B NVFP4 and DFlash2 peaked at 50.46 GiB against a 49.25 GiB cold phase.
+Amendment A2's placeholder is `max(request, weights × 1.6 + margin)`; with a 16 GiB KV
+cache the request (48.0 GiB) was the larger term, so the cold phase was the request plus
+the 1.25 GiB CUDA context and graph charge (ADR 0019). The CUDA graphs alone took
+1.64 GiB, the draft model's included, and they are captured after the KV cache is
+allocated, so they sit on top of the request, not inside the load term. A start above
+what CapyCTL reserved is what the startup budget exists to prevent.
+
+Rule: for vLLM and SGLang the derived placeholder startup is
+`max(request + graphs, weights × 1.6 + margin)`, where `graphs` is a first-start graph
+allowance of 1.25 GiB per model whose graphs the engine captures: the checkpoint, plus
+the draft model when the arguments name one (amendment A6's options). TensorFold declares
+its resources and is unchanged. The cold phase is that startup plus the CUDA context and
+graph charge, as before; Ready, parking and wake are unchanged. The allowance is recorded
+as `startup_graphs_bytes` beside `startup_bytes`, so a snapshot re-derives it; a revision
+frozen before this amendment records none and re-derives without it. A declared
+`memory.startup`, a declared `resources:` block and a device request (discrete GPU design
+§3) carry no allowance. As before, the first measured peak replaces the placeholder for
+later starts of the revision on that host and installation.
+
+For the A6 deployment the cold phase becomes 51.75 GiB (48.0 + 2 × 1.25 + 1.25), 1.29 GiB
+above the measured first-start peak; without a draft model it is 1.25 GiB larger than
+before. The allowance is a placeholder, not a measurement.
+
+## Amendment A9: the fitted context counts the draft model's KV (2026-10-02)
+
+Problem: found live on 2026-10-02. With no memory stated, the Qwen3.8-27B NVFP4 and
+DFlash2 deployment got the default 4 GiB KV cache and a context fitted to 32752 tokens
+from the checkpoint's layers alone, and vLLM 0.30 refused it ("4.2 GiB KV cache is
+needed, which is larger than the available KV cache memory (3.98 GiB)"). The draft
+model's KV layers share the engine's pool: vLLM groups them with the checkpoint's, and
+SGLang adds the draft pool's bytes per token to the target's.
+
+Rule: when the arguments name a draft model (amendment A6's options) on vLLM or SGLang,
+the fit (§5, owner decision 2026-09-25) reads the draft model's `config.json` where the
+checkpoint is read, counts its layers the same conservative way, and adds its KV per token
+to the checkpoint's, with the deployment's KV dtype for both. A draft model whose
+configuration cannot be read falls back to 4096 tokens with the reason. A declared
+`context_length` always wins; the fit warns about a declared one only when both shapes
+are exact. Status names the draft model in the fit's reason.
+
+Open issue (owner decision needed): on a hybrid checkpoint (linear-attention or Mamba
+layers) vLLM also needs, beyond the KV per token, one recurrent-state block per sequence
+(`max_num_seqs`, 256 by default) and, per request, 2 + speculative-tokens state blocks
+per recurrent layer group. Neither is sized from the KV per token. The default 4 GiB KV
+cache is too small for Qwen3.8-27B NVFP4 on vLLM 0.30 with or without a draft model
+("max_num_seqs (256) exceeds available Mamba cache blocks": 83 without DFlash2, 254 with
+it). A deployment of such a model declares `memory.kv_cache` (16 GiB works) until the
+default is decided.
