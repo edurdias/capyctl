@@ -25,8 +25,8 @@ shown to get one CapyCTL knows.
    ```
 
    The first command prints the GPU's name, compute capability and driver
-   version. The header of the second shows `CUDA Version`, the newest CUDA the
-   driver supports. Every install below uses CUDA 13.0 builds of PyTorch, so it
+   version. The header of the second shows `CUDA Version` (`CUDA UMD Version` on
+   newer drivers), the newest CUDA the driver supports. Every install below uses CUDA 13.0 builds of PyTorch, so it
    must read 13.0 or higher; if it does not, update the driver first
    ([CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)
    list the minimum driver for each CUDA version).
@@ -45,7 +45,7 @@ shown to get one CapyCTL knows.
    The commands below ask `uv` for Python 3.12 and let it download that Python,
    so the system Python does not matter.
 
-4. Disk space: each environment takes several gigabytes (about 8 GB for vLLM,
+4. Disk space: each environment takes several gigabytes (about 6 GB for vLLM,
    9 GB for SGLang and 5 GB for TensorFold on x86-64), plus `uv`'s download
    cache in `~/.cache/uv`. Models need their own space in `~/models`.
 
