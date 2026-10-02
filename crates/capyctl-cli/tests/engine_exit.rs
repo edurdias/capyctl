@@ -146,8 +146,12 @@ fn engine_files(root: &Path, runtime_mode: u32) -> (PathBuf, PathBuf) {
     let bin = root.join("engine");
     std::fs::create_dir_all(&bin).unwrap();
     let engine = bin.join("vllm");
-    std::fs::write(&engine, format!("#!{}\n{FAKE_VLLM}", python3().display())).unwrap();
-    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(
+        &engine,
+        format!("#!{}\n{FAKE_VLLM}", python3().display()),
+        0o755,
+    )
+    .unwrap();
     std::os::unix::fs::symlink(python3(), bin.join("python3")).unwrap();
     let runtime = root.join("runtime");
     std::fs::create_dir_all(&runtime).unwrap();

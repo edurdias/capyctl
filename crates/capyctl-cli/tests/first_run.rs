@@ -31,8 +31,8 @@ fn mkdir(path: &Path) {
 }
 
 fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
+        .unwrap();
 }
 
 /// A vLLM 0.29.0 venv whose interpreter answers the capability probe.

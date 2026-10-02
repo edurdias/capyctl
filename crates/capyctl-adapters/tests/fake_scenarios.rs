@@ -35,10 +35,12 @@ const BUFFER_RESIDUE: i64 = capyctl_testkit::BUFFER_RESIDUE;
 
 #[tokio::test]
 async fn slow_startup_liveness_is_not_readiness() {
-    let e = FakeEngine::new().with_startup_delay(Duration::from_millis(50));
+    // The delay runs from construction; it is long enough that the first
+    // check lands inside it on a slow runner too.
+    let e = FakeEngine::new().with_startup_delay(Duration::from_millis(500));
     let st = e.check_readiness(&member()).await.unwrap();
     assert!(matches!(st, Readiness::Initializing)); // early
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(matches!(
         e.check_readiness(&member()).await.unwrap(),
         Readiness::Ready

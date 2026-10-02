@@ -106,8 +106,13 @@ async fn start_spawns_real_process_and_stop_terminates_it() {
         .unwrap();
     c.wait_terminal(&op2).await.unwrap();
     assert!(c.live_pid(&id).is_none(), "handle released");
-    // The process group was terminated: give the kernel a beat.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The process group was terminated: wait for the kernel to reap it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
         "engine process terminated (T12)"

@@ -274,8 +274,12 @@ impl Fixture {
         let bin = path.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
-        std::fs::write(&engine, format!("#!{}\n{FAKE_VLLM}", python3().display())).unwrap();
-        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        capyctl_config::test_support::write_executable(
+            &engine,
+            format!("#!{}\n{FAKE_VLLM}", python3().display()),
+            0o755,
+        )
+        .unwrap();
         // Owner decision Q11: the launch runs the installation's interpreter on
         // capyctl's protected entry. The stand-ins: the interpreter beside the fake
         // engine, and an entry that runs the fake engine in process (its

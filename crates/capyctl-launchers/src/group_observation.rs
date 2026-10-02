@@ -656,7 +656,8 @@ mod tests {
             nix::sys::signal::Signal::SIGKILL,
         )
         .unwrap();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if observe_process_group_or_empty(&leader).is_ok_and(|m| m.is_empty()) {
                 return;
             }

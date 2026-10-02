@@ -363,6 +363,18 @@ impl ServiceObservation for ScriptedAvailability {
     }
 }
 
+/// Waits until `host` has published `samples` more readings, so the value
+/// the test scripted was read however slowly the runner schedules the
+/// startup sampler.
+async fn until_sampled(host: &ScriptedAvailability, samples: i64) {
+    let from = host.sampled.load(Ordering::SeqCst);
+    until(
+        "the startup sampler to read the scripted availability",
+        || host.sampled.load(Ordering::SeqCst) >= from + samples,
+    )
+    .await;
+}
+
 /// T29: a deployment with a derived memory request and no declared startup
 /// peak reserves the placeholder (its request, while its weights are unknown)
 /// on its first run. The run's peak drop in published availability is recorded
@@ -412,13 +424,14 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     // One scripted engine per launch: the first run, then the second.
     let (gate, again) = (Gate::new(false), Gate::new(false));
     let launches = Arc::new(Mutex::new(vec![again.clone(), gate.clone()]));
+    let scripted = Arc::new(ScriptedAvailability {
+        domains: observations.clone(),
+        available: available.clone(),
+        sampled: AtomicI64::new(1000),
+    });
     let w = OwnedCoordinator::spawn(
         owner.clone(),
-        Arc::new(ScriptedAvailability {
-            domains: observations.clone(),
-            available: available.clone(),
-            sampled: AtomicI64::new(1000),
-        }),
+        scripted.clone(),
         Arc::new(|| Ok(1900)),
         CoordinatorOptions {
             startup_sample_interval: Some(Duration::from_millis(10)),
@@ -439,9 +452,9 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     );
     // The engine's load drops availability by 12 GiB, then it settles.
     available.store(baseline - 12 * GIB, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_sampled(&scripted, 5).await;
     available.store(baseline - 8 * GIB, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    until_sampled(&scripted, 5).await;
     gate.release.add_permits(1);
     assert_eq!(
         first.wait(Duration::from_secs(10)).await.unwrap(),
@@ -624,13 +637,14 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     let (first, second) = (Gate::new(false), Gate::new(false));
     let launches = Arc::new(Mutex::new(vec![second.clone(), first.clone()]));
     let (small, gate_a) = (fence.deployment_id.clone(), a.clone());
+    let scripted = Arc::new(ScriptedAvailability {
+        domains: observations.clone(),
+        available: available.clone(),
+        sampled: AtomicI64::new(1000),
+    });
     let w = OwnedCoordinator::spawn(
         owner.clone(),
-        Arc::new(ScriptedAvailability {
-            domains: observations.clone(),
-            available: available.clone(),
-            sampled: AtomicI64::new(1000),
-        }),
+        scripted.clone(),
         Arc::new(|| Ok(1900)),
         CoordinatorOptions {
             startup_sample_interval: Some(Duration::from_millis(10)),
@@ -692,9 +706,9 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     assert_eq!(reserved["bytes"], 36 * GIB);
     // Its load drops availability by 34 GiB, then it settles at Ready.
     available.store(baseline - 34 * GIB, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_sampled(&scripted, 5).await;
     available.store(baseline - 32 * GIB, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    until_sampled(&scripted, 5).await;
     first.release.add_permits(1);
     until("the solo start to reach Ready", || {
         footprint(&owner, &id).is_some_and(|held| held.phase == ResourcePhase::Ready)

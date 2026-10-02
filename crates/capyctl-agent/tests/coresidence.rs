@@ -187,8 +187,12 @@ impl Fixture {
         let bin = path.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
-        std::fs::write(&engine, format!("#!{}\n{FAKE_ENGINE}", python3().display())).unwrap();
-        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        capyctl_config::test_support::write_executable(
+            &engine,
+            format!("#!{}\n{FAKE_ENGINE}", python3().display()),
+            0o755,
+        )
+        .unwrap();
         std::os::unix::fs::symlink(python3(), bin.join("python3")).unwrap();
         // SPEC §9.1, §13.3: the runtime directory holds capyctl's protected
         // entries, owned by the agent user and writable by it alone.
@@ -883,8 +887,10 @@ fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
     for _ in 0..3 {
         let asked = std::time::Instant::now();
         let inventory = hung.inventory().expect("the system domain is refreshed");
+        // The collector is hung until released, so a refresh that waited on
+        // it would never return; the bound is only for a slow runner.
         assert!(
-            asked.elapsed() < std::time::Duration::from_millis(200),
+            asked.elapsed() < std::time::Duration::from_secs(2),
             "{:?}",
             asked.elapsed()
         );

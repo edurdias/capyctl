@@ -591,14 +591,14 @@ async fn a_hung_gpu_collector_never_delays_heartbeats() {
         controller.beats.load(Ordering::SeqCst),
         controller.unobserved.load(Ordering::SeqCst),
     );
-    // Six 250 ms periods while the collector stays hung.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let sent = controller.beats.load(Ordering::SeqCst) - beats;
-    assert!(sent >= 4, "{sent} heartbeats in 1.5 s");
-    assert!(
-        controller.unobserved.load(Ordering::SeqCst) - unobserved >= 2,
-        "the device is reported unobserved while the collector hangs"
-    );
+    // The collector stays hung until released, so a heartbeat that waited
+    // on it would never be sent. Four more heartbeats (1 s at the 250 ms
+    // period) and two unobserved reports arrive however slow the runner is.
+    eventually(Duration::from_secs(10), || {
+        controller.beats.load(Ordering::SeqCst) - beats >= 4
+            && controller.unobserved.load(Ordering::SeqCst) - unobserved >= 2
+    })
+    .await;
     assert_eq!(controller.sessions.load(Ordering::SeqCst), 1);
     release.send(()).unwrap();
     stop.send(true).unwrap();

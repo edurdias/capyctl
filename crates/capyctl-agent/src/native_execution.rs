@@ -2519,8 +2519,9 @@ mod tests {
         );
         let executor = executor.with_model_sources(store);
         let mut evidence = run(executor.clone(), command("s3", &policy)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         for attempt in 0.. {
-            if evidence.state == "verified" || attempt > 200 {
+            if evidence.state == "verified" || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

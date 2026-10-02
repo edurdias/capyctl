@@ -251,6 +251,46 @@ fn fake_app(source: Arc<Fake>, options: EventStreamOptions) -> axum::Router {
     .unwrap()
 }
 
+/// Opens event streams until one answers `status`. A stream slot is released
+/// by the task that held it, so a slow runner frees it a little later than a
+/// fast one; a slot that is never released times out.
+async fn until_status(app: &axum::Router, status: u16) -> axum::response::Response {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(
+                    request("/management/v1/events")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == status {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no event stream answered {status}"))
+}
+
+/// Waits until the source has not been read for 100 ms.
+async fn until_quiet(source: &Fake) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let calls = source.calls.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if source.calls.load(Ordering::SeqCst) == calls {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the source is still polled");
+}
+
 #[tokio::test]
 async fn authentication_and_syntax_validation_precede_all_provider_work() {
     let source = fake(|_, _| panic!("provider must not be called"));
@@ -425,15 +465,7 @@ async fn slow_clients_disconnect_without_success_or_unsent_cursor_and_release_ca
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(source.calls.load(Ordering::SeqCst) <= 2);
-    let second = app
-        .oneshot(
-            request("/management/v1/events")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.status(), 200);
+    until_status(&app, 200).await;
     let mut body = response.into_body().into_data_stream();
     assert!(next(&mut body)
         .await
@@ -467,21 +499,8 @@ async fn dropping_body_stops_polling_and_releases_stream_slot() {
         429
     );
     drop(response);
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let calls = source.calls.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(source.calls.load(Ordering::SeqCst), calls);
-    assert_eq!(
-        app.oneshot(
-            request("/management/v1/events")
-                .body(Body::empty())
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .status(),
-        200
-    );
+    until_quiet(&source).await;
+    until_status(&app, 200).await;
 }
 
 #[tokio::test]
@@ -500,18 +519,7 @@ async fn finite_lifetime_closes_idle_stream_and_releases_capacity() {
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        app.oneshot(
-            request("/management/v1/events")
-                .body(Body::empty())
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .status(),
-        200
-    );
+    until_status(&app, 200).await;
     let mut body = first.into_body().into_data_stream();
     assert!(body.next().await.is_none());
 }
@@ -548,22 +556,12 @@ async fn dropped_streams_do_not_cancel_accepted_reads_or_release_global_worker_p
     let release_on_exit = Release(release);
     let app = fake_app(source, options());
     for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                request("/management/v1/events")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        tokio::time::timeout(Duration::from_secs(2), arrivals.recv())
+        let response = until_status(&app, 200).await;
+        tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
             .await
             .unwrap()
             .unwrap();
         drop(response);
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     for uri in ["/management/v1/events", "/management/v1/snapshot"] {
         let response = app
@@ -575,24 +573,15 @@ async fn dropped_streams_do_not_cancel_accepted_reads_or_release_global_worker_p
     }
     assert_eq!(completed.load(Ordering::SeqCst), 0);
     drop(release_on_exit);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while completed.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(
-        app.oneshot(
-            request("/management/v1/events")
-                .body(Body::empty())
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .status(),
-        200
-    );
+    // The read permits drop just after the reads return.
+    until_status(&app, 200).await;
 }
 
 #[tokio::test]
@@ -632,7 +621,7 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
                     .unwrap(),
             ),
         );
-        tokio::time::timeout(Duration::from_secs(2), arrivals.recv())
+        tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
             .await
             .unwrap()
             .unwrap();
@@ -652,16 +641,7 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
         429
     );
     drop(release_on_exit);
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let response = app
-        .oneshot(
-            request("/management/v1/events")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 500);
+    let response = until_status(&app, 500).await;
     let text = String::from_utf8(
         axum::body::to_bytes(response.into_body(), 4096)
             .await

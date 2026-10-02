@@ -1152,7 +1152,9 @@ async fn a_stop_terminates_after_its_drain_bound_and_the_lease_settles_on_eviden
         50,
         None,
         CoordinatorOptions {
-            stop_drain_timeout: Duration::from_millis(300),
+            // Long next to the 150 ms check below, so a slow runner still
+            // checks inside the bound.
+            stop_drain_timeout: Duration::from_millis(1_000),
             ..Default::default()
         },
     )
@@ -1186,7 +1188,7 @@ async fn a_stop_terminates_after_its_drain_bound_and_the_lease_settles_on_eviden
     assert_eq!(leases(&lab, &id), 1, "the lease is kept while draining");
     until_succeeded(&lab, stop.operation_id(), &id).await;
     assert!(
-        started.elapsed() >= Duration::from_millis(300),
+        started.elapsed() >= Duration::from_millis(1_000),
         "terminated before the drain bound"
     );
     assert_eq!(

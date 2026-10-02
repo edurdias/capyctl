@@ -886,12 +886,12 @@ mod tests {
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = dir.path().join("bin/python3");
         let marker = runtime.path().join("ran");
-        std::fs::write(
+        capyctl_config::test_support::write_executable(
             &executable,
             format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let script = runtime.path().join(PROBE_SCRIPT);
         std::fs::write(&script, "# helper\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -930,18 +930,19 @@ mod tests {
             std::fs::Permissions::from_mode(0o644),
         )
         .unwrap();
-        std::fs::write(
+        capyctl_config::test_support::write_executable(
             &executable,
             "#!/bin/sh\necho '{\"schema\":\"capyctl/engine-capabilities/v1\",\"engine\":\"sglang\",\
              \"capabilities\":{\"core\":[],\"deep_park\":[\"torch_memory_saver\"],\"metrics\":[],\
              \"observation\":[]}}'\n",
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let report =
             probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT).unwrap();
         assert_eq!(report.available("deep_park"), Some(false));
-        std::fs::write(&executable, "#!/bin/sh\nsleep 5\n").unwrap();
+        capyctl_config::test_support::write_executable(&executable, "#!/bin/sh\nsleep 5\n", 0o755)
+            .unwrap();
         assert_eq!(
             probe_capabilities(
                 Engine::Sglang,

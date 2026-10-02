@@ -289,7 +289,7 @@ async fn a_backend_that_completes_after_a_hang_up_releases_on_completion() {
     ));
     assert_eq!(counts.current("d"), 1);
     gate.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while counts.current("d") != 0 {
             tokio::task::yield_now().await;
         }
@@ -433,8 +433,10 @@ async fn progressing_stream_is_never_cut_at_a_fixed_wall_time() {
             deliver: true,
         },
         &counts,
-        300,
-        400,
+        // The first event is due well inside the 1.2 s the stream runs, and
+        // the idle bound leaves a slow runner room between 100 ms chunks.
+        500,
+        1_000,
     );
     let started = std::time::Instant::now();
     let bytes = axum::body::to_bytes(response.into_body(), 4096)

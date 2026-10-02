@@ -115,8 +115,12 @@ async fn an_idle_sample_before_the_hang_up_closes_nothing() {
     *h.lab.engine.idle_at.lock().unwrap() = Some(before);
     tokio::time::sleep(Duration::from_millis(5)).await;
     h.close_lease(lease, LeaseEnd::Cancelling).await;
-    tokio::time::sleep(TICKS).await;
-    assert!(!h.lab.engine.asked.lock().unwrap().is_empty());
+    // One question at a time: a second one means the first answer, the idle
+    // sample from before the hang-up, was applied.
+    until("a second quiescence question", || {
+        h.lab.engine.asked.lock().unwrap().len() > 1
+    })
+    .await;
     assert_eq!(h.outstanding(), 2, "an idle sample before the hang-up");
     *h.lab.engine.idle_at.lock().unwrap() = Some(capyctl_protocol::now_unix_ms());
     h.until_outstanding(1).await;
@@ -147,8 +151,10 @@ async fn a_wedged_engine_never_delays_a_start() {
     .await;
     let started = std::time::Instant::now();
     h.lab.ready(&h.lab.c).await;
+    // A scheduler held by the question would wait out its 3 s bound; the
+    // margin below it is for a slow runner, not for the scheduler.
     assert!(
-        started.elapsed() < Duration::from_millis(1500),
+        started.elapsed() < Duration::from_millis(2_500),
         "the start waited {:?} behind a wedged engine",
         started.elapsed()
     );

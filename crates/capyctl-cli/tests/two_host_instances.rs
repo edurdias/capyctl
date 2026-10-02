@@ -215,14 +215,10 @@ impl Cluster {
                 );
                 let engine = path.join(format!("{name}-engine"));
                 std::fs::create_dir_all(&engine).unwrap();
-                std::fs::write(
-                    engine.join("vllm"),
+                capyctl_config::test_support::write_executable(
+                    &engine.join("vllm"),
                     format!("#!{}\n{FAKE_VLLM}", python3().display()),
-                )
-                .unwrap();
-                std::fs::set_permissions(
-                    engine.join("vllm"),
-                    std::fs::Permissions::from_mode(0o755),
+                    0o755,
                 )
                 .unwrap();
                 std::fs::write(engine.join("host"), name).unwrap();

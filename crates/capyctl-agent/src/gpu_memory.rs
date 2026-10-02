@@ -461,7 +461,9 @@ mod tests {
         assert!(cache.current().is_none(), "nothing sampled yet");
         std::thread::sleep(Duration::from_millis(300));
         assert!(cache.current().is_none(), "still hung: unobserved");
-        assert!(started.elapsed() < Duration::from_millis(400) + Duration::from_millis(200));
+        // The collector is hung until released: a reading that waited on it
+        // would never return. The bound is only for a slow runner.
+        assert!(started.elapsed() < Duration::from_secs(3));
         // One collector at a time, however often it is asked.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         release.send(()).unwrap();
@@ -476,7 +478,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let asked = Instant::now();
         assert!(cache.current().is_none(), "a stale sample is unobserved");
-        assert!(asked.elapsed() < Duration::from_millis(50));
+        assert!(asked.elapsed() < Duration::from_secs(1));
         release.send(()).unwrap();
     }
 

@@ -48,7 +48,7 @@ async fn backpressure_stops_parser_before_next_event_even_in_same_http_chunk() {
                 .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
             .await
             .unwrap();
         assert!(

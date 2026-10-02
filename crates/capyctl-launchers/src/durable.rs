@@ -366,6 +366,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Reads `path` until `done` holds for its text: the detached child writes
+    /// it on its own schedule, later on a slow runner.
+    fn read_until(path: &std::path::Path, done: impl Fn(&str) -> bool) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if done(&text) || std::time::Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     struct Accept;
     impl LaunchAssociation for Accept {
         fn persist_api_identity(&self, _: &ProcessIdentity) -> Result<(), AssociationError> {
@@ -447,8 +460,9 @@ mod tests {
         launcher
             .spawn_persisted("log-test", &command, &Accept)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let text = std::fs::read_to_string(&log).unwrap();
+        let text = read_until(&log, |text| {
+            text.contains("hello-from-engine") && text.contains("oops")
+        });
         assert!(
             text.contains("hello-from-engine") && text.contains("oops"),
             "{text}"
@@ -485,8 +499,10 @@ mod tests {
         launcher
             .spawn_persisted("env-test", &command, &Accept)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let text = std::fs::read_to_string(&out).unwrap();
+        // `env` prints its two variables in one write.
+        let text = read_until(&out, |text| {
+            text.contains("NAMED=1\n") && text.contains("CAPYCTL_ENGINE_LOG=")
+        });
         let names: Vec<&str> = text
             .lines()
             .filter_map(|l| l.split_once('='))

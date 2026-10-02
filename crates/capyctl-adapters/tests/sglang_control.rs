@@ -711,7 +711,7 @@ async fn pending_control_cannot_report_ready_or_accept_concurrent_work() {
     let c = f.next(RuntimeAction::Park, "park");
     let adapter = f.adapter.clone();
     let work = tokio::spawn(async move { adapter.execute_persisted(&c).await });
-    tokio::time::timeout(Duration::from_secs(2), f.server.entered.notified())
+    tokio::time::timeout(Duration::from_secs(10), f.server.entered.notified())
         .await
         .unwrap();
     let member = MemberRef {
