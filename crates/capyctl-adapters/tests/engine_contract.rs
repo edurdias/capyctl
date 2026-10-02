@@ -650,6 +650,72 @@ async fn a_reasoning_trace_streams_through_and_survives_collection() {
     }
 }
 
+/// vLLM 0.29 and 0.30 stream the trace as `reasoning`, not `reasoning_content`
+/// (`DeltaMessage.reasoning`, vllm/entrypoints/generate/base/protocol.py). Found
+/// live 2026-10-02 with vLLM 0.30 and `--reasoning-parser qwen3`: the readiness
+/// probe failed and the engine was stopped. The field is relayed unchanged and a
+/// collected response carries it under the same name.
+#[tokio::test]
+async fn a_vllm_reasoning_trace_streams_through_under_its_own_name() {
+    let vllm_chunk = |delta: Value, finish: Value| {
+        format!(
+            "data: {}\r\n\r\n",
+            json!({"id":"chat-1","object":"chat.completion.chunk","created":1,"model":MODEL,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
+        )
+    };
+    let sse = format!(
+        "{}{}{}data:[DONE]\n\n",
+        vllm_chunk(
+            json!({"role":"assistant","content":"","reasoning":"thinking "}),
+            Value::Null
+        ),
+        vllm_chunk(json!({"reasoning":"more"}), Value::Null),
+        vllm_chunk(json!({"content":"OK","reasoning":null}), json!("stop")),
+    );
+    let (adapter, task) = engine(false, sse).await;
+    let mut chunks = vec![];
+    let end = adapter
+        .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |s| {
+            chunks.push(serde_json::from_str::<Value>(&s).unwrap())
+        })
+        .await
+        .expect("a vLLM reasoning stream is valid, not a protocol violation");
+    assert_eq!(end, StreamEnded::Completed);
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["reasoning"], "thinking ");
+    assert!(chunks[0]["choices"][0]["delta"]
+        .get("reasoning_content")
+        .is_none());
+    let collected = adapter
+        .forward_chat(&json!({"model":"public"}))
+        .await
+        .unwrap();
+    assert_eq!(collected["choices"][0]["message"]["content"], "OK");
+    assert_eq!(
+        collected["choices"][0]["message"]["reasoning"],
+        "thinking more"
+    );
+    assert!(collected["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+    drop(task);
+}
+
+/// `reasoning` is validated like `content`: a non-string trace is refused.
+#[tokio::test]
+async fn a_non_string_reasoning_delta_is_rejected() {
+    let sse = format!(
+        "data: {}\r\n\r\ndata:[DONE]\n\n",
+        json!({"id":"chat-1","object":"chat.completion.chunk","created":1,"model":MODEL,"choices":[{"index":0,"delta":{"reasoning":{"text":"x"}},"finish_reason":"stop"}]})
+    );
+    let (adapter, task) = engine(false, sse).await;
+    assert!(adapter
+        .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |_| {})
+        .await
+        .is_err());
+    drop(task);
+}
+
 /// A response with no trace keeps its existing shape: the field is absent, not empty.
 #[tokio::test]
 async fn a_response_without_a_trace_gains_no_reasoning_field() {

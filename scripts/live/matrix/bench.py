@@ -25,7 +25,7 @@ record says so (`usage_source`).
 Metric definitions (all times from the client's monotonic clock):
   TTFT           t_first_token - t_send, where t_send is taken just before the
                  connection opens and t_first_token is the arrival of the first
-                 chunk whose delta has non-empty `content` (or `reasoning_content`).
+                 chunk whose delta has non-empty `content` (or `reasoning_content`, or vLLM's `reasoning`).
   TTLT           t_last_token - t_send (last chunk with generated text).
   prefill tok/s  prompt_tokens / TTFT. At concurrency > 1 TTFT includes queueing,
                  so this is an effective rate, not the kernel's prefill rate.
@@ -196,7 +196,7 @@ def stream_chat(route, prompt, *, max_tokens, ignore_eos, base, timeout, marker=
                     got_text = False
                     for choice in obj.get("choices") or []:
                         delta = choice.get("delta") or {}
-                        for kind in ("content", "reasoning_content"):
+                        for kind in ("content", "reasoning_content", "reasoning"):
                             if delta.get(kind):
                                 got_text = True
                                 text_kinds.add(kind)
