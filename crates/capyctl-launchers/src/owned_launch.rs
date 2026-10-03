@@ -133,8 +133,9 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         // them (a compile worker pool) or outlived its parent: a helper,
         // recorded for cleanup, whose exit is not the engine's. Each kind is
         // numbered on its own, so a helper exiting renames no worker.
-        let (workers, helpers): (Vec<_>, Vec<_>) =
-            others.into_iter().partition(|fact| fact.parent_pid == api.pid);
+        let (workers, helpers): (Vec<_>, Vec<_>) = others
+            .into_iter()
+            .partition(|fact| fact.parent_pid == api.pid);
         let named = |prefix: &str, list: Vec<&crate::group_observation::GroupProcessFact>| {
             list.into_iter()
                 .enumerate()
@@ -427,9 +428,15 @@ mod tests {
         let members = until_members(&tool, &api, 4);
         let roles: Vec<_> = members.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles[0], "api", "{members:?}");
-        let workers = members.iter().filter(|m| m.role.starts_with("worker-")).count();
+        let workers = members
+            .iter()
+            .filter(|m| m.role.starts_with("worker-"))
+            .count();
         let helpers: Vec<_> = members.iter().filter(|m| m.is_helper()).collect();
-        assert_eq!(workers, 2, "the inner shell and the leader's sleep: {members:?}");
+        assert_eq!(
+            workers, 2,
+            "the inner shell and the leader's sleep: {members:?}"
+        );
         assert_eq!(helpers.len(), 1, "the inner shell's sleep: {members:?}");
         assert_eq!(helpers[0].role, "helper-0");
 

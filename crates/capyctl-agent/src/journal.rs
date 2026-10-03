@@ -2454,12 +2454,25 @@ mod helper_tests {
     /// Before readiness the observation's roles stand.
     #[test]
     fn a_process_first_seen_after_readiness_is_a_new_helper() {
-        let recorded = vec![p("api", 1), p("worker-0", 2), p("helper-0", 3), p("helper-4", 4)];
-        let observed = vec![p("api", 1), p("worker-0", 2), p("worker-1", 9), p("helper-0", 10)];
+        let recorded = vec![
+            p("api", 1),
+            p("worker-0", 2),
+            p("helper-0", 3),
+            p("helper-4", 4),
+        ];
+        let observed = vec![
+            p("api", 1),
+            p("worker-0", 2),
+            p("worker-1", 9),
+            p("helper-0", 10),
+        ];
         assert_eq!(
             after_readiness(&recorded, observed.clone(), true),
             vec![p("helper-5", 9), p("helper-6", 10)]
         );
-        assert_eq!(after_readiness(&recorded, observed.clone(), false), observed);
+        assert_eq!(
+            after_readiness(&recorded, observed.clone(), false),
+            observed
+        );
     }
 }

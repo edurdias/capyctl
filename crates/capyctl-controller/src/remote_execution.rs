@@ -1207,8 +1207,7 @@ mod tests {
             });
             r
         };
-        let (alive, facts) =
-            residency_evidence(true, &recorded, &parked("gone", "alive")).unwrap();
+        let (alive, facts) = residency_evidence(true, &recorded, &parked("gone", "alive")).unwrap();
         assert_eq!(facts, [Milestone::MemoryReleased]);
         assert_eq!(alive, recorded[..2].to_vec());
         assert!(matches!(

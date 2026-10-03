@@ -257,7 +257,10 @@ fn a_helper_may_be_gone_but_an_engine_process_may_not() {
     assert!(member("helper-0", 12).is_helper());
     assert!(!member("worker-0", 11).is_helper());
     assert!(!member("api", 10).is_helper());
-    assert!(!member("helper-", 14).is_helper(), "a bare prefix is no role");
+    assert!(
+        !member("helper-", 14).is_helper(),
+        "a bare prefix is no role"
+    );
     assert_eq!(
         engine_members(&recorded),
         vec![member("api", 10), member("worker-0", 11)]
@@ -270,7 +273,11 @@ fn a_helper_may_be_gone_but_an_engine_process_may_not() {
     );
     assert!(same_engine(
         &recorded,
-        &[member("api", 10), member("worker-0", 11), member("helper-1", 13)]
+        &[
+            member("api", 10),
+            member("worker-0", 11),
+            member("helper-1", 13)
+        ]
     ));
     assert!(
         !same_engine(&recorded, &[member("api", 10), member("helper-0", 12)]),
@@ -283,14 +290,22 @@ fn a_helper_may_be_gone_but_an_engine_process_may_not() {
     assert!(
         same_engine(
             &recorded,
-            &[member("api", 10), member("worker-0", 11), member("helper-2", 20)]
+            &[
+                member("api", 10),
+                member("worker-0", 11),
+                member("helper-2", 20)
+            ]
         ),
         "a helper started later does not change the engine"
     );
     assert!(
         !same_engine(
             &recorded,
-            &[member("api", 10), member("worker-0", 11), member("worker-1", 20)]
+            &[
+                member("api", 10),
+                member("worker-0", 11),
+                member("worker-1", 20)
+            ]
         ),
         "an engine process outside the recorded group is never the engine's"
     );

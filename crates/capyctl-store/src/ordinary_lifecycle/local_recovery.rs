@@ -505,7 +505,9 @@ mod tests {
         let session = store.begin_coordinator_session().unwrap();
         store.adopt_retired_local_launch(&session, &step).unwrap();
         let listed = store.local_ready_launches(&session).unwrap();
-        assert_eq!(listed[0].identities, recorded, "helpers stay recorded");
+        let mut stored = recorded.clone();
+        stored.sort();
+        assert_eq!(listed[0].identities, stored, "helpers stay recorded");
         let now = execution.issued_at_ms + 10_000;
         let evidence = |identities: Vec<ProcessIdentity>| RemoteReadinessEvidence {
             binding_id: execution.binding_id.clone(),

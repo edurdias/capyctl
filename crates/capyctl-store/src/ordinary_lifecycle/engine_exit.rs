@@ -431,7 +431,11 @@ mod tests {
         };
         assert_eq!(
             store
-                .record_engine_exit(&session, ExitSource::Embedded, &exit(identity("helper-0", 63)))
+                .record_engine_exit(
+                    &session,
+                    ExitSource::Embedded,
+                    &exit(identity("helper-0", 63))
+                )
                 .unwrap(),
             None,
             "a helper's exit names no engine exit"
@@ -441,7 +445,11 @@ mod tests {
         assert_eq!(exited(&store, &execution.token.operation_id), 0);
 
         let closed = store
-            .record_engine_exit(&session, ExitSource::Embedded, &exit(identity("worker-0", 62)))
+            .record_engine_exit(
+                &session,
+                ExitSource::Embedded,
+                &exit(identity("worker-0", 62)),
+            )
             .unwrap()
             .expect("an engine process exiting is the engine exiting");
         assert!(closed.first);
@@ -467,7 +475,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context.unwrap().identities,
-            recorded,
+            sorted(recorded.clone()),
             "cleanup terminates the helper too"
         );
         let gone = |identities: Vec<ProcessIdentity>| CleanupEvidence {
@@ -493,5 +501,10 @@ mod tests {
             .complete_cleanup(&session, &receipt.step_id, &gone(recorded), now + 3, ttl)
             .unwrap();
         assert_eq!(observed(&store, &fence.deployment_id), "failed");
+    }
+
+    fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
+        identities.sort();
+        identities
     }
 }

@@ -516,7 +516,8 @@ async fn a_standalone_engine_exit_is_settled_and_relaunched_on_demand() {
 /// started, as an SGLang scheduler starts torch inductor compile workers) that
 /// exits on its own is not the engine exiting. The engine stays ready and
 /// serves, nothing is journaled as an exit, a role restart re-adopts it and
-/// reopens dispatch without the helper, and a stop still ends the whole group.
+/// reopens dispatch without the helper, the API process exiting still fails
+/// it, and a stop still ends the whole group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
     let installation = Installation::new();
@@ -560,7 +561,10 @@ async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
 
     // A role restart adopts the engine and re-proves it on its own processes.
     drop(role);
-    assert!(alive(engine) && alive(worker), "the engine outlives the role");
+    assert!(
+        alive(engine) && alive(worker),
+        "the engine outlives the role"
+    );
     let _role = Role::spawn(
         {
             let mut command = installation.command();
@@ -575,23 +579,27 @@ async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
         Duration::from_secs(30),
     );
     installation.served_within(Duration::from_secs(20)).await;
-    assert_eq!(installation.launches(), vec![engine], "adopted, not relaunched");
+    assert_eq!(
+        installation.launches(),
+        vec![engine],
+        "adopted, not relaunched"
+    );
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(installation.status(&deployment)["observed_state"], "ready");
     assert!(!journaled_exit());
 
-    // The engine's own worker exiting is still the engine exiting; the
+    // The engine's own API process exiting is still the engine exiting; the
     // settlement ends the rest of the group.
     unsafe {
-        libc::kill(worker, libc::SIGKILL);
+        libc::kill(engine, libc::SIGKILL);
     }
     status_until(
         || installation.status(&deployment),
         |state| state == "failed",
         Duration::from_secs(30),
     );
-    wait_gone(engine, Duration::from_secs(5));
-    assert!(journaled_exit(), "the worker's exit was journaled");
+    wait_gone(worker, Duration::from_secs(5));
+    assert!(journaled_exit(), "the engine's exit was journaled");
 
     // A stop of the relaunched engine ends its helper too.
     installation.served_within(Duration::from_secs(60)).await;
