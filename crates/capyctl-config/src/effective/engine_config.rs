@@ -1218,6 +1218,7 @@ pub(super) fn normalize_engine_config(
                 common,
                 memory,
                 max_total_tokens: sglang.max_total_tokens,
+                max_mamba_cache_size: None,
                 chunked_prefill_size: sglang.chunked_prefill_size,
                 tokenizer_workers,
                 tool_call_parser,

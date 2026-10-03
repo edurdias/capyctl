@@ -102,10 +102,17 @@ They are written to `engines.yaml` as `security.approved_options` and
 
 CapyCTL counts a draft model when it sizes a deployment: its weights in the
 memory request, its CUDA graphs in the memory reserved for the first start,
-and its KV cache layers in the context it fits to the KV cache. A hybrid
-model (one with linear-attention layers) with a draft model on SGLang needs a
-larger KV cache than the 4 GiB default: set `memory.kv_cache` (16 GiB works
-for Qwen3.8-27B with DFlash2).
+and its KV cache layers in the context it fits to the KV cache.
+
+On SGLang, `memory.kv_cache` is the size of the KV cache, as on vLLM. A hybrid
+model (one with linear-attention layers) also keeps a state for each running
+request, beside the KV cache, so its `memory.request` has to hold the weights,
+the KV cache and that state. With a `memory.request` you state, CapyCTL runs
+your `max_concurrent_requests` (or as many as fit, up to 32) and refuses to start
+when they do not fit, naming the memory request they need: Qwen3.8-27B with
+DFlash2, a 16 GiB KV cache and 8 requests needs about 65 GiB. Without one,
+CapyCTL runs as many requests as fit and `capyctl status deployment` says
+"Running limited to N requests by the state cache".
 
 ## TensorFold
 

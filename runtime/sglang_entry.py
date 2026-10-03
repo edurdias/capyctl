@@ -88,6 +88,9 @@ _SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
 # ADR 0024: the parsers capyctl chose at launch. Present only when chosen, so
 # every earlier launch descriptor stays exactly as it was.
 _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
+# ADR 0014 amendment A14: the recurrent-state slots capyctl sized for a hybrid
+# model. Present only when sized, so every other launch descriptor is unchanged.
+_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size",)
 
 
 class LaunchError(Exception):
@@ -194,8 +197,10 @@ def _validate_settings(settings):
     """
     if type(settings) is not dict:
         _reject()
-    _exact_object(settings, _SETTINGS + tuple(name for name in _PARSER_SETTINGS
+    _exact_object(settings, _SETTINGS + tuple(name for name in _OPTIONAL_SETTINGS
                                               if name in settings))
+    if "max_mamba_cache_size" in settings:
+        _integer(settings["max_mamba_cache_size"], 1, _I32)
     for name in _PARSER_SETTINGS:
         if name in settings:
             value = settings[name]

@@ -298,7 +298,8 @@ def typed_keywords(settings):
         if settings[name] is not None:
             keywords[native] = settings[name]
     # ADR 0024: the parsers chosen at launch (SGLang 0.5.20 and 0.5.21 fields).
-    for name in ("tool_call_parser", "reasoning_parser"):
+    # ADR 0014 amendment A14: the recurrent-state slots sized at launch.
+    for name in ("tool_call_parser", "reasoning_parser", "max_mamba_cache_size"):
         if name in settings:
             keywords[name] = settings[name]
     if settings["language_model_only"]:
@@ -385,6 +386,11 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     # ADR 0024: resolution never passes a chosen parser beside the same extra.
     if any(name in settings and name in extra
            for name in ("tool_call_parser", "reasoning_parser")):
+        raise ServerArgsError("effective_args_mismatch")
+    # ADR 0014 amendment A14: extras that size the state pool own it, and
+    # capyctl then sizes none (resolution prevents both; this rechecks).
+    if "max_mamba_cache_size" in settings and (
+            "max_mamba_cache_size" in extra or "mamba_full_memory_ratio" in extra):
         raise ServerArgsError("effective_args_mismatch")
     fraction = static_fraction(
         settings["memory"]["static_bytes"],

@@ -462,6 +462,14 @@ fn status(value: &Value, names: &HostNames) -> String {
         }
         out.push_str(&line);
     }
+    // ADR 0014 amendment A14: a hybrid model's state cache holds fewer
+    // running requests than the deployment asked for.
+    if let Some(limit) = d["context"]["running_limit"].as_u64() {
+        out.push_str(&format!(
+            "Running limited to {limit} request{} by the state cache\n",
+            if limit == 1 { "" } else { "s" }
+        ));
+    }
     out
 }
 
@@ -794,6 +802,31 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    // T14: ADR 0014 amendment A14. Status says when a hybrid model's state
+    // cache limits the running requests; nothing otherwise.
+    #[test]
+    fn status_shows_a_running_limit_from_the_state_cache() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+            "context": {"tokens": 262144, "source": "fitted", "running_limit": 3}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nRunning limited to 3 requests by the state cache\n"),
+            "{out}"
+        );
+        d["context"]["running_limit"] = json!(1);
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("Running limited to 1 request by the state cache\n"),
+            "{out}"
+        );
+        d["context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("running_limit");
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(!out.contains("Running limited"), "{out}");
     }
 
     // T02: status on a role with no engine names the command that adds one.

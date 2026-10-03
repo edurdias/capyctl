@@ -35,7 +35,12 @@ use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
 
+mod sglang_pool;
 mod vllm_hybrid;
+pub use sglang_pool::{
+    sglang_pool, sglang_pool_for_effective, sglang_pool_for_launch, static_pool_bytes, SglangPool,
+    STATE_SLOTS_PER_REQUEST,
+};
 pub use vllm_hybrid::VllmFit;
 
 /// The context used when the KV bytes per token cannot be computed reliably.
@@ -86,6 +91,11 @@ pub struct ContextFit {
     /// refused here (the engine refuses it, as before); this says why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Amendment A14: the running requests SGLang is held to when a hybrid
+    /// model's state cache holds fewer than the deployment's count (or
+    /// CapyCTL's in-flight bound).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_limit: Option<u32>,
 }
 
 /// The per-token KV footprint read from a model configuration.
@@ -219,6 +229,9 @@ pub struct FitInputs<'a> {
     /// The launch is vLLM's: a hybrid checkpoint is fitted to its block
     /// layout (owner decision 2026-10-02).
     pub vllm: Option<VllmFit>,
+    /// The launch is SGLang's: a gated-delta-net hybrid keeps KV for its
+    /// full-attention layers only (amendment A14).
+    pub sglang: bool,
 }
 
 /// The width of one cached element: an explicit KV dtype (fp8 variants are one
@@ -246,6 +259,7 @@ fn fallback(reason: impl Into<String>) -> ContextFit {
         source: ContextSource::Fallback,
         reason: Some(reason.into()),
         warning: None,
+        running_limit: None,
     }
 }
 
@@ -301,7 +315,18 @@ fn fitted_tokens(
 /// launch, from the parsed model configuration (or why it could not be read).
 pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> ContextFit {
     let config_value = config.as_ref().ok().copied();
-    let shape = config.and_then(KvShape::from_config);
+    let shape = config.and_then(KvShape::from_config).map(|mut shape| {
+        // Amendment A14: SGLang keeps a gated-delta-net hybrid's recurrent
+        // state in a pool of its own, so only attention layers hold KV.
+        if let Some(layers) = config_value
+            .filter(|_| inputs.sglang)
+            .and_then(sglang_pool::gated_delta_attention_layers)
+        {
+            shape.layers = layers;
+            shape.approximation = None;
+        }
+        shape
+    });
     let draft = draft_shape(&inputs);
     if let Some(declared) = inputs.declared {
         // An explicit context always wins. When the shape is exact and the
@@ -335,6 +360,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
             source: ContextSource::Declared,
             reason: None,
             warning,
+            running_limit: None,
         };
     }
     let shape = match shape {
@@ -385,6 +411,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
                     }
                 )),
                 warning: None,
+                running_limit: None,
             },
             Err(reason) => fallback(reason),
         };
@@ -395,6 +422,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
             source: ContextSource::Fitted,
             reason,
             warning: None,
+            running_limit: None,
         },
         Err(reason) => fallback(reason),
     }
@@ -446,6 +474,7 @@ pub fn fit_for_launch(
                     source: ContextSource::HostFixed,
                     reason: Some(format!("the installation's host-fixed args set `{option}`")),
                     warning: None,
+                    running_limit: None,
                 };
             }
         }
@@ -472,7 +501,7 @@ pub fn fit_for_launch(
         sequences: vllm_sequences(settings, profile_args),
         speculative_tokens: speculative_tokens(&args),
     });
-    fit_context(
+    let mut fit = fit_context(
         FitInputs {
             declared: common.context_length,
             kv_cache_bytes: memory.kv_cache_bytes,
@@ -484,9 +513,26 @@ pub fn fit_for_launch(
                 .as_ref()
                 .map(|config| config.as_ref().map_err(String::as_str)),
             vllm,
+            sglang: engine == Engine::Sglang,
         },
         config.as_ref().map_err(Clone::clone),
-    )
+    );
+    // Amendment A14: a hybrid model's recurrent state that does not fit the
+    // memory request refuses the launch; status says so beforehand.
+    if let LaunchSettings::Sglang(sglang) = settings {
+        match sglang_pool(
+            sglang,
+            profile_args,
+            config.as_ref().map_err(Clone::clone),
+            draft
+                .as_ref()
+                .map(|config| config.as_ref().map_err(String::as_str)),
+        ) {
+            Ok(pool) => fit.running_limit = pool.running_limit,
+            Err(refusal) => fit.warning = Some(refusal),
+        }
+    }
+    fit
 }
 
 /// Owner decision 2026-10-02: the `--max-num-seqs` CapyCTL passes vLLM when
@@ -582,6 +628,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
                 "fitted to the KV cache grant by the host from its checkpoint at launch".into(),
             ),
             warning: None,
+            running_limit: None,
         },
     }
 }

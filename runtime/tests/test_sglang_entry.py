@@ -336,6 +336,18 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
                     public["settings"][key] = value
                     self.rejects(self.argv(public), self.payloads(public))
 
+    def test_state_slots_are_an_optional_positive_integer(self):
+        # ADR 0014 amendment A14: present only when capyctl sized a hybrid
+        # model's recurrent-state pool at launch.
+        public = copy.deepcopy(self.public)
+        public["settings"]["max_mamba_cache_size"] = 40
+        self.build(self.argv(public), self.payloads(public))
+        for value in (None, 0, -1, True, 1.0, "40", 2 ** 31):
+            with self.subTest(value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["max_mamba_cache_size"] = value
+                self.rejects(self.argv(public), self.payloads(public))
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.
