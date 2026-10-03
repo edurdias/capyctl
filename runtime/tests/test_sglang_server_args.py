@@ -393,6 +393,33 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         for secret in (self.root, self.inference.decode(), self.admin.decode()):
             self.assertNotIn(secret, repr(caught.exception))
 
+    # T16 (found live 2026-10-03): SGLang's own reason for refusing the
+    # arguments (here language_model_only on an architecture it does not
+    # support) reaches the private engine log when the operator turned debug
+    # engine logs on, scrubbed of credentials; without it nothing is written.
+    def test_a_refusal_reason_is_logged_only_with_debug_engine_logs(self):
+        import contextlib
+        import io
+        key = self.inference.decode()
+
+        def refusing(**kwargs):
+            raise ValueError("--language-model-only does not support "
+                             "['Qwen3_5ForConditionalGeneration'] " + key)
+        for debug, expected in (("1", True), (None, False)):
+            with self.subTest(debug=debug):
+                env = {} if debug is None else {"CAPYCTL_DEBUG_ENGINE_LOGS": debug}
+                captured = io.StringIO()
+                with mock.patch.dict(os.environ, env, clear=False), \
+                        contextlib.redirect_stderr(captured):
+                    if debug is None:
+                        os.environ.pop("CAPYCTL_DEBUG_ENGINE_LOGS", None)
+                    with self.assertRaises(mapping.ServerArgsError) as caught:
+                        construct(self.build(), self.placement(), refusing)
+                self.assertEqual(str(caught.exception), "server_args_construction_failed")
+                text = captured.getvalue()
+                self.assertEqual("language-model-only does not support" in text, expected, text)
+                self.assertNotIn(key, text)
+
     def test_import_is_cpu_only_and_the_boundary_requires_a_held_contract(self):
         original = __import__
 

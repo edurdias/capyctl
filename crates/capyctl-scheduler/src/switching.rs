@@ -234,11 +234,17 @@ pub fn observed_room(
         let charged = state.owners.values().fold(0_i64, |sum, footprint| {
             sum.saturating_add(amount(footprint, &limit.domain))
         });
+        // ADR 0019 §2: the device reserve absorbs memory nothing accounts
+        // for, as admission judges it.
+        let held = floors
+            .iter()
+            .filter(|f| f.domain == limit.domain)
+            .fold(0_i64, |sum, f| sum.saturating_add(f.bytes));
         observed
             .available_bytes
             .saturating_add(returned)
             .saturating_sub(charged)
-            >= limit.free_reserve_bytes
+            >= limit.required_free(observed.capacity_bytes, observed.available_bytes, held)
     })
 }
 
@@ -266,6 +272,7 @@ mod tests {
             domain: "unified".into(),
             managed_bytes: managed,
             free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }]
@@ -370,6 +377,7 @@ mod tests {
             domain: domain.into(),
             managed_bytes: managed * GIB,
             free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         };
@@ -434,6 +442,7 @@ mod tests {
                 domain: "gpu0".into(),
                 managed_bytes: 16 * GIB,
                 free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: None,
                 parked_bytes: None,
             },
@@ -441,6 +450,7 @@ mod tests {
                 domain: "system".into(),
                 managed_bytes: 61 * GIB,
                 free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: None,
                 parked_bytes: Some(parked),
             },

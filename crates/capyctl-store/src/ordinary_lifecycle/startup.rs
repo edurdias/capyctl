@@ -316,6 +316,26 @@ fn reservation(p: &Plan, e: &EffectiveDeployment) -> StartupReservation {
     }
 }
 
+/// What the frozen cold phase charges host domains, when any of its
+/// allocations is on a device domain (a discrete GPU).
+fn host_share(e: &EffectiveDeployment) -> Option<i64> {
+    let on_device = |domain: &str| {
+        e.host
+            .domains
+            .get(domain)
+            .is_some_and(|d| d.memory == capyctl_config::effective::DomainMemory::Device)
+    };
+    let cold = &e.resources.cold.allocations;
+    if !cold.iter().any(|a| on_device(&a.domain)) {
+        return None;
+    }
+    Some(
+        cold.iter()
+            .filter(|a| !on_device(&a.domain))
+            .fold(0_i64, |host, a| host.saturating_add(a.bytes)),
+    )
+}
+
 fn total_domain(footprint: &PhaseFootprint) -> i64 {
     footprint.allocations.iter().fold(0_i64, |sum, allocation| {
         sum.saturating_add(allocation.bytes)
@@ -337,6 +357,15 @@ pub struct StartupMeasurement {
 pub struct StartupStatus {
     pub bytes: i64,
     pub provenance: StartupProvenance,
+    /// ADR 0019 §3 (found live 2026-10-03): on a discrete GPU the part of
+    /// `bytes` charged on the card (the startup peak and the engine's CUDA
+    /// context) and the part charged on host RAM (the engine process), apart,
+    /// so the card's figure is not read as the sum. Absent on a host whose
+    /// memory is one pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_bytes: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<StartupMeasurement>,
 }
@@ -381,9 +410,14 @@ pub(crate) fn status(
             })
         })?
         .collect::<Result<_, _>>()?;
+    // The host RAM charge is the frozen one; a recomputed placeholder changes
+    // only the card's peak.
+    let host_bytes = host_share(&e);
     Ok(Some(StartupStatus {
         bytes,
         provenance,
+        device_bytes: host_bytes.map(|host| bytes.saturating_sub(host)),
+        host_bytes,
         measured,
     }))
 }
@@ -494,6 +528,8 @@ impl crate::Store {
                 domain: id.clone(),
                 managed_bytes: d.managed_limit,
                 free_reserve_bytes: d.free_reserve,
+                reserve_absorbs_unmanaged: d.memory
+                    == capyctl_config::effective::DomainMemory::Device,
                 host_kv_bytes: d.host_kv_limit,
                 parked_bytes: d.parked_limit,
             })

@@ -709,6 +709,7 @@ mod tests {
             domain: "ram".into(),
             managed_bytes: 100,
             free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];

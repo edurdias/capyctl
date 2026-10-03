@@ -1,5 +1,43 @@
 # Current implementation and launch status
 
+## A 9 GB model on a 16 GB GPU — 2026-10-03 (branch `fix/single-gpu-16gb`)
+
+Found running FrogNano-4B-2609 (BF16, 9.32 GB) on a 16 GB laptop GPU.
+
+- The device reserve absorbs memory held outside CapyCTL (driver reservation,
+  display server) in admission, the switch planner and the launch check; a
+  deployment charged up to the card's managed limit starts on an idle card. A
+  request declared for a card derives its KV cache as request minus weights ×
+  1.10 and its startup peak as the request (ADR 0019 amendment A1).
+- STARTUP shows the card's figure with host RAM beside it; a waiting start and
+  an unmeasurable checkpoint say why under the status table.
+- A local model outside the models directory (a Hugging Face cache snapshot)
+  is measured inside its own root and launches; `start --wait` ends at once on
+  a digest diagnostic that does not clear (ADR 0014 amendment A11).
+- A leased engine port another program listens on refuses the launch
+  `port_conflict` before anything starts.
+- A failed deployment with nothing retained can be updated, which also lets a
+  restart that re-sizes deployments (new port range) re-size it.
+- `start --wait` retries a `still_stopping` refusal through the stop window.
+- State paths: the lock and state refusals name the path and the rule
+  (`invalid_config`); `engine add` refuses a state directory whose socket path
+  is too long before writing `engines.yaml`.
+- SGLang: its own reason for refusing the server arguments reaches the private
+  log under `--debug-engine-logs`; the launch failure hint says SGLang writes
+  that log only then.
+- Non-streaming responses carry `usage` (the collection asks for it) and no
+  null `prompt_text` / `prompt_token_ids`.
+- SGLang CUDA graphs stay off by default while parking; measured and
+  documented (ADR 0014 note on §4).
+
+Live on the laptop with temporary home, config and state directories (vLLM
+0.29.0 and 0.30.0, SGLang 0.5.20 and 0.5.21): plain deployment files started
+and served; the redeploy-then-`start --wait`, failed-deployment update,
+re-size on restart, HF-snapshot digest, `usage`, SGLang park and wake of a
+thinking model, and the debug-log reason were each seen live. The
+`port_conflict` refusal itself is covered by a unit test (live, the lease
+skipped the busy port). CPU and Fake-engine tests are not qualification.
+
 ## Small CLI fixes — 2026-10-02 (branch `fix/small-cli-fixes`)
 
 - `engine remove` with no role running removes the profile from

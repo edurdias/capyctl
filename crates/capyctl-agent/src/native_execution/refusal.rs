@@ -72,7 +72,8 @@ fn deep_wake_cannot_reload(effective: &capyctl_config::effective::EffectiveDeplo
 /// `distinct` domain, the GPU for a `device` domain. The allocation must not
 /// exceed the domain's managed limit, the limit must not exceed what the
 /// domain observably holds, and the allocation plus the free reserve must
-/// fit what is available now. The switch planner charges the same domains,
+/// fit what is available now (on a device domain, the part of the reserve
+/// that memory held outside CapyCTL does not already take, ADR 0019 §2). The switch planner charges the same domains,
 /// so a switch it accepts passes here once its victims are released.
 pub fn admit_memory_with(
     effective: &capyctl_config::effective::EffectiveDeployment,
@@ -90,7 +91,7 @@ pub fn admit_memory_with(
             .domains
             .get(&allocation.domain)
             .ok_or(refused("unauthorized"))?;
-        let (capacity, available, short) = match limit.memory {
+        let (capacity, available, short, reserve) = match limit.memory {
             DomainMemory::Device => {
                 // ADR 0019: a device domain is read from the GPU its `gpuN`
                 // device names; any other id has no source.
@@ -105,16 +106,29 @@ pub fn admit_memory_with(
                     .and_then(|sample| sample.devices.iter().find(|d| d.index == index))
                     .and_then(|device| device.memory.as_ref())
                     .ok_or(LaunchVerdict::Uncertain)?;
+                // ADR 0019 §2: the reserve absorbs what the card holds outside
+                // CapyCTL's accounting. This check has no process attribution,
+                // so every byte in use counts as such; the ledger has already
+                // kept every charge within the managed limit, and this check
+                // then asks the card to physically hold the allocation.
+                let reserve = capyctl_domain::resources::absorbing_reserve(
+                    limit.free_reserve,
+                    memory.total_bytes,
+                    memory.free_bytes,
+                    0,
+                );
                 (
                     memory.total_bytes,
                     memory.free_bytes,
                     "insufficient_device_memory",
+                    reserve,
                 )
             }
             DomainMemory::Unified | DomainMemory::Distinct => (
                 host.memory.capacity_bytes,
                 host.memory.available_bytes,
                 "insufficient_memory",
+                limit.free_reserve,
             ),
         };
         if allocation.bytes > limit.managed_limit || limit.managed_limit > capacity {
@@ -122,13 +136,22 @@ pub fn admit_memory_with(
         }
         if allocation
             .bytes
-            .checked_add(limit.free_reserve)
+            .checked_add(reserve)
             .is_none_or(|required| required > available)
         {
             return Err(refused(short));
         }
     }
     Ok(())
+}
+
+/// SPEC §3.1: the leased loopback engine port must be free when a launch is
+/// admitted; a port another program listens on is `port_conflict` (the next
+/// start leases a free one: the server's lease skips a port it cannot bind).
+pub(crate) fn engine_port_free(port: u16) -> Result<(), LaunchVerdict> {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map(drop)
+        .map_err(|_| LaunchVerdict::Refused("port_conflict"))
 }
 
 /// Whether any allocation of `effective`'s starting footprint lands on a device
@@ -245,6 +268,11 @@ impl NativeHostExecution {
         plan: &SingleLaunchPlan,
         reading: GpuReading,
     ) -> Result<(), LaunchVerdict> {
+        // Found live 2026-10-03: another program listening on the leased
+        // engine port answered the new engine's readiness probe, which then
+        // treated it as an engine it could not prove its own and stopped the
+        // launch. A port in use is refused before anything starts.
+        engine_port_free(plan.service_port)?;
         if self.pre_admitted(command) {
             let refused = LaunchVerdict::Refused;
             let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
@@ -554,6 +582,52 @@ mod tests {
             admit_memory_with(&effective, &ram(61 * GIB, 10 * GIB), Some(&gpu(16376, 0))),
             Err(LaunchVerdict::Refused("insufficient_memory"))
         );
+    }
+
+    // T26 (ADR 0019 §2, found live on a 16 GB laptop GPU, 2026-10-03): the
+    // device reserve absorbs what the card holds outside CapyCTL (here 348 MiB
+    // the driver keeps and 112 MiB a display server uses), so a cold charge up
+    // to the managed limit passes on an idle card. Beyond the reserve the card
+    // must still hold the charge.
+    #[test]
+    fn the_device_reserve_absorbs_memory_held_outside_capyctl() {
+        const MIB: i64 = 1 << 20;
+        let sample = |used: i64, free: i64| {
+            crate::gpu_memory::parse_query_gpu(
+                &format!(
+                    "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, {used}, {free}\n"
+                ),
+                1,
+            )
+            .unwrap()
+        };
+        let mut effective = discrete_effective(14828 * MIB, 4 * GIB);
+        effective.host.domains.insert(
+            "gpu0".into(),
+            domain(15066 * MIB, 1310 * MIB, DomainMemory::Device, Some("gpu0")),
+        );
+        let host = ram(61 * GIB, 50 * GIB);
+        assert!(admit_memory_with(&effective, &host, Some(&sample(112, 15916))).is_ok());
+        // 2 GiB more in use elsewhere: 13868 MiB free cannot hold 14828 MiB.
+        assert_eq!(
+            admit_memory_with(&effective, &host, Some(&sample(2160, 13868))),
+            Err(LaunchVerdict::Refused("insufficient_device_memory"))
+        );
+    }
+
+    // T37 (SPEC §3.1, found live 2026-10-03): a leased engine port another
+    // program listens on refuses the launch `port_conflict` before anything
+    // starts; a free one passes.
+    #[test]
+    fn a_leased_engine_port_in_use_is_a_port_conflict() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert_eq!(
+            engine_port_free(port),
+            Err(LaunchVerdict::Refused("port_conflict"))
+        );
+        drop(held);
+        assert_eq!(engine_port_free(port), Ok(()));
     }
 
     // T26: the unified single-pool behaviour is unchanged.

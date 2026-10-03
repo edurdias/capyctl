@@ -619,3 +619,40 @@ default would not change what it can hold. Live at the default 4 GiB KV cache:
   state cache": 2.30 GB left, 146.81 MB of state per request, kept for every draft token).
 
 A hybrid SGLang deployment with a draft model declares `memory.kv_cache` (16 GiB works).
+
+## Amendment A11: a checkpoint outside the model store (2026-10-03)
+
+Problem: found live on 2026-10-03. The guides name an absolute path as a model, and
+resolution accepts one, but §7 measured a checkpoint only inside the host's model store.
+An absolute path to a Hugging Face cache snapshot got the digest diagnostic `invalid_root`;
+`start --wait` then waited out its whole Initialize window and the status table showed no
+error. The launch check refused the path too.
+
+Rule:
+
+- A local model named by a path outside the model store is measured inside its own root:
+  the hub directory of a Hugging Face cache snapshot (`<hub>/models--<org>--<name>/snapshots/<commit>`,
+  whose files link to the repository's blobs, and the large ones on to the hub's shared
+  blobs), otherwise its parent directory. Links follow the A5 chain rules inside that root.
+  A root other users may write is refused `invalid_root` (open issue 3: the time-of-check
+  mitigation is a directory other users cannot write). The launch accepts such a local
+  path; a downloaded source stays inside the sources store, and a draft model inside its
+  approved root (A6).
+- `start --wait` and `deploy --activate --wait` end at once, nothing started, on a digest
+  diagnostic that does not clear by itself (`invalid_root`, `unsafe_file`, `too_large`,
+  `unauthorized`, `not_materializable`), saying what it means; `status deployment` shows it
+  under the table.
+
+## Note on §4: SGLang CUDA graphs while parking (2026-10-03)
+
+The `cuda_graphs: false` default while the memory saver is on came from the first SGLang
+recipe (docs/plans/2026-09-12-f2b-sglang-adapter.md §2: "disable prefill/decode CUDA graphs
+for the first recipe"), not from a failure. Measured live on 2026-10-03 with SGLang 0.5.21
+and FrogNano-4B-2609 on a 16 GB laptop GPU, `deep` residency, no memory stated: 34.7 to
+36.1 tokens/s decoding with the default and 61.1 with `cuda_graphs: true`; with graphs on,
+start, park, wake (10 s to the first answer) and decoding after the wake all worked. The
+parked engine kept 1.57 GiB of the card with graphs on and 0.88 GiB without, above the
+1 GiB parked device residue placeholder (ADR 0019 §3), because SGLang's park does not
+release graph memory. The default is unchanged: turning it on needs a parked residue that
+covers the graphs, recorded per revision so frozen revisions re-derive unchanged. Until
+then a deployment that wants the speed states `cuda_graphs: true`.

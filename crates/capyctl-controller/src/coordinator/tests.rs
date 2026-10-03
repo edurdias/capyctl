@@ -1173,6 +1173,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
             domain: domain.clone(),
             managed_bytes: d.managed_limit,
             free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: d.host_kv_limit,
             parked_bytes: d.parked_limit,
         })
@@ -1359,6 +1360,7 @@ async fn restart_with_an_armed_step_never_resends_it() {
                 domain: domain.clone(),
                 managed_bytes: d.managed_limit,
                 free_reserve_bytes: d.free_reserve,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: d.host_kv_limit,
                 parked_bytes: d.parked_limit,
             })
@@ -1490,6 +1492,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
             domain: domain.clone(),
             managed_bytes: d.managed_limit,
             free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: d.host_kv_limit,
             parked_bytes: d.parked_limit,
         })

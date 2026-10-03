@@ -219,6 +219,7 @@ mod lru_tests {
             domain: "unified".into(),
             managed_bytes: managed * GIB,
             free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: parked.map(|p| p * GIB),
         }]
@@ -382,6 +383,7 @@ mod lru_tests {
             domain: "unified".into(),
             managed_bytes: 28 * GIB,
             free_reserve_bytes: 2 * GIB,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];

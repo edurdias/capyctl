@@ -368,18 +368,17 @@ fn links_that_escape_the_store_or_name_directories_are_refused() {
     }
 }
 
-// T37, SPEC §13.3: the checkpoint must be a directory inside the host's model store.
+// T37, SPEC §13.3: the checkpoint must be a directory; the model store itself,
+// a missing path and a relative path are refused.
 #[test]
-fn a_checkpoint_outside_the_model_store_is_refused() {
+fn a_checkpoint_that_is_not_a_directory_below_a_root_is_refused() {
     let store = Store::new();
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("config.json"), "{}").unwrap();
     let verifier = CheckpointVerifier::in_memory();
     for checkpoint in [
-        outside.path().to_path_buf(),
         store.root.clone(),
         store.root.join("missing"),
         PathBuf::from("relative/toy"),
+        PathBuf::from("/"),
     ] {
         assert_eq!(
             verifier.measure(&store.root, &checkpoint).unwrap_err(),
@@ -387,12 +386,115 @@ fn a_checkpoint_outside_the_model_store_is_refused() {
             "{checkpoint:?}"
         );
     }
-    // A link from inside the store to a directory outside it resolves outside.
-    symlink(outside.path(), store.root.join("escape")).unwrap();
+}
+
+// T37 (found live 2026-10-03: the guides name an absolute path as a model): a
+// checkpoint outside the model store is measured inside its own root, the
+// Hugging Face repository directory of a cache snapshot, else its parent, with
+// links confined there. It measures as the same bytes stored plainly.
+#[test]
+fn a_checkpoint_outside_the_model_store_is_measured_inside_its_own_root() {
+    let store = Store::new();
+    let verifier = CheckpointVerifier::in_memory();
+    let plain = Store::new();
+    let flat: Vec<_> = FILES
+        .iter()
+        .copied()
+        .filter(|(name, _)| !name.contains('/'))
+        .collect();
+    let copy = plain.checkpoint("toy", &flat);
+    let expected = verifier
+        .measure(&plain.root, &copy)
+        .unwrap()
+        .manifest
+        .digest;
+    // A Hugging Face cache outside the store: snapshot files link to the
+    // repository's blobs, and a large one on to the hub's shared blobs.
+    let cache = tempfile::tempdir().unwrap();
+    let hub = cache.path().join("hub");
+    let repository = hub.join("models--org--toy");
+    let blobs = repository.join("blobs");
+    let snapshot = repository.join("snapshots/abc");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snapshot).unwrap();
+    for (index, (name, bytes)) in flat.iter().enumerate() {
+        let digest = sha(bytes);
+        if index == 1 {
+            let shared = hub.join("blobs").join(&digest[..2]);
+            std::fs::create_dir_all(&shared).unwrap();
+            std::fs::write(shared.join(&digest), bytes).unwrap();
+            symlink(
+                format!("../../blobs/{}/{digest}", &digest[..2]),
+                blobs.join(&digest),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(blobs.join(&digest), bytes).unwrap();
+        }
+        symlink(format!("../../blobs/{digest}"), snapshot.join(name)).unwrap();
+    }
     assert_eq!(
         verifier
-            .measure(&store.root, &store.root.join("escape"))
-            .unwrap_err(),
+            .measure(&store.root, &snapshot)
+            .unwrap()
+            .manifest
+            .digest,
+        expected
+    );
+    assert_eq!(
+        verifier.size(&store.root, &snapshot).unwrap().weights_bytes,
+        verifier.size(&plain.root, &copy).unwrap().weights_bytes
+    );
+    // A plain directory outside the store.
+    let outside = tempfile::tempdir().unwrap();
+    let elsewhere = outside.path().join("toy");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    for (name, bytes) in &flat {
+        std::fs::write(elsewhere.join(name), bytes).unwrap();
+    }
+    assert_eq!(
+        verifier
+            .measure(&store.root, &elsewhere)
+            .unwrap()
+            .manifest
+            .digest,
+        expected
+    );
+    // A link out of its own root is refused, as one out of the store is.
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("secret"), "not a checkpoint").unwrap();
+    symlink(other.path().join("secret"), elsewhere.join("escape.json")).unwrap();
+    assert_eq!(
+        verifier.measure(&store.root, &elsewhere).unwrap_err(),
+        CheckpointError::UnsafeFile
+    );
+}
+
+// T37 (ADR 0014 open issue 3): a checkpoint outside the model store whose root
+// other users may write is refused, and a draft model stays inside its own
+// approved root.
+#[test]
+fn an_outside_root_others_may_write_or_a_drafter_outside_its_root_is_refused() {
+    let store = Store::new();
+    let verifier = CheckpointVerifier::in_memory();
+    let outside = tempfile::tempdir().unwrap();
+    let shared = outside.path().join("shared");
+    let checkpoint = shared.join("toy");
+    std::fs::create_dir_all(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("config.json"), "{}").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        verifier.measure(&store.root, &checkpoint).unwrap_err(),
+        CheckpointError::InvalidRoot
+    );
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(verifier.measure(&store.root, &checkpoint).is_ok());
+    let drafter = capyctl_config::effective::DrafterLocation {
+        root: store.root.clone(),
+        path: checkpoint.clone(),
+    };
+    assert_eq!(
+        verifier.drafter_weights(Some(&drafter)).unwrap_err(),
         CheckpointError::InvalidRoot
     );
 }

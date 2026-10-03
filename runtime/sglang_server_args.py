@@ -23,6 +23,7 @@ import argparse
 from dataclasses import dataclass, field
 import json
 import os
+import sys
 
 from . import extra_args_policy
 from . import sglang_entry
@@ -339,6 +340,23 @@ class CheckedServerArgs:
             raise ServerArgsError("effective_args_mismatch") from None
 
 
+def _log_refusal(error):
+    """SPEC §13.3 (found live 2026-10-03): SGLang's own reason for refusing the
+    arguments, for the private engine log, only when the operator turned debug
+    engine logs on (`--debug-engine-logs`); scrubbed of credentials and bounded.
+    The raised category stays closed either way."""
+    if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") != "1":
+        return
+    from .sglang_startup_guards import scrub
+    try:
+        text = "%s: %s" % (type(error).__name__, error)
+    except Exception:
+        return
+    line = scrub(" ".join(text.split()))[:1024]
+    sys.stderr.write("sglang refused the server arguments: " + line + "\n")
+    sys.stderr.flush()
+
+
 def construct_server_args(spec, placement, guarded_constructor, available_bytes=None,
                           approvals=None):
     """Map and check a caller-provided, already guarded ServerArgs class.
@@ -385,7 +403,8 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     try:
         native = guarded_constructor(**keywords)
         native.resolve_once()
-    except Exception:
+    except Exception as error:
+        _log_refusal(error)
         raise ServerArgsError("server_args_construction_failed") from None
     checked = CheckedServerArgs(native, tuple(expected.items()),
                                 settings["cuda_graphs"] is False)

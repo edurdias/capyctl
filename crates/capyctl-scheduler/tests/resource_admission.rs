@@ -49,6 +49,7 @@ fn admission_enforces_device_claim_conflicts() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -110,6 +111,7 @@ fn aggregate_resident_floors_cannot_exceed_observed_usage() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -198,6 +200,7 @@ fn wake_replaces_parked_residue() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -254,6 +257,7 @@ fn reservation_slack_is_not_physical_credit() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 16,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -337,6 +341,7 @@ fn installed_capacity_is_not_available_memory() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -386,6 +391,7 @@ fn two_proposals_cannot_spend_one_epoch() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -450,6 +456,7 @@ fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 16,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -484,4 +491,106 @@ fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
         admit_phase(&state, "a", &f(ResourcePhase::Wake, 67), context),
         Err(ResourceError::Insufficient)
     );
+}
+
+// T26 (ADR 0019 §2, found live on a 16 GB laptop GPU, 2026-10-03): on a device
+// domain the free reserve absorbs memory nothing accounts for (the driver's own
+// reservation, a display server). A deployment charged up to the managed limit
+// starts on an idle card; memory beyond the reserve still refuses it.
+#[test]
+fn a_device_reserve_absorbs_unaccounted_memory() {
+    const MIB: i64 = 1 << 20;
+    let cold = |bytes| PhaseFootprint {
+        phase: ResourcePhase::Cold,
+        allocations: vec![Allocation {
+            domain: "gpu0".into(),
+            bytes,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![],
+    };
+    let limit = |absorbs| MemoryLimit {
+        domain: "gpu0".into(),
+        managed_bytes: 15066 * MIB,
+        free_reserve_bytes: 1310 * MIB,
+        reserve_absorbs_unmanaged: absorbs,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    };
+    let observed = |available| {
+        [MemoryObservation {
+            domain: "gpu0".into(),
+            capacity_bytes: 16376 * MIB,
+            available_bytes: available,
+            sampled_at_ms: 100,
+        }]
+    };
+    let empty = LedgerSnapshot {
+        epoch: 0,
+        owners: Default::default(),
+    };
+    let admit = |absorbs, available, bytes| {
+        let limits = [limit(absorbs)];
+        let observations = observed(available);
+        admit_phase(
+            &empty,
+            "candidate",
+            &cold(bytes),
+            AdmissionContext::new(&observations, &limits, 101, 60, 4),
+        )
+    };
+    // The idle card: 460 MiB held by the driver and a display server.
+    let idle = 15916 * MIB;
+    // 14.48 GiB: FrogNano-4B's derived request plus the CUDA context charge.
+    let charged = 14828 * MIB;
+    assert_eq!(
+        admit(false, idle, charged),
+        Err(ResourceError::Insufficient)
+    );
+    assert_eq!(admit(true, idle, charged), Ok(()));
+    // Exactly the managed limit fits; beyond it the ledger refuses.
+    assert_eq!(admit(true, idle, 15066 * MIB), Ok(()));
+    assert_eq!(
+        admit(true, idle, 15067 * MIB),
+        Err(ResourceError::Insufficient)
+    );
+    // Another program holding 2 GiB more than the reserve absorbs: the card
+    // must still physically hold the charge.
+    let busy = idle - 2048 * MIB;
+    assert_eq!(admit(true, busy, charged), Err(ResourceError::Insufficient));
+    assert_eq!(admit(true, busy, busy), Ok(()));
+    assert_eq!(
+        admit(true, busy, busy + 1),
+        Err(ResourceError::Insufficient)
+    );
+}
+
+// T26: memory CapyCTL's own engines are sampled holding is not absorbed; the
+// reserve stays free beside them.
+#[test]
+fn a_device_reserve_does_not_absorb_attributed_engine_memory() {
+    const MIB: i64 = 1 << 20;
+    let limit = MemoryLimit {
+        domain: "gpu0".into(),
+        managed_bytes: 15066 * MIB,
+        free_reserve_bytes: 1310 * MIB,
+        reserve_absorbs_unmanaged: true,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    };
+    // 460 MiB unaccounted plus 6 GiB an engine holds.
+    let capacity = 16376 * MIB;
+    let available = capacity - 460 * MIB - 6144 * MIB;
+    assert_eq!(
+        limit.required_free(capacity, available, 6144 * MIB),
+        850 * MIB
+    );
+    // Unattributed, the engine's memory lowers the requirement to the physical fit.
+    assert_eq!(limit.required_free(capacity, available, 0), 0);
+    // Host memory keeps its whole reserve.
+    let host = MemoryLimit {
+        reserve_absorbs_unmanaged: false,
+        ..limit
+    };
+    assert_eq!(host.required_free(capacity, available, 0), 1310 * MIB);
 }

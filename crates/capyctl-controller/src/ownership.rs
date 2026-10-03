@@ -104,15 +104,18 @@ impl OwnedCoordinatorState {
     }
 }
 
-fn unsafe_path() -> io::Error {
+/// Found live 2026-10-03: the refusal names the path and the rule it breaks.
+fn unsafe_path(at: &Path, why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "unsafe controller state path",
+        format!("unsafe controller state path {}: {why}", at.display()),
     )
 }
 
 fn validate_directory(path: &Path, uid: u32) -> io::Result<()> {
-    let text = path.to_str().ok_or_else(unsafe_path)?;
+    let text = path
+        .to_str()
+        .ok_or_else(|| unsafe_path(path, "the path is not valid UTF-8"))?;
     if !text.starts_with('/')
         || text.len() > 4000
         || text.chars().any(char::is_control)
@@ -120,15 +123,29 @@ fn validate_directory(path: &Path, uid: u32) -> io::Result<()> {
             .split('/')
             .any(|part| matches!(part, "" | "." | ".."))
     {
-        return Err(unsafe_path());
+        return Err(unsafe_path(
+            path,
+            "the path must be absolute and normalized",
+        ));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != uid
-        || metadata.mode() & 0o7777 != 0o700
-        || path.canonicalize()? != path
-    {
-        return Err(unsafe_path());
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(unsafe_path(path, "not a directory owned by you"));
+    }
+    if metadata.mode() & 0o7777 != 0o700 {
+        return Err(unsafe_path(
+            path,
+            &format!(
+                "its mode is {:o}; capyctl's state directory must be 0700",
+                metadata.mode() & 0o7777
+            ),
+        ));
+    }
+    if path.canonicalize()? != path {
+        return Err(unsafe_path(
+            path,
+            "it is reached through a symbolic link; name its real path",
+        ));
     }
     // ControllerLock additionally verifies every canonical ancestor before
     // creating the lock, so shared/writable parent directories are rejected.
@@ -146,7 +163,10 @@ fn validate_database_file(path: &Path, uid: u32) -> io::Result<()> {
         || metadata.uid() != uid
         || metadata.mode() & 0o7777 != 0o600
     {
-        return Err(unsafe_path());
+        return Err(unsafe_path(
+            path,
+            "not a single-link regular file owned by you with mode 0600",
+        ));
     }
     Ok(())
 }

@@ -267,11 +267,17 @@ pub fn admit_phase(
         // on this domain beyond what its own processes hold (a wake releasing
         // its host copy) is not judged on free memory. Refusing it cannot
         // restore the reserve; it only held the wake until its deadline.
+        // ADR 0019 §2: on a device domain the reserve absorbs memory nothing
+        // accounts for; only the rest of it must stay free.
+        let held = resident_floors
+            .iter()
+            .filter(|f| f.domain == l.domain)
+            .try_fold(0, |sum, f| add(sum, f.bytes))?;
         if own > 0
             && o.available_bytes
                 .checked_sub(remaining)
                 .ok_or(ResourceError::Invalid)?
-                < l.free_reserve_bytes
+                < l.required_free(o.capacity_bytes, o.available_bytes, held)
         {
             return Err(ResourceError::Insufficient);
         }

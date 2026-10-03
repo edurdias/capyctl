@@ -75,8 +75,8 @@ const CACHE_VERSION: u32 = 1;
 /// A closed failure category. It never carries a path, file name or OS text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CheckpointError {
-    /// The model store or checkpoint path is not an absolute directory inside
-    /// the host's model store.
+    /// The model store or checkpoint path is not an absolute directory, or
+    /// one outside the model store sits in a directory other users may write.
     #[error("invalid_root")]
     InvalidRoot,
     /// A file that is not regular, a link that escapes the store or names a
@@ -324,7 +324,16 @@ impl CheckpointVerifier {
         model_store: &Path,
         checkpoint: &Path,
     ) -> Result<CheckpointSize, CheckpointError> {
-        let opened = open_checkpoint(model_store, checkpoint)?;
+        self.size_within(model_store, checkpoint, Confinement::OwnRootOutside)
+    }
+
+    fn size_within(
+        &self,
+        model_store: &Path,
+        checkpoint: &Path,
+        confinement: Confinement,
+    ) -> Result<CheckpointSize, CheckpointError> {
+        let opened = open_checkpoint(model_store, checkpoint, confinement)?;
         let walked = walk(&opened)?;
         let mut size = CheckpointSize {
             weights_bytes: 0,
@@ -356,7 +365,8 @@ impl CheckpointVerifier {
         drafter: Option<&capyctl_config::effective::DrafterLocation>,
     ) -> Result<i64, CheckpointError> {
         drafter.map_or(Ok(0), |drafter| {
-            self.size(&drafter.root, &drafter.path)
+            // ADR 0014 amendment A6: a draft model stays inside its approved root.
+            self.size_within(&drafter.root, &drafter.path, Confinement::Store)
                 .map(|size| size.weights_bytes)
         })
     }
@@ -369,7 +379,7 @@ impl CheckpointVerifier {
         model_store: &Path,
         checkpoint: &Path,
     ) -> Result<Verification, CheckpointError> {
-        let opened = open_checkpoint(model_store, checkpoint)?;
+        let opened = open_checkpoint(model_store, checkpoint, Confinement::OwnRootOutside)?;
         let key = opened.checkpoint.to_string_lossy().into_owned();
         let lock = {
             let mut locks = self.locks.lock().map_err(|_| CheckpointError::Io)?;
@@ -544,7 +554,20 @@ struct Walked {
     identity: FileIdentity,
 }
 
-fn open_checkpoint(model_store: &Path, checkpoint: &Path) -> Result<Opened, CheckpointError> {
+/// Where a walk is confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confinement {
+    /// Inside the given root only (a draft model inside its approved root).
+    Store,
+    /// Inside the model store, or a checkpoint outside it inside its own root.
+    OwnRootOutside,
+}
+
+fn open_checkpoint(
+    model_store: &Path,
+    checkpoint: &Path,
+    confinement: Confinement,
+) -> Result<Opened, CheckpointError> {
     if !model_store.is_absolute() || !checkpoint.is_absolute() {
         return Err(CheckpointError::InvalidRoot);
     }
@@ -556,6 +579,19 @@ fn open_checkpoint(model_store: &Path, checkpoint: &Path) -> Result<Opened, Chec
     let canonical = checkpoint
         .canonicalize()
         .map_err(|_| CheckpointError::InvalidRoot)?;
+    // Found live 2026-10-03 (the guides name an absolute path as a model):
+    // a checkpoint outside the model store is measured inside its own root,
+    // its Hugging Face hub directory for a cache snapshot (whose files link to
+    // the repository's blobs, and those to the hub's shared blobs) and
+    // otherwise its parent directory.
+    // Links are confined to that root exactly as to the store, and a root
+    // other users may write is refused (ADR 0014 open issue 3: the
+    // time-of-check mitigation is a directory others cannot write).
+    let (store, outside) = match canonical.strip_prefix(&store) {
+        Ok(_) => (store, false),
+        Err(_) if confinement == Confinement::OwnRootOutside => (own_root(&canonical)?, true),
+        Err(_) => return Err(CheckpointError::InvalidRoot),
+    };
     let relative = canonical
         .strip_prefix(&store)
         .map_err(|_| CheckpointError::InvalidRoot)?;
@@ -570,6 +606,9 @@ fn open_checkpoint(model_store: &Path, checkpoint: &Path) -> Result<Opened, Chec
         return Err(CheckpointError::InvalidRoot);
     }
     let store_fd = Arc::new(open_chain_from_root(&store)?);
+    if outside && fstat(store_fd.as_raw_fd()).map_err(os_error)?.st_mode & 0o002 != 0 {
+        return Err(CheckpointError::InvalidRoot);
+    }
     let mut fd = store_fd.clone();
     for part in parts {
         let name = CString::new(part.as_bytes()).map_err(|_| CheckpointError::InvalidRoot)?;
@@ -586,6 +625,29 @@ fn open_checkpoint(model_store: &Path, checkpoint: &Path) -> Result<Opened, Chec
         checkpoint_fd: fd,
         root: (identity.device, identity.inode),
     })
+}
+
+/// The root a checkpoint outside the model store is confined to: the hub
+/// directory of a Hugging Face cache snapshot
+/// (`<hub>/models--<org>--<name>/snapshots/<commit>`), else its parent.
+fn own_root(canonical: &Path) -> Result<PathBuf, CheckpointError> {
+    let parent = canonical.parent().ok_or(CheckpointError::InvalidRoot)?;
+    let repository = parent
+        .parent()
+        .filter(|_| parent.file_name().is_some_and(|name| name == "snapshots"))
+        .filter(|repository| {
+            repository
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("models--"))
+        });
+    // The hub's own shared blob store (`<hub>/blobs`) holds the large files
+    // a repository's blobs link to, so a snapshot is confined to its hub.
+    let root = repository.and_then(Path::parent).unwrap_or(parent);
+    if root.parent().is_none() {
+        return Err(CheckpointError::InvalidRoot);
+    }
+    Ok(root.to_path_buf())
 }
 
 /// Port of `_open_chain`: open an absolute path one component at a time from

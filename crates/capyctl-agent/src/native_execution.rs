@@ -560,7 +560,15 @@ impl NativeHostExecution {
         )
         .canonicalize()
         .map_err(|_| JournalError::Unauthorized)?;
-        if !checkpoint.starts_with(root) || !checkpoint.is_dir() {
+        // Found live 2026-10-03: a local model named by an absolute path may
+        // lie outside the store (the guides allow it; a Hugging Face cache
+        // snapshot is the usual case). Its digest walk confines it to its own
+        // root and refuses one other users may write (`verify_checkpoint`).
+        let outside_allowed = matches!(
+            effective.model.source,
+            capyctl_config::model_source::ModelSource::Local { .. }
+        );
+        if !(checkpoint.starts_with(root) || outside_allowed) || !checkpoint.is_dir() {
             return Err(JournalError::Unauthorized);
         }
         if effective.profile.engine == Engine::Vllm {

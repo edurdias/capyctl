@@ -14,7 +14,7 @@ proptest! {
         let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
             available_bytes: 128 - old, sampled_at_ms: 100 }];
         let limits = [MemoryLimit { domain: "system".into(), managed_bytes: peak,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
+            free_reserve_bytes: 12, reserve_absorbs_unmanaged: false, host_kv_bytes: None, parked_bytes: None }];
         let floors = [ResidentFloor { owner: "a".into(), domain: "system".into(),
             bytes: old, sampled_at_ms: 100 }];
         prop_assert_eq!(admit_phase(&state, "a", &f(ResourcePhase::Wake, peak),
@@ -50,6 +50,7 @@ fn categories_and_domains_do_not_create_capacity() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: Some(16),
         parked_bytes: None,
     }];
@@ -121,6 +122,7 @@ fn parked_and_timestamp_limits_are_enforced() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: Some(9),
     }];
@@ -196,6 +198,7 @@ fn spare_system_memory_cannot_cover_a_full_discrete_gpu() {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         },
@@ -203,6 +206,7 @@ fn spare_system_memory_cannot_cover_a_full_discrete_gpu() {
             domain: "gpu-memory:0".into(),
             managed_bytes: 40,
             free_reserve_bytes: 4,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         },

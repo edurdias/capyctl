@@ -308,6 +308,20 @@ fn deployments(value: &Value, names: &HostNames) -> String {
     table(&["NAME", "STATE", "READY", "REVISION", "HOSTS"], &rows)
 }
 
+/// A startup reservation: on a discrete GPU the card's figure with the host
+/// RAM beside it (ADR 0019 §3), else the one pool's.
+pub(crate) fn startup(startup: &Value) -> String {
+    match (
+        number(&startup["device_bytes"]),
+        number(&startup["host_bytes"]),
+    ) {
+        (Some(device), Some(host)) => format!("{} (+{} RAM)", gib(device), gib(host)),
+        _ => number(&startup["bytes"])
+            .map(gib)
+            .unwrap_or_else(|| "-".into()),
+    }
+}
+
 pub(crate) fn operation(op: &Value) -> String {
     if !op.is_object() {
         return "-".into();
@@ -341,9 +355,7 @@ fn last_error(instance: &Value) -> String {
 
 fn status(value: &Value, names: &HostNames) -> String {
     let d = value;
-    let startup = number(&d["startup"]["bytes"])
-        .map(gib)
-        .unwrap_or_else(|| "-".into());
+    let startup = startup(&d["startup"]);
     let initialize = number(&d["timeouts"]["initialize_ms"])
         .map(seconds)
         .unwrap_or_else(|| "-".into());
@@ -370,6 +382,29 @@ fn status(value: &Value, names: &HostNames) -> String {
             operation(&d["latest_operation"]),
         ]],
     );
+    // Found live 2026-10-03: a start that waits (for memory, a measurement)
+    // or a checkpoint the host cannot measure says why here, not only in
+    // the JSON.
+    let mut notes = Vec::new();
+    let op = &d["latest_operation"];
+    if op["state"] == "pending" {
+        if let Some(reason) = op["reason"].as_str().and_then(|r| r.lines().next()) {
+            notes.push(format!("Waiting     {}: {}", operation(op), clean(reason)));
+        }
+    }
+    if let Some(diagnostic) = d["checkpoint_digest"]["diagnostic"].as_str() {
+        notes.push(format!(
+            "Checkpoint  could not be measured ({})",
+            clean(diagnostic)
+        ));
+    }
+    if !notes.is_empty() {
+        out.push('\n');
+        for note in notes {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
     let instances: Vec<Vec<String>> = d["instances"]
         .as_array()
         .into_iter()
@@ -728,6 +763,39 @@ mod tests {
         assert!(lines[4].contains("gpu-a"), "{out}");
         assert!(lines[4].ends_with("engine exited with code 1"), "{out}");
         assert!(!out.contains("tiers"), "latency stays in the JSON");
+    }
+
+    // T16 (found live on a 16 GB laptop GPU, 2026-10-03): on a discrete GPU
+    // STARTUP is the card's figure, with the host RAM beside it, not their
+    // sum; a start waiting for memory says why under the table, and so does
+    // a checkpoint the host could not measure.
+    #[test]
+    fn status_shows_the_cards_startup_and_why_a_start_waits() {
+        let out = render(
+            View::Status,
+            &json!({"name": "fv", "kind": "model", "desired_state": "running",
+                "observed_state": "queued", "ready_instances": 0, "desired_instances": 1,
+                "revision": "1",
+                "startup": {"bytes": 19_838_388_100_i64, "device_bytes": 15_543_420_804_i64,
+                    "host_bytes": 4_294_967_296_i64},
+                "checkpoint_digest": {"state": "pending", "provisional": true,
+                    "diagnostic": "invalid_root"},
+                "latest_operation": {"kind": "initialize", "state": "pending",
+                    "reason": "gave up: resource or evidence check failed: insufficient resources"},
+                "instances": []}),
+            &names(),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains("14.5 GiB (+4.0 GiB RAM)"), "{out}");
+        assert!(!out.contains("18.5 GiB"), "{out}");
+        assert!(
+            out.contains("Waiting     initialize pending: gave up: resource or evidence check failed: insufficient resources"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Checkpoint  could not be measured (invalid_root)"),
+            "{out}"
+        );
     }
 
     // T16: an instance whose launch failed shows the failure's code and

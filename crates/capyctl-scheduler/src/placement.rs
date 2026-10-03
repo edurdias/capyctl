@@ -416,6 +416,7 @@ mod tests {
                 domain: "unified".into(),
                 managed_bytes: managed,
                 free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: None,
                 parked_bytes: None,
             }],
@@ -736,6 +737,7 @@ mod tests {
                 domain: (*domain).into(),
                 managed_bytes: managed,
                 free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: None,
                 parked_bytes: None,
             })

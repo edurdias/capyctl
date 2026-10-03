@@ -115,7 +115,12 @@ fn deploy(value: &Value, context: &Context) -> String {
             .row("Revision", s(&d["revision"]))
             .row("Hosts", table::instance_hosts(d, context.names))
             .row("Ready", table::ready(d))
-            .row_opt("Startup", d["startup"]["bytes"].as_i64().map(gib))
+            .row_opt(
+                "Startup",
+                d["startup"]["bytes"]
+                    .is_i64()
+                    .then(|| table::startup(&d["startup"])),
+            )
             .row_opt(
                 "Context",
                 d["context"]["tokens"]
