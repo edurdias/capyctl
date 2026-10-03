@@ -580,6 +580,7 @@ impl SglangAdapter {
                 command.action, command.context.token.step_id
             ),
             facts: vec![fact],
+            kernel_builds: Vec::new(),
         })
     }
 }

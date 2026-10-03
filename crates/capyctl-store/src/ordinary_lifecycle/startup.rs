@@ -2,8 +2,9 @@
 //!
 //! A launch's memory peaks while it initializes (weights read through
 //! transient buffers, kernel compilation, graph capture) and settles at its
-//! steady request once Ready. Admission reserves the startup peak as the cold
-//! phase from arm until Ready (ADR 0007 already distinguishes cold from
+//! steady request once Ready. The measured peak leaves out the samples taken
+//! while a kernel build ran (ADR 0014 amendment A11). Admission reserves the
+//! startup peak as the cold phase from arm until Ready (ADR 0007 already distinguishes cold from
 //! ready), and the Ready completion replaces it with the steady footprint.
 //!
 //! The peak is, in order of preference:

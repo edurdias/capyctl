@@ -619,3 +619,64 @@ default would not change what it can hold. Live at the default 4 GiB KV cache:
   state cache": 2.30 GB left, 146.81 MB of state per request, kept for every draft token).
 
 A hybrid SGLang deployment with a draft model declares `memory.kv_cache` (16 GiB works).
+
+## Amendment A11: kernel builds are not part of the startup peak (owner decision 2026-10-02)
+
+Problem: found live on 2026-10-02 while verifying SGLang 0.5.21 on a GB10 (unified
+memory). A first start with an empty JIT cache built FlashInfer kernels for about
+9 minutes (`MAX_JOBS` 14) and recorded a measured startup peak of 111 GiB, where the
+same deployment normally peaks at about 45 GiB. The compilers' memory comes from the
+pool the peak is measured in, so the measurement was the build's. Peaks merge with
+`MAX` (amendment A2), so every later start of that deployment was refused
+`capacity_blocked`. Starting the other SGLang environment rebuilt the kernels, because
+the shared JIT cache's build files name the environment's path, and recorded 108 GiB.
+vLLM, which builds FlashInfer kernels, can do the same. TensorFold builds its CUDA
+extensions on its first start (ADR 0023 §4), but a TensorFold deployment declares its
+`resources`, so no peak is measured for it.
+
+Decision (owner, option A): the startup peak records the engine's own memory, not the
+memory of a kernel build.
+
+- **Where builds happen.** The owner's option A was phrased as "start recording when
+  the engine begins loading weights". On the engines CapyCTL runs, that point does not
+  separate builds from loading. SGLang and FlashInfer build each kernel the first time
+  it is used, which is after weight loading has begun (SGLang's KV cache, rotary and
+  speculative sampling kernels, FlashInfer's attention and GEMM modules). TensorFold
+  builds at its first start or request, and vLLM builds FlashInfer kernels during
+  warmup. A log line such
+  as SGLang's `Load weight begin` would still count the builds, and every engine
+  version words it differently.
+- **Signal.** Every one of these builds runs as child processes of the engine, in the
+  process group CapyCTL launched it in: `ninja` with `nvcc`, `cicc`, `ptxas`, `c++` or
+  `cc1plus` under it. The signal is the same for every engine: a compiler in the
+  engine's process group. While an Initialize runs, its host checks the group every
+  500 ms (`capyctl-launchers` `group_building`, which reads `/proc/<pid>/stat`). It
+  reports each span with a compiler as a kernel build, in the host's clock, with the
+  readiness result (`EffectObservation.kernel_builds`; `MemberExecutionResult` field
+  15, at most 64 spans).
+  - A span starts at the last check that saw no compiler and ends at the first check
+    that sees none again, so it brackets the build.
+  - `ninja` runs for the whole build, so the short compiler steps between two checks
+    are covered.
+- **Rule.** The coordinator keeps the availability samples of an Initialize and
+  measures the peak from the samples outside every reported build. Samples before
+  and after a build count as before. A start whose every sample fell inside a build
+  records no peak, so the next start keeps the placeholder (A8) and measures then. A
+  measurement still merges with `MAX`. If the engine's own peak happened during a
+  build and was left out, the next start, which builds nothing, measures it and
+  raises the stored peak.
+- **Fallback.** A build this signal cannot see is still counted, as before this
+  amendment. That covers compilation inside the engine process (Triton, NVRTC,
+  torch.compile in process), a build shorter than one check between two checks, a
+  build whose compiler leaves the engine's process group, a launcher that cannot read
+  `/proc`, and an older host, which reports no builds. In those cases an inflated peak
+  is cleared by deleting and redeploying the deployment. A reset command (option C)
+  was not chosen.
+- **Stored peaks.** A peak recorded before this amendment is not changed: the store
+  cannot tell which of them came from a start that built kernels. A deployment that
+  is now `capacity_blocked` because of one is deleted and redeployed once (release
+  notes). After that, a start that builds records no build memory, so nothing new
+  needs healing.
+
+Nothing here changes admission, the placeholder or a declared peak. Only the
+measurement changes.

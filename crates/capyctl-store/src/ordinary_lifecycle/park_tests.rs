@@ -187,6 +187,7 @@ impl Lab {
                     observed_at_ms: now,
                     receipt: "fake host".into(),
                     facts: kind.facts().to_vec(),
+                    kernel_builds: Vec::new(),
                 },
                 now,
             )
@@ -339,6 +340,7 @@ fn evidence_must_name_the_retained_group_and_exact_facts() {
         observed_at_ms: 1_250,
         receipt: "host".into(),
         facts,
+        kernel_builds: Vec::new(),
     };
     for (ids, facts) in [
         (group(99), vec![Milestone::MemoryReleased]),

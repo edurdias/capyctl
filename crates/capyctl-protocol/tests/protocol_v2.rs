@@ -219,6 +219,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         refused: String::new(),
         launch_failure: String::new(),
         source: None,
+        kernel_builds: Vec::new(),
     }
 }
 

@@ -230,6 +230,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         refused: String::new(),
         launch_failure: String::new(),
         source: None,
+        kernel_builds: Vec::new(),
     }
 }
 
@@ -367,5 +368,41 @@ fn a_launch_failure_is_one_bounded_line_on_an_exited_launch_only() {
     let probe = probe("launch");
     let mut on_probe = ready_result(&probe);
     on_probe.launch_failure = "the engine exited before readiness".into();
+    assert!(validate_result(&probe, &on_probe).is_err());
+}
+
+// T29 (ADR 0014 amendment A11): kernel build spans ride a usable launch only,
+// ordered and bounded; any other result carrying them is refused.
+#[test]
+fn kernel_builds_ride_a_usable_launch_only() {
+    use capyctl_protocol::execution::{validate_result, MAX_KERNEL_BUILDS};
+    let span = |from_unix_ms, until_unix_ms| pb::KernelBuildSpan {
+        from_unix_ms,
+        until_unix_ms,
+    };
+    let command = launch_single();
+    let mut ready = ready_result(&command);
+    ready.state = "launched".into();
+    ready.owned_handle = command.identity.command_id.clone();
+    ready.binding_id = "01K00000000000000000000001".into();
+    ready.incarnation = "01K00000000000000000000002".into();
+    validate_result(&command, &ready).unwrap();
+    ready.kernel_builds = vec![span(10, 20), span(30, 30)];
+    validate_result(&command, &ready).unwrap();
+    for bad in [
+        vec![span(20, 10)],
+        vec![span(-1, 10)],
+        vec![span(1, 2); MAX_KERNEL_BUILDS + 1],
+    ] {
+        let mut refused = ready.clone();
+        refused.kernel_builds = bad;
+        assert!(validate_result(&command, &refused).is_err());
+    }
+    let mut unusable = ready.clone();
+    unusable.model_usable = false;
+    assert!(validate_result(&command, &unusable).is_err());
+    let probe = probe("launch");
+    let mut on_probe = ready_result(&probe);
+    on_probe.kernel_builds = vec![span(10, 20)];
     assert!(validate_result(&probe, &on_probe).is_err());
 }

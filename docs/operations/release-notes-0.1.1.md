@@ -15,6 +15,12 @@ unchecked in this release.
 
 ## Other changes
 
+- A first start of vLLM or SGLang that builds kernels (an empty FlashInfer
+  or SGLang kernel cache) no longer records the build's memory as the
+  deployment's startup peak, which left every later start of that
+  deployment `capacity_blocked` on a unified-memory host. A deployment that
+  recorded such a peak before this release keeps it: delete it and deploy it
+  again once.
 - A readiness check now accepts a model that answers with reasoning first.
 - New exit code 26, `toolchain_missing`, from `capyctl engine add`.
 - A client that hangs up in the middle of a streamed answer now stops the

@@ -399,6 +399,7 @@ impl LifecycleState {
             observed_at_ms,
             receipt: format!("fake-lifecycle-v1:{:?}:{}", command.action, c.token.step_id),
             facts,
+            kernel_builds: Vec::new(),
         })
     }
 }

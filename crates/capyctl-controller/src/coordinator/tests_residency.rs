@@ -101,6 +101,7 @@ impl EngineAdapter for Residency {
                 observed_at_ms: self.clock.load(Ordering::SeqCst),
                 receipt: format!("scripted {:?}", command.action),
                 facts,
+                kernel_builds: Vec::new(),
             }),
         }
     }

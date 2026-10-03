@@ -519,6 +519,16 @@ message MemberExecutionResult {
   string launch_failure = 13;
   // MaterializeSource results only (ADR 0008).
   ModelSourceEvidence source = 14;
+  // ADR 0014 amendment A11: a usable LaunchSingle only. When the engine's
+  // process group ran a compiler before readiness, in the host's Unix
+  // milliseconds; at most 64 spans, each with from <= until. Empty when none
+  // was seen. An older host sends none, and the startup peak then counts
+  // every sample as before.
+  repeated KernelBuildSpan kernel_builds = 15;
+}
+message KernelBuildSpan {
+  int64 from_unix_ms = 1;
+  int64 until_unix_ms = 2;
 }
 message ModelSourceEvidence {
   string state = 1;                 // pending | downloading | verified | failed

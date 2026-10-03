@@ -583,6 +583,9 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
     }
 }
 
+/// ADR 0014 amendment A11: the most kernel build spans one launch reports.
+pub const MAX_KERNEL_BUILDS: usize = 64;
+
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
 pub fn validate_result(
@@ -612,6 +615,18 @@ pub fn validate_result(
         {
             return Err(GroupIdentityError);
         }
+    }
+    // ADR 0014 amendment A11: kernel builds belong to a usable launch only.
+    if !result.kernel_builds.is_empty()
+        && (!matches!(command.action, MemberAction::LaunchSingle(_))
+            || !result.model_usable
+            || result.kernel_builds.len() > MAX_KERNEL_BUILDS
+            || result
+                .kernel_builds
+                .iter()
+                .any(|b| b.from_unix_ms < 0 || b.from_unix_ms > b.until_unix_ms))
+    {
+        return Err(GroupIdentityError);
     }
     // A probe, park or restore reports on exactly the launch it names, whatever
     // the outcome.
