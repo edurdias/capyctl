@@ -499,7 +499,10 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let dir = tempfile::tempdir().unwrap();
         let ninja = dir.path().join("ninja");
-        std::fs::copy("/bin/sleep", &ninja).unwrap();
+        // A link, not a copy: a copy's write descriptor can leak into a child
+        // another test forks meanwhile, and exec then fails with ETXTBSY. The
+        // kernel names the process after the link.
+        std::os::unix::fs::symlink("/bin/sleep", &ninja).unwrap();
         let identity = |child: &std::process::Child| {
             let pid = child.id();
             let boot = read_boot().unwrap();
