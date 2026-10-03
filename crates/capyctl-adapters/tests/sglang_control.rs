@@ -341,9 +341,12 @@ async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
     assert_eq!(requests[2].path, "/flush_cache?timeout=0");
     assert_eq!(requests[3].path, "/v1/chat/completions");
     assert_eq!(requests[3].authorization, "Bearer inference-secret");
+    // Found live 2026-10-02 (SGLang 0.5.20 and 0.5.21, Qwen3-4B): a thinking
+    // model spends the 8-token probe on its trace, so every deep wake was left
+    // uncertain. The probe asks the chat template to skip thinking.
     assert_eq!(
         requests[3].body,
-        json!({"model":MODEL,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false})
+        json!({"model":MODEL,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false,"chat_template_kwargs":{"enable_thinking":false}})
     );
     assert!(requests[..3]
         .iter()

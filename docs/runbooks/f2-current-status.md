@@ -1,5 +1,69 @@
 # Current implementation and launch status
 
+## SGLang 0.5.21 verified — 2026-10-02 (branch `feat/verify-sglang-0.5.21`)
+
+SGLang 0.5.21 joins 0.5.20 in the verified set (ADR 0018), so `engine add`
+shows it `custom no`; 0.5.22 and later stay custom. The upgrade keeps torch
+2.13.0, FlashInfer 0.6.18, sglang-kernel 0.4.7, transformers 5.12.1 and
+torch-memory-saver 0.0.10, and changes nothing CapyCTL drives: the
+ServerArgs record and its resolution, `launch_server`'s scheduler target, the
+scheduler and tokenizer manager hooks, the release, resume, reload and flush
+routes and their replies, and the metric names are the same. Of the 21 new
+options, none has a listener, path, configuration or code shape, and the new
+`--disaggregation-*` and `--hicache-storage-backend tensorcast` fall in
+reserved families. The new routes (`/v1/decisions`, `/v1/systemone`,
+`/pd_role_switch`, `/begin_weight_update`, `/end_weight_update`) are not
+forwarded. `--kv-cache-dtype` no longer accepts `fp4_e2m1`; CapyCTL never
+rendered it. A request-supplied `chat_template` is now refused unless the
+server runs with `--trust-request-chat-template`.
+
+One CapyCTL bug found and fixed, on both versions: the SGLang wake probe
+(`max_tokens: 8`, exact `OK`) was spent on Qwen3-4B's thinking, so every deep
+wake of a thinking model was left uncertain after resume, reload and flush had
+succeeded. The probe now sends `chat_template_kwargs: {"enable_thinking":
+false}`.
+
+Live on host B (standalone from this branch, fresh 0700 state and config
+directories, a new owner-approved `~/sglang-0.5.21-venv` beside the existing
+0.5.20 one, both registered in the same standalone). Same prompts on both,
+temperature 0, through the CapyCTL endpoint; context sweep 3 requests per
+point, decode 3 streams of 512 tokens one at a time.
+
+| | 0.5.20 | 0.5.21 |
+|---|---|---|
+| Qwen3-4B ready, cold (digest measured) | 99 s | 134 s (first start, kernel builds) |
+| Qwen3-4B ready, warm | 59 to 99 s | 74 to 102 s |
+| Qwen3-4B TTFT, 1k / 8k prompt | 0.149 / 1.169 s | 0.149 / 1.169 s |
+| Qwen3-4B decode, one stream | 22.3 tok/s | 22.3 tok/s |
+| Qwen3-4B measured startup peak | 19.4 GiB | 19.7 GiB |
+| Qwen3-4B request while parked | 91 s | 47 to 90 s |
+| Qwen3.8-27B NVFP4 + DFlash2 ready, new deployment (kernels already built) | 158 s | 169 s |
+| Qwen3.8-27B ready, warm | 173 s | 161 s |
+| Qwen3.8-27B TTFT, 1k / 8k prompt | 0.453 / 4.155 s | 0.456 / 4.165 s |
+| Qwen3.8-27B decode, one stream | 29.1 tok/s (24.4 to 29.3) | 29.1 tok/s (24.5 to 29.2) |
+| Qwen3.8-27B measured startup peak | 44.6 GiB | 44.9 GiB |
+
+The 27B deployments set `memory: {request: 48GiB, kv_cache: 16GiB}`. A wake
+is mostly the reload from disk (8 GB in 45 to 85 s on this host). On 0.5.21:
+park 2 s; the request while parked woke it (resume, reload, flush, probe);
+`--reasoning-parser qwen3` streamed 199 `reasoning_content` deltas and woke
+the same way; a stream hung up after 2 s and a park right after it settled in
+0.6 to 1.1 s; `start --evict` of the 27B parked Qwen3-4B (`released:
+parked`); shutdown with one stream in flight drained it (`drained: true`,
+`in_flight_at_close: 1`, the stream ended with `[DONE]`).
+
+Open finding, not fixed here: a start that builds kernels records the build's
+memory as its startup peak. The first 0.5.21 start of the 27B built FlashInfer
+kernels for 9 minutes (`MAX_JOBS` 14 from 117 GiB available) and recorded a
+111 GiB peak, and every later start of that deployment was refused
+`capacity_blocked`. The two SGLang environments share FlashInfer's JIT cache,
+so starting one after the other rebuilt the kernels again (one start took
+479 s and recorded 108 GiB). Deleting and redeploying cleared it.
+
+Cleanup: deployments deleted, both profiles removed, drained shutdown, state
+removed, no CapyCTL or engine process left; the environments and models are
+kept.
+
 ## TensorFold 0.6.3 verified — 2026-10-02 (branch `feat/verify-tensorfold-0.6.3`)
 
 TensorFold 0.6.3 joins 0.6.0 to 0.6.2 in the verified set (ADR 0023 §1), so

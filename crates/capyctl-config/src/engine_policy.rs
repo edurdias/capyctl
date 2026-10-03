@@ -535,7 +535,7 @@ const CONFIG_SUFFIXES: &[&str] = &["-config"];
 const CODE_SUFFIXES: &[&str] = &["-cls", "-class", "-loader"];
 
 /// Sensitive-shaped option names the installed parsers declare (SGLang 0.5.20
-/// `arg_groups/field_order.py`; vLLM `serve`), listed so an abbreviation of
+/// `arg_groups/field_order.py`, no new ones in 0.5.21; vLLM `serve`), listed so an abbreviation of
 /// one is refused at deploy time. The launch-time check on the parsed
 /// destination remains the authority for names not listed here.
 const SGLANG_SHAPED: &[&str] = &[
