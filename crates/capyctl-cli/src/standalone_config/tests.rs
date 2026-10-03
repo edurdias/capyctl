@@ -2096,3 +2096,103 @@ fn a_registered_denial_of_extra_args_holds_on_standalone() {
         "{refused}"
     );
 }
+
+/// The policy a unified standalone of `CAPACITY` bytes derives, before any
+/// stated memory limit.
+fn derived_unified() -> Value {
+    host_policy(
+        &named(&installed(Engine::Vllm, "/bin/true")),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+        PORTS,
+    )
+}
+
+fn domain_bytes(host: &Value, domain: &str, field: &str) -> i64 {
+    host["resource_policy"]["domains"][domain][field]
+        .as_str()
+        .unwrap()
+        .trim_end_matches('B')
+        .parse::<i64>()
+        .unwrap()
+}
+
+// T03 (owner decision 2026-10-03: standalone is a server and one host, every
+// setting three ways; found live 2026-10-03, a TensorFold declaration of
+// 84 GiB refused under the fixed 50 % limit): the document's
+// `host.resource_policy.memory.system` limits replace the derived ones, as a
+// size or a share of the observed memory; `auto` keeps the default.
+#[test]
+fn stated_memory_limits_replace_the_derived_ones() {
+    let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "90GiB", "free_reserve": "auto"}}}});
+    let mut host = derived_unified();
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, DOMAIN, "managed_limit"), 90 << 30);
+    assert_eq!(
+        domain_bytes(&host, DOMAIN, "free_reserve"),
+        CAPACITY / 100 * FREE_RESERVE_FRACTION,
+        "auto keeps the derived reserve"
+    );
+
+    let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "75%", "free_reserve": "10%"}}}});
+    let mut host = derived_unified();
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, DOMAIN, "managed_limit"), CAPACITY / 100 * 75);
+    assert_eq!(domain_bytes(&host, DOMAIN, "free_reserve"), CAPACITY / 100 * 10);
+
+    // Nothing stated: the derived policy, unchanged.
+    let mut host = derived_unified();
+    apply_stated_memory(&mut host, &serde_json::json!({}), CAPACITY).unwrap();
+    assert_eq!(host, derived_unified());
+}
+
+// T03: the managed limit and the free reserve are simultaneous constraints on
+// one memory, so together they must fit what the host observes; the parked and
+// host-KV sub-limits never exceed a lowered managed limit.
+#[test]
+fn stated_memory_limits_must_fit_the_observed_memory() {
+    for (managed, reserve) in [("120GiB", "auto"), ("90%", "20%"), ("200GiB", "0B")] {
+        let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+            "managed_limit": managed, "free_reserve": reserve}}}});
+        let mut host = derived_unified();
+        let error = apply_stated_memory(&mut host, &stated, CAPACITY).unwrap_err();
+        assert!(
+            error.contains("host.resource_policy.memory.system") && error.contains("GiB"),
+            "{managed}/{reserve}: {error}"
+        );
+    }
+    let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "8GiB"}}}});
+    let mut host = derived_unified();
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, DOMAIN, "parked_limit"), 8 << 30);
+    assert_eq!(domain_bytes(&host, DOMAIN, "host_kv_limit"), 8 << 30);
+}
+
+// T03 (ADR 0019): on a discrete host the stated limits are host RAM's, the
+// `system` domain; each card's own domain keeps its derived limits.
+#[test]
+fn stated_memory_limits_apply_to_host_ram_on_a_discrete_host() {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let derived = host_policy(
+        &named(&installed(Engine::Vllm, "/bin/true")),
+        "env-1",
+        CAPACITY,
+        None,
+        &shape,
+        PORTS,
+    );
+    let mut host = derived.clone();
+    let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "80%"}}}});
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, "system", "managed_limit"), CAPACITY / 100 * 80);
+    assert_eq!(
+        host["resource_policy"]["domains"]["gpu0"],
+        derived["resource_policy"]["domains"]["gpu0"]
+    );
+}
