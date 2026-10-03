@@ -257,10 +257,14 @@ impl ControlHttp {
             ),
             RuntimeAction::InvalidateCache => ("/flush_cache?timeout=0", Value::Null),
             // SPEC §8.3: ask for the exact usability marker without inviting
-            // punctuation (Qwen2.5-1.5B otherwise answers "OK.").
+            // punctuation (Qwen2.5-1.5B otherwise answers "OK."). Found live
+            // 2026-10-02 (SGLang 0.5.20 and 0.5.21): Qwen3-4B spent all 8
+            // tokens thinking, so every deep wake was left uncertain.
+            // `enable_thinking: false` asks the chat template to skip the
+            // trace; a template without the switch ignores it.
             RuntimeAction::Probe => (
                 "/v1/chat/completions",
-                json!({"model":self.model,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false}),
+                json!({"model":self.model,"messages":[{"role":"user","content":"Reply with exactly the two letters OK and nothing else. Do not add punctuation."}],"temperature":0,"max_tokens":8,"stream":false,"chat_template_kwargs":{"enable_thinking":false}}),
             ),
             _ => return Err(RuntimeError::Unsupported),
         };
