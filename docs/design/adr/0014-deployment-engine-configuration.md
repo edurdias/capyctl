@@ -897,8 +897,9 @@ Rule:
   `extra_args`) name `--speculative-algorithm` defaults to `restart_only`, as TensorFold
   does (ADR 0023 §6). The default is named in the provenance, so an existing revision
   re-resolves to it.
-- Such a deployment that states `deep` or `host_backed` is refused when it is resolved,
-  `capability_missing`, with the reason and `restart_only` as the way out.
+- Such a deployment that states `deep` or `host_backed` is refused when it is resolved, as
+  an invalid configuration (`unsupported combination at residency`) whose message gives
+  the reason and `restart_only` as the way out.
 - vLLM's speculative deployments are unchanged.
 - An enrollment that stops part way writes one line to the engine's log,
   `capyctl_saver_enrollment_refused`, with a fixed stage word (`arguments`, `library`,
@@ -907,7 +908,22 @@ Rule:
   observation scope, or without the memory saver, logs nothing.
 
 Evidence: `crates/capyctl-config/tests/sglang_speculative_residency.rs` and
-`test_a_refused_enrollment_names_its_stage` (runtime). CPU tests only.
+`test_a_refused_enrollment_names_its_stage` (runtime).
+
+Live (2026-10-03, GB10, SGLang 0.5.21, Qwen3.8-27B NVFP4 with DFlash2, request 55 GiB, KV
+cache 16 GiB, two running requests):
+
+- Before: the deployment resolved `deep` and started with the memory saver on and
+  `speculative_algorithm` `DFLASH`. The host's observation directory stayed empty. Both
+  gauges read 0.0, and the park was refused with the host log line
+  `saver_observation_unavailable` / `record_unreadable`.
+- Started with this change's runtime, the engine log carried
+  `capyctl_saver_enrollment_refused` with stage `install`, error `BridgeError` and code
+  `topology`.
+- After: the same file resolved `restart_only` (memory saver off, no refusal line), served
+  requests, and stopped and started again (258 s to ready). A park request is answered
+  `unsupported_capability`, as for any `restart_only` deployment. The same file with
+  `residency: deep` was refused at deploy with the reason.
 
 Follow-up: parking a speculative SGLang deployment. It needs the topology check to admit the
 speculative algorithm, a wake that restores the draft's weights (its own path on a disk

@@ -19,7 +19,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `multi_gpu_unsupported` | The deployment names two GPUs or asks for tensor parallelism. | Use one GPU per model. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
-| 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold), or a deployment asking such an engine to park, or an SGLang deployment with `--speculative-algorithm` asking to park. | Leave `--deep-park` out; use `residency: restart_only`. |
+| 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold), or a deployment asking such an engine to park. | Leave `--deep-park` out; use `residency: restart_only`. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
 | 7 | `device_conflict` | Another deployment holds the GPU exclusively. | Stop that deployment or choose another device. |
 | 8 | `category_limit` | A host limit on how many models of this kind may run was reached. | Stop one, or raise the limit in the host document. |
