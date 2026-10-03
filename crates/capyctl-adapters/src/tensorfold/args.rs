@@ -18,6 +18,7 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "HF_HUB_OFFLINE",
     "TRANSFORMERS_OFFLINE",
     "TENSORFOLD_NO_UPDATE_CHECK",
+    "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
     "TORCH_EXTENSIONS_DIR",
     "CAPYCTL_ENGINE_LOG",
     "CUDA_HOME",
@@ -49,6 +50,10 @@ pub struct PlanInputTensorfold {
     /// ADR 0023 §4: the bound a launch with an existing build
     /// gives up at, in milliseconds.
     pub warm_startup_ms: i64,
+    /// ADR 0023 §4 (amended 2026-10-03): the deployment's declared Ready
+    /// allocation on the GPU's memory, which caps TensorFold's CUDA budget
+    /// (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`). `None` renders no cap.
+    pub memory_limit_bytes: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -175,12 +180,32 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     if let Some(dir) = &input.extensions_dir {
         env.insert("TORCH_EXTENSIONS_DIR".into(), dir.clone());
     }
+    // ADR 0023 §4 (amended 2026-10-03, found live): without a cap TensorFold
+    // grants itself the machine's free memory less a floor, and its streams'
+    // caches grow into it past the declaration. TensorFold 0.6.3 caps that
+    // grant with this variable; earlier versions ignore it.
+    if let Some(bytes) = input.memory_limit_bytes.filter(|bytes| *bytes > 0) {
+        env.insert("TENSORFOLD_CUDA_MEMORY_LIMIT_GB".into(), gib_text(bytes));
+    }
     if let Some(namespace) = &input.cuda_namespace {
         for (name, value) in namespace.environment() {
             env.insert(name.into(), value);
         }
     }
     Ok(RenderedCommand { argv, env })
+}
+
+/// `bytes` in GiB, rounded down to a whole MiB, written exactly (a MiB is
+/// 1/1024 GiB, a finite decimal): `58`, `58.5`.
+fn gib_text(bytes: i64) -> String {
+    let mib = bytes >> 20;
+    let (whole, rest) = (mib / 1024, mib % 1024);
+    if rest == 0 {
+        return whole.to_string();
+    }
+    // rest / 1024 = rest * 9765625 / 10^10, exactly.
+    let fraction = format!("{:010}", rest * 9_765_625);
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
 }
 
 /// The closed environment one launch starts with (SPEC §13.3): the rendered

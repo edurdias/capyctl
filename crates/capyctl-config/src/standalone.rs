@@ -18,8 +18,10 @@
 //! runtime profiles. The models directory and model sources, the engine
 //! installation (`host.local_engine`), the runtime directory
 //! (`host.runtime_dir`), the engines' port range
-//! (`host.resource_policy.endpoint_port_range`) and the queue bounds
-//! (`host.resource_policy.queue`) are honoured as on a host
+//! (`host.resource_policy.endpoint_port_range`), the queue bounds
+//! (`host.resource_policy.queue`) and the memory limits
+//! (`host.resource_policy.memory.system`, ADR 0025: a size or a share of the
+//! observed memory) are honoured as on a host
 //! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` /
 //! `CAPYCTL_INFERENCE_ADDR` or `--management-listen` / `CAPYCTL_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
@@ -265,6 +267,75 @@ fn check_state_dir(
     Ok(())
 }
 
+/// The memory limits a standalone document may state under
+/// `host.resource_policy.memory.system` (owner decision 2026-10-03: standalone
+/// is a server and one host, every setting three ways). `auto` keeps the
+/// derived default.
+pub const STATED_MEMORY_LIMITS: &[&str] = &["managed_limit", "free_reserve"];
+
+/// A stated standalone memory limit: a size, or a whole percentage of the
+/// memory the host observes at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryShare {
+    Bytes(i64),
+    Percent(i64),
+}
+
+impl MemoryShare {
+    /// `auto` is `None`; `N%` is a whole percentage from 0 to 100; anything
+    /// else is a size (`90GiB`). The field's own range is checked by
+    /// [`check_memory_limit`].
+    pub fn parse(text: &str) -> Result<Option<Self>, String> {
+        if text == "auto" {
+            return Ok(None);
+        }
+        if let Some(number) = text.strip_suffix('%') {
+            return match number.parse::<i64>() {
+                Ok(percent) if (0..=100).contains(&percent) && !number.starts_with('+') => {
+                    Ok(Some(Self::Percent(percent)))
+                }
+                _ => Err(format!(
+                    "`{text}` is not a whole percentage from 0% to 100%"
+                )),
+            };
+        }
+        crate::effective::parse_bytes(text)
+            .map(|bytes| Some(Self::Bytes(bytes)))
+            .map_err(|_| {
+                format!("`{text}` is neither `auto`, a size such as `90GiB` nor a percentage such as `70%`")
+            })
+    }
+
+    /// The bytes this share is of `capacity`.
+    pub fn of(self, capacity: i64) -> i64 {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Percent(percent) => capacity / 100 * percent,
+        }
+    }
+}
+
+/// One stated memory limit's form and range: the managed limit is above zero
+/// and the free reserve below the whole memory. Whether the two fit the
+/// observed memory together is checked at start, when it is known.
+fn check_memory_limit(field: &str, value: &Value, path: &str) -> Result<(), ConfigError> {
+    let Some(text) = value.as_str() else {
+        return Err(refuse(path, "a memory limit is `auto`, a size or a percentage"));
+    };
+    let share = MemoryShare::parse(text).map_err(|detail| refuse(path, detail))?;
+    match (field, share) {
+        ("managed_limit", Some(MemoryShare::Bytes(0) | MemoryShare::Percent(0))) => Err(refuse(
+            path,
+            "the managed limit must be above zero",
+        )),
+        ("free_reserve", Some(MemoryShare::Percent(100))) => Err(refuse(
+            path,
+            "the free reserve must leave memory to manage",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Every leaf of `value` must be the string `auto`.
 fn only_auto(value: &Value, path: &str) -> Result<(), ConfigError> {
     match value {
@@ -381,6 +452,23 @@ pub fn check_honoured(
             // The queue bounds are honoured as on a host; their values are
             // checked when the embedded host's policy is normalized.
             map.remove("queue");
+        }
+        // Owner decision 2026-10-03: the memory limits take a size or a
+        // share of the observed memory; the derived value stays the default.
+        if let Some(system) = policy
+            .get_mut("memory")
+            .and_then(|memory| memory.get_mut("system"))
+            .and_then(Value::as_object_mut)
+        {
+            for field in STATED_MEMORY_LIMITS {
+                if let Some(value) = system.remove(*field) {
+                    check_memory_limit(
+                        field,
+                        &value,
+                        &format!("host.resource_policy.memory.system.{field}"),
+                    )?;
+                }
+            }
         }
         only_auto(&policy, "host.resource_policy")?;
     }
@@ -565,8 +653,12 @@ mod tests {
                 "host.resource_policy.memory.system.managed_limit",
                 Box::new(|d| {
                     d["host"]["resource_policy"]["memory"]["system"]["managed_limit"] =
-                        json!("8GiB")
+                        json!("8 gigabytes")
                 }),
+            ),
+            (
+                "host.resource_policy.memory.accounting",
+                Box::new(|d| d["host"]["resource_policy"]["memory"]["accounting"] = json!("8GiB")),
             ),
             (
                 "host.runtime_profiles",
@@ -631,6 +723,80 @@ mod tests {
 
     fn check(document: &Value) -> Result<Vec<IgnoredSetting>, ConfigError> {
         check_honoured(document, Path::new("/s/config"), Path::new("/s"))
+    }
+
+    // T03 (owner rule 2026-09-25: standalone is a server and one host, every
+    // setting three ways; found live 2026-10-03): the memory limits under
+    // `host.resource_policy.memory.system` take a size or a share of the
+    // observed memory, and `--set` and `CAPYCTL_SET__…` override them.
+    #[test]
+    fn the_memory_limits_take_a_size_or_a_share() {
+        use crate::setting_overrides::SettingOverrides;
+        for (managed, reserve) in [("90GiB", "auto"), ("75%", "10%"), ("auto", "8GiB")] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"] =
+                json!({"managed_limit": managed, "free_reserve": reserve});
+            crate::validate(
+                &serde_json::to_string(&doc).unwrap(),
+                crate::ConfigKind::Standalone,
+            )
+            .unwrap();
+            check(&doc).unwrap_or_else(|error| panic!("{managed}/{reserve}: {error}"));
+        }
+        for (field, bad) in [
+            ("managed_limit", "0B"),
+            ("managed_limit", "0%"),
+            ("managed_limit", "101%"),
+            ("managed_limit", "-1GiB"),
+            ("managed_limit", "7.5%"),
+            ("managed_limit", "lots"),
+            ("free_reserve", "100%"),
+            ("free_reserve", "1 GiB"),
+        ] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"][field] = json!(bad);
+            let error = check(&doc).expect_err(bad);
+            assert_eq!(
+                error.path,
+                format!("host.resource_policy.memory.system.{field}"),
+                "{bad}"
+            );
+        }
+        let overrides = SettingOverrides::parse(
+            crate::ConfigKind::Standalone,
+            &["host.resource_policy.memory.system.managed_limit=90GiB".to_owned()],
+            &[
+                (
+                    "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__MANAGED_LIMIT".to_owned(),
+                    "70%".to_owned(),
+                ),
+                (
+                    "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__FREE_RESERVE".to_owned(),
+                    "12GiB".to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let applied = overrides.apply_and_validate(generated("/s")).unwrap();
+        let system = &applied["host"]["resource_policy"]["memory"]["system"];
+        assert_eq!(system["managed_limit"], "90GiB", "--set wins");
+        assert_eq!(system["free_reserve"], "12GiB", "the environment over YAML");
+        check(&applied).unwrap();
+    }
+
+    #[test]
+    fn a_memory_share_resolves_against_the_observed_capacity() {
+        assert_eq!(MemoryShare::parse("auto").unwrap(), None);
+        assert_eq!(
+            MemoryShare::parse("90GiB").unwrap(),
+            Some(MemoryShare::Bytes(90 << 30))
+        );
+        assert_eq!(
+            MemoryShare::parse("75%").unwrap(),
+            Some(MemoryShare::Percent(75))
+        );
+        assert_eq!(MemoryShare::Percent(75).of(200 << 30), 150 << 30);
+        assert_eq!(MemoryShare::Bytes(90 << 30).of(200 << 30), 90 << 30);
     }
 
     // T03 (owner rule 2026-09-25: standalone is a server and one host, every

@@ -405,7 +405,11 @@ within the bound reports none), stops the owned process and verifies its exit;
 waking launches the same pinned contract again. `deep` and `host_backed` fail
 resolution with `capability_missing`. A TensorFold deployment states its
 `resources` and its `context_length`, which fixes the engine's KV allocation;
-TensorFold has no flag that caps its memory. The engine listens on loopback only,
+TensorFold has no flag that caps its memory. *Amended 2026-10-03 by
+[ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md):* the
+context does not bound a CUDA engine's growing caches, which TensorFold sizes from
+the machine's free memory; CapyCTL launches it with its declared Ready allocation
+as its cap (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, honoured from 0.6.3). The engine listens on loopback only,
 so local processes can reach its port; CapyCTL's routed path is the only network
 path to it. Its first start builds CUDA extensions into a private per-version
 directory, so registration checks the build toolchain on the engine's closed PATH
@@ -894,6 +898,10 @@ Relative paths in this example resolve against the configuration file, not an ar
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
 The generated shape states `inference.bind: "0.0.0.0:8443"` (with `authentication: api_key`). The sentence above that standalone listeners "serve plain HTTP on loopback" now reads: standalone listeners serve plain HTTP; use a private network or a TLS reverse proxy. The management listener stays on loopback.
+
+> **Amended by [ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md)** (owner decision 2026-10-03).
+
+`host.resource_policy.memory.system.managed_limit` and `free_reserve` take `auto` (50 % and 20 % of the observed memory), a size (`90GiB`) or a whole percentage (`75%`), by YAML, `--set` or `CAPYCTL_SET__…`. Together they must fit the observed memory. They apply to the `unified` domain, or to host RAM's `system` domain on a discrete machine, and the stored policy follows them at every start.
 
 ## 17. Observability and benchmark evidence
 

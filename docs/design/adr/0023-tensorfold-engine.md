@@ -83,6 +83,13 @@ or `host_backed` fails resolution with `capability_missing`. An undeclared
 1800 s; the host gives up at the ordinary derived bound once
 `TORCH_EXTENSIONS_DIR` holds a build.
 
+*Amended 2026-10-03 by [ADR 0025](0025-standalone-memory-limits-and-tensorfold-cap.md)
+(found live):* `--context` does not fix a CUDA engine's allocation; with
+`--parallel` above 1 its streams' caches grow into the budget TensorFold grants
+itself from free memory. The launch environment adds
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, the declared Ready allocation on the GPU's
+memory in GiB, which TensorFold 0.6.3 honours as its cap.
+
 ### 5. Drafter
 
 A drafter is handled as vLLM's and SGLang's draft models are (ADR 0014 §8 and
