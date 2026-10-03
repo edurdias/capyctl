@@ -785,6 +785,12 @@ exiting and stops it. With graphs off only the pool's parent is recorded and the
 stays up. Graphs gave that deployment almost nothing (21.3 against 20.9 tokens/s at one
 stream, 39.4 against 38.1 at two). The exit watcher has since stopped reading a helper's exit
 as the engine's, so graphs stay on for such a deployment too.
+Checked live after that fix (GB10, request 55 GiB, KV cache 16 GiB, two concurrent requests,
+graphs on by default): the compile workers exited (23 processes down to 3) and the engine
+stayed ready through 10 idle minutes, then served 21.3 tokens/s at one stream and 39.4 at
+two. Its park was refused `the engine is not quiescent` with graphs on and with them off
+alike, so that refusal is not about graphs and stays open; Qwen3-4B on the same build parked
+and was measured at 6.30 GiB again.
 
 ## Amendment A14: `memory.kv_cache` is SGLang's KV pool (owner decision 2026-10-03)
 
