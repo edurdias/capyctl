@@ -8,7 +8,7 @@ more than one, each in its own environment.
 | Engine | Versions this release knows | Environment used below |
 |---|---|---|
 | vLLM | 0.30.0, 0.29.0 | `~/venvs/vllm` |
-| SGLang | 0.5.20 | `~/venvs/sglang` |
+| SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 
 Another version still runs, but `capyctl engine detect` shows it as
@@ -83,7 +83,7 @@ shown to get one CapyCTL knows.
 vLLM's own guide:
 [GPU installation](https://docs.vllm.ai/en/v0.30.0/getting_started/installation/gpu/).
 
-## SGLang 0.5.20
+## SGLang 0.5.21 or 0.5.20
 
 1. Create the environment:
 
@@ -91,13 +91,14 @@ vLLM's own guide:
    uv venv --python 3.12 --seed --managed-python ~/venvs/sglang
    ```
 
-2. Install SGLang. This is SGLang's own `uv` command, pinned to 0.5.20:
+2. Install SGLang. This is SGLang's own `uv` command, pinned to 0.5.21
+   (write `0.5.20` for that version):
 
    ```bash
-   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang==0.5.20"
+   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang==0.5.21"
    ```
 
-   SGLang 0.5.20 needs CUDA 13 and installs PyTorch 2.13.0 and
+   Both versions need CUDA 13 and install PyTorch 2.13.0 and
    `torch_memory_saver`, which CapyCTL uses to park SGLang models.
    `--prerelease=allow` is needed with `uv` older than 0.12.0 and does nothing
    on newer ones.
@@ -109,7 +110,7 @@ vLLM's own guide:
    ~/venvs/sglang/bin/python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
    ```
 
-   The first prints `0.5.20`, the second `2.13.0`, `13.0` and `True` (the
+   The first prints `0.5.21`, the second `2.13.0`, `13.0` and `True` (the
    version can carry a `+cu130` suffix).
 
 SGLang's own guide: [Installation](https://docs.sglang.io/docs/get-started/install).

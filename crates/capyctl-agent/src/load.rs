@@ -207,7 +207,8 @@ const VLLM_HISTOGRAMS: &[(&str, &str)] = &[
         "vllm:inter_token_latency_seconds",
     ),
 ];
-/// SGLang 0.5.20 `sglang/srt/observability/metrics_collector.py`. SGLang has
+/// SGLang 0.5.20 `sglang/srt/observability/metrics_collector.py`; the names
+/// are unchanged in 0.5.21. SGLang has
 /// no prefill or decode phase histogram; its TTFT and end-to-end series carry
 /// an `is_streaming` label, summed here. Exported only with `enable_metrics`.
 const SGLANG_HISTOGRAMS: &[(&str, &str)] = &[
