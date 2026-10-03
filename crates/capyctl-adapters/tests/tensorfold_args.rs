@@ -239,6 +239,29 @@ fn the_engine_environment_is_closed() {
         assert!(!env.contains_key(absent), "{absent}");
     }
     assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
+    assert!(!env.contains_key("TENSORFOLD_CUDA_MEMORY_LIMIT_GB"));
+}
+
+// T41 (found live 2026-10-03: TensorFold 0.6.3 grew to 74 GiB under a 58 GiB
+// declaration, sizing its caches from the machine's free memory): the
+// deployment's declared allocation caps TensorFold's CUDA budget through
+// `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, in GiB, and the closed environment
+// keeps it.
+#[test]
+fn the_declared_allocation_caps_the_cuda_budget() {
+    let mut input = plan();
+    input.memory_limit_bytes = Some(58 << 30);
+    let rendered = render_command(&input).unwrap().env;
+    assert_eq!(rendered["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58");
+    let env = engine_environment(&rendered, &input, &|_| None, &BTreeMap::new());
+    assert_eq!(env["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58");
+    // Rounded down to a whole MiB, written exactly.
+    input.memory_limit_bytes = Some((58 << 30) + (512 << 20) + 1000);
+    let rendered = render_command(&input).unwrap().env;
+    assert_eq!(rendered["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58.5");
+    input.memory_limit_bytes = None;
+    let rendered = render_command(&input).unwrap().env;
+    assert!(!rendered.contains_key("TENSORFOLD_CUDA_MEMORY_LIMIT_GB"));
 }
 
 // T41
@@ -254,6 +277,8 @@ fn the_plan_comes_from_the_resolved_deployment() {
     assert_eq!(plan.context_length, 8192);
     assert_eq!(plan.port, 8101);
     assert_eq!(plan.engine_log.as_deref(), Some("/var/log/i.log"));
+    // The ready allocation on the GPU's memory is the engine's cap.
+    assert_eq!(plan.memory_limit_bytes, Some(8 << 30));
     // ADR 0023 §4: the derived bound is capped by the request deadline.
     assert_eq!(
         plan.warm_startup_ms,

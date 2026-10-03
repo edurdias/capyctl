@@ -2,7 +2,9 @@
 //! embedded coordinator both use (Spec §3: the paths cannot drift).
 use std::path::{Path, PathBuf};
 
-use capyctl_config::effective::{derived_initialize_ms, EffectiveDeployment, TimeoutSource};
+use capyctl_config::effective::{
+    derived_initialize_ms, DomainMemory, EffectiveDeployment, TimeoutSource,
+};
 use capyctl_config::engine_policy::{parse_options, sensitivity, Engine, Sensitivity};
 use capyctl_domain::launch::LaunchSettings;
 
@@ -100,5 +102,28 @@ pub fn plan_from_effective(
             .cuda_namespace()
             .map_err(|_| TensorfoldPlanError::UnpinnableDevice)?,
         warm_startup_ms,
+        memory_limit_bytes: gpu_allocation(effective),
     })
+}
+
+/// ADR 0023 §4 (amended 2026-10-03): what the deployment declares it holds
+/// Ready on the memory its GPU allocates from (a `unified` or `device`
+/// domain; host RAM in a `distinct` domain is not TensorFold's CUDA budget).
+/// Ready is the charge the engine runs under for its whole life after start.
+fn gpu_allocation(effective: &EffectiveDeployment) -> Option<i64> {
+    let bytes: i64 = effective
+        .resources
+        .ready
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            effective
+                .host
+                .domains
+                .get(&allocation.domain)
+                .is_some_and(|domain| domain.memory != DomainMemory::Distinct)
+        })
+        .map(|allocation| allocation.bytes)
+        .sum();
+    (bytes > 0).then_some(bytes)
 }

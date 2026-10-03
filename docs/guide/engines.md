@@ -187,6 +187,16 @@ parks, so `parked` holds nothing and `parking` and `wake` repeat `ready` and
 32768-token context on a GB10: TensorFold estimated 27.7 GiB at startup and
 CapyCTL measured a 20.2 GiB peak.
 
+The `ready` bytes are also TensorFold's memory cap: CapyCTL starts it with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to them. Without a cap TensorFold sizes
+itself from the machine's free memory: with `--parallel` its caches grow as
+requests get longer, and it keeps long prompts' states for later turns, past what
+CapyCTL reserved. TensorFold 0.6.3 honours the cap;
+earlier versions ignore it. The cap covers what TensorFold allocates on the GPU,
+not the rest of the process, so leave a few GiB above what the model needs. A
+window or a number of streams that does not fit is refused by TensorFold at start,
+or its requests wait, instead of taking memory CapyCTL did not reserve.
+
 A drafter works as a draft model does for vLLM and SGLang: allow it when you
 add the engine, with the directory that holds your drafters,
 
