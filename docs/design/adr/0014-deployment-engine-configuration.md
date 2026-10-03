@@ -680,3 +680,9 @@ memory of a kernel build.
 
 Nothing here changes admission, the placeholder or a declared peak. Only the
 measurement changes.
+
+Live (2026-10-03, GB10, Qwen3.8-27B NVFP4 with DFlash2 on SGLang): a first start that
+rebuilt the JIT kernels for about 6 minutes recorded 106.5 GiB without this amendment, and
+the next start was refused `capacity_blocked`. With it, a first start that rebuilt the
+same kernels (availability fell to 1.8 GiB during the build) recorded 44.8 GiB, and the
+next start was ready in 177 s.

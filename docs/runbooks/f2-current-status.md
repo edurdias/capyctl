@@ -58,7 +58,36 @@ Tests (CPU and scripted engines, which are not qualification):
   building and a `sleep` group is not.
 - SGLang adapter: a compiler seen while starting is reported in the step.
 
-Live check pending (hosts in use).
+Live on host A (GB10, 2026-10-03), Qwen3.8-27B NVFP4 with DFlash2 on SGLang
+(`memory: {request: 48GiB}`, local checkpoint). Two standalones were built from
+`main` (93ec627) and from this branch (493f8fd), each with its own state and
+config directories. Switching the SGLang environment forced the JIT kernel
+rebuild (the shared cache names the environment), so both first starts built.
+No cache was deleted.
+
+| | `main`, SGLang 0.5.20 | this branch, SGLang 0.5.21 |
+|---|---|---|
+| First start (with kernel builds) | 624 s | 585 s |
+| Lowest MemAvailable during the build | 10.7 GiB | 1.8 GiB |
+| Measured startup peak | 106.5 GiB | 44.8 GiB |
+| Next start | refused `capacity_blocked` (needs 106.5 GiB, 60.8 GiB limit) | ready in 177 s, no build |
+
+An independent 2 s sampler saw `ninja` and up to 28 compiler processes for
+about 6 minutes of each first start.
+
+vLLM 0.30 with Qwen3-4B on this branch started in 67 s. Its compile caches were
+warm, so no compiler ran and it measured 20.6 GiB. The 102 GiB vLLM first start
+seen in the three-engine run was not reproduced, because doing so needs its
+caches cleared:
+
+- FlashInfer's JIT build runs under `ninja`, so it is seen.
+- torch.compile's compile workers are Python processes and are not seen
+  (the fallback).
+- FlashInfer autotuning uses the engine's own GPU memory.
+
+Cleanup: deployments deleted, both standalones shut down drained, every
+process and directory the check made removed. The environments, models and
+caches are kept.
 
 
 ## Small CLI fixes — 2026-10-02 (branch `fix/small-cli-fixes`)
