@@ -324,6 +324,18 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             with self.subTest(retired=retired):
                 self.rejects(self.argv(public), self.payloads(public))
 
+    def test_parser_settings_are_optional_tokens(self):
+        # ADR 0024: present only when a parser was chosen at launch.
+        public = copy.deepcopy(self.public)
+        public["settings"].update(tool_call_parser="qwen3_coder", reasoning_parser="qwen3")
+        self.build(self.argv(public), self.payloads(public))
+        for key in ("tool_call_parser", "reasoning_parser"):
+            for value in (None, "", "a b", 1, "--x", "x" * 65):
+                with self.subTest(key=key, value=value):
+                    public = copy.deepcopy(self.public)
+                    public["settings"][key] = value
+                    self.rejects(self.argv(public), self.payloads(public))
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.

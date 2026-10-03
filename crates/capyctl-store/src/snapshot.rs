@@ -135,16 +135,28 @@ pub struct DeploymentSnapshot {
     /// Additive; absent when the revision does not decode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<capyctl_config::context_fit::ContextFit>,
+    /// ADR 0024 (owner decision 2026-10-03): the tool-call and reasoning
+    /// parsers the current revision's launch passes and where they came from
+    /// (`on_host` for a choice a remote host makes at launch). Additive; absent
+    /// for an engine without a parser setting or a revision that does not decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsers: Option<capyctl_config::parsers::Parsers>,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
 /// current revision. An embedded (standalone) checkpoint is read here, where
 /// the launch reads it; a revision placed on enrolled remote hosts is fitted by
 /// the host, so a host's path is never read on this machine.
+type LaunchStatus = (
+    Option<capyctl_config::context_fit::ContextFit>,
+    Option<capyctl_config::parsers::Parsers>,
+);
+
+/// ADR 0024: the parsers are chosen where the context is fitted, the same way.
 fn context_status(
     conn: &rusqlite::Connection,
     deployment_id: &str,
-) -> rusqlite::Result<Option<capyctl_config::context_fit::ContextFit>> {
+) -> rusqlite::Result<LaunchStatus> {
     use rusqlite::OptionalExtension;
     let row: Option<(String, bool)> = conn
         .query_row(
@@ -155,16 +167,22 @@ fn context_status(
         )
         .optional()?;
     let Some((raw, remote)) = row else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let Ok(effective) = capyctl_config::effective::decode_effective_snapshot(&raw) else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    Ok(Some(if remote {
-        capyctl_config::context_fit::fit_on_remote_host(&effective)
+    Ok(if remote {
+        (
+            Some(capyctl_config::context_fit::fit_on_remote_host(&effective)),
+            capyctl_config::parsers::parsers_on_remote_host(&effective),
+        )
     } else {
-        capyctl_config::context_fit::fit_for_effective(&effective)
-    }))
+        (
+            Some(capyctl_config::context_fit::fit_for_effective(&effective)),
+            capyctl_config::parsers::parsers_for_effective(&effective),
+        )
+    })
 }
 
 /// SPEC §6.4: an operation and its error as status shows them. The reason is
@@ -565,6 +583,7 @@ impl Store {
                 warm: false,
                 latest_operation: None,
                 context: None,
+                parsers: None,
             })
         })?;
         let mut deployments = deployments;
@@ -588,7 +607,7 @@ impl Store {
         for entry in &mut deployments {
             entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
-            entry.context = context_status(&tx, &entry.id)?;
+            (entry.context, entry.parsers) = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
             entry.latest_operation = latest_operation(

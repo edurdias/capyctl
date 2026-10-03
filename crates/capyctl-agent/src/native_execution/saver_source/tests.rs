@@ -177,6 +177,8 @@ fn frozen(endpoint: String) -> NativeLaunch {
             max_total_tokens: None,
             chunked_prefill_size: None,
             tokenizer_workers: 1,
+            tool_call_parser: None,
+            reasoning_parser: None,
             memory_saver: true,
             cpu_weight_backup: false,
             weight_restore: "disk_reload".into(),
