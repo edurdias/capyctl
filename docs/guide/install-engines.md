@@ -9,7 +9,7 @@ more than one, each in its own environment.
 |---|---|---|
 | vLLM | 0.30.0, 0.29.0 | `~/venvs/vllm` |
 | SGLang | 0.5.20 | `~/venvs/sglang` |
-| TensorFold | 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
+| TensorFold | 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -116,7 +116,7 @@ SGLang's own guide: [Installation](https://docs.sglang.io/docs/get-started/insta
 For DGX Spark, SGLang links
 [this guide](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/).
 
-## TensorFold 0.6.2, 0.6.1 or 0.6.0
+## TensorFold 0.6.3, 0.6.2, 0.6.1 or 0.6.0
 
 TensorFold builds CUDA kernels the first time it serves, so besides the Python
 packages it needs `nvcc`, `ninja` and a C++ compiler. TensorFold's own
@@ -138,11 +138,11 @@ TensorFold from a plain environment, which is what these steps build.
    ```
 
 3. Install TensorFold from its release tag, and `ninja` (for an earlier
-   version, write `@v0.6.1` or `@v0.6.0`). This needs `git`:
+   version, write `@v0.6.2`, `@v0.6.1` or `@v0.6.0`). This needs `git`:
 
    ```bash
    uv pip install --python ~/venvs/tensorfold/bin/python \
-     "tensorfold @ git+https://github.com/ashhart/TensorFold.git@v0.6.2" ninja
+     "tensorfold @ git+https://github.com/ashhart/TensorFold.git@v0.6.3" ninja
    ```
 
 4. Provide the CUDA compiler. Either:
@@ -151,7 +151,7 @@ TensorFold from a plain environment, which is what these steps build.
      (`ls /usr/local/cuda/bin/nvcc` to check; otherwise
      [NVIDIA's CUDA downloads](https://developer.nvidia.com/cuda-downloads)),
      or
-   - 0.6.1 and 0.6.2: NVIDIA's compiler wheels in the environment, matched to
+   - 0.6.1 to 0.6.3: NVIDIA's compiler wheels in the environment, matched to
      PyTorch's CUDA 13.0:
 
      ```bash
@@ -167,11 +167,11 @@ TensorFold from a plain environment, which is what these steps build.
    ~/venvs/tensorfold/bin/tensorfold --version
    ```
 
-   It prints `tensorfold 0.6.2`.
+   It prints `tensorfold 0.6.3`.
 
 TensorFold's own guide: the
-[README](https://github.com/ashhart/TensorFold/blob/v0.6.2/README.md) and
-[runbook](https://github.com/ashhart/TensorFold/blob/v0.6.2/RUNBOOK.md)
+[README](https://github.com/ashhart/TensorFold/blob/v0.6.3/README.md) and
+[runbook](https://github.com/ashhart/TensorFold/blob/v0.6.3/RUNBOOK.md)
 at the release tag.
 
 ## Register it with CapyCTL

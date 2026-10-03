@@ -62,7 +62,7 @@ the CLI and the running role the same ones.
 ## Custom builds
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 or
-TensorFold 0.6.0, 0.6.1 and 0.6.2, the versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
+TensorFold 0.6.0 to 0.6.3, the versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 
 ```bash
@@ -109,11 +109,11 @@ for Qwen3.8-27B with DFlash2).
 
 ## TensorFold
 
-CapyCTL runs TensorFold 0.6.0, 0.6.1 and 0.6.2 from a plain venv. TensorFold builds
+CapyCTL runs TensorFold 0.6.0 to 0.6.3 from a plain venv. TensorFold builds
 CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
 a C++ compiler where the engine can find them: the venv's `bin`, the CUDA
 toolkit's `bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. Either install a system
-CUDA toolkit, or (0.6.1 and 0.6.2) put the compiler in the venv with pip:
+CUDA toolkit, or (0.6.1 to 0.6.3) put the compiler in the venv with pip:
 
 ```bash
 pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"
@@ -196,7 +196,7 @@ external draft model only: a checkpoint with built-in MTP heads, such as
 Nemotron, still drafts (the response's `tensorfold` record shows
 `"drafts":true`).
 
-Some models need an explicit choice. TensorFold 0.6.1 and 0.6.2 refuse to start Qwen3.8
+Some models need an explicit choice. TensorFold 0.6.1 to 0.6.3 refuse to start Qwen3.8
 dense (Qwen3.8-27B) on an NVIDIA GPU without a drafter, and the start fails
 with `TensorFold needs a drafter for this model: name one with --drafter, or
 add --no-drafts to turn drafts off`. To run it without drafts, turn them off;
