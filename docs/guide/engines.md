@@ -234,7 +234,12 @@ A Qwen3 checkpoint whose template uses the XML tool-call format (Qwen3-Coder)
 gets `qwen3_coder`, a template without tool calls gets no tool parser, and one
 without `<think>` (an instruct-only model) gets no reasoning parser. Any other
 model gets no parser, as before. `capyctl status deployment` prints the choice
-on its `Parsers` line.
+under the engine, here for FrogNano 4B (a Qwen3.5 checkpoint) on vLLM 0.30:
+
+```text
+Engine  vllm 0.30.0 (/home/me/venvs/vllm/bin/vllm)
+Parsers tool calls: qwen3_coder, reasoning: qwen3 (model family qwen3_5)
+```
 
 To choose yourself, set either parser in the engine's block: `auto` (the
 default), `none`, or the engine's parser name.
