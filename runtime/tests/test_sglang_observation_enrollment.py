@@ -158,6 +158,31 @@ class EnrollmentTests(unittest.TestCase):
         self.assertFalse(enrollment.enroll(self.fakes.scheduler))
         self.assertEqual(os.listdir(self.directory.name), [Path(self.library).name])
 
+    # ADR 0014 amendment A15 (found live 2026-10-03): a scheduler outside the
+    # observed topology (here speculative decoding) is not enrolled, and the
+    # engine's log says at which stage, with fixed words only.
+    def test_a_refused_enrollment_names_its_stage(self):
+        import io
+        self.scope()
+        self.fakes.scheduler.server_args = type(self.fakes.scheduler.server_args)(
+            speculative_algorithm="DFLASH")
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        self.assertEqual(os.listdir(self.directory.name), [Path(self.library).name])
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(json.loads(lines[0]), {
+            "event": "capyctl_saver_enrollment_refused", "stage": "install",
+            "error": "BridgeError", "code": "topology"})
+        self.assertNotIn(self.directory.name, stderr.getvalue())
+        # A launch outside any scope is not an enrollment, so it logs nothing.
+        enrollment.clear_environment()
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_scheduler_target_enrolls_after_construction_before_the_event_loop(self):
         events = []
 

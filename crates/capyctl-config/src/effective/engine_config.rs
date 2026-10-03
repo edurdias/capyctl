@@ -201,6 +201,11 @@ pub(super) struct RawEngineConfig {
 }
 
 impl RawEngineConfig {
+    /// The extra engine arguments as written (validated later).
+    pub(super) fn extra_args(&self) -> &[String] {
+        self.extra_args.as_deref().unwrap_or_default()
+    }
+
     /// Whether the block states a memory request or a KV cache.
     pub(super) fn states_memory(&self) -> bool {
         self.memory

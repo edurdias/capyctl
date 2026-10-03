@@ -938,6 +938,11 @@ const TENSORFOLD_NEEDS_RESOURCES: &str =
     "a TensorFold deployment states resources: TensorFold sizes \
     itself from free memory, and its Ready allocation is the cap it is launched with";
 
+const SGLANG_SPECULATIVE_PARKS: &str =
+    "capability_missing: SGLang cannot park a deployment with speculative decoding \
+    (`--speculative-algorithm`): its park releases the draft model's weights and its wake \
+    does not restore them; use restart_only";
+
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
     path: &str,
@@ -1085,13 +1090,33 @@ pub fn resolve_effective_with_checkpoint(
     // is named in the provenance so a re-resolution with the measured weights
     // chooses again (ADR 0014 §7).
     let residency_defaulted = d.residency.is_none();
+    // ADR 0014 amendment A15: SGLang does not park a speculative deployment.
+    let sglang_speculative = raw_profile.engine == Engine::Sglang
+        && crate::engine_policy::sglang_speculative(
+            &raw_profile
+                .args
+                .iter()
+                .chain(d.engine_config.extra_args())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+    if sglang_speculative && d.residency.is_some_and(Residency::parks) {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "residency",
+            SGLANG_SPECULATIVE_PARKS,
+        ));
+    }
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
         let discrete =
             device_sizing.map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6: TensorFold never parks, so its default is restart_only.
+        // ADR 0023 §6: TensorFold never parks, so its default is restart_only,
+        // as it is for SGLang with speculative decoding (A15).
         crate::deployment_defaults::default_residency(
-            raw_profile.security.deep_park.is_enabled() && raw_profile.engine != Engine::Tensorfold,
+            raw_profile.security.deep_park.is_enabled()
+                && raw_profile.engine != Engine::Tensorfold
+                && !sglang_speculative,
             discrete,
         )
     });
