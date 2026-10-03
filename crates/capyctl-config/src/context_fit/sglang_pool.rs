@@ -51,6 +51,13 @@ use crate::engine_policy::{matches_name, parse_options, Engine};
 /// "max_mamba_cache_size=14, 5 state slots per request".
 pub const STATE_SLOTS_PER_REQUEST: u64 = 5;
 
+/// What SGLang allocates inside its static pool besides the weights and its
+/// pools (CUDA context, workspaces, load buffers). Found live on 2026-10-03
+/// with Qwen3.8-27B NVFP4 and DFlash2 on GB10: a static pool of exactly
+/// weights, KV cache and state held 356793 of 399457 KV tokens, 1.7 GiB short.
+/// A placeholder until measured per model.
+pub const STATIC_OVERHEAD_BYTES: u64 = 2 << 30;
+
 /// What CapyCTL tells SGLang about its pools; `None` leaves a setting as the
 /// deployment (or the engine) has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,9 +71,11 @@ pub struct SglangPool {
     /// The running requests, when the state that fits holds fewer than the
     /// deployment's count (or CapyCTL's in-flight bound).
     pub running_limit: Option<u32>,
-    /// Bytes of the margin a derived request's state takes; the static pool
-    /// grows by them.
-    pub borrowed_margin_bytes: u64,
+    /// The static pool (`--mem-fraction-static` share) the launch renders
+    /// when CapyCTL sized the pools: weights, KV cache, state and
+    /// [`STATIC_OVERHEAD_BYTES`], taken from the margin. `None` keeps
+    /// [`static_pool_bytes`].
+    pub static_bytes: Option<i64>,
     /// Why a pool is left to SGLang, or how it was sized.
     pub reason: Option<String>,
 }
@@ -276,6 +285,7 @@ pub fn sglang_pool(
         pool.max_total_tokens = Some(u32::try_from(tokens.min(i32::MAX as u64)).unwrap_or(0));
     }
     let Some(hybrid) = hybrid else {
+        pool.static_bytes = grown_static(memory, 0);
         return Ok(pool);
     };
     // The deployment's (or the installation's) arguments own the state pool
@@ -380,15 +390,31 @@ pub fn sglang_pool(
     if running < bound {
         pool.running_limit = Some(running);
     }
-    pool.borrowed_margin_bytes = need(running)
-        .unwrap_or(0)
-        .saturating_sub(room)
-        .min(borrowable);
+    pool.static_bytes = grown_static(memory, need(running).unwrap_or(0));
     pool.reason = Some(format!(
         "hybrid model: recurrent state for {running} running request{} sized beside the KV cache",
         if running == 1 { "" } else { "s" }
     ));
     Ok(pool)
+}
+
+/// The static pool that holds the weights, the KV cache, `state` and
+/// [`STATIC_OVERHEAD_BYTES`], never below [`static_pool_bytes`] nor above the
+/// request. On unified memory only: a discrete device's margin is fixed by
+/// its request (discrete GPU design §3), and `None` keeps it.
+fn grown_static(memory: &MemoryRequest, state: u64) -> Option<i64> {
+    if memory.device_total_bytes.is_some() {
+        return None;
+    }
+    let weights = memory.weights_bytes?;
+    let want = i64::try_from(state.checked_add(STATIC_OVERHEAD_BYTES)?)
+        .ok()?
+        .checked_add(weights)?
+        .checked_add(memory.kv_cache_bytes)?;
+    Some(
+        want.min(memory.request_bytes)
+            .max(static_pool_bytes(memory).1),
+    )
 }
 
 /// The request was derived from the weights (weights + KV + margin), so it

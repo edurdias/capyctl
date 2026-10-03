@@ -53,10 +53,12 @@ pub fn frozen_from_effective(
         settings.common.max_concurrent_requests = Some(running);
     }
     settings.max_mamba_cache_size = pool.max_mamba_cache_size;
-    // A derived request's state takes part of the margin (unified memory
-    // only): the static pool the entry renders grows by it.
-    settings.memory.margin_bytes -= i64::try_from(pool.borrowed_margin_bytes)
-        .map_err(|_| RuntimeError::Uncertain("memory arithmetic overflows".into()))?;
+    // The static pool holds the weights, the KV cache, the state and SGLang's
+    // own allocations (unified memory only): what it takes beyond the request
+    // less the margin comes out of the margin.
+    if let Some(static_bytes) = pool.static_bytes {
+        settings.memory.margin_bytes = settings.memory.request_bytes - static_bytes;
+    }
     // ADR 0024 (owner decision 2026-10-03): the parsers chosen by model
     // family from the checkpoint read here, unless the deployment named or
     // turned them off or its extras already pass them. The digest covers them.

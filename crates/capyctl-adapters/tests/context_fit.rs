@@ -384,7 +384,7 @@ fn a_derived_request_lends_the_state_part_of_its_margin() {
     let gib = 1i64 << 30;
     assert_eq!(
         settings["memory"]["static_bytes"],
-        json!(weights + 4 * gib + 26 * state)
+        json!(weights + 4 * gib + 26 * state + 2 * gib)
     );
     let fit = capyctl_config::context_fit::fit_for_effective(&effective);
     assert_eq!(fit.running_limit, Some(5));

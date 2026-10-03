@@ -130,7 +130,12 @@ fn a_hybrid_models_state_is_sized_beside_its_kv_cache() {
     assert_eq!(found.max_running_requests, Some(4));
     assert_eq!(found.max_mamba_cache_size, Some(20));
     assert_eq!(found.running_limit, Some(4));
-    assert_eq!(found.borrowed_margin_bytes, 0);
+    // The static pool holds weights, KV, state and SGLang's own allocations.
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    assert_eq!(
+        found.static_bytes,
+        Some(weights + 16 * GIB + 21 * STATE as i64 + overhead)
+    );
     // A larger request runs CapyCTL's whole in-flight bound.
     let found = pool(&fp8(settings(96 * GIB, 16 * GIB, Some(weights))), &target).unwrap();
     assert_eq!(
@@ -289,7 +294,10 @@ fn a_derived_request_fits_what_it_can() {
     assert_eq!(found.max_running_requests, Some(5));
     assert_eq!(found.max_mamba_cache_size, Some(25));
     assert_eq!(found.running_limit, Some(5));
-    assert_eq!(found.borrowed_margin_bytes, 26 * STATE);
+    assert_eq!(
+        found.static_bytes,
+        Some(21_920_000_000 + 4 * GIB + 26 * STATE as i64 + STATIC_OVERHEAD_BYTES as i64)
+    );
     // A declared count is lowered to what fits rather than refused.
     let mut declared = dflash(derived(16 * GIB, 25_770_000_000));
     declared.common.max_concurrent_requests = Some(8);
@@ -297,7 +305,10 @@ fn a_derived_request_fits_what_it_can() {
     assert_eq!(found.max_running_requests, Some(1));
     assert_eq!(found.max_mamba_cache_size, Some(5));
     assert_eq!(found.running_limit, Some(1));
-    assert_eq!(found.borrowed_margin_bytes, (6 + 2 * 8) * STATE);
+    assert_eq!(
+        found.static_bytes,
+        Some(25_770_000_000 + 16 * GIB + 22 * STATE as i64 + STATIC_OVERHEAD_BYTES as i64)
+    );
     // One request that does not fit half the margin is refused.
     declared.extra_args[5] = "32".into();
     let refusal = sglang_pool(&declared, &[], Ok(&target), Some(Ok(&drafter))).unwrap_err();
@@ -308,4 +319,19 @@ fn a_derived_request_fits_what_it_can() {
     explicit.common.max_concurrent_requests = Some(8);
     let refusal = sglang_pool(&explicit, &[], Ok(&target), Some(Ok(&drafter))).unwrap_err();
     assert!(refusal.contains("8 running requests"), "{refusal}");
+}
+
+// T14 (found live 2026-10-03): a dense model's static pool also holds
+// SGLang's own allocations beside the weights and the KV cache, from the
+// margin, so the KV pool is not cut short.
+#[test]
+fn a_dense_static_pool_holds_the_overhead() {
+    let found = pool(&settings(16 * GIB, 4 * GIB, Some(4 * GIB)), &dense()).unwrap();
+    assert_eq!(found.static_bytes, Some(10 * GIB));
+    // Never above the request, nor on a discrete device.
+    let found = pool(&settings(9 * GIB, 4 * GIB, Some(4 * GIB)), &dense()).unwrap();
+    assert_eq!(found.static_bytes, Some(9 * GIB));
+    let mut discrete = settings(16 * GIB, 4 * GIB, Some(4 * GIB));
+    discrete.memory.device_total_bytes = Some(16 * GIB);
+    assert_eq!(pool(&discrete, &dense()).unwrap().static_bytes, None);
 }

@@ -754,8 +754,13 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
 - The running requests are the deployment's `max_concurrent_requests`. Undeclared, they are
   the most, up to CapyCTL's in-flight bound (32, `MAX_REQUESTS_PER_DEPLOYMENT`), whose state
   fits, passed as `--max-running-requests`.
-- The static pool is unchanged (the request less the margin) and must hold the weights
-  (with the draft model's, amendment A6), the KV cache and the state. The state is
+- The static pool rendered is the weights (with the draft model's, amendment A6), the KV
+  cache, the state and 2 GiB of SGLang's own allocations (CUDA context, workspaces, load
+  buffers), never less than the request less the margin nor more than the request; what it
+  takes beyond the request less the margin comes out of the margin. Found live on
+  2026-10-03: a static pool of exactly weights, KV cache and state held 356793 of the
+  399457 KV tokens passed, 1.7 GiB short. A discrete device keeps its static pool. The
+  state must fit the request less the margin, the weights and the KV cache. The state is
   `(slots + 1) × slot`, plus `(running + 1) × draft tokens × slot` of intermediate states
   with speculative decoding (`--speculative-num-draft-tokens`), as SGLang reserves them.
 - The weights are the revision's recorded weights. A revision that declares both its
