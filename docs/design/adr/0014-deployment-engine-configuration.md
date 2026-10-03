@@ -783,6 +783,84 @@ launch records them in its process group, the pool's workers exit when idle, and
 embedded exit watcher (`engine_exit.rs`) reads any recorded member gone as the engine
 exiting and stops it. With graphs off only the pool's parent is recorded and the engine
 stays up. Graphs gave that deployment almost nothing (21.3 against 20.9 tokens/s at one
-stream, 39.4 against 38.1 at two). Until the exit watcher stops treating such helpers as the
-engine, a deployment like it states `cuda_graphs: false`.
+stream, 39.4 against 38.1 at two). The exit watcher has since stopped reading a helper's exit
+as the engine's, so graphs stay on for such a deployment too.
 
+## Amendment A14: `memory.kv_cache` is SGLang's KV pool (owner decision 2026-10-03)
+
+Problem: found live on 2026-10-03 with SGLang 0.5.21, Qwen3.8-27B NVFP4, DFlash2 (8 draft
+tokens), fp8 KV, `memory: {request: 48GiB, kv_cache: 16GiB}` and
+`max_concurrent_requests: 8`. §5 gave SGLang a static pool (`--mem-fraction-static`) of the
+request less the margin, and the KV cache only bounded it from below. SGLang loaded the
+weights (21.2 GB, and 3.3 GB of draft model) and split what was left between the hybrid
+model's recurrent-state pool and the KV pool, about 0.9 to 1. The KV pool held 211k tokens
+where vLLM, given the same 16 GiB, held 322k. The state pool held 14 slots at 5 per request,
+so SGLang capped the running requests at 2 ("max_running_requests is capped to 2 by the
+mamba state cache").
+
+Rule (vLLM is unchanged; it is already given the KV cache in bytes):
+
+- The KV pool is `memory.kv_cache` divided by SGLang's KV bytes per token, passed as
+  `--max-total-tokens`. The bytes per token are the KV dtype (else the deployment's dtype,
+  else the checkpoint's) times key and value heads for each layer that keeps KV. A
+  gated-delta-net hybrid keeps KV for its full-attention layers only. A draft model's layers
+  are added in full, in the same KV dtype or `--speculative-draft-kv-cache-dtype` (amendment
+  A9; SGLang's `dflash_draft_cell_size_per_token`). The fitted context (§5) of such a hybrid
+  on SGLang counts the same layers.
+- On a gated-delta-net hybrid, the recurrent-state pool is passed as
+  `--max-mamba-cache-size`: 5 slots per running request, SGLang 0.5.20 and 0.5.21's most
+  (3, plus 2 with the radix cache's extra buffer and overlap scheduling, their defaults).
+  A slot is one request's state: per linear-attention layer, a bfloat16 convolution state
+  of `linear_conv_kernel_dim - 1` positions and a temporal state in `mamba_ssm_dtype`
+  (float32 by default, or `--mamba-ssm-dtype`).
+- The running requests are the deployment's `max_concurrent_requests`. Undeclared, they are
+  the most, up to CapyCTL's in-flight bound (32, `MAX_REQUESTS_PER_DEPLOYMENT`), whose state
+  fits, passed as `--max-running-requests`.
+- The static pool rendered is the weights (with the draft model's, amendment A6), the KV
+  cache, the state and 2 GiB of SGLang's own allocations (CUDA context, workspaces, load
+  buffers), never less than the request less the margin nor more than the request; what it
+  takes beyond the request less the margin comes out of the margin. Found live on
+  2026-10-03: a static pool of exactly weights, KV cache and state held 356793 of the
+  399457 KV tokens passed, 1.7 GiB short. A discrete device keeps its static pool. The
+  state must fit the request less the margin, the weights and the KV cache. The state is
+  `(slots + 1) × slot`, plus `(running + 1) × draft tokens × slot` of intermediate states
+  with speculative decoding (`--speculative-num-draft-tokens`), as SGLang reserves them.
+- The weights are the revision's recorded weights. A revision that declares both its
+  request and its KV cache records none (it is not re-resolved with the measurement), so
+  the launch sums the weight files it reads: the checkpoint's and the draft model's
+  (found live 2026-10-03).
+- With an explicit `memory.request`, sizing is strict. When a declared
+  `max_concurrent_requests` does not fit, or one running request does not, the launch is
+  refused before anything starts. The refusal names the state's bytes and the memory
+  request that would hold it. Where the checkpoint is read locally, the status JSON
+  carries the same text as the context's `warning`.
+- With a derived request (owner decision 2026-10-03), CapyCTL fits what it can. A derived
+  request holds the weights, the KV cache and the margin, and nothing for the state, so on
+  unified memory the state may take up to half of the margin; the other half stays for
+  SGLang's runtime outside its static pool. The static pool grows by what the state takes.
+  The running requests are the most, up to the declared count (or 32), that fit, and the
+  launch is refused only when one request does not fit. A discrete device lends nothing
+  from its margin.
+- When the state holds fewer running requests than the declared count (or 32),
+  `status deployment` says "Running limited to N requests by the state cache", and the
+  status JSON carries `context.running_limit` (standalone; a remote host decides at launch).
+- Arguments that size the state pool themselves (`--max-mamba-cache-size`,
+  `--mamba-full-memory-ratio`, in the deployment's or the installation's arguments) win:
+  CapyCTL then passes neither the state pool nor the running requests, and still passes
+  the KV pool. A declared `max_total_tokens` is the deployment's own KV pool.
+- What this does not model is left to SGLang's own sizing, as before, with the reason: a
+  sliding-window or latent-attention checkpoint, another hybrid kind, an unreadable
+  configuration, an unknown KV dtype, speculative decoding with no draft-token count. When
+  the weights are unknown, only a declared count's state is passed.
+- Dense models keep their memory request; only `--max-total-tokens` is new for them.
+
+Consequence: an explicit memory request for a hybrid deployment has to hold its state. The
+recipe above needs about 16.2 GiB more for 8 running requests with DFlash2 (113 slots of
+146.81 MiB). Without a stated request, Qwen3.8-27B at the default 4 GiB KV cache runs 5
+requests (it ran 1 before), and with DFlash2 at that default it runs 1 (it was
+refused before). Amendment A10's note that SGLang sizes its state itself no longer applies.
+
+Follow-up: a derived request should include the state for its running requests. That needs
+the state's bytes as a checkpoint fact beside the weights (measured by the host that reads
+the checkpoint, sent with the measurement, recorded with the revision), since resolution
+reads no checkpoint file. Until then the margin lends it.

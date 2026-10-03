@@ -56,6 +56,56 @@ pub struct ProcessIdentity {
     pub start_ticks: u64,
 }
 
+/// ADR 0027: the role prefix of a helper. A helper is a process in the launch's
+/// group that the engine's own processes did not start directly, such as a
+/// torch inductor compile worker. It is recorded, so cleanup terminates it and
+/// proves it gone, but its exit is not the engine's exit.
+pub const HELPER_ROLE_PREFIX: &str = "helper-";
+
+impl ProcessIdentity {
+    /// ADR 0027: whether this recorded process is a helper rather than one of
+    /// the engine's own processes (`api` and `worker-N`). A helper's role is
+    /// `helper-N`, with N a decimal number.
+    pub fn is_helper(&self) -> bool {
+        is_helper_role(&self.role)
+    }
+}
+
+/// ADR 0027: whether `role` is a helper's (`helper-N`, N a decimal number).
+pub fn is_helper_role(role: &str) -> bool {
+    role.strip_prefix(HELPER_ROLE_PREFIX)
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// ADR 0027: the engine's own processes of a recorded group, without helpers.
+pub fn engine_members(identities: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
+    identities
+        .iter()
+        .filter(|identity| !identity.is_helper())
+        .cloned()
+        .collect()
+}
+
+/// ADR 0027: whether `observed` (the owned processes of a launch alive now) is
+/// still the engine `recorded` names: every engine process of `recorded` is
+/// there, and every engine process there is one `recorded` names. Helpers do
+/// not decide it: one that exited since, or one the engine started later, does
+/// not change the engine.
+pub fn same_engine(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -> bool {
+    let recorded_set = recorded.iter().collect::<BTreeSet<_>>();
+    let observed_set = observed.iter().collect::<BTreeSet<_>>();
+    !recorded.is_empty()
+        && observed_set.len() == observed.len()
+        && observed
+            .iter()
+            .filter(|identity| !identity.is_helper())
+            .all(|identity| recorded_set.contains(identity))
+        && recorded
+            .iter()
+            .filter(|identity| !identity.is_helper())
+            .all(|identity| observed_set.contains(identity))
+}
+
 /// Whether a recorded process still exists, judged by pid, boot id and start ticks
 /// together. A pid alone is not an identity: the kernel reuses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

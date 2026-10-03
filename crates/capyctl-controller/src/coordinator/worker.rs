@@ -2613,8 +2613,8 @@ async fn execute_residency(
 /// restore contract as one command (W4) and answers with all four facts; an
 /// embedded vLLM engine runs SPEC §9.1's steps one persisted call each, then a
 /// fresh model probe, and any failure after the first effect is uncertain,
-/// never retried (T20). An embedded group must still be exactly the recorded
-/// processes (SPEC §13.2).
+/// never retried (T20). An embedded group must still be every recorded engine
+/// process (SPEC §13.2); a helper may have exited (ADR 0027).
 async fn residency_effect(
     driver: &Arc<Driver>,
     kind: ResidencyKind,
@@ -2665,6 +2665,13 @@ async fn residency_effect(
         observation.token = context.token.clone();
     }
     if driver.tools.is_some() {
+        // ADR 0027: the engine's own processes; a helper may have exited, and
+        // the evidence then names only what is alive.
+        observation.identities.retain(|identity| {
+            !identity.is_helper()
+                || capyctl_launchers::process_absence::presence(identity)
+                    == capyctl_domain::completion::Presence::Alive
+        });
         for identity in &observation.identities {
             if capyctl_launchers::process_absence::presence(identity)
                 != capyctl_domain::completion::Presence::Alive

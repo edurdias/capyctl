@@ -279,18 +279,18 @@ impl LocalReadiness {
         }
         // SPEC §6.1: the answer must come from the recorded group, so the group is
         // proven alive on both sides of it.
-        alive(&launch.identities)?;
+        let live = alive(&launch.identities)?;
         let observed_at_ms = capyctl_protocol::now_unix_ms();
         self.settle_retired_leases(launch, &target, observed_at_ms)
             .await?;
         let evidence = RemoteReadinessEvidence {
             binding_id: launch.binding_id.clone(),
             incarnation: launch.incarnation.clone(),
-            identities: launch.identities.clone(),
+            identities: live,
             observed_at_ms,
             receipt: format!(
-                "every recorded process alive with its recorded start ticks and boot; the \
-                 engine answered an authenticated model list naming {}",
+                "every recorded engine process alive with its recorded start ticks and boot; \
+                 the engine answered an authenticated model list naming {}",
                 target.served
             ),
         };
@@ -365,11 +365,11 @@ impl LocalReadiness {
             return Err(unobserved());
         }
         // The quiescent engine is still the recorded group.
-        alive(&launch.identities)?;
+        let live = alive(&launch.identities)?;
         let evidence = QuiescenceEvidence {
             binding_id: launch.binding_id.clone(),
             incarnation: launch.incarnation.clone(),
-            identities: launch.identities.clone(),
+            identities: live,
             readiness_observed_at_ms: probed_at,
             quiescent_at_ms: capyctl_protocol::now_unix_ms(),
             receipt: "the engine's metrics, read with its per-launch key after a fresh model \
@@ -393,14 +393,18 @@ impl LocalReadiness {
     }
 }
 
-/// Every recorded process is alive as recorded. `Unknown` is not alive.
-fn alive(identities: &[ProcessIdentity]) -> Result<(), String> {
+/// Every recorded engine process is alive as recorded; `Unknown` is not alive.
+/// Returns the recorded processes alive now. ADR 0027: a helper may have exited
+/// (an idle compile worker does); it is left out rather than refused.
+fn alive(identities: &[ProcessIdentity]) -> Result<Vec<ProcessIdentity>, String> {
     if identities.is_empty() {
         return Err("the launch recorded no processes".into());
     }
+    let mut live = Vec::new();
     for identity in identities {
         match capyctl_launchers::process_absence::presence(identity) {
-            Presence::Alive => {}
+            Presence::Alive => live.push(identity.clone()),
+            _ if identity.is_helper() => {}
             Presence::Gone => {
                 return Err(format!(
                     "recorded {} process {} is gone",
@@ -415,7 +419,7 @@ fn alive(identities: &[ProcessIdentity]) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(live)
 }
 
 #[cfg(test)]

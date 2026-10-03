@@ -78,21 +78,37 @@ fn bootstrap_is_durable_and_reopen_prefers_persisted_policy() {
 
     let store = crate::Store::open(&path).unwrap();
     let session = store.begin_coordinator_session().unwrap();
-    let mut local = host();
-    local.domains.get_mut("system").unwrap().managed_limit = 99;
     let reopened = store
-        .import_resource_policy(&session, &local, &observations(), 11_000)
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
         .unwrap();
     assert!(!reopened.changed);
-    assert_eq!(reopened.controls.domains["system"].managed_limit, 80);
+    assert_eq!(reopened.revision, 1);
+    // Limits the observed memory cannot hold (99 managed + 20 reserved of
+    // 100) are refused, and the persisted policy stands.
+    let mut local = host();
+    local.domains.get_mut("system").unwrap().managed_limit = 99;
+    assert!(matches!(
+        store.import_resource_policy(&session, &local, &observations(), 11_000),
+        Err(ResourcePolicyError::Invalid)
+    ));
+    assert_eq!(
+        store
+            .resource_policy("host-a")
+            .unwrap()
+            .unwrap()
+            .controls
+            .domains["system"]
+            .managed_limit,
+        80
+    );
     assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
 }
 
-// T19 (SPEC §10, §16.2; found live 2026-10-02): the embedded host's queue
-// bounds follow its document at every import, as a host's publication does
-// (M32), while its persisted memory limits are kept.
+// T19 (SPEC §10, §16.2; found live 2026-10-02 and 2026-10-03): the embedded
+// host's queue bounds and memory limits follow its document at every import,
+// as a host's publication does (M32).
 #[test]
-fn reopen_applies_changed_queue_bounds_and_keeps_memory_limits() {
+fn reopen_applies_changed_queue_bounds_and_memory_limits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.sqlite3");
     let store = crate::Store::open(&path).unwrap();
@@ -104,7 +120,7 @@ fn reopen_applies_changed_queue_bounds_and_keeps_memory_limits() {
     let store = crate::Store::open(&path).unwrap();
     let session = store.begin_coordinator_session().unwrap();
     let mut local = host();
-    local.domains.get_mut("system").unwrap().managed_limit = 99;
+    local.domains.get_mut("system").unwrap().managed_limit = 75;
     local.queue.stream_idle_ms = 600_000;
     let reopened = store
         .import_resource_policy(&session, &local, &observations(), 11_000)
@@ -112,7 +128,17 @@ fn reopen_applies_changed_queue_bounds_and_keeps_memory_limits() {
     assert!(reopened.changed);
     assert_eq!(reopened.revision, 2);
     assert_eq!(reopened.controls.queue.stream_idle_ms, 600_000);
-    assert_eq!(reopened.controls.domains["system"].managed_limit, 80);
+    assert_eq!(reopened.controls.domains["system"].managed_limit, 75);
+    assert_eq!(
+        store
+            .resource_policy("host-a")
+            .unwrap()
+            .unwrap()
+            .controls
+            .domains["system"]
+            .managed_limit,
+        75
+    );
     let queue = store.tightest_queue_policy().unwrap().unwrap();
     assert_eq!(queue.stream_idle_ms, 600_000);
     // The same bounds again change nothing.

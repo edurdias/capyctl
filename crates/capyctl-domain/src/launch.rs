@@ -184,6 +184,10 @@ pub struct SglangLaunchSettings {
     pub memory: MemoryRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
+    /// ADR 0014 amendment A14: the recurrent-state slots of a hybrid model,
+    /// derived where the checkpoint is read at launch; never declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_mamba_cache_size: Option<u32>,
     /// SGLang accepts `-1` to disable chunked prefill.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunked_prefill_size: Option<i32>,

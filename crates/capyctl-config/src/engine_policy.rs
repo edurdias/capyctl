@@ -772,7 +772,7 @@ pub fn typed_field_option(engine: Engine, field: &str) -> Option<&'static str> {
 /// Both engines' parsers accept any unambiguous prefix of a long option, so a
 /// name that is a prefix of a protected name could reach it (ADR 0014 §3). An
 /// abbreviation is refused whether or not it is ambiguous in the full parser.
-fn matches_name(given: &str, protected: &str) -> bool {
+pub(crate) fn matches_name(given: &str, protected: &str) -> bool {
     given.len() > 2 && protected.starts_with(given)
 }
 

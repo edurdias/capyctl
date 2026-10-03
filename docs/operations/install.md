@@ -542,6 +542,11 @@ single `unified` domain. Otherwise it publishes two kinds of memory domain:
 | `system` (`memory: distinct`) | host RAM | 50 % of RAM | 20 % of RAM | 25 % of RAM (host-KV 10 %) |
 | `gpuN` (`memory: device`), one per GPU | the card | total − reserve | the larger of 1 GiB and 8 % of the card | the smaller of 8 GiB and 25 % of the card |
 
+The `system` domain's managed limit and free reserve are settings
+(`host.resource_policy.memory.system`, see
+[configuration](configuration.md#standalone-memory-limits)); on a GB10 they set
+the single `unified` domain.
+
 The reserve on the card leaves room for a desktop session on a workstation
 GPU. Memory other programs already hold on the card lowers what CapyCTL sees as
 available; it is never hidden. An enrolled host states the same shape in its

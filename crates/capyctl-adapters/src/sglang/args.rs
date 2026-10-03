@@ -258,13 +258,7 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
     // (`(request - kv) / 11`) and the static pool holds the weights and the
     // KV cache. The unified placeholder margin (8 GiB) would leave a card's
     // static pool smaller than the weights it must load.
-    let margin_bytes = match memory.device_total_bytes {
-        Some(_) => (memory.request_bytes - memory.kv_cache_bytes) / 11,
-        None => memory.margin_bytes,
-    };
-    let static_bytes = (memory.request_bytes - margin_bytes)
-        .max(memory.kv_cache_bytes)
-        .min(memory.request_bytes);
+    let (margin_bytes, static_bytes) = capyctl_config::context_fit::static_pool_bytes(memory);
     let expected_restore = if s.cpu_weight_backup {
         "cpu_backup"
     } else {
@@ -285,6 +279,7 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         || !positive_i32(common.context_length)
         || !positive_i32(common.max_concurrent_requests)
         || !positive_i32(s.max_total_tokens)
+        || !positive_i32(s.max_mamba_cache_size)
         || s.chunked_prefill_size
             .is_some_and(|size| size == 0 || size < -1)
         || !(1..=1024).contains(&s.tokenizer_workers)
@@ -322,6 +317,11 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         "memory": public_memory(memory, margin_bytes, static_bytes),
         "extra_args": s.extra_args,
     });
+    // ADR 0014 amendment A14: present only when CapyCTL sized a hybrid
+    // model's recurrent-state pool, so every other launch renders as before.
+    if let Some(slots) = s.max_mamba_cache_size {
+        rendered["max_mamba_cache_size"] = json!(slots);
+    }
     // ADR 0024: present only when a parser was chosen, so every earlier launch
     // renders exactly as before. `none` is the deployment's switch, never a name.
     for (key, value) in [

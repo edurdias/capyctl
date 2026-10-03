@@ -929,3 +929,31 @@ async fn engine_quiescence_reads_both_sglang_gauges() {
     .unwrap();
     assert!(!unkeyed.engine_quiescent(&member, 0).await);
 }
+
+/// ADR 0027: a park of a launch whose recorded group holds a helper (a
+/// compile worker its scheduler started) that has since exited still parks,
+/// and its evidence names what is alive. A recorded process the observation
+/// does not name that is the engine's own worker still makes it uncertain.
+#[tokio::test]
+async fn a_park_with_a_helper_gone_still_parks_but_not_with_a_worker_gone() {
+    let mut recorded = identities();
+    recorded.push(ProcessIdentity {
+        role: "helper-0".into(),
+        pid: 23,
+        boot_id: "boot".into(),
+        start_ticks: 102,
+    });
+    let f = Fixture::new().await;
+    let mut c = f.next(RuntimeAction::Park, "park");
+    c.context.identities = ExecutionIdentities::Retained(recorded.clone());
+    let result = f.adapter.execute_persisted(&c).await.unwrap();
+    assert_eq!(result.facts, vec![Milestone::MemoryReleased]);
+    assert_eq!(result.identities, identities(), "the helper is gone");
+
+    let f = Fixture::new().await;
+    let mut c = f.next(RuntimeAction::Park, "park");
+    c.context.identities = ExecutionIdentities::Retained(recorded.clone());
+    f.server.observer.0.lock().unwrap().identities = vec![recorded[0].clone(), recorded[2].clone()];
+    uncertain(f.adapter.execute_persisted(&c).await);
+    assert!(f.requests().is_empty(), "nothing is sent");
+}

@@ -855,8 +855,8 @@ pub(super) fn normalize_engine_config(
             return Err(ConfigError::new(
                 ConfigErrorCode::MissingRequired,
                 "engine_config.context_length",
-                "a TensorFold deployment states context_length: it fixes the engine's KV \
-                 allocation, and TensorFold has no flag that caps its memory",
+                "a TensorFold deployment states context_length: it fixes the window \
+                 TensorFold serves",
             ));
         }
     }
@@ -1225,6 +1225,7 @@ pub(super) fn normalize_engine_config(
                 common,
                 memory,
                 max_total_tokens: sglang.max_total_tokens,
+                max_mamba_cache_size: None,
                 chunked_prefill_size: sglang.chunked_prefill_size,
                 tokenizer_workers,
                 tool_call_parser,

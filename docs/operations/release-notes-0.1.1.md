@@ -21,7 +21,19 @@ unchecked in this release.
   deployment `capacity_blocked` on a unified-memory host. A deployment that
   recorded such a peak before this release keeps it: delete it and deploy it
   again once.
+- An engine whose own processes start helper processes, such as the torch
+  inductor compile workers SGLang starts with CUDA graphs on, is no longer
+  stopped when those helpers exit on their own a few minutes after it is
+  ready. Only the engine's own processes exiting stops it; a stop still ends
+  the helpers.
 - A readiness check now accepts a model that answers with reasoning first.
+- On SGLang, `memory.kv_cache` is now the size of the KV cache, as on vLLM. A
+  hybrid model's per-request state is sized beside it, for
+  `max_concurrent_requests` (or as many as fit, up to 32). A stated
+  `memory.request` that cannot hold it is refused with the request it needs;
+  without one, CapyCTL runs as many requests as fit and status shows the
+  limit. Before, the state took part of the KV cache and could limit a hybrid
+  model to 2 running requests.
 - New exit code 26, `toolchain_missing`, from `capyctl engine add`.
 - A client that hangs up in the middle of a streamed answer now stops the
   engine's work on it, for vLLM, SGLang and TensorFold. CapyCTL keeps the

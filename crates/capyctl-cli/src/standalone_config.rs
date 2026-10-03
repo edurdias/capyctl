@@ -3,7 +3,8 @@
 //! The profile is ADR 0008's engine installation, and it is now the installation the
 //! provider actually found rather than a shape invented here. Limits derive from
 //! observed capacity rather than a configured guess, because an invented ceiling is
-//! how a host gets overcommitted.
+//! how a host gets overcommitted. An operator may state the host-memory limits
+//! as a size or a share of that capacity ([`apply_stated_memory`], ADR 0025).
 
 use crate::device_inventory::InventoryPublication;
 use capyctl_agent::gpu_memory::{GpuMemory, HostShape};
@@ -310,6 +311,78 @@ pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
             queue.insert(bound.clone(), value.clone());
         }
     }
+}
+
+/// Owner decision 2026-10-03 (standalone is a server and one host, every
+/// setting three ways): the memory limits the standalone document states under
+/// `host.resource_policy.memory.system` (after `--set` and `CAPYCTL_SET__…`)
+/// replace the derived ones in the embedded host's policy. They apply to the
+/// one host-memory domain: `unified` on a unified machine, `system` (host
+/// RAM) on a discrete one; a card's own domain keeps its derived limits.
+///
+/// A size is taken as stated; a percentage is of `capacity_bytes`, the memory
+/// observed at this start. The managed limit and the free reserve are
+/// simultaneous constraints on one memory (SPEC §16), so together they must
+/// fit `capacity_bytes`, as the derived pair does; the parked and host-KV
+/// sub-limits are lowered to a managed limit below them. Forms and ranges were
+/// checked when the document was read
+/// ([`capyctl_config::standalone::check_honoured`]).
+pub fn apply_stated_memory(
+    host: &mut Value,
+    stated_host: &Value,
+    capacity_bytes: i64,
+) -> Result<(), String> {
+    use capyctl_config::standalone::{MemoryShare, STATED_MEMORY_LIMITS};
+    const GIB: f64 = (1u64 << 30) as f64;
+    let stated = &stated_host["resource_policy"]["memory"]["system"];
+    let mut shares = Vec::new();
+    for field in STATED_MEMORY_LIMITS {
+        let path = format!("host.resource_policy.memory.system.{field}");
+        if let Some(text) = stated[*field].as_str() {
+            if let Some(share) = MemoryShare::parse(text).map_err(|e| format!("{path}: {e}"))? {
+                shares.push((*field, share.of(capacity_bytes)));
+            }
+        }
+    }
+    if shares.is_empty() {
+        return Ok(());
+    }
+    let Some(domain) = host["resource_policy"]["domains"]
+        .as_object_mut()
+        .and_then(|domains| {
+            domains
+                .values_mut()
+                .find(|domain| domain["memory"] != "device")
+        })
+    else {
+        return Ok(());
+    };
+    let bytes = |domain: &Value, field: &str| -> i64 {
+        domain[field]
+            .as_str()
+            .and_then(|text| capyctl_config::effective::parse_bytes(text).ok())
+            .unwrap_or(0)
+    };
+    for (field, value) in &shares {
+        domain[*field] = json!(format!("{value}B"));
+    }
+    let managed = bytes(domain, "managed_limit");
+    let reserve = bytes(domain, "free_reserve");
+    if managed.saturating_add(reserve) > capacity_bytes {
+        return Err(format!(
+            "host.resource_policy.memory.system: the managed limit ({:.1} GiB) and the free \
+             reserve ({:.1} GiB) together exceed the {:.1} GiB of memory this host has",
+            managed as f64 / GIB,
+            reserve as f64 / GIB,
+            capacity_bytes as f64 / GIB,
+        ));
+    }
+    for sub_limit in ["parked_limit", "host_kv_limit"] {
+        if domain.get(sub_limit).is_some() && bytes(domain, sub_limit) > managed {
+            domain[sub_limit] = json!(format!("{managed}B"));
+        }
+    }
+    Ok(())
 }
 
 /// The request deadline a deployment carries unless its caller names another.

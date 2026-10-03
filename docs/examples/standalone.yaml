@@ -33,8 +33,8 @@ host:
     memory:
       accounting: auto
       system:
-        managed_limit: auto
-        free_reserve: auto
+        managed_limit: auto   # 50 % of memory; or a size ("90GiB") or a share ("75%")
+        free_reserve: auto    # 20 % of memory; or a size or a share
     # Optional request queue bounds, as on a host (defaults shown):
     # queue:
     #   request_deadline: "1800s"     # until the first output, prefill included

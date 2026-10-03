@@ -1799,6 +1799,8 @@ async fn start_standalone_in(
         );
         models.write_into(&mut host);
         crate::standalone_config::apply_stated_queue(&mut host, &stated_host);
+        crate::standalone_config::apply_stated_memory(&mut host, &stated_host, capacity_bytes)
+            .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
         // The host's own policy, normalized exactly as resolution normalizes
         // it (`resolve_effective(..).host` is this same value). Nothing here
         // sizes a deployment: a card too small for any template boots and

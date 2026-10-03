@@ -119,23 +119,39 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             return Err(uncertain("process group leader identity changed"));
         }
         let mut members: Vec<ProcessIdentity> = Vec::new();
-        let mut workers: Vec<_> = facts.iter().filter(|fact| fact.pid != api.pid).collect();
+        let mut others: Vec<_> = facts.iter().filter(|fact| fact.pid != api.pid).collect();
         // Start order, not pid order: pids wrap, start ticks within one boot do not.
-        workers.sort_by_key(|fact| (fact.start_ticks, fact.pid));
+        others.sort_by_key(|fact| (fact.start_ticks, fact.pid));
         if facts
             .iter()
             .any(|fact| fact.pid == api.pid && fact.start_ticks == api.start_ticks)
         {
             members.push(api.clone());
         }
-        for (index, fact) in workers.into_iter().enumerate() {
-            members.push(ProcessIdentity {
-                role: format!("worker-{index}"),
-                pid: fact.pid,
-                boot_id: fact.boot_id.clone(),
-                start_ticks: fact.start_ticks,
-            });
-        }
+        // ADR 0027: the processes the API process started itself are the
+        // engine's workers. Anything else in the group was started by one of
+        // them (a compile worker pool) or outlived its parent: a helper,
+        // recorded for cleanup, whose exit is not the engine's. Each kind is
+        // numbered on its own, so a helper exiting renames no worker.
+        let (workers, helpers): (Vec<_>, Vec<_>) = others
+            .into_iter()
+            .partition(|fact| fact.parent_pid == api.pid);
+        let named = |prefix: &str, list: Vec<&crate::group_observation::GroupProcessFact>| {
+            list.into_iter()
+                .enumerate()
+                .map(|(index, fact)| ProcessIdentity {
+                    role: format!("{prefix}{index}"),
+                    pid: fact.pid,
+                    boot_id: fact.boot_id.clone(),
+                    start_ticks: fact.start_ticks,
+                })
+                .collect::<Vec<_>>()
+        };
+        members.extend(named("worker-", workers));
+        members.extend(named(
+            capyctl_domain::completion::HELPER_ROLE_PREFIX,
+            helpers,
+        ));
         Ok(members)
     }
 
@@ -368,6 +384,79 @@ mod tests {
         );
 
         tool.terminate_owned(&members, Duration::from_millis(200))
+            .unwrap();
+        assert!(tool.observe_group(&api).unwrap().is_empty());
+    }
+
+    /// A leader with one child, which starts a grandchild of its own: an engine
+    /// whose scheduler started a compile worker pool.
+    fn with_helper(seconds: u32) -> RenderedCommand {
+        RenderedCommand {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("sh -c 'sleep {seconds} & wait; sleep {seconds}' & sleep {seconds}; wait"),
+            ],
+            env: Default::default(),
+        }
+    }
+
+    /// The group once it holds at least `count` processes.
+    fn until_members(
+        tool: &DurableProcessLaunch,
+        api: &ProcessIdentity,
+        count: usize,
+    ) -> Vec<ProcessIdentity> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let members = tool.observe_group(api).unwrap();
+            if members.len() >= count || Instant::now() >= deadline {
+                return members;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// ADR 0027: the processes the leader started itself are the engine's
+    /// workers; a process one of them started is a helper. A helper that exits
+    /// leaves the workers' names unchanged, and terminating the recorded group
+    /// still ends every helper.
+    #[test]
+    fn a_grandchild_is_recorded_as_a_helper_and_still_terminated() {
+        let tool = DurableProcessLaunch::new(Arc::new(Accept));
+        let api = tool.spawn_durable("helper", &with_helper(60)).unwrap();
+        let members = until_members(&tool, &api, 4);
+        let roles: Vec<_> = members.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles[0], "api", "{members:?}");
+        let workers = members
+            .iter()
+            .filter(|m| m.role.starts_with("worker-"))
+            .count();
+        let helpers: Vec<_> = members.iter().filter(|m| m.is_helper()).collect();
+        assert_eq!(
+            workers, 2,
+            "the inner shell and the leader's sleep: {members:?}"
+        );
+        assert_eq!(helpers.len(), 1, "the inner shell's sleep: {members:?}");
+        assert_eq!(helpers[0].role, "helper-0");
+
+        let helper = helpers[0].clone();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(helper.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tool.present(&helper) != Presence::Gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tool.present(&helper), Presence::Gone);
+        let after = tool.observe_group(&api).unwrap();
+        for member in members.iter().filter(|m| !m.is_helper()) {
+            assert!(after.contains(member), "{member:?} renamed: {after:?}");
+        }
+
+        tool.terminate_owned(&members, Duration::from_secs(2))
             .unwrap();
         assert!(tool.observe_group(&api).unwrap().is_empty());
     }

@@ -102,10 +102,17 @@ They are written to `engines.yaml` as `security.approved_options` and
 
 CapyCTL counts a draft model when it sizes a deployment: its weights in the
 memory request, its CUDA graphs in the memory reserved for the first start,
-and its KV cache layers in the context it fits to the KV cache. A hybrid
-model (one with linear-attention layers) with a draft model on SGLang needs a
-larger KV cache than the 4 GiB default: set `memory.kv_cache` (16 GiB works
-for Qwen3.8-27B with DFlash2).
+and its KV cache layers in the context it fits to the KV cache.
+
+On SGLang, `memory.kv_cache` is the size of the KV cache, as on vLLM. A hybrid
+model (one with linear-attention layers) also keeps a state for each running
+request, beside the KV cache, so its `memory.request` has to hold the weights,
+the KV cache and that state. With a `memory.request` you state, CapyCTL runs
+your `max_concurrent_requests` (or as many as fit, up to 32) and refuses to start
+when they do not fit, naming the memory request they need: Qwen3.8-27B with
+DFlash2, a 16 GiB KV cache and 8 requests needs about 65 GiB. Without one,
+CapyCTL runs as many requests as fit and `capyctl status deployment` says
+"Running limited to N requests by the state cache".
 
 ## TensorFold
 
@@ -179,6 +186,16 @@ parks, so `parked` holds nothing and `parking` and `wake` repeat `ready` and
 `cold`. The values above fit Nemotron 3.5 Lightning 30B-A3B 4-bit with a
 32768-token context on a GB10: TensorFold estimated 27.7 GiB at startup and
 CapyCTL measured a 20.2 GiB peak.
+
+The `ready` bytes are also TensorFold's memory cap: CapyCTL starts it with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to them. Without a cap TensorFold sizes
+itself from the machine's free memory: with `--parallel` its caches grow as
+requests get longer, and it keeps long prompts' states for later turns, past what
+CapyCTL reserved. TensorFold 0.6.3 honours the cap;
+earlier versions ignore it. The cap covers what TensorFold allocates on the GPU,
+not the rest of the process, so leave a few GiB above what the model needs. A
+window or a number of streams that does not fit is refused by TensorFold at start,
+or its requests wait, instead of taking memory CapyCTL did not reserve.
 
 A drafter works as a draft model does for vLLM and SGLang: allow it when you
 add the engine, with the directory that holds your drafters,

@@ -234,3 +234,95 @@ async fn standalone_queue_bounds_follow_the_document_and_its_overrides() {
         };
     assert!(error.contains("resource_policy"), "{error}");
 }
+
+// T03 T19 (owner decision 2026-10-03: standalone is a server and one host,
+// every setting three ways; found live 2026-10-03, the fixed 50 % limit
+// refused an 84 GiB declaration): the standalone document's
+// `host.resource_policy.memory.system` limits replace the derived ones in the
+// stored policy, `--set` and `CAPYCTL_SET__…` override them, a restart applies
+// a change, and `auto` returns to the derived default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_memory_limits_follow_the_document_and_its_overrides() {
+    use capyctl_cli::roles::SettingOverrides;
+    use capyctl_config::ConfigKind;
+    const CAPACITY: i64 = support::TEST_CAPACITY_BYTES;
+    let dir = support::safe_state_dir();
+    let config = dir.path().join("standalone.yaml");
+    std::fs::write(
+        &config,
+        "schema_version: 1\nkind: standalone\nname: s\nhost:\n  resource_policy:\n    memory:\n      system:\n        managed_limit: 70%\n        free_reserve: auto\n",
+    )
+    .unwrap();
+    let ports = support::engine_ports();
+    let stored = |app: &capyctl_cli::roles::App| {
+        let policy = app
+            .store
+            .resource_policy("standalone")
+            .unwrap()
+            .expect("the embedded host published its policy");
+        let domain = &policy.controls.domains["unified"];
+        (domain.managed_limit, domain.free_reserve)
+    };
+    let app = support::boot_with_overrides_on(
+        dir.path(),
+        Some(&config),
+        &SettingOverrides::none(ConfigKind::Standalone),
+        ports,
+    )
+    .await
+    .expect("standalone boots with its stated memory limit");
+    assert_eq!(stored(&app), (CAPACITY / 100 * 70, CAPACITY / 100 * 20));
+    let _ = app.shutdown().await;
+
+    // A restart applies `--set` over the environment over the document.
+    let overrides = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.memory.system.managed_limit=20GiB".to_owned()],
+        &[
+            (
+                "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__MANAGED_LIMIT".to_owned(),
+                "60%".to_owned(),
+            ),
+            (
+                "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__FREE_RESERVE".to_owned(),
+                "4GiB".to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let app = support::boot_with_overrides_on(dir.path(), Some(&config), &overrides, ports)
+        .await
+        .expect("standalone boots with its overrides");
+    assert_eq!(stored(&app), (20 << 30, 4 << 30));
+    let _ = app.shutdown().await;
+
+    // Limits that do not fit the memory together are refused at boot.
+    let refused = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.memory.system.managed_limit=30GiB".to_owned()],
+        &[],
+    )
+    .unwrap();
+    let error =
+        match support::boot_with_overrides_on(dir.path(), Some(&config), &refused, ports).await {
+            Ok(_) => panic!("a managed limit beyond the memory booted"),
+            Err(error) => error.to_string(),
+        };
+    assert!(
+        error.contains("host.resource_policy.memory.system"),
+        "{error}"
+    );
+
+    // `auto` returns to the derived default (50 %).
+    let auto = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.memory.system.managed_limit=auto".to_owned()],
+        &[],
+    )
+    .unwrap();
+    let app = support::boot_with_overrides_on(dir.path(), Some(&config), &auto, ports)
+        .await
+        .expect("standalone boots with the derived limit");
+    assert_eq!(stored(&app), (CAPACITY / 100 * 50, CAPACITY / 100 * 20));
+    let _ = app.shutdown().await;
+}

@@ -1902,12 +1902,11 @@ fn complete(
         .clone()
         .ok_or(LifecycleError::CorruptStoredData)?;
     let ttl = policy(tx, &e)?.controls.observation_ttl_ms;
-    let mut observed = o.identities.clone();
-    observed.sort();
+    // ADR 0027: the engine's own processes, all of them; a helper may be gone.
     if o.token != p.token()
         || o.binding_id != p.binding_id
         || o.incarnation != p.incarnation
-        || observed != identities
+        || !names_engine(&identities, &o.identities)
         || o.facts != p.kind.facts()
     {
         return Err(LifecycleError::Rejected(

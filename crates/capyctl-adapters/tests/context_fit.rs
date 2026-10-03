@@ -225,3 +225,188 @@ fn vllm_runs_the_routers_in_flight_bound_unless_told_otherwise() {
     );
     assert_eq!(max_num_seqs(&argv), Some("64"));
 }
+
+/// Qwen3.8-27B NVFP4's language model: 48 gated-delta-net layers and 16
+/// attention layers with 4 KV heads of 256.
+fn qwen38_27b() -> Value {
+    let mut types = Vec::new();
+    for _ in 0..16 {
+        types.extend(["linear_attention", "linear_attention", "linear_attention"]);
+        types.push("full_attention");
+    }
+    json!({"model_type": "qwen3_5", "text_config": {
+        "model_type": "qwen3_5_text", "num_hidden_layers": 64, "num_attention_heads": 24,
+        "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 5120,
+        "max_position_embeddings": 262144, "dtype": "bfloat16", "layer_types": types,
+        "full_attention_interval": 4, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+    }})
+}
+
+fn sglang_frozen(
+    effective: &EffectiveDeployment,
+) -> Result<capyctl_domain::launch::NativeLaunch, capyctl_adapters::RuntimeError> {
+    frozen_from_effective(
+        effective,
+        "01K00000000000000000000001",
+        "01K00000000000000000000002",
+        "127.0.0.1:8123",
+        "toy".into(),
+        "sglang-inference-binding-1".into(),
+        "sglang-admin-binding-1".into(),
+    )
+}
+
+/// The settings the protected entry is given.
+fn sglang_public(effective: &EffectiveDeployment) -> Value {
+    let frozen = sglang_frozen(effective).unwrap();
+    let launch = capyctl_adapters::sglang::SglangLaunch::from_frozen(&frozen).unwrap();
+    launch.public_metadata()["settings"].clone()
+}
+
+/// The golden SGLang deployment with `memory`, sized with `weights` of
+/// checkpoint weights.
+fn sized_sglang(
+    config: &Value,
+    weights: Option<i64>,
+    edit: impl FnOnce(&mut Value),
+) -> (tempfile::TempDir, EffectiveDeployment) {
+    let store = tempfile::tempdir().unwrap();
+    let checkpoint = store.path().join("toy");
+    std::fs::create_dir(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("config.json"), config.to_string()).unwrap();
+    let (mut deployment, mut host) = golden("sglang");
+    host["model_store"]["path"] = json!(store.path());
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["engine_config"]["kv_cache_dtype"] = json!("fp8_e4m3");
+    edit(&mut deployment);
+    let facts = capyctl_config::effective::CheckpointFacts {
+        weights_bytes: weights,
+        ..Default::default()
+    };
+    let effective =
+        capyctl_config::effective::resolve_effective_with_checkpoint(&deployment, &host, facts)
+            .unwrap();
+    (store, effective)
+}
+
+// T14 (owner decision 2026-10-03, ADR 0014 amendment A14): SGLang is given
+// the KV cache as its KV pool in tokens, as vLLM is given it in bytes.
+#[test]
+fn sglang_is_given_the_kv_cache_as_its_kv_pool() {
+    let (_store, effective) = resolved("sglang", Some(&dense()), |_, _| {});
+    let settings = sglang_public(&effective);
+    // 4 GiB / 512 KiB of bfloat16 KV per token.
+    assert_eq!(settings["max_total_tokens"], json!(8192));
+    assert_eq!(settings["max_running_requests"], Value::Null);
+    assert!(settings.get("max_mamba_cache_size").is_none(), "{settings}");
+}
+
+// T14 (amendment A14, found live 2026-10-03): a hybrid model's KV pool counts
+// its attention layers only, and its recurrent state is sized for its running
+// requests beside the KV cache instead of taking a share of it.
+#[test]
+fn sglang_sizes_a_hybrid_models_state_beside_its_kv_cache() {
+    let weights = 21_920_000_000;
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(weights), |d| {
+        d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
+    });
+    let settings = sglang_public(&effective);
+    assert_eq!(settings["max_total_tokens"], json!(524288));
+    assert_eq!(
+        settings["max_running_requests"],
+        json!(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
+    );
+    assert_eq!(settings["max_mamba_cache_size"], json!(160));
+    // A declared count is kept, and its state sized.
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(weights), |d| {
+        d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    let settings = sglang_public(&effective);
+    assert_eq!(settings["max_running_requests"], json!(8));
+    assert_eq!(settings["max_mamba_cache_size"], json!(40));
+}
+
+// T14 (amendment A14): a state that does not fit the memory request is
+// refused before anything starts, naming the request that would hold it, and
+// status shows the same reason beforehand.
+#[test]
+fn sglang_refuses_a_hybrid_state_the_request_cannot_hold() {
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(21_920_000_000), |d| {
+        d["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "16GiB"});
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    let Err(error) = sglang_frozen(&effective) else {
+        panic!("refused")
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("engine_config.memory.request") && error.contains("max_concurrent_requests"),
+        "{error}"
+    );
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert!(fit
+        .warning
+        .is_some_and(|warning| warning.contains("engine_config.memory.request")),);
+}
+
+// T14 (#40's rule): extra arguments that size the state pool win, and
+// CapyCTL passes nothing for it.
+#[test]
+fn extra_arguments_that_size_sglangs_state_pool_win() {
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(21_920_000_000), |d| {
+        d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
+        d["engine_config"]["accept_extra_args"] = json!(true);
+        d["engine_config"]["extra_args"] = json!(["--max-mamba-cache-size", "64"]);
+    });
+    let settings = sglang_public(&effective);
+    assert!(settings.get("max_mamba_cache_size").is_none(), "{settings}");
+    assert_eq!(settings["max_running_requests"], Value::Null);
+    assert_eq!(settings["max_total_tokens"], json!(524288));
+}
+
+// T14 (owner decision 2026-10-03): a derived request fits what it can: the
+// state takes part of the margin, SGLang's static pool grows by it, and the
+// running requests are limited to what fits.
+#[test]
+fn a_derived_request_lends_the_state_part_of_its_margin() {
+    let weights = 21_920_000_000i64;
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(weights), |d| {
+        d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+    });
+    let settings = sglang_public(&effective);
+    let state = 153_944_064i64;
+    assert_eq!(settings["max_running_requests"], json!(5));
+    assert_eq!(settings["max_mamba_cache_size"], json!(25));
+    let gib = 1i64 << 30;
+    assert_eq!(
+        settings["memory"]["static_bytes"],
+        json!(weights + 4 * gib + 26 * state + 2 * gib)
+    );
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, Some(5));
+}
+
+// T14 (amendment A14, found live 2026-10-03): a revision that declares its
+// request and KV cache records no weights, so the launch sizes the weight
+// files it reads and still refuses a state that does not fit.
+#[test]
+fn sglang_sizes_the_weights_at_launch_when_the_revision_has_none() {
+    let (store, effective) = sized_sglang(&qwen38_27b(), None, |d| {
+        d["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "16GiB"});
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    // A sparse file stands for the weights.
+    std::fs::File::create(store.path().join("toy/model.safetensors"))
+        .unwrap()
+        .set_len(21_920_000_000)
+        .unwrap();
+    let Err(error) = sglang_frozen(&effective) else {
+        panic!("refused")
+    };
+    let error = error.to_string();
+    assert!(error.contains("21920000000 bytes of weights"), "{error}");
+}

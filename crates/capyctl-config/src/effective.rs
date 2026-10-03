@@ -936,7 +936,7 @@ struct RawLogPolicy {
 
 const TENSORFOLD_NEEDS_RESOURCES: &str =
     "a TensorFold deployment states resources: TensorFold sizes \
-    itself from free memory and has no flag that caps it";
+    itself from free memory, and its Ready allocation is the cap it is launched with";
 
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,

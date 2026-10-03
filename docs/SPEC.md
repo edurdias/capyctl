@@ -405,7 +405,11 @@ within the bound reports none), stops the owned process and verifies its exit;
 waking launches the same pinned contract again. `deep` and `host_backed` fail
 resolution with `capability_missing`. A TensorFold deployment states its
 `resources` and its `context_length`, which fixes the engine's KV allocation;
-TensorFold has no flag that caps its memory. The engine listens on loopback only,
+TensorFold has no flag that caps its memory. *Amended 2026-10-03 by
+[ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md):* the
+context does not bound a CUDA engine's growing caches, which TensorFold sizes from
+the machine's free memory; CapyCTL launches it with its declared Ready allocation
+as its cap (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, honoured from 0.6.3). The engine listens on loopback only,
 so local processes can reach its port; CapyCTL's routed path is the only network
 path to it. Its first start builds CUDA extensions into a private per-version
 directory, so registration checks the build toolchain on the engine's closed PATH
@@ -421,7 +425,7 @@ The first inference surface is `GET /v1/models` and streaming/non-streaming `POS
 
 Resolve model aliases to explicit deployments. A deployment with several instances is served by all of its READY instances; the router selects among instances with open admission using its own in-flight counts and fresh host-reported engine load, and fails over to another instance only before upstream acceptance (ADR 0013). Preserve supported payloads, tool calls, structured-output parameters, reasoning fields, multimodal content, and stream events. Do not tokenize, rewrite prompts, silently substitute models, or execute client tools. Any model-name remapping in responses must be documented and limited.
 
-Note (2026-09-24): CapyCTL relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser. For a known model family CapyCTL chooses the tool-call and reasoning parsers itself (ADR 0024); otherwise the deployment names them in `engine_config.<engine>.tool_call_parser` and `reasoning_parser`, or passes them in `extra_args`. Without one, the engine rejects the request or answers in plain text, and CapyCTL relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
+Note (2026-09-24): CapyCTL relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser. For a known model family CapyCTL chooses the tool-call and reasoning parsers itself (ADR 0024); otherwise the deployment names them in `engine_config.<engine>.tool_call_parser` and `reasoning_parser`, or passes them in `extra_args`. Without one, the engine rejects the request or answers in plain text, and CapyCTL relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body, or, before any output, a stream error event with one of those codes, which is how SGLang refuses a prompt longer than its KV pool) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
 
 Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `capyctl start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
 
@@ -499,6 +503,10 @@ Track PID plus start identity, process-tree/service/container handles, deploymen
 On server restart, reconcile desired state with agents before dispatch. On agent restart, inspect owned handles, verify current generations, and reconcile resources before accepting new transitions. On control-channel loss, preserve ownership, freeze new unsupervised transitions, and let existing work finish where the serving path remains available. Server/router failure may still break streams.
 
 On wake failure, keep admission closed. A bounded clean-restart fallback is allowed after verified cleanup and before inference dispatch. Repeated failures exhaust the deployment's attempt budget and leave it terminal `Failed` with its own admission closed (ADR 0011 decision 5). On park failure, safely stop the owned group after drain if policy allows. Unexpected memory growth blocks new admission; no blind activation of the next model.
+
+> **Amended by [ADR 0027](design/adr/0027-engine-processes-and-helpers.md)** (owner decision 2026-10-03).
+
+A launch's recorded group names the engine's own processes (the `api` process and the processes it started itself, `worker-N`) apart from helpers (`helper-N`: processes those started in turn, such as a compile worker pool). Only an engine process gone while Ready is an engine exit, and a later proof that the recorded engine still runs needs every recorded engine process and no other engine process. Helpers stay owned: cleanup terminates them and proves them gone before anything is released.
 
 Controller command generations are not a substitute for physical fencing. Initial scope is one active controller with persistent state and local locking, not active-active failover. An agent cannot switch to another controller identity just because it has a similar hostname.
 
@@ -894,6 +902,10 @@ Relative paths in this example resolve against the configuration file, not an ar
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
 The generated shape states `inference.bind: "0.0.0.0:8443"` (with `authentication: api_key`). The sentence above that standalone listeners "serve plain HTTP on loopback" now reads: standalone listeners serve plain HTTP; use a private network or a TLS reverse proxy. The management listener stays on loopback.
+
+> **Amended by [ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md)** (owner decision 2026-10-03).
+
+`host.resource_policy.memory.system.managed_limit` and `free_reserve` take `auto` (50 % and 20 % of the observed memory), a size (`90GiB`) or a whole percentage (`75%`), by YAML, `--set` or `CAPYCTL_SET__…`. Together they must fit the observed memory. They apply to the `unified` domain, or to host RAM's `system` domain on a discrete machine, and the stored policy follows them at every start.
 
 ## 17. Observability and benchmark evidence
 
