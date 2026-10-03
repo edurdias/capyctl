@@ -144,7 +144,7 @@ impl From<LifecycleError> for LifecycleFault {
             // clears.
             LifecycleError::RuntimeRetained
             | LifecycleError::HostPolicyDenied
-            | LifecycleError::CapacityBlocked
+            | LifecycleError::CapacityBlocked(_)
             | LifecycleError::StartupRequiresEmptyHost
             | LifecycleError::HostIneligible
             | LifecycleError::QueueFull
@@ -179,6 +179,8 @@ impl From<CoordinatorError> for LifecycleFault {
             // re-made once the coordinator has capacity again.
             CoordinatorError::Busy => Self::Blocked(text),
             CoordinatorError::Stopped(_) => Self::Unavailable(text),
+            // Nothing was admitted; it clears once the stop or launch settles.
+            CoordinatorError::Paused(_) => Self::Unavailable(text),
             CoordinatorError::Service(_) => Self::Unavailable(text),
             CoordinatorError::Invalid => Self::Blocked(text),
             // W5: deferred without effect; it proceeds once capacity is back.

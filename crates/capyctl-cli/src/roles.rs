@@ -1726,8 +1726,17 @@ async fn start_standalone_in(
             (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
         }
     });
+    // ADR 0018 amendment A3: a profile for an engine kind this release does
+    // not know (a newer release wrote it) is skipped with a warning.
     let registered = match &engines {
-        Some(path) => capyctl_config::registration::EnginesFile::load(path)?.profiles,
+        Some(path) => {
+            let (runnable, skipped) =
+                capyctl_config::registration::EnginesFile::load(path)?.runnable();
+            for unknown in skipped {
+                role_warning(&unknown.warning(path));
+            }
+            runnable
+        }
         None => serde_json::Map::new(),
     };
     for (name, profile) in &registered {

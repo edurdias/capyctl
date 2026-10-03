@@ -555,10 +555,11 @@ async fn scoped_start_paused_history_is_read_only_and_conflicts_and_corruption_s
             .unwrap(),
         receipt
     );
+    // The worker runs, paused on the uncertain launch: a new start waits.
     assert!(matches!(
         handle.start("owner", &fence.deployment_id, 1, "new", 10000),
         Err(CoordinatorCommandError::Coordinator(
-            CoordinatorError::Stopped(_)
+            CoordinatorError::Paused(_)
         ))
     ));
     assert!(matches!(
@@ -888,4 +889,48 @@ async fn scoped_start_store_queue_failure_waits_for_in_progress_admission() {
         still_accepting,
         "fatal Store queue failure closed admission before the in-progress command could commit"
     );
+}
+
+// SPEC §6.4, §14: while an unproven stop (or an uncertain launch) pauses new
+// activations, a start is refused as paused, which management reports as a
+// retryable `still_stopping`, not as a stopped coordinator
+// (`reconciliation_required`). Once the pause lifts the same start is taken.
+// T08 T17
+#[tokio::test]
+async fn a_start_while_activations_are_paused_is_refused_as_paused() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+        Arc::new(move |_| Ok(test_driver(gate.clone()))),
+    )
+    .unwrap();
+    w.shared.pause(Paused {
+        binding: "an-unproven-stop".into(),
+        status: WorkerStatus::Uncertain {
+            operation_id: "op".into(),
+            reason: "an unproven stop".into(),
+        },
+        retry: None,
+    });
+    let refused = w
+        .commands()
+        .start("owner", &fence.deployment_id, 1, "start", 10000);
+    assert!(
+        matches!(
+            refused,
+            Err(CoordinatorCommandError::Coordinator(
+                CoordinatorError::Paused(_)
+            ))
+        ),
+        "{refused:?}"
+    );
+    w.shared.unpause("an-unproven-stop");
+    w.commands()
+        .start("owner", &fence.deployment_id, 1, "start", 10000)
+        .expect("admitted once the pause lifts");
+    w.shutdown().await.unwrap();
 }

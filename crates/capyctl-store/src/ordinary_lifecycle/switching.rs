@@ -25,7 +25,7 @@ use crate::events::{append_event, EventMetadata, SwitchPhase};
 use crate::instances::instance_owner_id;
 use capyctl_config::instances::Placement;
 use capyctl_scheduler::device_choice::choose_device_with_eviction_within;
-use capyctl_scheduler::placement::{candidate_fits, fits};
+use capyctl_scheduler::placement::{candidate_fits, fits, gib};
 use capyctl_scheduler::switching::{
     choose_victims_within, observed_room, order_victims, Release, Victim, VictimCandidate,
 };
@@ -1305,11 +1305,6 @@ fn mark_last_ready(
             .all(|k| released.contains(&(victim.deployment_id.clone(), *k)));
     }
     Ok(())
-}
-
-/// Bytes shown to the operator, in GiB with one decimal.
-fn gib(bytes: i64) -> String {
-    format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
 }
 
 /// Owner decision 2026-09-25: why one host cannot take the instance even with

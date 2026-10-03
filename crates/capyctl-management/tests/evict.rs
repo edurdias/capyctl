@@ -267,6 +267,16 @@ async fn a_default_start_never_evicts_and_evict_reports_its_victims() {
     let (status, refused) = send(&lab, action(&lab.b, "start-b", start(false))).await;
     assert_eq!(status, 503, "{refused}");
     assert_eq!(refused["error"]["code"], "capacity_blocked");
+    // The refusal names the limit it hit: what B needs, what is free and the
+    // host's limit (A holds 8 GiB of the 15 GiB).
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(
+            "host lab needs 10.0 GiB of unified memory, 7.0 GiB free of its 15.0 GiB limit"
+        ),
+        "{message}"
+    );
+    assert!(message.contains("--evict"), "{message}");
     assert_eq!(lab.instance(&lab.a, 0), ("ready".into(), true));
     assert!(
         lab.switch_events().is_empty(),

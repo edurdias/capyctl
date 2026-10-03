@@ -842,7 +842,7 @@ impl crate::Store {
             }
         }
         let _reservation = reserved.ok_or(if detailed {
-            LifecycleError::CapacityBlocked
+            LifecycleError::CapacityBlocked(None)
         } else {
             LifecycleError::Conflict
         })?;

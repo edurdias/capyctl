@@ -2742,7 +2742,7 @@ impl crate::Store {
                     },
                 })),
                 // SPEC §6.5: deferred while it would displace active work.
-                Err(LifecycleError::CapacityBlocked) => Ok(None),
+                Err(LifecycleError::CapacityBlocked(_)) => Ok(None),
                 Err(LifecycleError::RevisionConflict) => {
                     finish("revision_changed", Some("preinitialize_revision_changed"))
                 }

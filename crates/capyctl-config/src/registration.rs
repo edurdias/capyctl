@@ -105,6 +105,30 @@ impl EnginesFile {
         })
     }
 
+    /// The profiles this release can run, and the ones it skips: a profile
+    /// whose `engine` names a kind this release does not know (a newer
+    /// release shares the file and wrote it). Every other profile, a known
+    /// kind or a missing or non-string `engine`, is kept and validated as
+    /// before. Writers keep every profile; only a role skips them.
+    pub fn runnable(&self) -> (Map<String, Value>, Vec<UnknownEngineProfile>) {
+        let mut runnable = Map::new();
+        let mut skipped = Vec::new();
+        for (name, profile) in &self.profiles {
+            match profile["engine"].as_str() {
+                Some(kind) if Engine::from_name(kind).is_none() => {
+                    skipped.push(UnknownEngineProfile {
+                        profile: name.clone(),
+                        engine: kind.to_owned(),
+                    })
+                }
+                _ => {
+                    runnable.insert(name.clone(), profile.clone());
+                }
+            }
+        }
+        (runnable, skipped)
+    }
+
     /// JSON-shaped YAML, as `capyctl init` writes, under the revision line.
     pub fn render(&self, revision: u64) -> String {
         let body = serde_json::json!({"schema_version": 1, "kind": "engines", "runtime_profiles": self.profiles});
@@ -115,8 +139,32 @@ impl EnginesFile {
     }
 }
 
+/// ADR 0018 amendment A3: a profile in engines.yaml for an engine kind this
+/// release does not know. The role skips it and starts; a deployment that
+/// names it fails as any unpublished profile does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEngineProfile {
+    pub profile: String,
+    pub engine: String,
+}
+
+impl UnknownEngineProfile {
+    /// The start-up warning that names the skipped profile and its kind.
+    pub fn warning(&self, engines: &Path) -> String {
+        format!(
+            "warning: {}: profile {} uses engine `{}`, which this capyctl release does not support; \
+             it is skipped and not published. Upgrade capyctl to use it, or run `capyctl engine remove {}`",
+            engines.display(),
+            self.profile,
+            self.engine,
+            self.profile
+        )
+    }
+}
+
 /// ADR 0018 §2: `document` (a host document) with `engines`' profiles added.
-/// A profile name the host document already declares is refused.
+/// A profile name the host document already declares is refused. A profile
+/// for an engine kind this release does not know is left out (amendment A3).
 pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<(), ConfigError> {
     if engines.profiles.is_empty() {
         return Ok(());
@@ -135,7 +183,7 @@ pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<()
             "must be a mapping",
         )
     })?;
-    for (name, profile) in &engines.profiles {
+    for (name, profile) in &engines.runnable().0 {
         if declared.contains_key(name) {
             return Err(ConfigError::new(
                 ConfigErrorCode::UnsupportedCombination,
