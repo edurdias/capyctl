@@ -295,6 +295,86 @@ pub fn candidate_fits(
     .map(|(device, headroom)| (headroom, Some(device)))
 }
 
+/// Bytes shown to the operator, in GiB with one decimal.
+pub fn gib(bytes: i64) -> String {
+    format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
+}
+
+/// Why `candidate` cannot take the instance, in the operator's terms: on the
+/// domain short by the most, what the instance needs, what is free as the
+/// ledger stands and the host's limit there. `None` when no managed limit is
+/// short (the refusal was a host-KV, parked or count limit).
+pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
+    let bytes = |f: &PhaseFootprint, domain: &str| -> i64 {
+        f.allocations
+            .iter()
+            .filter(|a| a.domain == domain)
+            .map(|a| a.bytes)
+            .sum()
+    };
+    let footprints: Vec<&PhaseFootprint> = if candidate.device_options.is_empty() {
+        vec![&candidate.footprint]
+    } else {
+        candidate
+            .device_options
+            .iter()
+            .map(|o| &o.footprint)
+            .collect()
+    };
+    // On a host offering a device choice, the device closest to fitting.
+    footprints
+        .into_iter()
+        .flat_map(|footprint| {
+            candidate.limits.iter().filter_map(move |limit| {
+                let need = bytes(footprint, &limit.domain);
+                let used: i64 = candidate
+                    .ledger
+                    .owners
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != owner)
+                    .map(|(_, f)| bytes(f, &limit.domain))
+                    .sum();
+                let free = (limit.managed_bytes - used).max(0);
+                (need > free).then_some((need - free, need, free, limit))
+            })
+        })
+        .min_by_key(|(short, ..)| *short)
+        .map(|(_, need, free, limit)| {
+            format!(
+                "needs {} of {} memory, {} free of its {} limit",
+                gib(need),
+                limit.domain,
+                gib(free),
+                gib(limit.managed_bytes)
+            )
+        })
+}
+
+impl Unplaceable {
+    /// Each refusing host and its reason, naming the limit for a host that
+    /// is short of memory, e.g. `host a needs 64.0 GiB of gpu0 memory,
+    /// 60.8 GiB free of its 60.8 GiB limit`.
+    pub fn detail(&self, candidates: &[HostCandidate], owner: &str) -> String {
+        if self.refusals.is_empty() {
+            return "no allowed host resolved the deployment's revision".into();
+        }
+        self.refusals
+            .iter()
+            .map(|(host, refusal)| {
+                let short = (*refusal == HostRefusal::Insufficient)
+                    .then(|| candidates.iter().find(|c| &c.host_id == host))
+                    .flatten()
+                    .and_then(|c| shortfall(c, owner));
+                match short {
+                    Some(short) => format!("host {host} {short}"),
+                    None => format!("host {host}: {}", refusal.code()),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +432,28 @@ mod tests {
             device_options: vec![],
             preferred_device: None,
         }
+    }
+
+    // SPEC §14: a capacity refusal names the limit it hit: what the instance
+    // needs, what is free and the host's limit there; other reasons keep
+    // their closed code.
+    // T05 T23
+    #[test]
+    fn a_refusal_names_the_memory_limit_it_hit() {
+        let a = host("a", 15 * GIB, 0, &[("other", footprint(8 * GIB, None))]);
+        let mut b = host("b", 100 * GIB, 0, &[]);
+        b.eligible = false;
+        let refused =
+            place(&[a.clone(), b.clone()], "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(&[a, b], "d"),
+            "host a needs 10.0 GiB of unified memory, 7.0 GiB free of its 15.0 GiB limit; \
+             host b: host_ineligible"
+        );
+        assert_eq!(
+            Unplaceable { refusals: vec![] }.detail(&[], "d"),
+            "no allowed host resolved the deployment's revision"
+        );
     }
 
     // ADR 0013 §4 step 3: spread prefers the host with fewest instances of

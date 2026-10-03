@@ -144,7 +144,7 @@ impl From<LifecycleError> for LifecycleFault {
             // clears.
             LifecycleError::RuntimeRetained
             | LifecycleError::HostPolicyDenied
-            | LifecycleError::CapacityBlocked
+            | LifecycleError::CapacityBlocked(_)
             | LifecycleError::StartupRequiresEmptyHost
             | LifecycleError::HostIneligible
             | LifecycleError::QueueFull

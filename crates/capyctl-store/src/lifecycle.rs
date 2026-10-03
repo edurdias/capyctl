@@ -338,8 +338,10 @@ pub enum LifecycleError {
     RuntimeRetained,
     #[error("host policy denies lifecycle action")]
     HostPolicyDenied,
+    /// No allowed host can take the start now; when known, each host's
+    /// reason, naming the memory limit it hit (SPEC §14).
     #[error("endpoint capacity exhausted")]
-    CapacityBlocked,
+    CapacityBlocked(Option<String>),
     #[error("lifecycle command queue full")]
     QueueFull,
     #[error("resource policy requires reconciliation")]

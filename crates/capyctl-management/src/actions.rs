@@ -833,7 +833,12 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             LifecycleError::RuntimeRetained => F::RuntimeRetained,
             LifecycleError::Unsupported => F::Unsupported,
             LifecycleError::Disabled | LifecycleError::HostPolicyDenied => F::HostPolicyDenied,
-            LifecycleError::CapacityBlocked => F::CapacityBlocked,
+            // SPEC §14: the refusal names the limit it hit when placement
+            // could say which.
+            LifecycleError::CapacityBlocked(Some(detail)) => F::CapacityBlockedBecause(format!(
+                "Capacity is unavailable: {detail}; wait, stop another deployment, or start with --evict"
+            )),
+            LifecycleError::CapacityBlocked(None) => F::CapacityBlocked,
             LifecycleError::StartupRequiresEmptyHost => F::StartupRequiresEmptyHost,
             // Explained with each host's reason by `OwnedActionSource::explain`.
             LifecycleError::HostIneligible => F::HostIneligible(String::new()),
@@ -1207,7 +1212,7 @@ mod tests {
             LifecycleError::RuntimeRetained
         )));
         for error in [
-            LifecycleError::CapacityBlocked,
+            LifecycleError::CapacityBlocked(None),
             LifecycleError::IdempotencyConflict,
             LifecycleError::RevisionConflict,
             LifecycleError::StartupRequiresEmptyHost,

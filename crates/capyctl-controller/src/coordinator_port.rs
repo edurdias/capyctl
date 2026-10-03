@@ -589,7 +589,7 @@ impl CoordinatorLifecycle {
             // ADR 0013 §8 rule 2 failed: no allowed host fits without
             // eviction. W10 makes room instead of refusing.
             Err(crate::coordinator::CoordinatorCommandError::Lifecycle(
-                capyctl_store::lifecycle::LifecycleError::CapacityBlocked,
+                capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_),
             )) => return Ok(Activation::Capacity),
             // Owner decision 2026-09-23: a solo first start empties its host
             // through the same switching rules a request uses.
@@ -880,7 +880,7 @@ impl LifecyclePort for CoordinatorLifecycle {
         match self.activate_once(deployment)? {
             Activation::Accepted(handle) => Ok(handle),
             Activation::Capacity => {
-                Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked.into())
+                Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(None).into())
             }
             Activation::Fault(fault) => Err(fault),
         }
