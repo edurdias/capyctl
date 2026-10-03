@@ -17,7 +17,7 @@
 
 [Unit]
 Description=capyctl server
-Documentation=file:///usr/local/share/capyctl/docs/operations/install.md
+Documentation=https://edurdias.github.io/capyctl/docs/install/
 Wants=network-online.target
 After=network-online.target
 

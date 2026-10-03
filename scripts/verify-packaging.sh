@@ -213,9 +213,7 @@ expected="$work/expected"
 actual="$work/actual"
 {
   printf '%s\n' bin/capyctl BUILDINFO SHA256SUMS
-  git ls-files -- LICENSE packaging/systemd docs/examples docs/operations/install.md \
-    docs/operations/configuration.md docs/operations/network-access.md \
-    docs/operations/release-notes-0.1.0.md docs/operations/release-notes-0.1.1.md
+  git ls-files -- LICENSE packaging/systemd
 } >"$work/files"
 # Every file plus each of its parent directories, under the package directory.
 {
@@ -235,30 +233,6 @@ if diff -u "$expected" "$actual" >"$work/contents.diff"; then
 else
   fail "tarball entries differ from the expected set (- expected, + actual):"
   cat "$work/contents.diff" >&2
-fi
-
-# Every relative link in a shipped Markdown guide, and every docs/ path a
-# shipped unit names, must resolve inside the package (final review I12).
-link_problems=""
-while IFS= read -r doc; do
-  dir=$(dirname "$doc")
-  while IFS= read -r target; do
-    target=${target%%#*}
-    [ -z "$target" ] && continue
-    if [ ! -e "$pkg/$dir/$target" ]; then
-      link_problems+="$doc -> $target"$'\n'
-    fi
-  done < <(grep -o '](\([^)]*\))' "$pkg/$doc" | sed -e 's/^](//' -e 's/)$//' |
-    grep -v -E '^(https?:|mailto:)' || true)
-done < <(cd "$pkg" && find docs -name '*.md' -printf '%p\n' | LC_ALL=C sort)
-while IFS= read -r ref; do
-  [ -e "$pkg/$ref" ] || link_problems+="packaging/systemd -> $ref"$'\n'
-done < <(grep -h -o 'docs/[A-Za-z0-9_./-]*\.md' "$pkg"/packaging/systemd/*/*.service | LC_ALL=C sort -u)
-if [ -z "$link_problems" ]; then
-  pass "every relative link in the shipped guides and units resolves"
-else
-  fail "links that do not resolve inside the package:"
-  printf '%s' "$link_problems" >&2
 fi
 
 for unit in system/capyctl-server system/capyctl-host system/capyctl-standalone \

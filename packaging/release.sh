@@ -18,8 +18,6 @@
 #                            written to <state_dir>/runtime at role start
 #                            (decided 2026-09-24; SPEC §3.3).
 #   packaging/systemd/       system and user service units (SPEC §4.3)
-#   docs/examples/           example role and deployment documents
-#   docs/operations/install.md
 #   LICENSE                  Apache-2.0 license
 #   BUILDINFO                version, commit, target, toolchain, build time,
 #                            embedded runtime manifest digest
@@ -141,12 +139,9 @@ copy_tracked() {
 # The runtime helpers are not shipped as files: they are compiled into
 # bin/capyctl (crates/capyctl-agent/build.rs) and materialized owner-only at role
 # start (crates/capyctl-agent/src/embedded_runtime.rs).
-# The operator guides ship together: install.md links configuration.md and
-# network-access.md, and the units point at configuration.md (final review
-# I12); scripts/verify-packaging.sh checks every relative link resolves.
-copy_tracked 0644 LICENSE packaging/systemd docs/examples docs/operations/install.md \
-  docs/operations/configuration.md docs/operations/network-access.md \
-  docs/operations/release-notes-0.1.0.md docs/operations/release-notes-0.1.1.md
+# The guides are not shipped: they live on the project site, which the
+# units' Documentation= and the installer point at.
+copy_tracked 0644 LICENSE packaging/systemd
 
 if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l \) -print -quit | grep -q .; then
   echo "staged tree contains bytecode or symlinks" >&2

@@ -1016,6 +1016,33 @@ mod tests {
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
     }
 
+    // T41 (ADR 0023 §7): with `stream_options.include_usage`, TensorFold 0.6.3
+    // sends usage as its own final chunk with `choices: []` after the finish
+    // chunk that carries the `tensorfold` object (found live 2026-10-02).
+    // Collection keeps both.
+    #[test]
+    fn a_collected_response_keeps_a_separate_usage_chunk() {
+        let chunk = |delta: Value, finish: Value| {
+            json!({"id": "c", "object": "chat.completion.chunk",
+            "created": 1, "model": "m", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}).to_string()
+        };
+        let mut end: Value = serde_json::from_str(&chunk(json!({}), json!("stop"))).unwrap();
+        end["tensorfold"] = json!({"accepted": 2});
+        let usage = json!({"id": "c", "object": "chat.completion.chunk", "created": 1,
+            "model": "m", "choices": [], "usage": {"total_tokens": 4}});
+        let response = assemble(vec![
+            chunk(json!({"role": "assistant"}), Value::Null),
+            chunk(json!({"content": "hi"}), Value::Null),
+            end.to_string(),
+            usage.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(response["tensorfold"], json!({"accepted": 2}));
+        assert_eq!(response["usage"]["total_tokens"], 4);
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    }
+
     // T41 T22 (ADR 0023 §6): reasoning alone answers the probe; nothing does not.
     #[test]
     fn a_reasoning_only_answer_answers_the_probe() {

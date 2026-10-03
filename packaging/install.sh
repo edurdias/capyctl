@@ -231,8 +231,10 @@ mkdir -p "$bin_dir" "$share_dir"
 cp "$pkg/bin/capyctl" "$bin_dir/.capyctl.new.$$"
 chmod 0755 "$bin_dir/.capyctl.new.$$"
 mv -f "$bin_dir/.capyctl.new.$$" "$bin_dir/capyctl"
+# Earlier releases also kept a copy of the guides in docs/; the guides
+# now live on the project site.
 rm -rf "$share_dir/packaging" "$share_dir/docs"
-cp -R "$pkg/packaging" "$pkg/docs" "$share_dir/"
+cp -R "$pkg/packaging" "$share_dir/"
 cp "$pkg/BUILDINFO" "$share_dir/BUILDINFO"
 if [ -f "$pkg/LICENSE" ]; then cp "$pkg/LICENSE" "$share_dir/LICENSE"; fi
 printf '%s\n' "$bin_dir/capyctl" >"$record.tmp"
@@ -245,10 +247,9 @@ if [ -n "$role" ]; then
   unit=capyctl-$role.service
   mkdir -p "$unit_dir"
   source_unit=$share_dir/packaging/systemd/$scope/$unit
-  # The packaged units name the default locations (/usr/local, ~/.local);
+  # The packaged units name the default binary (/usr/local, ~/.local);
   # point them at this install, so a PREFIX elsewhere is honoured.
   sed -e "s#^ExecStart=[^ ]*/bin/capyctl #ExecStart=$bin_dir/capyctl #" \
-    -e "s#^Documentation=file://[^ ]*/share/capyctl/#Documentation=file://$share_dir/#" \
     "$source_unit" >"$unit_dir/.$unit.new"
   chmod 0644 "$unit_dir/.$unit.new"
   mv -f "$unit_dir/.$unit.new" "$unit_dir/$unit"
@@ -279,4 +280,4 @@ case ":${PATH:-}:" in
   *":$bin_dir:"*) ;;
   *) say "note: $bin_dir is not on PATH" ;;
 esac
-say "next: docs/operations/install.md ($share_dir/docs/operations/install.md)"
+say "next: https://edurdias.github.io/capyctl/docs/install/"
