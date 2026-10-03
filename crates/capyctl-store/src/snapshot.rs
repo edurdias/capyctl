@@ -115,6 +115,12 @@ pub struct DeploymentSnapshot {
     /// and every startup peak measured for it. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup: Option<crate::ordinary_lifecycle::startup::StartupStatus>,
+    /// ADR 0014 amendment A13: what a park of the current revision is
+    /// charged on the memory that holds the engine's device allocations, and
+    /// every parked residue measured for it. Absent for a deployment that
+    /// never parks or declares its resources. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked: Option<crate::ordinary_lifecycle::parked_charge::ParkedStatus>,
     /// W10 (owner decision 2026-09-23): the switch in progress that names this
     /// deployment as its target or a victim: target, host, victims and phase.
     /// Additive; absent when none.
@@ -579,6 +585,7 @@ impl Store {
                 hosts: Vec::new(),
                 timeouts: None,
                 startup: None,
+                parked: None,
                 switch: None,
                 warm: false,
                 latest_operation: None,
@@ -607,6 +614,7 @@ impl Store {
         for entry in &mut deployments {
             entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
+            entry.parked = crate::ordinary_lifecycle::parked_charge::status(&tx, &entry.id)?;
             (entry.context, entry.parsers) = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;

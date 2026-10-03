@@ -9,6 +9,8 @@ pub mod lanes;
 pub(crate) mod legacy_engine_config;
 pub mod local_recovery;
 pub mod park;
+// ADR 0014 amendment A13: the parked charge measured per revision.
+pub mod parked_charge;
 pub mod placement;
 mod receipt;
 pub mod reconcile;
@@ -581,7 +583,7 @@ fn validate_local(
             // the footprint a park or restore of it has left (parked, or a
             // transition peak while one is armed or uncertain).
             let held = if state == "completed" {
-                park::retained_footprint(e, ledger.owners.get(&p.owner()))
+                park::retained_footprint(tx, p, e, ledger.owners.get(&p.owner()))?
             } else {
                 ledger.owners.get(&p.owner()) == Some(&startup::cold(p, e))
             };

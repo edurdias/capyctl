@@ -910,6 +910,24 @@ CREATE TABLE IF NOT EXISTS request_lease_cancellations(
 );
 "#;
 
+/// v39 (ADR 0014 amendment A13): the memory a parked engine was sampled
+/// holding, per revision, host, engine installation and memory domain. A park
+/// of the revision there is charged the largest one recorded instead of the
+/// parked placeholder (never less). Additive and forward-only.
+pub const SCHEMA_V39: &str = r#"
+CREATE TABLE IF NOT EXISTS parked_measurements(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  installation TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  bytes INTEGER NOT NULL CHECK(bytes>0),
+  step_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,installation,domain)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

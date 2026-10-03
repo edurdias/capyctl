@@ -87,3 +87,30 @@ fn a_defaulted_deep_park_snapshot_revalidates_and_cannot_be_forged() {
         }
     }
 }
+
+/// ADR 0014 amendment A13: a revision frozen while CapyCTL turned SGLang's
+/// CUDA graphs off beside the memory saver keeps them off: it revalidates
+/// unchanged, with the old default and its provenance.
+#[test]
+fn a_revision_frozen_with_sglang_graphs_off_by_default_keeps_them_off() {
+    let source: Value = serde_json::from_str(include_str!(
+        "fixtures/effective-sglang-graphs-off-legacy.json"
+    ))
+    .unwrap();
+    let frozen = &source["effective"];
+    assert_eq!(frozen["engine_config"]["common"]["cuda_graphs"], false);
+    assert_eq!(
+        frozen["engine_config"]["provenance"]["cuda_graphs"],
+        "capyctl default"
+    );
+    let decoded = decode_effective_snapshot(&frozen.to_string()).unwrap();
+    assert_eq!(&serde_json::to_value(&decoded).unwrap(), frozen);
+    // A new resolution of the same input leaves the graphs to SGLang.
+    let fresh =
+        resolve_effective(&source["input"]["deployment"], &source["input"]["host"]).unwrap();
+    let fresh = serde_json::to_value(&fresh).unwrap();
+    assert!(fresh["engine_config"]["common"]["cuda_graphs"].is_null());
+    assert!(fresh["engine_config"]["provenance"]
+        .get("cuda_graphs")
+        .is_none());
+}

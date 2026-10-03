@@ -2456,8 +2456,68 @@ async fn drive_residency(
         }
     }
     execute_residency(shared, &driver, &work, context, stop).await?;
+    if work.kind == ResidencyKind::Park {
+        measure_parked(shared, source, &work, stop).await;
+    }
     Ok(true)
 }
+
+/// ADR 0014 amendment A13: once a park completed, sample the host and record
+/// what the parked processes still hold, so later parks of the revision are
+/// charged it instead of the placeholder. Only a sample taken after the park
+/// counts; a host whose report predates it is asked once more. A failure costs
+/// nothing but the measurement.
+async fn measure_parked(
+    shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
+    work: &ResidencyWork,
+    stop: &mut watch::Receiver<bool>,
+) {
+    let Ok(since) = (shared.clock)() else {
+        return;
+    };
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::select! {
+                biased;
+                _ = stop.changed() => return,
+                _ = tokio::time::sleep(PARKED_SAMPLE_RETRY) => {}
+            }
+        }
+        let sampled = tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            result = tokio::time::timeout(
+                shared.options.protocol_timeout,
+                source.observe_with_residents(work.host.clone()),
+            ) => result,
+        };
+        let Ok(Ok((observed, residents))) = sampled else {
+            return;
+        };
+        if observed.iter().any(|o| o.sampled_at_ms < since) {
+            continue;
+        }
+        let step = work.step_id.clone();
+        let _ = shared
+            .read(move |owner, now| {
+                owner.store().record_parked_residue(
+                    owner.session(),
+                    &step,
+                    &observed,
+                    &residents,
+                    since,
+                    now,
+                )
+            })
+            .await;
+        return;
+    }
+}
+
+/// How long a host whose report predates a park is given before it is asked
+/// again for the parked residue.
+const PARKED_SAMPLE_RETRY: Duration = Duration::from_secs(3);
 
 /// Send one armed park or restore exactly once and record what it proved.
 async fn execute_residency(
