@@ -811,6 +811,22 @@ impl<'a> Parser<'a> {
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<(), AdapterError> {
         let StrictValue(mut chunk) = serde_json::from_str(data).map_err(|_| uncertain())?;
+        // SPEC §10, T19 (found live 2026-10-03): SGLang checks a prompt against
+        // its KV pool after the stream opened and answers with one error event.
+        // Before any chunk, that event is the engine's complete invalid-request
+        // answer, as a 400 body would be; anything later stays uncertain.
+        if self.id.is_none() {
+            if let Some(status) = chunk["error"]["code"]
+                .as_u64()
+                .and_then(|code| u16::try_from(code).ok())
+                .filter(|status| rejection_status(*status))
+            {
+                return Err(match rejection_message(data.as_bytes()) {
+                    Some(message) => AdapterError::Rejected { status, message },
+                    None => uncertain(),
+                });
+            }
+        }
         if chunk["model"].as_str() != Some(self.backend)
             || chunk["object"] != "chat.completion.chunk"
             || chunk["created"].as_u64().is_none()
@@ -1452,6 +1468,67 @@ mod tests {
             "id":"call_x","type":"function",
             "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}])
         );
+    }
+
+    /// SPEC §10, T19 (found live 2026-10-03): SGLang checks a prompt against its
+    /// KV pool after the stream opened and answers with one error event, then
+    /// `[DONE]`. Before any chunk that event is the engine's complete
+    /// invalid-request answer, so it is relayed as a rejection (a 400, or an
+    /// in-band `engine_rejected`), not as an unverified completion. An error
+    /// event after output, or with any other code, stays uncertain.
+    // T19
+    #[tokio::test]
+    async fn an_error_event_before_any_output_is_the_engine_rejection() {
+        let error = |code: u16| {
+            let event = serde_json::json!({"error":{"object":"error",
+                "message":"Input length (258174 tokens) exceeds the maximum allowed length (186353 tokens). Use a shorter input or enable --allow-auto-truncate.",
+                "type":"BAD_REQUEST","param":null,"code":code}});
+            format!("data: {event}\n\n")
+        };
+        let request = serde_json::json!({"model":"p","messages":[]});
+        let sse = [error(400), "data: [DONE]\n\n".to_owned()].concat();
+        let (url, _) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        match forward.forward_chat(&request).await {
+            Err(AdapterError::Rejected { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(
+                    message.starts_with("Input length (258174 tokens)"),
+                    "{message}"
+                );
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        let mut relayed = Vec::new();
+        let streamed = forward
+            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .await;
+        assert!(
+            matches!(streamed, Err(AdapterError::Rejected { status: 400, .. })),
+            "{:?}",
+            streamed.map(|_| ())
+        );
+        assert!(relayed.is_empty(), "{relayed:?}");
+        for sse in [
+            // Output already reached the client: the answer is not a rejection.
+            [
+                tool_chunk(serde_json::json!({"content":"hi"}), serde_json::Value::Null),
+                error(400),
+                "data: [DONE]\n\n".to_owned(),
+            ]
+            .concat(),
+            // A server error may follow accepted work.
+            [error(500), "data: [DONE]\n\n".to_owned()].concat(),
+        ] {
+            let (url, _) = recording(sse).await;
+            let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+            let result = forward.forward_chat(&request).await;
+            assert!(
+                matches!(result, Err(AdapterError::Uncertain(_))),
+                "{:?}",
+                result.map(|_| ())
+            );
+        }
     }
 
     /// SPEC §10, T19: a malformed `tool_calls` delta is not relayed as success.
