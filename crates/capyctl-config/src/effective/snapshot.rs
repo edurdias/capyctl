@@ -254,11 +254,18 @@ pub(super) fn declared_engine_config(
         block.insert("memory".into(), Value::Object(raw_memory));
     }
     let family: &[&str] = match engine {
-        Some("vllm") => &["block_size_tokens", "max_num_batched_tokens"],
+        Some("vllm") => &[
+            "block_size_tokens",
+            "max_num_batched_tokens",
+            "tool_call_parser",
+            "reasoning_parser",
+        ],
         Some("sglang") => &[
             "max_total_tokens",
             "chunked_prefill_size",
             "tokenizer_workers",
+            "tool_call_parser",
+            "reasoning_parser",
         ],
         Some("tensorfold") => &["max_tokens", "thinking"],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),

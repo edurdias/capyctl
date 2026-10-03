@@ -38,6 +38,9 @@ engine_config:
     kv_cache: "16GiB"
   sglang:
     chunked_prefill_size: 8192
+    # auto (default): chosen by model family; none; or the engine's parser name.
+    tool_call_parser: auto
+    reasoning_parser: none
 request_deadline: "1800s"
 timeouts:
   initialize: "1200s"

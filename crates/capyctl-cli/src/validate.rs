@@ -291,6 +291,9 @@ pub fn validate_config_at(
                             // as this machine sees it (a remote host fits it
                             // again from its own copy at launch).
                             "context": capyctl_config::context_fit::fit_for_effective(&effective),
+                            // ADR 0024: the parsers the launch passes,
+                            // chosen from the checkpoint as this machine sees it.
+                            "parsers": capyctl_config::parsers::parsers_for_effective(&effective),
                         },
                     });
                     if provisional {

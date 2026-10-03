@@ -320,6 +320,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[
                 ("block_size_tokens", SCALAR),
                 ("max_num_batched_tokens", SCALAR),
+                // ADR 0024: `auto` (default), `none`, or a parser name.
+                ("tool_call_parser", SCALAR),
+                ("reasoning_parser", SCALAR),
             ]),
         ),
         (
@@ -328,6 +331,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("max_total_tokens", SCALAR),
                 ("chunked_prefill_size", SCALAR),
                 ("tokenizer_workers", SCALAR),
+                ("tool_call_parser", SCALAR),
+                ("reasoning_parser", SCALAR),
             ]),
         ),
         // ADR 0023 §4: TensorFold's own typed fields.

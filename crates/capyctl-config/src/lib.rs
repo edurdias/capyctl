@@ -20,6 +20,8 @@ pub mod model_source;
 // Owner decisions 2026-09-25: the models directory and the model-source
 // switches, resolved once for every role (flag > environment > YAML > default).
 pub mod model_settings;
+// ADR 0024: tool-call and reasoning parsers chosen by model family.
+pub mod parsers;
 // ADR 0018 §2: `engines.yaml`, the capyctl-owned engines file beside the role
 // document, its lock, atomic write, and the merge into the host document.
 pub mod registration;

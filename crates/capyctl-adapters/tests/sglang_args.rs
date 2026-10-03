@@ -516,3 +516,34 @@ fn a_device_total_rides_the_settings_only_when_known() {
     config.memory.device_total_bytes = Some(0);
     assert!(SglangLaunch::from_frozen(&frozen(metadata(1), config)).is_err());
 }
+
+/// ADR 0024: the parsers chosen at launch ride the closed settings object
+/// only when there are some, so every earlier launch renders as before.
+// T14 T22
+#[test]
+fn chosen_parsers_render_as_optional_settings() {
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    let rendered = &public_args(&launch)["settings"];
+    assert!(rendered.get("tool_call_parser").is_none());
+    assert!(rendered.get("reasoning_parser").is_none());
+
+    let mut config = settings();
+    config.tool_call_parser = Some("qwen3_coder".into());
+    config.reasoning_parser = Some("qwen3".into());
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+    let rendered = &public_args(&launch)["settings"];
+    assert_eq!(rendered["tool_call_parser"], "qwen3_coder");
+    assert_eq!(rendered["reasoning_parser"], "qwen3");
+
+    // `none` is the deployment's switch, never a parser name.
+    let mut config = settings();
+    config.tool_call_parser = Some("none".into());
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+    assert!(public_args(&launch)["settings"]
+        .get("tool_call_parser")
+        .is_none());
+
+    let mut config = settings();
+    config.reasoning_parser = Some("bad name".into());
+    assert!(SglangLaunch::from_frozen(&frozen(metadata(1), config)).is_err());
+}

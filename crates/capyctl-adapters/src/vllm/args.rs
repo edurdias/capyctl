@@ -56,6 +56,11 @@ pub struct PlanInputVllm {
     pub language_model_only: bool,
     /// Host-approved at deploy time (ADR 0014 §8).
     pub trust_remote_code: bool,
+    /// ADR 0024: the tool-call and reasoning parsers chosen at launch, and
+    /// `--enable-auto-tool-choice` beside a rendered tool parser.
+    pub tool_call_parser: Option<String>,
+    pub reasoning_parser: Option<String>,
+    pub enable_auto_tool_choice: bool,
     /// CPU-offload budget in bytes; rendered as whole GiB (vLLM's unit).
     /// Zero means "no offload flag" (Step 3, Spec §3).
     pub cpu_offload_bytes: i64,
@@ -125,6 +130,9 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("enforce_eager", &self.enforce_eager)
             .field("language_model_only", &self.language_model_only)
             .field("trust_remote_code", &self.trust_remote_code)
+            .field("tool_call_parser", &self.tool_call_parser)
+            .field("reasoning_parser", &self.reasoning_parser)
+            .field("enable_auto_tool_choice", &self.enable_auto_tool_choice)
             .field("cpu_offload_bytes", &self.cpu_offload_bytes)
             .field("granted", &self.granted)
             .field("engine_args", &self.engine_args)
@@ -410,10 +418,14 @@ fn typed_args(input: &PlanInputVllm) -> Vec<String> {
         "--max-num-batched-tokens",
         input.max_num_batched_tokens.map(|v| v.to_string()),
     );
+    // ADR 0024: names verified registered in vLLM 0.29.0 and 0.30.0.
+    value("--tool-call-parser", input.tool_call_parser.clone());
+    value("--reasoning-parser", input.reasoning_parser.clone());
     for (flag, on) in [
         ("--enforce-eager", input.enforce_eager),
         ("--language-model-only", input.language_model_only),
         ("--trust-remote-code", input.trust_remote_code),
+        ("--enable-auto-tool-choice", input.enable_auto_tool_choice),
     ] {
         if on {
             args.push(flag.into());
