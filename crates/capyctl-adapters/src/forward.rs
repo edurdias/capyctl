@@ -248,7 +248,7 @@ impl ChatHttp {
         // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
         // the collected response must carry it as a non-streaming one does.
         let mut body = body.clone();
-        if body.get("stream_options").is_none_or(Value::is_null) {
+        if body.is_object() && body.get("stream_options").is_none_or(Value::is_null) {
             body["stream_options"] = json!({"include_usage": true});
         }
         let end = self

@@ -112,7 +112,7 @@ pub fn fixture_with(edit: impl FnOnce(&mut Value, &mut Value)) -> Fixture {
             domain: domain.clone(),
             managed_bytes: p.managed_limit,
             free_reserve_bytes: p.free_reserve,
-            reserve_absorbs_unmanaged: false,
+            reserve_absorbs_unmanaged: p.memory == capyctl_config::effective::DomainMemory::Device,
             host_kv_bytes: p.host_kv_limit,
             parked_bytes: p.parked_limit,
         })
