@@ -19,7 +19,7 @@
 
 [Unit]
 Description=capyctl server
-Documentation=file://%h/.local/share/capyctl/docs/operations/install.md
+Documentation=https://edurdias.github.io/capyctl/docs/install/
 
 [Service]
 Type=simple
