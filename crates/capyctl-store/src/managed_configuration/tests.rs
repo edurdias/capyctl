@@ -625,3 +625,42 @@ fn replay_checks_frozen_revision_content_not_just_its_existence() {
         Err(ManagedConfigurationError::CorruptStoredData)
     ));
 }
+
+// T09 (found live 2026-10-03): a deployment whose start failed, with its
+// runtime released and nothing else retained, is updated like a stopped one;
+// it no longer has to be deleted first. Its desired state stays what the
+// operator asked for.
+#[test]
+fn a_failed_deployment_with_nothing_retained_can_be_replaced() {
+    let (store, session, config, host) = setup();
+    let first = store
+        .create_stopped_managed_configuration(
+            &session,
+            "p",
+            "k",
+            &json!({"config":config}).to_string(),
+            &host,
+            1,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE deployments SET desired_state='ready',observed_state='stopped' WHERE id=?1",
+            [&first.deployment_id],
+        )
+        .unwrap();
+    store.conn.execute("INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES('binding',?1,1,'incarnation','managed','{}','[]','released')",[&first.deployment_id]).unwrap();
+    let replaced = store
+        .replace_stopped_managed_configuration(
+            &session,
+            "p",
+            "r",
+            &first.deployment_id,
+            &json!({"config":config,"expected_revision":1}).to_string(),
+            &host,
+            2,
+        )
+        .expect("a failed deployment with nothing retained is replaced");
+    assert_eq!(replaced.revision, 2);
+}

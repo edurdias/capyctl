@@ -371,7 +371,7 @@ fn a_launch_failure_is_one_bounded_line_on_an_exited_launch_only() {
     assert!(validate_result(&probe, &on_probe).is_err());
 }
 
-// T29 (ADR 0014 amendment A11): kernel build spans ride a usable launch only,
+// T29 (ADR 0014 amendment A12): kernel build spans ride a usable launch only,
 // ordered and bounded; any other result carrying them is refused.
 #[test]
 fn kernel_builds_ride_a_usable_launch_only() {

@@ -229,6 +229,7 @@ mod tests {
             domain: d.into(),
             managed_bytes: m,
             free_reserve_bytes: GIB,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: Some(2 * GIB),
         };
@@ -308,6 +309,7 @@ mod tests {
             domain: "gpu2".into(),
             managed_bytes: 30 * GIB,
             free_reserve_bytes: GIB,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         });

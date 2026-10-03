@@ -183,7 +183,7 @@ struct ScriptedTool {
     descriptors: Mutex<Vec<[Vec<u8>; 3]>>,
     gone_on_spawn: bool,
     present_calls: Arc<AtomicUsize>,
-    /// ADR 0014 amendment A11: whether a compiler runs in the group.
+    /// ADR 0014 amendment A12: whether a compiler runs in the group.
     building: std::sync::atomic::AtomicBool,
 }
 
@@ -602,12 +602,12 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     assert_eq!(probe.body["messages"][0]["content"], "Say ready.");
     assert!(tool.present_calls.load(Ordering::SeqCst) >= 1);
     assert!(_stub.polls.load(Ordering::SeqCst) >= 1);
-    // ADR 0014 amendment A11: no compiler ran, so no build is reported.
+    // ADR 0014 amendment A12: no compiler ran, so no build is reported.
     assert!(observation.kernel_builds.is_empty());
     std::fs::remove_file(&log).ok();
 }
 
-/// ADR 0014 amendment A11: a compiler in the engine's group while it starts is
+/// ADR 0014 amendment A12: a compiler in the engine's group while it starts is
 /// reported as a kernel build, in the host's clock, inside the step.
 // T29
 #[tokio::test]

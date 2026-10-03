@@ -378,6 +378,11 @@ impl Management {
             let current = deployment(&snapshot, id)?;
             let digest = &current["checkpoint_digest"];
             let digest_pending = digest["state"] == "pending" && digest["provisional"] == true;
+            if digest_pending {
+                if let Some(blocked) = unmeasurable(current, digest) {
+                    return Err(blocked);
+                }
+            }
             // ADR 0008 (owner decision 2026-09-25): a declared remote source is
             // waited for the same way; found live, `--activate --wait` was
             // refused `model_source_pending` while the download ran.
@@ -748,6 +753,36 @@ fn model_source_pending(deployment: &Value) -> bool {
 
 /// Whether `deployment`, or any of its instances, is still stopping: a stop
 /// run is queued or running and its cleanup is not yet verified.
+/// ADR 0014 §7 (found live 2026-10-03): the closed diagnostics a host reports
+/// for a checkpoint it will not measure until the deployment or the files
+/// change. `start --wait` ends at once on one of them, with what it means,
+/// instead of waiting out the Initialize window; a transient one (`changed`,
+/// `io_error`, `host_unavailable`) is waited through.
+fn unmeasurable(deployment: &Value, digest: &Value) -> Option<StructuredError> {
+    let diagnostic = digest["diagnostic"].as_str()?;
+    let meaning = match diagnostic {
+        "invalid_root" => {
+            "the model path is not a checkpoint directory the host can read: it must be a directory under the models directory, or an absolute path whose directory other users cannot write"
+        }
+        "unsafe_file" => {
+            "the checkpoint holds a link that leaves its directory or names a directory, or a file that is not a regular file"
+        }
+        "too_large" => "the checkpoint exceeds the file, directory or depth bounds of a measurement",
+        "unauthorized" => "the host does not allow this model source",
+        "not_materializable" => {
+            "the deployment's memory does not resolve with the measured weights; `capyctl validate config --file <deployment.yaml>` shows why"
+        }
+        _ => return None,
+    };
+    let name = deployment["name"].as_str().unwrap_or("the deployment");
+    Some(error(
+        "invalid_config",
+        format!(
+            "the checkpoint of {name} could not be measured ({diagnostic}): {meaning}; nothing was started"
+        ),
+    ))
+}
+
 fn stopping(deployment: &Value) -> bool {
     deployment["observed_state"] == "stopping"
         || deployment["instances"]
@@ -756,6 +791,53 @@ fn stopping(deployment: &Value) -> bool {
 }
 
 impl Management {
+    /// SPEC §6.4 (found live 2026-10-03): `start --wait` waits through a stop
+    /// that is still being confirmed. Right after a revision redeploy the
+    /// snapshot can already read stopped while the old engine's cleanup is
+    /// unconfirmed, and the start is refused `still_stopping` (retryable).
+    /// The refusal accepted nothing, so its saved body is dropped and a fresh
+    /// one (with a fresh deadline) is sent once the stop settles, within the
+    /// deployment's stop window. Any other refusal is returned as it was.
+    async fn start_through_stops(
+        &self,
+        id: &str,
+        instance: Option<u32>,
+    ) -> Result<(Value, i64), StructuredError> {
+        let mut until: Option<tokio::time::Instant> = None;
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            let refused = match self.action_on(id, "start", instance).await {
+                Err(refused) if refused.code == "still_stopping" => refused,
+                result => return result,
+            };
+            let deadline = match until {
+                Some(deadline) => deadline,
+                None => {
+                    let snapshot = self.snapshot().await?;
+                    let current = deployment(&snapshot, id)?;
+                    let window_ms = window(current, "stop", None)?;
+                    let name = current["name"].as_str().unwrap_or(id);
+                    eprintln!(
+                        "Waiting for the stop of {name} to finish (at most {}s)",
+                        window_ms / 1000
+                    );
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(u64::try_from(window_ms).unwrap_or(0));
+                    until = Some(deadline);
+                    deadline
+                }
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(refused);
+            }
+            if let Some(journal) = &self.journal {
+                journal.forget("action")?;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
     /// SPEC §6.4: a start refused `runtime_retained` because the deployment
     /// is still stopping says so, and what to run, with its own exit code.
     /// Any other refusal is returned as it was.
@@ -1046,7 +1128,12 @@ pub async fn execute_with_start_options(
             if api.wait_start && action == "start" {
                 api.await_activation_inputs(id).await?;
             }
-            let (receipt, deadline) = match api.action(id, action).await {
+            let started = if api.wait_start && action == "start" {
+                api.start_through_stops(id, None).await
+            } else {
+                api.action(id, action).await
+            };
+            let (receipt, deadline) = match started {
                 Err(refused) if action == "start" => {
                     return Err(api.still_stopping(id, refused).await)
                 }
@@ -1107,7 +1194,12 @@ pub async fn execute_with_start_options(
             if api.wait_start && action == "start" {
                 api.await_activation_inputs(id).await?;
             }
-            let (receipt, deadline) = match api.action_on(id, action, Some(*instance)).await {
+            let started = if api.wait_start && action == "start" {
+                api.start_through_stops(id, Some(*instance)).await
+            } else {
+                api.action_on(id, action, Some(*instance)).await
+            };
+            let (receipt, deadline) = match started {
                 Err(refused) if action == "start" => {
                     return Err(api.still_stopping(id, refused).await)
                 }

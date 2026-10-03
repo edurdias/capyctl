@@ -17,8 +17,9 @@ model: Qwen3-4B
 - `engine`: the engine profile, as `capyctl engine list` shows it
   ([Add an engine](engines.md)).
 - `model`: where the weights are. A directory under your models directory
-  (`~/models` unless you set another), an absolute path, or a Hugging Face
-  repository:
+  (`~/models` unless you set another), an absolute path (a Hugging Face cache
+  snapshot works; its directory must not be writable by other users), or a
+  Hugging Face repository:
 
 ```yaml title="qwen3-4b.yaml"
 name: qwen3-4b
@@ -68,6 +69,10 @@ Add a field to choose something yourself, for example:
   [several machines](several-machines.md).
 - `engine_config: {memory: {request: 16GiB}}` to set the GPU memory it may
   use: weights plus KV cache.
+- `engine_config: {cuda_graphs: true}` on SGLang for faster decoding. CapyCTL
+  turns SGLang's CUDA graphs off while the model can park; on a 16 GB card
+  FrogNano-4B decoded 61 tokens/s with them and 35 without, and kept about
+  0.6 GiB more of the card while parked.
 
 Every other field is in [Configuration files](configuration.md).
 
@@ -166,12 +171,14 @@ INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   parked   active      gpu0      -
 ```
 
-`STARTUP` is the memory CapyCTL set aside to start the model. When a start fails,
-`LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
+`STARTUP` is the memory CapyCTL set aside to start the model. On a discrete GPU
+it is the card's memory, with the host RAM the engine process takes beside it.
+When a start fails, `LAST OPERATION` says so and the instance's `LAST ERROR`
+gives the reason:
 
 ```text
-NAME           STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
-broken-model   failed   0/1     1          17.2 GiB   130s         initialize failed (launch_failed)
+NAME           STATE    READY   REVISION   STARTUP                   INITIALIZE   LAST OPERATION
+broken-model   failed   0/1     1          13.2 GiB (+4.0 GiB RAM)   130s         initialize failed (launch_failed)
 
 INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   failed   active      gpu0      launch_failed: launch failed: engine launch failed: the engine exited before readiness

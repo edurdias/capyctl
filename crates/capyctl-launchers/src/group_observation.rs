@@ -143,7 +143,7 @@ pub fn scan_group_by_pgid(
     collect_members(pgid, facts)
 }
 
-/// ADR 0014 amendment A11: the programs a JIT kernel build runs (FlashInfer,
+/// ADR 0014 amendment A12: the programs a JIT kernel build runs (FlashInfer,
 /// SGLang's and PyTorch's extension builds, TensorFold's CUDA build), by the
 /// kernel's process name. Triton and NVRTC compile inside the engine process
 /// and are not seen.
@@ -168,7 +168,7 @@ const KERNEL_BUILD_TOOLS: &[&str] = &[
     "cmake",
 ];
 
-/// ADR 0014 amendment A11: whether a compiler runs now in the process group
+/// ADR 0014 amendment A12: whether a compiler runs now in the process group
 /// `api` leads. A best-effort reading for the startup peak only, never for
 /// ownership: anything unreadable answers `false`, which counts the sample
 /// as the engine's, as before this amendment.
@@ -464,7 +464,7 @@ mod tests {
         }
     }
 
-    /// ADR 0014 amendment A11: a compiler in the launched group is a kernel
+    /// ADR 0014 amendment A12: a compiler in the launched group is a kernel
     /// build; the same name outside it, or older than the leader, is not.
     #[test]
     fn a_compiler_in_the_launched_group_is_a_kernel_build() {
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(stat_comm(&stat(42, 1, 42, 10)), Some("odd ) name\n"));
     }
 
-    /// ADR 0014 amendment A11, on this host's /proc: a group led by a
+    /// ADR 0014 amendment A12, on this host's /proc: a group led by a
     /// process named like a compiler is building; one led by `sleep` is not.
     #[test]
     fn a_running_compiler_group_is_seen_as_building() {

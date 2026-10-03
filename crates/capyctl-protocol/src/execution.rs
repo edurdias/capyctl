@@ -583,7 +583,7 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
     }
 }
 
-/// ADR 0014 amendment A11: the most kernel build spans one launch reports.
+/// ADR 0014 amendment A12: the most kernel build spans one launch reports.
 pub const MAX_KERNEL_BUILDS: usize = 64;
 
 /// SPEC §13: shape and exact command binding only. The caller must establish the
@@ -616,7 +616,7 @@ pub fn validate_result(
             return Err(GroupIdentityError);
         }
     }
-    // ADR 0014 amendment A11: kernel builds belong to a usable launch only.
+    // ADR 0014 amendment A12: kernel builds belong to a usable launch only.
     if !result.kernel_builds.is_empty()
         && (!matches!(command.action, MemberAction::LaunchSingle(_))
             || !result.model_usable
@@ -785,7 +785,7 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// `device_conflict`: the launch's device claim conflicts with a launch the
 /// host still claims (an exclusive claim on a shared device, SPEC §7.3);
 /// `port_conflict`: the leased port belongs to a launch the host still claims
-/// (per-launch claims, SPEC §3.1); `unauthorized`: any other local policy
+/// (per-launch claims, SPEC §3.1), or another program listens on it; `unauthorized`: any other local policy
 /// refusal. `insufficient_memory` also covers the host's managed or host-KV
 /// budget with every claimed launch counted. ADR 0008 (owner decision
 /// 2026-09-23): `installation_drift`: the installation no longer measures to

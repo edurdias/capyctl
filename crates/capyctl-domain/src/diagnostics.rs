@@ -69,7 +69,11 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "engine_exited",
-        "the engine exited before it was ready; check the deployment's engine_config and the host's private engine log",
+        "the engine exited before it was ready; check the deployment's engine_config and the host's private engine log (SGLang writes its output there only when capyctl runs with --debug-engine-logs; restart capyctl with it and start again to see the reason)",
+    ),
+    (
+        "port_conflict",
+        "another program listens on the engine port capyctl leased for this launch; start again (the next start leases a free port), or give capyctl another range with --engine-ports",
     ),
 ];
 
@@ -244,6 +248,23 @@ mod tests {
         assert!(operator_hint("startup_requires_empty_host")
             .unwrap()
             .contains("--evict"));
+    }
+
+    // T16 (found live 2026-10-03): SGLang keeps no output unless capyctl runs
+    // with --debug-engine-logs, so the hint that sends an operator to the log
+    // says so; a launch refused for its engine port names what to do.
+    #[test]
+    fn hints_name_debug_engine_logs_and_a_busy_engine_port() {
+        assert!(operator_hint("engine_exited")
+            .unwrap()
+            .contains("--debug-engine-logs"));
+        assert_eq!(
+            classify(Some("launch_failed"), "launch refused: port_conflict"),
+            Some("port_conflict")
+        );
+        assert!(operator_hint("port_conflict")
+            .unwrap()
+            .contains("--engine-ports"));
     }
 
     // T29: only a closed code is shown as an operation's error code.

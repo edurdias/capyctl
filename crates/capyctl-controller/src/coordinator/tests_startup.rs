@@ -525,7 +525,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     w.shutdown().await.unwrap();
 }
 
-/// ADR 0014 amendment A11: availability sampled while the engine reported a
+/// ADR 0014 amendment A12: availability sampled while the engine reported a
 /// kernel build (its compilers' memory, on a unified host) is not part of the
 /// startup peak. Samples before and after the build are, so the recorded peak
 /// is the engine's own, and the next start is not refused for capacity.
@@ -591,7 +591,7 @@ async fn a_peak_sampled_during_a_kernel_build_is_not_recorded() {
     w.shutdown().await.unwrap();
 }
 
-/// ADR 0014 amendment A11: a start whose every sample fell inside a kernel
+/// ADR 0014 amendment A12: a start whose every sample fell inside a kernel
 /// build measured nothing of its own, so it records no peak and the next
 /// start keeps the placeholder.
 // T29

@@ -422,7 +422,7 @@ pub trait OwnedProcessLaunch: Send + Sync {
         &self,
         api: &capyctl_domain::completion::ProcessIdentity,
     ) -> Result<Vec<capyctl_domain::completion::ProcessIdentity>, RuntimeError>;
-    /// ADR 0014 amendment A11: whether a compiler (a kernel build) runs now in
+    /// ADR 0014 amendment A12: whether a compiler (a kernel build) runs now in
     /// the process group the recorded API process leads. Evidence for the
     /// startup peak only, never for ownership. `false` when the launcher
     /// cannot tell, which leaves the peak measured as before.

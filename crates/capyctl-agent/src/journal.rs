@@ -1214,7 +1214,7 @@ impl HostJournal {
         }
         result.model_usable = true;
         result.observed_at_unix_ms = observation.observed_at_ms;
-        // ADR 0014 amendment A11: the kernel builds the adapter saw, so the
+        // ADR 0014 amendment A12: the kernel builds the adapter saw, so the
         // controller leaves their samples out of the startup peak.
         result.kernel_builds = observation
             .kernel_builds
@@ -1782,7 +1782,7 @@ impl HostJournal {
                 result.model_usable = previous.model_usable;
                 // A physical process observation cannot refresh model readiness.
                 result.observed_at_unix_ms = previous.observed_at_unix_ms;
-                // ADR 0014 amendment A11: they travel with the readiness proof.
+                // ADR 0014 amendment A12: they travel with the readiness proof.
                 if result.model_usable {
                     result.kernel_builds = previous.kernel_builds;
                 }

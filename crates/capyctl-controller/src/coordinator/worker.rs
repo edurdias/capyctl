@@ -2049,7 +2049,7 @@ fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
 /// the largest drop in its host's published availability of the domain its
 /// startup reservation charges, below what was available when it armed.
 ///
-/// ADR 0014 amendment A11: samples are kept until the engine answers, so that
+/// ADR 0014 amendment A12: samples are kept until the engine answers, so that
 /// those taken while it reported a kernel build can be left out.
 struct StartupPeak {
     domain: Option<String>,
@@ -2101,7 +2101,7 @@ impl StartupPeak {
     }
 
     /// The measured peak, when a fresh sample outside every kernel build the
-    /// engine reported showed availability dropping. ADR 0014 amendment A11:
+    /// engine reported showed availability dropping. ADR 0014 amendment A12:
     /// a compiler's memory is the build's, not the engine's.
     fn peak(&self, builds: &[capyctl_domain::completion::KernelBuild]) -> Option<i64> {
         let (available, _) = self.baseline?;
@@ -2157,6 +2157,7 @@ async fn drive(
             domain: domain.clone(),
             managed_bytes: d.managed_limit,
             free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
             host_kv_bytes: d.host_kv_limit,
             parked_bytes: d.parked_limit,
         })

@@ -742,7 +742,7 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
     ))
 }
 
-/// ADR 0014 amendment A11: the kernel builds a usable launch's host saw, in
+/// ADR 0014 amendment A12: the kernel builds a usable launch's host saw, in
 /// the host's clock (the clock its memory samples carry). The result was
 /// validated, so every span is ordered and there are at most 64.
 fn kernel_builds(
@@ -1064,7 +1064,7 @@ mod tests {
         }
     }
 
-    /// ADR 0014 amendment A11: the host's kernel builds reach the coordinator
+    /// ADR 0014 amendment A12: the host's kernel builds reach the coordinator
     /// as reported; a result from an older host carries none.
     #[test]
     fn a_launch_result_carries_the_hosts_kernel_builds() {

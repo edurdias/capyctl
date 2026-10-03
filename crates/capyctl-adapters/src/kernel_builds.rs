@@ -1,4 +1,4 @@
-//! ADR 0014 amendment A11: the kernel builds an engine runs while it starts.
+//! ADR 0014 amendment A12: the kernel builds an engine runs while it starts.
 //!
 //! A first start with an empty JIT cache compiles kernels (FlashInfer and
 //! SGLang's own JIT kernels, PyTorch extensions, TensorFold's CUDA build). On
@@ -88,7 +88,7 @@ impl BuildWatch {
                 tokio::time::sleep(poll).await;
                 let (tools, api) = (tools.clone(), api.clone());
                 // A `/proc` scan, so it runs off the async threads. A failed
-                // scan reads as no build: the sample counts, as before A11.
+                // scan reads as no build: the sample counts, as before A12.
                 let building = tokio::task::spawn_blocking(move || tools.building(&api))
                     .await
                     .unwrap_or(false);

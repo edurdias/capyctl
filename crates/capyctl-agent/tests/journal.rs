@@ -704,7 +704,7 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
             Milestone::CacheValid,
             Milestone::ModelUsable,
         ],
-        // ADR 0014 amendment A11: the builds the adapter saw travel with it.
+        // ADR 0014 amendment A12: the builds the adapter saw travel with it.
         kernel_builds: vec![capyctl_domain::completion::KernelBuild {
             from_ms: 12,
             until_ms: 18,

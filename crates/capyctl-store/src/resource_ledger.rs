@@ -587,6 +587,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -625,6 +626,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -669,6 +671,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -716,6 +719,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -759,6 +763,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -856,6 +861,7 @@ mod transaction_fault_tests {
             domain: "host-a/domain/unified".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];
@@ -943,6 +949,7 @@ mod transaction_fault_tests {
             domain: "system".into(),
             managed_bytes: 96,
             free_reserve_bytes: 12,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];

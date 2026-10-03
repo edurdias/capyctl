@@ -156,6 +156,11 @@ pub struct CheckpointFacts {
     /// re-resolves exactly as it was, without it. Never set for a new
     /// resolution.
     pub legacy_startup_graphs: bool,
+    /// ADR 0019 §3 (2026-10-03): a snapshot that records the engine family's
+    /// margin was sized before a request declared for a discrete GPU took the
+    /// device margin (weights x 0.10); it re-resolves exactly as it was. Never
+    /// set for a new resolution.
+    pub legacy_device_margin: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -1044,9 +1049,23 @@ pub(super) fn normalize_engine_config(
     // Review decision (discrete GPU design §3): a request derived from the
     // weights on a device domain is sized for the card, not with the unified
     // placeholder margin, which would not fit a small card.
+    let mut provenance_startup_derived = false;
     let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {
         (Some(device), None, None) => {
             device_request_from_weights(device, engine, inputs.facts.weights_bytes, kv_cache)?
+        }
+        _ => None,
+    };
+    // ADR 0019 §3 (found live on a 16 GB laptop GPU, 2026-10-03): a request
+    // declared for a discrete GPU is sized as the derived one is: the margin
+    // is the weights x 0.10 of `device_request_from_weights`, so a KV cache
+    // left out is the request less the weights x 1.10, and an undeclared
+    // startup peak is the request. A revision frozen before records the
+    // family margin and re-resolves as it was.
+    let declared_device_margin = match (inputs.device, declared_request, inputs.facts.weights_bytes)
+    {
+        (Some(_), Some(_), Some(weights)) if !inputs.facts.legacy_device_margin => {
+            Some(weights / 100 * 10)
         }
         _ => None,
     };
@@ -1055,14 +1074,23 @@ pub(super) fn normalize_engine_config(
         kv_cache,
         declared_ready_total: inputs.declared_ready_total,
         weights: inputs.facts.weights_bytes,
-        margin: overhead_margin(engine),
+        margin: declared_device_margin.unwrap_or_else(|| overhead_margin(engine)),
     })?;
+    if declared_device_margin.is_some() && declared_startup.is_none() {
+        // Design §3: the engine's use of the card is bounded by the fraction
+        // capyctl renders from this request.
+        declared_startup = Some(memory.request_bytes);
+        provenance_startup_derived = true;
+    }
     let mut provenance: BTreeMap<String, SettingSource> = memory_provenance
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
     if tensorfold_kv {
         provenance.insert("memory.kv_cache".into(), SettingSource::Derived);
+    }
+    if provenance_startup_derived {
+        provenance.insert("memory.startup".into(), SettingSource::Derived);
     }
     if let Some(request) = device_request {
         provenance.insert("memory.request".into(), SettingSource::Derived);

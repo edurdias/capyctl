@@ -372,3 +372,51 @@ added.
    revision, host and installation as ADR 0014 keeps the startup peak) after live runs.
 3. The SGLang ModelOpt refusal for `host_backed` may be lifted after a live check, since a
    wake from the CPU backup does not reload from disk.
+
+## Amendment A1: a 16 GB card sizes and starts a 9 GB model (2026-10-03)
+
+Problem: found live on 2026-10-03 with FrogNano-4B-2609 (BF16, 9.32 GB of weights) on a
+16 GB laptop GPU, vLLM 0.29 and SGLang 0.5.20. With no memory stated, §3 derived a
+14.48 GiB charge (request plus the CUDA context charge) against the card's 14.71 GiB
+managed limit, so the deploy was accepted, but the start stayed `queued` forever. The idle
+card had 15.54 GiB free: 348 MiB is the driver's own reservation and 112 MiB a display
+server, so the admission and launch checks, which asked for the allocation plus the whole
+1.28 GiB reserve on top of what was free, could never pass. The reserve was counted twice:
+it is outside every charge (the managed limit is the card minus the reserve) and the memory
+it exists to absorb was also missing from the free figure. Declaring only `memory.request`
+did not help: the KV cache was derived with the unified 8 GiB margin and came out negative,
+and an undeclared startup peak took the unified placeholder (weights × 2.25 plus 8 GiB),
+far beyond the card.
+
+Rule:
+
+- **The device reserve absorbs memory held outside CapyCTL.** On a `device` domain the free
+  memory admission, the switch planner's observed room and the launch check require after
+  the allocation is the reserve less the memory nobody accounts for (the card's capacity
+  minus its free memory minus what CapyCTL's own processes were sampled holding), never
+  below zero. The ledger still keeps every charge within the managed limit, so the reserve
+  stays outside every charge. Memory beyond the reserve still refuses: the card must
+  physically hold the allocation. The launch check has no process attribution and counts
+  everything in use as unaccounted, which lowers its requirement to the physical fit only.
+  Host memory (`unified` and `distinct` domains) keeps its whole reserve.
+- **A request declared for a card is sized like a derived one.** When a deployment declares
+  `memory.request` on a device domain without `resources:`, its margin is the weights × 0.10
+  of §3 (recorded as `margin_bytes`), so a KV cache left out is the request less the
+  weights × 1.10, and an undeclared `memory.startup` is the request. A revision frozen
+  before this amendment records the family margin and re-resolves as it was.
+- **Status shows the card's figure.** `status deployment` and `deploy` show STARTUP as the
+  device charge with the host RAM beside it (`14.5 GiB (+4.0 GiB RAM)`); the JSON adds
+  `startup.device_bytes` and `startup.host_bytes` beside `startup.bytes`, their sum. A start
+  that waits (for memory, a measurement) shows its reason under the table, and so does a
+  checkpoint the host could not measure.
+- **A leased engine port must be free.** A launch whose leased loopback port another program
+  listens on is refused `port_conflict` before anything starts (it was started, its
+  readiness probe reached the other program, and the launch was stopped as uncertain). The
+  next start leases a free port: the lease already skips a port it cannot bind.
+
+Live (2026-10-03, the same laptop): a deployment stating only `name`, `engine` and `model`
+was charged 14.48 GiB of the card and started and served FrogNano-4B-2609 on vLLM 0.30.0
+(context fitted to 116160 tokens; 12.9 GiB of the card in use when ready, 60 tokens/s) and
+on SGLang 0.5.21 (12.6 GiB in use); with `context_length: 16384` it did so on vLLM 0.29.0
+too. With another program listening on the first port of the range, the SGLang launch
+leased the next one.
