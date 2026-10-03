@@ -34,6 +34,13 @@ pub fn frozen_from_effective(
     let mut settings = declared.clone();
     settings.common.context_length =
         capyctl_config::context_fit::fit_for_effective(effective).tokens;
+    // ADR 0024 (owner decision 2026-10-03): the parsers chosen by model
+    // family from the checkpoint read here, unless the deployment named or
+    // turned them off or its extras already pass them. The digest covers them.
+    let parsers = capyctl_config::parsers::parsers_for_effective(effective);
+    (settings.tool_call_parser, settings.reasoning_parser) = parsers
+        .map(|parsers| (parsers.tool_call.name, parsers.reasoning.name))
+        .unwrap_or_default();
     let settings = &settings;
     // SPEC §3: the launch carries exactly one reviewed logical placement. The
     // native startup still resolves and corroborates it independently.

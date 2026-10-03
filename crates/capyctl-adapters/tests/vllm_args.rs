@@ -619,3 +619,37 @@ fn a_discrete_launch_renders_kv_bytes_and_utilization() {
         .windows(2)
         .any(|w| w == ["--gpu-memory-utilization", "0.76"]));
 }
+
+/// ADR 0024: chosen parsers render as typed arguments after the user marker,
+/// with `--enable-auto-tool-choice` beside the tool parser when asked for;
+/// nothing renders when none was chosen.
+// T14
+#[test]
+fn chosen_parsers_render_as_typed_arguments() {
+    let cmd = render_command(&plan()).unwrap();
+    for flag in [
+        "--tool-call-parser",
+        "--reasoning-parser",
+        "--enable-auto-tool-choice",
+    ] {
+        assert!(!cmd.argv.iter().any(|a| a == flag), "{flag}");
+    }
+    let mut p = plan();
+    p.tool_call_parser = Some("qwen3_coder".into());
+    p.reasoning_parser = Some("qwen3".into());
+    p.enable_auto_tool_choice = true;
+    let cmd = render_command(&p).unwrap();
+    let user = cmd.argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
+    let tool = cmd
+        .argv
+        .iter()
+        .position(|a| a == "--tool-call-parser")
+        .unwrap();
+    assert!(user < tool);
+    assert_flag(&cmd, "--tool-call-parser", "qwen3_coder");
+    assert_flag(&cmd, "--reasoning-parser", "qwen3");
+    assert!(cmd.argv.iter().any(|a| a == "--enable-auto-tool-choice"));
+    // The same option in the extras is a duplicate.
+    p.extra_args = vec!["--tool-call-parser".into(), "hermes".into()];
+    assert!(render_command(&p).is_err());
+}

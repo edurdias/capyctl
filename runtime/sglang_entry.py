@@ -85,6 +85,9 @@ _SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
              "trust_remote_code", "max_total_tokens", "chunked_prefill_size",
              "tokenizer_workers", "memory_saver", "cpu_weight_backup",
              "weight_restore", "memory", "extra_args")
+# ADR 0024: the parsers capyctl chose at launch. Present only when chosen, so
+# every earlier launch descriptor stays exactly as it was.
+_PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 
 
 class LaunchError(Exception):
@@ -189,7 +192,16 @@ def _validate_settings(settings):
     closure only. Reserved settings never appear here: construct_server_args
     renders them from the binding, placement and grant.
     """
-    _exact_object(settings, _SETTINGS)
+    if type(settings) is not dict:
+        _reject()
+    _exact_object(settings, _SETTINGS + tuple(name for name in _PARSER_SETTINGS
+                                              if name in settings))
+    for name in _PARSER_SETTINGS:
+        if name in settings:
+            value = settings[name]
+            if type(value) is not str or value.startswith("-"):
+                _reject()
+            _optional_token(value)
     for name in ("dtype", "quantization", "kv_cache_dtype"):
         _optional_token(settings[name])
     if settings["dtype"] not in (None, "auto", "bfloat16", "float16", "float32"):

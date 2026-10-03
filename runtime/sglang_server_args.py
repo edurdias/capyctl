@@ -297,6 +297,10 @@ def typed_keywords(settings):
                          ("chunked_prefill_size", "chunked_prefill_size")):
         if settings[name] is not None:
             keywords[native] = settings[name]
+    # ADR 0024: the parsers chosen at launch (SGLang 0.5.20 and 0.5.21 fields).
+    for name in ("tool_call_parser", "reasoning_parser"):
+        if name in settings:
+            keywords[name] = settings[name]
     if settings["language_model_only"]:
         keywords["language_model_only"] = True
     if settings["cuda_graphs"] is False:
@@ -378,6 +382,10 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         raise ServerArgsError("sensitive_option_refused")
     extra = parse_extra_args(settings["extra_args"], guarded_constructor, approvals,
                              spec._checkpoint_root)
+    # ADR 0024: resolution never passes a chosen parser beside the same extra.
+    if any(name in settings and name in extra
+           for name in ("tool_call_parser", "reasoning_parser")):
+        raise ServerArgsError("effective_args_mismatch")
     fraction = static_fraction(
         settings["memory"]["static_bytes"],
         available_bytes_for(settings["memory"]) if available_bytes is None

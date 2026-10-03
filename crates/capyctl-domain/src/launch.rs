@@ -162,6 +162,13 @@ pub struct VllmLaunchSettings {
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_batched_tokens: Option<u32>,
+    /// ADR 0024: the deployment's tool-call and reasoning parser choice:
+    /// a parser name, or `none` to turn it off. `None` is `auto`: capyctl
+    /// chooses by model family where the checkpoint is read, at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_parser: Option<String>,
     /// Derived, reserved: sleep (development) mode is on only where the host
     /// leaves deep parking enabled and the deployment parks (SPEC §6.2, §9.1).
     pub enable_sleep_mode: bool,
@@ -182,6 +189,13 @@ pub struct SglangLaunchSettings {
     pub chunked_prefill_size: Option<i32>,
     /// ADR 0014 §4: capyctl default 1 (live finding), overridable.
     pub tokenizer_workers: u32,
+    /// ADR 0024: the deployment's tool-call and reasoning parser choice:
+    /// a parser name, or `none` to turn it off. `None` is `auto`: capyctl
+    /// chooses by model family where the checkpoint is read, at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_parser: Option<String>,
     /// Derived from residency (ADR 0010): SGLang takes its park strategy at
     /// launch, so these are startup settings, not park parameters.
     pub memory_saver: bool,

@@ -38,6 +38,35 @@ thinking model, and the debug-log reason were each seen live. The
 `port_conflict` refusal itself is covered by a unit test (live, the lease
 skipped the busy port). CPU and Fake-engine tests are not qualification.
 
+## Parsers chosen by model family — 2026-10-03 (branch `feat/parser-defaults`)
+
+ADR 0024 (owner decision 2026-10-03). For vLLM and SGLang, CapyCTL reads the
+checkpoint's `config.json` and chat template at launch render and picks the
+tool-call and reasoning parsers for the Qwen3 family (`hermes` / `qwen25`,
+`qwen3`) and the Qwen3.5 family (Qwen3.5, Qwen3.6, Qwen3.8: `qwen3_coder`,
+`qwen3`), plus `--enable-auto-tool-choice` on vLLM. An unknown family gets
+none. `engine_config.vllm|sglang.tool_call_parser` and `reasoning_parser` take
+`auto`, `none` or a name. The same option in `extra_args` or host-fixed args
+wins over `auto`. A named parser or `none` beside it is refused. Status and
+`validate config` show the choice. Parser names were checked as registered in
+vLLM 0.29.0 and 0.30.0 and SGLang 0.5.20 and 0.5.21.
+
+Live on a laptop (RTX 4090 Laptop 16 GB), standalone from this branch with
+temporary home, config and state directories. FrogNano-4B-2609
+(`qwen3_5`, revision `b90468c1`) ran on vLLM 0.30.0 and SGLang 0.5.21 with no
+`extra_args`. The memory was declared by hand (12.5 GiB request, 3 GiB KV
+cache, 13 GiB startup) until the 16 GB sizing fix lands. On both engines:
+- status printed `Parsers tool calls: qwen3_coder, reasoning: qwen3 (model
+  family qwen3_5)`;
+- a `tools` request returned structured `tool_calls` with
+  `finish_reason: tool_calls`;
+- a plain question returned the trace apart from `content`: `reasoning` on
+  vLLM, `reasoning_content` on SGLang.
+
+The vLLM command line carried `--tool-call-parser qwen3_coder
+--reasoning-parser qwen3 --enable-auto-tool-choice`. CPU and Fake-engine
+tests are not qualification.
+
 ## Small CLI fixes — 2026-10-02 (branch `fix/small-cli-fixes`)
 
 - `engine remove` with no role running removes the profile from

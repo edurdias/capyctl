@@ -229,6 +229,11 @@ struct RawVllmFields {
     block_size_tokens: Option<u32>,
     #[serde(default)]
     max_num_batched_tokens: Option<u32>,
+    // ADR 0024: `auto` (the default), `none`, or a parser name.
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+    #[serde(default)]
+    reasoning_parser: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -240,6 +245,11 @@ struct RawSglangFields {
     chunked_prefill_size: Option<i32>,
     #[serde(default)]
     tokenizer_workers: Option<u32>,
+    // ADR 0024: `auto` (the default), `none`, or a parser name.
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+    #[serde(default)]
+    reasoning_parser: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -747,6 +757,45 @@ fn token(path: &str, value: &Option<String>) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// ADR 0024: one declared parser setting. `auto` (or nothing) resolves to
+/// `None`, chosen at launch; `none` and a name are kept, and refused beside
+/// the same option in the host-fixed or extra args.
+fn parser_choice(
+    block: &str,
+    field: &str,
+    value: Option<String>,
+    profile_args: &[String],
+    extra_args: &[String],
+) -> Result<Option<String>, ConfigError> {
+    let path = format!("engine_config.{block}.{field}");
+    let Some(value) = value.filter(|value| value != crate::parsers::AUTO) else {
+        return Ok(None);
+    };
+    if !crate::parsers::valid_value(&value) {
+        return Err(invalid(
+            path,
+            "must be auto, none, or the engine's parser name",
+        ));
+    }
+    let option = if field == "tool_call_parser" {
+        crate::parsers::TOOL_CALL_OPTION
+    } else {
+        crate::parsers::REASONING_OPTION
+    };
+    for (args, owner) in [
+        (profile_args, "the installation's host-fixed args"),
+        (extra_args, "extra_args"),
+    ] {
+        if crate::parsers::args_set(args, option) {
+            return Err(invalid(
+                path,
+                format!("{owner} already set `{option}`; remove one of them"),
+            ));
+        }
+    }
+    Ok(Some(value))
+}
+
 fn positive(path: &str, value: Option<u32>) -> Result<(), ConfigError> {
     if value == Some(0) {
         return Err(invalid(path, "must be positive"));
@@ -928,6 +977,40 @@ pub(super) fn normalize_engine_config(
         )
         .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
     }
+    // ADR 0024: a parser the deployment names (or turns off) and the same
+    // option in the host-fixed or extra args contradict each other.
+    let parser_fields = match engine {
+        Engine::Vllm => Some((
+            "vllm",
+            vllm.tool_call_parser.clone(),
+            vllm.reasoning_parser.clone(),
+        )),
+        Engine::Sglang => Some((
+            "sglang",
+            sglang.tool_call_parser.clone(),
+            sglang.reasoning_parser.clone(),
+        )),
+        Engine::Tensorfold => None,
+    };
+    let (tool_call_parser, reasoning_parser) = match parser_fields {
+        Some((block, tool, reasoning)) => (
+            parser_choice(
+                block,
+                "tool_call_parser",
+                tool,
+                inputs.profile_args,
+                &extra_args,
+            )?,
+            parser_choice(
+                block,
+                "reasoning_parser",
+                reasoning,
+                inputs.profile_args,
+                &extra_args,
+            )?,
+        ),
+        None => (None, None),
+    };
     // ADR 0023 §5: drafts off and a named drafter contradict each other,
     // whether the host-fixed or the extra arguments say either.
     if engine == Engine::Tensorfold {
@@ -1077,6 +1160,8 @@ pub(super) fn normalize_engine_config(
                 memory,
                 block_size_tokens: vllm.block_size_tokens,
                 max_num_batched_tokens: vllm.max_num_batched_tokens,
+                tool_call_parser,
+                reasoning_parser,
                 enable_sleep_mode: sleep_mode,
                 extra_args,
                 provenance,
@@ -1135,6 +1220,8 @@ pub(super) fn normalize_engine_config(
                 max_total_tokens: sglang.max_total_tokens,
                 chunked_prefill_size: sglang.chunked_prefill_size,
                 tokenizer_workers,
+                tool_call_parser,
+                reasoning_parser,
                 memory_saver,
                 cpu_weight_backup,
                 weight_restore: weight_restore.into(),
@@ -1168,15 +1255,15 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
         "cuda_graphs": raw.cuda_graphs, "language_model_only": raw.language_model_only,
         "trust_remote_code": raw.trust_remote_code,
         "memory": declared_memory(&memory)?,
-        "vllm": raw.vllm.as_ref().map(|v| serde_json::json!({
+        "vllm": raw.vllm.as_ref().map(|v| with_parsers(serde_json::json!({
             "block_size_tokens": v.block_size_tokens,
             "max_num_batched_tokens": v.max_num_batched_tokens,
-        })),
-        "sglang": raw.sglang.as_ref().map(|s| serde_json::json!({
+        }), &v.tool_call_parser, &v.reasoning_parser)),
+        "sglang": raw.sglang.as_ref().map(|s| with_parsers(serde_json::json!({
             "max_total_tokens": s.max_total_tokens,
             "chunked_prefill_size": s.chunked_prefill_size,
             "tokenizer_workers": s.tokenizer_workers,
-        })),
+        }), &s.tool_call_parser, &s.reasoning_parser)),
         "tensorfold": raw.tensorfold.as_ref().map(|t| serde_json::json!({
             "max_tokens": t.max_tokens, "thinking": t.thinking,
         })),
@@ -1191,6 +1278,17 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
         }
     }
     Ok(declared)
+}
+
+/// ADR 0024: the parser settings join a block's identity only when declared,
+/// so every earlier command fingerprint keeps its identity.
+fn with_parsers(mut block: Value, tool: &Option<String>, reasoning: &Option<String>) -> Value {
+    for (key, value) in [("tool_call_parser", tool), ("reasoning_parser", reasoning)] {
+        if let Some(value) = value {
+            block[key] = serde_json::json!(value);
+        }
+    }
+    block
 }
 
 /// The declared memory block's identity. `startup` appears only when declared,

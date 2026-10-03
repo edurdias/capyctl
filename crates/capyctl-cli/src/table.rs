@@ -455,7 +455,39 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&format!("note: {note}\n"));
         }
     }
+    if let Some(line) = parsers(&d["parsers"]) {
+        // Under the engine line when there is one, else after a blank line.
+        if !(d["engine"].is_string() || d["installation"].is_object()) {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
     out
+}
+
+/// ADR 0024: the parsers a launch passes, one line, absent for an engine
+/// without a parser setting.
+fn parsers(p: &Value) -> Option<String> {
+    if !p.is_object() {
+        return None;
+    }
+    let one = |c: &Value| match (c["name"].as_str(), c["source"].as_str()) {
+        (Some(name), _) => clean(name),
+        (None, Some("extra_args")) => "from extra_args".into(),
+        (None, Some("host_fixed")) => "from host-fixed args".into(),
+        (None, Some("on_host")) => "chosen on the host".into(),
+        (None, Some("off")) => "off".into(),
+        _ => "none".into(),
+    };
+    let family = p["family"]
+        .as_str()
+        .map(|f| format!(" (model family {})", clean(f)))
+        .unwrap_or_default();
+    Some(format!(
+        "Parsers tool calls: {}, reasoning: {}{family}\n",
+        one(&p["tool_call"]),
+        one(&p["reasoning"])
+    ))
 }
 
 fn engines(value: &Value) -> String {
@@ -716,6 +748,50 @@ mod tests {
         let out = render(View::Status, &d, &HostNames::new());
         assert!(
             out.ends_with("\nEngine  tensorfold 0.6.0 (/opt/tf060/bin/tensorfold)\nnote: pinned to an engine no longer registered as tensorfold; redeploy to use 0.6.1\n"),
+            "{out}"
+        );
+    }
+
+    // T14: ADR 0024. Status shows the parsers a launch passes and where they
+    // came from; nothing when the engine has no parser setting.
+    #[test]
+    fn status_shows_the_chosen_parsers() {
+        let base = json!({"name": "m", "observed_state": "ready", "instances": []});
+        let mut d = base.clone();
+        d["parsers"] = json!({"family": "qwen3_5",
+            "tool_call": {"name": "qwen3_coder", "source": "model_family"},
+            "reasoning": {"name": "qwen3", "source": "model_family"}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(
+                "\nParsers tool calls: qwen3_coder, reasoning: qwen3 (model family qwen3_5)\n"
+            ),
+            "{out}"
+        );
+        d["parsers"] = json!({
+            "tool_call": {"source": "extra_args"}, "reasoning": {"source": "off"}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nParsers tool calls: from extra_args, reasoning: off\n"),
+            "{out}"
+        );
+        d["parsers"] = json!({
+            "tool_call": {"source": "on_host"}, "reasoning": {"source": "unknown_family"}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nParsers tool calls: chosen on the host, reasoning: none\n"),
+            "{out}"
+        );
+        let out = render(View::Status, &base, &HostNames::new());
+        assert!(!out.contains("Parsers"), "{out}");
+        d["installation"] = json!({"profile": "vllm", "version": "0.30.0",
+            "executable": "/opt/vllm/bin/vllm"});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(
+                "\nEngine  vllm 0.30.0 (/opt/vllm/bin/vllm)\n\
+                 Parsers tool calls: chosen on the host, reasoning: none\n"
+            ),
             "{out}"
         );
     }

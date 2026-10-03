@@ -168,6 +168,31 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                                           weight_restore="disk_reload", cuda_graphs=None))
         self.assertIs(kwargs["enable_memory_saver"], False)
 
+    # T14: ADR 0024. Parsers chosen at launch reach the constructor under
+    # their field names; absent, nothing is passed and the engine has none.
+    def test_chosen_parsers_reach_the_constructor(self):
+        kwargs = self.seen(self.spec_with(tool_call_parser="qwen3_coder",
+                                          reasoning_parser="qwen3"))
+        self.assertEqual(kwargs["tool_call_parser"], "qwen3_coder")
+        self.assertEqual(kwargs["reasoning_parser"], "qwen3")
+        self.public["settings"].pop("tool_call_parser")
+        self.public["settings"].pop("reasoning_parser")
+        kwargs = self.seen(self.build())
+        self.assertNotIn("tool_call_parser", kwargs)
+        self.assertNotIn("reasoning_parser", kwargs)
+
+    # T14: ADR 0024. A chosen parser and the same destination in the extras
+    # never both reach the engine (resolution prevents it; this rechecks).
+    def test_a_chosen_parser_and_the_same_extra_are_refused(self):
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        with self.assertRaises(mapping.ServerArgsError) as caught:
+            construct(self.spec_with(reasoning_parser="qwen3",
+                                     extra_args=["--reasoning-parser", "qwen3"]),
+                      self.placement(), constructor)
+        self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
     # T14: extra arguments flow in through the installed parser.
     def test_extra_arguments_reach_the_constructor_under_their_field_names(self):
         kwargs = self.seen(self.spec_with(extra_args=[
