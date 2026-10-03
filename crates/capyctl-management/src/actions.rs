@@ -820,6 +820,7 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
         CoordinatorCommandError::Coordinator(CoordinatorError::Stopped(_)) => {
             F::ReconciliationRequired
         }
+        CoordinatorCommandError::Coordinator(CoordinatorError::Paused(_)) => F::StillStopping,
         CoordinatorCommandError::Coordinator(CoordinatorError::CallerTimeout) => {
             F::DeadlineExceeded
         }
@@ -1200,6 +1201,38 @@ async fn accept_instance_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC §6.4, §14: a start refused while a stop or launch is still being
+    /// confirmed is a retryable `still_stopping` (503) that says what to do,
+    /// not `reconciliation_required`. A stopped coordinator stays as it was.
+    // T08
+    #[tokio::test]
+    async fn a_start_while_a_stop_settles_is_a_retryable_still_stopping() {
+        let body = |failure: ConfigurationFailure| async move {
+            let response = failure.response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, value["error"].clone())
+        };
+        let (status, error) = body(command_failure(CoordinatorCommandError::Coordinator(
+            CoordinatorError::Paused("a stop is not yet confirmed".into()),
+        )))
+        .await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["code"], "still_stopping", "{error}");
+        assert_eq!(error["retryable"], true, "{error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("nothing was started"), "{message}");
+        assert!(message.contains("--wait"), "{message}");
+        let (_, error) = body(command_failure(CoordinatorCommandError::Coordinator(
+            CoordinatorError::Stopped("closed".into()),
+        )))
+        .await;
+        assert_eq!(error["code"], "reconciliation_required", "{error}");
+    }
 
     /// SPEC §6.3: after an accepted wake, only "every instance already holds a
     /// runtime" lets a start answer with the wake's receipt. Every other

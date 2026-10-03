@@ -61,6 +61,11 @@ use scheduler::run;
 pub enum CoordinatorError {
     #[error("coordinator stopped: {0}")]
     Stopped(String),
+    /// SPEC §6.1, §13.2: new activations wait while a stop whose cleanup is
+    /// not yet proven, or a launch whose outcome is uncertain, settles. The
+    /// worker is running; the same command can be sent again once it settles.
+    #[error("new starts are paused: {0}")]
+    Paused(String),
     #[error("coordinator observer capacity exhausted")]
     Busy,
     #[error("caller observation deadline elapsed")]
@@ -829,9 +834,10 @@ impl CoordinatorCommands {
         if !self.shared.accepting.load(Ordering::Acquire)
             || !self.shared.initializing.load(Ordering::Acquire)
         {
-            return Err(
-                CoordinatorError::Stopped("worker is not admitting Initialize".into()).into(),
-            );
+            return Err(self
+                .shared
+                .not_initializing("worker is not admitting Initialize")
+                .into());
         }
         let receipt = owner
             .store()
@@ -967,9 +973,10 @@ impl CoordinatorCommands {
         if !self.shared.accepting.load(Ordering::Acquire)
             || (increases && !self.shared.initializing.load(Ordering::Acquire))
         {
-            return Err(
-                CoordinatorError::Stopped("worker is not admitting this command".into()).into(),
-            );
+            return Err(self
+                .shared
+                .not_initializing("worker is not admitting this command")
+                .into());
         }
         let now = (self.shared.clock)()?;
         let receipt = accept(&owner, now).map_err(|error| {
@@ -1802,6 +1809,22 @@ impl CleanupObserver {
 }
 
 impl Shared {
+    /// Why an activation is not admitted, read under the owner mutex: a
+    /// running worker that holds activations for an unproven stop or an
+    /// uncertain launch is `Paused` (retry once it settles); otherwise the
+    /// worker is closing or closed (`Stopped`).
+    fn not_initializing(&self, stopped: &str) -> CoordinatorError {
+        if self.accepting.load(Ordering::Acquire)
+            && !self.shutdown_requested.load(Ordering::Acquire)
+            && !self.paused_is_empty()
+        {
+            return CoordinatorError::Paused(
+                "a stop or launch is not yet confirmed on its host".into(),
+            );
+        }
+        CoordinatorError::Stopped(stopped.into())
+    }
+
     fn close_admission(&self) {
         // Serialize closure with the entire command lookup/check/commit boundary.
         // Recover a poisoned guard only to close admission, never to access Store.
