@@ -470,7 +470,35 @@ fn status(value: &Value, names: &HostNames) -> String {
             if limit == 1 { "" } else { "s" }
         ));
     }
+    if let Some(line) = streams(&d["context"]["streams"]) {
+        out.push_str(&line);
+    }
     out
+}
+
+/// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch decodes
+/// together, one line, absent for other engines.
+fn streams(s: &Value) -> Option<String> {
+    let source = s["source"].as_str()?;
+    let whose = match source {
+        "declared" => "engine_config.max_concurrent_requests",
+        "default" => "CapyCTL default",
+        "extra_args" => "from extra_args",
+        "host_fixed" => "from host-fixed args",
+        other => other,
+    };
+    let reason = s["reason"]
+        .as_str()
+        .map(|r| format!(": {}", clean(r)))
+        .unwrap_or_default();
+    Some(match s["count"].as_u64() {
+        Some(1) => format!("Streams 1 request at a time ({whose}){reason}\n"),
+        Some(n) => format!("Streams up to {n} requests decoded together ({whose}){reason}\n"),
+        None => format!(
+            "Streams set by {}{reason}\n",
+            whose.trim_start_matches("from ")
+        ),
+    })
 }
 
 /// ADR 0024: the parsers a launch passes, one line, absent for an engine
@@ -827,6 +855,36 @@ mod tests {
             .remove("running_limit");
         let out = render(View::Status, &d, &HostNames::new());
         assert!(!out.contains("Running limited"), "{out}");
+    }
+
+    // ADR 0023 §4 (amended 2026-10-03): status says how many requests a
+    // TensorFold launch decodes together and where the count came from.
+    #[test]
+    fn status_shows_the_streams_a_tensorfold_launch_decodes_together() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+            "context": {"tokens": 32768, "source": "declared",
+                "streams": {"count": 8, "source": "default"}}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nStreams up to 8 requests decoded together (CapyCTL default)\n"),
+            "{out}"
+        );
+        d["context"]["streams"] = json!({"count": 1, "source": "extra_args",
+            "reason": "TensorFold 0.6.3 serves this model family (nemotron_h) one request at a time on CUDA"});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(
+                "Streams 1 request at a time (from extra_args): TensorFold 0.6.3 serves this \
+                 model family (nemotron_h) one request at a time on CUDA\n"
+            ),
+            "{out}"
+        );
+        d["context"]["streams"] = json!({"source": "host_fixed"});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(out.ends_with("Streams set by host-fixed args\n"), "{out}");
+        d["context"].as_object_mut().unwrap().remove("streams");
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(!out.contains("Streams"), "{out}");
     }
 
     // T02: status on a role with no engine names the command that adds one.

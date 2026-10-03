@@ -17,6 +17,15 @@ use std::collections::BTreeMap;
 /// router's bound and the engine's cannot drift apart.
 pub const MAX_REQUESTS_PER_DEPLOYMENT: u32 = 32;
 
+/// ADR 0023 §4 (amended 2026-10-03, owner decision): the requests TensorFold
+/// decodes together (`--parallel`) unless the deployment sets
+/// `max_concurrent_requests` or its arguments pass `--parallel`. Lower than
+/// the router's bound: TensorFold sizes its drafter's buffers for every stream
+/// at start, inside the declared memory (about 0.7 GiB a stream for
+/// Qwen3.8-27B with DFlash2), and refuses a context that no longer fits. The
+/// router's other requests wait in TensorFold's queue.
+pub const TENSORFOLD_DEFAULT_PARALLEL: u32 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "engine", rename_all = "lowercase")]
 pub enum LaunchSettings {

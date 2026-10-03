@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use capyctl_config::engine_policy::{
-    parse_options, tensorfold_drafts, typed_option_of, validate_rendered_args, Engine,
-    ProfileArgError, TENSORFOLD_DRAFTS_CONFLICT,
+    parse_options, tensorfold_drafts, tensorfold_parallel, typed_option_of, validate_rendered_args,
+    Engine, ProfileArgError, TENSORFOLD_DRAFTS_CONFLICT, TENSORFOLD_PARALLEL,
 };
 
 use crate::traits::RenderedCommand;
@@ -42,6 +42,10 @@ pub struct PlanInputTensorfold {
     pub kv_dtype: Option<String>,
     pub max_tokens: Option<u32>,
     pub thinking: Option<bool>,
+    /// ADR 0023 §4 (amended 2026-10-03): the requests TensorFold decodes
+    /// together (`--parallel`); `None` when the host-fixed or extra arguments
+    /// pass it themselves.
+    pub parallel: Option<u32>,
     pub engine_args: Vec<String>,
     pub extra_args: Vec<String>,
     pub extensions_dir: Option<String>,
@@ -73,6 +77,9 @@ pub enum TensorfoldArgsError {
 /// The typed flags, in TensorFold's own spelling (`tensorfold/cli_args.py`).
 fn typed_args(input: &PlanInputTensorfold) -> Vec<String> {
     let mut argv = vec!["--context".to_owned(), input.context_length.to_string()];
+    if let Some(parallel) = input.parallel {
+        argv.extend(["--parallel".to_owned(), parallel.to_string()]);
+    }
     if let Some(dtype) = &input.kv_dtype {
         argv.extend(["--kv-dtype".to_owned(), dtype.clone()]);
     }
@@ -140,6 +147,17 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     )?;
     let typed = typed_args(input);
     check_typed(input, &typed)?;
+    // ADR 0023 §4 (amended 2026-10-03): a rendered `--parallel` and a passed
+    // one never both reach TensorFold.
+    if input.parallel.is_some()
+        && tensorfold_parallel(&pass_through)
+            .map_err(|error| TensorfoldArgsError::Malformed(error.to_string()))?
+            .is_some()
+    {
+        return Err(TensorfoldArgsError::Duplicate(
+            TENSORFOLD_PARALLEL.to_owned(),
+        ));
+    }
     let mut argv = vec![
         input.engine_bin.clone(),
         "serve".into(),

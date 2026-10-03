@@ -96,6 +96,37 @@ pub struct ContextFit {
     /// CapyCTL's in-flight bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_limit: Option<u32>,
+    /// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch
+    /// decodes together (`--parallel`) and where the count came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streams: Option<Streams>,
+}
+
+/// ADR 0023 §4 (amended 2026-10-03): TensorFold's `--parallel` for one launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Streams {
+    /// The requests decoded together; `None` when a passed value does not
+    /// parse (TensorFold refuses it at start).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    pub source: StreamsSource,
+    /// Why the count is not what the launch passes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Where a TensorFold launch's stream count came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamsSource {
+    /// The deployment's `engine_config.max_concurrent_requests`.
+    Declared,
+    /// CapyCTL's TensorFold default (`TENSORFOLD_DEFAULT_PARALLEL`).
+    Default,
+    /// `--parallel` among the deployment's extra arguments.
+    ExtraArgs,
+    /// `--parallel` among the installation's host-fixed arguments.
+    HostFixed,
 }
 
 /// The per-token KV footprint read from a model configuration.
@@ -260,6 +291,7 @@ fn fallback(reason: impl Into<String>) -> ContextFit {
         reason: Some(reason.into()),
         warning: None,
         running_limit: None,
+        streams: None,
     }
 }
 
@@ -361,6 +393,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
             reason: None,
             warning,
             running_limit: None,
+            streams: None,
         };
     }
     let shape = match shape {
@@ -412,6 +445,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
                 )),
                 warning: None,
                 running_limit: None,
+                streams: None,
             },
             Err(reason) => fallback(reason),
         };
@@ -423,6 +457,7 @@ pub fn fit_context(inputs: FitInputs<'_>, config: Result<&Value, String>) -> Con
             reason,
             warning: None,
             running_limit: None,
+            streams: None,
         },
         Err(reason) => fallback(reason),
     }
@@ -475,6 +510,7 @@ pub fn fit_for_launch(
                     reason: Some(format!("the installation's host-fixed args set `{option}`")),
                     warning: None,
                     running_limit: None,
+                    streams: None,
                 };
             }
         }
@@ -532,6 +568,7 @@ pub fn fit_for_launch(
             Err(refusal) => fit.warning = Some(refusal),
         }
     }
+    fit.streams = tensorfold_streams(settings, profile_args, config.as_ref().ok());
     fit
 }
 
@@ -549,6 +586,94 @@ pub fn vllm_default_max_num_seqs(
     let host_fixed = option_names(profile_args).is_ok_and(|names| names.contains("--max-num-seqs"));
     (declared.is_none() && !host_fixed)
         .then_some(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
+}
+
+/// ADR 0023 §4 (amended 2026-10-03, owner decision): the `--parallel` CapyCTL
+/// passes TensorFold: the deployment's `max_concurrent_requests`, else
+/// `TENSORFOLD_DEFAULT_PARALLEL`. `None` when the
+/// extra or host-fixed arguments pass `--parallel` themselves (they win;
+/// beside a declared count they are refused at resolution).
+pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -> Option<u32> {
+    let LaunchSettings::Tensorfold(s) = settings else {
+        return None;
+    };
+    let passed = |args: &[String]| {
+        crate::engine_policy::tensorfold_parallel(args).map_or(true, |found| found.is_some())
+    };
+    if passed(profile_args) || passed(&s.extra_args) {
+        return None;
+    }
+    Some(
+        s.common
+            .max_concurrent_requests
+            .unwrap_or(capyctl_domain::launch::TENSORFOLD_DEFAULT_PARALLEL),
+    )
+}
+
+/// The model families whose CUDA engine TensorFold 0.6.3 runs one request at
+/// a time whatever `--parallel` says (`families/nemotron_h`).
+const TENSORFOLD_ONE_AT_A_TIME: &[&str] = &["nemotron_h"];
+
+/// ADR 0023 §4 (amended 2026-10-03): the streams a TensorFold launch decodes
+/// together, for status. `config` is the checkpoint's configuration when
+/// this machine reads it.
+fn tensorfold_streams(
+    settings: &LaunchSettings,
+    profile_args: &[String],
+    config: Option<&Value>,
+) -> Option<Streams> {
+    let LaunchSettings::Tensorfold(s) = settings else {
+        return None;
+    };
+    let mut streams = match tensorfold_parallel(settings, profile_args) {
+        Some(count) => Streams {
+            count: Some(count),
+            source: if s.common.max_concurrent_requests.is_some() {
+                StreamsSource::Declared
+            } else {
+                StreamsSource::Default
+            },
+            reason: None,
+        },
+        None => {
+            let extra = crate::engine_policy::tensorfold_parallel(&s.extra_args)
+                .ok()
+                .flatten();
+            let (value, source) = match extra {
+                Some(value) => (value, StreamsSource::ExtraArgs),
+                None => (
+                    crate::engine_policy::tensorfold_parallel(profile_args)
+                        .ok()
+                        .flatten()
+                        .flatten(),
+                    StreamsSource::HostFixed,
+                ),
+            };
+            // TensorFold's `auto` is one request at a time on CUDA.
+            let count = value.and_then(|value| match value.trim().to_ascii_lowercase() {
+                auto if auto == "auto" => Some(1),
+                number => number
+                    .parse::<i64>()
+                    .ok()
+                    .map(|n| n.clamp(1, i64::from(u32::MAX)) as u32),
+            });
+            Streams {
+                count,
+                source,
+                reason: None,
+            }
+        }
+    };
+    let family = config.and_then(|config| config["model_type"].as_str());
+    if let Some(family) = family.filter(|family| TENSORFOLD_ONE_AT_A_TIME.contains(family)) {
+        if streams.count.is_some_and(|count| count > 1) {
+            streams.count = Some(1);
+            streams.reason = Some(format!(
+                "TensorFold 0.6.3 serves this model family ({family}) one request at a time on CUDA"
+            ));
+        }
+    }
+    Some(streams)
 }
 
 /// The sequences a vLLM launch runs with: declared, host-fixed, or the
@@ -629,6 +754,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
             ),
             warning: None,
             running_limit: None,
+            streams: tensorfold_streams(&effective.engine_config, &effective.profile.args, None),
         },
     }
 }

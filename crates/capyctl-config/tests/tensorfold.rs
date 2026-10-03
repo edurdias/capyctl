@@ -176,14 +176,12 @@ fn tensorfold_requirements_are_refused_with_their_path() {
     for field in [
         "dtype",
         "quantization",
-        "max_concurrent_requests",
         "cuda_graphs",
         "language_model_only",
         "trust_remote_code",
     ] {
         let (mut deployment, host) = fixture();
         let value = match field {
-            "max_concurrent_requests" => json!(4),
             "cuda_graphs" | "language_model_only" | "trust_remote_code" => json!(true),
             "dtype" => json!("bfloat16"),
             _ => json!("fp8"),
@@ -354,4 +352,119 @@ fn no_drafts_is_ordinary_and_refused_beside_a_drafter() {
         error.contains("--no-drafts") && error.contains("--drafter"),
         "{error}"
     );
+}
+
+// ADR 0023 §4 (amended 2026-10-03): `max_concurrent_requests` is TensorFold's
+// `--parallel`. The same option in the extra or host-fixed arguments, in any
+// spelling TensorFold's parser accepts, beside a declared count is refused,
+// naming both.
+#[test]
+fn max_concurrent_requests_is_parallel_and_refused_beside_it() {
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        effective.engine_config.common().max_concurrent_requests,
+        Some(4)
+    );
+
+    for extra in [
+        json!(["--parallel", "8"]),
+        json!(["--parallel=8"]),
+        json!(["--par", "8"]),
+        json!(["--PARALLEL", "auto"]),
+    ] {
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+        deployment["engine_config"]["accept_extra_args"] = true.into();
+        deployment["engine_config"]["extra_args"] = extra.clone();
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(
+            error.path, "engine_config.max_concurrent_requests",
+            "{extra}"
+        );
+        assert!(error.detail.contains("--parallel"), "{error}");
+    }
+    let (mut deployment, mut host) = fixture();
+    deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+    host["runtime_profiles"]["local"]["args"] = json!(["--parallel", "2"]);
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert_eq!(error.path, "engine_config.max_concurrent_requests");
+    assert!(error.detail.contains("--parallel"), "{error}");
+
+    // Undeclared, `--parallel` in the extra arguments is ordinary.
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["accept_extra_args"] = true.into();
+    deployment["engine_config"]["extra_args"] = json!(["--parallel", "8"]);
+    resolve_effective(&deployment, &host).expect("--parallel needs no approval");
+}
+
+// ADR 0023 §4 (amended 2026-10-03): status and validate show the streams a
+// TensorFold launch decodes together and where the count came from.
+#[test]
+fn the_streams_a_launch_decodes_together_are_shown_with_their_source() {
+    use capyctl_config::context_fit::{fit_for_effective, fit_for_launch, StreamsSource};
+    let streams = |deployment: &Value, host: &Value| {
+        let effective = resolve_effective(deployment, host).unwrap();
+        let streams = fit_for_effective(&effective)
+            .streams
+            .expect("TensorFold streams");
+        (streams.count, streams.source)
+    };
+    let (mut deployment, mut host) = fixture();
+    assert_eq!(
+        streams(&deployment, &host),
+        (
+            Some(capyctl_domain::launch::TENSORFOLD_DEFAULT_PARALLEL),
+            StreamsSource::Default
+        )
+    );
+    deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+    assert_eq!(
+        streams(&deployment, &host),
+        (Some(4), StreamsSource::Declared)
+    );
+    deployment["engine_config"] = json!({"context_length": 8192, "accept_extra_args": true,
+        "extra_args": ["--parallel", "8"]});
+    assert_eq!(
+        streams(&deployment, &host),
+        (Some(8), StreamsSource::ExtraArgs)
+    );
+    // TensorFold's own default on CUDA is one request at a time.
+    deployment["engine_config"]["extra_args"] = json!(["--parallel=auto"]);
+    assert_eq!(
+        streams(&deployment, &host),
+        (Some(1), StreamsSource::ExtraArgs)
+    );
+    deployment["engine_config"]["extra_args"] = json!(["--parallel", "many"]);
+    assert_eq!(
+        streams(&deployment, &host),
+        (None, StreamsSource::ExtraArgs)
+    );
+    deployment["engine_config"] = json!({"context_length": 8192});
+    host["runtime_profiles"]["local"]["args"] = json!(["--parallel", "2"]);
+    assert_eq!(
+        streams(&deployment, &host),
+        (Some(2), StreamsSource::HostFixed)
+    );
+
+    // TensorFold 0.6.3's Nemotron-H CUDA engine takes `--parallel` and serves
+    // one request at a time.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{"model_type": "nemotron_h"}"#,
+    )
+    .unwrap();
+    let (deployment, host) = fixture();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let fit = fit_for_launch(
+        Engine::Tensorfold,
+        &effective.engine_config,
+        &effective.profile.args,
+        Some(tmp.path()),
+    );
+    let streams = fit.streams.unwrap();
+    assert_eq!(streams.count, Some(1));
+    assert!(streams.reason.unwrap().contains("one request at a time"));
 }

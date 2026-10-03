@@ -258,6 +258,20 @@ pub fn tensorfold_drafts(args: &[String]) -> Result<TensorfoldDrafts, ProfileArg
     Ok(drafts)
 }
 
+/// ADR 0023 §4 (amended 2026-10-03): TensorFold's `--parallel` among `args`,
+/// in any spelling its parser expands (exact, `=value`, underscores, an
+/// abbreviation): `Some` with the last occurrence's value, `None` when absent.
+pub fn tensorfold_parallel(args: &[String]) -> Result<Option<Option<String>>, ProfileArgError> {
+    Ok(parse_options(args)?
+        .into_iter()
+        .rev()
+        .find(|option| matches_name(&option.name, TENSORFOLD_PARALLEL))
+        .map(|option| option.value))
+}
+
+/// TensorFold's option for the requests it decodes together.
+pub const TENSORFOLD_PARALLEL: &str = "--parallel";
+
 /// Whole option families reserved for SGLang: every `ssl_*` field, the
 /// `modelopt_*_path` fields (quantization is out of scope, SPEC §1.2), and the
 /// disaggregation, hierarchical-cache and external-cache integrations (SPEC §12).

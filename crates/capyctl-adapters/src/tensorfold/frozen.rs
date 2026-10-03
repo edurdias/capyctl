@@ -94,6 +94,13 @@ pub fn plan_from_effective(
         kv_dtype: settings.common.kv_cache_dtype.clone(),
         max_tokens: settings.max_tokens,
         thinking: settings.thinking,
+        // ADR 0023 §4 (amended 2026-10-03, owner decision): TensorFold decodes
+        // the deployment's concurrent requests together, as vLLM and SGLang
+        // run them; a host-fixed or extra `--parallel` wins.
+        parallel: capyctl_config::context_fit::tensorfold_parallel(
+            &effective.engine_config,
+            &profile.args,
+        ),
         engine_args: profile.args.clone(),
         extra_args: settings.extra_args.clone(),
         extensions_dir,

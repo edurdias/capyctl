@@ -831,10 +831,6 @@ pub(super) fn normalize_engine_config(
         for (field, set) in [
             ("dtype", raw.dtype.is_some()),
             ("quantization", raw.quantization.is_some()),
-            (
-                "max_concurrent_requests",
-                raw.max_concurrent_requests.is_some(),
-            ),
             ("cuda_graphs", raw.cuda_graphs.is_some()),
             // `false` is what TensorFold does, and what a snapshot restates.
             ("language_model_only", raw.language_model_only == Some(true)),
@@ -976,6 +972,27 @@ pub(super) fn normalize_engine_config(
             },
         )
         .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
+    }
+    // ADR 0023 §4 (amended 2026-10-03): a declared count renders TensorFold's
+    // `--parallel`; the same option passed beside it says it twice.
+    if engine == Engine::Tensorfold && raw.max_concurrent_requests.is_some() {
+        for (args, whose) in [
+            (inputs.profile_args, "the installation's host-fixed args"),
+            (extra_args.as_slice(), "engine_config.extra_args"),
+        ] {
+            let passed = crate::engine_policy::tensorfold_parallel(args)
+                .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
+            if passed.is_some() {
+                return Err(invalid(
+                    "engine_config.max_concurrent_requests",
+                    format!(
+                        "{whose} already set `{}`, which is TensorFold's option for this \
+                         field; remove one of them",
+                        crate::engine_policy::TENSORFOLD_PARALLEL
+                    ),
+                ));
+            }
+        }
     }
     // ADR 0024: a parser the deployment names (or turns off) and the same
     // option in the host-fixed or extra args contradict each other.

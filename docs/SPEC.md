@@ -409,7 +409,11 @@ TensorFold has no flag that caps its memory. *Amended 2026-10-03 by
 [ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md):* the
 context does not bound a CUDA engine's growing caches, which TensorFold sizes from
 the machine's free memory; CapyCTL launches it with its declared Ready allocation
-as its cap (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, honoured from 0.6.3). The engine listens on loopback only,
+as its cap (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, honoured from 0.6.3). *Amended
+2026-10-03 (owner decision, ADR 0023 §4):* TensorFold decodes the deployment's
+`max_concurrent_requests` together (`--parallel`), 8 when undeclared; `--parallel`
+in the deployment's or host's arguments wins, and beside a declared count is
+refused. The engine listens on loopback only,
 so local processes can reach its port; CapyCTL's routed path is the only network
 path to it. Its first start builds CUDA extensions into a private per-version
 directory, so registration checks the build toolchain on the engine's closed PATH

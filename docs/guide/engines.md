@@ -194,8 +194,30 @@ requests get longer, and it keeps long prompts' states for later turns, past wha
 CapyCTL reserved. TensorFold 0.6.3 honours the cap;
 earlier versions ignore it. The cap covers what TensorFold allocates on the GPU,
 not the rest of the process, so leave a few GiB above what the model needs. A
-window or a number of streams that does not fit is refused by TensorFold at start,
+window that does not fit beside the streams is refused by TensorFold at start,
 or its requests wait, instead of taking memory CapyCTL did not reserve.
+
+TensorFold decodes several requests together only when it is told how many.
+CapyCTL starts it with `--parallel` set to the deployment's
+`max_concurrent_requests`, or 8 when the deployment does not set it; requests
+past that wait in TensorFold's queue. Lower than vLLM's 32 because TensorFold
+reserves its drafter's buffers for every stream at start, inside the `ready`
+bytes: Qwen3.8-27B with DFlash2 and a 32768-token context needs about 28 GiB
+for one stream and 0.7 GiB more for each other one. A context that no longer
+fits is refused at start, and `capyctl status deployment` says to lower
+`max_concurrent_requests` or `context_length`, or raise `ready`. The streams'
+KV caches grow as their requests get longer: a new request waits while it would
+not fit beside the others. To serve one request at a time (one stream decodes
+alone a little faster on some models), set `max_concurrent_requests: 1`.
+`--parallel` in `extra_args` also works and wins over the default; beside
+`max_concurrent_requests` it is refused. Status shows the count:
+
+```text
+Streams up to 8 requests decoded together (CapyCTL default)
+```
+
+TensorFold 0.6.3 runs Nemotron-H models one request at a time whatever
+`--parallel` says, and status shows one stream for them.
 
 A drafter works as a draft model does for vLLM and SGLang: allow it when you
 add the engine, with the directory that holds your drafters,
