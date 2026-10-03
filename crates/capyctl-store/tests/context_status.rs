@@ -113,3 +113,35 @@ fn a_remote_revision_is_fitted_by_its_host() {
     let (_dir, store) = store_with(&effective(models.path(), Some(2048)), true);
     assert_eq!(shown(&store), json!({"tokens": 2048, "source": "declared"}));
 }
+
+fn parsers(store: &Store) -> Value {
+    serde_json::to_value(store.snapshot().unwrap()).unwrap()["deployments"][0]["parsers"].clone()
+}
+
+// T14: ADR 0024. Status shows the parsers a launch passes: chosen from the
+// embedded checkpoint's family, and by the host for a remote revision.
+#[test]
+fn status_shows_the_parsers_chosen_by_model_family() {
+    let models = checkpoint();
+    std::fs::write(
+        models.path().join("toy/config.json"),
+        json!({"model_type": "qwen3_5", "num_hidden_layers": 4}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        models.path().join("toy/chat_template.jinja"),
+        "<tool_call><function=f></function></tool_call><think>",
+    )
+    .unwrap();
+    let (_dir, store) = store_with(&effective(models.path(), None), false);
+    assert_eq!(
+        parsers(&store),
+        json!({"family": "qwen3_5",
+            "tool_call": {"name": "qwen3_coder", "source": "model_family",
+                "reason": "model family qwen3_5"},
+            "reasoning": {"name": "qwen3", "source": "model_family",
+                "reason": "model family qwen3_5"}})
+    );
+    let (_dir, store) = store_with(&effective(models.path(), None), true);
+    assert_eq!(parsers(&store)["tool_call"]["source"], "on_host");
+}

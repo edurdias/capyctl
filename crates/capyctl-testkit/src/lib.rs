@@ -59,6 +59,8 @@ pub fn vllm_launch_settings() -> LaunchSettings {
         },
         block_size_tokens: None,
         max_num_batched_tokens: None,
+        tool_call_parser: None,
+        reasoning_parser: None,
         enable_sleep_mode: false,
         extra_args: Vec::new(),
         provenance: [
@@ -94,6 +96,8 @@ pub fn sglang_launch_settings() -> SglangLaunchSettings {
         max_total_tokens: None,
         chunked_prefill_size: None,
         tokenizer_workers: 1,
+        tool_call_parser: None,
+        reasoning_parser: None,
         memory_saver: true,
         cpu_weight_backup: false,
         weight_restore: "disk_reload".into(),

@@ -288,6 +288,10 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         || s.chunked_prefill_size
             .is_some_and(|size| size == 0 || size < -1)
         || !(1..=1024).contains(&s.tokenizer_workers)
+        || [&s.tool_call_parser, &s.reasoning_parser]
+            .into_iter()
+            .flatten()
+            .any(|name| !capyctl_config::parsers::valid_value(name))
         || s.weight_restore != expected_restore
         || s.extra_args.len() > MAX_EXTRA_ARGS
         || s.extra_args.iter().any(|token| {
@@ -300,7 +304,7 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
     // duplicates are refused again at render; the entry rechecks after parsing.
     validate_rendered_args(Engine::Sglang, &s.extra_args, false)
         .map_err(|_| RuntimeError::Unsupported)?;
-    Ok(json!({
+    let mut rendered = json!({
         "dtype": common.dtype,
         "quantization": common.quantization,
         "kv_cache_dtype": common.kv_cache_dtype,
@@ -317,7 +321,21 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         "weight_restore": s.weight_restore,
         "memory": public_memory(memory, margin_bytes, static_bytes),
         "extra_args": s.extra_args,
-    }))
+    });
+    // ADR 0024: present only when a parser was chosen, so every earlier launch
+    // renders exactly as before. `none` is the deployment's switch, never a name.
+    for (key, value) in [
+        ("tool_call_parser", &s.tool_call_parser),
+        ("reasoning_parser", &s.reasoning_parser),
+    ] {
+        if let Some(name) = value
+            .as_deref()
+            .filter(|name| *name != capyctl_config::parsers::OFF)
+        {
+            rendered[key] = json!(name);
+        }
+    }
+    Ok(rendered)
 }
 
 /// The closed memory object. `device_total_bytes` is present only on a

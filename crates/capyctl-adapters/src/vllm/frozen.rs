@@ -120,6 +120,16 @@ pub fn plan_from_effective(
     // ADR 0014 §8: host-fixed arguments and the deployment's extras stay
     // apart, so the entry can gate exactly what the extras resolve to.
     let engine_args = profile.args.clone();
+    // ADR 0024 (owner decision 2026-10-03): parsers chosen by model family
+    // from the checkpoint read here, unless the deployment named or turned
+    // them off, or its extras or the host-fixed args already pass them.
+    let parsers = capyctl_config::parsers::parsers_for_effective(effective);
+    let enable_auto_tool_choice = parsers.as_ref().is_some_and(|parsers| {
+        capyctl_config::parsers::vllm_auto_tool_choice(parsers, &profile.args, &settings.extra_args)
+    });
+    let (tool_call_parser, reasoning_parser) = parsers
+        .map(|parsers| (parsers.tool_call.name, parsers.reasoning.name))
+        .unwrap_or_default();
     Ok(PlanInputVllm {
         engine_bin: profile.executable.clone(),
         // The engine's own bin directory has to be on PATH: the JIT compile
@@ -161,6 +171,9 @@ pub fn plan_from_effective(
         enforce_eager: common.cuda_graphs == Some(false),
         language_model_only: common.language_model_only,
         trust_remote_code: common.trust_remote_code,
+        tool_call_parser,
+        reasoning_parser,
+        enable_auto_tool_choice,
         // Reserved: CPU offload and swap are not offered to deployments.
         cpu_offload_bytes: 0,
         // ADR 0014 §5: the KV cache is the deployment's declared or derived

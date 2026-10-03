@@ -33,6 +33,9 @@ engine_config:
     kv_cache: "12GiB"
   vllm:
     block_size_tokens: 16
+    # auto (default): chosen by model family; none; or the engine's parser name.
+    tool_call_parser: auto
+    reasoning_parser: auto
 request_deadline: "900s"
 # Derived from the checkpoint's size when omitted; never beyond the request deadline.
 timeouts:

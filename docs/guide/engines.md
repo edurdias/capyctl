@@ -218,6 +218,40 @@ minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
 discrete GPU it runs, but no live check has passed there yet.
 
+## Tool calls and reasoning
+
+vLLM and SGLang return structured `tool_calls` and a separate reasoning trace
+only when they run with a tool-call parser and a reasoning parser. CapyCTL
+picks both from the model's `config.json` and chat template for the families it
+knows, with nothing in the deployment file:
+
+| Model family | vLLM | SGLang |
+|---|---|---|
+| Qwen3.5, Qwen3.6, Qwen3.8 (`qwen3_5`, `qwen3_5_moe`) | `--tool-call-parser qwen3_coder --reasoning-parser qwen3 --enable-auto-tool-choice` | `--tool-call-parser qwen3_coder --reasoning-parser qwen3` |
+| Qwen3 (`qwen3`, `qwen3_moe`) | `--tool-call-parser hermes --reasoning-parser qwen3 --enable-auto-tool-choice` | `--tool-call-parser qwen25 --reasoning-parser qwen3` |
+
+A Qwen3 checkpoint whose template uses the XML tool-call format (Qwen3-Coder)
+gets `qwen3_coder`, a template without tool calls gets no tool parser, and one
+without `<think>` (an instruct-only model) gets no reasoning parser. Any other
+model gets no parser, as before. `capyctl status deployment` prints the choice
+on its `Parsers` line.
+
+To choose yourself, set either parser in the engine's block: `auto` (the
+default), `none`, or the engine's parser name.
+
+```yaml
+engine_config:
+  vllm:
+    tool_call_parser: hermes
+    reasoning_parser: none
+```
+
+The same option in `extra_args` still works and wins over `auto`, so recipes
+that pass `--tool-call-parser` and `--reasoning-parser` by hand run unchanged;
+those arguments are no longer needed for the families above. Naming a parser
+in the block and passing the same option in `extra_args` is refused.
+TensorFold handles tool calls itself and has no parser setting.
+
 ## First model on each engine
 
 One example per engine, from adding it to a first answer, on one GB10 machine
