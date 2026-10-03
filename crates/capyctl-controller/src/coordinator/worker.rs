@@ -1686,11 +1686,19 @@ impl OwnedCoordinator {
             .store(true, Ordering::Release);
         self.shared.close_admission();
         self.stop.send_replace(true);
-        self.task
+        let status = self
+            .task
             .take()
             .expect("owned task")
             .await
-            .map_err(|_| CoordinatorError::Stopped("worker task failed".into()))
+            .map_err(|_| CoordinatorError::Stopped("worker task failed".into()));
+        // ADR 0015 invariant 6: a cancelled task can leave a Store job queued
+        // on the blocking pool, holding the owned state. Wait for every such
+        // job, so a returned shutdown holds nothing (a restart in the same
+        // process can open the state at once). A closed queue has none left.
+        let all = u32::try_from(self.shared.options.max_observers + 1).unwrap_or(u32::MAX);
+        let _ = self.shared.store_jobs.acquire_many(all).await;
+        status
     }
 }
 impl Drop for OwnedCoordinator {
@@ -1895,6 +1903,9 @@ impl Shared {
         let shared = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Dropped before the permit, so a waiter that holds every permit
+            // (shutdown) knows this job no longer holds the owned state.
+            let shared = shared;
             let owner = shared.owner.lock().map_err(|error| {
                 drop(error);
                 shared.fail("ownership mutex poisoned")
