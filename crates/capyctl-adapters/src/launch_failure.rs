@@ -131,6 +131,20 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         );
         return text;
     }
+    // ADR 0023 §4 (amended 2026-10-03): TensorFold sizes one window and its
+    // streams' drafter buffers inside the cap CapyCTL passes (the declared
+    // Ready allocation) and refuses an explicit context that does not fit.
+    if engine_output
+        .lines()
+        .any(|line| line.contains("CUDA startup memory budget cannot fit"))
+    {
+        text.push_str(
+            "; TensorFold's memory cap cannot hold context_length beside its streams: \
+             lower max_concurrent_requests or context_length, or raise the ready \
+             allocation in resources",
+        );
+        return text;
+    }
     // Name as many refused options as the bound allows.
     let mut options = rejected_options(engine_output);
     while !options.is_empty() {
@@ -209,6 +223,23 @@ mod tests {
              for this model: name one with --drafter, or add --no-drafts to turn drafts off"
         );
         assert!(!text.contains("z-lab"));
+        assert!(text.len() <= MAX_SUMMARY_BYTES);
+    }
+    // ADR 0023 §4 (amended 2026-10-03): TensorFold refuses at start a context
+    // its memory budget (the declared Ready allocation) cannot hold beside its
+    // streams; the summary names the settings that fix it, never a number
+    // from the engine's line.
+    #[test]
+    fn a_tensorfold_budget_refusal_names_the_fix() {
+        let output = "[tensorfold] precision: checkpoint\nValueError: CUDA startup memory budget cannot fit requested context 32768; estimated largest fitting prompt-plus-reply window: 20480 tokens across the ranks. Use --context 20480 with a smaller prompt/reply reserve, or free memory or use smaller/quantized weights; no model weights or KV caches have been loaded. KV precision is unchanged.\n";
+        let text = summary(output, Some(EngineExit::Code(1)));
+        assert_eq!(
+            text,
+            "the engine exited before readiness with exit code 1; TensorFold's memory cap \
+             cannot hold context_length beside its streams: lower max_concurrent_requests or \
+             context_length, or raise the ready allocation in resources"
+        );
+        assert!(!text.contains("20480"));
         assert!(text.len() <= MAX_SUMMARY_BYTES);
     }
 }

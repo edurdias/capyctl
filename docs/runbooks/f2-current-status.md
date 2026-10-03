@@ -1,5 +1,40 @@
 # Current implementation and launch status
 
+## TensorFold decodes the deployment's requests together — 2026-10-03 (branch `fix/tensorfold-parallel`)
+
+Owner decision 2026-10-03, recorded in ADR 0023 §4. TensorFold serves one request
+at a time on CUDA unless started with `--parallel`, and CapyCTL passed none, so a
+TensorFold deployment served its requests in turn while vLLM and SGLang ran them
+together. `max_concurrent_requests` now renders `--parallel` (8 when undeclared:
+TensorFold reserves the drafter's buffers for every stream at start, inside the
+declared memory); `--parallel` in the extra or host-fixed arguments wins and is
+refused beside a declared count; status shows `Streams ...`; TensorFold's
+refusal of a context its cap cannot hold names the fix.
+
+Live, through `capyctl start standalone` on the branch build:
+
+- One GB10, Qwen3.8-27B NVFP4 with DFlash2, 32768-token context, 34 GiB Ready.
+  TensorFold 0.6.3 started with `--parallel 8` and logged a 30.68 GiB startup
+  estimate within the 34.00 GiB cap and "up to 8 streams". Aggregate decode, 512
+  tokens a request, medians of three rounds: 15.8 tokens/s at 1 stream, 17.6 at 2,
+  28.9 at 4, 62.2 at 8 (3.9 times one stream). With `--parallel auto` in
+  `extra_args` (TensorFold's one at a time) the same machine gave 12.3 at 1 and
+  12.8 at 8. TensorFold 0.6.1 gave the same shape (15.6 at 1, 61.3 at 8). This
+  machine decodes this model about a third as fast as the recipe's measurement
+  for one stream; the ratios are what was checked.
+- The same deployment with `max_concurrent_requests: 32` was refused by
+  TensorFold at start (49.3 GiB estimated on 0.6.1) and status read "TensorFold's
+  memory cap cannot hold context_length beside its streams: lower
+  max_concurrent_requests or context_length, or raise the ready allocation in
+  resources". `max_concurrent_requests: 4` beside `extra_args: [--parallel, "8"]`
+  was refused at deploy, naming both.
+- One RTX 4090 Laptop GPU (16 GB), FrogNano-4B-2609 MLX 4-bit on TensorFold
+  0.6.3, no drafter, 11 GiB cap: startup estimate 7.29 GiB for 8 streams.
+  Aggregate decode 50.4 tokens/s at 1 stream, 93.4 at 2, 176.5 at 4, 319.1 at 8
+  (40.3 each); one stream 49.5 to 50.4 tokens/s from 0.5k to 32k tokens of
+  context. Eight 28k-token prompts at once all completed, GPU memory at most
+  9.9 GiB.
+
 ## Standalone memory limits and the TensorFold memory cap — 2026-10-03 (branch `fix/standalone-memory-limit`)
 
 Found in the three-engine comparison (Qwen3.8-27B NVFP4 with DFlash2 on one

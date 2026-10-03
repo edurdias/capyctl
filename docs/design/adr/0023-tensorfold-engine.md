@@ -76,7 +76,7 @@ host approval by name; `--vision` is ordinary.
 ### 4. Deployment configuration
 
 `context_length` is required and renders `--context`; `kv_cache_dtype` renders
-`--kv-dtype`; `engine_config.tensorfold` takes `max_tokens` and `thinking`. The common fields TensorFold has no flag for are refused. A
+`--kv-dtype`; `engine_config.tensorfold` takes `max_tokens` and `thinking`. The common fields TensorFold has no flag for are refused; `max_concurrent_requests` renders `--parallel` (amendment below). A
 TensorFold deployment states `resources`. Its residency is `restart_only`; `deep`
 or `host_backed` fails resolution with `capability_missing`. An undeclared
 `timeouts.initialize` is 1800 s and an undeclared `request_deadline` is at least
@@ -89,6 +89,43 @@ or `host_backed` fails resolution with `capability_missing`. An undeclared
 itself from free memory. The launch environment adds
 `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, the declared Ready allocation on the GPU's
 memory in GiB, which TensorFold 0.6.3 honours as its cap.
+
+*Amended 2026-10-03 (owner decision):* TensorFold decodes as many requests
+together as CapyCTL keeps in flight for the deployment, as vLLM and SGLang run
+them. `max_concurrent_requests` is no longer refused: it renders `--parallel <n>`
+after `--context`. Undeclared, CapyCTL renders `--parallel 8`
+(`TENSORFOLD_DEFAULT_PARALLEL`), lower than the router's per-deployment bound of
+32 that vLLM gets as `--max-num-seqs`: TensorFold sizes its drafter's buffers
+for every stream at start, inside the declared memory, and refuses a context
+that no longer fits. Qwen3.8-27B NVFP4 with DFlash2 and a 32768-token context
+estimates 27.6 GiB at one stream and 49.3 GiB at 32 (about 0.7 GiB a stream),
+so 32 would refuse the 34 GiB that the same deployment declares, while 8 fits
+it. The router's other requests wait in TensorFold's queue. TensorFold's own
+default, `auto`, is one request at a time on CUDA.
+`--parallel` in the extra or host-fixed arguments, in any spelling TensorFold's
+parser accepts (exact, `=value`, underscores, an abbreviation), wins: CapyCTL
+renders none, so a deployment that passes it keeps its value. Beside a declared
+`max_concurrent_requests` it is refused at resolution, naming the field and the
+option, and a rendered and a passed `--parallel` are refused again when the
+command is rendered. `capyctl status deployment` and `capyctl validate config`
+show the count and its source (`declared`, `default`, `extra_args`,
+`host_fixed`) under `context.streams`.
+
+TensorFold's startup admission sizes one stream's full window and the drafter's
+buffers for every stream, inside the cap above; the other streams' caches grow
+by use. A new request waits while its projected memory does not fit beside the
+streams already decoding, and when even the oldest stream cannot grow the newest
+is stopped with an error that names `--parallel`. Nothing is refused at start
+for a count whose caches do not all fit at full length; a context that does not
+fit beside the streams' drafter buffers is, and the launch failure says to
+lower `max_concurrent_requests` or `context_length`, or raise the Ready
+allocation. Families TensorFold
+0.6.3 runs one request at a time on CUDA whatever `--parallel` says
+(Nemotron-H) take the option and ignore it; status shows one stream for them
+when it reads the checkpoint. On a GB10, Qwen3.8 dense with one stream drafts
+wider trees than with `--parallel` above 1; measured live, one request alone
+decoded no slower with `--parallel 8` (15.8 against 12.3 tokens/s on the same
+machine).
 
 ### 5. Drafter
 

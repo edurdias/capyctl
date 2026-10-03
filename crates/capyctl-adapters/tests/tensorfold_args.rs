@@ -2,7 +2,7 @@
 //! only; they prove the rendering, not that TensorFold starts.
 use capyctl_adapters::tensorfold::{
     engine_environment, plan_from_effective, render_command, PlanInputTensorfold,
-    TensorfoldPlanError,
+    TensorfoldArgsError, TensorfoldPlanError,
 };
 use capyctl_config::effective::{derived_initialize_ms, resolve_effective};
 use serde_json::{json, Value};
@@ -332,4 +332,102 @@ fn an_approved_drafter_path_is_checked_through_symlinks() {
         matches!(error, TensorfoldPlanError::PathNotApproved(_)),
         "a missing drafter is not inside an approved path: {error}"
     );
+}
+
+// ADR 0023 §4 (amended 2026-10-03, owner decision): TensorFold decodes as many
+// requests together as CapyCTL keeps in flight for the deployment, as vLLM
+// and SGLang do: `--parallel` is the deployment's `max_concurrent_requests`,
+// else CapyCTL's TensorFold default (8). The same option in the extra or
+// host-fixed arguments wins, and CapyCTL renders none.
+#[test]
+fn the_plan_passes_the_deployments_concurrency_as_parallel() {
+    let parallel = |argv: &[String]| -> Vec<String> {
+        argv.windows(2)
+            .filter(|w| w[0].starts_with("--par"))
+            .map(|w| format!("{} {}", w[0], w[1]))
+            .chain(
+                argv.iter()
+                    .filter(|a| a.starts_with("--parallel="))
+                    .cloned(),
+            )
+            .collect()
+    };
+    let (deployment, host) = fixture();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let plan = plan_from_effective(&effective, 8101, "/var/log/i.log".into(), None).unwrap();
+    assert_eq!(
+        plan.parallel,
+        Some(capyctl_domain::launch::TENSORFOLD_DEFAULT_PARALLEL)
+    );
+    let argv = render_command(&plan).unwrap().argv;
+    assert_eq!(parallel(&argv), ["--parallel 8"]);
+    // Typed: right after `--context`.
+    let at = argv.iter().position(|a| a == "--parallel").unwrap();
+    assert_eq!(argv[at - 2], "--context");
+
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let plan = plan_from_effective(&effective, 8101, "/var/log/i.log".into(), None).unwrap();
+    assert_eq!(plan.parallel, Some(4));
+    assert_eq!(
+        parallel(&render_command(&plan).unwrap().argv),
+        ["--parallel 4"]
+    );
+
+    for (extra, rendered) in [
+        (json!(["--parallel", "8"]), "--parallel 8"),
+        (json!(["--parallel=8"]), "--parallel=8"),
+        (json!(["--par", "8"]), "--par 8"),
+    ] {
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"]["accept_extra_args"] = true.into();
+        deployment["engine_config"]["extra_args"] = extra;
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let plan = plan_from_effective(&effective, 8101, "/var/log/i.log".into(), None).unwrap();
+        assert_eq!(plan.parallel, None, "{rendered}");
+        assert_eq!(parallel(&render_command(&plan).unwrap().argv), [rendered]);
+    }
+
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] = json!(["--parallel", "2"]);
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let plan = plan_from_effective(&effective, 8101, "/var/log/i.log".into(), None).unwrap();
+    assert_eq!(plan.parallel, None);
+    assert_eq!(
+        parallel(&render_command(&plan).unwrap().argv),
+        ["--parallel 2"]
+    );
+}
+
+// The render half of the same rule: a rendered `--parallel` and the same
+// option among the pass-through arguments never both reach TensorFold.
+#[test]
+fn a_rendered_parallel_beside_a_passed_one_is_refused() {
+    let mut input = plan();
+    input.parallel = Some(4);
+    for args in [
+        vec!["--parallel".to_owned(), "8".to_owned()],
+        vec!["--parallel=8".to_owned()],
+        vec!["--par".to_owned(), "8".to_owned()],
+    ] {
+        input.extra_args = args.clone();
+        assert!(
+            matches!(
+                render_command(&input),
+                Err(TensorfoldArgsError::Duplicate(_))
+            ),
+            "{args:?}"
+        );
+        input.extra_args.clear();
+        input.engine_args = args.clone();
+        assert!(
+            matches!(
+                render_command(&input),
+                Err(TensorfoldArgsError::Duplicate(_))
+            ),
+            "{args:?}"
+        );
+        input.engine_args.clear();
+    }
 }
