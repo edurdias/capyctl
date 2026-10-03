@@ -207,8 +207,8 @@ for one stream and 0.7 GiB more for each other one. A context that no longer
 fits is refused at start, and `capyctl status deployment` says to lower
 `max_concurrent_requests` or `context_length`, or raise `ready`. The streams'
 KV caches grow as their requests get longer: a new request waits while it would
-not fit beside the others. To serve one request at a time (one stream decodes
-alone a little faster on some models), set `max_concurrent_requests: 1`.
+not fit beside the others. To serve one request at a time, set
+`max_concurrent_requests: 1`.
 `--parallel` in `extra_args` also works and wins over the default; beside
 `max_concurrent_requests` it is refused. Status shows the count:
 

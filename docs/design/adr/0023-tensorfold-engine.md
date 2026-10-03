@@ -123,9 +123,9 @@ allocation. Families TensorFold
 0.6.3 runs one request at a time on CUDA whatever `--parallel` says
 (Nemotron-H) take the option and ignore it; status shows one stream for them
 when it reads the checkpoint. On a GB10, Qwen3.8 dense with one stream drafts
-wider trees than with `--parallel` above 1, so one request alone decodes
-differently; a deployment that serves one user at a time can pass
-`--parallel 1`.
+wider trees than with `--parallel` above 1; measured live, one request alone
+decoded no slower with `--parallel 8` (15.8 against 12.3 tokens/s on the same
+machine).
 
 ### 5. Drafter
 
