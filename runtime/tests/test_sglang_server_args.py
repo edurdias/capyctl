@@ -61,13 +61,16 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--engine-info-bootstrap-port", type=int, default=None)
         parser.add_argument("--decoupled-spec-bind-endpoint", default=None)
         parser.add_argument("--chat-template", default=None)
+        parser.add_argument("--max-mamba-cache-size", type=int, default=None)
+        parser.add_argument("--mamba-full-memory-ratio", type=float, default=None)
 
 
 SyntheticArgs.__struct_fields__ = (
     "model_path", "host", "port", "tp_size", "mem_fraction_static", "enable_metrics",
     "ssl_keyfile", "dtype", "context_length", "reasoning_parser",
     "detokenizer_worker_num", "schedule_policy", "disable_cuda_graph",
-    "engine_info_bootstrap_port", "decoupled_spec_bind_endpoint", "chat_template")
+    "engine_info_bootstrap_port", "decoupled_spec_bind_endpoint", "chat_template",
+    "max_mamba_cache_size", "mamba_full_memory_ratio")
 
 
 def synthetic_constructor(**kwargs):
@@ -94,6 +97,10 @@ class MappingTests(LaunchFixture, unittest.TestCase):
 
     def spec_with(self, **settings):
         self.public["settings"].update(settings)
+        return self.build()
+
+    def build_without(self, key):
+        self.public["settings"].pop(key, None)
         return self.build()
 
     def seen(self, spec):
@@ -192,6 +199,27 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                                      extra_args=["--reasoning-parser", "qwen3"]),
                       self.placement(), constructor)
         self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T14: ADR 0014 amendment A14. The state slots sized at launch reach the
+    # constructor; absent, nothing is passed and SGLang sizes its own pool.
+    def test_sized_state_slots_reach_the_constructor(self):
+        kwargs = self.seen(self.spec_with(max_mamba_cache_size=40))
+        self.assertEqual(kwargs["max_mamba_cache_size"], 40)
+        kwargs = self.seen(self.build_without("max_mamba_cache_size"))
+        self.assertNotIn("max_mamba_cache_size", kwargs)
+
+    # T14: ADR 0014 amendment A14. Sized slots and extras that size the same
+    # pool never both reach the engine (resolution prevents it; this rechecks).
+    def test_sized_state_slots_and_a_state_extra_are_refused(self):
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        for extra in (["--max-mamba-cache-size", "64"], ["--mamba-full-memory-ratio", "0.5"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    construct(self.spec_with(max_mamba_cache_size=40, extra_args=extra),
+                              self.placement(), constructor)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T14: extra arguments flow in through the installed parser.
     def test_extra_arguments_reach_the_constructor_under_their_field_names(self):

@@ -34,6 +34,31 @@ pub fn frozen_from_effective(
     let mut settings = declared.clone();
     settings.common.context_length =
         capyctl_config::context_fit::fit_for_effective(effective).tokens;
+    // ADR 0014 amendment A14 (owner decision 2026-10-03): `memory.kv_cache` is
+    // SGLang's KV pool, in tokens, and a hybrid model's recurrent state is
+    // sized for its running requests beside it; a state that does not fit
+    // the memory request is refused here, before anything starts.
+    let pool = capyctl_config::context_fit::sglang_pool_for_launch(
+        &settings,
+        &profile.args,
+        effective
+            .model
+            .resolved_path
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+    .map_err(RuntimeError::Refused)?;
+    settings.max_total_tokens = settings.max_total_tokens.or(pool.max_total_tokens);
+    if let Some(running) = pool.max_running_requests {
+        settings.common.max_concurrent_requests = Some(running);
+    }
+    settings.max_mamba_cache_size = pool.max_mamba_cache_size;
+    // The static pool holds the weights, the KV cache, the state and SGLang's
+    // own allocations (unified memory only): what it takes beyond the request
+    // less the margin comes out of the margin.
+    if let Some(static_bytes) = pool.static_bytes {
+        settings.memory.margin_bytes = settings.memory.request_bytes - static_bytes;
+    }
     // ADR 0024 (owner decision 2026-10-03): the parsers chosen by model
     // family from the checkpoint read here, unless the deployment named or
     // turned them off or its extras already pass them. The digest covers them.

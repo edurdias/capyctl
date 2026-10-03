@@ -22,6 +22,7 @@ fn inputs(kv: i64) -> FitInputs<'static> {
         reserved_blocks: 0,
         draft: None,
         vllm: None,
+        sglang: false,
     }
 }
 
@@ -350,4 +351,23 @@ fn a_hybrid_model_on_vllm_is_fitted_to_its_block_layout() {
         )
         .tokens
     );
+}
+
+// T14 (amendment A14): SGLang keeps a gated-delta-net hybrid's recurrent
+// state in its own pool, so its context is fitted to the attention layers'
+// KV alone: 16 × 2 × 4 × 256 fp8 bytes per token, 131072 tokens in 4 GiB.
+#[test]
+fn a_hybrid_model_on_sglang_is_fitted_to_its_attention_layers() {
+    let target = qwen38_27b();
+    let mut sglang = inputs(4 * GIB);
+    sglang.kv_cache_dtype = Some("fp8");
+    sglang.sglang = true;
+    let fit = fit_context(sglang, Ok(&target));
+    assert_eq!(fit.tokens, Some(131072));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    assert_eq!(fit.reason, None);
+    // A dense model is fitted as before.
+    let mut dense_fit = inputs(4 * GIB);
+    dense_fit.sglang = true;
+    assert_eq!(fit_context(dense_fit, Ok(&dense())).tokens, Some(8192));
 }
