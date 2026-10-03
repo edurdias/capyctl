@@ -332,6 +332,44 @@ async fn a_name_in_both_is_refused_at_start() {
     assert_eq!(structured.code, "profile_exists", "{}", structured.message);
 }
 
+// T02 T03 (ADR 0018 amendment A3): engines.yaml shared with a newer release
+// holds a profile for an engine kind this release does not know. Standalone
+// skips it and starts with the rest; a reload keeps skipping it; a deployment
+// naming it is refused as an unpublished profile; the file still holds it.
+#[tokio::test]
+async fn a_profile_for_an_unknown_engine_kind_is_skipped_at_start() {
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    register(&document, "only");
+    let path = engines_beside(&document);
+    {
+        let lock = lock_engines(&path).unwrap();
+        let mut engines = EnginesFile::load(&path).unwrap();
+        let mut future = engines.profiles["only"].clone();
+        future["engine"] = "futureengine".into();
+        engines.profiles.insert("future".into(), future);
+        write_engines(&engines, &lock, None).unwrap();
+    }
+    let app = support::boot_registered_only(state.path(), &document)
+        .await
+        .expect("standalone starts and skips the unknown kind");
+    assert_eq!(app.profiles(), vec!["only".to_string()]);
+    let socket = state.path().join(SOCKET_NAME);
+    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(reload["ok"], true, "{reload}");
+    assert_eq!(app.profiles(), vec!["only".to_string()]);
+    let (status, body) = deploy(&app, state.path(), "m", "future").await;
+    assert!(!status.is_success(), "{status} {body}");
+    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+    assert!(EnginesFile::load(&path)
+        .unwrap()
+        .profiles
+        .contains_key("future"));
+    let _ = app.shutdown().await;
+}
+
 /// Deploy `name` on `profile` and start it to Ready; its deployment id.
 async fn ready_on(
     app: &capyctl_cli::roles::App,
