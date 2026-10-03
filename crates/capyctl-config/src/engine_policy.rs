@@ -376,6 +376,18 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
     named.filter(|path| Path::new(path).is_absolute())
 }
 
+/// ADR 0014 amendment A15: whether SGLang arguments (host-fixed then the
+/// deployment's) turn on speculative decoding, which SGLang does with
+/// `--speculative-algorithm` (abbreviations and the `=` spelling included).
+/// Arguments that do not parse are refused by their own validation.
+pub fn sglang_speculative(args: &[String]) -> bool {
+    parse_options(args).is_ok_and(|options| {
+        options
+            .iter()
+            .any(|parsed| matches_name(&parsed.name, "--speculative-algorithm"))
+    })
+}
+
 /// Whether a `--speculative-config` value is admissible under the host's
 /// approved directories (ADR 0014 §8).
 fn speculative_config_admitted(value: &str, approved_paths: &[PathBuf]) -> bool {

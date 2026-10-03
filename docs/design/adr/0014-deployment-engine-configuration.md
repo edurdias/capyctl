@@ -789,8 +789,10 @@ Checked live after that fix (GB10, request 55 GiB, KV cache 16 GiB, two concurre
 graphs on by default): the compile workers exited (23 processes down to 3) and the engine
 stayed ready through 10 idle minutes, then served 21.3 tokens/s at one stream and 39.4 at
 two. Its park was refused `the engine is not quiescent` with graphs on and with them off
-alike, so that refusal is not about graphs and stays open; Qwen3-4B on the same build parked
-and was measured at 6.30 GiB again.
+alike, so that refusal is not about graphs; Qwen3-4B on the same build parked and was
+measured at 6.30 GiB again. Closed by amendment A15: the refusal came from the saver
+observation, not from the engine's gauges, and a speculative SGLang deployment no longer
+parks.
 
 ## Amendment A14: `memory.kv_cache` is SGLang's KV pool (owner decision 2026-10-03)
 
@@ -870,3 +872,45 @@ Follow-up: a derived request should include the state for its running requests. 
 the state's bytes as a checkpoint fact beside the weights (measured by the host that reads
 the checkpoint, sent with the measurement, recorded with the revision), since resolution
 reads no checkpoint file. Until then the margin lends it.
+
+## Amendment A15: SGLang does not park a speculative deployment (owner decision 2026-10-03)
+
+Problem: the open issue of amendment A13. Qwen3.8-27B (NVFP4, DFlash2) on SGLang 0.5.21 was
+refused every park with `the engine is not quiescent` while SGLang's running and waiting
+gauges read 0. The embedded check before a park needs both the gauges at zero and an
+enrolled memory saver that is real and fully mapped, and reports either failing as not
+quiescent. The saver half failed: the scheduler observation reads only the single-rank
+topology the recipe renders, and that topology has no speculative algorithm, so the
+DFlash2 scheduler failed the check when it enrolled. The enrollment then stopped without a
+word, no record was written, and the host had no saver evidence. Qwen3-4B, with no draft,
+enrolled and parked.
+
+The topology check is right to refuse it. Read in SGLang 0.5.21's source: a park pauses the
+draft model's weights with the target's (the same `weights` region), and a `deep` wake
+sends `update_weights_from_disk` with the target's checkpoint to every weight runner, the
+draft's included, so the draft would wake without its weights. The draft's host-RAM backup
+(`--enable-draft-weights-cpu-backup`) is not part of the recipe either.
+
+Rule:
+
+- An SGLang deployment whose arguments (the installation's or the deployment's
+  `extra_args`) name `--speculative-algorithm` defaults to `restart_only`, as TensorFold
+  does (ADR 0023 §6). The default is named in the provenance, so an existing revision
+  re-resolves to it.
+- Such a deployment that states `deep` or `host_backed` is refused when it is resolved,
+  `capability_missing`, with the reason and `restart_only` as the way out.
+- vLLM's speculative deployments are unchanged.
+- An enrollment that stops part way writes one line to the engine's log,
+  `capyctl_saver_enrollment_refused`, with a fixed stage word (`arguments`, `library`,
+  `install`, `listen`, `record`), the exception's class name and a binding error's closed
+  code (`topology` here), never its message, a path or a credential. A launch outside an
+  observation scope, or without the memory saver, logs nothing.
+
+Evidence: `crates/capyctl-config/tests/sglang_speculative_residency.rs` and
+`test_a_refused_enrollment_names_its_stage` (runtime). CPU tests only.
+
+Follow-up: parking a speculative SGLang deployment. It needs the topology check to admit the
+speculative algorithm, a wake that restores the draft's weights (its own path on a disk
+reload, or the draft's host-RAM backup), and a live check that drafts are still accepted
+after a wake. SGLang 0.5.20 also could not reload ModelOpt (NVFP4) weights from disk (ADR
+0019 §5), so for this checkpoint the wake has to be proven on the installed build.

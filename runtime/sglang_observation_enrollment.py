@@ -20,7 +20,8 @@ enrollment:
 
 An enrollment that cannot complete leaves the engine serving without one: the
 host then has no saver evidence and refuses Park with no effect (fail closed).
-No exception text, path or credential is ever written anywhere. Nothing here
+No exception text, path or credential is ever written anywhere; a refused
+enrollment logs its stage and the exception's class name only. Nothing here
 proves release, residency or readiness; the host fuses these facts with its own.
 """
 
@@ -100,8 +101,38 @@ def _write_record(directory, name, record):
         os.close(parent)
 
 
+def _refused(stage, error):
+    """One line on the engine's own stderr naming where an enrollment stopped:
+a fixed stage word, the exception class name and a binding error's closed code,
+never its message, a path or a credential. Found live 2026-10-03 (ADR 0014
+amendment A15): a speculative scheduler failed the topology check here and
+left no trace, so its park was refused as not quiescent with nothing to say why.
+"""
+    try:
+        import re
+        import sys
+        kind = type(error).__name__
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", kind) is None:
+            kind = "unnamed"
+        code = getattr(error, "code", None)
+        if type(code) is not str or re.fullmatch(r"[a-z_]{1,32}", code) is None:
+            code = None
+        sys.stderr.write(json.dumps({"event": "capyctl_saver_enrollment_refused",
+                                     "stage": stage, "error": kind, "code": code},
+                                    separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def enroll(scheduler):
-    """Enroll this scheduler's saver observation; never raises, never logs."""
+    """Enroll this scheduler's saver observation; never raises.
+
+    A launch outside any observation scope, or without the memory saver, is
+    not an enrollment and returns False silently; an enrollment that stops
+    part way logs its stage (`_refused`).
+    """
+    stage = "scope"
     try:
         scope = _scope()
         if scope is None:
@@ -112,23 +143,28 @@ def enroll(scheduler):
         from .sglang_observation_server import SchedulerObservationServer
         from .sglang_observation_transport import observation_key
         from .sglang_scheduler_observer import install_scheduler_observer
+        stage = "arguments"
         args = saver._fields(scheduler).get("server_args")
         if residency.server_arg(args, "enable_memory_saver") is not True:
             return False
         admin = residency.server_arg(args, "admin_api_key")
         key = observation_key(admin, binding, incarnation)
+        stage = "library"
         path = _preload_library()
         build = saver.TrustedSaverBuild(path, _digest(path), "preload")
         owner = saver.current_process_identity()
+        stage = "install"
         bridge = install_scheduler_observer(
             scheduler, binding_id=binding, incarnation_id=incarnation, expected_owner=owner,
             build=build,
             observe=functools.partial(residency.observe_scheduler_saver, weight_restore=restore),
             topology=residency.topology)
+        stage = "listen"
         server = SchedulerObservationServer.start(
             path=os.path.join(directory, binding + ".sock"), bridge=bridge, binding_id=binding,
             incarnation_id=incarnation, expected_owner=owner, key=key)
         _ENROLLED.append(server)
+        stage = "record"
         _write_record(directory, binding + ".json", {
             "version": 1,
             "binding_id": binding,
@@ -141,8 +177,9 @@ def enroll(scheduler):
             "socket": binding + ".sock",
         })
         return True
-    except Exception:
+    except Exception as error:
         # Fail closed: without an enrollment the host refuses Park unchanged.
+        _refused(stage, error)
         return False
 
 
