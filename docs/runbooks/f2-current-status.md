@@ -1,5 +1,33 @@
 # Current implementation and launch status
 
+## Standalone memory limits and the TensorFold memory cap — 2026-10-03 (branch `fix/standalone-memory-limit`)
+
+Found in the three-engine comparison (Qwen3.8-27B NVFP4 with DFlash2 on one
+GB10, 121.7 GiB) and recorded in ADR 0025.
+
+1. **The standalone managed limit could not be raised.** It was 50 % of memory
+   (60.8 GiB), so an 84 GiB TensorFold declaration and a 72 GiB vLLM request were
+   refused `capacity_blocked`. `host.resource_policy.memory.system.managed_limit`
+   and `free_reserve` now take `auto`, a size or a whole percentage, by YAML,
+   `--set` and `CAPYCTL_SET__…`; together they must fit the observed memory. The
+   stored policy follows them at every start (before, standalone kept the limits
+   it first stored), and `auto` returns to the default.
+2. **TensorFold grew past its declaration.** CapyCTL launched it with no cap, so
+   TensorFold 0.6.3 sized its CUDA budget from the machine's available memory and
+   kept long prompts' states until that ran out (77.9 GiB of machine memory under
+   a 58 GiB Ready declaration). The launch now sets
+   `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` to the declared Ready allocation.
+
+Live on host A so far (TensorFold 0.6.3): `--set ...managed_limit=90GiB` was
+stored as a 90.0 GiB limit; a deployment declaring 84 GiB cold and 82 GiB Ready
+was admitted and launched with the variable at `82`. A 254,993-token prompt got
+its first token at 260 s and completed. Repeated long prompts took machine
+memory from 47 to 67 to 84 GiB, where the growth stopped (84.4 GiB, 80.8 GiB
+above idle, under the 82 GiB cap) and a new 250k-token prompt was still served.
+Still to run live: the limit by environment and by YAML, a 58 GiB declaration
+under the same prompts, and SGLang with a 70 GiB request and
+`--max-mamba-cache-size 40` at 256k.
+
 ## A 9 GB model on a 16 GB GPU — 2026-10-03 (branch `fix/single-gpu-16gb`)
 
 Found running FrogNano-4B-2609 (BF16, 9.32 GB) on a 16 GB laptop GPU.

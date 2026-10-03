@@ -320,18 +320,19 @@ impl MemoryShare {
 /// observed memory together is checked at start, when it is known.
 fn check_memory_limit(field: &str, value: &Value, path: &str) -> Result<(), ConfigError> {
     let Some(text) = value.as_str() else {
-        return Err(refuse(path, "a memory limit is `auto`, a size or a percentage"));
+        return Err(refuse(
+            path,
+            "a memory limit is `auto`, a size or a percentage",
+        ));
     };
     let share = MemoryShare::parse(text).map_err(|detail| refuse(path, detail))?;
     match (field, share) {
-        ("managed_limit", Some(MemoryShare::Bytes(0) | MemoryShare::Percent(0))) => Err(refuse(
-            path,
-            "the managed limit must be above zero",
-        )),
-        ("free_reserve", Some(MemoryShare::Percent(100))) => Err(refuse(
-            path,
-            "the free reserve must leave memory to manage",
-        )),
+        ("managed_limit", Some(MemoryShare::Bytes(0) | MemoryShare::Percent(0))) => {
+            Err(refuse(path, "the managed limit must be above zero"))
+        }
+        ("free_reserve", Some(MemoryShare::Percent(100))) => {
+            Err(refuse(path, "the free reserve must leave memory to manage"))
+        }
         _ => Ok(()),
     }
 }

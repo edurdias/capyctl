@@ -2141,8 +2141,14 @@ fn stated_memory_limits_replace_the_derived_ones() {
         "managed_limit": "75%", "free_reserve": "10%"}}}});
     let mut host = derived_unified();
     apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
-    assert_eq!(domain_bytes(&host, DOMAIN, "managed_limit"), CAPACITY / 100 * 75);
-    assert_eq!(domain_bytes(&host, DOMAIN, "free_reserve"), CAPACITY / 100 * 10);
+    assert_eq!(
+        domain_bytes(&host, DOMAIN, "managed_limit"),
+        CAPACITY / 100 * 75
+    );
+    assert_eq!(
+        domain_bytes(&host, DOMAIN, "free_reserve"),
+        CAPACITY / 100 * 10
+    );
 
     // Nothing stated: the derived policy, unchanged.
     let mut host = derived_unified();
@@ -2190,7 +2196,10 @@ fn stated_memory_limits_apply_to_host_ram_on_a_discrete_host() {
     let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
         "managed_limit": "80%"}}}});
     apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
-    assert_eq!(domain_bytes(&host, "system", "managed_limit"), CAPACITY / 100 * 80);
+    assert_eq!(
+        domain_bytes(&host, "system", "managed_limit"),
+        CAPACITY / 100 * 80
+    );
     assert_eq!(
         host["resource_policy"]["domains"]["gpu0"],
         derived["resource_policy"]["domains"]["gpu0"]
