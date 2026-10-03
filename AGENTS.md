@@ -21,7 +21,8 @@ Read these in order when orienting. Lower entries never override higher ones.
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,
    version skew, engine registration, and ADR 0019 for discrete GPUs and the network
    inference endpoint, ADR 0021 for terminal output: text by default, JSON on
-   request, and ADR 0024 for tool-call and reasoning parsers chosen by model family).
+   request, ADR 0024 for tool-call and reasoning parsers chosen by model family, and
+   ADR 0025 for standalone memory limits and TensorFold's memory cap).
 3. `docs/design/milestones/f2-sglang-design.md` — approved F2 design.
 4. `docs/plans/` — per-slice implementation plans. Feature design notes written
    ahead of their plans live in `docs/specs/`.

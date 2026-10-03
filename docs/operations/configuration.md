@@ -201,7 +201,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
-| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, `endpoint_port_range`, and the `queue` bounds of a host) |
+| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit` and `free_reserve`, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 
@@ -246,6 +246,34 @@ host:
     queue:
       stream_idle_timeout: "600s"
 ```
+
+### Standalone memory limits
+
+Standalone admits deployments against limits it derives from the memory it
+observes at start: a managed limit of 50 % and a free reserve of 20 % (on a
+discrete-GPU machine, of host RAM; each card's limits are derived from the card
+and are not settable). To admit a larger model, raise the managed limit with a
+size or a whole percentage:
+
+```bash
+capyctl start standalone --set host.resource_policy.memory.system.managed_limit=90GiB
+CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__MANAGED_LIMIT=75%
+```
+
+```yaml
+host:
+  resource_policy:
+    memory:
+      system:
+        managed_limit: "90GiB"   # or "75%"; auto is 50 %
+        free_reserve: auto       # auto is 20 %
+```
+
+The managed limit and the free reserve must fit the memory together; a start
+whose limits do not is refused with both numbers. Every start applies the limits
+in force to the stored policy, and `auto` returns to the default. A limit lowered
+below what running models already hold is refused until they stop. A higher limit
+leaves less memory for everything else on the machine.
 
 How a value is read and checked:
 

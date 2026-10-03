@@ -588,10 +588,16 @@ impl crate::Store {
         // Found live 2026-10-02 (standalone, as M32 on a host): a standalone
         // restarted with changed queue bounds kept its first imported ones,
         // silently. The queue bounds are operator settings of the standalone
-        // document, so they follow it as a host's do; the persisted memory
-        // limits are kept.
+        // document, so they follow it as a host's do. Found live 2026-10-03:
+        // so are its memory limits (`host.resource_policy.memory.system`,
+        // owner decision 2026-10-03), and each domain's limits follow the
+        // document too, the derived ones included, so a limit set back to
+        // `auto` returns to its default. A changed limit is applied through
+        // the ordinary update, which refuses one the current charges exceed.
+        let document = ResourceControls::from_host(host);
         let mut published = imported.controls.clone();
-        published.queue = ResourceControls::from_host(host).queue;
+        published.queue = document.queue;
+        published.domains = document.domains;
         let host_id = imported.context.host_id.clone();
         self.apply_publication(session, &host_id, imported, published, observations, now_ms)
     }
