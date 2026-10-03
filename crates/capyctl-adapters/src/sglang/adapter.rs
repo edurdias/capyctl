@@ -488,8 +488,9 @@ impl SglangAdapter {
                     || identity.boot_id.is_empty()
                     || identity.boot_id != expected[0].boot_id
             })
-            || observed.identities.len() != expected.len()
-            || observed.identities.iter().collect::<BTreeSet<_>>() != identities
+            // ADR 0027: every engine process recorded and no other; a helper
+            // (an idle compile worker) may have exited.
+            || !capyctl_domain::completion::same_engine(expected, &observed.identities)
             || clock_ms()? > c.deadline_ms
         {
             return Err(uncertain());

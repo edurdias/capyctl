@@ -27,7 +27,8 @@ pub(crate) fn check_session(
 /// distinct pids. A tensor-parallel launch needs several workers, and vLLM's
 /// EngineCore already numbers them this way; ADR 0023 §6: TensorFold serves from
 /// the api process alone. The vLLM and SGLang adapters refuse a group without a
-/// worker before it reaches the store.
+/// worker before it reaches the store. ADR 0027: any number of helpers
+/// (`helper-N`, distinct, gaps allowed) may stand beside the workers.
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
@@ -54,18 +55,34 @@ pub(crate) fn canonical_members(
     {
         return Err(LifecycleError::Invalid);
     }
+    // ADR 0027: helpers are numbered apart from the workers, and one that has
+    // exited leaves a gap, so they are set aside first and only need distinct
+    // `helper-N` roles. They never stand in for the engine's own workers.
+    let helpers = ids.iter().filter(|i| i.is_helper()).count();
+    roles.retain(|role| !capyctl_domain::completion::is_helper_role(role));
     // Every role is distinct (checked above), so removing `api` and then every
     // expected `worker-i` in turn only succeeds, with nothing left over, when
-    // the role set is exactly {api, worker-0, ..., worker-(len-2)}.
-    if !roles.remove("api") {
+    // the remaining role set is exactly {api, worker-0, ..., worker-(n-2)}.
+    let engine = ids.len() - helpers;
+    if !roles.remove("api") || (helpers > 0 && engine < 2) {
         return Err(LifecycleError::Invalid);
     }
-    for worker in 0..ids.len() - 1 {
+    for worker in 0..engine - 1 {
         if !roles.remove(&format!("worker-{worker}")) {
             return Err(LifecycleError::Invalid);
         }
     }
+    if !roles.is_empty() {
+        return Err(LifecycleError::Invalid);
+    }
     Ok(ids)
+}
+/// ADR 0027: liveness evidence still names the engine `recorded` names. It is
+/// a canonical set holding every engine process of `recorded` and no other
+/// engine process; a helper may be missing (it exited) or new (started later).
+pub(crate) fn names_engine(recorded: &[ProcessIdentity], evidence: &[ProcessIdentity]) -> bool {
+    canonical_members(evidence).is_ok()
+        && capyctl_domain::completion::same_engine(recorded, evidence)
 }
 pub(crate) fn identity_dtos(ids: &[ProcessIdentity]) -> Vec<IdentityDto> {
     ids.iter()

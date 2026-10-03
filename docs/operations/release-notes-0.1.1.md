@@ -21,6 +21,11 @@ unchecked in this release.
   deployment `capacity_blocked` on a unified-memory host. A deployment that
   recorded such a peak before this release keeps it: delete it and deploy it
   again once.
+- An engine whose own processes start helper processes, such as the torch
+  inductor compile workers SGLang starts with CUDA graphs on, is no longer
+  stopped when those helpers exit on their own a few minutes after it is
+  ready. Only the engine's own processes exiting stops it; a stop still ends
+  the helpers.
 - A readiness check now accepts a model that answers with reasoning first.
 - New exit code 26, `toolchain_missing`, from `capyctl engine add`.
 - A client that hangs up in the middle of a streamed answer now stops the

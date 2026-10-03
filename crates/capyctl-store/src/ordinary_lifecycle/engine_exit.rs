@@ -50,8 +50,9 @@ impl crate::Store {
     /// Record an exit of a member of this session's Ready launch `exit.step_id`
     /// and close that instance's dispatch. `None` when the exit names no such
     /// launch now: another generation (T34), a launch that is stopping,
-    /// settled or never Ready, a process outside its recorded group, or a
-    /// source that does not serve it. Nothing changes then.
+    /// settled or never Ready, a process outside its recorded group, a helper
+    /// of it (ADR 0027), or a source that does not serve it. Nothing changes
+    /// then.
     pub fn record_engine_exit(
         &self,
         s: &CoordinatorSession,
@@ -105,7 +106,9 @@ impl crate::Store {
         let Some(association) = association(&tx, &p)? else {
             return Ok(None);
         };
-        if !members(&association.identities)?.contains(&exit.process) {
+        // ADR 0027: a helper's exit is not the engine's. Cleanup still proves
+        // it gone with the rest of the recorded group.
+        if exit.process.is_helper() || !members(&association.identities)?.contains(&exit.process) {
             return Ok(None);
         }
         // SPEC §13.2: dispatch to this incarnation closes before anything else;
@@ -177,6 +180,18 @@ mod tests {
         DeploymentFence,
         StepExecutionContext,
     ) {
+        ready_local_with(group())
+    }
+
+    /// An embedded launch that reached Ready with `group` recorded.
+    fn ready_local_with(
+        group: Vec<ProcessIdentity>,
+    ) -> (
+        crate::Store,
+        CoordinatorSession,
+        DeploymentFence,
+        StepExecutionContext,
+    ) {
         let (store, session, fence, execution) = armed_ordinary();
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 5;
@@ -187,7 +202,7 @@ mod tests {
                 &OwnedLaunchReceipt {
                     binding_id: execution.binding_id.clone(),
                     incarnation: execution.incarnation.clone(),
-                    identities: group(),
+                    identities: group.clone(),
                     observed_at_ms: now,
                     receipt: "owned launch observed".into(),
                 },
@@ -201,7 +216,7 @@ mod tests {
                 &step,
                 &CompletionEvidence {
                     token: execution.token.clone(),
-                    identities: group(),
+                    identities: group.clone(),
                     observed_at_ms: now,
                     control_receipt: Some("model list names the route".into()),
                     milestones: vec![
@@ -390,5 +405,106 @@ mod tests {
             .owners
             .contains_key(&fence.deployment_id));
         assert_eq!(observed(&store, &fence.deployment_id), "failed");
+    }
+
+    /// ADR 0027: a helper of a Ready launch (here a compile worker its
+    /// scheduler started) exiting is not the engine exiting: nothing closes and
+    /// nothing is journaled. The engine's own process exiting still closes
+    /// dispatch, and the settlement's cleanup still needs the helper proven gone
+    /// with the rest of the recorded group.
+    #[test]
+    fn a_helper_exit_is_not_an_engine_exit() {
+        let recorded = vec![
+            identity("api", 61),
+            identity("worker-0", 62),
+            identity("helper-0", 63),
+        ];
+        let (store, session, fence, execution) = ready_local_with(recorded.clone());
+        let step = execution.token.step_id.clone();
+        let exit = |process: ProcessIdentity| EngineExit {
+            deployment_id: fence.deployment_id.clone(),
+            generation: fence.generation,
+            step_id: step.clone(),
+            process,
+            status: "exit status unobserved".into(),
+            observed_at_ms: execution.issued_at_ms + 100,
+        };
+        assert_eq!(
+            store
+                .record_engine_exit(
+                    &session,
+                    ExitSource::Embedded,
+                    &exit(identity("helper-0", 63))
+                )
+                .unwrap(),
+            None,
+            "a helper's exit names no engine exit"
+        );
+        assert!(dispatch(&store, &fence.deployment_id));
+        assert_eq!(observed(&store, &fence.deployment_id), "ready");
+        assert_eq!(exited(&store, &execution.token.operation_id), 0);
+
+        let closed = store
+            .record_engine_exit(
+                &session,
+                ExitSource::Embedded,
+                &exit(identity("worker-0", 62)),
+            )
+            .unwrap()
+            .expect("an engine process exiting is the engine exiting");
+        assert!(closed.first);
+        assert!(!dispatch(&store, &fence.deployment_id));
+
+        let ttl = store.observation_ttl_for_step(&step).unwrap();
+        let now = execution.issued_at_ms + 200;
+        let receipt = store
+            .accept_instance_stop_command(
+                &session,
+                "system:engine_exit",
+                &fence.deployment_id,
+                0,
+                fence.revision,
+                "engine-exit:binding",
+                now,
+                now + 50_000,
+            )
+            .unwrap()
+            .expect("the instance holds a runtime");
+        let (_, context) = store
+            .arm_ordinary_cleanup_with_context(&session, &receipt.step_id, now + 1)
+            .unwrap();
+        assert_eq!(
+            context.unwrap().identities,
+            sorted(recorded.clone()),
+            "cleanup terminates the helper too"
+        );
+        let gone = |identities: Vec<ProcessIdentity>| CleanupEvidence {
+            binding_id: execution.binding_id.clone(),
+            incarnation: execution.incarnation.clone(),
+            identities,
+            observed_at_ms: now + 2,
+            receipt: "every recorded process observed gone after termination".into(),
+        };
+        assert!(
+            store
+                .complete_cleanup(
+                    &session,
+                    &receipt.step_id,
+                    &gone(recorded[..2].to_vec()),
+                    now + 3,
+                    ttl
+                )
+                .is_err(),
+            "the helper must be proven gone as well"
+        );
+        store
+            .complete_cleanup(&session, &receipt.step_id, &gone(recorded), now + 3, ttl)
+            .unwrap();
+        assert_eq!(observed(&store, &fence.deployment_id), "failed");
+    }
+
+    fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
+        identities.sort();
+        identities
     }
 }

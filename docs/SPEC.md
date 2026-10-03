@@ -504,6 +504,10 @@ On server restart, reconcile desired state with agents before dispatch. On agent
 
 On wake failure, keep admission closed. A bounded clean-restart fallback is allowed after verified cleanup and before inference dispatch. Repeated failures exhaust the deployment's attempt budget and leave it terminal `Failed` with its own admission closed (ADR 0011 decision 5). On park failure, safely stop the owned group after drain if policy allows. Unexpected memory growth blocks new admission; no blind activation of the next model.
 
+> **Amended by [ADR 0027](design/adr/0027-engine-processes-and-helpers.md)** (owner decision 2026-10-03).
+
+A launch's recorded group names the engine's own processes (the `api` process and the processes it started itself, `worker-N`) apart from helpers (`helper-N`: processes those started in turn, such as a compile worker pool). Only an engine process gone while Ready is an engine exit, and a later proof that the recorded engine still runs needs every recorded engine process and no other engine process. Helpers stay owned: cleanup terminates them and proves them gone before anything is released.
+
 Controller command generations are not a substitute for physical fencing. Initial scope is one active controller with persistent state and local locking, not active-active failover. An agent cannot switch to another controller identity just because it has a similar hostname.
 
 ### 13.3 Local authority and security

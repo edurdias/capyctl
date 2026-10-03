@@ -143,8 +143,7 @@ impl crate::Store {
         let (p, e, association) = adopted(&tx, s, id)?;
         if evidence.binding_id != p.binding_id
             || evidence.incarnation != p.incarnation
-            || canonical_members(&evidence.identities).ok()
-                != Some(members(&association.identities)?)
+            || !names_engine(&members(&association.identities)?, &evidence.identities)
         {
             return Err(LifecycleError::Conflict);
         }
