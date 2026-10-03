@@ -1396,6 +1396,14 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }) {
                     crate::roles::role_warning(&warning);
                 }
+                // ADR 0018 amendment A3: a profile for an engine kind this
+                // release does not know is skipped (the merge leaves it out),
+                // and named here. An unreadable file is refused by the load.
+                if let Ok(file) = capyctl_config::registration::EnginesFile::load(&engines) {
+                    for unknown in file.runnable().1 {
+                        crate::roles::role_warning(&unknown.warning(&engines));
+                    }
+                }
                 let mut host = load_host(
                     &path,
                     &engines,

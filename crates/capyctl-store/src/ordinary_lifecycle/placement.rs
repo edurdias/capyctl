@@ -38,8 +38,9 @@ pub(crate) enum Prepared {
     Running,
     /// The instance was placed and fenced for a fresh start.
     Placed(DeploymentFence),
-    /// No allowed host can take it now; the closed diagnostic.
-    Unplaceable(&'static str),
+    /// No allowed host can take it now; the closed diagnostic, and each
+    /// host's reason naming the limit it hit.
+    Unplaceable(&'static str, String),
 }
 
 pub(super) fn strategy(placement: &Placement) -> Strategy {
@@ -357,7 +358,12 @@ pub(crate) fn prepare(
                 last_host.as_deref(),
             ) {
                 Ok(chosen) => chosen,
-                Err(_) => return Ok(Prepared::Unplaceable(unplaceable.code())),
+                Err(reclaimed) => {
+                    return Ok(Prepared::Unplaceable(
+                        unplaceable.code(),
+                        reclaimed.detail(&hosts, &owner),
+                    ))
+                }
             }
         }
     };
@@ -513,6 +519,8 @@ impl crate::Store {
         let mut first: Option<Start> = None;
         let mut refusal: Option<LifecycleError> = None;
         let mut blocked = false;
+        // SPEC §14: why the first instance that fit nowhere was refused.
+        let mut detail: Option<String> = None;
         // Owner decision 2026-09-23: whether every instance that fit nowhere
         // was refused only because its solo first start needs an empty host.
         let mut needs_empty_host = true;
@@ -567,8 +575,9 @@ impl crate::Store {
                         }
                     }
                 }
-                Prepared::Unplaceable(code) => {
+                Prepared::Unplaceable(code, why) => {
                     blocked = true;
+                    detail.get_or_insert(why);
                     needs_empty_host &= code == "startup_requires_empty_host";
                     only_ineligible &= code == "host_ineligible";
                     let until = (scope != StartScope::OnDemand).then_some(deadline);
@@ -596,8 +605,8 @@ impl crate::Store {
             None if blocked && refusal.is_none() && only_ineligible => {
                 Err(LifecycleError::HostIneligible)
             }
-            None if blocked && refusal.is_none() => Err(LifecycleError::CapacityBlocked),
-            None => Err(refusal.unwrap_or(LifecycleError::CapacityBlocked)),
+            None if blocked && refusal.is_none() => Err(LifecycleError::CapacityBlocked(detail)),
+            None => Err(refusal.unwrap_or(LifecycleError::CapacityBlocked(detail))),
         }
     }
 }

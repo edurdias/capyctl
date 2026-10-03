@@ -487,3 +487,91 @@ fn approvals_are_written_and_reach_the_host_document() {
         serde_json::json!(["/srv/drafters"])
     );
 }
+
+/// A profile a newer release wrote for an engine kind this release does not
+/// know (for example `tensorfold` read by 0.1.0).
+fn future_profile() -> serde_json::Value {
+    let mut future = profile();
+    future["engine"] = "futureengine".into();
+    future
+}
+
+// T03 T04 (ADR 0018 §2 amendment A3): engines.yaml shared with a newer release
+// may hold a profile for an engine kind this release does not know. That
+// profile is skipped, with its name and kind reported, and the rest loads;
+// the file itself keeps it.
+#[test]
+fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let path = engines_beside(&host);
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("vllm".into(), profile());
+    engines.profiles.insert("future".into(), future_profile());
+    let lock = lock_engines(&path).unwrap();
+    write_engines(&engines, &lock, Some(&host_value(&host))).unwrap();
+    drop(lock);
+
+    let loaded = EnginesFile::load(&path).unwrap();
+    assert!(loaded.profiles.contains_key("future"), "the file keeps it");
+    let (runnable, skipped) = loaded.runnable();
+    assert_eq!(runnable.keys().collect::<Vec<_>>(), vec!["vllm"]);
+    assert_eq!(
+        skipped,
+        vec![UnknownEngineProfile {
+            profile: "future".into(),
+            engine: "futureengine".into()
+        }]
+    );
+    let warning = skipped[0].warning(&path);
+    assert!(
+        warning.contains("future") && warning.contains("futureengine"),
+        "{warning}"
+    );
+
+    let config = HostConfig::load(&host).expect("the host starts");
+    assert!(config.profiles.contains_key("vllm"));
+    assert!(!config.profiles.contains_key("future"));
+}
+
+// SPEC §15.3: only an engine kind this release does not know is skipped. A
+// known kind is validated as strictly as before, and a missing or non-string
+// `engine` is still refused.
+#[test]
+fn a_known_engine_kind_is_still_validated_strictly() {
+    for broken in [
+        {
+            let mut p = profile();
+            p["executable"] = 5.into();
+            p
+        },
+        {
+            let mut p = profile();
+            p["engine"] = 5.into();
+            p
+        },
+        {
+            let mut p = profile();
+            p.as_object_mut().unwrap().remove("engine");
+            p
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_doc(dir.path());
+        std::fs::write(
+            engines_beside(&host),
+            format!(
+                "kind: engines\nschema_version: 1\nruntime_profiles:\n  broken: {broken}\n  future: {}\n",
+                future_profile()
+            ),
+        )
+        .unwrap();
+        let loaded = EnginesFile::load(&engines_beside(&host)).unwrap();
+        let (runnable, skipped) = loaded.runnable();
+        assert_eq!(skipped.len(), 1, "only `future` is skipped");
+        assert!(
+            check_profile("broken", &runnable["broken"]).is_err(),
+            "a broken profile is still refused: {broken}"
+        );
+    }
+}

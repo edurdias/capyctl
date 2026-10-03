@@ -31,6 +31,31 @@ Tests (CPU and scripted engines, which are not qualification):
 
 Live check pending (hosts in use).
 
+## Small CLI fixes — 2026-10-02 (branch `fix/small-cli-fixes`)
+
+- `engine remove` with no role running removes the profile from
+  `engines.yaml` under its lock and exits 0 (`published: role_not_running`);
+  it was refused `agent_unreachable`. A running role keeps the retirement
+  path (ADR 0018 amendment A3).
+- A role skips an `engines.yaml` profile whose engine kind it does not know
+  (written by a newer release), warns at start with the profile and kind, and
+  starts; it was refused `invalid_config` at `runtime_profiles.engine`.
+  Releases before this one still refuse such a file.
+- `capacity_blocked` names, per host short of memory, the domain, the need,
+  what is free and the limit.
+- A start while new activations wait on an unproven stop is refused
+  `still_stopping` (503, retryable, exit 25) instead of
+  `reconciliation_required`.
+- `a_success_resets_the_attempt_budget` and
+  `a_restart_pauses_and_retries_every_adopted_uncertain_launch` no longer
+  depend on timing; `shutdown` waits for queued Store jobs.
+
+Live on a laptop with temporary home, config and state directories: a
+standalone with only an unknown-kind profile starts with the warning and
+publishes nothing, and after it stops `engine remove` edits the file. The
+capacity message and `still_stopping` are covered by unit and integration
+tests only. CPU and Fake-engine tests are not qualification.
+
 ## SGLang 0.5.21 verified — 2026-10-02 (branch `feat/verify-sglang-0.5.21`)
 
 SGLang 0.5.21 joins 0.5.20 in the verified set (ADR 0018), so `engine add`

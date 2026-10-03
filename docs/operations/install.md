@@ -107,10 +107,10 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
-| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `capyctl engine list`, then `capyctl engine remove` again; a retry resumes the same removal. |
+| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, the profile is removed from `engines.yaml` (exit 0, `published: role_not_running`) and the role publishes the removal when it starts. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `capyctl engine list`, then `capyctl engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `capyctl engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
-| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop to finish and then starts. |
+| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified, or while CapyCTL was still confirming that a slow stop's engine exited; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop to finish and then starts. |
 
 **A revoked host (14).** After `capyctl revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its
@@ -691,9 +691,11 @@ into `host.yaml` stays yours to edit. It is refused while a deployment on this
 machine uses the profile (`profile_in_use`); `--drain` stops those deployments
 through the ordinary stop path first. The command asks the running role to
 retire the profile, waits until the server confirms their stop evidence, then
-rewrites `engines.yaml` without it and asks the role to publish the removal. A
-role that is not running cannot remove a published profile
-(`agent_unreachable`); start it and retry. If a removal is interrupted after
+rewrites `engines.yaml` without it and asks the role to publish the removal.
+With no role running (no control socket, or a stale one nobody listens on),
+nothing runs on the profile, so the command removes it from `engines.yaml`
+under the file's lock and exits 0 with `published: role_not_running`; the role
+publishes the removal when it starts. If a removal is interrupted after
 the confirmation (the command was killed, the connection dropped, or the
 publication failed), the profile stays out of placement on that machine; run
 `capyctl engine remove <name>` again, which resumes the same removal and finishes
@@ -702,6 +704,16 @@ it.
 A deployment naming a runtime profile that no allowed host publishes is refused
 at `deploy` (`profile_not_published`), naming the profile and each host; run
 `capyctl engine add <path> --name <profile>` on a host, then deploy again.
+
+An older CapyCTL that shares `engines.yaml` with a newer one may find a
+profile for an engine it does not support (for example `tensorfold`, which
+0.1.1 added). From this release on, a role skips such a profile at start and
+on reload, prints a warning that names the profile and its engine, and starts
+with the rest; a deployment that names it is refused `profile_not_published`.
+The file keeps the profile. Upgrade CapyCTL to use it, or remove it with
+`capyctl engine remove <name>`. Releases before this one refuse to start
+(`invalid_config` at `runtime_profiles.engine`); remove the profile with the
+newer binary, or edit `engines.yaml`, before starting the older one.
 
 In standalone, `CAPYCTL_VLLM_BIN` or `CAPYCTL_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist

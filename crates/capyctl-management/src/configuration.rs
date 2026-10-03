@@ -76,6 +76,10 @@ pub enum ConfigurationFailure {
     /// victim did not drain within the switch drain timeout, or its release
     /// failed). Nothing was started; victims not released serve again.
     SwitchFailed,
+    /// SPEC §6.4: new starts wait while a stop whose cleanup is not yet
+    /// verified (or a launch whose outcome is uncertain) settles. Nothing was
+    /// started; the same start succeeds once it settles.
+    StillStopping,
     LifecycleConflict,
     /// ADR 0014 §7 (WE3): activation waits for the checkpoint digest.
     CheckpointDigestPending,
@@ -293,6 +297,12 @@ impl ConfigurationFailure {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "switch_failed",
                 "The eviction did not complete: a victim did not drain within the switch drain timeout or its release failed; nothing was started and victims not released serve again",
+                true,
+            ),
+            StillStopping => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "still_stopping",
+                "A stop is still being confirmed (its engine has not yet been seen to exit), and new starts wait until it is; nothing was started. Retry after the stop finishes (`capyctl status deployment <name>` shows it), or run `capyctl start deployment <name> --wait`",
                 true,
             ),
             StartupRequiresEmptyHost => (

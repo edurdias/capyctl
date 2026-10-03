@@ -705,6 +705,8 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         // publishes; nothing was stored.
         "profile_not_published" => "profile_not_published",
         "reconciliation_required" => "unreconciled",
+        // SPEC §6.4: a stop is still being confirmed; nothing was started.
+        "still_stopping" => "still_stopping",
         "unsupported_capability" => "unsupported",
         "not_found" => "not_found",
         "invalid_config" | "invalid_request" | "body_too_large" => "invalid_config",
@@ -1407,6 +1409,12 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "host_ineligible",
                 ExitCode::HOST_INELIGIBLE,
+            ),
+            // SPEC §6.4: a stop still being confirmed; retry once it settles.
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "still_stopping",
+                ExitCode::STILL_STOPPING,
             ),
         ];
         for (status, code, exit) in cases {

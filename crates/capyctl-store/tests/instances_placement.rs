@@ -922,7 +922,7 @@ fn per_launch_hosts_take_other_deployments_but_not_a_second_instance() {
     let second = only_a("second", 2);
     assert!(matches!(
         try_start(&second, "start-second"),
-        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked)
+        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_))
     ));
     assert!(t.planned(&second).is_empty());
 
@@ -941,7 +941,7 @@ fn per_launch_hosts_take_other_deployments_but_not_a_second_instance() {
     per_launch(false);
     assert!(matches!(
         try_start(&third, "start-third"),
-        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked)
+        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_))
     ));
     assert!(t.planned(&third).is_empty());
     // 10 GiB cold each against 32 GiB: the third fits, the fourth does not,
@@ -952,7 +952,7 @@ fn per_launch_hosts_take_other_deployments_but_not_a_second_instance() {
     let fourth = only_a("fourth", 1);
     assert!(matches!(
         try_start(&fourth, "start-fourth"),
-        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked)
+        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_))
     ));
     assert!(t.planned(&fourth).is_empty(), "never over budget");
 }
@@ -1225,7 +1225,7 @@ fn the_switch_planner_frees_a_single_claim_host_by_releasing_its_occupant() {
             DEADLINE,
             None,
         ),
-        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked)
+        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_))
     ));
     match plan(&t, &second) {
         SwitchPlan::Evict {

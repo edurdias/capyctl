@@ -263,7 +263,8 @@ fn reload(
     host_id: &str,
 ) -> Value {
     let registered = match EnginesFile::load(engines) {
-        Ok(file) => file.profiles,
+        // ADR 0018 amendment A3: an unknown engine kind is skipped, as at start.
+        Ok(file) => file.runnable().0,
         Err(e) => return refused("invalid_config", format!("{}: {}", e.path, e.detail)),
     };
     let named = match resolve(provider, &registered) {
@@ -341,7 +342,8 @@ impl StandaloneControl {
         tokio::task::spawn_blocking(move || {
             let mut registered = EnginesFile::load(&engines)
                 .map_err(|e| refused("invalid_config", format!("{}: {}", e.path, e.detail)))?
-                .profiles;
+                .runnable()
+                .0;
             registered.remove(&name);
             resolve(provider.as_ref(), &registered).map(|_| ())
         })

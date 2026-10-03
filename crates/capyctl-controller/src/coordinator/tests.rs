@@ -1730,12 +1730,15 @@ async fn a_success_resets_the_attempt_budget() {
         InitializeStatus::Completed
     );
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    // The observer sees Ready when the step commits; the task resets the
+    // budget just after that. Shutdown joins every task, so once it returns
+    // the reset has run (under load the budget was read before the reset).
+    w.shutdown().await.unwrap();
     let record = {
         let o = owner.lock().unwrap();
         o.store().attempts(&fence).unwrap()
     };
     assert_eq!(record, None, "the two failed attempts were not reset");
-    w.shutdown().await.unwrap();
 }
 
 /// Retrying an effect that may have landed can start a second engine while the
