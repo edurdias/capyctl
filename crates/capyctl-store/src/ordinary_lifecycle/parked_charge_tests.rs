@@ -225,6 +225,7 @@ impl Lab {
                     observed_at_ms: now,
                     receipt: "fake host".into(),
                     facts: kind.facts().to_vec(),
+                    kernel_builds: Vec::new(),
                 },
                 now,
             )
