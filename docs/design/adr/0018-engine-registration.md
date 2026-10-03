@@ -117,8 +117,8 @@ it was first written under until it is cleared, so a retried `remove` (after a l
 dropped session, a crash between the confirmation and the CLI's write, or a failed reload)
 resumes it and finishes the removal; a retirement still draining is resumed as draining. A
 profile the role never published is removed from `engines.yaml` without a retirement. A
-published profile is never removed while the role is unreachable (`agent_unreachable`,
-nothing written). A `remove` the role took but did not answer (the connection closed or the
+published profile is never removed while a running role does not take the request
+(`agent_unreachable`, nothing written); with no role running, see amendment A3. A `remove` the role took but did not answer (the connection closed or the
 CLI's bound, the role's 960 s plus a margin, passed) is reported as an unknown outcome, with
 `mllm engine list` to settle it.
 
@@ -217,6 +217,28 @@ keeps its existing deployments and places none until a profile is published. Its
 banner and `capyctl status deployment <name>` say to run `capyctl engine add <path>`.
 
 `engine remove` may remove the last registered profile. It retires the profile through §4:
-deployments using it drain and stop first. The `agent_unreachable` rule of §4 stands, so
-the operator starts the role, removes the profile and stops it again. A new deploy that
+deployments using it drain and stop first. (A3: with no role running, `engine remove`
+edits `engines.yaml` directly.) A new deploy that
 names a profile no host publishes still fails fast (§7).
+
+## Amendment A3: offline removal and unknown engine kinds (owner decision 2026-10-02)
+
+**Offline removal.** When no role listens on the control socket (it does not
+exist, or a stale one refuses the connection), `engine remove` removes a
+registered profile from `engines.yaml` under the file's lock, as `engine add`
+writes offline, and succeeds with `published: role_not_running`. Nothing runs
+on the profile while the role is stopped; the role publishes the removal at
+its next start, and a deployment that names the profile is then refused as an
+unpublished one (§7). A role that is running keeps the §4 path (retire,
+confirm, write, reload); one that takes the request and does not answer is
+still an unknown outcome. This replaces A2's "start the role, remove, stop it
+again".
+
+**Unknown engine kinds.** A newer release may write a profile whose `engine`
+names a kind this release does not know (for example `tensorfold`, read by
+0.1.0). A role skips that profile at start and on reload, warns once at start
+naming the profile and its kind, and starts with the rest. The file keeps the
+profile, so the newer release still finds it, and `engine remove` can remove
+it. A profile of a known kind, or one whose `engine` is missing or not a
+string, is validated as strictly as before. This helps only releases that
+carry it; an older binary still refuses such a file.

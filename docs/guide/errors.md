@@ -11,7 +11,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `device_policy_mismatch` | A host's file describes a card that does not match the GPU it found. | Fix the `gpuN` entries of `resource_policy` to match `nvidia-smi -L`. |
 | 2 | `missing_system_allocation` | A deployment that lists its own `resources` on a discrete card leaves out host RAM (`system`). | Add the `system` entry, or leave `resources` out and let CapyCTL size it. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
-| 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. |
+| 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. |
 | 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. | Use a smaller or quantized checkpoint, a smaller KV cache, or free the card. vLLM needs a card of about 10 GiB or more. |
 | 4 | `device_unobserved` | `nvidia-smi` gave no fresh reading for that GPU, so nothing new starts on it. | Check that `nvidia-smi` works on that machine, then retry. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
@@ -38,7 +38,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 22 | `agent_unreachable` | CapyCTL on this machine is running but did not answer an engine command. | Retry; if the message says the outcome is unknown, run `capyctl engine list` first. |
 | 23 | `not_interactive` | `capyctl engine add` without a path needs a terminal to pick one. | Name the installation. |
 | 24 | `profile_not_published` | No allowed host offers the engine profile the deployment names; nothing was stored. | Register the engine on a host with `capyctl engine add <path> --name <profile>`, then deploy again. |
-| 25 | `still_stopping` | A `start` came right after a `stop`, before the engine finished going away; nothing was started. | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop and then starts. |
+| 25 | `still_stopping` | A `start` came right after a `stop`, before the engine finished going away, or while CapyCTL was still confirming that a slow stop's engine exited; nothing was started. | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop and then starts. |
 | 26 | `toolchain_missing` | `capyctl engine add` found a TensorFold installation, but `ninja`, `nvcc` or a C++ compiler is not on the engine's PATH (its `bin`, the CUDA toolkit's `bin`, then `/usr/local/bin`, `/usr/bin`, `/bin`). TensorFold builds CUDA kernels on its first start. Nothing was written. | Install what the message names into one of those directories, or set `CUDA_HOME` to a toolkit that has `nvcc`, then add the engine again. |
 
 The systemd units restart CapyCTL when it fails, except on exits a restart cannot
