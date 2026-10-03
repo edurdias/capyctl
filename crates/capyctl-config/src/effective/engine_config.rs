@@ -161,6 +161,10 @@ pub struct CheckpointFacts {
     /// device margin (weights x 0.10); it re-resolves exactly as it was. Never
     /// set for a new resolution.
     pub legacy_device_margin: bool,
+    /// ADR 0014 amendment A13: a snapshot frozen while CapyCTL turned SGLang's
+    /// CUDA graphs off beside the memory saver records that default; it
+    /// re-resolves exactly as it was. Never set for a new resolution.
+    pub legacy_sglang_graphs_off: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -1198,9 +1202,12 @@ pub(super) fn normalize_engine_config(
             for field in ["memory_saver", "cpu_weight_backup", "weight_restore"] {
                 provenance.insert(field.into(), SettingSource::Derived);
             }
-            // ADR 0014 §4: a live finding, not a checkpoint pin. CUDA graphs stay
-            // off while the memory saver is on unless the deployment says otherwise.
-            if common.cuda_graphs.is_none() && memory_saver {
+            // ADR 0014 amendment A13: CUDA graphs are SGLang's default (on)
+            // while the memory saver is on too; what a parked engine keeps of
+            // them is measured and charged per revision. A revision frozen
+            // under the old default (graphs off beside the saver) keeps it.
+            if common.cuda_graphs.is_none() && memory_saver && inputs.facts.legacy_sglang_graphs_off
+            {
                 common.cuda_graphs = Some(false);
                 provenance.insert("cuda_graphs".into(), SettingSource::CapyctlDefault);
             }

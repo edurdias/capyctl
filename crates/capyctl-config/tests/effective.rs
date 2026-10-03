@@ -638,12 +638,14 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     assert_eq!(settings.common.context_length, None);
     assert_eq!(settings.max_total_tokens, None);
     assert_eq!(settings.tokenizer_workers, 1);
-    assert_eq!(settings.common.cuda_graphs, Some(false));
+    // ADR 0014 amendment A13: CUDA graphs stay SGLang's default (on) while
+    // the memory saver is on; the parked charge is measured instead.
+    assert_eq!(settings.common.cuda_graphs, None);
     assert!(settings.memory_saver);
     assert!(!settings.cpu_weight_backup);
     assert_eq!(settings.weight_restore, "disk_reload");
     let provenance = &settings.provenance;
-    assert_eq!(provenance["cuda_graphs"], SettingSource::CapyctlDefault);
+    assert!(!provenance.contains_key("cuda_graphs"));
     assert_eq!(
         provenance["sglang.tokenizer_workers"],
         SettingSource::CapyctlDefault
@@ -652,10 +654,7 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     assert_eq!(provenance["memory.request"], SettingSource::Derived);
     assert!(!provenance.contains_key("memory.kv_cache"));
     let shown = serde_json::to_value(&effective).unwrap();
-    assert_eq!(
-        shown["engine_config"]["provenance"]["cuda_graphs"],
-        "capyctl default"
-    );
+    assert!(shown["engine_config"]["common"]["cuda_graphs"].is_null());
     assert_eq!(shown["engine_config"]["engine"], "sglang");
 
     // A deployment may override a safe default; the provenance entry goes away.
@@ -670,6 +669,16 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     assert_eq!(settings.tokenizer_workers, 2);
     assert!(!settings.provenance.contains_key("cuda_graphs"));
     assert!(!settings.provenance.contains_key("sglang.tokenizer_workers"));
+
+    // The override that turns them off is kept.
+    let (mut deployment, _) = fixture();
+    deployment["engine_config"]["cuda_graphs"] = false.into();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let LaunchSettings::Sglang(settings) = &effective.engine_config else {
+        panic!("sglang settings")
+    };
+    assert_eq!(settings.common.cuda_graphs, Some(false));
+    assert!(!settings.provenance.contains_key("cuda_graphs"));
 }
 
 /// Owner decision E1: every engine serves any model. The configuration layer

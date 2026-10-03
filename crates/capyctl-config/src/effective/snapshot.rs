@@ -318,6 +318,10 @@ pub(super) fn declared_engine_config(
             // device margin.
             legacy_device_margin: memory.get("margin_bytes").and_then(Value::as_i64)
                 == Some(super::engine_config::VLLM_OVERHEAD_MARGIN_BYTES),
+            // ADR 0014 amendment A13: the graphs-off default beside the
+            // memory saver, as frozen before it was dropped.
+            legacy_sglang_graphs_off: engine == Some("sglang")
+                && provenance.get("cuda_graphs").and_then(Value::as_str) == Some("capyctl default"),
         },
     ))
 }

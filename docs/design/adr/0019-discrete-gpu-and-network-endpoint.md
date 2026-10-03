@@ -367,9 +367,10 @@ added.
 
 1. Moving a running or parked instance to another GPU is out of scope; a stopped instance
    prefers its last GPU.
-2. The engine host overhead (4 GiB) and the parked device residue (1 GiB) are placeholders.
-   They are to be replaced by measured values (process RSS and parked residue, kept per
-   revision, host and installation as ADR 0014 keeps the startup peak) after live runs.
+2. The engine host overhead (4 GiB) is a placeholder, to be replaced by the measured process
+   RSS after live runs. The parked device residue (1 GiB) is measured per revision, host and
+   installation since ADR 0014 amendment A13 and charged once measured, never below the
+   placeholder.
 3. The SGLang ModelOpt refusal for `host_backed` may be lifted after a live check, since a
    wake from the CPU backup does not reload from disk.
 

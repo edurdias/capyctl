@@ -182,6 +182,7 @@ fn a_revision_frozen_before_the_budget_still_decodes_with_its_request() {
             legacy_overhead: true,
             legacy_startup_graphs: true,
             legacy_device_margin: true,
+            legacy_sglang_graphs_off: false,
         },
     )
     .unwrap();
@@ -307,6 +308,7 @@ fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
         weights_bytes: Some(GIB),
         legacy_startup_graphs: true,
         legacy_device_margin: true,
+        legacy_sglang_graphs_off: false,
         ..Default::default()
     };
     let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
@@ -326,6 +328,7 @@ fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
         weights_bytes: Some(30 * GIB),
         legacy_startup_graphs: true,
         legacy_device_margin: true,
+        legacy_sglang_graphs_off: false,
         ..Default::default()
     };
     let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();

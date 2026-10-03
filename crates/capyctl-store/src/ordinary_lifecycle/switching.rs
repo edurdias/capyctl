@@ -19,7 +19,7 @@
 //! the ledger as that evidence left it (step 6). The victim stays eligible for
 //! on-demand activation (rule 6: no background refill).
 use super::cleanup::{instance_scope, StopCommand};
-use super::park::{footprints, journal, launch, parks};
+use super::park::{charged_footprints, journal, launch, parks};
 use super::*;
 use crate::events::{append_event, EventMetadata, SwitchPhase};
 use crate::instances::instance_owner_id;
@@ -890,8 +890,8 @@ fn plan_in(
     let mut hosts = placement::candidates(tx, target, revision, instance, eligible, true)?;
     if let Some((_, Some(parked_on))) = &parked {
         hosts.retain(|c| &c.host_id == parked_on);
-        let (_, e, _) = launch(tx, target, instance)?;
-        let peak = footprints(&e).wake;
+        let (source, e, _) = launch(tx, target, instance)?;
+        let peak = charged_footprints(tx, &source, &e)?.wake;
         for c in &mut hosts {
             c.footprint = peak.clone();
             // ADR 0019: it wakes on the GPU it parked on, no other.
@@ -1019,7 +1019,7 @@ fn plan_in(
                 params![deployment, index],
                 |r| r.get(0),
             )?;
-            let (_, e, _) = launch(tx, &deployment, index)?;
+            let (source, e, _) = launch(tx, &deployment, index)?;
             let may_park = !c.whole_host
                 && parks(&e)
                 && !park_refused(tx, &deployment, index, generation)?
@@ -1037,7 +1037,10 @@ fn plan_in(
                 // Discrete GPU design §5: what it leaves charged once parked
                 // (for `host_backed`, the weights copy on the system domain),
                 // so the planner parks it only where that copy fits.
-                parked: may_park.then(|| footprints(&e).parked),
+                parked: match may_park {
+                    true => Some(charged_footprints(tx, &source, &e)?.parked),
+                    false => None,
+                },
             });
             by_owner.insert(victim_owner, (deployment, index, generation, elsewhere));
         }

@@ -143,7 +143,7 @@ accept abbreviations), and at launch by the engine's own parser (§6).
 
 Some of today's pins encode live findings rather than a checkpoint. They become defaults
 the deployment may override, shown with provenance `mllm default` in the effective
-configuration (T14): SGLang CUDA graphs off while the memory saver is on, SGLang
+configuration (T14): SGLang CUDA graphs off while the memory saver is on (until A13), SGLang
 tokenizer and detokenizer workers 1, vLLM
 `--safetensors-load-strategy eager` whenever sleep mode is on (reserved there). Every
 other `_FIXED` value is dropped and the engine's own default applies.
@@ -655,7 +655,8 @@ parked engine kept 1.57 GiB of the card with graphs on and 0.88 GiB without, abo
 1 GiB parked device residue placeholder (ADR 0019 §3), because SGLang's park does not
 release graph memory. The default is unchanged: turning it on needs a parked residue that
 covers the graphs, recorded per revision so frozen revisions re-derive unchanged. Until
-then a deployment that wants the speed states `cuda_graphs: true`.
+then a deployment that wants the speed states `cuda_graphs: true`. Amendment A13 records the
+residue and turns the default on.
 
 ## Amendment A12: kernel builds are not part of the startup peak (owner decision 2026-10-02)
 
@@ -723,6 +724,73 @@ rebuilt the JIT kernels for about 6 minutes recorded 106.5 GiB without this amen
 the next start was refused `capacity_blocked`. With it, a first start that rebuilt the
 same kernels (availability fell to 1.8 GiB during the build) recorded 44.8 GiB, and the
 next start was ready in 177 s.
+
+## Amendment A13: the parked charge is measured; SGLang CUDA graphs stay on (owner decision 2026-10-03)
+
+Problem: the parked phase charged a fixed placeholder, 1 GiB of the card on a discrete GPU
+(ADR 0019 §3) and 2 GiB of the pool on unified memory (§5). SGLang's park does not release
+its CUDA graphs, so with graphs on a parked engine held more than the placeholder (1.57 GiB
+on a 16 GB card, note on §4), and CapyCTL kept the graphs off beside the memory saver,
+costing about 40 % of the decoding speed.
+
+Rule:
+
+- When a park completes, the coordinator samples the host. The memory the parked processes
+  hold (matched by the process identities the store recorded, as for resident floors, ADR
+  0007) is recorded per revision, host, engine installation and memory domain, the largest
+  kept, like the startup peak (A2). Only a sample taken after the park counts. Only the
+  domains that hold the engine's device memory are measured: a `device` domain (GPU bytes)
+  or a `unified` pool (GPU bytes and anonymous pages). The host RAM charged on a discrete
+  host's system domain keeps its placeholder.
+- A park of that revision on that host and installation is charged the measured residue,
+  never below the placeholder and never above the Ready charge on that domain. The host
+  re-checks co-residence with the revision's own parked phase (SPEC §3.1), so the
+  controller never charges less than the host does. Parked owners of the revision are moved
+  to the new charge in the transaction that records it.
+- A deployment that declares `resources:` keeps its declared parked phase; nothing is
+  measured for a restart-only one.
+- Status shows `parked`: the charge on the measured domains, `placeholder` or `measured`,
+  and every residue recorded.
+- SGLang's CUDA graphs are no longer turned off beside the memory saver: `cuda_graphs` is
+  left to SGLang (on) unless the deployment states it. `cuda_graphs: false` still turns
+  them off. A revision frozen with the old default (`cuda_graphs: false`, provenance
+  `capyctl default`) re-resolves with it unchanged.
+- Until the first park of a revision is measured, its first park is charged the
+  placeholder. A start admitted beside it on that charge is still checked against the
+  card's observed free memory at launch, so an undercharge refuses or waits rather than
+  overcommitting the card; the measurement follows the park within one sample.
+
+Found live 2026-10-03 on a 16 GB laptop GPU with SGLang 0.5.21 and FrogNano-4B-2609, no
+memory stated, `deep` residency: graphs on by default (captured at start), 62 tokens/s;
+the park left 1564 MiB on the card and the ledger charged 1.53 GiB (status `measured`); a
+wake on request answered in 13 s and decoded at 62 tokens/s again; a vLLM deployment of
+11.5 GiB started beside the parked engine (14.28 GiB charged on the card's 14.71 GiB); one
+of 12.25 GiB, which the 1 GiB placeholder would have admitted beside it, reclaimed the
+parked engine instead (15.03 GiB with the measured residue).
+
+Found live 2026-10-03 on a GB10 (unified memory) with SGLang 0.5.21: Qwen3-4B, nothing
+stated, graphs captured at start, 22 tokens/s at one stream; its park was measured at
+6.30 GiB (3.06 GiB of GPU memory and 3.2 GiB of anonymous pages; MemAvailable dropped by the
+same amount), against the 2 GiB unified placeholder, so the placeholder undercharged a
+parked engine on that host too. Qwen3.8-27B (NVFP4, DFlash draft, request 48 GiB) then
+started beside the parked engine on the measured charge.
+
+Recorded with it: the 27B SGLang deployment with CUDA graphs on stops a few minutes after
+Ready, with or without requests (the "exits at 2 streams" of the 2026-10-03 three-engine
+benchmark, where it ran `restart_only`). Not a memory or graph failure: with graphs on, the
+scheduler starts a torch inductor compile-worker pool (21 processes) before Ready; the
+launch records them in its process group, the pool's workers exit when idle, and the
+embedded exit watcher (`engine_exit.rs`) reads any recorded member gone as the engine
+exiting and stops it. With graphs off only the pool's parent is recorded and the engine
+stays up. Graphs gave that deployment almost nothing (21.3 against 20.9 tokens/s at one
+stream, 39.4 against 38.1 at two). The exit watcher has since stopped reading a helper's exit
+as the engine's, so graphs stay on for such a deployment too.
+Checked live after that fix (GB10, request 55 GiB, KV cache 16 GiB, two concurrent requests,
+graphs on by default): the compile workers exited (23 processes down to 3) and the engine
+stayed ready through 10 idle minutes, then served 21.3 tokens/s at one stream and 39.4 at
+two. Its park was refused `the engine is not quiescent` with graphs on and with them off
+alike, so that refusal is not about graphs and stays open; Qwen3-4B on the same build parked
+and was measured at 6.30 GiB again.
 
 ## Amendment A14: `memory.kv_cache` is SGLang's KV pool (owner decision 2026-10-03)
 
