@@ -104,7 +104,11 @@ fn a_speculative_sglang_deployment_that_asks_to_park_is_refused() {
         let (mut speculative, host) = deployment("sglang", dflash());
         speculative["residency"] = json!(residency);
         let error = resolve_effective_with_checkpoint(&speculative, &host, weights()).unwrap_err();
-        assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination, "{error}");
+        assert_eq!(
+            error.code,
+            ConfigErrorCode::UnsupportedCombination,
+            "{error}"
+        );
         assert_eq!(error.path, "residency");
         assert!(
             error.to_string().contains("speculative decoding")
