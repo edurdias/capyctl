@@ -43,6 +43,12 @@ unchecked in this release.
   when that engine is no longer registered.
 - Idle models are stopped or parked only when `ready_idle_timeout` or
   `parked_idle_timeout` is set; both are off by default.
+- SGLang keeps its CUDA graphs on while a model can park (about 75 % faster
+  decoding on a 16 GB card). A parked model is charged the GPU memory CapyCTL
+  measured it holding after its first park, instead of a fixed 1 GiB, shown as
+  `parked` in `capyctl status deployment <name> --json`. Set
+  `engine_config: {cuda_graphs: false}` to turn the graphs off; a deployment
+  revision created before keeps them off.
 - CI is a fast gate; the integration suites run with `scripts/ci-local.sh --deep`
   before a merge, and tests no longer depend on runner speed.
 
