@@ -2048,11 +2048,19 @@ fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
 /// Owner decision 2026-09-23: the startup peak of one Initialize, measured as
 /// the largest drop in its host's published availability of the domain its
 /// startup reservation charges, below what was available when it armed.
+///
+/// ADR 0014 amendment A12: samples are kept until the engine answers, so that
+/// those taken while it reported a kernel build can be left out.
 struct StartupPeak {
     domain: Option<String>,
     baseline: Option<(i64, i64)>,
-    lowest: Option<i64>,
+    /// `(sampled_at_ms, available_bytes)`, one per distinct host sample.
+    samples: Vec<(i64, i64)>,
 }
+
+/// Samples one Initialize keeps. The coordinator's 3600 s ceiling at the
+/// default 1 s interval stays below it; later samples are dropped.
+const MAX_STARTUP_SAMPLES: usize = 8192;
 
 impl StartupPeak {
     fn new(work: &InitializeWork, baseline: &[MemoryObservation]) -> Self {
@@ -2069,7 +2077,7 @@ impl StartupPeak {
         Self {
             domain,
             baseline,
-            lowest: None,
+            samples: Vec::new(),
         }
     }
 
@@ -2082,17 +2090,28 @@ impl StartupPeak {
             .iter()
             .find(|o| &o.domain == domain && o.sampled_at_ms > since && o.available_bytes >= 0)
         {
-            self.lowest = Some(
-                self.lowest
-                    .map_or(o.available_bytes, |l| l.min(o.available_bytes)),
-            );
+            // A host that has not published since the last tick repeats it.
+            if self.samples.last() == Some(&(o.sampled_at_ms, o.available_bytes))
+                || self.samples.len() >= MAX_STARTUP_SAMPLES
+            {
+                return;
+            }
+            self.samples.push((o.sampled_at_ms, o.available_bytes));
         }
     }
 
-    /// The measured peak, when a fresh sample showed availability dropping.
-    fn peak(&self) -> Option<i64> {
+    /// The measured peak, when a fresh sample outside every kernel build the
+    /// engine reported showed availability dropping. ADR 0014 amendment A12:
+    /// a compiler's memory is the build's, not the engine's.
+    fn peak(&self, builds: &[capyctl_domain::completion::KernelBuild]) -> Option<i64> {
         let (available, _) = self.baseline?;
-        available.checked_sub(self.lowest?).filter(|drop| *drop > 0)
+        let lowest = self
+            .samples
+            .iter()
+            .filter(|(at, _)| !builds.iter().any(|build| build.covers(*at)))
+            .map(|(_, bytes)| *bytes)
+            .min()?;
+        available.checked_sub(lowest).filter(|drop| *drop > 0)
     }
 }
 
@@ -2299,6 +2318,7 @@ async fn drive(
                 .record_owned_launch(owner.session(), &step, &receipt, now)
         })
         .await?;
+    let builds = observation.kernel_builds.clone();
     let evidence = CompletionEvidence {
         token: observation.token,
         identities: observation.identities,
@@ -2319,7 +2339,10 @@ async fn drive(
     // the host's memory (no other activation or cleanup on it) is recorded
     // for later starts of this revision there. A failure to record it costs
     // nothing but the measurement.
-    if let Some(peak) = peak.peak().filter(|_| !contended.load(Ordering::Acquire)) {
+    if let Some(peak) = peak
+        .peak(&builds)
+        .filter(|_| !contended.load(Ordering::Acquire))
+    {
         let step = work.step_id().to_owned();
         let _ = shared
             .read(move |owner, now| {

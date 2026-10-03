@@ -115,6 +115,7 @@ impl EngineAdapter for Scripted {
             observed_at_ms: self.clock.load(Ordering::SeqCst),
             receipt: format!("scripted {:?}", command.action),
             facts,
+            kernel_builds: Vec::new(),
         })
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {

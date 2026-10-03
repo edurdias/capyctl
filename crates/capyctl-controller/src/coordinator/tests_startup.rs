@@ -525,6 +525,161 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     w.shutdown().await.unwrap();
 }
 
+/// ADR 0014 amendment A12: availability sampled while the engine reported a
+/// kernel build (its compilers' memory, on a unified host) is not part of the
+/// startup peak. Samples before and after the build are, so the recorded peak
+/// is the engine's own, and the next start is not refused for capacity.
+// T29
+#[tokio::test]
+async fn a_peak_sampled_during_a_kernel_build_is_not_recorded() {
+    let (dir, owner, _, observations) = setup().await;
+    let fence = measured_deployment(&owner, "building");
+    let baseline = observations[0].available_bytes;
+    let available = Arc::new(AtomicI64::new(baseline));
+    let gate = Gate::new(false);
+    let scripted = Arc::new(ScriptedAvailability {
+        domains: observations.clone(),
+        available: available.clone(),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = startup_worker(
+        owner.clone(),
+        scripted.clone(),
+        BTreeMap::from([(fence.deployment_id.clone(), gate.clone())]),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+    );
+    let first = w.start(&fence, 60_000).unwrap();
+    gate.entered().await;
+    // Loading the weights drops availability by 6 GiB.
+    available.store(baseline - 6 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    // The compilers take 40 GiB more while the build runs. The sample taken
+    // just before the build began may already read it, so the build is
+    // reported from that sample on (the watcher's poll brackets a build).
+    let from = scripted.sampled.load(Ordering::SeqCst) - 1;
+    available.store(baseline - 46 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    // The build ends; graphs and the KV cache bring the engine to 12 GiB.
+    available.store(baseline - 12 * GIB, Ordering::SeqCst);
+    let ended = scripted.sampled.load(Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    available.store(baseline - 8 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    *gate.builds.lock().unwrap() = vec![capyctl_domain::completion::KernelBuild {
+        from_ms: from,
+        until_ms: ended,
+    }];
+    gate.release.add_permits(1);
+    assert_eq!(
+        first.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let peak = || -> Option<i64> {
+        sql.query_row(
+            "SELECT peak_bytes FROM startup_measurements WHERE deployment_id=?1 AND revision=?2",
+            rusqlite::params![fence.deployment_id, fence.revision],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    until("the measured peak", || peak().is_some()).await;
+    assert_eq!(peak(), Some(12 * GIB));
+    w.shutdown().await.unwrap();
+}
+
+/// ADR 0014 amendment A12: a start whose every sample fell inside a kernel
+/// build measured nothing of its own, so it records no peak and the next
+/// start keeps the placeholder.
+// T29
+#[tokio::test]
+async fn a_start_that_built_kernels_throughout_records_no_peak() {
+    let (dir, owner, _, observations) = setup().await;
+    let fence = measured_deployment(&owner, "always-building");
+    let baseline = observations[0].available_bytes;
+    let available = Arc::new(AtomicI64::new(baseline));
+    let gate = Gate::new(false);
+    let scripted = Arc::new(ScriptedAvailability {
+        domains: observations.clone(),
+        available: available.clone(),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = startup_worker(
+        owner.clone(),
+        scripted.clone(),
+        BTreeMap::from([(fence.deployment_id.clone(), gate.clone())]),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+    );
+    let first = w.start(&fence, 60_000).unwrap();
+    gate.entered().await;
+    available.store(baseline - 46 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    *gate.builds.lock().unwrap() = vec![capyctl_domain::completion::KernelBuild {
+        from_ms: 0,
+        until_ms: i64::MAX,
+    }];
+    gate.release.add_permits(1);
+    assert_eq!(
+        first.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    // The step is complete; give a recording every chance to land.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let measured: i64 = sql
+        .query_row(
+            "SELECT COUNT(*) FROM startup_measurements WHERE deployment_id=?1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(measured, 0);
+    w.shutdown().await.unwrap();
+}
+
+/// A stopped deployment whose memory request is derived and whose startup
+/// peak is the measurable placeholder (no declared `resources:` block).
+fn measured_deployment(owner: &SharedCoordinatorState, name: &str) -> DeploymentFence {
+    let o = owner.lock().unwrap();
+    let source: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut host = source["input"]["host"].clone();
+    host["runtime_profiles"]["local"]["build_fingerprint"] =
+        serde_json::json!("qualification-fake-v1");
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+        serde_json::json!("secret://another-admin");
+    let mut deployment = source["input"]["deployment"].clone();
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["name"] = serde_json::json!(name);
+    deployment["routes"] = serde_json::json!([name]);
+    deployment["engine_config"]["memory"] =
+        serde_json::json!({"request": "8GiB", "kv_cache": "4GiB"});
+    let receipt = o
+        .store()
+        .create_stopped_managed_configuration(
+            o.session(),
+            "owner",
+            name,
+            &serde_json::json!({ "config": deployment }).to_string(),
+            &host,
+            1700,
+        )
+        .unwrap();
+    DeploymentFence {
+        deployment_id: receipt.deployment_id,
+        revision: receipt.revision,
+        generation: receipt.generation,
+    }
+}
+
 /// T29: a peak measured while another task ran on the same host cannot be
 /// attributed to one launch, so none is recorded.
 // T29

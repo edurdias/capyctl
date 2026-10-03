@@ -70,6 +70,8 @@ struct Gate {
     lost_reply: AtomicBool,
     /// The builder's own reason for failing, once it has done whatever it does.
     failure: Mutex<Option<String>>,
+    /// ADR 0014 amendment A12: the kernel builds the engine reports.
+    builds: Mutex<Vec<capyctl_domain::completion::KernelBuild>>,
 }
 impl Gate {
     fn new(panic: bool) -> Arc<Self> {
@@ -84,6 +86,7 @@ impl Gate {
             api_only: AtomicBool::new(false),
             lost_reply: AtomicBool::new(false),
             failure: Mutex::new(None),
+            builds: Mutex::new(Vec::new()),
         })
     }
     async fn entered(&self) {
@@ -160,7 +163,10 @@ impl EngineAdapter for Gate {
                 "lost Initialize reply after associated launch".into(),
             ));
         }
-        result
+        result.map(|mut observation| {
+            observation.kernel_builds = self.builds.lock().unwrap().clone();
+            observation
+        })
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
         Err(AdapterError::UnsupportedCapability)

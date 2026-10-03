@@ -95,6 +95,10 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         presence(identity)
     }
 
+    fn building(&self, api: &ProcessIdentity) -> bool {
+        crate::group_observation::group_building(api)
+    }
+
     fn observe_group(&self, api: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
         let mut observed = observe_process_group_or_empty(api);
         for _ in 1..OBSERVATION_ATTEMPTS {

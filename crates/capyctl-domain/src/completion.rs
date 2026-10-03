@@ -232,6 +232,26 @@ pub struct EffectObservation {
     pub observed_at_ms: i64,
     pub receipt: String,
     pub facts: Vec<Milestone>,
+    /// ADR 0014 amendment A12: when the engine's process group ran a kernel
+    /// build during this step, in the host's clock. Empty when none was seen
+    /// or the launcher cannot see one.
+    pub kernel_builds: Vec<KernelBuild>,
+}
+
+/// ADR 0014 amendment A12: a span of host time, in Unix milliseconds, during
+/// which a compiler ran in an engine's process group. It may start before the
+/// compiler did and end after it left (the watcher's poll brackets it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelBuild {
+    pub from_ms: i64,
+    pub until_ms: i64,
+}
+
+impl KernelBuild {
+    /// Whether a host sample taken at `at_ms` falls inside this build.
+    pub fn covers(&self, at_ms: i64) -> bool {
+        self.from_ms <= at_ms && at_ms <= self.until_ms
+    }
 }
 
 /// Local parked-state observation; no engine command or inference request.

@@ -369,6 +369,7 @@ impl RemoteEngine {
                 }
             ),
             facts,
+            kernel_builds: Vec::new(),
         })
     }
 }
@@ -559,6 +560,7 @@ impl EngineAdapter for RemoteEngine {
                 Milestone::CacheValid,
                 Milestone::ModelUsable,
             ],
+            kernel_builds: kernel_builds(&result),
         })
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
@@ -738,6 +740,22 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
     Err(RuntimeError::Uncertain(
         "remote model readiness is unproven".into(),
     ))
+}
+
+/// ADR 0014 amendment A12: the kernel builds a usable launch's host saw, in
+/// the host's clock (the clock its memory samples carry). The result was
+/// validated, so every span is ordered and there are at most 64.
+fn kernel_builds(
+    result: &pb::MemberExecutionResult,
+) -> Vec<capyctl_domain::completion::KernelBuild> {
+    result
+        .kernel_builds
+        .iter()
+        .map(|span| capyctl_domain::completion::KernelBuild {
+            from_ms: span.from_unix_ms,
+            until_ms: span.until_unix_ms,
+        })
+        .collect()
 }
 
 /// SPEC §§6.1, 13.2: the host's authenticated Terminate result proves the owned
@@ -1044,6 +1062,25 @@ mod tests {
             observed_at_unix_ms: 5,
             ..Default::default()
         }
+    }
+
+    /// ADR 0014 amendment A12: the host's kernel builds reach the coordinator
+    /// as reported; a result from an older host carries none.
+    #[test]
+    fn a_launch_result_carries_the_hosts_kernel_builds() {
+        let mut ready = result(vec![observed("api", 10, "alive")]);
+        assert!(kernel_builds(&ready).is_empty());
+        ready.kernel_builds = vec![pb::KernelBuildSpan {
+            from_unix_ms: 100,
+            until_unix_ms: 250,
+        }];
+        assert_eq!(
+            kernel_builds(&ready),
+            [capyctl_domain::completion::KernelBuild {
+                from_ms: 100,
+                until_ms: 250,
+            }]
+        );
     }
 
     /// G1: the host's Terminate result settles a launch only when its claim is

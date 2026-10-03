@@ -547,6 +547,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             refused: String::new(),
             launch_failure: String::new(),
             source: None,
+            kernel_builds: Vec::new(),
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }

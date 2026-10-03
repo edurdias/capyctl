@@ -67,6 +67,67 @@ The vLLM command line carried `--tool-call-parser qwen3_coder
 --reasoning-parser qwen3 --enable-auto-tool-choice`. CPU and Fake-engine
 tests are not qualification.
 
+## Kernel builds left out of the startup peak — 2026-10-02 (branch `fix/startup-peak-excludes-kernel-build`)
+
+ADR 0014 amendment A12 (owner decision 2026-10-02, option A). While an
+Initialize runs, its host checks the engine's process group every 500 ms for
+a compiler (`ninja`, `nvcc`, `cicc`, `ptxas`, `c++`, `cc1plus` and others). It
+reports each span with one as a kernel build, with the readiness result
+(`MemberExecutionResult` field 15). The coordinator measures the startup peak
+from the availability samples outside those spans. A start that built kernels
+throughout records no peak. Peaks recorded before this change stay; a
+deployment blocked by one is deleted and redeployed once.
+
+- SGLang and FlashInfer build kernels after weight loading has begun, so a
+  start-at-weight-loading signal would still count the builds. The
+  process-group signal works for every engine. TensorFold deployments
+  declare their resources, so no peak is measured for them.
+- Builds inside the engine process (Triton, NVRTC) are not seen, and are
+  counted as before.
+
+Tests (CPU and scripted engines, which are not qualification):
+
+- coordinator: a peak sampled during a build is left out (12 GiB recorded
+  where the build took 46 GiB); a start that built throughout records none;
+  the existing measured-peak tests pass unchanged with no builds reported.
+- host journal: the builds are carried in the readiness result and its replay.
+- protocol: the field is accepted only on a usable launch, ordered and bounded.
+- launchers: a real process group led by a compiler-named process is seen
+  building and a `sleep` group is not.
+- SGLang adapter: a compiler seen while starting is reported in the step.
+
+Live on host A (GB10, 2026-10-03), Qwen3.8-27B NVFP4 with DFlash2 on SGLang
+(`memory: {request: 48GiB}`, local checkpoint). Two standalones were built from
+`main` (93ec627) and from this branch (493f8fd), each with its own state and
+config directories. Switching the SGLang environment forced the JIT kernel
+rebuild (the shared cache names the environment), so both first starts built.
+No cache was deleted.
+
+| | `main`, SGLang 0.5.20 | this branch, SGLang 0.5.21 |
+|---|---|---|
+| First start (with kernel builds) | 624 s | 585 s |
+| Lowest MemAvailable during the build | 10.7 GiB | 1.8 GiB |
+| Measured startup peak | 106.5 GiB | 44.8 GiB |
+| Next start | refused `capacity_blocked` (needs 106.5 GiB, 60.8 GiB limit) | ready in 177 s, no build |
+
+An independent 2 s sampler saw `ninja` and up to 28 compiler processes for
+about 6 minutes of each first start.
+
+vLLM 0.30 with Qwen3-4B on this branch started in 67 s. Its compile caches were
+warm, so no compiler ran and it measured 20.6 GiB. The 102 GiB vLLM first start
+seen in the three-engine run was not reproduced, because doing so needs its
+caches cleared:
+
+- FlashInfer's JIT build runs under `ninja`, so it is seen.
+- torch.compile's compile workers are Python processes and are not seen
+  (the fallback).
+- FlashInfer autotuning uses the engine's own GPU memory.
+
+Cleanup: deployments deleted, both standalones shut down drained, every
+process and directory the check made removed. The environments, models and
+caches are kept.
+
+
 ## Small CLI fixes — 2026-10-02 (branch `fix/small-cli-fixes`)
 
 - `engine remove` with no role running removes the profile from
@@ -144,7 +205,8 @@ the same way; a stream hung up after 2 s and a park right after it settled in
 parked`); shutdown with one stream in flight drained it (`drained: true`,
 `in_flight_at_close: 1`, the stream ended with `[DONE]`).
 
-Open finding, not fixed here: a start that builds kernels records the build's
+Open finding, fixed by ADR 0014 amendment A12 (branch
+`fix/startup-peak-excludes-kernel-build`): a start that builds kernels records the build's
 memory as its startup peak. The first 0.5.21 start of the 27B built FlashInfer
 kernels for 9 minutes (`MAX_JOBS` 14 from 117 GiB available) and recorded a
 111 GiB peak, and every later start of that deployment was refused
