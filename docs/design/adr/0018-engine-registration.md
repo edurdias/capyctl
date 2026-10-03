@@ -10,7 +10,7 @@ never rewritten).
 
 **Amended by:** ADR 0023 (2026-10-01): detection also reads `tensorfold-*.dist-info`,
 the entry point `<env>/bin/tensorfold`, and the verified set gains TensorFold 0.6.0,
-0.6.1 and 0.6.2.
+0.6.1, 0.6.2 and 0.6.3.
 
 ## Context
 

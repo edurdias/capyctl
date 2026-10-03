@@ -1,5 +1,45 @@
 # Current implementation and launch status
 
+## TensorFold 0.6.3 verified — 2026-10-02 (branch `feat/verify-tensorfold-0.6.3`)
+
+TensorFold 0.6.3 joins 0.6.0 to 0.6.2 in the verified set (ADR 0023 §1), so
+`engine add` shows it `custom no`; 0.6.4 and later stay custom. Between the
+0.6.2 and 0.6.3 tags, `cuda/build.py` and the drafter checks are unchanged.
+`cli_args.py` adds `--vision-offload`, `--vision-image-tokens` and a
+`control` command; neither option names a path, a listener or code, so both
+stay ordinary pass-through options. `server/metrics.py` adds a decode
+histogram (`tensorfold:request_decode_seconds`, mirrored as
+`tensorfold:request_decode_time_seconds`); the gauges CapyCTL reads are
+unchanged and the new histogram is not read. With
+`stream_options.include_usage`, 0.6.3 sends usage as its own final chunk with
+`choices: []` after the finish chunk that carries the `tensorfold` object;
+the stream relay already accepted that chunk, and a unit test now pins the
+collected shape.
+
+Live on host A (one GB10, standalone from origin/main `74a9b9b`, fresh 0700
+state and config directories, a new `~/tensorfold-0.6.3-venv` with the same
+pins as 0.6.2: torch 2.13.0 cu130, system CUDA 13.0). Qwen3.8-27B NVFP4 with
+the DFlash2 drafter, `--parallel 8`, greedy:
+
+| Step | Result |
+|---|---|
+| `engine add` | `tf063 0.6.3` registered beside `tf062 0.6.2` |
+| `start --wait`, cold (empty kernel cache) | 103.4 s (0.6.2: 115.1 s) |
+| `start --wait`, warm | 13.9 s |
+| stream with reasoning | 14 reasoning chunks, content `391`, `finish_reason: stop`, usage chunk, `[DONE]` |
+| request after `stop deployment` | 409 at once |
+| wake on request | the 0.6.2 deployment stopped, 0.6.3 started, answered in 15.4 s |
+| `--no-drafts` | ready in 12.3 s, answered |
+| shutdown | `drained: true`, `forced: false`, 0 in flight |
+
+Benchmark against 0.6.2 on the same deployment (medians; concurrency 512
+tokens, 10 rounds pooled from two interleaved passes; context 128 tokens, 3
+runs): aggregate tok/s C1 42.7 / 42.7, C4 122.6 / 122.7, C8 195.3 / 194.6;
+decode tok/s 2k 46.4 / 46.5, 32k 41.2 / 41.3, 128k 30.3 / 30.1; TTFT at 128k
+87.1 / 87.0 s. `token_sha` matched on 30 of 30 keys. Usage was counted on
+130 of 130 measured requests per version. On Qwen3.8 dense the `/health`
+keys are the same as 0.6.2's. No CapyCTL bug found.
+
 ## Long prompts, stream bounds and standalone queue settings — 2026-10-02 (branch `fix/stream-idle-cancel`)
 
 Found in the TensorFold 0.6.1 and 0.6.2 context sweep (Qwen3.8-27B NVFP4,

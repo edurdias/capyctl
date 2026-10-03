@@ -23,15 +23,15 @@ extensions with `torch.utils.cpp_extension`.
 profile name is `tensorfold`; the entry point is `<env>/bin/tensorfold`; the
 version check is `<env>/bin/tensorfold --version`. Detection reads
 `tensorfold-*.dist-info` with ADR 0018 §1's bounds and locations and executes
-nothing. The verified set gains TensorFold 0.6.0, 0.6.1 and 0.6.2; any other
-version is `custom`.
+nothing. The verified set gains TensorFold 0.6.0, 0.6.1, 0.6.2 and 0.6.3; any
+other version is `custom`.
 
 ### 2. Registration
 
 `capyctl engine add` refuses a TensorFold installation with `toolchain_missing`
 (exit 26) unless `ninja`, `nvcc` and `c++` or `g++` are on the engine's closed
 launch PATH: the installation's `bin`, the profile's `<cuda_home>/bin`, then
-`/usr/local/bin:/usr/bin:/bin`. TensorFold 0.6.1 and 0.6.2 also build with a pip-only
+`/usr/local/bin:/usr/bin:/bin`. TensorFold 0.6.1 to 0.6.3 also build with a pip-only
 compiler (`pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"`), which puts
 `nvcc` in `<env>/lib/python3.*/site-packages/nvidia/cu<major>/bin`; `nvcc` is
 also looked up there, after `<env>/bin` and before `<cuda_home>/bin`. The
@@ -52,7 +52,7 @@ another engine).
 only when the host or extra arguments name neither `--drafter` nor
 `--no-drafts`: TensorFold's default `--drafter auto` would pick a drafter from
 the Hugging Face cache. `--no-drafts` is ordinary and renders alone, since
-TensorFold 0.6.1 and 0.6.2 refuse `--drafter none` for a family whose CUDA engine needs
+TensorFold 0.6.1 to 0.6.3 refuse `--drafter none` for a family whose CUDA engine needs
 a drafter (Qwen3.8 dense); naming both is refused at deploy time and again when
 rendering, and a launch TensorFold refuses for a missing drafter reports that
 fix (found live 2026-10-02). The environment is

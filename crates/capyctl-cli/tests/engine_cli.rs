@@ -957,10 +957,15 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
     assert!(!engines_of(&document).profiles.contains_key("tf-deep"));
 }
 
-// T41 T07: 0.6.1 and 0.6.2 are verified beside 0.6.0; an unknown 0.6.3 is custom.
+// T41 T07: 0.6.1 to 0.6.3 are verified beside 0.6.0; an unknown 0.6.4 is custom.
 #[tokio::test]
-async fn tensorfold_062_is_verified_and_063_is_custom() {
-    for (version, custom) in [("0.6.1", false), ("0.6.2", false), ("0.6.3", true)] {
+async fn tensorfold_063_is_verified_and_064_is_custom() {
+    for (version, custom) in [
+        ("0.6.1", false),
+        ("0.6.2", false),
+        ("0.6.3", false),
+        ("0.6.4", true),
+    ] {
         let dir = private_dir();
         let env = tensorfold_env(&dir.path().join("tf"), version, &["ninja", "nvcc", "c++"]);
         let document = host_doc(dir.path());
