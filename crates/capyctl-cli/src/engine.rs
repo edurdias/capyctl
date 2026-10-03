@@ -543,7 +543,8 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 }
 
 /// ADR 0018 §4 (review decision C1): the CLI is the only writer of
-/// engines.yaml. Remove asks the running role to retire the profile, waits
+/// engines.yaml. With no role running it edits the file (amendment A3).
+/// Otherwise remove asks the running role to retire the profile, waits
 /// for the confirmation, then writes engines.yaml without it and asks the
 /// role to reload, which publishes the removal. A retry after any failure
 /// resumes the same retirement (review decision I1), so a crash between the
@@ -596,6 +597,11 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
         // acted on it; only `engine list` can say what happened.
         Err(ClientError::Unanswered(e)) => return Err(unknown_outcome(&e, name)),
         Err(_) if !registered => return Err(not_registered()),
+        // ADR 0018 amendment A3 (owner decision 2026-10-02): no role is
+        // running, so nothing is published from this file and nothing runs
+        // on it. The file is edited under its lock, as `engine add` does
+        // offline; the role publishes the removal when it starts.
+        Err(ClientError::NotRunning(_)) => return remove_offline(target, name),
         // Owner decision 2026-09-25: a published profile is never removed unconfirmed.
         Err(e) => {
             return Err(error(
@@ -649,6 +655,34 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             ),
         )),
     }
+}
+
+/// ADR 0018 amendment A3: `engine remove` with no role listening. The
+/// profile leaves engines.yaml; a deployment that names it is refused as an
+/// unpublished profile once the role starts.
+fn remove_offline(target: &Target, name: &str) -> Result<Value, StructuredError> {
+    let revision = write_without(target, name).map_err(|e| {
+        error(
+            "internal",
+            format!("{}: {}; nothing was removed", e.path, e.detail),
+        )
+    })?;
+    Ok(json!({
+        "removed": name, "engines_file": target.engines, "revision": revision,
+        "published": "role_not_running",
+        "notice": format!(
+            "removed from {} (revision {revision}); no capyctl answered on {}, so the \
+             change takes effect when it starts (`{}`). If it is already running with \
+             another --state-dir or --config, restart it, and pass the same option to \
+             `capyctl engine`",
+            target.engines.display(),
+            target.socket.display(),
+            match target.kind {
+                RoleKind::Standalone => "capyctl start standalone",
+                RoleKind::Host => "capyctl start host",
+            },
+        ),
+    }))
 }
 
 /// review decision C1: who the role runs as, when this CLI is root and the

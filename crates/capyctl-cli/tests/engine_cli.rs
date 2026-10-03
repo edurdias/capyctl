@@ -518,10 +518,11 @@ async fn remove_in_use_is_refused_with_the_list() {
     assert!(error.message.contains("q14"), "{}", error.message);
 }
 
-// Owner decision 2026-09-25: without a role nothing is removed; a profile the
-// operator declared in host.yaml is never removed by capyctl.
+// ADR 0018 amendment A3: with no role running, remove edits engines.yaml
+// under its lock (the role publishes the change when it starts); a profile
+// the operator declared in host.yaml is never removed by capyctl.
 #[tokio::test]
-async fn remove_without_a_role_writes_nothing() {
+async fn remove_without_a_role_edits_the_engines_file() {
     let dir = private_dir();
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
@@ -537,8 +538,9 @@ async fn remove_without_a_role_writes_nothing() {
     .unwrap_err();
     assert_eq!(error.code, "invalid_config", "no such profile");
     let _ = execute(&add(&env), Some(&document), dir.path()).await;
-    let before = std::fs::read(engines_beside(&document)).unwrap();
-    let error = execute(
+    let added = engines_of(&document);
+    let profile = added.profiles["vllm"].clone();
+    let removed = execute(
         &Command::EngineRemove {
             name: "vllm".into(),
             drain: true,
@@ -547,12 +549,22 @@ async fn remove_without_a_role_writes_nothing() {
         dir.path(),
     )
     .await
-    .unwrap_err();
-    assert_eq!(error.code, "agent_unreachable");
-    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+    .expect("no role running: the file is edited");
+    assert_eq!(removed["removed"], "vllm");
+    assert_eq!(removed["published"], "role_not_running");
+    assert!(
+        removed["notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("capyctl start host")),
+        "{removed}"
+    );
+    let after = engines_of(&document);
+    assert!(!after.profiles.contains_key("vllm"));
+    assert_eq!(after.revision, added.revision + 1);
+    assert_eq!(removed["revision"], after.revision);
     let mut host: Value =
         serde_json::from_str(&std::fs::read_to_string(&document).unwrap()).unwrap();
-    host["runtime_profiles"]["theirs"] = engines_of(&document).profiles["vllm"].clone();
+    host["runtime_profiles"]["theirs"] = profile;
     std::fs::write(&document, host.to_string()).unwrap();
     let error = execute(
         &Command::EngineRemove {
