@@ -110,7 +110,8 @@ impl EngineExits {
 
     /// One pass over this session's Ready embedded launches. Only processes
     /// recorded against this boot are judged (`exit_observed`): an engine this
-    /// role did not start on this boot is never declared exited from here.
+    /// role did not start on this boot is never declared exited from here. Of
+    /// those, only the engine's own (`api`, `worker-N`), never a helper.
     pub fn local_pass(&self) -> Vec<ExitHandled> {
         let launches = {
             let Ok(owner) = self.commands.owner_for_read() else {
@@ -123,7 +124,9 @@ impl EngineExits {
         };
         let mut handled = Vec::new();
         for launch in launches {
-            let mut group = launch.identities.clone();
+            // ADR 0027: only the engine's own processes are judged. A helper
+            // (an idle compile worker) exits on its own; cleanup still ends it.
+            let mut group = capyctl_domain::completion::engine_members(&launch.identities);
             group.sort_by_key(|p| (p.role != "api", p.role.clone(), p.pid));
             let Some(process) = group
                 .into_iter()

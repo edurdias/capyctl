@@ -270,8 +270,7 @@ impl crate::Store {
         current_admitted(&tx, s, &p, true, true)?;
         if evidence.binding_id != p.binding_id
             || evidence.incarnation != p.incarnation
-            || canonical_members(&evidence.identities).ok()
-                != Some(members(&association.identities)?)
+            || !names_engine(&members(&association.identities)?, &evidence.identities)
         {
             return Err(LifecycleError::Conflict);
         }
@@ -330,6 +329,18 @@ mod tests {
         DeploymentFence,
         StepExecutionContext,
     ) {
+        ready_local_with(group())
+    }
+
+    /// An embedded launch that reached Ready with `group` recorded.
+    fn ready_local_with(
+        group: Vec<ProcessIdentity>,
+    ) -> (
+        crate::Store,
+        CoordinatorSession,
+        DeploymentFence,
+        StepExecutionContext,
+    ) {
         let (store, session, fence, execution) = armed_ordinary();
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 5;
@@ -340,7 +351,7 @@ mod tests {
                 &OwnedLaunchReceipt {
                     binding_id: execution.binding_id.clone(),
                     incarnation: execution.incarnation.clone(),
-                    identities: group(),
+                    identities: group.clone(),
                     observed_at_ms: now,
                     receipt: "owned launch observed".into(),
                 },
@@ -354,7 +365,7 @@ mod tests {
                 &step,
                 &CompletionEvidence {
                     token: execution.token.clone(),
-                    identities: group(),
+                    identities: group.clone(),
                     observed_at_ms: now,
                     control_receipt: Some("model list names the route".into()),
                     milestones: vec![
@@ -476,6 +487,65 @@ mod tests {
         assert!(store
             .reverify_local_dispatch(&session, &step, &evidence(group(), now), now)
             .is_err());
+    }
+
+    /// ADR 0027: a restarted standalone re-proves an adopted launch on its
+    /// engine's own processes. A helper that exited since Ready (an idle
+    /// compile worker) does not keep dispatch closed; a worker that exited does.
+    #[test]
+    fn an_adopted_launch_reopens_with_a_helper_gone_but_not_a_worker() {
+        let recorded = vec![
+            identity("api", 61),
+            identity("worker-0", 62),
+            identity("helper-0", 63),
+            identity("helper-1", 64),
+        ];
+        let (store, _old, fence, execution) = ready_local_with(recorded.clone());
+        let step = execution.token.step_id.clone();
+        let session = store.begin_coordinator_session().unwrap();
+        store.adopt_retired_local_launch(&session, &step).unwrap();
+        let listed = store.local_ready_launches(&session).unwrap();
+        assert_eq!(listed[0].identities, recorded, "helpers stay recorded");
+        let now = execution.issued_at_ms + 10_000;
+        let evidence = |identities: Vec<ProcessIdentity>| RemoteReadinessEvidence {
+            binding_id: execution.binding_id.clone(),
+            incarnation: execution.incarnation.clone(),
+            identities,
+            observed_at_ms: now - 1,
+            receipt: "recorded engine processes alive; authenticated model list".into(),
+        };
+        assert!(matches!(
+            store.reverify_local_dispatch(
+                &session,
+                &step,
+                &evidence(vec![identity("api", 61), identity("helper-0", 63)]),
+                now,
+            ),
+            Err(LifecycleError::Conflict)
+        ));
+        assert!(matches!(
+            store.reverify_local_dispatch(
+                &session,
+                &step,
+                &evidence(vec![
+                    identity("api", 61),
+                    identity("worker-0", 62),
+                    identity("worker-1", 65)
+                ]),
+                now,
+            ),
+            Err(LifecycleError::Conflict)
+        ));
+        assert!(!dispatch(&store, &fence.deployment_id));
+        store
+            .reverify_local_dispatch(
+                &session,
+                &step,
+                &evidence(vec![identity("api", 61), identity("worker-0", 62)]),
+                now,
+            )
+            .unwrap();
+        assert!(dispatch(&store, &fence.deployment_id));
     }
 
     fn lease(

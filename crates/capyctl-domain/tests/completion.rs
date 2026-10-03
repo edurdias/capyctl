@@ -233,3 +233,85 @@ fn a_single_process_launch_completes_on_its_api_identity() {
         "a group without its api process never completes"
     );
 }
+
+fn member(role: &str, pid: u32) -> ProcessIdentity {
+    ProcessIdentity {
+        role: role.into(),
+        pid,
+        boot_id: "boot-a".into(),
+        start_ticks: u64::from(pid) + 1,
+    }
+}
+
+// ADR 0027: a helper (a process the engine's own processes did not start
+// directly, such as a compile worker) is recorded, but only the engine's own
+// processes decide whether the recorded engine is still the one running.
+#[test]
+fn a_helper_may_be_gone_but_an_engine_process_may_not() {
+    let recorded = vec![
+        member("api", 10),
+        member("worker-0", 11),
+        member("helper-0", 12),
+        member("helper-1", 13),
+    ];
+    assert!(member("helper-0", 12).is_helper());
+    assert!(!member("worker-0", 11).is_helper());
+    assert!(!member("api", 10).is_helper());
+    assert!(!member("helper-", 14).is_helper(), "a bare prefix is no role");
+    assert_eq!(
+        engine_members(&recorded),
+        vec![member("api", 10), member("worker-0", 11)]
+    );
+
+    assert!(same_engine(&recorded, &recorded));
+    assert!(
+        same_engine(&recorded, &recorded[..2]),
+        "every helper gone is still the engine"
+    );
+    assert!(same_engine(
+        &recorded,
+        &[member("api", 10), member("worker-0", 11), member("helper-1", 13)]
+    ));
+    assert!(
+        !same_engine(&recorded, &[member("api", 10), member("helper-0", 12)]),
+        "a worker gone is not the engine"
+    );
+    assert!(
+        !same_engine(&recorded, &[member("worker-0", 11)]),
+        "the api gone is not the engine"
+    );
+    assert!(
+        same_engine(
+            &recorded,
+            &[member("api", 10), member("worker-0", 11), member("helper-2", 20)]
+        ),
+        "a helper started later does not change the engine"
+    );
+    assert!(
+        !same_engine(
+            &recorded,
+            &[member("api", 10), member("worker-0", 11), member("worker-1", 20)]
+        ),
+        "an engine process outside the recorded group is never the engine's"
+    );
+    assert!(
+        !same_engine(&recorded, &[member("api", 10), member("worker-0", 21)]),
+        "a replaced worker is another engine"
+    );
+    assert!(!same_engine(&[], &[]));
+}
+
+// ADR 0027: the Ready proof still needs the recorded group exactly; only later
+// liveness proofs let a helper be gone.
+#[test]
+fn a_launch_with_helpers_completes_only_on_its_whole_group() {
+    let (mut expected, mut evidence) = fixture();
+    expected.identities.push(member("helper-0", 102));
+    evidence.identities.push(member("helper-0", 102));
+    verify_completion(&expected, &evidence, 151, 60).unwrap();
+    evidence.identities.pop();
+    assert_eq!(
+        verify_completion(&expected, &evidence, 151, 60),
+        Err(CompletionError::RuntimeChanged)
+    );
+}

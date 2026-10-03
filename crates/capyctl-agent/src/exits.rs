@@ -2,11 +2,11 @@
 //!
 //! A Ready engine that dies without a Terminate is found here, not at the
 //! controller's next probe. Every Ready launch this host claims is watched by the
-//! exact group its native readiness recorded (PID, boot and start ticks). A
-//! member of that group that is gone on this boot is an exit: it is journaled
-//! (with the exit code or signal when this host's launcher reaped it) and
-//! reported to the controller as a `MemberExit`, which closes that instance's
-//! dispatch and drives its verified cleanup.
+//! exact group its native readiness recorded (PID, boot and start ticks). An
+//! engine process of that group (not a helper, ADR 0027) that is gone on this
+//! boot is an exit: it is journaled (with the exit code or signal when this
+//! host's launcher reaped it) and reported to the controller as a `MemberExit`,
+//! which closes that instance's dispatch and drives its verified cleanup.
 //!
 //! Nothing here releases a claim, terminates a process or restarts an engine.
 //! The claim stays until an authenticated Terminate proves the whole recorded
@@ -42,7 +42,10 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
         return Vec::new();
     };
     let mut exited = Vec::new();
-    for (command, mut group) in ready {
+    for (command, group) in ready {
+        // ADR 0027: a helper (an idle compile worker) exits on its own; only
+        // the engine's own processes are watched. Terminate still ends helpers.
+        let mut group = capyctl_domain::completion::engine_members(&group);
         group.sort_by_key(|p| (p.role != "api", p.role.clone(), p.pid));
         let Some(process) = group
             .iter()

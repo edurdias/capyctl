@@ -383,7 +383,9 @@ impl RemoteReadiness {
                 start_ticks: p.start_ticks,
             })
             .collect();
-        if sorted(alive) != sorted(launch.identities.clone()) {
+        // ADR 0027: every engine process of the associated group and no
+        // other; a helper of it may have exited.
+        if !capyctl_domain::completion::same_engine(&launch.identities, &alive) {
             return Err("the probed engine is not the associated process group".into());
         }
         if self.hosts.current_session(&launch.host_id).as_deref() != Some(session) {
@@ -400,7 +402,7 @@ impl RemoteReadiness {
         let evidence = RemoteReadinessEvidence {
             binding_id: launch.binding_id.clone(),
             incarnation: launch.incarnation.clone(),
-            identities: launch.identities.clone(),
+            identities: alive,
             observed_at_ms: result.observed_at_unix_ms,
             receipt: format!(
                 "authenticated host session {session} answered a fresh native model probe"
@@ -510,18 +512,6 @@ fn quiescent(view: &LoadView, launch: &RemoteReadyLaunch, probed_at: i64) -> boo
         launch.fence.generation,
         probed_at,
     )
-}
-
-fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
-    identities.sort_by(|a, b| {
-        (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(
-            &b.role,
-            b.pid,
-            &b.boot_id,
-            b.start_ticks,
-        ))
-    });
-    identities
 }
 
 #[cfg(test)]

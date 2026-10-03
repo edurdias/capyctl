@@ -232,3 +232,29 @@ fn canonical_members_accepts_many_workers_or_the_api_alone() {
         "workers are contiguous from 0"
     );
 }
+
+/// ADR 0027: a launch records its helpers (processes its own processes did not
+/// start directly) beside its workers. They are named apart, so a helper that
+/// exited leaves a gap in their numbering and the set is still the launch's;
+/// a group of an api and helpers alone, or a helper role without a number, is
+/// not.
+#[test]
+fn canonical_members_accept_helpers_with_gaps_beside_the_workers() {
+    let api = identity("api", 10);
+    let w0 = identity("worker-0", 11);
+    let h0 = identity("helper-0", 12);
+    let h3 = identity("helper-3", 15);
+    assert!(canonical_members(&[api.clone(), w0.clone(), h0.clone(), h3.clone()]).is_ok());
+    assert!(
+        canonical_members(&[api.clone(), w0.clone(), h3]).is_ok(),
+        "helpers may be gone"
+    );
+    assert!(
+        canonical_members(&[api.clone(), identity("helper-", 13), w0]).is_err(),
+        "a helper role names its number"
+    );
+    assert!(
+        canonical_members(&[api, h0]).is_err(),
+        "helpers never stand in for the engine's workers"
+    );
+}

@@ -1140,8 +1140,13 @@ impl HostJournal {
                 continue;
             };
             let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
+            let ready: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_results WHERE command_id=?1)",
+                [&owner],
+                |r| r.get(0),
+            )?;
             let tx = db.transaction()?;
-            for identity in observed {
+            for identity in after_readiness(&processes, observed, ready) {
                 persist_process(&tx, &owner, &identity)?;
             }
             tx.commit()?;
@@ -1198,18 +1203,13 @@ impl HostJournal {
         capyctl_domain::group::validate_local_processes(&observation.identities)
             .map_err(|_| JournalError::Conflict)?;
         let mut result = self.execution_result(command_id, observation.observed_at_ms)?;
-        let alive: std::collections::BTreeSet<_> = result
-            .processes
-            .iter()
-            .filter(|p| p.presence == "alive")
-            .map(|p| ProcessIdentity {
-                role: p.role.clone(),
-                pid: p.pid,
-                boot_id: p.boot_id.clone(),
-                start_ticks: p.start_ticks,
-            })
-            .collect();
-        if alive != observation.identities.iter().cloned().collect() {
+        // ADR 0027: the observation names the group, helpers included. A
+        // helper that has exited since is no reason to refuse it; an engine
+        // process gone, or anything alive the observation does not name, is.
+        if !capyctl_domain::completion::same_engine(
+            &observation.identities,
+            &alive_identities(&result),
+        ) {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
@@ -1289,7 +1289,8 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        if sorted(current) != sorted(expected.clone()) {
+        // ADR 0027: every engine process of the Ready group; a helper may be gone.
+        if !capyctl_domain::completion::same_engine(&expected, &current) {
             return Err(JournalError::Uncertain);
         }
         Ok(expected)
@@ -1319,7 +1320,7 @@ impl HostJournal {
             return Err(JournalError::Uncertain);
         }
         let mut result = self.execution_result(probe_id, observed_at_ms)?;
-        if sorted(alive_identities(&result)) != sorted(expected.to_vec()) {
+        if !capyctl_domain::completion::same_engine(expected, &alive_identities(&result)) {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
@@ -1451,10 +1452,11 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        Ok((sorted(current) == sorted(expected.clone())).then_some(expected))
+        Ok(capyctl_domain::completion::same_engine(&expected, &current).then_some(expected))
     }
 
-    /// The journaled group of a launch is still exactly `expected`, alive.
+    /// The journaled group of a launch is still `expected`, alive: every engine
+    /// process of it and no other (a helper may be gone, ADR 0027).
     pub fn group_unchanged(
         self: &Arc<Self>,
         owned_handle: &str,
@@ -1466,7 +1468,7 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        Ok(sorted(current) == sorted(expected.to_vec()))
+        Ok(capyctl_domain::completion::same_engine(expected, &current))
     }
 
     /// SPEC §§9.1, 13.1: persist how a begun Park or Restore ended, with its
@@ -1514,7 +1516,8 @@ impl HostJournal {
         // A claim needs the unchanged group and this command's own durable
         // intent (a Terminate that settled the launch meanwhile removed it).
         if claimed
-            && (!intent_held || sorted(alive_identities(&result)) != sorted(expected.to_vec()))
+            && (!intent_held
+                || !capyctl_domain::completion::same_engine(expected, &alive_identities(&result)))
         {
             outcome = ResidencyOutcome::Uncertain;
         }
@@ -1741,11 +1744,16 @@ impl HostJournal {
                 .map_err(|_| JournalError::Storage)?;
             capyctl_protocol::execution::validate_result(&command, &previous)
                 .map_err(|_| JournalError::Storage)?;
+            // ADR 0027: the engine's own processes; a helper that exited
+            // since the result was persisted does not change the launch.
             let alive = |report: &pb::MemberExecutionResult| {
                 report
                     .processes
                     .iter()
-                    .filter(|p| p.presence == "alive")
+                    .filter(|p| {
+                        p.presence == "alive"
+                            && !capyctl_domain::completion::is_helper_role(&p.role)
+                    })
                     .map(|p| (p.role.clone(), p.pid, p.boot_id.clone(), p.start_ticks))
                     .collect::<std::collections::BTreeSet<_>>()
             };
@@ -1908,6 +1916,46 @@ fn fenced_handle(db: &Connection, handle: &str) -> Result<bool, JournalError> {
         )
         .optional()?
         .unwrap_or(false))
+}
+
+/// ADR 0027: a process first seen in a launch's group after its readiness was
+/// recorded is a helper, whatever started it: it is recorded for cleanup, and
+/// its exit, like its presence, is not the engine's. It is numbered after every
+/// helper already recorded, so no two recorded processes share a role. Before
+/// readiness the observation's own roles stand.
+fn after_readiness(
+    recorded: &[ProcessIdentity],
+    observed: Vec<ProcessIdentity>,
+    ready: bool,
+) -> Vec<ProcessIdentity> {
+    if !ready {
+        return observed;
+    }
+    let known = |p: &ProcessIdentity| {
+        recorded
+            .iter()
+            .any(|r| r.pid == p.pid && r.boot_id == p.boot_id && r.start_ticks == p.start_ticks)
+    };
+    let mut next = recorded
+        .iter()
+        .filter_map(|p| {
+            p.role
+                .strip_prefix(capyctl_domain::completion::HELPER_ROLE_PREFIX)
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .max()
+        .map_or(0, |n| n + 1);
+    observed
+        .into_iter()
+        .filter(|p| !known(p))
+        .map(|mut p| {
+            if p.role != "api" {
+                p.role = format!("{}{next}", capyctl_domain::completion::HELPER_ROLE_PREFIX);
+                next += 1;
+            }
+            p
+        })
+        .collect()
 }
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
@@ -2384,4 +2432,34 @@ fn validate_files(path: &Path) -> Result<(), JournalError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::after_readiness;
+    use capyctl_domain::completion::ProcessIdentity;
+
+    fn p(role: &str, pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            role: role.into(),
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: u64::from(pid),
+        }
+    }
+
+    /// ADR 0027: after readiness, a process first seen on an agent restart is
+    /// recorded as a helper numbered past the recorded ones, so no two recorded
+    /// processes share a role; one already recorded is not recorded again.
+    /// Before readiness the observation's roles stand.
+    #[test]
+    fn a_process_first_seen_after_readiness_is_a_new_helper() {
+        let recorded = vec![p("api", 1), p("worker-0", 2), p("helper-0", 3), p("helper-4", 4)];
+        let observed = vec![p("api", 1), p("worker-0", 2), p("worker-1", 9), p("helper-0", 10)];
+        assert_eq!(
+            after_readiness(&recorded, observed.clone(), true),
+            vec![p("helper-5", 9), p("helper-6", 10)]
+        );
+        assert_eq!(after_readiness(&recorded, observed.clone(), false), observed);
+    }
 }

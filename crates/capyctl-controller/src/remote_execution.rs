@@ -377,27 +377,25 @@ impl RemoteEngine {
 /// SPEC §§6.1, 9.1, 13.2: what an authenticated Park or Restore result proves.
 /// `parked` counts only without a usable-model claim, `restored` only with one,
 /// and both only on completion with the claim retained and the live group
-/// exactly the identities the controller recorded. `unchanged` is a refusal
+/// the engine the controller recorded (every engine process and no other; a
+/// helper may be gone, ADR 0027). `unchanged` is a refusal
 /// without effect; every other result is uncertain.
 fn residency_evidence(
     park: bool,
     recorded: &[ProcessIdentity],
     result: &pb::MemberExecutionResult,
 ) -> Result<(Vec<ProcessIdentity>, Vec<Milestone>), RuntimeError> {
-    let key = |p: &ProcessIdentity| (p.role.clone(), p.pid, p.boot_id.clone(), p.start_ticks);
-    let mut alive: Vec<_> = result
+    let alive: Vec<_> = result
         .processes
         .iter()
         .filter(|p| p.presence == "alive")
         .map(process)
         .collect();
-    let mut expected = recorded.to_vec();
-    alive.sort_by_key(key);
-    expected.sort_by_key(key);
+    // ADR 0027: every engine process the controller recorded and no other;
+    // a helper of the group may have exited.
     let held = result.state == "completed"
         && result.claim_retained
-        && !expected.is_empty()
-        && alive == expected;
+        && capyctl_domain::completion::same_engine(recorded, &alive);
     let facts = match result.residency.as_ref().map(|r| r.state.as_str()) {
         Some("parked") if park && held && !result.model_usable => vec![Milestone::MemoryReleased],
         Some("restored") if !park && held && result.model_usable => vec![
@@ -1184,6 +1182,39 @@ mod tests {
             );
         }
         assert!(residency_evidence(true, &[], &with("parked", false)).is_err());
+    }
+
+    /// ADR 0027: a helper of the recorded group (a compile worker its
+    /// scheduler started) that exited does not make a park or wake uncertain;
+    /// the engine's own worker exiting still does.
+    #[test]
+    fn remote_residency_evidence_lets_a_helper_be_gone() {
+        let recorded = vec![
+            process(&observed("api", 10, "alive")),
+            process(&observed("worker-0", 11, "alive")),
+            process(&observed("helper-0", 12, "alive")),
+        ];
+        let parked = |helper: &str, worker: &str| {
+            let mut r = result(vec![
+                observed("api", 10, "alive"),
+                observed("worker-0", 11, worker),
+                observed("helper-0", 12, helper),
+            ]);
+            r.claim_retained = true;
+            r.residency = Some(pb::ResidencyEvidence {
+                state: "parked".into(),
+                ..Default::default()
+            });
+            r
+        };
+        let (alive, facts) =
+            residency_evidence(true, &recorded, &parked("gone", "alive")).unwrap();
+        assert_eq!(facts, [Milestone::MemoryReleased]);
+        assert_eq!(alive, recorded[..2].to_vec());
+        assert!(matches!(
+            residency_evidence(true, &recorded, &parked("alive", "gone")),
+            Err(RuntimeError::Uncertain(_))
+        ));
     }
     /// SPEC §§6.1, 6.4, 13.2: a launch whose engine the host reports exited
     /// before readiness (launched, not usable, every process gone) failed with

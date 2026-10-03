@@ -26,7 +26,10 @@ use support::process::{free_port, free_ports, Guarded};
 /// from `VLLM_API_KEY`, every `/v1` route keyed, one forked worker child in the
 /// same process group, SSE chat. Each start appends its pid to `launches.log`
 /// and its worker's pid to `workers.log`. A chat whose last message is `slower`
-/// streams for about 12 s.
+/// streams for about 12 s. The worker starts one helper of its own before the
+/// engine serves (as a scheduler starts a compile worker pool), appended to
+/// `helpers.log`; the helper exits once `helper.exit` exists, and the worker
+/// lives on.
 const FAKE_VLLM: &str = r#"
 import json, os, sys, time, http.server
 args = sys.argv[1:]
@@ -36,10 +39,24 @@ with open(os.path.join(here, "launches.log"), "a") as f:
     f.write(str(os.getpid()) + "\n")
 port = int(args[args.index("--port") + 1])
 served = args[args.index("--served-model-name") + 1]
+ready_r, ready_w = os.pipe()
 worker = os.fork()
 if worker == 0:
+    helper = os.fork()
+    if helper == 0:
+        while not os.path.exists(os.path.join(here, "helper.exit")):
+            time.sleep(0.1)
+        os._exit(0)
+    with open(os.path.join(here, "helpers.log"), "a") as f:
+        f.write(str(helper) + "\n")
+    os.write(ready_w, b"x")
     while True:
-        time.sleep(60)
+        time.sleep(0.1)
+        try:
+            os.waitpid(helper, os.WNOHANG)
+        except ChildProcessError:
+            pass
+os.read(ready_r, 1)
 with open(os.path.join(here, "workers.log"), "a") as f:
     f.write(str(worker) + "\n")
 
@@ -305,6 +322,10 @@ impl Installation {
         pids(&self.root.path().join("engine/workers.log"))
     }
 
+    fn helpers(&self) -> Vec<i32> {
+        pids(&self.root.path().join("engine/helpers.log"))
+    }
+
     fn api_key(&self) -> String {
         std::fs::read_to_string(self.state().join("identity/credentials"))
             .unwrap()
@@ -398,7 +419,7 @@ impl Drop for Installation {
                 libc::killpg(pid, libc::SIGKILL);
             }
         }
-        for pid in self.workers() {
+        for pid in self.workers().into_iter().chain(self.helpers()) {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
@@ -459,6 +480,8 @@ async fn a_standalone_engine_exit_is_settled_and_relaunched_on_demand() {
     );
     assert_eq!(status["suspended"], false, "not an operator stop: {status}");
     wait_gone(worker, Duration::from_secs(5));
+    // ADR 0027: the helper the worker started is ended with the group.
+    wait_gone(installation.helpers()[0], Duration::from_secs(5));
     {
         let store =
             capyctl_store::Store::open(&installation.state().join("server/srv.sqlite3")).unwrap();
@@ -487,6 +510,108 @@ async fn a_standalone_engine_exit_is_settled_and_relaunched_on_demand() {
         Duration::from_secs(10),
     );
     assert_eq!(status["observed_state"], "ready");
+}
+
+/// ADR 0027: a helper of a Ready standalone engine (a process its worker
+/// started, as an SGLang scheduler starts torch inductor compile workers) that
+/// exits on its own is not the engine exiting. The engine stays ready and
+/// serves, nothing is journaled as an exit, a role restart re-adopts it and
+/// reopens dispatch without the helper, and a stop still ends the whole group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
+    let installation = Installation::new();
+    let role = Role::spawn(
+        {
+            let mut command = installation.command();
+            command.args(["start", "standalone"]);
+            command
+        },
+        Some("\"role\":\"standalone\""),
+    );
+    let deployment = installation.deploy();
+    installation.served_within(Duration::from_secs(20)).await;
+    let (engine, worker) = (installation.launches()[0], installation.workers()[0]);
+    let helper = installation.helpers()[0];
+    assert!(alive(helper), "the helper runs beside the engine");
+
+    // The helper exits on its own, as an idle compile worker does.
+    let exit_flag = installation.root.path().join("engine/helper.exit");
+    std::fs::write(&exit_flag, "").unwrap();
+    wait_gone(helper, Duration::from_secs(5));
+    std::fs::remove_file(&exit_flag).unwrap();
+    // Several exit-watcher passes later the engine is still the one serving.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        installation.status(&deployment)["observed_state"],
+        "ready",
+        "a helper's exit is not the engine's"
+    );
+    installation.served_within(Duration::from_secs(5)).await;
+    let journaled_exit = || {
+        let store =
+            capyctl_store::Store::open(&installation.state().join("server/srv.sqlite3")).unwrap();
+        store
+            .journal_evidence_of(&deployment)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains(" exited ("))
+    };
+    assert!(!journaled_exit(), "no engine exit was journaled");
+
+    // A role restart adopts the engine and re-proves it on its own processes.
+    drop(role);
+    assert!(alive(engine) && alive(worker), "the engine outlives the role");
+    let _role = Role::spawn(
+        {
+            let mut command = installation.command();
+            command.args(["start", "standalone"]);
+            command
+        },
+        Some("\"role\":\"standalone\""),
+    );
+    status_until(
+        || installation.status(&deployment),
+        |state| state == "ready",
+        Duration::from_secs(30),
+    );
+    installation.served_within(Duration::from_secs(20)).await;
+    assert_eq!(installation.launches(), vec![engine], "adopted, not relaunched");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(installation.status(&deployment)["observed_state"], "ready");
+    assert!(!journaled_exit());
+
+    // The engine's own worker exiting is still the engine exiting; the
+    // settlement ends the rest of the group.
+    unsafe {
+        libc::kill(worker, libc::SIGKILL);
+    }
+    status_until(
+        || installation.status(&deployment),
+        |state| state == "failed",
+        Duration::from_secs(30),
+    );
+    wait_gone(engine, Duration::from_secs(5));
+    assert!(journaled_exit(), "the worker's exit was journaled");
+
+    // A stop of the relaunched engine ends its helper too.
+    installation.served_within(Duration::from_secs(60)).await;
+    let launches = installation.launches();
+    assert_eq!(launches.len(), 2, "relaunched on demand: {launches:?}");
+    let helper = *installation.helpers().last().unwrap();
+    assert!(alive(helper));
+    let out = installation.cli(&["stop", "deployment", &deployment]);
+    assert!(
+        out.status.success(),
+        "stop: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    status_until(
+        || installation.status(&deployment),
+        |state| state == "stopped",
+        Duration::from_secs(30),
+    );
+    wait_gone(launches[1], Duration::from_secs(5));
+    wait_gone(helper, Duration::from_secs(5));
 }
 
 // -------------------------------------------------------------------- remote

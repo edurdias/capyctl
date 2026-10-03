@@ -24,7 +24,7 @@ pub mod unarmed_stop;
 pub mod worker;
 use crate::lifecycle::completion::{
     canonical_members, check_session, completion_value, decode, encode, fresh, identity_dtos,
-    members,
+    members, names_engine,
 };
 use crate::lifecycle::ArmResult;
 use crate::resource_ledger::{self, reserve_increase_in_transaction, GrantRequest};
