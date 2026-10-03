@@ -610,7 +610,7 @@ fn retained(
     // SPEC §7.3 (W5): a completed launch may be parked, or held at a park
     // or restore peak that this stop took over while it was uncertain.
     let held = if p.source_state == "completed" {
-        super::park::retained_footprint(e, ledger.owners.get(&original.owner()))
+        super::park::retained_footprint(tx, original, e, ledger.owners.get(&original.owner()))?
     } else {
         ledger.owners.get(&original.owner()) == Some(&super::startup::cold(original, e))
     };

@@ -169,6 +169,7 @@
   "effective": {
     "engine_config": {
       "common": {
+        "cuda_graphs": false,
         "language_model_only": false,
         "trust_remote_code": false
       },
@@ -183,6 +184,7 @@
       "memory_saver": true,
       "provenance": {
         "cpu_weight_backup": "derived",
+        "cuda_graphs": "capyctl default",
         "memory.request": "derived",
         "memory_saver": "derived",
         "sglang.tokenizer_workers": "capyctl default",
@@ -259,7 +261,7 @@
       }
     },
     "recipe": "standard",
-    "recipe_fingerprint": "cf01a686e1935111ccdf0749011001ead55964a5ff40408a8f3fe5d81e62209e",
+    "recipe_fingerprint": "7ff6f4184386a4689447a447f3f14e2c61629fca27ad0ff5a0a60f7d054e96be",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
     "residency": "deep",

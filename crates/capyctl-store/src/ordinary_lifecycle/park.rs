@@ -340,9 +340,27 @@ pub(super) struct Footprints {
     pub(super) wake: PhaseFootprint,
 }
 
-pub(super) fn footprints(e: &EffectiveDeployment) -> Footprints {
+/// ADR 0014 amendment A13: the footprints of the launch `p` started, its
+/// parked phase charged the residue measured for its revision.
+pub(super) fn charged_footprints(
+    tx: &rusqlite::Connection,
+    p: &Plan,
+    e: &EffectiveDeployment,
+) -> Result<Footprints, LifecycleError> {
+    let measured = super::parked_charge::measured(tx, &p.deployment_id, p.revision, e)?;
+    Ok(footprints_with(e, &measured))
+}
+
+fn footprints_with(
+    e: &EffectiveDeployment,
+    measured: &super::parked_charge::Measured,
+) -> Footprints {
     let ready = phase(&e.resources.ready, ResourcePhase::Ready);
-    let parked = phase(&e.resources.parked, ResourcePhase::Parked);
+    let parked = super::parked_charge::apply(
+        &phase(&e.resources.parked, ResourcePhase::Parked),
+        &ready,
+        measured,
+    );
     Footprints {
         parking: peak(
             &ready,
@@ -371,10 +389,18 @@ fn same(a: &PhaseFootprint, b: &PhaseFootprint) -> bool {
 /// footprints its residency transitions leave it with. A Ready launch holds
 /// the Ready footprint; a parked one the Parked; one in a park or restore
 /// (armed or uncertain) the transition peak.
-pub(super) fn retained_footprint(e: &EffectiveDeployment, held: Option<&PhaseFootprint>) -> bool {
-    let Some(held) = held else { return false };
-    let f = footprints(e);
-    same(&f.ready, held) || same(&f.parking, held) || same(&f.parked, held) || same(&f.wake, held)
+pub(super) fn retained_footprint(
+    tx: &rusqlite::Connection,
+    p: &Plan,
+    e: &EffectiveDeployment,
+    held: Option<&PhaseFootprint>,
+) -> Result<bool, LifecycleError> {
+    let Some(held) = held else { return Ok(false) };
+    let f = charged_footprints(tx, p, e)?;
+    Ok(same(&f.ready, held)
+        || same(&f.parking, held)
+        || same(&f.parked, held)
+        || same(&f.wake, held))
 }
 
 // --- small helpers -----------------------------------------------------------
@@ -526,6 +552,36 @@ pub(super) fn launch(
 /// disguise), and a host that opted out of deep parking refuses it too.
 pub(super) fn parks(e: &EffectiveDeployment) -> bool {
     e.residency != Residency::RestartOnly && e.profile.security.deep_park.is_enabled()
+}
+
+/// A park step that completed: the instance it parked, under which generation
+/// and binding.
+pub(super) struct CompletedPark {
+    pub(super) deployment_id: String,
+    pub(super) instance: u32,
+    pub(super) generation: i64,
+    pub(super) binding_id: String,
+}
+
+/// ADR 0014 amendment A13: the park `id` names, once it completed. `None`
+/// for a restore, or a park still in flight or that did not complete.
+pub(super) fn completed_park(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<CompletedPark>, LifecycleError> {
+    let (p, state) = match read(tx, id) {
+        Ok(read) => read,
+        Err(LifecycleError::Unsupported) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(
+        (p.kind == ResidencyKind::Park && state == "completed").then_some(CompletedPark {
+            deployment_id: p.deployment_id,
+            instance: p.instance_index,
+            generation: p.generation,
+            binding_id: p.binding_id,
+        }),
+    )
 }
 
 /// The instance's stored observed state and whether it may take new work.
@@ -1637,7 +1693,7 @@ fn arm(
     if state != "planned" {
         return Err(LifecycleError::Conflict);
     }
-    let (_, e, identities) = current_residency(tx, s, &p)?;
+    let (source, e, identities) = current_residency(tx, s, &p)?;
     if context.now_ms < p.accepted_at_ms || context.now_ms >= p.deadline_ms {
         return Err(LifecycleError::Conflict);
     }
@@ -1672,7 +1728,7 @@ fn arm(
         return Err(LifecycleError::Conflict);
     }
     let owner = p.owner();
-    let f = footprints(&e);
+    let f = charged_footprints(tx, &source, &e)?;
     let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
     // ADR 0007 (found live 2026-09-23, matrix M33): a wake beside a Ready
     // engine was refused because the memory that engine holds, already out of
@@ -1840,7 +1896,7 @@ fn complete(
     if state != "armed" {
         return Err(LifecycleError::Conflict);
     }
-    let (_, e, identities) = current_residency(tx, s, &p)?;
+    let (source, e, identities) = current_residency(tx, s, &p)?;
     let execution = p
         .execution
         .clone()
@@ -1864,7 +1920,7 @@ fn complete(
         now,
         ttl,
     )?;
-    let f = footprints(&e);
+    let f = charged_footprints(tx, &source, &e)?;
     let (held, next) = match p.kind {
         ResidencyKind::Park => (&f.parking, &f.parked),
         ResidencyKind::Restore => (&f.wake, &f.ready),
@@ -1972,8 +2028,8 @@ fn refuse(
     if state != "armed" {
         return Err(LifecycleError::Conflict);
     }
-    let (_, e, _) = current_residency(tx, s, &p)?;
-    let f = footprints(&e);
+    let (source, e, _) = current_residency(tx, s, &p)?;
+    let f = charged_footprints(tx, &source, &e)?;
     let (held, back) = match p.kind {
         ResidencyKind::Park => (&f.parking, &f.ready),
         ResidencyKind::Restore => (&f.wake, &f.parked),

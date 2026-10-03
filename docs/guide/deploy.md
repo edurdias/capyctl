@@ -69,10 +69,11 @@ Add a field to choose something yourself, for example:
   [several machines](several-machines.md).
 - `engine_config: {memory: {request: 16GiB}}` to set the GPU memory it may
   use: weights plus KV cache.
-- `engine_config: {cuda_graphs: true}` on SGLang for faster decoding. CapyCTL
-  turns SGLang's CUDA graphs off while the model can park; on a 16 GB card
-  FrogNano-4B decoded 61 tokens/s with them and 35 without, and kept about
-  0.6 GiB more of the card while parked.
+- `engine_config: {cuda_graphs: false}` on SGLang to turn its CUDA graphs off.
+  They are on by default; on a 16 GB card FrogNano-4B decoded 61 tokens/s with
+  them and 35 without, and kept about 0.7 GiB more of the card while parked.
+  After the first park CapyCTL charges a parked model what it measured it
+  holding (`parked` in `capyctl status deployment <name> --json`).
 
 Every other field is in [Configuration files](configuration.md).
 
