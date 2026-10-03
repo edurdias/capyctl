@@ -422,9 +422,30 @@ pub fn sglang_pool_for_launch(
         .chain(&settings.extra_args)
         .cloned()
         .collect();
-    let draft = checkpoint_root
-        .and_then(|_| crate::engine_policy::draft_model_path(Engine::Sglang, &args))
-        .map(|path| read_model_config(Path::new(&path)));
+    let draft_path =
+        checkpoint_root.and_then(|_| crate::engine_policy::draft_model_path(Engine::Sglang, &args));
+    let draft = draft_path
+        .as_ref()
+        .map(|path| read_model_config(Path::new(path)));
+    // A revision that declares its request and KV cache is not re-resolved
+    // with the measured weights (found live 2026-10-03), so the launch sizes
+    // them here, where it reads the checkpoint: the weight files of the
+    // checkpoint and of the draft model (amendment A6).
+    let mut measured;
+    let settings = match (settings.memory.weights_bytes, checkpoint_root) {
+        (None, Some(root)) => {
+            measured = settings.clone();
+            measured.memory.weights_bytes = [Some(root), draft_path.as_deref().map(Path::new)]
+                .into_iter()
+                .flatten()
+                .map(weight_file_bytes)
+                .sum::<Option<u64>>()
+                .and_then(|bytes| i64::try_from(bytes).ok())
+                .filter(|bytes| *bytes > 0);
+            &measured
+        }
+        _ => settings,
+    };
     sglang_pool(
         settings,
         profile_args,
@@ -433,6 +454,32 @@ pub fn sglang_pool_for_launch(
             .as_ref()
             .map(|config| config.as_ref().map_err(String::as_str)),
     )
+}
+
+/// The weight files a checkpoint directory loads (`.safetensors`, `.bin`,
+/// `.pt`, `.pth`, `.gguf`, as the checkpoint measurement counts them), two
+/// directory levels deep; `None` when the directory cannot be read.
+fn weight_file_bytes(root: &Path) -> Option<u64> {
+    fn walk(dir: &Path, depth: u8) -> Option<u64> {
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            let metadata = std::fs::metadata(&path).ok()?;
+            if metadata.is_dir() {
+                if depth > 0 {
+                    total = total.checked_add(walk(&path, depth - 1)?)?;
+                }
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "safetensors" | "bin" | "pt" | "pth" | "gguf"))
+            {
+                total = total.checked_add(metadata.len())?;
+            }
+        }
+        Some(total)
+    }
+    walk(root, 1)
 }
 
 /// [`sglang_pool_for_launch`] for a resolved deployment on the machine that

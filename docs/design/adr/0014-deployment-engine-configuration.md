@@ -758,6 +758,10 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   (with the draft model's, amendment A6), the KV cache and the state. The state is
   `(slots + 1) × slot`, plus `(running + 1) × draft tokens × slot` of intermediate states
   with speculative decoding (`--speculative-num-draft-tokens`), as SGLang reserves them.
+- The weights are the revision's recorded weights. A revision that declares both its
+  request and its KV cache records none (it is not re-resolved with the measurement), so
+  the launch sums the weight files it reads: the checkpoint's and the draft model's
+  (found live 2026-10-03).
 - With an explicit `memory.request`, sizing is strict. When a declared
   `max_concurrent_requests` does not fit, or one running request does not, the launch is
   refused before anything starts. The refusal names the state's bytes and the memory

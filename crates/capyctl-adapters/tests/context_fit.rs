@@ -389,3 +389,24 @@ fn a_derived_request_lends_the_state_part_of_its_margin() {
     let fit = capyctl_config::context_fit::fit_for_effective(&effective);
     assert_eq!(fit.running_limit, Some(5));
 }
+
+// T14 (amendment A14, found live 2026-10-03): a revision that declares its
+// request and KV cache records no weights, so the launch sizes the weight
+// files it reads and still refuses a state that does not fit.
+#[test]
+fn sglang_sizes_the_weights_at_launch_when_the_revision_has_none() {
+    let (store, effective) = sized_sglang(&qwen38_27b(), None, |d| {
+        d["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "16GiB"});
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    // A sparse file stands for the weights.
+    std::fs::File::create(store.path().join("toy/model.safetensors"))
+        .unwrap()
+        .set_len(21_920_000_000)
+        .unwrap();
+    let Err(error) = sglang_frozen(&effective) else {
+        panic!("refused")
+    };
+    let error = error.to_string();
+    assert!(error.contains("21920000000 bytes of weights"), "{error}");
+}
