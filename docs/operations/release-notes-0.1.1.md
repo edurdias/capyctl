@@ -15,6 +15,12 @@ unchecked in this release.
 
 ## Other changes
 
+- A first start of vLLM or SGLang that builds kernels (an empty FlashInfer
+  or SGLang kernel cache) no longer records the build's memory as the
+  deployment's startup peak, which left every later start of that
+  deployment `capacity_blocked` on a unified-memory host. A deployment that
+  recorded such a peak before this release keeps it: delete it and deploy it
+  again once.
 - A readiness check now accepts a model that answers with reasoning first.
 - On SGLang, `memory.kv_cache` is now the size of the KV cache, as on vLLM. A
   hybrid model's per-request state is sized beside it, for

@@ -217,6 +217,8 @@ pub(super) async fn initialize(
     })
     .await
     .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
+    // ADR 0014 amendment A12: note any kernel build until the step ends.
+    let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
     // Spec §4: the builder ends before the coordinator's bound so its own error wins.
     let stop_at = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
@@ -351,6 +353,7 @@ pub(super) async fn initialize(
             Milestone::CacheValid,
             Milestone::ModelUsable,
         ],
+        kernel_builds: builds.finish(),
     })
 }
 

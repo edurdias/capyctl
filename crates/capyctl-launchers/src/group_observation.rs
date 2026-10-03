@@ -143,6 +143,71 @@ pub fn scan_group_by_pgid(
     collect_members(pgid, facts)
 }
 
+/// ADR 0014 amendment A12: the programs a JIT kernel build runs (FlashInfer,
+/// SGLang's and PyTorch's extension builds, TensorFold's CUDA build), by the
+/// kernel's process name. Triton and NVRTC compile inside the engine process
+/// and are not seen.
+const KERNEL_BUILD_TOOLS: &[&str] = &[
+    "ninja",
+    "nvcc",
+    "cicc",
+    "ptxas",
+    "cudafe++",
+    "fatbinary",
+    "nvlink",
+    "cc1plus",
+    "cc1",
+    "c++",
+    "g++",
+    "gcc",
+    "cc",
+    "ld",
+    "collect2",
+    "as",
+    "make",
+    "cmake",
+];
+
+/// ADR 0014 amendment A12: whether a compiler runs now in the process group
+/// `api` leads. A best-effort reading for the startup peak only, never for
+/// ownership: anything unreadable answers `false`, which counts the sample
+/// as the engine's, as before this amendment.
+pub fn group_building(api: &ProcessIdentity) -> bool {
+    if api.pid == 0 || read_boot().ok().as_deref() != Some(api.boot_id.as_str()) {
+        return false;
+    }
+    let Ok(pids) = list_pids() else {
+        return false;
+    };
+    let members = pids.into_iter().filter_map(|pid| {
+        let raw = read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES).ok()?;
+        let fact = parse_stat(pid, &raw, &api.boot_id).ok()?;
+        Some((fact, stat_comm(&raw)?.to_owned()))
+    });
+    builds_in(api, members)
+}
+
+/// Whether any of `members` is a compiler in `api`'s group that began no
+/// earlier than its leader (an older one belongs to an earlier group).
+fn builds_in(
+    api: &ProcessIdentity,
+    members: impl IntoIterator<Item = (GroupProcessFact, String)>,
+) -> bool {
+    members.into_iter().any(|(fact, comm)| {
+        fact.process_group == api.pid
+            && fact.start_ticks >= api.start_ticks
+            && KERNEL_BUILD_TOOLS.contains(&comm.as_str())
+    })
+}
+
+/// The process name in a `/proc/<pid>/stat` line: between the first `(` and
+/// the last `) `, since the name itself may hold either.
+fn stat_comm(raw: &str) -> Option<&str> {
+    let open = raw.find(" (")? + 2;
+    let close = raw.rfind(") ")?;
+    raw.get(open..close)
+}
+
 /// One listed pid's facts, or `None` if it exited after the listing.
 ///
 /// A pid that disappears between the directory listing and its `stat` read is
@@ -397,6 +462,80 @@ mod tests {
             boot_id: BOOT.into(),
             start_ticks: 10,
         }
+    }
+
+    /// ADR 0014 amendment A12: a compiler in the launched group is a kernel
+    /// build; the same name outside it, or older than the leader, is not.
+    #[test]
+    fn a_compiler_in_the_launched_group_is_a_kernel_build() {
+        let member = |pid, group, ticks, comm: &str| {
+            let raw = stat(pid, 1, group, ticks).replace("(odd ) name\n)", &format!("({comm})"));
+            (
+                parse_stat(pid, &raw, BOOT).unwrap(),
+                stat_comm(&raw).unwrap().to_owned(),
+            )
+        };
+        let engine = member(42, 42, 10, "python3");
+        assert!(!builds_in(&api(), [engine.clone()]));
+        for tool in ["ninja", "nvcc", "cicc", "ptxas", "cc1plus", "c++", "g++"] {
+            assert!(
+                builds_in(&api(), [engine.clone(), member(50, 42, 11, tool)]),
+                "{tool}"
+            );
+        }
+        // Another group, or a process that began before the leader.
+        assert!(!builds_in(
+            &api(),
+            [engine.clone(), member(50, 77, 11, "nvcc")]
+        ));
+        assert!(!builds_in(&api(), [engine, member(50, 42, 9, "nvcc")]));
+        assert_eq!(stat_comm(&stat(42, 1, 42, 10)), Some("odd ) name\n"));
+    }
+
+    /// ADR 0014 amendment A12, on this host's /proc: a group led by a
+    /// process named like a compiler is building; one led by `sleep` is not.
+    #[test]
+    fn a_running_compiler_group_is_seen_as_building() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ninja = dir.path().join("ninja");
+        // A link, not a copy: a copy's write descriptor can leak into a child
+        // another test forks meanwhile, and exec then fails with ETXTBSY. The
+        // kernel names the process after the link.
+        std::os::unix::fs::symlink("/bin/sleep", &ninja).unwrap();
+        let identity = |child: &std::process::Child| {
+            let pid = child.id();
+            let boot = read_boot().unwrap();
+            let raw = read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES).unwrap();
+            let fact = parse_stat(pid, &raw, &boot).unwrap();
+            ProcessIdentity {
+                role: "api".into(),
+                pid,
+                boot_id: boot,
+                start_ticks: fact.start_ticks,
+            }
+        };
+        let mut building = std::process::Command::new(&ninja)
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut idle = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The copy is exec'd by the time its stat names it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !group_building(&identity(&building)) {
+            assert!(std::time::Instant::now() < deadline, "build never seen");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!group_building(&identity(&idle)));
+        let _ = building.kill();
+        let _ = idle.kill();
+        let _ = building.wait();
+        let _ = idle.wait();
     }
 
     #[test]

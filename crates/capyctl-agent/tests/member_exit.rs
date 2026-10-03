@@ -191,6 +191,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
                     Milestone::CacheValid,
                     Milestone::ModelUsable,
                 ],
+                kernel_builds: Vec::new(),
             },
         )
         .unwrap();

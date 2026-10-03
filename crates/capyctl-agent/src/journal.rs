@@ -1214,6 +1214,17 @@ impl HostJournal {
         }
         result.model_usable = true;
         result.observed_at_unix_ms = observation.observed_at_ms;
+        // ADR 0014 amendment A12: the kernel builds the adapter saw, so the
+        // controller leaves their samples out of the startup peak.
+        result.kernel_builds = observation
+            .kernel_builds
+            .iter()
+            .take(capyctl_protocol::execution::MAX_KERNEL_BUILDS)
+            .map(|build| capyctl_protocol::pb::KernelBuildSpan {
+                from_unix_ms: build.from_ms,
+                until_unix_ms: build.until_ms,
+            })
+            .collect();
         capyctl_protocol::execution::validate_result(&command, &result)
             .map_err(|_| JournalError::Conflict)?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -1712,6 +1723,7 @@ impl HostJournal {
             launch_failure: String::new(),
             // ADR 0008: MaterializeSource is never journaled either.
             source: None,
+            kernel_builds: Vec::new(),
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -1770,6 +1782,10 @@ impl HostJournal {
                 result.model_usable = previous.model_usable;
                 // A physical process observation cannot refresh model readiness.
                 result.observed_at_unix_ms = previous.observed_at_unix_ms;
+                // ADR 0014 amendment A12: they travel with the readiness proof.
+                if result.model_usable {
+                    result.kernel_builds = previous.kernel_builds;
+                }
             }
         }
         Ok(result)
@@ -2141,6 +2157,9 @@ impl OwnedProcessLaunch for JournalLaunchTools {
         } else {
             Presence::Unknown
         }
+    }
+    fn building(&self, api: &ProcessIdentity) -> bool {
+        self.owns(api) && self.tools.building(api)
     }
     fn observe_group(
         &self,

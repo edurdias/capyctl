@@ -61,6 +61,8 @@ pub(super) async fn initialize(
     let api = tokio::task::spawn_blocking(move || spawn_tools.spawn_durable(&incarnation, &cmd))
         .await
         .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
+    // ADR 0014 amendment A12: note any kernel build until the step ends.
+    let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
     // ADR 0023 §4: the ordinary bound once a build exists, the
     // whole (first-build) deadline otherwise.
     let deadline = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
@@ -165,5 +167,6 @@ pub(super) async fn initialize(
             Milestone::CacheValid,
             Milestone::ModelUsable,
         ],
+        kernel_builds: builds.finish(),
     })
 }

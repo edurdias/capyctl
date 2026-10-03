@@ -183,6 +183,8 @@ struct ScriptedTool {
     descriptors: Mutex<Vec<[Vec<u8>; 3]>>,
     gone_on_spawn: bool,
     present_calls: Arc<AtomicUsize>,
+    /// ADR 0014 amendment A12: whether a compiler runs in the group.
+    building: std::sync::atomic::AtomicBool,
 }
 
 /// Read each protected descriptor through a duplicated descriptor, then rewind
@@ -209,6 +211,7 @@ impl ScriptedTool {
             descriptors: Mutex::new(Vec::new()),
             gone_on_spawn: false,
             present_calls: Arc::new(AtomicUsize::new(0)),
+            building: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -254,6 +257,10 @@ impl OwnedProcessLaunch for ScriptedTool {
 
     fn observe_group(&self, _api: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
         Ok(self.group.clone())
+    }
+
+    fn building(&self, _api: &ProcessIdentity) -> bool {
+        self.building.load(Ordering::SeqCst)
     }
 
     fn terminate_owned(
@@ -595,6 +602,39 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     assert_eq!(probe.body["messages"][0]["content"], "Say ready.");
     assert!(tool.present_calls.load(Ordering::SeqCst) >= 1);
     assert!(_stub.polls.load(Ordering::SeqCst) >= 1);
+    // ADR 0014 amendment A12: no compiler ran, so no build is reported.
+    assert!(observation.kernel_builds.is_empty());
+    std::fs::remove_file(&log).ok();
+}
+
+/// ADR 0014 amendment A12: a compiler in the engine's group while it starts is
+/// reported as a kernel build, in the host's clock, inside the step.
+// T29
+#[tokio::test]
+async fn a_compiler_seen_while_starting_is_reported_as_a_kernel_build() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 4, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    tool.building.store(true, Ordering::SeqCst);
+    let adapter = equipped(frozen_launch(port), tool.clone(), &log)
+        .with_extra_approvals(r#"{"options":[],"paths":[],"trust_remote_code":false}"#.into());
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let before = now();
+    let observation = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let after = now();
+    let [build] = observation.kernel_builds.as_slice() else {
+        panic!("one build expected: {:?}", observation.kernel_builds);
+    };
+    assert!(before <= build.from_ms && build.from_ms < build.until_ms && build.until_ms <= after);
     std::fs::remove_file(&log).ok();
 }
 
