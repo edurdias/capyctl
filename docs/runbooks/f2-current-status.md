@@ -18,15 +18,24 @@ GB10, 121.7 GiB) and recorded in ADR 0025.
    a 58 GiB Ready declaration). The launch now sets
    `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` to the declared Ready allocation.
 
-Live on host A so far (TensorFold 0.6.3): `--set ...managed_limit=90GiB` was
-stored as a 90.0 GiB limit; a deployment declaring 84 GiB cold and 82 GiB Ready
-was admitted and launched with the variable at `82`. A 254,993-token prompt got
-its first token at 260 s and completed. Repeated long prompts took machine
-memory from 47 to 67 to 84 GiB, where the growth stopped (84.4 GiB, 80.8 GiB
-above idle, under the 82 GiB cap) and a new 250k-token prompt was still served.
-Still to run live: the limit by environment and by YAML, a 58 GiB declaration
-under the same prompts, and SGLang with a 70 GiB request and
-`--max-mamba-cache-size 40` at 256k.
+Live on host A (TensorFold 0.6.3, SGLang 0.5.21), one standalone restarted
+with the limit set each way:
+
+- `--set ...managed_limit=90GiB`: a 90.0 GiB limit (policy revision 1). A
+  TensorFold deployment declaring 84 GiB cold and 82 GiB Ready, refused under the
+  old limit, was admitted and launched with the variable at `82`. A
+  254,993-token prompt got its first token at 260 s and completed. Repeated long
+  prompts took machine memory from 47 to 67 to 84 GiB, where the growth stopped
+  (84.4 GiB, 80.8 GiB above idle, under the 82 GiB cap); a new 250k-token prompt
+  was still served.
+- `CAPYCTL_SET__…MANAGED_LIMIT=88GiB` on restart: revision 2, 88.0 GiB. The
+  comparison's 58 GiB Ready declaration launched with the variable at `58`; five
+  prompts (255k, 128k, 255k, 250k, 255k tokens) all completed and machine memory
+  peaked at 60.6 GiB (about 56.5 GiB above idle; 77.9 GiB in the comparison).
+- `managed_limit: "80%"` in the document on restart: revision 3, 97.4 GiB. An
+  SGLang deployment with a 70 GiB request and `--max-mamba-cache-size 40` was
+  admitted and started in 153 s; a 254,993-token prompt got its first token at
+  367 s and completed (machine memory peak 73.7 GiB).
 
 ## A 9 GB model on a 16 GB GPU — 2026-10-03 (branch `fix/single-gpu-16gb`)
 
