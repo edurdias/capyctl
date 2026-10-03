@@ -245,9 +245,15 @@ impl ChatHttp {
         read_idle: Option<Duration>,
     ) -> Result<Value, AdapterError> {
         let mut chunks = Vec::new();
+        // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
+        // the collected response must carry it as a non-streaming one does.
+        let mut body = body.clone();
+        if body.is_object() && body.get("stream_options").is_none_or(Value::is_null) {
+            body["stream_options"] = json!({"include_usage": true});
+        }
         let end = self
             .stream_inner(
-                body,
+                &body,
                 &mut Collecting {
                     chunks: &mut chunks,
                     observer,
@@ -374,6 +380,15 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         }
     }
     response["object"] = json!("chat.completion");
+    // vLLM's first chunk carries `prompt_text` and `prompt_token_ids` (null
+    // unless asked for); they describe the stream, not the completion.
+    if let Some(fields) = response.as_object_mut() {
+        for field in ["prompt_text", "prompt_token_ids"] {
+            if fields.get(field).is_some_and(Value::is_null) {
+                fields.remove(field);
+            }
+        }
+    }
     // Collecting must not silently discard the trace a streaming caller would
     // have received. The field is omitted entirely when the engine sent none,
     // so a non-reasoning response keeps its existing shape.
@@ -1305,6 +1320,50 @@ mod tests {
         let chunk = serde_json::json!({"id":"c","object":"chat.completion.chunk","created":1,
             "model":"m","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
         format!("data: {chunk}\n\n")
+    }
+
+    /// SPEC §10 (found live 2026-10-03 with vLLM 0.29): a non-streaming request
+    /// is collected from a stream, and vLLM streams usage only when asked, so
+    /// the collection asks for it (`stream_options.include_usage`) and the
+    /// response carries `usage`, as the engine's own non-streaming answer does.
+    /// The null `prompt_text` and `prompt_token_ids` of vLLM's first chunk are
+    /// not carried into the completion.
+    // T19
+    #[tokio::test]
+    async fn a_collected_response_asks_for_and_carries_usage() {
+        let first = serde_json::json!({"id":"c","object":"chat.completion.chunk","created":1,
+            "model":"m","prompt_text":null,"prompt_token_ids":null,
+            "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]});
+        let usage = serde_json::json!({"id":"c","object":"chat.completion.chunk","created":1,
+            "model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}});
+        let sse = [
+            format!("data: {first}\n\n"),
+            tool_chunk(
+                serde_json::json!({"content":"hi"}),
+                serde_json::json!("stop"),
+            ),
+            format!("data: {usage}\n\n"),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat();
+        let (url, seen) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let request = serde_json::json!({"model":"public","messages":[]});
+        let response = forward.forward_chat(&request).await.unwrap();
+        assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
+        assert!(response.get("prompt_text").is_none(), "{response}");
+        assert!(response.get("prompt_token_ids").is_none(), "{response}");
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(sent["stream_options"]["include_usage"], true, "{sent}");
+        // A streaming caller's own stream options are relayed as sent.
+        let mut relayed = Vec::new();
+        forward
+            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .await
+            .unwrap();
+        let sent = seen.lock().unwrap()[1].clone();
+        assert!(sent.get("stream_options").is_none(), "{sent}");
     }
 
     /// SPEC §10 "preserve ... tool calls": `tools` and `tool_choice` reach the

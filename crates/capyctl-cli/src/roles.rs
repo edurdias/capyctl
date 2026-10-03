@@ -768,21 +768,27 @@ impl From<ProviderError> for StartError {
 
 impl From<StartError> for StructuredError {
     fn from(err: StartError) -> Self {
-        let code = match err {
-            // SPEC §13.2 / T33: a store written by a newer capyctl is not a
-            // transient fault; restarting this binary never heals it.
-            StartError::Store(capyctl_store::StoreError::FromNewerVersion { .. })
-            | StartError::Ownership(capyctl_controller::OwnedStateError::Store(
-                capyctl_store::StoreError::FromNewerVersion { .. },
-            )) => crate::output::STORE_FROM_NEWER_VERSION,
-            StartError::Config(_) => "invalid_config",
-            StartError::NoEngineInstallation(_) => "invalid_config",
-            StartError::ProfileExists(_) => "profile_exists",
-            StartError::Setting(_) => "invalid_config",
-            StartError::GpuTopology(error) => error.code(),
-            StartError::Template(ref error) => error.code(),
-            _ => "internal",
-        };
+        let code =
+            match err {
+                // SPEC §13.2 / T33: a store written by a newer capyctl is not a
+                // transient fault; restarting this binary never heals it.
+                StartError::Store(capyctl_store::StoreError::FromNewerVersion { .. })
+                | StartError::Ownership(capyctl_controller::OwnedStateError::Store(
+                    capyctl_store::StoreError::FromNewerVersion { .. },
+                )) => crate::output::STORE_FROM_NEWER_VERSION,
+                StartError::Config(_) => "invalid_config",
+                // Found live 2026-10-03: a state path that breaks the ownership
+                // rules is the operator's to change, not an internal fault.
+                StartError::Ownership(capyctl_controller::OwnedStateError::Ownership(
+                    ref error,
+                )) if error.kind() == std::io::ErrorKind::PermissionDenied => "invalid_config",
+                StartError::NoEngineInstallation(_) => "invalid_config",
+                StartError::ProfileExists(_) => "profile_exists",
+                StartError::Setting(_) => "invalid_config",
+                StartError::GpuTopology(error) => error.code(),
+                StartError::Template(ref error) => error.code(),
+                _ => "internal",
+            };
         StructuredError {
             code,
             message: err.to_string(),

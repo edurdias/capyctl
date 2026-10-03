@@ -328,6 +328,19 @@ async fn add(
     extras: Extras<'_>,
     toolchain: Toolchain<'_>,
 ) -> Result<Value, StructuredError> {
+    // Found live 2026-10-03: a role cannot listen on a control socket whose
+    // path a Unix socket cannot hold, so nothing is saved for one it could
+    // never publish to.
+    if target.socket.as_os_str().len() > capyctl_agent::control_socket::MAX_PATH {
+        return Err(error(
+            "invalid_config",
+            format!(
+                "{} is longer than the {}-byte socket path limit, so capyctl cannot run with this state directory; use a shorter --state-dir (or CAPYCTL_STATE_DIR); nothing was written",
+                target.socket.display(),
+                capyctl_agent::control_socket::MAX_PATH
+            ),
+        ));
+    }
     let path = match path {
         Some(path) => path.to_path_buf(),
         None => pick()?,

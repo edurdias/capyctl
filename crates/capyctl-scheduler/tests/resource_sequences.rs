@@ -35,6 +35,7 @@ fn park_before_wake_fits_without_cold_restart() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -104,6 +105,7 @@ fn both_parked_is_not_enough_without_each_wake_path() {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -141,6 +143,7 @@ fn cleanup_credits_only_qualified_floors_and_preserves_inputs() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -209,6 +212,7 @@ fn cleanup_rejects_impossible_attribution_before_removal() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -264,6 +268,7 @@ fn cleanup_after_phase_uses_forecast_floor_and_phase_wrapper_is_equivalent() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];
@@ -328,6 +333,7 @@ fn aggregate_floor_validation_preserves_phase_error_precedence() {
         domain: "system".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }];

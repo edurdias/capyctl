@@ -151,6 +151,48 @@ fn engine_add_with_a_role_that_does_not_answer_is_agent_unreachable() {
     );
 }
 
+// T07 (found live 2026-10-03): a state directory whose control socket path
+// is longer than a Unix socket allows can never run a role, so `engine add`
+// refuses it before writing anything, with what to do.
+#[test]
+fn engine_add_with_a_state_dir_too_long_for_its_socket_writes_nothing() {
+    let root = private_dir();
+    mkdir(&root.path().join("home"));
+    let env = vllm_env(&root.path().join("v"));
+    let state = root.path().join("s".repeat(110));
+    let output = capyctl(
+        root.path(),
+        root.path(),
+        &[
+            "engine",
+            "add",
+            env.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    assert!(
+        text(&output).contains("socket path limit"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        text(&output).contains("shorter --state-dir"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !root
+            .path()
+            .join("home/.config/capyctl/engines.yaml")
+            .exists(),
+        "{}",
+        text(&output)
+    );
+}
+
 struct Role(AtomicUsize);
 #[async_trait::async_trait]
 impl ControlHandler for Role {
@@ -564,6 +606,10 @@ struct Stopping {
     refused_starts: AtomicUsize,
     starts: AtomicUsize,
     stopped_after: usize,
+    /// Starts refused `still_stopping` (503, retryable) while the snapshot
+    /// already reads stopped: the shape after a revision redeploy, whose old
+    /// engine is still being confirmed gone (found live 2026-10-03).
+    still_stopping_refusals: usize,
 }
 
 const START_ID: &str = "01K00000000000000000000004";
@@ -593,6 +639,15 @@ async fn stopping_management(state: Arc<Stopping>) -> std::net::SocketAddr {
         .route(
             &format!("/management/v1/deployments/{DEPLOYMENT_ID}/actions"),
             routing::post(move |State(m): State<Arc<Stopping>>| async move {
+                if m.refused_starts.load(Ordering::SeqCst) < m.still_stopping_refusals {
+                    m.refused_starts.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"api_version": "1", "error": {"code": "still_stopping",
+                            "message": "A stop is still being confirmed",
+                            "retryable": true, "operation_id": null, "details": {}}})),
+                    );
+                }
                 if still(&m) {
                     m.refused_starts.fetch_add(1, Ordering::SeqCst);
                     return (
@@ -650,6 +705,7 @@ async fn start_while_the_stop_settles_says_still_stopping() {
         refused_starts: AtomicUsize::new(0),
         starts: AtomicUsize::new(0),
         stopped_after: usize::MAX,
+        still_stopping_refusals: 0,
     });
     let address = stopping_management(state.clone()).await;
     let output = start(root.path(), address, &[]).await;
@@ -674,6 +730,7 @@ async fn start_wait_waits_for_the_stop_to_settle() {
         refused_starts: AtomicUsize::new(0),
         starts: AtomicUsize::new(0),
         stopped_after: 3,
+        still_stopping_refusals: 0,
     });
     let address = stopping_management(state.clone()).await;
     let output = start(root.path(), address, &["--wait"]).await;
@@ -682,4 +739,89 @@ async fn start_wait_waits_for_the_stop_to_settle() {
     assert!(all.contains("Waiting for the stop of first-model"), "{all}");
     assert_eq!(state.starts.load(Ordering::SeqCst), 1);
     assert_eq!(state.refused_starts.load(Ordering::SeqCst), 0);
+}
+
+// T08 (SPEC §6.4, found live 2026-10-03): right after a revision redeploy the
+// snapshot already reads stopped while the old engine's stop is still being
+// confirmed, and the start is refused `still_stopping`. `--wait` retries it
+// until the stop settles, then starts; without `--wait` the refusal stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_wait_retries_a_still_stopping_refusal() {
+    let root = private_dir();
+    let state = Arc::new(Stopping {
+        reads: AtomicUsize::new(0),
+        refused_starts: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        stopped_after: 0,
+        still_stopping_refusals: 2,
+    });
+    let address = stopping_management(state.clone()).await;
+    let output = start(root.path(), address, &["--wait"]).await;
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{all}");
+    assert!(all.contains("Waiting for the stop of first-model"), "{all}");
+    assert_eq!(state.refused_starts.load(Ordering::SeqCst), 2);
+    assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+}
+
+/// A management API whose deployment's checkpoint digest is pending with a
+/// closed diagnostic the host reported.
+async fn unmeasurable_management(
+    diagnostic: &'static str,
+    starts: Arc<AtomicUsize>,
+) -> std::net::SocketAddr {
+    use axum::{extract::State, http::StatusCode, routing, Json, Router};
+    let app = Router::new()
+        .route(
+            "/management/v1/snapshot",
+            routing::get(move || async move {
+                Json(json!({"operations": [], "deployments": [{
+                    "id": DEPLOYMENT_ID, "name": "first-model", "revision": "1",
+                    "observed_state": "stopped", "desired_state": "stopped",
+                    "timeouts": {"initialize_ms": 60_000, "request_deadline_ms": 600_000},
+                    "checkpoint_digest": {"state": "pending", "host_id": "h",
+                        "provisional": true, "diagnostic": diagnostic},
+                }]}))
+            }),
+        )
+        .route(
+            &format!("/management/v1/deployments/{DEPLOYMENT_ID}/actions"),
+            routing::post(move |State(starts): State<Arc<AtomicUsize>>| async move {
+                starts.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"api_version": "1",
+                    "operation_id": START_ID, "deployment_id": DEPLOYMENT_ID})),
+                )
+            }),
+        )
+        .with_state(starts);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    address
+}
+
+// T16 (ADR 0014 §7, found live 2026-10-03): a checkpoint the host cannot
+// measure (here a path it refused) ends `start --wait` at once with the reason
+// and nothing started, instead of waiting out the Initialize window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_wait_ends_at_once_on_a_checkpoint_that_cannot_be_measured() {
+    let root = private_dir();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let address = unmeasurable_management("invalid_root", starts.clone()).await;
+    let began = std::time::Instant::now();
+    let output = start(root.path(), address, &["--wait"]).await;
+    let all = text(&output);
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(20),
+        "{all}"
+    );
+    assert_eq!(output.status.code(), Some(2), "{all}");
+    assert!(
+        all.contains("could not be measured (invalid_root)"),
+        "{all}"
+    );
+    assert!(all.contains("first-model"), "{all}");
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
 }

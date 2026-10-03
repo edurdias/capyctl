@@ -56,6 +56,7 @@ fn limits() -> [MemoryLimit; 1] {
         domain: "system".into(),
         managed_bytes: 96,
         free_reserve_bytes: 12,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     }]

@@ -1883,3 +1883,68 @@ fn the_cuda_context_is_charged_alike_on_unified_and_discrete_hosts() {
         );
     }
 }
+
+// T26 (ADR 0019 §3, found live on a 16 GB laptop GPU, 2026-10-03): a request
+// declared for a discrete GPU is sized as the derived one is. A KV cache left
+// out is the request less the weights x 1.10 (the unified 8 GiB margin made it
+// negative for a 9 GB model on a 16 GB card), and an undeclared startup peak
+// is the request, not the unified placeholder (weights x 2.25 plus 8 GiB,
+// beyond the card).
+#[test]
+fn a_request_declared_on_a_discrete_gpu_is_sized_for_the_card() {
+    let declared = |memory: serde_json::Value| {
+        let mut d = deployment_with("deep", "vllm", "1GiB");
+        d["engine_config"] = serde_json::json!({ "memory": memory });
+        d
+    };
+    let weights = 8 * GIB;
+    let request = 12 * GIB;
+    let r = resolve(
+        &declared(serde_json::json!({"request": "12GiB"})),
+        &discrete_host(),
+    )
+    .expect("a request alone resolves on the card");
+    let memory = r.engine_config.memory();
+    assert_eq!(memory.request_bytes, request);
+    assert_eq!(
+        memory.kv_cache_bytes,
+        request - weights - weights / 100 * 10
+    );
+    assert_eq!(memory.startup_bytes, Some(request));
+    let overhead = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    assert_eq!(
+        phase(&r.resources.cold)[0],
+        ("gpu0".into(), request + overhead)
+    );
+    let snapshot = serde_json::to_string(&r).unwrap();
+    assert_eq!(
+        capyctl_config::effective::decode_effective_snapshot(&snapshot).unwrap(),
+        r
+    );
+    // A declared KV cache is kept; the startup peak is still the request.
+    let r = resolve(
+        &declared(serde_json::json!({"request": "12GiB", "kv_cache": "2GiB"})),
+        &discrete_host(),
+    )
+    .unwrap();
+    assert_eq!(r.engine_config.memory().kv_cache_bytes, 2 * GIB);
+    assert_eq!(r.engine_config.memory().startup_bytes, Some(request));
+    let snapshot = serde_json::to_string(&r).unwrap();
+    assert_eq!(
+        capyctl_config::effective::decode_effective_snapshot(&snapshot).unwrap(),
+        r
+    );
+    // A request too small for the weights is refused with the reason.
+    let e = resolve(
+        &declared(serde_json::json!({"request": "8GiB"})),
+        &discrete_host(),
+    )
+    .unwrap_err();
+    assert!(e.path.starts_with("engine_config.memory"), "{e}");
+    // A unified host keeps the placeholder margin.
+    let unified = resolve(&declared(serde_json::json!({"request": "20GiB"})), &host()).unwrap();
+    assert_eq!(
+        unified.engine_config.memory().kv_cache_bytes,
+        20 * GIB - weights - capyctl_config::effective::overhead_margin(Engine::Vllm)
+    );
+}

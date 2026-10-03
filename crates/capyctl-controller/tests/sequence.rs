@@ -65,6 +65,7 @@ impl Fixture {
                 domain: "ram".into(),
                 managed_bytes: 100,
                 free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
                 host_kv_bytes: None,
                 parked_bytes: None,
             }],
@@ -745,6 +746,7 @@ fn retained_recipe_matching_ignores_allocation_and_device_order() {
         domain: "other".into(),
         managed_bytes: 100,
         free_reserve_bytes: 0,
+        reserve_absorbs_unmanaged: false,
         host_kv_bytes: None,
         parked_bytes: None,
     });
@@ -876,6 +878,7 @@ mod host_scoped {
             domain: ours.clone(),
             managed_bytes: 100,
             free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: false,
             host_kv_bytes: None,
             parked_bytes: None,
         }];

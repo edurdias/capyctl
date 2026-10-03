@@ -57,6 +57,22 @@ the engine's own output. For SGLang it stays empty unless CapyCTL was started
 with `--debug-engine-logs`: restart CapyCTL with it and start the model again to
 see why SGLang stopped. That output may contain prompts.
 
+**A model stays queued.** `status deployment` shows why under its table, for
+example `Waiting     initialize pending: gave up: resource or evidence check failed: insufficient resources`:
+the GPU does not have the memory free now. Stop or park another model, or free
+the card from other programs.
+
+**The checkpoint could not be measured.** `status deployment` shows
+`Checkpoint  could not be measured (<reason>)` and `start --wait` stops at once.
+`invalid_root`: the model path is not a directory CapyCTL can read, or it sits in
+a directory other users can write. `unsafe_file`: a link leaves the model's
+directory (or its Hugging Face cache). Fix the path or the permissions and
+deploy again.
+
+**A launch refused `port_conflict`.** Another program listens on the engine port
+CapyCTL leased. Start again (the next start takes a free port), or give CapyCTL
+another range with `--engine-ports`.
+
 **SGLang: a permissions warning in the engine log.** CapyCTL checks that the SGLang
 library it uses to park and wake is not writable by other users. When the
 check cannot prove that (for example, a group-writable environment on a

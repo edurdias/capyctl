@@ -71,8 +71,49 @@ pub struct MemoryLimit {
     pub domain: String,
     pub managed_bytes: i64,
     pub free_reserve_bytes: i64,
+    /// ADR 0019 §2 (found live on a 16 GB laptop GPU, 2026-10-03): on a
+    /// `device` domain the free reserve absorbs memory the card holds outside
+    /// CapyCTL's accounting (the driver's own reservation, a display server).
+    /// Only the part of the reserve that this memory does not already take must
+    /// stay free; see [`MemoryLimit::required_free`]. Always `false` on host
+    /// memory, where the whole reserve stays free for the operating system.
+    pub reserve_absorbs_unmanaged: bool,
     pub host_kv_bytes: Option<i64>,
     pub parked_bytes: Option<i64>,
+}
+
+impl MemoryLimit {
+    /// The free memory that must remain after admission on this domain,
+    /// given its observation and the memory CapyCTL's own processes were
+    /// sampled holding there (`held`, a verified lower bound).
+    ///
+    /// ADR 0019 §2: the ledger keeps every charge within `managed_bytes`
+    /// (capacity minus the reserve), so the reserve is already outside every
+    /// charge. On a device domain the memory nobody accounts for (capacity
+    /// minus available minus `held`) sits in that reserve; requiring the whole
+    /// reserve free on top of it counted it twice, and a deployment sized to
+    /// the managed limit could never start (a 16 GB card loses about 0.35 GiB
+    /// to the driver's own reservation before any process runs). Unattributed
+    /// engine memory counts as unaccounted, which only lowers the requirement
+    /// to the physical fit, never below it.
+    pub fn required_free(&self, capacity: i64, available: i64, held: i64) -> i64 {
+        if !self.reserve_absorbs_unmanaged {
+            return self.free_reserve_bytes;
+        }
+        absorbing_reserve(self.free_reserve_bytes, capacity, available, held)
+    }
+}
+
+/// ADR 0019 §2: the part of a device domain's `reserve` that must stay free
+/// when the card has `available` of `capacity` bytes free and CapyCTL's own
+/// processes hold `held` bytes of the rest: the reserve less what nobody
+/// accounts for, never negative.
+pub fn absorbing_reserve(reserve: i64, capacity: i64, available: i64, held: i64) -> i64 {
+    let unaccounted = capacity
+        .saturating_sub(available)
+        .saturating_sub(held)
+        .max(0);
+    reserve.saturating_sub(unaccounted).max(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

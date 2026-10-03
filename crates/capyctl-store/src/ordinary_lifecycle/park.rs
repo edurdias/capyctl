@@ -1310,6 +1310,7 @@ fn limits(policy: &ResourcePolicySnapshot) -> Vec<MemoryLimit> {
             domain: id.clone(),
             managed_bytes: d.managed_limit,
             free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
             host_kv_bytes: d.host_kv_limit,
             parked_bytes: d.parked_limit,
         })

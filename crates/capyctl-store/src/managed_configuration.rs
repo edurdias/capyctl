@@ -916,7 +916,9 @@ fn replay(
 /// The next revision and generation of a replacement, and whether the
 /// deployment is running (holds a coherent runtime on some instance).
 ///
-/// A stopped deployment is replaced exactly as before instances existed. ADR
+/// A stopped deployment is replaced exactly as before instances existed, and
+/// so is one whose start failed once nothing is retained (found live
+/// 2026-10-03: it had to be deleted to be corrected). ADR
 /// 0013 §7 and owner decision Q8: a running deployment is replaced too — a
 /// count-only revision leaves its running instances untouched and any other
 /// revision stops and restarts them — but only while everything it retains is
@@ -924,7 +926,7 @@ fn replay(
 /// (an owner, a lease, a claim or an endpoint without such a launch) still
 /// refuses the replacement, because nothing could reconcile it.
 fn replacement_fence(tx: &Transaction<'_>, id: &str, expected: i64) -> Result<(i64, i64, bool)> {
-    let row:Option<(i64,i64,bool)> = tx.query_row("SELECT revision,current_generation,(desired_state='stopped' AND observed_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0 AND kind='model') FROM deployments WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let row:Option<(i64,i64,bool)> = tx.query_row("SELECT revision,current_generation,(observed_state IN ('stopped','failed') AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0 AND kind='model') FROM deployments WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let (revision, generation, stopped) = row.ok_or(ManagedConfigurationError::RevisionConflict)?;
     if revision != expected {
         return Err(ManagedConfigurationError::RevisionConflict);

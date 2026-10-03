@@ -770,7 +770,7 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// `device_conflict`: the launch's device claim conflicts with a launch the
 /// host still claims (an exclusive claim on a shared device, SPEC §7.3);
 /// `port_conflict`: the leased port belongs to a launch the host still claims
-/// (per-launch claims, SPEC §3.1); `unauthorized`: any other local policy
+/// (per-launch claims, SPEC §3.1), or another program listens on it; `unauthorized`: any other local policy
 /// refusal. `insufficient_memory` also covers the host's managed or host-KV
 /// budget with every claimed launch counted. ADR 0008 (owner decision
 /// 2026-09-23): `installation_drift`: the installation no longer measures to
