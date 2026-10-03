@@ -92,7 +92,12 @@ fn bootstrap_is_durable_and_reopen_prefers_persisted_policy() {
         Err(ResourcePolicyError::Invalid)
     ));
     assert_eq!(
-        store.resource_policy("host-a").unwrap().unwrap().controls.domains["system"]
+        store
+            .resource_policy("host-a")
+            .unwrap()
+            .unwrap()
+            .controls
+            .domains["system"]
             .managed_limit,
         80
     );
@@ -125,7 +130,12 @@ fn reopen_applies_changed_queue_bounds_and_memory_limits() {
     assert_eq!(reopened.controls.queue.stream_idle_ms, 600_000);
     assert_eq!(reopened.controls.domains["system"].managed_limit, 75);
     assert_eq!(
-        store.resource_policy("host-a").unwrap().unwrap().controls.domains["system"]
+        store
+            .resource_policy("host-a")
+            .unwrap()
+            .unwrap()
+            .controls
+            .domains["system"]
             .managed_limit,
         75
     );
