@@ -1,5 +1,18 @@
 # Current implementation and launch status
 
+## 0.1.2 release preparation — 2026-10-04
+
+Version bumped to 0.1.2 with release notes in
+`docs/operations/release-notes-0.1.2.md` (vLLM 0.30.0, SGLang 0.5.21,
+TensorFold 0.6.2, 0.6.3 and 0.6.5, the memory and reliability fixes since
+0.1.1, parser defaults, TensorFold `--parallel`, SGLang CUDA graphs on). Four
+entries that PRs after 0.1.1 had appended to the 0.1.1 notes moved to the
+0.1.2 notes; the 0.1.1 notes are back to their published text. The
+verification result is in the release pull request. Nothing is built, tagged
+or published yet: next are the manual Release build workflow, the strict local
+packaging check, a draft release and the live check from the draft
+(docs/operations/releasing.md). The owner publishes.
+
 ## TensorFold 0.6.5 verified — 2026-10-04 (branch `feat/verify-tensorfold-0.6.5`)
 
 TensorFold 0.6.5 joins 0.6.0 to 0.6.3 in the verified set (ADR 0023 §1), so
