@@ -661,9 +661,11 @@ impl CheckpointGate {
     /// message keeps the walker's reason.
     async fn verified(&self) -> Result<(), RuntimeError> {
         self.check().await.map_err(|refusal| match refusal {
-            GateRefusal::Mismatch => {
-                RuntimeError::Uncertain("the checkpoint does not match its recorded digest".into())
-            }
+            // Found live 2026-10-04: the closed code leads, so status and
+            // `--wait` attach the hint about model.content_fingerprint.
+            GateRefusal::Mismatch => RuntimeError::Uncertain(
+                "checkpoint_mismatch: the checkpoint does not match its recorded digest".into(),
+            ),
             GateRefusal::Unavailable(reason) => {
                 RuntimeError::Uncertain(format!("the checkpoint could not be measured ({reason})"))
             }

@@ -436,6 +436,16 @@ async fn the_embedded_gate_verifies_before_initialize_and_restore() {
     assert!(
         matches!(refused, RuntimeError::Uncertain(ref text) if text.contains("recorded digest"))
     );
+    // Found live 2026-10-04: the reason names the closed code, so status and
+    // `--wait` attach the hint that says what model.content_fingerprint holds.
+    let RuntimeError::Uncertain(text) = &refused else {
+        unreachable!()
+    };
+    assert_eq!(
+        capyctl_domain::diagnostics::classify(None, text),
+        Some("checkpoint_mismatch"),
+        "{text}"
+    );
     assert!(gate
         .execute_persisted(&step(&f, RuntimeAction::Restore))
         .await
