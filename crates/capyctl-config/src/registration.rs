@@ -376,6 +376,7 @@ pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Tensorfold, "0.6.1"),
     (Engine::Tensorfold, "0.6.2"),
     (Engine::Tensorfold, "0.6.3"),
+    (Engine::Tensorfold, "0.6.5"),
 ];
 
 pub fn is_verified(engine: Engine, version: &str) -> bool {

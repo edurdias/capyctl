@@ -610,7 +610,7 @@ pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -
     )
 }
 
-/// The model families whose CUDA engine TensorFold 0.6.3 runs one request at
+/// The model families whose CUDA engine TensorFold 0.6.3 to 0.6.5 runs one request at
 /// a time whatever `--parallel` says (`families/nemotron_h`).
 const TENSORFOLD_ONE_AT_A_TIME: &[&str] = &["nemotron_h"];
 
@@ -669,7 +669,7 @@ fn tensorfold_streams(
         if streams.count.is_some_and(|count| count > 1) {
             streams.count = Some(1);
             streams.reason = Some(format!(
-                "TensorFold 0.6.3 serves this model family ({family}) one request at a time on CUDA"
+                "TensorFold serves this model family ({family}) one request at a time on CUDA"
             ));
         }
     }

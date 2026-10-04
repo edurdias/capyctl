@@ -1,7 +1,7 @@
 //! ADR 0023 §2: the tools TensorFold's first start needs to build its CUDA
 //! extensions, looked up on the engine's closed launch PATH (SPEC §13.3): the
 //! installation's `bin`, the profile's `<cuda_home>/bin`, then the fixed
-//! system directories. TensorFold 0.6.1 to 0.6.3 also build with a pip-only compiler
+//! system directories. TensorFold 0.6.1 to 0.6.5 also build with a pip-only compiler
 //! (`pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"`), so `nvcc` is also
 //! looked up in the environment's `site-packages/nvidia/cu*/bin`, after the
 //! installation's `bin` and before `<cuda_home>/bin`. The caller's PATH is never read and nothing is run.

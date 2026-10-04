@@ -1,5 +1,6 @@
 //! ADR 0023 §3: one TensorFold `serve` command from a resolved plan. No shell,
-//! no key: TensorFold has none, and capyctl's routed path is the only way in.
+//! no key: capyctl starts TensorFold without one (0.6.5's key options are
+//! reserved), and capyctl's routed path is the only way in.
 use std::collections::BTreeMap;
 
 use capyctl_config::engine_policy::{
@@ -200,7 +201,7 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     }
     // ADR 0023 §4 (amended 2026-10-03, found live): without a cap TensorFold
     // grants itself the machine's free memory less a floor, and its streams'
-    // caches grow into it past the declaration. TensorFold 0.6.3 caps that
+    // caches grow into it past the declaration. TensorFold 0.6.3 and later cap that
     // grant with this variable; earlier versions ignore it.
     if let Some(bytes) = input.memory_limit_bytes.filter(|bytes| *bytes > 0) {
         env.insert("TENSORFOLD_CUDA_MEMORY_LIMIT_GB".into(), gib_text(bytes));

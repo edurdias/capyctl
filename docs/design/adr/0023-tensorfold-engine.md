@@ -23,15 +23,15 @@ extensions with `torch.utils.cpp_extension`.
 profile name is `tensorfold`; the entry point is `<env>/bin/tensorfold`; the
 version check is `<env>/bin/tensorfold --version`. Detection reads
 `tensorfold-*.dist-info` with ADR 0018 §1's bounds and locations and executes
-nothing. The verified set gains TensorFold 0.6.0, 0.6.1, 0.6.2 and 0.6.3; any
-other version is `custom`.
+nothing. The verified set gains TensorFold 0.6.0, 0.6.1, 0.6.2, 0.6.3 and 0.6.5; any
+other version is `custom` (0.6.4 was not run live).
 
 ### 2. Registration
 
 `capyctl engine add` refuses a TensorFold installation with `toolchain_missing`
 (exit 26) unless `ninja`, `nvcc` and `c++` or `g++` are on the engine's closed
 launch PATH: the installation's `bin`, the profile's `<cuda_home>/bin`, then
-`/usr/local/bin:/usr/bin:/bin`. TensorFold 0.6.1 to 0.6.3 also build with a pip-only
+`/usr/local/bin:/usr/bin:/bin`. TensorFold 0.6.1 to 0.6.5 also build with a pip-only
 compiler (`pip install ninja "cuda-toolkit[nvcc,cccl]==13.0.*"`), which puts
 `nvcc` in `<env>/lib/python3.*/site-packages/nvidia/cu<major>/bin`; `nvcc` is
 also looked up there, after `<env>/bin` and before `<cuda_home>/bin`. The
@@ -52,7 +52,7 @@ another engine).
 only when the host or extra arguments name neither `--drafter` nor
 `--no-drafts`: TensorFold's default `--drafter auto` would pick a drafter from
 the Hugging Face cache. `--no-drafts` is ordinary and renders alone, since
-TensorFold 0.6.1 to 0.6.3 refuse `--drafter none` for a family whose CUDA engine needs
+TensorFold 0.6.1 to 0.6.5 refuse `--drafter none` for a family whose CUDA engine needs
 a drafter (Qwen3.8 dense); naming both is refused at deploy time and again when
 rendering, and a launch TensorFold refuses for a missing drafter reports that
 fix (found live 2026-10-02). The environment is
@@ -67,7 +67,10 @@ journal claims, or the standalone's unreleased bindings) is proved gone: a
 concurrent start of the same version shares the directory, and the lock of a
 launch that may be building stands (found live 2026-10-02). Reserved: `--host`, `--port`, `--name`, `--alias`,
 `--backend`, `--context`, `--tp`, `--rank`, `--master`, `--master-port`, `--snapshot-dir`,
-`--no-update-check`, checked with the
+`--no-update-check`, and 0.6.5's `--api-key`, `--api-key-file` and `--metrics-open`
+(as vLLM's `--api-key`: CapyCTL owns authentication, and an engine key would lock
+CapyCTL out of the engine's routes and `/metrics`; the closed environment never
+carries `TENSORFOLD_API_KEY`), checked with the
 abbreviation rule at deploy time and again when the command is rendered. There is
 no protected entry: TensorFold's parser accepts abbreviations, and the prefix rule
 is what re-verifies them. `--vision-urls`, `--lane-kernels` and `--drafter` need
@@ -88,7 +91,7 @@ or `host_backed` fails resolution with `capability_missing`. An undeclared
 `--parallel` above 1 its streams' caches grow into the budget TensorFold grants
 itself from free memory. The launch environment adds
 `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, the declared Ready allocation on the GPU's
-memory in GiB, which TensorFold 0.6.3 honours as its cap.
+memory in GiB, which TensorFold 0.6.3 and later honour as its cap.
 
 *Amended 2026-10-03 (owner decision):* TensorFold decodes as many requests
 together as CapyCTL keeps in flight for the deployment, as vLLM and SGLang run
@@ -120,7 +123,7 @@ for a count whose caches do not all fit at full length; a context that does not
 fit beside the streams' drafter buffers is, and the launch failure says to
 lower `max_concurrent_requests` or `context_length`, or raise the Ready
 allocation. Families TensorFold
-0.6.3 runs one request at a time on CUDA whatever `--parallel` says
+0.6.3 to 0.6.5 run one request at a time on CUDA whatever `--parallel` says
 (Nemotron-H) take the option and ignore it; status shows one stream for them
 when it reads the checkpoint. On a GB10, Qwen3.8 dense with one stream drafts
 wider trees than with `--parallel` above 1; measured live, one request alone

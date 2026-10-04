@@ -886,11 +886,11 @@ mod tests {
             "{out}"
         );
         d["context"]["streams"] = json!({"count": 1, "source": "extra_args",
-            "reason": "TensorFold 0.6.3 serves this model family (nemotron_h) one request at a time on CUDA"});
+            "reason": "TensorFold serves this model family (nemotron_h) one request at a time on CUDA"});
         let out = render(View::Status, &d, &HostNames::new());
         assert!(
             out.ends_with(
-                "Streams 1 request at a time (from extra_args): TensorFold 0.6.3 serves this \
+                "Streams 1 request at a time (from extra_args): TensorFold serves this \
                  model family (nemotron_h) one request at a time on CUDA\n"
             ),
             "{out}"
