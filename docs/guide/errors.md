@@ -69,6 +69,14 @@ a directory other users can write. `unsafe_file`: a link leaves the model's
 directory (or its Hugging Face cache). Fix the path or the permissions and
 deploy again.
 
+**A launch refused `checkpoint_mismatch`.** The checkpoint's digest is not the
+one the deployment declares in `model.content_fingerprint`, or the one CapyCTL
+recorded. A `sha256:` value with 64 hex digits there is CapyCTL's checkpoint
+digest, taken over every file under the model directory, not the hash of a
+weight file. `capyctl status deployment <name>` shows the declared and measured
+digests; set the field to the measured one, or leave it out and CapyCTL
+measures it. If the files changed on the host, restore them or deploy again.
+
 **A launch refused `port_conflict`.** Another program listens on the engine port
 CapyCTL leased. Start again (the next start takes a free port), or give CapyCTL
 another range with `--engine-ports`.

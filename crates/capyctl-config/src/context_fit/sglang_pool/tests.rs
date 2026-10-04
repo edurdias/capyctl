@@ -335,3 +335,65 @@ fn a_dense_static_pool_holds_the_overhead() {
     discrete.memory.device_total_bytes = Some(16 * GIB);
     assert_eq!(pool(&discrete, &dense()).unwrap().static_bytes, None);
 }
+
+/// The memory request a refusal names, in MiB.
+fn named_request_mib(refusal: &str) -> i64 {
+    let tail = refusal
+        .split("raise engine_config.memory.request to \"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no named request: {refusal}"));
+    tail.split("MiB\"").next().unwrap().parse().unwrap()
+}
+
+/// `settings` with an explicit request of `mib` MiB.
+fn at_mib(settings: &SglangLaunchSettings, mib: i64) -> SglangLaunchSettings {
+    let mut explicit = settings.clone();
+    explicit.provenance.clear();
+    explicit.memory.request_bytes = mib << 20;
+    explicit
+}
+
+// Found live 2026-10-04 (FrogNano NVFP4 on SGLang 0.5.21): a refusal named
+// 27.88 GB at a 24 GiB request and 30.03 GB at 26 GiB, while the state needed
+// weights + KV + state + the 8 GiB margin (31 GiB started). The request a
+// refusal names is the smallest whole MiB the same check accepts: one MiB
+// less is refused again.
+#[test]
+fn a_refusal_names_the_smallest_request_that_fits() {
+    let target = qwen38_27b();
+    let drafter = dflash_drafter();
+    let check = |settings: &SglangLaunchSettings| {
+        sglang_pool(settings, &[], Ok(&target), Some(Ok(&drafter)))
+    };
+    let weights = 25_770_000_000;
+    let mut cases = Vec::new();
+    // Weights and KV beyond the static pool: the room was floored at zero.
+    cases.push(dflash(fp8(settings(30 * GIB, 16 * GIB, Some(weights)))));
+    // Some room, not enough for the declared requests.
+    let mut declared = dflash(fp8(settings(48 * GIB, 16 * GIB, Some(weights))));
+    declared.common.max_concurrent_requests = Some(8);
+    cases.push(declared);
+    // Without speculative decoding, one request at a small request.
+    cases.push(fp8(settings(24 * GIB, 4 * GIB, Some(21_920_000_000))));
+    // A discrete device: the margin is a tenth of the weights share.
+    let mut discrete = fp8(settings(20 * GIB, 2 * GIB, Some(17 * GIB)));
+    discrete.memory.device_total_bytes = Some(48 * GIB);
+    cases.push(discrete);
+    // A derived request whose one request does not fit half the margin.
+    let mut derived = dflash(derived(16 * GIB, weights));
+    derived.extra_args[5] = "32".into();
+    cases.push(derived);
+    for case in cases {
+        let refusal = check(&case).unwrap_err();
+        let named = named_request_mib(&refusal);
+        assert!(named << 20 > case.memory.request_bytes, "{refusal}");
+        assert!(
+            check(&at_mib(&case, named)).is_ok(),
+            "{named} MiB: {refusal}"
+        );
+        assert!(
+            check(&at_mib(&case, named - 1)).is_err(),
+            "{named} MiB: {refusal}"
+        );
+    }
+}

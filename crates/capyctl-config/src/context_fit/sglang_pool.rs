@@ -353,13 +353,18 @@ pub fn sglang_pool(
                 _ => 1,
             };
             let needed = need(running).unwrap_or(u64::MAX);
-            let short = needed.saturating_sub(room + borrowable);
+            // Found live 2026-10-04: the request named is the smallest whole
+            // MiB this same check accepts for an explicit request, with the
+            // KV cache as it is: SGLang's margin stays outside the static pool.
+            let named = smallest_request(memory, weights.saturating_add(kv), needed)
+                .map(|mib| format!("to \"{mib}MiB\" ({} bytes)", mib << 20))
+                .unwrap_or_else(|| "beyond what CapyCTL can express".into());
             return Err(format!(
                 "SGLang keeps {needed} bytes of recurrent state for {running} running \
                  request{} of this hybrid model ({} state slots of {} bytes{}), beside {weights} \
                  bytes of weights and the {kv}-byte KV cache, and the memory request leaves \
-                 {} bytes for it; raise engine_config.memory.request by {short} bytes (to \
-                 {}){}",
+                 {} bytes for it; raise engine_config.memory.request {named}, keeping \
+                 memory.kv_cache at {kv} bytes{}",
                 if running == 1 { "" } else { "s" },
                 u64::from(running) * STATE_SLOTS_PER_REQUEST + 1,
                 hybrid.state_bytes,
@@ -372,11 +377,8 @@ pub fn sglang_pool(
                     String::new()
                 },
                 room + borrowable,
-                u64::try_from(memory.request_bytes)
-                    .unwrap_or(0)
-                    .saturating_add(short),
                 if running > 1 {
-                    " or lower max_concurrent_requests"
+                    " (or lower max_concurrent_requests)"
                 } else {
                     ""
                 },
@@ -415,6 +417,39 @@ fn grown_static(memory: &MemoryRequest, state: u64) -> Option<i64> {
         want.min(memory.request_bytes)
             .max(static_pool_bytes(memory).1),
     )
+}
+
+/// The smallest explicit memory request, in whole MiB, whose static pool
+/// ([`static_pool_bytes`], the margin outside it) holds `held` bytes of
+/// weights and KV cache plus `needed` bytes of state; `None` past `i64`.
+fn smallest_request(memory: &MemoryRequest, held: u64, needed: u64) -> Option<i64> {
+    let fits = |mib: i64| {
+        let mut memory = memory.clone();
+        memory.request_bytes = mib.checked_mul(1 << 20)?;
+        let (_, static_bytes) = static_pool_bytes(&memory);
+        Some(u64::try_from(static_bytes).ok()?.saturating_sub(held) >= needed)
+    };
+    // The check only grows with the request: a doubling step finds one that
+    // fits, and bisection the smallest.
+    let mut short = memory.request_bytes >> 20;
+    let mut step = 1i64;
+    let mut fit = loop {
+        let mib = short.checked_add(step)?;
+        if fits(mib)? {
+            break mib;
+        }
+        short = mib;
+        step = step.checked_mul(2)?;
+    };
+    while fit - short > 1 {
+        let mid = short + (fit - short) / 2;
+        if fits(mid)? {
+            fit = mid;
+        } else {
+            short = mid;
+        }
+    }
+    Some(fit)
 }
 
 /// The request was derived from the weights (weights + KV + margin), so it

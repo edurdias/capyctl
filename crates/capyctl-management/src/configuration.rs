@@ -264,7 +264,7 @@ impl ConfigurationFailure {
             CheckpointMismatch => (
                 StatusCode::CONFLICT,
                 "checkpoint_mismatch",
-                "The checkpoint does not match its declared or recorded digest",
+                "The checkpoint does not match its declared or recorded digest; a declared model.content_fingerprint is CapyCTL's checkpoint digest (over every file under the model directory), not a file hash. `capyctl status deployment <name>` shows the measured digest",
                 false,
             ),
             ModelSourcePending => (
