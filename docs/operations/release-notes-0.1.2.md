@@ -52,8 +52,10 @@
   `max_concurrent_requests`, or as many requests as fit, up to 32. An explicit
   `memory.request` too small for it is refused before launch, naming the
   smallest request that fits; a derived one runs as many requests as fit, and
-  status shows the limit. Before, a hybrid model could be held to 2 running
-  requests.
+  status shows the limit. On a discrete GPU, a derived request keeps the state
+  inside the KV cache CapyCTL chose, up to half of it, and the fitted context
+  is held to the rest; status and the start name the same request. Before, a
+  hybrid model could be held to 2 running requests.
 - **First starts and draft models.** The first-start reservation on vLLM and
   SGLang covers CUDA graph capture and the load transient
   (`max(request + graphs, weights x 2.25 + margin)` for new deployments). A
