@@ -11,7 +11,7 @@
 # and GPU drivers are never installed.
 #
 # Options:
-#   --version V     release to install, e.g. 0.1.1 (a leading "v" is
+#   --version V     release to install, e.g. 0.1.2 (a leading "v" is
 #                   accepted). Default: the latest release; a release
 #                   candidate is installed only when named.
 #   --system        install for every user: /usr/local/bin/capyctl, units under
