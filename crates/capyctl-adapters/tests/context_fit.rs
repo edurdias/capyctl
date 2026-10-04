@@ -410,3 +410,112 @@ fn sglang_sizes_the_weights_at_launch_when_the_revision_has_none() {
     let error = error.to_string();
     assert!(error.contains("21920000000 bytes of weights"), "{error}");
 }
+
+/// FrogNano-4B-2609's language model: 24 gated-delta-net layers and 8
+/// attention layers of 4 KV heads of 256; 51511296 bytes of state a request.
+fn frognano_4b() -> Value {
+    let mut types = Vec::new();
+    for _ in 0..8 {
+        types.extend(["linear_attention", "linear_attention", "linear_attention"]);
+        types.push("full_attention");
+    }
+    json!({"model_type": "qwen3_5", "text_config": {
+        "model_type": "qwen3_5_text", "num_hidden_layers": 32, "num_attention_heads": 16,
+        "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 2560,
+        "max_position_embeddings": 262144, "dtype": "bfloat16", "layer_types": types,
+        "full_attention_interval": 4, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+    }})
+}
+
+/// The golden SGLang deployment, stating no memory, on a 16 GB laptop GPU
+/// (16376 MiB, the standalone host's device domain: 8 % reserved).
+fn laptop_sglang(
+    config: &Value,
+    weights: i64,
+    edit: impl FnOnce(&mut Value),
+) -> (tempfile::TempDir, EffectiveDeployment) {
+    let store = tempfile::tempdir().unwrap();
+    let checkpoint = store.path().join("toy");
+    std::fs::create_dir(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("config.json"), config.to_string()).unwrap();
+    let (mut deployment, mut host) = golden("sglang");
+    host["model_store"]["path"] = json!(store.path());
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "30GiB", "free_reserve": "12GiB",
+                   "parked_limit": "15GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "15797762136B",
+                 "free_reserve": "1373718440B", "parked_limit": "4292870144B"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["engine_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("memory");
+    edit(&mut deployment);
+    let facts = capyctl_config::effective::CheckpointFacts {
+        weights_bytes: Some(weights),
+        ..Default::default()
+    };
+    let effective =
+        capyctl_config::effective::resolve_effective_with_checkpoint(&deployment, &host, facts)
+            .unwrap();
+    (store, effective)
+}
+
+fn named_mib(text: &str) -> String {
+    text.split("memory.request to \"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .unwrap_or_else(|| panic!("no named request: {text}"))
+        .to_owned()
+}
+
+// Found live 2026-10-04 (FrogNano-4B BF16, SGLang 0.5.21, a 16 GB laptop
+// GPU): a deployment stating no memory was refused for one running request.
+// Its derived request fits what it can: the state takes up to half of the KV
+// cache CapyCTL chose, the KV pool and the fitted context hold the rest, and
+// status says so before the start, as the start does.
+#[test]
+fn a_derived_hybrid_on_a_discrete_gpu_fits_what_it_can() {
+    let weights = 9_319_820_920i64;
+    let (_store, effective) = laptop_sglang(&frognano_4b(), weights, |_| {});
+    let kv = effective.engine_config.memory().kv_cache_bytes;
+    assert_eq!(kv, 15_797_762_136 / 4);
+    let state = 36 * 51_511_296i64;
+    let pool_tokens = (kv - state) / 32768;
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.warning, None);
+    assert_eq!(fit.running_limit, Some(7));
+    assert_eq!(fit.tokens, Some((pool_tokens - pool_tokens % 16) as u32));
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let settings = sglang_public(&sized);
+    assert_eq!(settings["max_running_requests"], json!(7));
+    assert_eq!(settings["max_mamba_cache_size"], json!(35));
+    assert_eq!(settings["max_total_tokens"], json!(pool_tokens));
+    assert_eq!(settings["context_length"], json!(fit.tokens));
+}
+
+// Found live 2026-10-04: status sized a discrete deployment's static pool as
+// unified memory's, so it named another request than the refused start.
+#[test]
+fn status_and_a_refused_discrete_start_name_the_same_request() {
+    let (_store, effective) = laptop_sglang(&frognano_4b(), 9_319_820_920, |d| {
+        d["engine_config"]["memory"] = json!({"request": "12GiB", "kv_cache": "3GiB"});
+    });
+    let warning = capyctl_config::context_fit::fit_for_effective(&effective)
+        .warning
+        .expect("status warns");
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let Err(error) = sglang_frozen(&sized) else {
+        panic!("refused")
+    };
+    assert_eq!(named_mib(&warning), named_mib(&error.to_string()));
+}
