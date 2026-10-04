@@ -555,16 +555,30 @@ pub fn fit_for_launch(
     );
     // Amendment A14: a hybrid model's recurrent state that does not fit the
     // memory request refuses the launch; status says so beforehand.
+    // The pool is sized as the launch sizes it (`sglang_pool_for_launch`),
+    // so status and a refused start name the same request.
     if let LaunchSettings::Sglang(sglang) = settings {
-        match sglang_pool(
-            sglang,
-            profile_args,
-            config.as_ref().map_err(Clone::clone),
-            draft
-                .as_ref()
-                .map(|config| config.as_ref().map_err(String::as_str)),
-        ) {
-            Ok(pool) => fit.running_limit = pool.running_limit,
+        match sglang_pool_for_launch(sglang, profile_args, checkpoint_root) {
+            Ok(pool) => {
+                fit.running_limit = pool.running_limit;
+                // A derived request on a discrete device keeps the state in
+                // the KV cache: a fitted context is held to the KV pool left.
+                if let (ContextSource::Fitted, Some(tokens), Some(pool_tokens)) =
+                    (fit.source, fit.tokens, pool.max_total_tokens)
+                {
+                    let block = DEFAULT_BLOCK_TOKENS;
+                    let held = pool_tokens - pool_tokens % block;
+                    if held < tokens && held > 0 {
+                        fit.tokens = Some(held);
+                        fit.reason = Some(match fit.reason.take() {
+                            Some(reason) => {
+                                format!("{reason}; held to the KV pool the recurrent state leaves")
+                            }
+                            None => "held to the KV pool the recurrent state leaves".into(),
+                        });
+                    }
+                }
+            }
             Err(refusal) => fit.warning = Some(refusal),
         }
     }
@@ -722,10 +736,27 @@ fn speculative_tokens(args: &[String]) -> Option<u32> {
 pub fn fit_for_effective(effective: &crate::effective::EffectiveDeployment) -> ContextFit {
     fit_for_launch(
         effective.profile.engine,
-        &effective.engine_config,
+        &sized_on_device(effective),
         &effective.profile.args,
         effective.model.resolved_path.as_deref().map(Path::new),
     )
+}
+
+/// SGLang's settings as a launch on a device domain sizes them: found live
+/// 2026-10-04, `status` (which has observed no card total) sized a discrete
+/// deployment's static pool as unified memory's and named another request
+/// than the refused start. Only whether the device is discrete matters to the
+/// pool, so the Ready allocation stands in for an unobserved total.
+pub(crate) fn sized_on_device(effective: &crate::effective::EffectiveDeployment) -> LaunchSettings {
+    let mut settings = effective.engine_config.clone();
+    if let LaunchSettings::Sglang(sglang) = &mut settings {
+        if sglang.memory.device_total_bytes.is_none() {
+            if let Some((_, bytes)) = effective.ready_device_allocation() {
+                sglang.memory.device_total_bytes = Some(bytes.max(1));
+            }
+        }
+    }
+    settings
 }
 
 /// The effective context as a server sees a deployment whose checkpoint is on

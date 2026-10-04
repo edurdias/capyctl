@@ -849,6 +849,21 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   The running requests are the most, up to the declared count (or 32), that fit, and the
   launch is refused only when one request does not fit. A discrete device lends nothing
   from its margin.
+- On a discrete device (found live 2026-10-04, FrogNano-4B BF16 on a 16 GB laptop GPU), a
+  derived request is the weights x 1.10 plus the KV cache, its static pool exactly the
+  weights and the KV cache, and its margin lends nothing, so every hybrid deployment that
+  stated no memory was refused for one running request. CapyCTL chose that KV cache as
+  well, so the state takes up to half of it: the running requests are the most, up to the
+  declared count (or 32), whose state fits half the KV cache, the KV pool
+  (`--max-total-tokens`) is the KV cache less that state, and the fitted context is held to
+  that pool. FrogNano-4B there runs 7 requests at 63920 tokens of context (it fitted 120512
+  and was refused). The launch is refused only when one request's state exceeds half the KV
+  cache. A declared `max_total_tokens` keeps its pool and lends nothing. Open: SGLang's own
+  allocations inside a discrete static pool are not modelled (it keeps its static pool), so
+  that start held 42741 of the 63935 KV tokens passed and answered a longer input with a
+  400 naming the limit.
+- `status` sizes a deployment on a device domain as the launch does, before a card total is
+  observed, so its warning and a refused start name the same memory request.
 - When the state holds fewer running requests than the declared count (or 32),
   `status deployment` says "Running limited to N requests by the state cache", and the
   status JSON carries `context.running_limit` (standalone; a remote host decides at launch).

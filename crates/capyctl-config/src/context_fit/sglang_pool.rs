@@ -26,7 +26,9 @@
 //!   hold it. A derived request (owner decision 2026-10-03) fits what it can:
 //!   the state may take up to half of the margin on unified memory, the
 //!   running requests are limited to what fits, and only one request that
-//!   does not fit is refused.
+//!   does not fit is refused. On a discrete device the margin lends nothing:
+//!   the state takes up to half of the KV cache, and the KV pool holds the
+//!   rest (found live 2026-10-04).
 //!
 //! SGLang 0.5.20 and 0.5.21 (`kv_cache_configurator.py`): an explicit
 //! `max_mamba_cache_size` fixes the state pool, reserving
@@ -334,12 +336,25 @@ pub fn sglang_pool(
     // half of the margin on unified memory; the other half stays for SGLang's
     // runtime outside its static pool. An explicit request is strict.
     let derived = derived_request(settings, weights);
-    let borrowable = if derived && memory.device_total_bytes.is_none() {
+    let discrete = memory.device_total_bytes.is_some();
+    let borrowable = if derived && !discrete {
         u64::try_from(margin / 2).unwrap_or(0)
     } else {
         0
     };
-    let fits = |running: u32| need(running).is_some_and(|bytes| bytes <= room + borrowable);
+    // Found live 2026-10-04 (FrogNano-4B BF16, a 16 GB discrete GPU): a
+    // derived discrete request's static pool is exactly the weights and the
+    // KV cache, and its margin lends nothing, so every hybrid deployment was
+    // refused. CapyCTL chose that KV cache too: the state takes up to half of
+    // it, and the KV pool (and the fitted context) holds what is left. A
+    // declared `max_total_tokens` is the deployment's own pool and keeps it.
+    let from_kv = if derived && discrete && settings.max_total_tokens.is_none() {
+        kv / 2
+    } else {
+        0
+    };
+    let available = room + borrowable + from_kv;
+    let fits = |running: u32| need(running).is_some_and(|bytes| bytes <= available);
     let bound = declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT);
     let largest = (1..=bound).rev().find(|running| fits(*running));
     let running = match (largest, declared) {
@@ -376,7 +391,7 @@ pub fn sglang_pool(
                 } else {
                     String::new()
                 },
-                room + borrowable,
+                available,
                 if running > 1 {
                     " (or lower max_concurrent_requests)"
                 } else {
@@ -386,6 +401,11 @@ pub fn sglang_pool(
         }
     };
     pool.max_mamba_cache_size = state_slots(running);
+    let taken = need(running).unwrap_or(0).saturating_sub(room + borrowable);
+    if from_kv > 0 && taken > 0 {
+        let tokens = (kv - taken.min(kv)) / per_token.max(1);
+        pool.max_total_tokens = Some(u32::try_from(tokens.min(i32::MAX as u64)).unwrap_or(0));
+    }
     if declared != Some(running) {
         pool.max_running_requests = Some(running);
     }
@@ -394,8 +414,13 @@ pub fn sglang_pool(
     }
     pool.static_bytes = grown_static(memory, need(running).unwrap_or(0));
     pool.reason = Some(format!(
-        "hybrid model: recurrent state for {running} running request{} sized beside the KV cache",
-        if running == 1 { "" } else { "s" }
+        "hybrid model: recurrent state for {running} running request{} sized {}",
+        if running == 1 { "" } else { "s" },
+        if from_kv > 0 && taken > 0 {
+            "out of the KV cache"
+        } else {
+            "beside the KV cache"
+        }
     ));
     Ok(pool)
 }
@@ -452,16 +477,24 @@ fn smallest_request(memory: &MemoryRequest, held: u64, needed: u64) -> Option<i6
     Some(fit)
 }
 
-/// The request was derived from the weights (weights + KV + margin), so it
-/// holds nothing for a hybrid model's state.
+/// The request was derived from the weights, so it holds nothing for a
+/// hybrid model's state: weights + KV + margin, or on a discrete device the
+/// weights x 1.10 + KV (discrete GPU design §3).
 fn derived_request(settings: &SglangLaunchSettings, weights: u64) -> bool {
     let memory = &settings.memory;
+    let kv = u64::try_from(memory.kv_cache_bytes).unwrap_or(0);
+    let derived = if memory.device_total_bytes.is_some() {
+        (weights / 100)
+            .checked_mul(110)
+            .and_then(|scaled| scaled.checked_add(kv))
+    } else {
+        weights
+            .checked_add(kv)
+            .and_then(|sum| sum.checked_add(u64::try_from(memory.margin_bytes).ok()?))
+    };
     settings.provenance.get("memory.request")
         == Some(&capyctl_domain::launch::SettingSource::Derived)
-        && u64::try_from(memory.request_bytes).ok()
-            == weights
-                .checked_add(u64::try_from(memory.kv_cache_bytes).unwrap_or(0))
-                .and_then(|sum| sum.checked_add(u64::try_from(memory.margin_bytes).ok()?))
+        && u64::try_from(memory.request_bytes).ok() == derived
 }
 
 fn state_slots(running: u32) -> Option<u32> {
@@ -548,7 +581,7 @@ fn weight_file_bytes(root: &Path) -> Option<u64> {
 pub fn sglang_pool_for_effective(
     effective: &crate::effective::EffectiveDeployment,
 ) -> Option<Result<SglangPool, String>> {
-    match &effective.engine_config {
+    match &super::sized_on_device(effective) {
         capyctl_domain::launch::LaunchSettings::Sglang(settings) => Some(sglang_pool_for_launch(
             settings,
             &effective.profile.args,

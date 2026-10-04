@@ -397,3 +397,95 @@ fn a_refusal_names_the_smallest_request_that_fits() {
         );
     }
 }
+
+/// FrogNano-4B-2609's language model: 24 gated-delta-net layers and 8
+/// attention layers with 4 KV heads of 256 (32 KiB of bfloat16 KV per
+/// token). SGLang's state per request is 24 × (8192 × 3 × 2 + 32 × 128 ×
+/// 128 × 4) = 51511296 bytes.
+fn frognano_4b() -> Value {
+    let mut types = Vec::new();
+    for _ in 0..8 {
+        types.extend(["linear_attention", "linear_attention", "linear_attention"]);
+        types.push("full_attention");
+    }
+    json!({"model_type": "qwen3_5", "text_config": {
+        "model_type": "qwen3_5_text", "num_hidden_layers": 32, "num_attention_heads": 16,
+        "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 2560,
+        "max_position_embeddings": 262144, "dtype": "bfloat16", "layer_types": types,
+        "full_attention_interval": 4, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+    }})
+}
+
+const FROGNANO_STATE: u64 = 51_511_296;
+const FROGNANO_WEIGHTS: i64 = 9_319_820_920;
+/// The default KV cache on a 16 GB laptop GPU: a quarter of its managed limit.
+const LAPTOP_KV: i64 = 3_949_440_534;
+
+/// A request CapyCTL derived on a discrete GPU: the weights x 1.10 plus the
+/// KV cache (discrete GPU design §3), beside SGLang's family margin.
+fn derived_discrete(kv: i64, weights: i64) -> SglangLaunchSettings {
+    let mut derived = settings(weights / 100 * 110 + kv, kv, Some(weights));
+    derived.memory.device_total_bytes = Some(17_171_480_576);
+    derived.provenance.insert(
+        "memory.request".into(),
+        capyctl_domain::launch::SettingSource::Derived,
+    );
+    derived
+}
+
+// Found live 2026-10-04 (FrogNano-4B BF16, SGLang 0.5.21, a 16 GB laptop
+// GPU): a derived request on a discrete device leaves no room beside the
+// weights and the KV cache, and every start was refused for one running
+// request. CapyCTL chose that KV cache, so the state takes up to half of it
+// and the KV pool holds the rest.
+#[test]
+fn a_derived_discrete_request_keeps_the_state_in_its_kv_cache() {
+    let target = frognano_4b();
+    let found = pool(&derived_discrete(LAPTOP_KV, FROGNANO_WEIGHTS), &target).unwrap();
+    // Half the KV cache holds 7 requests: 36 slots of state.
+    let state = 36 * FROGNANO_STATE;
+    assert!(state <= LAPTOP_KV as u64 / 2 && 41 * FROGNANO_STATE > LAPTOP_KV as u64 / 2);
+    assert_eq!(found.max_running_requests, Some(7));
+    assert_eq!(found.max_mamba_cache_size, Some(35));
+    assert_eq!(found.running_limit, Some(7));
+    assert_eq!(
+        found.max_total_tokens,
+        Some(((LAPTOP_KV as u64 - state) / 32768) as u32)
+    );
+    // A discrete device keeps its static pool.
+    assert_eq!(found.static_bytes, None);
+    // A declared count that fits is kept.
+    let mut declared = derived_discrete(LAPTOP_KV, FROGNANO_WEIGHTS);
+    declared.common.max_concurrent_requests = Some(4);
+    let found = pool(&declared, &target).unwrap();
+    assert_eq!(found.max_running_requests, None);
+    assert_eq!(found.max_mamba_cache_size, Some(20));
+    assert_eq!(found.running_limit, None);
+    assert_eq!(
+        found.max_total_tokens,
+        Some(((LAPTOP_KV as u64 - 21 * FROGNANO_STATE) / 32768) as u32)
+    );
+    // An explicit request of the same size is strict, and refused.
+    let mut explicit = derived_discrete(LAPTOP_KV, FROGNANO_WEIGHTS);
+    explicit.provenance.clear();
+    let refusal = pool(&explicit, &target).unwrap_err();
+    assert!(refusal.contains("1 running request "), "{refusal}");
+    // A KV cache whose half holds no request's state is refused.
+    let refusal = pool(&derived_discrete(256 << 20, FROGNANO_WEIGHTS), &target).unwrap_err();
+    assert!(refusal.contains("1 running request "), "{refusal}");
+}
+
+// T14: unified memory is unchanged: the state borrows half the margin and
+// the KV pool is the whole KV cache.
+#[test]
+fn a_derived_unified_request_keeps_its_kv_pool() {
+    let target = frognano_4b();
+    let mut unified = derived(4 * GIB, FROGNANO_WEIGHTS);
+    unified.common.kv_cache_dtype = None;
+    let found = pool(&unified, &target).unwrap();
+    assert_eq!(found.max_total_tokens, Some((4 * GIB / 32768) as u32));
+    assert_eq!(found.max_mamba_cache_size, Some(5 * 16));
+    assert_eq!(found.running_limit, Some(16));
+}
