@@ -141,3 +141,71 @@ async fn wait_succeeds_once_every_replica_is_ready() {
         "{result}"
     );
 }
+
+// Found live 2026-10-04: a launch refused before anything started (an SGLang
+// sizing refusal, a TensorFold memory cap) gives up and closes the instance's
+// admission while its operation stays pending until the Initialize deadline.
+// `--wait` ends at once with the refusal status shows, not after the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_ends_at_once_when_the_start_gave_up() {
+    const REFUSAL: &str = "gave up: launch refused: SGLang keeps 1 bytes of recurrent state";
+    let latest = json!({"id": OPERATION, "kind": "initialize", "state": "pending",
+        "reason": REFUSAL, "given_up": true});
+    let app = Router::new()
+        .route(
+            "/management/v1/snapshot",
+            routing::get(move || {
+                let latest = latest.clone();
+                async move {
+                    Json(json!({
+                        "deployments": [{
+                            "id": DEPLOYMENT, "name": "pair", "revision": "1",
+                            "timeouts": {"request_deadline_ms": 600_000,
+                                         "initialize_ms": 300_000, "stop_ms": 3_000},
+                            "latest_operation": latest,
+                            "instances": [{"index": 0, "lifecycle": "active",
+                                "observed_state": "queued", "operator_stopped": false,
+                                "latest_operation": latest}]
+                        }],
+                        "operations": [{"id": OPERATION, "state": "pending"}]
+                    }))
+                }
+            }),
+        )
+        .route(
+            &format!("/management/v1/deployments/{DEPLOYMENT}/actions"),
+            routing::post(|| async {
+                (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(json!({"api_version": "1", "operation_id": OPERATION,
+                        "deployment_id": DEPLOYMENT, "joined": false, "revision": "1"})),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = state_dir();
+    let began = std::time::Instant::now();
+    let output = tokio::task::spawn_blocking(move || {
+        support::capyctl()
+            .env("CAPYCTL_STATE_DIR", dir.path())
+            .env(capyctl_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string())
+            .args(["start", "deployment", "pair", "--wait", "--format", "json"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(20),
+        "{said}"
+    );
+    assert!(!output.status.success(), "{said}");
+    assert!(said.contains(REFUSAL), "{said}");
+}

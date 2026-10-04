@@ -16,6 +16,10 @@ model:
   # A checkpoint directory under the models directory (~/models by default).
   path: Qwen3-4B
   # Labels for this copy of the weights; change them when the files change.
+  # A `sha256:` followed by 64 hex digits is not a label: it is CapyCTL's
+  # checkpoint digest (over every file under the model directory, not one
+  # file's hash), which the start then requires. Leave it out to have CapyCTL
+  # measure it; `capyctl status deployment <name> --format json` shows it.
   content_fingerprint: "qwen3-4b-1"
   revision: "1"
 devices:

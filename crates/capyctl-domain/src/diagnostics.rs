@@ -27,7 +27,7 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "checkpoint_mismatch",
-        "the checkpoint on the host no longer matches the digest recorded for this revision; restore that checkpoint, or deploy a new revision so it is measured again",
+        "the checkpoint's digest is not the one declared or recorded for this revision. A declared model.content_fingerprint of the form sha256:<64 hex> is CapyCTL's checkpoint digest over every file under the model directory, not a file hash: `capyctl status deployment <name>` shows the measured one; set the field to it, or leave it out and CapyCTL measures it. Otherwise the checkpoint changed on the host: restore it, or deploy a new revision so it is measured again",
     ),
     (
         "checkpoint_unverified",
@@ -265,6 +265,16 @@ mod tests {
         assert!(operator_hint("port_conflict")
             .unwrap()
             .contains("--engine-ports"));
+    }
+
+    // Found live 2026-10-04: a weight file's SHA-256 declared as
+    // `content_fingerprint` was refused with no word of what the field holds.
+    #[test]
+    fn a_checkpoint_mismatch_says_what_the_fingerprint_is() {
+        let hint = operator_hint("checkpoint_mismatch").unwrap();
+        assert!(hint.contains("model.content_fingerprint"), "{hint}");
+        assert!(hint.contains("not a file hash"), "{hint}");
+        assert!(hint.contains("capyctl status deployment"), "{hint}");
     }
 
     // T29: only a closed code is shown as an operation's error code.

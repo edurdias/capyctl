@@ -512,6 +512,15 @@ impl Management {
                     _ => {}
                 }
             }
+            // Found live 2026-10-04: a start that gave up (a refused launch,
+            // its retries spent) stays pending until its deadline; nothing
+            // more is attempted for it, so the wait ends now with its reason.
+            if gave_up(&snapshot, operation) {
+                return Err(error(
+                    "operation_failed",
+                    failure_message(&snapshot, operation),
+                ));
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(error("activation_timeout", format!("Wait expired for operation {operation}; the accepted operation was not cancelled")));
             }
@@ -548,14 +557,17 @@ fn replicas(deployment: &Value, seen: &mut std::collections::BTreeSet<u64>) -> R
         if seen.contains(&index) {
             continue;
         }
+        // Found live 2026-10-04: a start that gave up is as final as a
+        // failed one, though its operation stays pending until its deadline.
+        let given_up = instance["latest_operation"]["given_up"] == true;
         match state {
             // Ended without becoming Ready: a start that could not be placed
             // before its deadline, a failed launch, or stopped meanwhile.
-            "stopped" | "failed" | "parked" => {
+            _ if given_up || matches!(state, "stopped" | "failed" | "parked") => {
                 let last_error = instance["last_error"].as_str().unwrap_or("");
                 let reason = instance["latest_operation"]["reason"]
                     .as_str()
-                    .filter(|_| state == "failed")
+                    .filter(|_| state == "failed" || given_up)
                     .unwrap_or(last_error);
                 let code = if last_error.starts_with("placement:") {
                     "insufficient_resources"
@@ -658,6 +670,25 @@ fn with_timeout(mut intent: Value, initialize_timeout_ms: Option<i64>) -> Value 
 /// the reason and hint of that operation where the deployment or one of its
 /// instances reports it as its latest operation, else its closed error code
 /// with that code's fixed hint, else only where to look.
+/// Found live 2026-10-04: whether status records that `operation` gave up
+/// (`latest_operation.given_up`, on the deployment or one of its instances).
+fn gave_up(snapshot: &Value, operation: &str) -> bool {
+    snapshot["deployments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|d| {
+            std::iter::once(&d["latest_operation"]).chain(
+                d["instances"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|i| &i["latest_operation"]),
+            )
+        })
+        .any(|op| op["id"] == operation && op["given_up"] == true)
+}
+
 fn failure_message(snapshot: &Value, operation: &str) -> String {
     let latest = snapshot["deployments"]
         .as_array()

@@ -1345,7 +1345,10 @@ async fn conclude_initialize(
                 )))
             }
         };
-        if record.attempts < i64::from(shared.options.max_attempts) {
+        // Found live 2026-10-04: a refusal a retry cannot change gives up now.
+        if !refused_for_good(&recorded_reason)
+            && record.attempts < i64::from(shared.options.max_attempts)
+        {
             // The step is still planned against its original reservation, so a
             // later poll rediscovers this exact work. Nothing is released, no
             // epoch advances and no dispatch is replayed.
@@ -1420,4 +1423,32 @@ async fn conclude_initialize(
         )));
     }
     Outcome::Done
+}
+
+/// Host refusals that can clear on their own (another start takes a free
+/// port, memory another program held is freed, a download or a parked
+/// instance's release completes, a host session is re-established): these
+/// keep the retry budget (SPEC §13.2, ADR 0011 decision 5).
+const TRANSIENT_REFUSALS: &[&str] = &[
+    "port_conflict",
+    "insufficient_memory",
+    "insufficient_device_memory",
+    "parked_capacity",
+    "model_source_pending",
+    "checkpoint_unverified",
+    "unauthorized",
+];
+
+/// Found live 2026-10-04: whether `reason` is a host refusal before any
+/// effect that a retry of the same configuration cannot change (an SGLang
+/// sizing refusal, a checkpoint mismatch, a missing capability). Such a
+/// start gives up at once instead of waiting out its retry cooldowns.
+fn refused_for_good(reason: &str) -> bool {
+    let prefix = capyctl_adapters::traits::RuntimeError::Refused(String::new()).to_string();
+    match reason.split_once(prefix.as_str()) {
+        Some((_, category)) => !TRANSIENT_REFUSALS
+            .iter()
+            .any(|transient| category.starts_with(transient)),
+        None => false,
+    }
 }

@@ -179,6 +179,48 @@ ValueError: invalid choice bogus-value SECRET'),
         .is_none());
 }
 
+/// Found live 2026-10-04: a start whose launch was refused (an SGLang sizing
+/// refusal, a TensorFold memory cap) gives up and closes its own admission
+/// while its operation stays pending until the Initialize deadline. Status
+/// says so (`given_up`), so a waiting client can end its wait at once.
+#[test]
+fn status_marks_an_operation_whose_start_gave_up() {
+    let (_dir, store, writer) = fixture();
+    writer
+        .execute_batch(&format!(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,observed_state,admission_enabled,dispatch_enabled,suspended,current_generation,schema_version,revision) VALUES('d','d','model','ready','starting',0,0,0,5,1,1);
+            INSERT INTO effective_revisions VALUES('d',1,'{VLLM_EXPOSED}','f');
+            UPDATE deployment_instances SET generation=5 WHERE deployment_id='d' AND instance_index=0;
+            INSERT INTO operations(id,deployment_id,kind,state,accepted_at) VALUES
+              ('o1','d','initialize','pending','2026-01-01T00:00:02.000Z');
+            INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json,instance_index) VALUES
+              ('o1','d',1,5,'s','activate','running',1,'{{}}',0);
+            INSERT INTO journal_entries(id,host_id,operation_id,state,evidence) VALUES
+              ('j1',NULL,'o1','attempt_failed','deployment d: attempt failed: launch refused'),
+              ('j2',NULL,'o1','given_up','deployment d: gave up: launch refused');"#
+        ))
+        .unwrap();
+    let json = serde_json::to_value(store.snapshot().unwrap()).unwrap();
+    let deployment = &json["deployments"][0];
+    for latest in [
+        &deployment["latest_operation"],
+        &deployment["instances"][0]["latest_operation"],
+    ] {
+        assert_eq!(latest["id"], "o1", "{json}");
+        assert_eq!(latest["state"], "pending");
+        assert_eq!(latest["given_up"], true, "{json}");
+        assert_eq!(latest["reason"], "gave up: launch refused");
+    }
+    // An operation still retrying has not given up, and says nothing.
+    writer
+        .execute_batch("DELETE FROM journal_entries WHERE id='j2';")
+        .unwrap();
+    let json = serde_json::to_value(store.snapshot().unwrap()).unwrap();
+    assert!(json["deployments"][0]["latest_operation"]
+        .get("given_up")
+        .is_none());
+}
+
 /// ADR 0013 §7: compaction moves an instance that holds no runtime into a free
 /// lower index. The runs recorded at that index belong to the incarnations
 /// that used it before; the instance now there never ran them. Status derives

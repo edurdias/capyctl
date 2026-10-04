@@ -209,6 +209,12 @@ pub struct LatestOperation {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<&'static str>,
+    /// Found live 2026-10-04: the start gave up (its retries are spent, or its
+    /// failure may not be replayed) and closed its own admission; the
+    /// operation stays pending until its deadline, but nothing more is
+    /// attempted for it. A waiting client ends its wait on it. Additive.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub given_up: bool,
 }
 
 /// ADR 0013 §3: one allowed host's resolution of the current revision.
@@ -924,7 +930,7 @@ impl Store {
 
 /// SPEC §6.4: the columns [`latest_operation`] reads, the operation aliased
 /// `o`: its latest journal evidence is cut in SQL before it is read.
-const LATEST_OPERATION: &str = "o.id,o.kind,o.state,o.error_code,(SELECT substr(j.evidence,1,4096) FROM journal_entries j WHERE j.operation_id=o.id ORDER BY j.rowid DESC LIMIT 1)";
+const LATEST_OPERATION: &str = "o.id,o.kind,o.state,o.error_code,(SELECT substr(j.evidence,1,4096) FROM journal_entries j WHERE j.operation_id=o.id ORDER BY j.rowid DESC LIMIT 1),(SELECT j.state='given_up' FROM journal_entries j WHERE j.operation_id=o.id ORDER BY j.rowid DESC LIMIT 1)";
 
 /// SPEC §6.4: one latest operation, with its closed error code and, when it did
 /// not succeed, its bounded reason and hint.
@@ -967,6 +973,7 @@ fn latest_operation(
         error_code,
         reason,
         hint,
+        given_up: failed && r.get::<_, Option<bool>>(5)?.unwrap_or(false),
     }))
 }
 

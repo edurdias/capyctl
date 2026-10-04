@@ -398,6 +398,22 @@ fn status(value: &Value, names: &HostNames) -> String {
             clean(diagnostic)
         ));
     }
+    // Found live 2026-10-04: a declared fingerprint that is a weight file's
+    // hash, not CapyCTL's checkpoint digest, says which value is expected.
+    let digest = &d["checkpoint_digest"];
+    if digest["state"] == "mismatch" {
+        if let (Some(declared), Some(measured)) =
+            (digest["expected"].as_str(), digest["digest"].as_str())
+        {
+            notes.push(format!(
+                "Checkpoint  mismatch: declared {}, measured {}. model.content_fingerprint is \
+                 CapyCTL's checkpoint digest (over every file under the model directory), not \
+                 a file hash: set it to the measured value, or leave it out",
+                clean(declared),
+                clean(measured)
+            ));
+        }
+    }
     if !notes.is_empty() {
         out.push('\n');
         for note in notes {
@@ -963,6 +979,29 @@ mod tests {
             out.contains("Checkpoint  could not be measured (invalid_root)"),
             "{out}"
         );
+    }
+
+    // Found live 2026-10-04: a declared `sha256:` fingerprint that was a weight
+    // file's hash was refused `checkpoint_mismatch` with no word of what the
+    // field holds. Status names the declared and measured digests and says
+    // that the field is CapyCTL's checkpoint digest.
+    #[test]
+    fn status_explains_a_checkpoint_mismatch() {
+        let declared = format!("sha256:{}", "a".repeat(64));
+        let measured = format!("sha256:{}", "b".repeat(64));
+        let out = render(
+            View::Status,
+            &json!({"name": "fv", "kind": "model", "desired_state": "running",
+                "observed_state": "stopped", "ready_instances": 0, "desired_instances": 1,
+                "revision": "1",
+                "checkpoint_digest": {"state": "mismatch", "provisional": false,
+                    "expected": declared, "digest": measured},
+                "instances": []}),
+            &names(),
+        );
+        assert!(out.contains(&format!("declared {declared}")), "{out}");
+        assert!(out.contains(&format!("measured {measured}")), "{out}");
+        assert!(out.contains("not a file hash"), "{out}");
     }
 
     // T16: an instance whose launch failed shows the failure's code and
