@@ -56,6 +56,8 @@ fn tensorfold_is_a_named_engine_with_a_verified_version() {
     assert!(is_verified(Engine::Tensorfold, "0.6.2"));
     assert!(is_verified(Engine::Tensorfold, "0.6.3"));
     assert!(!is_verified(Engine::Tensorfold, "0.6.4"));
+    assert!(is_verified(Engine::Tensorfold, "0.6.5"));
+    assert!(!is_verified(Engine::Tensorfold, "0.6.6"));
 }
 
 // T41 T14: every reserved flag is refused, abbreviated and as a value form.
@@ -77,6 +79,14 @@ fn reserved_tensorfold_flags_are_refused_in_every_spelling() {
         json!(["--no-update-check"]),
         json!(["--snapshot", "/tmp/s"]),
         json!(["--conte", "4096"]),
+        // TensorFold 0.6.5: the engine's own API keys. CapyCTL owns
+        // authentication; a key would lock CapyCTL out of the engine's
+        // routes and `/metrics`.
+        json!(["--api-key", "k"]),
+        json!(["--api-key=k"]),
+        json!(["--api-key-file", "/tmp/keys"]),
+        json!(["--api-key-f", "/tmp/keys"]),
+        json!(["--metrics-open"]),
     ] {
         let args: Vec<String> = serde_json::from_value(args.clone()).unwrap();
         let error = validate_extra_args(&args, &context(&none, &none))

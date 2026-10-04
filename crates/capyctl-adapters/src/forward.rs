@@ -1048,8 +1048,8 @@ mod tests {
     }
 
     // T41 (ADR 0023 §7): with `stream_options.include_usage`, TensorFold 0.6.3
-    // sends usage as its own final chunk with `choices: []` after the finish
-    // chunk that carries the `tensorfold` object (found live 2026-10-02).
+    // to 0.6.5 send usage as their own final chunk with `choices: []` after the
+    // finish chunk that carries the `tensorfold` object (found live 2026-10-02).
     // Collection keeps both.
     #[test]
     fn a_collected_response_keeps_a_separate_usage_chunk() {
