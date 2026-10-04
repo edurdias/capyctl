@@ -1611,6 +1611,72 @@ fn steps(sql: &rusqlite::Connection, deployment_id: &str) -> (i64, bool) {
 /// up on only after the budget is spent. SPEC §13.2: the retry is counted against
 /// the exact configuration that failed, and the wait between attempts doubles. T20
 // T20
+/// Drive one start whose launch fails with `failure` until the deployment
+/// gives up; how many launches were attempted.
+async fn attempts_until_given_up(failure: capyctl_adapters::traits::RuntimeError) -> usize {
+    let (dir, owner, fence, observations) = setup().await;
+    let drives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = drives.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(CoordinatorError::Service(failure.to_string()))
+        }),
+    )
+    .unwrap();
+    let start = w.start(&fence, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !steps(&sql, &fence.deployment_id).1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deployment never gave up");
+    drop(start);
+    w.shutdown().await.unwrap();
+    drives.load(Ordering::SeqCst)
+}
+
+// Found live 2026-10-04: a launch the host refused before any effect for a
+// reason that a retry cannot change (an SGLang sizing refusal, a checkpoint
+// mismatch, a missing capability) gives up at once; the same start was
+// retried twice, 30 s and 60 s apart, before. A refusal that can clear (a
+// busy port, memory another program holds) keeps the retry budget.
+#[tokio::test]
+async fn a_deterministic_refusal_gives_up_without_retrying() {
+    use capyctl_adapters::traits::RuntimeError;
+    for reason in [
+        "SGLang keeps 2111963136 bytes of recurrent state for 8 running requests",
+        "checkpoint_mismatch",
+        "capability_missing:deep_park",
+    ] {
+        assert_eq!(
+            attempts_until_given_up(RuntimeError::Refused(reason.into())).await,
+            1,
+            "{reason}"
+        );
+    }
+    for reason in ["port_conflict", "insufficient_device_memory"] {
+        assert_eq!(
+            attempts_until_given_up(RuntimeError::Refused(reason.into())).await,
+            3,
+            "{reason}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_failed_start_is_retried_until_the_budget_is_spent() {
     let (dir, owner, fence, observations) = setup().await;
