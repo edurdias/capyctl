@@ -1,5 +1,52 @@
 # Current implementation and launch status
 
+## TensorFold 0.6.5 verified — 2026-10-04 (branch `feat/verify-tensorfold-0.6.5`)
+
+TensorFold 0.6.5 joins 0.6.0 to 0.6.3 in the verified set (ADR 0023 §1), so
+`engine add` shows it `custom no`; 0.6.4, not run live, and later versions stay
+custom. Between the v0.6.3 and v0.6.5 tags, the build toolchain and the drafter
+checks are unchanged for CapyCTL (`cuda/build.py` only adds a refusal of Flash
+Next below sm_120). `cli_args.py` adds `--api-key` (repeatable),
+`--api-key-file` and `--metrics-open`: with a key, TensorFold refuses every
+route without one, `/metrics` included, and `/health` shrinks to
+`{"status":"ok"}`. All three are now reserved, as vLLM's `--api-key` is;
+CapyCTL passes no key and its closed environment never carries
+`TENSORFOLD_API_KEY`, so `/metrics` stays open on the loopback listener.
+`--mtp-confidence` (Nemotron's fixed floor instead of 0.6.5's measured-cost
+depth) stays an ordinary option, and the `plan` command is not `serve`.
+`server/metrics.py` adds `tensorfold:requests_total` (with keys only) and
+`tensorfold:process_footprint_bytes` (macOS only); neither is read. Nemotron-H
+on CUDA still runs one request at a time, and the status reason no longer
+names a version.
+
+Live on host A (one GB10, standalone from origin/main `9b90a56`, fresh 0700
+state and config directories, a new `~/tensorfold-0.6.5-venv` with the same
+pins as 0.6.3: torch 2.13.0 cu130, triton 3.7.1, system CUDA 13.0). Qwen3.8-27B
+NVFP4 with the DFlash2 drafter, `--parallel 8`, greedy:
+
+| Step | Result |
+|---|---|
+| `engine add` | `tf065 0.6.5` registered beside `tf063 0.6.3` |
+| `start --wait`, cold (empty kernel cache) | 104.8 s (0.6.3: 123.0 s) |
+| `start --wait`, warm | 14.5 s |
+| stream with reasoning | 14 reasoning chunks, content `391`, `finish_reason: stop`, usage chunk, `[DONE]` |
+| request after `stop deployment` | 409 at once |
+| wake on request | with 0.6.3 started by `--evict`, a request for 0.6.5 switched and answered in 15.3 s |
+| `--no-drafts` | ready in 12.9 s, answered |
+| engine `/metrics`, no key | 200, the three gauges CapyCTL reads present |
+| shutdown | `drained: true`, `forced: false`, 0 in flight |
+
+Benchmark against 0.6.3 on the same deployment (medians; concurrency 512
+tokens, 10 rounds pooled from two interleaved passes; context 128 tokens, 3
+runs): aggregate tok/s C1 42.2 / 41.5 (one slower round), C4 121.3 / 121.4,
+C8 193.9 / 193.8; prefill at 2k, 32k and 128k within 0.4%; TTFT at 128k 87.2
+/ 86.9 s. `token_sha` matched on 24 of 30 keys: every concurrency pair and the
+2k runs; the 32k and 128k replies differ, as 0.6.4's fp32 tree-attention fold
+(#268) allows, so decode speed there follows different replies. Nemotron 3.5
+Lightning, one stream: 147.5 / 152.5 tok/s (+3.4%), the same tokens. The 0.6.5
+engine logs name `--no-thinking` at start and warn when a reply hits
+`max_tokens` while thinking; the role log has no error or warning lines.
+
 ## TensorFold decodes the deployment's requests together — 2026-10-03 (branch `fix/tensorfold-parallel`)
 
 Owner decision 2026-10-03, recorded in ADR 0023 §4. TensorFold serves one request
