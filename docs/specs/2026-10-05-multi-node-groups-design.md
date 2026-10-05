@@ -662,6 +662,8 @@ applied above.
   host contact. Implementers must otherwise violate either the ordering guarantee or
   the plan's completeness and immutability.
 
+  Adopted 2026-10-04 (ADR 0028 §4).
+
 - **Binding deep-park decision excludes TensorFold** — Owner decision 2 / §12 Park and wake (P1, whole-document (independent pass), confidence 100)
 
   The release cannot simultaneously satisfy the binding day-one group-wide
@@ -670,6 +672,8 @@ applied above.
   authoritative; explicitly limiting the binding decision to engines with collective
   sleep support makes TensorFold's documented restart behavior implementable.
 
+  Held for the owner.
+
 - **World-size-one topology has conflicting placement semantics** — §2 Deployment configuration (P1, whole-document (independent pass), confidence 100)
 
   A deployment with an explicit TP 1 × PP 1 topology cannot reliably behave like the
@@ -677,6 +681,8 @@ applied above.
   placement fields and reject it in standalone mode. Users and validators will
   therefore disagree over whether that configuration is valid and how it selects its
   host.
+
+  Adopted 2026-10-04 (ADR 0028 §2).
 
 - **Arbitrary-N and PP support outruns qualification** — 17. Testing (P1, adversarial (independent pass), whole-document (independent pass), confidence 100)
 
@@ -687,6 +693,8 @@ applied above.
   to PP staging or three-plus-host failure fan-out. Gating supported shapes to
   live-qualified rows keeps the exposed capability aligned with available evidence.
 
+  Held for the owner.
+
 - **Engine environment lacks required environment-variable inputs** — §2.1 Engine environment / §18 Documentation (P1, whole-document (independent pass), confidence 100)
 
   The CLI and configuration implementation cannot honor the project's declared
@@ -696,6 +704,8 @@ applied above.
   input channel, and the promised operations documentation cannot be written from
   the contract.
 
+  Adopted 2026-10-04 (ADR 0028 §2.1).
+
 - **Environment values exposed through status** — 2.1 Engine environment (P1, security, security (independent pass) (+1 anchor), confidence 100)
 
   A deployment author who places a credential or token in an approved environment
@@ -704,6 +714,8 @@ applied above.
   users but does not prevent accidental disclosure. Treating values as
   sensitive-by-default and redacting them from output closes the direct exposure
   path.
+
+  Adopted 2026-10-04 (ADR 0028 §2.1).
 
 - **Exact-token canary assumes bitwise determinism across TP collectives** — §12 Park and wake (P1, adversarial, confidence 75)
 
@@ -716,6 +728,8 @@ applied above.
   produces one. MN4 runs only 5 cycles, which is too few to measure that
   false-positive rate.
 
+  Held for the owner.
+
 - **Stated problem (catalog models 8-16) is mostly unsolved by this milestone** — Problem; §17.2 catalog table (P1, adversarial, adversarial (independent pass), scope-guardian, confidence 75)
 
   The motivation is that half the pinned catalog needs two or more machines. By the
@@ -725,6 +739,8 @@ applied above.
   catalog models run through CapyCTL groups on the shipped engines. Users and the
   downstream integration would then see the 'multi-machine serving' gap as closed
   when it is not.
+
+  Held for the owner.
 
 - **Unset GLOO interface binds loopback on default Ubuntu hosts** — §10 Engine adapters (common rules); Open question 1 (P1, feasibility, confidence 75)
 
@@ -741,6 +757,8 @@ applied above.
   is an address choice, not a transport choice. That fits the doc's own rule that
   'addresses are not transport', since CapyCTL already confirms the peer address is
   on a local interface.
+
+  Adopted 2026-10-04 (ADR 0028 §10).
 
 - **SGLang wake path: make `group_model_path_mismatch` firm or drop it** — §6 Weights (item 4), §12 Park and wake, §16 Error codes (P1, feasibility, scope-guardian (contradiction), confidence 75)
 
@@ -759,6 +777,8 @@ applied above.
   feasibility would make the refusal unconditional for SGLang groups with deep
   residency; scope-guardian would remove the code until a live row needs it.
 
+  Held for the owner.
+
 - **No detection for a hung rank or failed interconnect after READY** — §9 Readiness and the router; §11 Stop, failure and settlement (P1, adversarial, confidence 75)
 
   Most real group failures leave every process alive: the direct link drops, a GPU
@@ -768,6 +788,8 @@ applied above.
   until client timeouts, maybe indefinitely. The design's own fake harness models
   this case ('a rank exit leaves the others alive but not serving (as NCCL hangs)'),
   but nothing in the lifecycle acts on it.
+
+  Held for the owner.
 
 - **Per-member park evidence skips SGLang's saver-map contract** — §12 Park and wake (P1, feasibility, confidence 75)
 
@@ -782,6 +804,8 @@ applied above.
   weaken SGLang park evidence to process sampling for groups, which breaks the
   existing rule, or find the worker has no observation and the park is refused. The
   plan's Task 19 inherits the same gap.
+
+  Adopted 2026-10-04 (ADR 0028 §12).
 
 - **Owned env list misses names that switch security controls** — §2.1 Engine environment, rule 1 (P1, security, confidence 75)
 
@@ -801,6 +825,8 @@ applied above.
   `PYTHONUNBUFFERED`, closes this. The rule's own logic already covers it ('names
   CapyCTL already renders or closes'); the enumeration just stops short.
 
+  Adopted 2026-10-04 (ADR 0028 §2.1).
+
 - **Risk statement understates exposure: pickle over open ports** — §13 Ports and peer exposure (security), Risk statement (P1, security, confidence 75)
 
   The owner accepts the trust-the-network risk on a description that is too mild.
@@ -815,6 +841,8 @@ applied above.
   amendment, the status line and the docs tell the operator, so the 'keep group
   hosts on a private link' advice carries its real weight.
 
+  Adopted 2026-10-04 (ADR 0028 §13).
+
 - **Group readiness lacks collective inference proof** — 9. Readiness and the router (P1, adversarial (independent pass), confidence 75)
 
   The router can expose a group whose head reports model readiness while a worker
@@ -822,6 +850,8 @@ applied above.
   that head readiness implies a working collective is warranted only if that check
   completes an actual distributed forward pass. Requiring a bounded inference probe
   before READY directly tests the property on which routing depends.
+
+  Held for the owner.
 
 - **Port held by another process is drawn again on every retry** — §5 Rendezvous port; §7 Prepare (P1, feasibility, adversarial, adversarial (independent pass) (+1 anchor), confidence 100)
 
@@ -835,6 +865,8 @@ applied above.
   the engine then fails to bind at launch, which becomes a group member failure
   instead of a typed prepare refusal.
 
+  Adopted 2026-10-04 (ADR 0028 §5).
+
 - **MN9 vLLM bar compares stock 0.30.0 to a patched-build recipe** — §17.2 Live on two GB10 hosts (MN9) (P2, adversarial, feasibility (+1 anchor), confidence 100)
 
   MN9's 10% bar for vLLM uses the published two-Spark recipe's numbers, but the
@@ -844,6 +876,8 @@ applied above.
   and the row cannot tell which, so the pass/fail result would not support the
   release decision.
 
+  Held for the owner.
+
 - **require_rdma summary says host checks refuse; compaction never does** — Owner decisions (carried forward) vs §7 table (P2, coherence, confidence 75)
 
   The carried-forward summary says host checks warn by default and refuse under
@@ -852,12 +886,16 @@ applied above.
   under require_rdma. The detailed table (and the implementation plan: 'compaction
   never refuses') is authoritative.
 
+  Adopted 2026-10-04 (ADR 0028 decision 10, §7).
+
 - **validate config multi-host resolution is an adjacent feature** — 15. Status and CLI (P2, scope-guardian, confidence 75)
 
   Resolving a group deployment against every named host document via `--host` adds
   new CLI behavior that no owner decision or goal asks for, against the 'minimal
   fix, no adjacent features' rule. It adds multi-document loading, per-host profile
   resolution and its own error surface to build and test.
+
+  Held for the owner.
 
 ## Known risks
 

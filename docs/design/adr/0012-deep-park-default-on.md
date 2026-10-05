@@ -94,10 +94,12 @@ status surface, which remains open.
 ## Amendment 2026-10-05 — peer exposure of engine groups (ADR 0028)
 
 Owner decision 3 of 2026-09-25: during a multi-node group run, the engine's
-rendezvous store, vLLM's broadcast queue, TensorFold's extra serving port and
-NCCL open unauthenticated listeners on every interface of every member host,
-including any wireless or overlay network. Anyone who can reach them can disturb
-or crash the group. CapyCTL renders the direct-link addresses where the engine
+rendezvous store, vLLM's broadcast queue, gloo's CPU-group ports,
+TensorFold's extra serving port and NCCL open unauthenticated listeners on every
+interface of every member host, including any wireless or overlay network. The
+store, the broadcast queue and gloo's object collectives carry pickled Python
+objects, so anyone who can reach those ports can likely run code as the engine's
+user and read its per-launch keys. They can also disturb or crash the group. CapyCTL renders the direct-link addresses where the engine
 takes them, performs no firewall check, and leaves the network to the operator.
 This is a recorded known risk, not a protection. Every protection in decision 5
 above is unchanged: the API server and every control endpoint stay on loopback
