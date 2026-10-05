@@ -404,6 +404,7 @@ impl Fixture {
                 service_port: self.port,
                 checkpoint_digest,
                 checkpoint_weights_bytes: None,
+                checkpoint_state_slot_bytes: None,
                 startup_bytes: None,
             }),
         })

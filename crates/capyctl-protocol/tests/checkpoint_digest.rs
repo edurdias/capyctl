@@ -83,6 +83,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         coordinator_session_id: "01K00000000000000000000004".into(),
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
         startup_bytes: None,
     }
 }
@@ -96,6 +97,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         total_bytes: 12,
         reason: String::new(),
         full_rehash: true,
+        state_slot_bytes: None,
     }
 }
 
@@ -183,6 +185,7 @@ fn a_launch_plan_carries_the_recorded_checkpoint_additively() {
     let recorded = SingleLaunchPlan {
         checkpoint_digest: DIGEST.into(),
         checkpoint_weights_bytes: Some(4 << 30),
+        checkpoint_state_slot_bytes: None,
         startup_bytes: None,
         ..typed.clone()
     };
@@ -204,6 +207,12 @@ fn a_launch_plan_carries_the_recorded_checkpoint_additively() {
         },
         // Weights without a digest name nothing the host could verify.
         |p| p.checkpoint_weights_bytes = Some(1),
+        // ADR 0014 amendment A16: likewise a state slot, and never zero.
+        |p| p.checkpoint_state_slot_bytes = Some(1),
+        |p| {
+            p.checkpoint_digest = DIGEST.into();
+            p.checkpoint_state_slot_bytes = Some(0);
+        },
     ];
     for edit in refused {
         let mut plan = launch_plan();
@@ -226,6 +235,12 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
     )
     .unwrap();
     validate_result(&expecting, &result(&expecting, evidence("mismatch", OTHER))).unwrap();
+    // ADR 0014 amendment A16: a measured hybrid state slot rides along.
+    let with_state = pb::CheckpointDigestEvidence {
+        state_slot_bytes: Some(10 << 20),
+        ..evidence("computed", DIGEST)
+    };
+    validate_result(&open, &result(&open, with_state)).unwrap();
     let refusal = pb::CheckpointDigestEvidence {
         state: "refused".into(),
         reason: "unsafe_file".into(),
@@ -257,6 +272,20 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
             pb::CheckpointDigestEvidence {
                 reason: "x".into(),
                 ..evidence("computed", DIGEST)
+            },
+        ),
+        (
+            &open,
+            pb::CheckpointDigestEvidence {
+                state_slot_bytes: Some(0),
+                ..evidence("computed", DIGEST)
+            },
+        ),
+        (
+            &open,
+            pb::CheckpointDigestEvidence {
+                state_slot_bytes: Some(1),
+                ..refusal.clone()
             },
         ),
         (

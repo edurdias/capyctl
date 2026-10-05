@@ -161,6 +161,18 @@ pub struct MemoryRequest {
     /// before the allowance existed, which re-derives without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_graphs_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
+    /// state on SGLang, a checkpoint fact the host measured from
+    /// `config.json` beside the weights. Recorded so a snapshot re-derives
+    /// identically; absent for any other model or engine, and in a revision
+    /// measured before the fact existed, which keeps its sizing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_slot_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: the recurrent state a derived request holds
+    /// for its running requests (their slots, the padding slot and any
+    /// draft-token states). Absent when the request holds none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

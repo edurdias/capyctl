@@ -33,6 +33,9 @@ pub struct SingleLaunchPlan {
     /// starting phase instead of its own placeholder, never below the steady
     /// request it resolves itself.
     pub startup_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: the hybrid state slot the server resolved this
+    /// revision with, beside the weights.
+    pub checkpoint_state_slot_bytes: Option<i64>,
 }
 /// ADR 0014 §7: an empty digest (pre-WE3 journal) or a canonical one; weights
 /// only alongside a digest, and never negative.
@@ -68,6 +71,9 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
             || plan.issued_at_unix_ms < 0
             || !recorded_checkpoint_ok(&plan.checkpoint_digest, plan.checkpoint_weights_bytes)
             || plan.startup_bytes.is_some_and(|bytes| bytes <= 0)
+            || plan
+                .checkpoint_state_slot_bytes
+                .is_some_and(|bytes| bytes <= 0 || plan.checkpoint_digest.is_empty())
         {
             return Err(GroupIdentityError);
         }
@@ -93,6 +99,7 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
             checkpoint_digest: plan.checkpoint_digest,
             checkpoint_weights_bytes: plan.checkpoint_weights_bytes,
             startup_bytes: plan.startup_bytes,
+            checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
         })
     }
 }
@@ -118,6 +125,7 @@ impl SingleLaunchPlan {
             checkpoint_digest: self.checkpoint_digest.clone(),
             checkpoint_weights_bytes: self.checkpoint_weights_bytes,
             startup_bytes: self.startup_bytes,
+            checkpoint_state_slot_bytes: self.checkpoint_state_slot_bytes,
         }
     }
 }
@@ -893,7 +901,8 @@ fn validate_checkpoint(
         && evidence.weights_bytes >= 0
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
         && evidence.file_count <= 65_536
-        && evidence.reason.is_empty();
+        && evidence.reason.is_empty()
+        && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0);
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
@@ -905,6 +914,7 @@ fn validate_checkpoint(
                 && evidence.file_count <= 65_536
                 && evidence.reason.is_empty()
                 && !evidence.full_rehash
+                && evidence.state_slot_bytes.is_none()
         }
         "computed" => {
             measured
@@ -926,6 +936,7 @@ fn validate_checkpoint(
                 && evidence.file_count == 0
                 && evidence.total_bytes == 0
                 && !evidence.full_rehash
+                && evidence.state_slot_bytes.is_none()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

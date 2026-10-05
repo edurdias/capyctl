@@ -27,6 +27,19 @@ pub struct CheckpointLocation {
     /// ADR 0014 §5 amendment A6: the draft model the launch loads beside the
     /// checkpoint, whose weights are counted with the checkpoint's.
     pub drafter: Option<DrafterLocation>,
+    /// ADR 0014 amendment A16: an SGLang launch's arguments (the
+    /// installation's and the deployment's), which size the hybrid state slot
+    /// measured beside the weights; `None` for another engine.
+    pub sglang_args: Option<Vec<String>>,
+}
+
+impl CheckpointLocation {
+    /// ADR 0014 amendment A16: one request slot of the hybrid state an SGLang
+    /// launch of this checkpoint keeps, from its `config.json`; `None` for any
+    /// other model or engine.
+    pub fn state_slot_bytes(&self) -> Option<i64> {
+        crate::context_fit::sglang_state_slot_bytes(&self.checkpoint, self.sglang_args.as_ref()?)
+    }
 }
 
 /// ADR 0014 §5 amendment A6: a draft model directory and the approved root
@@ -68,6 +81,26 @@ impl EffectiveDeployment {
             &self.profile.security.approved_paths,
         )
     }
+
+    /// ADR 0014 amendment A16: one request slot of the hybrid state an SGLang
+    /// launch of this deployment keeps, read from its checkpoint on this
+    /// machine; `None` for any other model or engine.
+    pub fn state_slot_bytes(&self) -> Option<i64> {
+        if self.profile.engine != Engine::Sglang {
+            return None;
+        }
+        let args: Vec<String> = self
+            .profile
+            .args
+            .iter()
+            .chain(self.engine_config.extra_args())
+            .cloned()
+            .collect();
+        crate::context_fit::sglang_state_slot_bytes(
+            Path::new(self.model.resolved_path.as_deref()?),
+            &args,
+        )
+    }
 }
 
 /// ADR 0014 §7: locate a deployment's checkpoint from its `model` block and the
@@ -84,25 +117,28 @@ pub fn checkpoint_location(
         return Err(invalid("host.model_store.path", "must be absolute"));
     }
     let sources = crate::model_source::ModelSourcePolicy::from_raw(host.model_sources)?;
-    let drafter = host
+    let profile = host
         .runtime_profiles
-        .get(deployment["runtime_profile"].as_str().unwrap_or_default())
-        .and_then(|profile| {
-            let extra: Vec<String> = deployment["engine_config"]["extra_args"]
-                .as_array()
-                .map(|args| {
-                    args.iter()
-                        .filter_map(|arg| arg.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            drafter_location(
-                profile.engine,
-                &profile.args,
-                &extra,
-                &profile.security.approved_paths,
-            )
-        });
+        .get(deployment["runtime_profile"].as_str().unwrap_or_default());
+    let extra: Vec<String> = deployment["engine_config"]["extra_args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let drafter = profile.and_then(|profile| {
+        drafter_location(
+            profile.engine,
+            &profile.args,
+            &extra,
+            &profile.security.approved_paths,
+        )
+    });
+    let sglang_args = profile
+        .filter(|profile| profile.engine == Engine::Sglang)
+        .map(|profile| profile.args.iter().chain(&extra).cloned().collect());
     let model = normalize_model(raw, Some(&store), Some(sources.root(&store)))?;
     let checkpoint = PathBuf::from(model.require_resolved_path()?);
     let root = match model.source {
@@ -114,6 +150,7 @@ pub fn checkpoint_location(
         checkpoint,
         content_fingerprint: model.content_fingerprint,
         drafter,
+        sglang_args,
     })
 }
 

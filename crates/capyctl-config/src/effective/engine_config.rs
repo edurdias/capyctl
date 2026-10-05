@@ -143,6 +143,12 @@ const DTYPES: &[&str] = &["auto", "bfloat16", "float16", "float32"];
 pub struct CheckpointFacts {
     /// Sum of the checkpoint's weight-file sizes.
     pub weights_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
+    /// state on SGLang, measured by the host from `config.json`
+    /// (`context_fit::sglang_state_slot_bytes`). `None` for any other model
+    /// and in a revision measured before the fact existed, which keeps its
+    /// sizing.
+    pub state_slot_bytes: Option<i64>,
     /// A snapshot frozen before the startup memory budget existed records no
     /// startup peak; it is re-resolved exactly as it was, with a cold phase
     /// equal to the request. Never set for a new resolution.
@@ -282,6 +288,72 @@ pub(super) struct DeviceSizing {
     pub(super) declared_total: i64,
 }
 
+/// ADR 0014 amendment A16: the recurrent state a derived SGLang request
+/// reserves: that of the most running requests, up to the declared count (or
+/// CapyCTL's in-flight bound), whose request still fits the memory domain it
+/// derives on, beside the engine's CUDA context and (on unified memory) the
+/// first-start graph allowance. `None` with a declared request or
+/// `resources:`, without the measured weights and state, or when no running
+/// request fits: the launch then sizes the state as before (amendment A14).
+fn sglang_state_reserve(
+    inputs: &EngineInputs<'_>,
+    declared_request: Option<i64>,
+    kv_cache: Option<i64>,
+    extra_args: &[String],
+    declared_running: Option<u32>,
+) -> Option<i64> {
+    if inputs.engine != Engine::Sglang
+        || declared_request.is_some()
+        || inputs.declared_ready_total.is_some()
+    {
+        return None;
+    }
+    let slot = u64::try_from(inputs.facts.state_slot_bytes?).ok()?;
+    let weights = inputs.facts.weights_bytes.filter(|bytes| *bytes > 0)?;
+    let kv = kv_cache?;
+    let args: Vec<String> = inputs
+        .profile_args
+        .iter()
+        .chain(extra_args)
+        .cloned()
+        .collect();
+    let overhead = if inputs.facts.legacy_overhead {
+        0
+    } else {
+        ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+    };
+    let graphs = startup_graph_allowance(
+        Engine::Sglang,
+        crate::engine_policy::draft_model_path(Engine::Sglang, &args).is_some(),
+    );
+    let fits = |state: u64| {
+        let Ok(state) = i64::try_from(state) else {
+            return false;
+        };
+        let (charged, limit) = match inputs.device {
+            Some(device) => (
+                crate::context_fit::derived_request_bytes(weights, kv, 0, state, true)
+                    .and_then(|request| request.checked_add(overhead)),
+                Some(device.managed_limit),
+            ),
+            None => (
+                crate::context_fit::derived_request_bytes(
+                    weights,
+                    kv,
+                    overhead_margin(Engine::Sglang),
+                    state,
+                    false,
+                )
+                .and_then(|request| request.checked_add(overhead)?.checked_add(graphs)),
+                inputs.domain_limit,
+            ),
+        };
+        matches!((charged, limit), (Some(charged), Some(limit)) if charged <= limit)
+    };
+    crate::context_fit::derived_state_reserve(slot, &args, declared_running, fits)
+        .and_then(|bytes| i64::try_from(bytes).ok())
+}
+
 /// Design §3: a device request is `weights x 1.10 + kv`, and vLLM's at least
 /// 0.75 of the card (vLLM 0.29 with CUDA graphs does not start a 4B model on a
 /// 16 GB card below `--gpu-memory-utilization 0.75`). Unknown weights are not
@@ -345,6 +417,10 @@ pub(super) struct EngineInputs<'a> {
     pub(super) facts: CheckpointFacts,
     /// The device domain the phases derive on, when it is a discrete GPU's.
     pub(super) device: Option<DeviceSizing>,
+    /// ADR 0014 amendment A16: the managed limit of the one memory domain
+    /// the phases derive on, which a derived request's state must leave room
+    /// in. `None` when the devices name no single domain.
+    pub(super) domain_limit: Option<i64>,
 }
 
 /// ADR 0014 §5 (P2) inputs, all in bytes.
@@ -483,6 +559,8 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             device_total_bytes: None,
             overhead_bytes: None,
             startup_graphs_bytes: None,
+            state_slot_bytes: None,
+            state_bytes: None,
         },
         derived,
     ))
@@ -1076,10 +1154,25 @@ pub(super) fn normalize_engine_config(
     // weights on a device domain is sized for the card, not with the unified
     // placeholder margin, which would not fit a small card.
     let mut provenance_startup_derived = false;
+    // ADR 0014 amendment A16: a derived SGLang request holds the recurrent
+    // state of its running requests, when the checkpoint's state is known.
+    let state_reserve = sglang_state_reserve(
+        &inputs,
+        declared_request,
+        kv_cache,
+        &extra_args,
+        raw.max_concurrent_requests,
+    );
     let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {
-        (Some(device), None, None) => {
-            device_request_from_weights(device, engine, inputs.facts.weights_bytes, kv_cache)?
-        }
+        (Some(device), None, None) => device_request_from_weights(
+            device,
+            engine,
+            inputs
+                .facts
+                .weights_bytes
+                .map(|weights| weights.saturating_add(state_reserve.unwrap_or(0))),
+            kv_cache,
+        )?,
         _ => None,
     };
     // ADR 0019 §3 (found live on a 16 GB laptop GPU, 2026-10-03): a request
@@ -1102,6 +1195,19 @@ pub(super) fn normalize_engine_config(
         weights: inputs.facts.weights_bytes,
         margin: declared_device_margin.unwrap_or_else(|| overhead_margin(engine)),
     })?;
+    if engine == Engine::Sglang {
+        memory.state_slot_bytes = inputs.facts.state_slot_bytes;
+    }
+    if let Some(state) = state_reserve {
+        // A discrete request already holds it in its weights share.
+        if device_request.is_none() {
+            memory.request_bytes = memory
+                .request_bytes
+                .checked_add(state)
+                .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
+        }
+        memory.state_bytes = Some(state);
+    }
     if declared_device_margin.is_some() && declared_startup.is_none() {
         // Design §3: the engine's use of the card is bounded by the fraction
         // capyctl renders from this request.

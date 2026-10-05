@@ -59,6 +59,8 @@ fn settings(request: i64, kv: i64, weights: Option<i64>) -> SglangLaunchSettings
             device_total_bytes: None,
             overhead_bytes: None,
             startup_graphs_bytes: None,
+            state_slot_bytes: None,
+            state_bytes: None,
         },
         max_total_tokens: None,
         max_mamba_cache_size: None,
@@ -488,4 +490,60 @@ fn a_derived_unified_request_keeps_its_kv_pool() {
     assert_eq!(found.max_total_tokens, Some((4 * GIB / 32768) as u32));
     assert_eq!(found.max_mamba_cache_size, Some(5 * 16));
     assert_eq!(found.running_limit, Some(16));
+}
+
+// ADR 0014 amendment A16: the host measures one state slot from the
+// checkpoint's configuration, as the launch sizes it with its arguments.
+#[test]
+fn the_state_slot_is_read_from_the_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), qwen38_27b().to_string()).unwrap();
+    assert_eq!(sglang_state_slot_bytes(dir.path(), &[]), Some(STATE as i64));
+    // A bfloat16 temporal state: 48 x (61440 + 1572864).
+    let args = ["--mamba-ssm-dtype".to_owned(), "bfloat16".to_owned()];
+    assert_eq!(
+        sglang_state_slot_bytes(dir.path(), &args),
+        Some(48 * (61_440 + 1_572_864))
+    );
+    std::fs::write(dir.path().join("config.json"), dense().to_string()).unwrap();
+    assert_eq!(sglang_state_slot_bytes(dir.path(), &[]), None);
+    assert_eq!(sglang_state_slot_bytes(&dir.path().join("none"), &[]), None);
+}
+
+// ADR 0014 amendment A16: what a derived request reserves for the state.
+#[test]
+fn a_derived_request_reserves_the_state_that_fits() {
+    let all = |_: u64| true;
+    assert_eq!(
+        derived_state_reserve(STATE, &[], None, all),
+        Some(161 * STATE)
+    );
+    assert_eq!(
+        derived_state_reserve(STATE, &[], Some(8), all),
+        Some(41 * STATE)
+    );
+    let under = |bytes: u64| bytes <= 91 * STATE;
+    assert_eq!(
+        derived_state_reserve(STATE, &[], None, under),
+        Some(91 * STATE)
+    );
+    assert_eq!(derived_state_reserve(STATE, &[], None, |_| false), None);
+    // Draft-token states are reserved with the slots.
+    let args: Vec<String> = [
+        "--speculative-algorithm",
+        "DFLASH",
+        "--speculative-num-draft-tokens",
+        "8",
+    ]
+    .map(str::to_owned)
+    .into();
+    assert_eq!(
+        derived_state_reserve(STATE, &args, Some(2), all),
+        Some((11 + 3 * 8) * STATE)
+    );
+    // Without a draft-token count, or when the arguments size the state
+    // pool, the launch sizes it as before.
+    assert_eq!(derived_state_reserve(STATE, &args[..2], Some(2), all), None);
+    let args = ["--max-mamba-cache-size".to_owned(), "64".to_owned()];
+    assert_eq!(derived_state_reserve(STATE, &args, None, all), None);
 }
