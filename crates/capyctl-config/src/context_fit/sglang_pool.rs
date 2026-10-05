@@ -17,8 +17,8 @@
 //! - on a gated-delta-net hybrid, the state pool holds
 //!   [`STATE_SLOTS_PER_REQUEST`] slots per running request
 //!   (`--max-mamba-cache-size`), and the running requests are the deployment's
-//!   `max_concurrent_requests`, or the most of CapyCTL's in-flight bound
-//!   (`MAX_REQUESTS_PER_DEPLOYMENT`) whose state fits;
+//!   `max_concurrent_requests`, or the most of CapyCTL's hybrid default
+//!   (`SGLANG_HYBRID_DEFAULT_RUNNING`, 8) whose state fits;
 //! - the static pool (memory request less the margin) must hold the weights,
 //!   the KV cache and that state. With an explicit request, a declared
 //!   `max_concurrent_requests` whose state does not fit, or one running
@@ -40,7 +40,9 @@
 
 use std::path::Path;
 
-use capyctl_domain::launch::{MemoryRequest, SglangLaunchSettings, MAX_REQUESTS_PER_DEPLOYMENT};
+use capyctl_domain::launch::{
+    MemoryRequest, SglangLaunchSettings, MAX_REQUESTS_PER_DEPLOYMENT, SGLANG_HYBRID_DEFAULT_RUNNING,
+};
 use serde_json::Value;
 
 use super::{dtype_bytes, positive, read_model_config, KvShape};
@@ -369,7 +371,7 @@ pub fn sglang_pool(
     };
     let available = room + borrowable + from_kv;
     let fits = |running: u32| need(running).is_some_and(|bytes| bytes <= available);
-    let bound = declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT);
+    let bound = declared.unwrap_or(SGLANG_HYBRID_DEFAULT_RUNNING);
     let largest = (1..=bound).rev().find(|running| fits(*running));
     let running = match (largest, declared) {
         (Some(running), Some(declared)) if running == declared || derived => running,
@@ -423,7 +425,9 @@ pub fn sglang_pool(
     if declared != Some(running) {
         pool.max_running_requests = Some(running);
     }
-    if running < bound {
+    // Status names the limit below what the router admits: the declared
+    // count, or its in-flight bound.
+    if running < declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT) {
         pool.running_limit = Some(running);
     }
     pool.static_bytes = grown_static(memory, need(running).unwrap_or(0));
@@ -527,7 +531,7 @@ pub fn sglang_state_slot_bytes(checkpoint_root: &Path, args: &[String]) -> Optio
 
 /// ADR 0014 amendment A16: the state a derived request reserves, for `slot`
 /// bytes a slot: that of the most running requests, up to the declared count
-/// (or CapyCTL's in-flight bound), whose request still `fits`. `None` when
+/// (or `SGLANG_HYBRID_DEFAULT_RUNNING`), whose request still `fits`. `None` when
 /// none fits, when the arguments size the state pool themselves, or with
 /// speculative decoding and no draft-token count: the launch then sizes the
 /// state as before.
@@ -551,7 +555,7 @@ pub(crate) fn derived_state_reserve(
     } else {
         0
     };
-    (1..=declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT))
+    (1..=declared.unwrap_or(SGLANG_HYBRID_DEFAULT_RUNNING))
         .rev()
         .filter_map(|running| state_bytes(u64::from(running), slot, draft_tokens))
         .find(|bytes| fits(*bytes))
