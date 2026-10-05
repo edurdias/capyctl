@@ -90,3 +90,16 @@ status surface, which remains open.
   live-proven launch shape. Standalone SGLang's template declares `deep`, so
   `MLLM_DEEP_PARK=off` makes its deployment fail resolution rather than launch without
   its parking recipe.
+
+## Amendment 2026-10-05 — peer exposure of engine groups (ADR 0028)
+
+Owner decision 3 of 2026-09-25: during a multi-node group run, the engine's
+rendezvous store, vLLM's broadcast queue, TensorFold's extra serving port and
+NCCL open unauthenticated listeners on every interface of every member host,
+including any wireless or overlay network. Anyone who can reach them can disturb
+or crash the group. CapyCTL renders the direct-link addresses where the engine
+takes them, performs no firewall check, and leaves the network to the operator.
+This is a recorded known risk, not a protection. Every protection in decision 5
+above is unchanged: the API server and every control endpoint stay on loopback
+with the per-launch keys and the guard, and no control path reaches host ingress
+or the router. Status marks a group instance `peer transport: unauthenticated`.
