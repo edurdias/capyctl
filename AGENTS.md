@@ -123,7 +123,8 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   middleware, and no engine control path through host ingress or the router. vLLM
   development mode remains an isolated integration, not a production-hardened one.
 - A multi-node group run opens unauthenticated peer listeners on every interface of
-  its hosts (ADR 0012 amendment, ADR 0028 §13).
+  its hosts, and some carry pickled objects, so a reachable peer can likely run code
+  as the engine's user (ADR 0012 amendment, ADR 0028 §13).
 
 ## Code conventions
 

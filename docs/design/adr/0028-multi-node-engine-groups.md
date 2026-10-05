@@ -26,8 +26,8 @@ Owner decisions:
    loads.
 2. **Residency.** Deep park is supported from day one: group-wide sleep and wake with
    evidence from every rank.
-3. **Peer exposure.** Trust the network. CapyCTL does no firewall check. Rendezvous
-   and NCCL ports are open on all interfaces during a run. CapyCTL binds to the
+3. **Peer exposure.** Trust the network. CapyCTL does no firewall check. Rendezvous,
+   broadcast, gloo and NCCL ports are open on all interfaces during a run. CapyCTL binds to the
    direct link where the engine allows it. Recorded as a known risk.
 4. **NCCL.** CapyCTL sets no NCCL setting; NCCL chooses the transport.
 5. **Readiness.** Head health only. Other hosts record their rank's process
@@ -41,8 +41,9 @@ Owner decisions:
    25000-25099), recorded in the group plan, released only after every host proves
    stop.
 10. **Host tuning.** The compaction sysctl, memlock and `/dev/infiniband` access are
-    set by the owner as root. CapyCTL checks them, warns or refuses, and never changes
-    them.
+    set by the owner as root. CapyCTL checks them and never changes them. By default
+    each check warns; under `require_rdma`, memlock and infiniband refuse and
+    compaction only warns.
 11. **Weights.** Every named host downloads the model source in parallel. Digests are
     compared across hosts before launch. Free disk is checked first.
 12. **Engines (changed 2026-10-05).** SGLang, vLLM and TensorFold together, in one
@@ -54,14 +55,16 @@ Owner decisions:
 
 Engine environment (2026-09-25): settings an engine reads only from the environment
 are declared in YAML (the profile's `env`, the deployment's `engine_config.env`) or by
-a flag (`capyctl engine add --env K=V`, `capyctl deploy --engine-env K=V`). Names are
-checked against the profile's approved list. CapyCTL-owned names (`NCCL_*`, `GLOO_*`,
-`MASTER_*`, `VLLM_HOST_IP`) are never settable.
+a flag or environment variable (`capyctl engine add --env K=V`, `capyctl deploy
+--engine-env K=V`; §2.1). Names are checked against the profile's approved list.
+CapyCTL-owned names (`NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, and the rest of
+§2.1 rule 1) are never settable.
 
 Choices carried forward from the 2026-09-25 design: addresses are not transport
-(CapyCTL renders the head's peer address and each host's own peer address, nothing
-named `NCCL_*` or `GLOO_*`); host checks warn by default and refuse under
-`require_rdma: true`; group eviction is all-or-nothing across the named hosts;
+(CapyCTL renders the head's peer address and each host's own peer address, plus the
+interface that holds it for gloo, and nothing named `NCCL_*`); host checks warn by
+default; under `require_rdma: true` memlock and infiniband refuse and compaction only
+warns; group eviction is all-or-nothing across the named hosts;
 `instances: 1` and one device per host in the first version; a post-wake canary for
 groups. Standalone is a server plus one host, so a group needs the server and host
 roles. Existing engine installations only: no engine install, no containers yet.
@@ -79,6 +82,26 @@ Decided on 2026-10-05, answering the design's open questions:
   registered virtual environments.
 - Groups of three or more hosts run live on rented machines after MN1-MN9 pass, with
   the cost confirmed first.
+
+Review rulings 2026-10-04 (the coordinator's answers to the spec review, recorded in
+the sections named; the rest of the findings are held for the owner):
+
+- Group plan timing: written after every host reports its path and digest, durable
+  before any `Prepare` or `Launch` (§4, §5, §6).
+- Explicit TP 1 x PP 1 is the single-host path, with no group rules (§2).
+- Engine environment has an environment-variable channel for each setting; a
+  non-empty `--approve-env` list replaces `CAPYCTL_APPROVE_ENV` (§2.1).
+- Environment values are redacted in status and effective configuration (§2.1 rule 7).
+- `GLOO_SOCKET_IFNAME` is rendered from the peer address; still nothing named
+  `NCCL_*` (§10).
+- SGLang park evidence per member follows the saver-map contract (§12).
+- Owned environment names are extended, and CapyCTL values always win (§2.1 rule 1).
+- Peer exposure names pickled objects and gloo's ports; decision 3 stands (§13, ADR
+  0012 amendment).
+- The rendezvous allocator skips externally held ports, and `Prepare` probes with a
+  wildcard bind (§5, §7).
+- Under `require_rdma`, memlock and infiniband refuse; compaction only warns
+  (decision 10, §7).
 
 Closed error codes and exit numbers are in the design's section 16 table
 (`docs/specs/2026-10-05-multi-node-groups-design.md`).
@@ -106,13 +129,16 @@ exact `placement.hosts`. Checked at deploy time:
 
 - No `topology`, or `tensor_parallel x pipeline_parallel = 1`, is a single-host
   instance with byte-identical command identity, effective configuration and digests.
+  An explicit TP 1 x PP 1 topology is the single-host path: no group rules apply, and
+  placement fields (`host:`, `placement.selector`, `strategy`, `max_per_host`) and a
+  standalone role are allowed.
 - With world size `W > 1`, `placement.hosts` is required, has at least two distinct
   entries, and its length `N` divides `W`; local ranks are `W / N`, which must be 1 in
   the first version (`group_shape_unsupported`).
-- `host:`, `placement.selector`, `strategy` and `max_per_host` are refused with a
-  topology (`group_placement_required`); `instances` must be 1
+- With world size `W > 1`, `host:`, `placement.selector`, `strategy` and `max_per_host`
+  are refused (`group_placement_required`); `instances` must be 1
   (`group_instances_unsupported`). A standalone role refuses a topology with
-  `group_placement_required` (one host).
+  `W > 1` using `group_placement_required` (one host).
 - Duplicate hosts (after trimming), a zero dimension, or a host count that does not
   divide TP x PP is `group_topology_invalid`.
 - `resources` and `engine_config.memory` are per member (§5). `devices` states one
@@ -133,18 +159,32 @@ exact `placement.hosts`. Checked at deploy time:
 #### 2.1 Engine environment
 
 Implemented for every deployment, single-host or group. Levels: the engine profile
-(`env:`, `capyctl engine add --env K=V`), the deployment (`engine_config.env:`,
-`capyctl deploy --engine-env K=V`) and approval (`security.approved_env:`,
-`capyctl engine add --approve-env GLOB`).
+(`env:`), the deployment (`engine_config.env:`) and approval
+(`security.approved_env:`). Every setting is available three ways, with precedence
+flag > env > YAML > default:
+
+| Setting | YAML | Flag | Environment |
+|---|---|---|---|
+| Profile env | `env:` | `capyctl engine add --env K=V` | `CAPYCTL_ENGINE_ADD_ENV` |
+| Deployment env | `engine_config.env:` | `capyctl deploy --engine-env K=V` | `CAPYCTL_ENGINE_ENV` |
+| Approval | `security.approved_env:` | `capyctl engine add --approve-env GLOB` | `CAPYCTL_APPROVE_ENV` |
+
+An environment variable holds `;`-separated entries (`K=V;K2=V2` for env, `;`-separated
+globs for approvals). Between the two command-line channels a flag wins per name; a
+non-empty `--approve-env` list replaces `CAPYCTL_APPROVE_ENV` as a whole, which is used
+only when no flag is given.
 
 1. CapyCTL-owned names are never settable at either level, whatever `approved_env`
    says: `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`; the names CapyCTL already
-   renders or closes (`PATH`, `LD_*`, `PYTHONPATH`, `CUDA_HOME`,
-   `CUDA_VISIBLE_DEVICES`, `CAPYCTL_*`); and the address and rendezvous names of the
+   renders or closes (`PATH`, `LD_*`, `CUDA_HOME`, `CUDA_VISIBLE_DEVICES`,
+   `CAPYCTL_*`, `VLLM_PLUGINS`, `VLLM_SERVER_DEV_MODE`, `VLLM_API_KEY`, `VLLM_PORT`,
+   `VLLM_ALLOW_INSECURE_SERIALIZATION`, `TORCH_EXTENSIONS_DIR`,
+   `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, every `PYTHON*` name except `PYTHONUNBUFFERED`,
+   and every name the adapters pin); and the address and rendezvous names of the
    other engines (`SGLANG_HOST_IP`, `HOST_IP`, `SGLANG_LOCAL_IP_NIC`,
    `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`, `TF_COMM_BACKEND`, `TF_NCCL_LIB`).
    Refused `engine_env_reserved:<name>`, and so is an approval entry that matches only
-   owned names.
+   owned names. CapyCTL-rendered values always win over any configured value.
 2. A deployment name must match an `approved_env` entry of the profile it resolves
    against (`engine_env_not_approved:<name>`). The profile's own `env` is
    host-authored and needs no approval, except for rule 1. The existing safe names
@@ -155,12 +195,15 @@ Implemented for every deployment, single-host or group. Levels: the engine profi
    `*`. A bare `*` is refused. Rule 1 is checked on the concrete name.
 4. The deployment's value overrides the profile's; the effective configuration shows
    each variable with its source.
-5. A name given both in the file and by a flag is `engine_env_conflict:<name>`.
+5. A name given both in the YAML document and by a flag or environment variable is
+   `engine_env_conflict:<name>`.
 6. In a group every named host resolves against its own profile; a name not approved
    on one host refuses the group. Rendered environments are equal across members
    apart from the per-host address variable.
-7. Values are bounded (4 KiB each, 64 names per level), single-line, and shown in
-   status and the effective configuration. They are not secret storage.
+7. Values are bounded (4 KiB each, 64 names per level) and single-line. They are
+   stored for launch and the fingerprint, but status and the effective configuration
+   show names and sources with the value as `<redacted>`. They are still not secret
+   storage.
 8. A deployment env change is a new revision; a profile env change changes the recipe
    fingerprint.
 
@@ -190,8 +233,9 @@ service port, and a worker loopback port only when its engine opens one (SGLang)
 nonzero rendezvous port and a positive generation; and `tensor_parallel x
 pipeline_parallel = N x local_ranks`. `MemberPlan` gains `role`, `model_path` and
 `worker_port: Option<u16>`; `service_port` becomes `Option<u16>`. The plan carries the
-engine, topology and generation, and is written durably with the reservation (§5)
-before any host is contacted.
+engine, topology and generation, and is written durably with the reservation (§5),
+after every host has materialized the source and reported its path and digest (§6;
+digests agree) and before any `Prepare` or `Launch` is sent.
 
 ### 5. Reservations, memory per rank, rendezvous port
 
@@ -209,7 +253,9 @@ before any host is contacted.
   sharing a host cannot deadlock on partial acquisition. This is atomic accounting in
   the server's store, not a cross-host atomic launch.
 - **Rendezvous port** is drawn in the same transaction: the lowest port in the head's
-  range not held by an unsettled group plan (`rendezvous_ports_exhausted`). SGLang
+  range not held by an unsettled group plan and not recently found held outside
+  CapyCTL (`rendezvous_ports_exhausted`). A `Prepare` that finds the port held records
+  it as externally held for that head, with an expiry, so the next draw skips it. SGLang
   worker loopback ports come from each worker host's `endpoint_port_range` through the
   existing endpoint lease table.
 - **Eviction.** The planner computes a victim set on each named host with the existing
@@ -221,8 +267,9 @@ before any host is contacted.
 
 The model source is materialized on every named host at once through the existing path,
 after a free-space check on each (`insufficient_space`, naming the host). When all have
-finished, each reports its checkpoint digest; they must be equal
-(`group_checkpoint_mismatch`) and nothing launches on a mismatch. The store's digest
+finished, each reports its path and checkpoint digest; they must be equal
+(`group_checkpoint_mismatch`) and nothing launches on a mismatch. Only then is the
+group plan written (§4), so materialization runs before the reservation. The store's digest
 record becomes one row per host. Each member's own `model_path` goes into the plan; if
 live bring-up shows an engine needs the same path on every node, preparation refuses
 differing paths (`group_model_path_mismatch`).
@@ -232,7 +279,8 @@ differing paths (`group_model_path_mismatch`).
 After the reservation commits, `Prepare(GroupPlan)` goes to every member and has no
 process effect. Each host checks: the profile resolves with the recorded fingerprint;
 the model path holds the recorded digest; the peer address is local; on the head, the
-rendezvous port is free on the peer address and the service port on loopback; on a
+rendezvous port is free under a wildcard bind (`0.0.0.0` and `::`, since the torch
+store binds every interface) and the service port on loopback; on a
 SGLang worker, its loopback port is free; and host tuning:
 
 | Check | How | Default | `require_rdma: true` |
@@ -242,7 +290,8 @@ SGLang worker, its loopback port is free; and host tuning:
 | `infiniband` | `/dev/infiniband/uverbs*` absent or not read-write for the service user | warn | refuse |
 
 Warnings are `host_tuning_warning:<item>`, refusals `host_tuning_missing:<item>`.
-CapyCTL reads these and never writes them. A refusal releases every member's
+CapyCTL reads these and never writes them. Only memlock and infiniband refuse;
+compaction only warns. A refusal releases every member's
 reservation and records the refusal per host. `Prepare` is idempotent and retried
 under the same command id.
 
@@ -285,7 +334,11 @@ configuration layer reads for the §2 checks.
 | Deep park flag | `--enable-sleep-mode` on every rank | `--enable-memory-saver` on every rank | not applicable |
 | Head serves | loopback API, keys and guard, as single-rank | same | same |
 
-- Nothing named `NCCL_*` or `GLOO_*` is rendered or inherited (decision 4). The
+- Nothing named `NCCL_*` is rendered or inherited (decision 4). CapyCTL renders
+  `GLOO_SOCKET_IFNAME` (CapyCTL-owned) as the interface that holds the member's peer
+  address, because otherwise gloo binds the hostname's address, which is `127.0.1.1`
+  on Ubuntu, and the remote rank cannot connect. This is an address choice, not a
+  transport choice. The agent resolves the interface name from the peer address. The
   single-rank loopback pin (`GLOO_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`,
   `VLLM_HOST_IP=127.0.0.1`, SGLang's file store) is not applied to a group launch.
 - The protected entries (`runtime/vllm_entry.py`, `runtime/sglang_server_args.py`,
@@ -340,7 +393,10 @@ loopback control endpoint. Workers never receive a sleep call.
 - **Park (deep), vLLM and SGLang.** Close ingress, drain, then the head calls `/sleep`
   (vLLM, admin key) or `/release_memory_occupation` (SGLang). The park settles only
   when the call succeeded and every member's host reports its resident memory at or
-  below the member's parked budget (`process_residency`, per member). A member that
+  below the member's parked budget (`process_residency`, per member). For SGLang the
+  evidence follows the existing saver-map contract: each worker host passes its
+  observation directory to its worker launch and reports saver facts for its member,
+  and there is no fallback to process sampling. A member that
   reports nothing within the park deadline keeps its full charge and the group is
   uncertain; a member still resident fails the park. Either stops the group. The
   collective is never repeated.
@@ -364,15 +420,18 @@ loopback control endpoint. Workers never receive a sleep call.
 - Engines also open listeners CapyCTL does not choose: the torch TCP store on the
   rendezvous port binds every interface; vLLM's broadcast queue binds an ephemeral
   port on `VLLM_HOST_IP`; TensorFold Flash Next under `--parallel` opens one extra
-  ephemeral port on rank 0; NCCL uses dynamic ports. None is authenticated.
+  ephemeral port on rank 0; NCCL uses dynamic ports; gloo opens ephemeral CPU-group ports on each rank. None is
+  authenticated.
 - CapyCTL narrows what it can: it renders the direct-link addresses where the engine
   takes them, keeps every API and control endpoint on loopback, and exposes nothing
   through ingress or the router.
 
-Risk: during a group run, unauthenticated rendezvous, broadcast and NCCL listeners are
-reachable on every interface of every member host, including any wireless or overlay
-network. Anyone who can reach them can disturb or crash the group, and may be able to
-inject tensors into it. CapyCTL performs no firewall check; the operator is
+Risk: during a group run, unauthenticated rendezvous, broadcast, gloo and NCCL
+listeners are reachable on every interface of every member host, including any
+wireless or overlay network. The rendezvous store, vLLM's broadcast queue and gloo's
+object collectives carry pickled Python objects, so anyone who can reach those ports
+can likely run code as the engine's user and read its per-launch keys. They can also
+disturb or crash the group. CapyCTL performs no firewall check; the operator is
 responsible for the network (decision 3). Status marks a group instance `peer
 transport: unauthenticated`, and the docs say to keep group hosts on a private link.
 The ADR 0012 amendment records this.
@@ -412,7 +471,7 @@ shared KV caches across members.
 - A model larger than one machine can serve through one route, on any of the three
   engines, with per-host accounting and evidence.
 - Every group run exposes unauthenticated peer listeners on all interfaces of its
-  hosts. This is a recorded risk (ADR 0012 amendment), not a protection.
+  hosts, and some carry pickled objects. This is a recorded risk (ADR 0012 amendment), not a protection.
 - Group placement is manual: the operator names the hosts and declares each host's
   peer address.
 - Engine environment settings become declarable for every deployment, single-host or
