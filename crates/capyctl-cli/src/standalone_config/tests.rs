@@ -2247,3 +2247,75 @@ fn stated_memory_limits_apply_to_host_ram_on_a_discrete_host() {
         derived["resource_policy"]["domains"]["gpu0"]
     );
 }
+
+// T14 (ADR 0028 §3, R21; owner rule: standalone is a server plus one host):
+// standalone honours the group policy from a flag, the environment and its
+// `host:` YAML, and publishes it in the embedded host's policy; nothing is
+// published when none is stated.
+#[test]
+fn standalone_publishes_the_group_policy_from_every_layer() {
+    use capyctl_config::engine_settings::EngineOverrides;
+    use capyctl_config::groups_policy::{host_groups_policy, StatedGroups};
+    let Some(_guard) = isolated("standalone_publishes_the_group_policy_from_every_layer") else {
+        return;
+    };
+    let shape = HostShape::Unified;
+    let published = |groups: &StatedGroups| {
+        let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape, PORTS);
+        groups.write_into(&mut host).unwrap();
+        host
+    };
+    // Nothing stated: no block.
+    let host = published(&StatedGroups::default());
+    assert!(host["resource_policy"].get("groups").is_none());
+    for name in [
+        "CAPYCTL_PEER_ADDRESS",
+        "CAPYCTL_RENDEZVOUS_PORTS",
+        "CAPYCTL_REQUIRE_RDMA",
+    ] {
+        std::env::remove_var(name);
+    }
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    let runtime = private_runtime(dir.path());
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    let yaml = serde_json::json!({
+        "local_engine": {"vllm": bin, "build_fingerprint": "fp"},
+        "runtime_dir": runtime,
+        "resource_policy": {"groups": {"peer_address": "192.0.2.10"}}
+    });
+    let groups = |flags: EngineOverrides| {
+        let provider = crate::roles::EnvEngineProvider::new().with_flags(flags);
+        provider.configure(&yaml).expect("the document is valid");
+        provider.role_settings().expect("role settings").groups
+    };
+    let from_yaml = groups(EngineOverrides::default());
+    assert_eq!(from_yaml.peer_address, Some("192.0.2.10".parse().unwrap()));
+    assert_eq!(
+        host_groups_policy(&published(&from_yaml))
+            .unwrap()
+            .peer_address,
+        Some("192.0.2.10".parse().unwrap())
+    );
+    std::env::set_var("CAPYCTL_PEER_ADDRESS", "192.0.2.11");
+    std::env::set_var("CAPYCTL_RENDEZVOUS_PORTS", "26000-26009");
+    let from_env = groups(EngineOverrides::default());
+    assert_eq!(from_env.peer_address, Some("192.0.2.11".parse().unwrap()));
+    assert_eq!(from_env.rendezvous_ports, Some((26000, 26009)));
+    let from_flag = groups(EngineOverrides {
+        peer_address: Some("192.0.2.12".parse().unwrap()),
+        require_rdma: Some(true),
+        ..Default::default()
+    });
+    let policy = host_groups_policy(&published(&from_flag)).unwrap();
+    assert_eq!(policy.peer_address, Some("192.0.2.12".parse().unwrap()));
+    assert_eq!(policy.rendezvous_ports, 26000..=26009);
+    assert!(policy.require_rdma);
+    for name in [
+        "CAPYCTL_PEER_ADDRESS",
+        "CAPYCTL_RENDEZVOUS_PORTS",
+        "CAPYCTL_MODELS_ROOT",
+    ] {
+        std::env::remove_var(name);
+    }
+}

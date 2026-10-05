@@ -450,6 +450,10 @@ pub fn check_honoured(
         let mut policy = policy.clone();
         if let Some(map) = policy.as_object_mut() {
             map.remove("endpoint_port_range");
+            // ADR 0028 §3 (owner rule: standalone is a server plus one
+            // host): the group policy is honoured as on a host; its values
+            // were checked by `from_document` above.
+            map.remove("groups");
             // The queue bounds are honoured as on a host; their values are
             // checked when the embedded host's policy is normalized.
             map.remove("queue");
@@ -720,6 +724,27 @@ mod tests {
         )
         .unwrap();
         check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
+    }
+
+    // T14 (ADR 0028 §3, R21): standalone honours `host.resource_policy.groups`
+    // and refuses a malformed one with its path.
+    #[test]
+    fn standalone_honours_the_group_policy() {
+        let mut doc = generated("/s");
+        doc["host"]["resource_policy"]["groups"] = json!({
+            "peer_address": "192.0.2.10",
+            "rendezvous_port_range": {"start": 26000, "end": 26009},
+            "require_rdma": true
+        });
+        crate::validate(
+            &serde_json::to_string(&doc).unwrap(),
+            crate::ConfigKind::Standalone,
+        )
+        .unwrap();
+        check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
+        doc["host"]["resource_policy"]["groups"]["peer_address"] = json!("127.0.0.1");
+        let error = check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap_err();
+        assert!(error.to_string().contains("groups.peer_address"), "{error}");
     }
 
     fn check(document: &Value) -> Result<Vec<IgnoredSetting>, ConfigError> {

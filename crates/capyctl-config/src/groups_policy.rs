@@ -41,6 +41,41 @@ pub struct StatedGroups {
     pub require_rdma: Option<bool>,
 }
 
+impl StatedGroups {
+    /// ADR 0028 §3 (owner rule: standalone is a server plus one host): write
+    /// the stated settings into `host`'s `resource_policy.groups`, one shared
+    /// writer for host and standalone. Only stated keys are written, and
+    /// nothing at all when none is, so an unstated host publishes no block.
+    pub fn write_into(&self, host: &mut Value) -> Result<(), ConfigError> {
+        if self.peer_address.is_none()
+            && self.rendezvous_ports.is_none()
+            && self.require_rdma.is_none()
+        {
+            return Ok(());
+        }
+        let policy = host
+            .as_object_mut()
+            .ok_or_else(|| refuse("", "the host document is not a mapping"))?
+            .entry("resource_policy")
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| refuse("resource_policy", "must be a mapping"))?;
+        let groups = policy
+            .entry("groups")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(address) = self.peer_address {
+            groups["peer_address"] = Value::String(address.to_string());
+        }
+        if let Some((start, end)) = self.rendezvous_ports {
+            groups["rendezvous_port_range"] = serde_json::json!({"start": start, "end": end});
+        }
+        if let Some(required) = self.require_rdma {
+            groups["require_rdma"] = Value::Bool(required);
+        }
+        Ok(())
+    }
+}
+
 fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
 }
@@ -48,16 +83,19 @@ fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
 /// ADR 0028 §3: a peer address is a unicast address a peer can reach: not
 /// loopback, not unspecified, not multicast.
 pub fn peer_address(name: &str, text: &str) -> Result<IpAddr, ConfigError> {
-    let address: IpAddr = text.parse().map_err(|_| {
+    let parsed: IpAddr = text.parse().map_err(|_| {
         refuse(
             name,
             format!("must be an IP address such as 192.0.2.10; got {text:?}"),
         )
     })?;
-    if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+    // An IPv4-mapped IPv6 address (::ffff:127.0.0.1) is the IPv4 address it wraps.
+    let address = parsed.to_canonical();
+    let broadcast = matches!(address, IpAddr::V4(v4) if v4.is_broadcast());
+    if address.is_loopback() || address.is_unspecified() || address.is_multicast() || broadcast {
         return Err(refuse(
             name,
-            format!("must be a unicast address a peer host can reach; got {address}"),
+            format!("must be a unicast address a peer host can reach; got {text}"),
         ));
     }
     Ok(address)

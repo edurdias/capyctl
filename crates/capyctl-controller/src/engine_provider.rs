@@ -88,6 +88,9 @@ pub struct RoleSettings {
     /// Empty when the role names none (see [`EngineInstallation::models_root`]).
     pub models_root: PathBuf,
     pub cuda_home: Option<PathBuf>,
+    /// ADR 0028 §3: the group policy settings the role states, published in
+    /// its host's `resource_policy.groups` (nothing when none is stated).
+    pub groups: capyctl_config::groups_policy::StatedGroups,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +166,7 @@ pub trait EngineProvider: Send + Sync {
             engine_ports: base.engine_ports,
             models_root: base.models_root,
             cuda_home: base.cuda_home,
+            groups: Default::default(),
         })
     }
 
