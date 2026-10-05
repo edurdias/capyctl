@@ -472,7 +472,7 @@ If one member fails, coordinate recovery according to the engine recipe; otherwi
 
 > **Amended by [ADR 0028](design/adr/0028-multi-node-engine-groups.md)** (owner decisions 2026-09-25 and 2026-10-05).
 
-Groups run on named hosts in rank order, the first host being the head (the only member that serves HTTP), for vLLM, SGLang and TensorFold. Each member is reserved and settles on its own host's evidence only; the group is READY on the head's readiness check, and a post-wake canary guards deep park and wake (ADR 0028 §5, §9, §11, §12).
+Groups run on named hosts in rank order, the first host being the head (the only member that serves HTTP), for vLLM, SGLang and TensorFold. Each member is reserved and settles on its own host's evidence only; the group is READY on the head's readiness check (this supersedes the clause above that readiness covers all required workers, for groups), and a post-wake canary guards deep park and wake (ADR 0028 §5, §9, §11, §12).
 
 ## 12. KV-cache integration and data lifetime
 
