@@ -507,6 +507,25 @@ class DiscreteBaselineTest(unittest.TestCase):
         self.assertEqual(mapping.available_bytes_for(memory), 16376 * 2**20)
         self.assertEqual(mapping.static_fraction(8 * 2**30, 16 * 2**30), 0.5)
 
+    # ADR 0014, note on amendment A14 (found live 2026-10-04): a discrete launch
+    # whose pools capyctl fixed renders its fraction from the static pool and
+    # the baseline allowance, never the whole card; without one, the static pool.
+    def test_the_allowance_raises_the_fraction_below_the_card(self):
+        total = 16 * 2**30
+        memory = {"static_bytes": 8 * 2**30, "device_total_bytes": total}
+        self.assertEqual(mapping.fraction_bytes(memory, total), 8 * 2**30)
+        memory["static_allowance_bytes"] = 2**30
+        self.assertEqual(mapping.fraction_bytes(memory, total), 9 * 2**30)
+        self.assertEqual(mapping.static_fraction(mapping.fraction_bytes(memory, total), total),
+                         0.5625)
+        memory["static_bytes"] = total - 2**20
+        self.assertEqual(mapping.static_fraction(mapping.fraction_bytes(memory, total), total),
+                         0.9999)
+        for bad in (0, -1, True, 1.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(mapping.ServerArgsError):
+                    mapping.fraction_bytes(dict(memory, static_allowance_bytes=bad), total)
+
     def test_unified_keeps_memavailable(self):
         with mock.patch.object(mapping, "available_memory_bytes", return_value=100):
             self.assertEqual(mapping.available_bytes_for({}), 100)

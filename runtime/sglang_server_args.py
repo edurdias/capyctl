@@ -232,6 +232,26 @@ def static_fraction(static_bytes, available_bytes):
     return bps / 10000
 
 
+def fraction_bytes(memory, available_bytes):
+    """The bytes mem_fraction_static is rendered from: the static pool.
+
+    ADR 0014, note on amendment A14 (found live 2026-10-04): SGLang sizes its
+    pools from the fraction times the GPU memory free when it starts (after
+    its CUDA context, without the driver's reserve), not times the card's
+    total, so a discrete launch whose pools capyctl fixed (KV tokens and state
+    slots) adds `static_allowance_bytes`. The fixed pools bound what SGLang
+    allocates; the fraction stays below the whole card.
+    """
+    static_bytes = memory["static_bytes"]
+    allowance = memory.get("static_allowance_bytes")
+    if allowance is None:
+        return static_bytes
+    if (type(allowance) is not int or allowance <= 0 or type(available_bytes) is not int
+            or type(static_bytes) is not int):
+        raise ServerArgsError("memory_grant_unavailable")
+    return min(static_bytes + allowance, -(-available_bytes * 9999 // 10000))
+
+
 class _ClosedParser(argparse.ArgumentParser):
     """The installed parser's options, without exit, help or usage output."""
 
@@ -392,10 +412,10 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     if "max_mamba_cache_size" in settings and (
             "max_mamba_cache_size" in extra or "mamba_full_memory_ratio" in extra):
         raise ServerArgsError("effective_args_mismatch")
+    available = (available_bytes_for(settings["memory"]) if available_bytes is None
+                 else available_bytes)
     fraction = static_fraction(
-        settings["memory"]["static_bytes"],
-        available_bytes_for(settings["memory"]) if available_bytes is None
-        else available_bytes)
+        fraction_bytes(settings["memory"], available), available)
     reserved = dict(_RESERVED_CONSTANT)
     if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") == "1":
         reserved.update(log_level="debug", log_level_http="debug")

@@ -235,7 +235,12 @@ def _validate_settings(settings):
     # Discrete GPU design §6: the card's total is stated only on a discrete
     # device, where the static pool is a share of the card, not MemAvailable.
     discrete = type(memory) is dict and "device_total_bytes" in memory
-    _exact_object(memory, keys + ("device_total_bytes",) if discrete else keys)
+    # ADR 0014, note on amendment A14: a discrete launch whose pools capyctl
+    # fixed carries the allowance its fraction takes beyond the static pool.
+    allowance = discrete and "static_allowance_bytes" in memory
+    _exact_object(memory, keys + ("device_total_bytes",)
+                  + (("static_allowance_bytes",) if allowance else ())
+                  if discrete else keys)
     for name in ("request_bytes", "kv_cache_bytes", "static_bytes"):
         _integer(memory[name], 1, _I64)
     _integer(memory["margin_bytes"], 0, _I64)
@@ -248,6 +253,8 @@ def _validate_settings(settings):
         # the margin is a tenth of the weights share.
         if memory["margin_bytes"] != (request - kv) // 11:
             _reject()
+        if allowance:
+            _integer(memory["static_allowance_bytes"], 1, 1 << 34)
     # ADR 0014 §5: the static pool is the request minus the overhead margin,
     # floored at the declared KV cache and never above the whole request (an
     # explicit request below KV plus margin cannot honour the margin).

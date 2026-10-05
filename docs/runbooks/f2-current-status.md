@@ -14,6 +14,21 @@ Live on the laptop (16 GB GPU, SGLang 0.5.21, FrogNano-4B BF16, standalone, isol
 limited to 8 requests by the state cache", SGLang got `max_running_requests` 8 and
 `max_mamba_cache_size` 40, started, and answered 12 concurrent requests. Not run on a GB10.
 
+## SGLang's fraction on a discrete GPU — 2026-10-04 (branch `fix/sglang-discrete-overhead`)
+
+Closes ADR 0014 A14's open item (note on amendment A14). SGLang 0.5.21 takes
+`mem_fraction_static` of the GPU memory free at its baseline (after its CUDA context,
+without the driver's reserve), not of the card's total CapyCTL renders against, and keeps
+100 MiB for a multimodal checkpoint, so its pools fell about 0.65 GiB short on a 16 GB card.
+On a discrete GPU whose pools CapyCTL fixes, the closed memory object now carries
+`static_allowance_bytes` (1 GiB) and the entry renders the fraction from the static pool
+plus it (at most 0.9999). The fixed pools bound what SGLang allocates.
+
+Live on the laptop (16 GB GPU, SGLang 0.5.21, FrogNano-4B BF16, nothing stated, standalone,
+isolated state): before, SGLang held 42778 of 63935 KV tokens and refused inputs over 42772
+while status showed 63920; after, fraction 0.8352, `max_total_num_tokens=63935`, prompts of
+63820 and 63910 tokens answered, 14478 MiB on the card inside the 14.5 GiB charge. CPU and
+Fake-engine tests are not qualification.
 ## Derived SGLang requests hold the hybrid state — 2026-10-04 (branch `feat/sglang-state-facts`)
 
 ADR 0014 amendment A16 closes A14's follow-up. The host that measures a checkpoint also

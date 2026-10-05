@@ -518,6 +518,35 @@ fn status_and_a_refused_discrete_start_name_the_same_request() {
     assert_eq!(named_mib(&warning), named_mib(&error.to_string()));
 }
 
+// ADR 0014, note on amendment A14 (found live 2026-10-04, FrogNano-4B BF16,
+// SGLang 0.5.21, a 16 GB laptop GPU): SGLang took its fraction of the 15.24
+// GiB free when it started, not of the card's 15.99 GiB, and held 42778 of the
+// 63935 KV tokens passed. The fraction for a discrete launch whose pools are
+// fixed now carries the baseline allowance; unified memory renders as before.
+#[test]
+fn a_discrete_sglang_fraction_carries_the_baseline_allowance() {
+    let weights = 9_319_820_920i64;
+    let (_store, effective) = laptop_sglang(&frognano_4b(), weights, |_| {});
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let memory = sized.engine_config.memory();
+    let static_pool = memory.request_bytes - (memory.request_bytes - memory.kv_cache_bytes) / 11;
+    let settings = sglang_public(&sized);
+    assert_eq!(settings["memory"]["static_bytes"], json!(static_pool));
+    assert_eq!(
+        settings["memory"]["static_allowance_bytes"],
+        json!(capyctl_config::context_fit::DISCRETE_BASELINE_ALLOWANCE_BYTES)
+    );
+    let weights = 21_920_000_000;
+    let (_store, effective) = sized_sglang(&qwen38_27b(), Some(weights), |d| {
+        d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
+    });
+    let settings = sglang_public(&effective);
+    assert_eq!(settings["memory"]["static_bytes"], json!(88i64 << 30));
+    assert!(settings["memory"].get("static_allowance_bytes").is_none());
+}
+
 /// The golden SGLang deployment stating `memory`, on a unified host managing
 /// `managed`, resolved with the measured weights and (ADR 0014 amendment A16)
 /// the state slot the host measured beside them.
