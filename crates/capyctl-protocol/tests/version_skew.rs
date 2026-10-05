@@ -329,6 +329,7 @@ fn every_post_baseline_field_names_its_capability() {
             LIVE_PROFILE_UPDATE,
             DEVICE_MEMORY_DOMAINS,
             CHECKPOINT_STATE_SLOT,
+            ENGINE_GROUPS,
         ]
         .contains(name)
         {

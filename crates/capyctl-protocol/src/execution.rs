@@ -353,7 +353,15 @@ pub struct MemberCommand {
 }
 impl TryFrom<pb::GroupLaunchPlan> for GroupPlan {
     type Error = GroupIdentityError;
+    // ADR 0028 §14: every field is decoded from the wire and the plan is
+    // validated by `GroupPlan::new`; nothing is assumed.
     fn try_from(plan: pb::GroupLaunchPlan) -> Result<Self, Self::Error> {
+        let port = |value: u32| -> Result<Option<u16>, GroupIdentityError> {
+            match value {
+                0 => Ok(None),
+                value => value.try_into().map(Some).map_err(|_| GroupIdentityError),
+            }
+        };
         let members = plan
             .members
             .into_iter()
@@ -364,46 +372,41 @@ impl TryFrom<pb::GroupLaunchPlan> for GroupPlan {
                         member_id: m.member_id,
                     },
                     rank: m.rank,
-                    role: if m.rank == 0 {
-                        MemberRole::Head
-                    } else {
-                        MemberRole::Worker
+                    role: match m.role.as_str() {
+                        "head" => MemberRole::Head,
+                        "worker" => MemberRole::Worker,
+                        _ => return Err(GroupIdentityError),
                     },
                     profile_name: m.profile_name,
                     profile_fingerprint: m.profile_fingerprint,
                     checkpoint_fingerprint: m.checkpoint_fingerprint,
-                    // Interim: the wire does not yet carry engine, topology,
-                    // generation, model path or worker port (Task 7 adds them).
-                    // Until then a decoded plan takes a placeholder path and the
-                    // legacy vLLM shape, so the existing wire still round-trips.
-                    model_path: "-".into(),
+                    model_path: m.model_path,
                     devices: m.devices,
                     peer_address: m.peer_address.parse().map_err(|_| GroupIdentityError)?,
                     // A worker serves no API; the wire writes its port as zero.
-                    service_port: if m.rank == 0 {
-                        Some(m.service_port.try_into().map_err(|_| GroupIdentityError)?)
-                    } else if m.service_port == 0 {
-                        None
-                    } else {
-                        return Err(GroupIdentityError);
-                    },
-                    worker_port: None,
+                    service_port: port(m.service_port)?,
+                    worker_port: port(m.worker_port)?,
                 })
             })
             .collect::<Result<Vec<_>, GroupIdentityError>>()?;
-        let topology = GroupTopology {
-            tensor_parallel: members.len() as u32,
-            pipeline_parallel: 1,
-            local_ranks: 1,
+        let engine = match plan.engine.as_str() {
+            "vllm" => GroupEngine::Vllm,
+            "sglang" => GroupEngine::Sglang,
+            "tensorfold" => GroupEngine::Tensorfold,
+            _ => return Err(GroupIdentityError),
         };
         Self::new(
-            GroupEngine::Vllm,
+            engine,
             members,
-            topology,
+            GroupTopology {
+                tensor_parallel: plan.tensor_parallel,
+                pipeline_parallel: plan.pipeline_parallel,
+                local_ranks: plan.local_ranks,
+            },
             plan.rendezvous_port
                 .try_into()
                 .map_err(|_| GroupIdentityError)?,
-            1,
+            plan.generation,
         )
     }
 }
@@ -612,9 +615,21 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
                 devices: member.devices.clone(),
                 peer_address: member.peer_address.to_string(),
                 service_port: member.service_port.unwrap_or(0).into(),
+                role: match member.role {
+                    MemberRole::Head => "head",
+                    MemberRole::Worker => "worker",
+                }
+                .into(),
+                model_path: member.model_path.clone(),
+                worker_port: member.worker_port.unwrap_or(0).into(),
             })
             .collect(),
         rendezvous_port: plan.rendezvous_port().into(),
+        engine: plan.engine().as_str().into(),
+        tensor_parallel: plan.topology().tensor_parallel,
+        pipeline_parallel: plan.topology().pipeline_parallel,
+        local_ranks: plan.topology().local_ranks,
+        generation: plan.generation(),
     }
 }
 

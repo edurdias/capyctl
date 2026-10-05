@@ -425,3 +425,251 @@ fn kernel_builds_ride_a_usable_launch_only() {
     on_probe.kernel_builds = vec![span(10, 20)];
     assert!(validate_result(&probe, &on_probe).is_err());
 }
+
+mod groups {
+    use super::{command, MemberCommand};
+    use capyctl_domain::group::{
+        member_id, GroupEngine, GroupPlan, GroupTopology, MemberKey, MemberPlan, MemberRole,
+    };
+    use capyctl_protocol::capabilities::{
+        agent_capabilities, drain_only_permits, group_refusal, required, CATALOGUE, ENGINE_GROUPS,
+    };
+    use capyctl_protocol::execution::MemberAction;
+    use capyctl_protocol::pb;
+    use std::collections::BTreeSet;
+
+    struct Shape {
+        engine: GroupEngine,
+        topology: GroupTopology,
+        generation: i64,
+        model_path: &'static str,
+        worker_port: u16,
+    }
+    fn shape(engine: GroupEngine) -> Shape {
+        Shape {
+            engine,
+            topology: GroupTopology {
+                tensor_parallel: 2,
+                pipeline_parallel: 1,
+                local_ranks: 1,
+            },
+            generation: 1,
+            model_path: "/models/m",
+            worker_port: 25001,
+        }
+    }
+    fn plan_of(shape: &Shape) -> GroupPlan {
+        let members = (0..2)
+            .map(|rank| MemberPlan {
+                member: MemberKey {
+                    host_id: format!("host-{rank}"),
+                    member_id: member_id(rank),
+                },
+                rank,
+                role: if rank == 0 {
+                    MemberRole::Head
+                } else {
+                    MemberRole::Worker
+                },
+                profile_name: "profile".into(),
+                profile_fingerprint: "pinned".into(),
+                checkpoint_fingerprint: "checkpoint".into(),
+                model_path: shape.model_path.into(),
+                devices: vec!["gpu0".into()],
+                peer_address: format!("192.0.2.{}", rank + 10).parse().unwrap(),
+                service_port: (rank == 0).then_some(30000),
+                worker_port: (rank > 0 && shape.engine == GroupEngine::Sglang)
+                    .then_some(shape.worker_port),
+            })
+            .collect();
+        GroupPlan::new(
+            shape.engine,
+            members,
+            shape.topology,
+            25000,
+            shape.generation,
+        )
+        .unwrap()
+    }
+    fn sample_group_plan(engine: GroupEngine) -> GroupPlan {
+        plan_of(&shape(engine))
+    }
+    fn command_with(action: MemberAction) -> MemberCommand {
+        let mut command = MemberCommand::try_from(command()).unwrap();
+        command.identity.member.host_id = "host-0".into();
+        command.identity.member.member_id = member_id(0);
+        command.action = action;
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+    fn digest(plan: GroupPlan) -> [u8; 32] {
+        command_with(MemberAction::Launch(plan)).canonical_digest()
+    }
+
+    // T34: group actions round-trip every member field, and the digest binds them.
+    #[test]
+    fn group_launch_round_trips_new_fields() {
+        for engine in [
+            GroupEngine::Vllm,
+            GroupEngine::Sglang,
+            GroupEngine::Tensorfold,
+        ] {
+            for action in [
+                MemberAction::Launch(sample_group_plan(engine)),
+                MemberAction::Prepare(sample_group_plan(engine)),
+            ] {
+                let command = command_with(action);
+                let wire = command.to_wire();
+                let back = MemberCommand::try_from(pb::ServerToAgent {
+                    msg: Some(pb::server_to_agent::Msg::ExecuteMember(wire)),
+                })
+                .unwrap();
+                assert_eq!(back, command);
+                back.verify_digest().unwrap();
+            }
+        }
+    }
+
+    // T34: each wire field is bound by the payload digest.
+    #[test]
+    fn group_digest_binds_engine_topology_generation_path_and_port() {
+        let base = digest(sample_group_plan(GroupEngine::Sglang));
+        let variants = vec![
+            digest(sample_group_plan(GroupEngine::Vllm)),
+            digest(plan_of(&Shape {
+                worker_port: 25002,
+                ..shape(GroupEngine::Sglang)
+            })),
+            digest(plan_of(&Shape {
+                generation: 2,
+                ..shape(GroupEngine::Sglang)
+            })),
+            digest(plan_of(&Shape {
+                model_path: "/models/other",
+                ..shape(GroupEngine::Sglang)
+            })),
+            // Same members and ranks, different split: tp1 x pp2.
+            digest(plan_of(&Shape {
+                topology: GroupTopology {
+                    tensor_parallel: 1,
+                    pipeline_parallel: 2,
+                    local_ranks: 1,
+                },
+                ..shape(GroupEngine::Sglang)
+            })),
+        ];
+        for variant in &variants {
+            assert_ne!(*variant, base);
+        }
+        let distinct: BTreeSet<_> = variants.iter().collect();
+        assert_eq!(distinct.len(), variants.len());
+        // Two vLLM plans differing only in topology split differ too.
+        assert_ne!(
+            digest(sample_group_plan(GroupEngine::Vllm)),
+            digest(plan_of(&Shape {
+                topology: GroupTopology {
+                    tensor_parallel: 1,
+                    pipeline_parallel: 2,
+                    local_ranks: 1,
+                },
+                ..shape(GroupEngine::Vllm)
+            }))
+        );
+    }
+
+    fn launch_plan_mut(wire: &mut pb::ExecuteMember) -> &mut pb::GroupLaunchPlan {
+        match wire.action.as_mut().unwrap() {
+            pb::execute_member::Action::Launch(plan) => plan,
+            _ => unreachable!(),
+        }
+    }
+    fn decodes(wire: pb::ExecuteMember) -> bool {
+        MemberCommand::try_from(pb::ServerToAgent {
+            msg: Some(pb::server_to_agent::Msg::ExecuteMember(wire)),
+        })
+        .is_ok()
+    }
+
+    // T34: a malformed wire plan never becomes a domain plan.
+    #[test]
+    fn malformed_wire_plan_is_refused() {
+        let good =
+            command_with(MemberAction::Launch(sample_group_plan(GroupEngine::Sglang))).to_wire();
+        assert!(decodes(good.clone()));
+        let edits: &[fn(&mut pb::GroupLaunchPlan)] = &[
+            |p| p.members[1].rank = 0,
+            |p| p.members[1].role = "head".into(),
+            |p| p.members[0].role = "worker".into(),
+            |p| p.members[1].role = "observer".into(),
+            |p| p.members[1].role.clear(),
+            |p| p.members[1].model_path.clear(),
+            |p| p.members[1].worker_port = 0,
+            |p| p.members[0].worker_port = 25001,
+            |p| p.members[1].worker_port = 70000,
+            |p| p.engine = "triton".into(),
+            |p| p.engine.clear(),
+            |p| p.tensor_parallel = 0,
+            |p| p.pipeline_parallel = 0,
+            |p| p.local_ranks = 0,
+            |p| p.tensor_parallel = 4,
+            |p| p.generation = 0,
+        ];
+        for (index, edit) in edits.iter().enumerate() {
+            let mut wire = good.clone();
+            edit(launch_plan_mut(&mut wire));
+            assert!(!decodes(wire), "edit {index} was accepted");
+        }
+    }
+
+    // T34: a host without engine_groups is refused typed; one with it is not.
+    #[test]
+    fn engine_groups_gates_group_placement() {
+        let none = BTreeSet::new();
+        assert_eq!(
+            group_refusal(&none).as_deref(),
+            Some("host_capability_missing:engine_groups")
+        );
+        let with = BTreeSet::from([ENGINE_GROUPS.to_owned()]);
+        assert_eq!(group_refusal(&with), None);
+        assert!(agent_capabilities().contains(&ENGINE_GROUPS.to_owned()));
+        assert!(CATALOGUE.iter().any(|(name, _)| *name == ENGINE_GROUPS));
+        for action in [
+            MemberAction::Launch(sample_group_plan(GroupEngine::Vllm)),
+            MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)),
+        ] {
+            assert_eq!(required(&command_with(action).to_wire()), [ENGINE_GROUPS]);
+        }
+        assert!(required(&command_with(MemberAction::Inspect).to_wire()).is_empty());
+    }
+
+    // T34: drain-only hosts may terminate a member but never prepare or launch one.
+    #[test]
+    fn drain_only_refuses_group_prepare_and_launch() {
+        for action in [
+            MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)),
+            MemberAction::Launch(sample_group_plan(GroupEngine::Vllm)),
+        ] {
+            assert!(!drain_only_permits(&command_with(action).to_wire()));
+        }
+        let terminate = MemberAction::Terminate {
+            owned_handle: "owned".into(),
+            recorded: Vec::new(),
+        };
+        assert!(drain_only_permits(&command_with(terminate).to_wire()));
+    }
+
+    // R11: the inventory carries a peer address and findings, nothing else.
+    #[test]
+    fn group_inventory_round_trips() {
+        use prost::Message;
+        let inventory = pb::ReportInventory {
+            group: Some(pb::GroupInventory {
+                peer_address: "192.0.2.10".into(),
+                findings: vec!["rdma_absent".into()],
+            }),
+            ..Default::default()
+        };
+        let back = pb::ReportInventory::decode(inventory.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back, inventory);
+    }
+}

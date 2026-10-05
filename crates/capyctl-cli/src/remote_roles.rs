@@ -1008,6 +1008,7 @@ async fn serve_host(
     .await
     .map_err(|_| unavailable())?;
     let inventory = pb::ReportInventory {
+        group: None,
         domains,
         profiles,
         envelope: Some(pb::Envelope {
