@@ -161,34 +161,54 @@ engine: tensorfold
 model: nemotron-3.5-lightning-30b-a3b-4bit
 residency: restart_only
 devices: [{id: gpu0}]
-resources:
-  cold:
-    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  ready:
-    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  parking:
-    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  parked:
-    allocations: [{domain: unified, bytes: 0B, host_kv_bytes: 0B}]
-    devices: []
-  wake:
-    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
+resources: {gpu: 30GiB, ram: 2GiB}
 engine_config:
   context_length: 32768
 ```
 
-`cold` covers the start, `ready` the running engine; a TensorFold model never
-parks, so `parked` holds nothing and `parking` and `wake` repeat `ready` and
-`cold`. The values above fit Nemotron 3.5 Lightning 30B-A3B 4-bit with a
-32768-token context on a GB10: TensorFold estimated 27.7 GiB at startup and
-CapyCTL measured a 20.2 GiB peak.
+`gpu` is what TensorFold holds on the GPU and `ram` what its process holds in
+host RAM. CapyCTL reserves both while the model starts, runs and stops, and
+nothing once it is stopped: a TensorFold model never parks. On a discrete card
+`gpu` is reserved on the card and `ram` in host RAM; on a GB10 both come from
+the one memory pool, so CapyCTL reserves their sum, 32 GiB. The values above fit
+Nemotron 3.5 Lightning 30B-A3B 4-bit with a 32768-token context on a GB10:
+TensorFold estimated 27.7 GiB at startup and CapyCTL measured a 20.2 GiB peak.
 
-The `ready` bytes are also TensorFold's memory cap: CapyCTL starts it with
-`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to them. Without a cap TensorFold sizes
+`capyctl validate config` lists what the two figures stand for; with
+`--host <host.yaml>` it names the memory domains they are reserved in:
+
+```bash
+capyctl validate config --file docs/examples/deployment-tensorfold.yaml
+```
+
+```text
+docs/examples/deployment-tensorfold.yaml is a valid deployment document
+
+Resources
+  cold     gpu 30GiB, ram 2GiB
+  ready    gpu 30GiB, ram 2GiB
+  parking  gpu 30GiB, ram 2GiB
+  parked   gpu 0B, ram 0B
+  wake     gpu 30GiB, ram 2GiB
+
+Not checked
+  resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, the host's devices and capacity, and timeouts, and to see the host's defaults; a TensorFold profile under another name than tensorfold is recognised only there
+  whether each allowed host is enrolled, online and has published (host_unpublished)
+  which runtime profiles the host's role accepted and published after measuring each installation (profile_not_published)
+  the host's current resource policy as the server stores it (resource_policy_unavailable)
+  route and deployment-name conflicts with existing deployments (route_conflict)
+  a new checkpoint's digest, measured on the host after acceptance (checkpoint_digest_pending)
+```
+
+The long form spells those five phases out, each with its `allocations` (a
+memory domain of the host, its `bytes` and `host_kv_bytes`) and `devices`. It
+is still accepted, and needed when a phase differs, for example a start that
+needs more than the running model. The short form is for a model that does not
+park: it means `residency: restart_only`, and any engine takes it.
+
+The GPU figure is also TensorFold's memory cap: CapyCTL starts it with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to it (on a GB10, to the sum; in the long
+form, to the `ready` bytes). Without a cap TensorFold sizes
 itself from the machine's free memory: with `--parallel` its caches grow as
 requests get longer, and it keeps long prompts' states for later turns, past what
 CapyCTL reserved. TensorFold 0.6.3 and later honour the cap;
@@ -201,11 +221,11 @@ TensorFold decodes several requests together only when it is told how many.
 CapyCTL starts it with `--parallel` set to the deployment's
 `max_concurrent_requests`, or 8 when the deployment does not set it; requests
 past that wait in TensorFold's queue. Lower than vLLM's 32 because TensorFold
-reserves its drafter's buffers for every stream at start, inside the `ready`
-bytes: Qwen3.8-27B with DFlash2 and a 32768-token context needs about 28 GiB
+reserves its drafter's buffers for every stream at start, inside the GPU
+figure: Qwen3.8-27B with DFlash2 and a 32768-token context needs about 28 GiB
 for one stream and 0.7 GiB more for each other one. A context that no longer
 fits is refused at start, and `capyctl status deployment` says to lower
-`max_concurrent_requests` or `context_length`, or raise `ready`. The streams'
+`max_concurrent_requests` or `context_length`, or raise `gpu`. The streams'
 KV caches grow as their requests get longer: a new request waits while it would
 not fit beside the others. To serve one request at a time, set
 `max_concurrent_requests: 1`.

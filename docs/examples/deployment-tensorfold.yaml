@@ -12,23 +12,9 @@ model: {hf: Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit@d9d758fb839534
 # TensorFold cannot free its memory while it runs, so the model never parks.
 residency: restart_only
 devices: [{id: gpu0}]
-# TensorFold states its memory: `cold` covers the start, `ready` the running
-# engine; `parking` and `wake` repeat them and `parked` holds nothing.
-resources:
-  cold:
-    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  ready:
-    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  parking:
-    allocations: [{domain: unified, bytes: 30GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
-  parked:
-    allocations: [{domain: unified, bytes: 0B, host_kv_bytes: 0B}]
-    devices: []
-  wake:
-    allocations: [{domain: unified, bytes: 32GiB, host_kv_bytes: 0B}]
-    devices: [{id: gpu0}]
+# TensorFold states its memory: what it holds on the GPU and in host RAM while
+# it starts, runs and stops. It never parks, so nothing is held once stopped.
+# On a GB10 both come from the one memory pool, which is charged their sum.
+resources: {gpu: 30GiB, ram: 2GiB}
 engine_config:
   context_length: 32768

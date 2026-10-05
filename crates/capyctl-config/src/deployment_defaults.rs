@@ -275,12 +275,18 @@ pub fn for_host(deployment: &Value, host: &Value) -> Result<Value, ConfigError> 
             }
         }
     }
-    if !object.contains_key("devices") && !object.contains_key("resources") {
+    // The short form names no domain, so it takes the default device as a
+    // document without resources does.
+    let names_domains = object
+        .get("resources")
+        .is_some_and(|r| !crate::short_resources::is_short(r));
+    if !object.contains_key("devices") && !names_domains {
         if let Some(claim) = default_device(host) {
             object.insert("devices".into(), json!([claim]));
         }
     }
     fill_device_sharing(&mut result, host);
+    crate::short_resources::expand_for_host(&mut result, host)?;
     Ok(result)
 }
 

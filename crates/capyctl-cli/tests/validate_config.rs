@@ -666,3 +666,79 @@ fn the_text_output_names_what_still_needs_a_host() {
     assert!(text.contains("Not checked"), "{text}");
     assert!(text.contains("--host"), "{text}");
 }
+
+// T03 T15: the short form of `resources` validates offline and shows the five
+// phases it stands for; against a discrete host it is the long form, with the
+// card's domain and the system domain named.
+#[test]
+fn the_short_resources_form_shows_its_phases() {
+    let root = tempfile::tempdir().unwrap();
+    let text = "name: m\nengine: vllm\nmodel: coding-small-r1\nresidency: restart_only\n\
+                devices: [{id: gpu0}]\nresources: {gpu: 11GiB, ram: 2GiB}\n\
+                engine_config: {memory: {kv_cache: 2GiB}}\n";
+    let short = write(root.path(), "short.yaml", text);
+    let (code, value, raw) = validate(&["--file", short.to_str().unwrap()]);
+    assert_eq!(code, 0, "{raw}");
+    let active = json!({"gpu": "11GiB", "ram": "2GiB"});
+    assert_eq!(
+        value["resources"],
+        json!({"cold": active, "ready": active, "parking": active,
+               "parked": {"gpu": "0B", "ram": "0B"}, "wake": active}),
+        "{raw}"
+    );
+    let out = support::capyctl()
+        .args(["validate", "config", "--file", short.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text_out = String::from_utf8(out.stdout).unwrap();
+    assert!(text_out.contains("ready"), "{text_out}");
+    assert!(text_out.contains("gpu 11GiB, ram 2GiB"), "{text_out}");
+
+    let host = examples().join("host-discrete.yaml");
+    let (code, value, raw) = validate(&[
+        "--file",
+        short.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    // Strict configs take no YAML anchors, so the long form spells each phase.
+    let phase = |name: &str, gpu: &str, ram: &str, devices: &str| {
+        format!(
+            "  {name}:\n    allocations: [{{domain: gpu0, bytes: {gpu}, host_kv_bytes: 0B}}, \
+             {{domain: system, bytes: {ram}, host_kv_bytes: 0B}}]\n    devices: {devices}\n"
+        )
+    };
+    let mut phases = String::from("resources:\n");
+    for name in ["cold", "ready", "parking", "wake"] {
+        phases.push_str(&phase(name, "11GiB", "2GiB", "[{id: gpu0}]"));
+    }
+    phases.push_str(&phase("parked", "0B", "0B", "[]"));
+    let long_text = text.replace("resources: {gpu: 11GiB, ram: 2GiB}\n", &phases);
+    let long = write(root.path(), "long.yaml", &long_text);
+    let (code, long_value, raw) = validate(&[
+        "--file",
+        long.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(
+        value["effective"], long_value["effective"],
+        "the short form resolves as the long form"
+    );
+    assert_eq!(
+        value["document"]["resources"]["ready"]["allocations"][0]["domain"],
+        "gpu0"
+    );
+    let out = support::capyctl()
+        .args(["validate", "config", "--file", short.to_str().unwrap()])
+        .args(["--host", host.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text_out = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text_out.contains("gpu0 11.0 GiB, system 2.0 GiB"),
+        "{text_out}"
+    );
+}

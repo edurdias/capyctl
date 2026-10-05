@@ -1,5 +1,27 @@
 # Current implementation and launch status
 
+## Short form of `resources` — 2026-10-04 (branch `feat/short-resources`)
+
+Owner decision, recorded in ADR 0023 §4: `resources: {gpu: 11GiB, ram: 2GiB}`
+stands for the five phases of a model that restarts. Where the document meets
+its host (`deployment_defaults::for_host`) it becomes the long form: cold,
+ready, parking and wake charge `gpu` on the device's domain and `ram` on the
+system domain (their sum on a unified pool), parked charges zero with no
+device, and an undeclared residency is `restart_only`. Refused: a parking
+residency, several devices, a missing figure, a zero `gpu`, a mix with phases.
+`validate config` shows the phases (short terms offline, by domain with
+`--host`). Any engine takes it; the TensorFold example uses it.
+
+Live, standalone on the branch build, one RTX 4090 Laptop GPU, TensorFold
+0.6.3, FrogNano-4B-2609 MLX 4-bit: the recipe's long-form file and the same
+file with `resources: {gpu: 11GiB, ram: 2GiB}` deployed side by side. Both
+started (`initialize succeeded`), both launched TensorFold with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB=11`, and status showed the same startup
+charge (11.0 GiB of gpu0 plus 2.0 GiB of RAM) and the same effective
+fingerprint. The short-form deployment answered a chat request (`391`,
+`finish_reason: stop`); with it running, starting the long-form one was
+refused `capacity_blocked` naming 11.0 GiB of gpu0, as for the long form.
+
 ## 0.1.2 release preparation — 2026-10-04
 
 Version bumped to 0.1.2 with release notes in

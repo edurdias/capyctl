@@ -163,6 +163,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("parking", PHASE),
         ("parked", PHASE),
         ("wake", PHASE),
+        // The short form, one figure each for every phase (`short_resources`).
+        ("gpu", BYTES),
+        ("ram", BYTES),
     ];
     // Spec §7: a deployment names where its weights come from. The union of every
     // variant's keys is listed once; which subset is legal is decided by the tagged

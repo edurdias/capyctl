@@ -130,6 +130,24 @@ wider trees than with `--parallel` above 1; measured live, one request alone
 decoded no slower with `--parallel 8` (15.8 against 12.3 tokens/s on the same
 machine).
 
+*Amended 2026-10-04 (owner decision):* a model that restarts holds the same
+memory in every phase, so the five phases repeated one figure. `resources` also
+takes a short form, one GPU figure and one RAM figure:
+`resources: {gpu: 11GiB, ram: 2GiB}`. Where the document meets its host it
+becomes the five phases: cold, ready, parking and wake charge both figures with
+the deployment's one device, and parked charges zero and holds no device. On a
+discrete GPU `gpu` charges the device's memory domain and `ram` the host's one
+system domain; on a unified machine both come from the one pool, which is
+charged their sum (that sum is then TensorFold's cap). The short form implies
+`residency: restart_only` and refuses a parking residency, several devices, a
+missing figure, a zero `gpu` and a block that mixes it with phases. It is
+generic: any engine that takes declared resources takes it. The long form is
+unchanged and still needed when the phases differ. A short and a long form that
+say the same resolve to the same effective configuration and snapshot; the
+command identity of a short-form deployment is its two figures.
+`capyctl validate config` shows the five phases: in the short form's terms
+offline, by domain with `--host`.
+
 ### 5. Drafter
 
 A drafter is handled as vLLM's and SGLang's draft models are (ADR 0014 §8 and
