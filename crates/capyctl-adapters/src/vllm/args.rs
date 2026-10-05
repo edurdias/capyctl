@@ -142,7 +142,8 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("api_key", &crate::traits::redacted(self.api_key.is_some()))
             .field("engine_path_extra", &self.engine_path_extra)
             .field("cuda_home", &self.cuda_home)
-            .field("build_env", &self.build_env)
+            // ADR 0028 §2.1: values may hold tokens; names only.
+            .field("build_env", &self.build_env.keys().collect::<Vec<_>>())
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
             .field("cuda_namespace", &self.cuda_namespace)

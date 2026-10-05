@@ -2015,3 +2015,21 @@ fn a_profile_env_may_not_set_an_owned_name() {
         "{error}"
     );
 }
+
+// T03: engine add refuses a bad approval entry now, not at every deployment.
+#[test]
+fn a_profile_with_a_bad_approved_env_is_refused_when_written() {
+    let (_, host) = fixture();
+    for bad in ["*", "NCCL_*", "mbx_*"] {
+        let mut profile = host["runtime_profiles"]["local"].clone();
+        profile["security"]["approved_env"] = serde_json::json!([bad]);
+        let error = capyctl_config::effective::check_runtime_profile(&profile).unwrap_err();
+        assert_eq!(
+            error.path, "runtime_profiles.security.approved_env",
+            "{bad}"
+        );
+    }
+    let mut profile = host["runtime_profiles"]["local"].clone();
+    profile["security"]["approved_env"] = serde_json::json!(["MBX_*"]);
+    capyctl_config::effective::check_runtime_profile(&profile).unwrap();
+}

@@ -77,6 +77,10 @@ pub(super) fn normalize_profile(
     let sleep_mode = raw_profile.security.deep_park.is_enabled() && residency.parks();
     validate_profile_args(raw_profile.engine, &raw_profile.args, sleep_mode)
         .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
+    // ADR 0028 §2.1: a malformed or owned-only approval entry is refused when
+    // the profile is written, not at every deployment that uses it.
+    crate::engine_env::ApprovedEnv::parse(&raw_profile.security.approved_env)
+        .map_err(|e| invalid("runtime_profiles.security.approved_env", e.code()))?;
     // ADR 0028 §2.1: a profile's own env needs no approval; owned names and
     // malformed entries are refused with the closed reason.
     validate_profile_env(&raw_profile.env)
