@@ -16,10 +16,16 @@ pub fn deployment_command_fingerprint(
     use sha2::{Digest, Sha256};
     // ADR 0013 §2: a claim stated by sharing mode alone names no device; its
     // identity is its position, the same on every host.
-    let mut input: DeploymentInput = decode(
-        &crate::instances::identity_devices(deployment),
-        "deployment",
-    )?;
+    // The short form of `resources` is the command's own statement: its
+    // figures are its identity, and the phases it stands for need a host.
+    let short = crate::short_resources::check(deployment)?;
+    let mut source = crate::instances::identity_devices(deployment);
+    if short.is_some() {
+        if let Some(object) = source.as_object_mut() {
+            object.remove("resources");
+        }
+    }
+    let mut input: DeploymentInput = decode(&source, "deployment")?;
     if input.schema_version != 1
         || input.kind != "deployment"
         || input.name.is_empty()
@@ -59,7 +65,10 @@ pub fn deployment_command_fingerprint(
         "version": 2, "name": input.name, "routes": input.routes,
         "runtime_profile": input.runtime_profile, "runtime_profile_revision": input.runtime_profile_revision,
         "model": model, "recipe": input.recipe, "residency": input.residency,
-        "recovery": input.recovery, "devices": input.devices, "resources": resources,
+        "recovery": input.recovery, "devices": input.devices, "resources": match short {
+            Some([(_, gpu), (_, ram)]) => json!({"gpu": gpu, "ram": ram}),
+            None => json!(resources),
+        },
         "request_deadline_ms": request_deadline_ms, "engine_config": engine_config,
     });
     // ADR 0013 §7: the instance count and placement are part of what the

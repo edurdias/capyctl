@@ -29,6 +29,8 @@ pub mod remote_resources;
 pub mod remote_roles;
 pub mod resource_controls;
 pub mod schema;
+// One GPU figure and one RAM figure for the five phases of a model that restarts.
+pub mod short_resources;
 // Owner decision 2026-09-25: every YAML setting of a role three ways, through
 // the generic `--set path=value` and `CAPYCTL_SET__PATH=value` overrides.
 pub mod setting_overrides;

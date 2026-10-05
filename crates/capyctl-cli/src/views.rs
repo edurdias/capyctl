@@ -228,6 +228,7 @@ fn validate(value: &Value) -> String {
     ))
     .row_opt("Resolved against", opt(&value["resolved_against"]))
     .render();
+    text.push_str(&resource_phases(value));
     // SPEC §15.3: without a host, say what was not checked.
     if value["resolved_against"].is_null() {
         if let Some(items) = value["requires_server"]
@@ -241,6 +242,43 @@ fn validate(value: &Value) -> String {
         }
     }
     text
+}
+
+/// The five phases of a deployment's resources: resolved on a host, by
+/// domain; offline, the short form's figures (the host names the domains).
+fn resource_phases(value: &Value) -> String {
+    const PHASES: [&str; 5] = ["cold", "ready", "parking", "parked", "wake"];
+    let line = |phase: &str| -> Option<String> {
+        if let Some(resolved) = value["effective"]["resources"][phase].as_object() {
+            let parts: Vec<String> = resolved
+                .get("allocations")?
+                .as_array()?
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{} {}",
+                        s(&a["domain"]),
+                        gib(a["bytes"].as_i64().unwrap_or(0))
+                    )
+                })
+                .collect();
+            return Some(parts.join(", "));
+        }
+        let short = value["resources"][phase].as_object()?;
+        Some(format!(
+            "gpu {}, ram {}",
+            s(&short["gpu"]),
+            s(&short["ram"])
+        ))
+    };
+    let lines: Vec<String> = PHASES
+        .iter()
+        .filter_map(|phase| line(phase).map(|l| format!("  {phase:<9}{l}\n")))
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\nResources\n{}", lines.concat())
 }
 
 fn published(value: &Value) -> String {

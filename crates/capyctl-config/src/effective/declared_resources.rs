@@ -24,6 +24,10 @@ pub fn validate_declared_resources(deployment: &Value) -> Result<(), ConfigError
         }
         return Ok(());
     };
+    // The short form's own checks; its phases need the host.
+    if crate::short_resources::check(deployment)?.is_some() {
+        return Ok(());
+    }
     // Deploy fills a claim's missing `sharing` from the host (found live
     // 2026-10-01: the guide's block names devices without it). Offline the
     // host is unknown, so a missing one takes the deployment's own sharing for

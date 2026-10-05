@@ -38,6 +38,13 @@
   with `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to the deployment's Ready
   allocation. Before, TensorFold sized itself from the machine's free memory
   and could grow past its declaration under long prompts.
+- **Short `resources`.** A model that restarts instead of parking can state
+  its memory as `resources: {gpu: 11GiB, ram: 2GiB}` instead of five phases:
+  CapyCTL reserves both figures while it starts, runs and stops and nothing
+  once it is stopped. On a unified-memory machine the pool is charged their
+  sum. The five phases are still accepted, and `capyctl validate config` shows
+  what the short form stands for. See the TensorFold section of the
+  [engines guide](../guide/engines.md).
 - **Kernel builds leave the startup peak alone.** A first start of vLLM,
   SGLang or TensorFold that compiles kernels no longer records the compilers'
   memory as the deployment's startup peak, which on a unified-memory host left

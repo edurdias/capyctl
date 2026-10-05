@@ -216,7 +216,8 @@ pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigE
 /// when the host has no device domain, when the deployment names a device
 /// (`devices: [{id: gpuN}]` pins it), declares several claims (refused
 /// `multi_gpu_unsupported` by resolution), or declares explicit `resources`,
-/// which name their domains and so their device.
+/// which name their domains and so their device (the short form
+/// `{gpu, ram}` names none, so it offers the choice).
 pub fn device_choices(
     deployment: &Value,
     host: &Value,
@@ -240,7 +241,10 @@ pub fn device_choices(
                 .collect()
         })
         .unwrap_or_default();
-    if devices.is_empty() || deployment.get("resources").is_some_and(|r| !r.is_null()) {
+    let names_domains = deployment
+        .get("resources")
+        .is_some_and(|r| !r.is_null() && !crate::short_resources::is_short(r));
+    if devices.is_empty() || names_domains {
         return Ok(Vec::new());
     }
     let claims = match deployment.get("devices") {

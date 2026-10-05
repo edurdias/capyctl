@@ -172,6 +172,13 @@ pub fn validate_config_at(
                     ];
                     unchecked.extend_from_slice(REQUIRES_SERVER);
                     out["requires_server"] = json!(unchecked);
+                    // The phases the short form of `resources` stands for;
+                    // the host names their domains.
+                    if let Some(phases) =
+                        capyctl_config::short_resources::offline_phases(&deployment["resources"])
+                    {
+                        out["resources"] = phases;
+                    }
                     return Ok(out);
                 }
                 Some(host_file) => {
