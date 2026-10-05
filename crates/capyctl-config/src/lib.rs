@@ -14,6 +14,7 @@ pub mod engine_policy;
 // ways (flag > environment > YAML > default), shared by host and standalone.
 pub mod engine_settings;
 pub mod error;
+pub mod group_support;
 pub mod instances;
 // ADR 0019, design §9: the one-time move of the old loopback inference bind.
 // ADR 0008: declared model sources and the host's model-source policy.
@@ -41,6 +42,8 @@ pub mod strict_yaml;
 pub mod yaml_emit;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
+// ADR 0028 §2: a deployment's multi-node topology and group shape.
+pub mod topology;
 // Tests across the workspace write executables through this.
 #[doc(hidden)]
 pub mod test_support;

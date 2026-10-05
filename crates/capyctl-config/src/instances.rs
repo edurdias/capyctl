@@ -86,6 +86,10 @@ pub struct InstanceSpec {
     /// written before it existed keeps its idempotency fingerprint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm: bool,
+    /// ADR 0028 §2: the multi-node group this deployment runs as, present only
+    /// for a world size above one, so a single-host command keeps its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<crate::topology::GroupShape>,
 }
 
 impl Default for InstanceSpec {
@@ -94,6 +98,7 @@ impl Default for InstanceSpec {
             instances: 1,
             placement: Placement::default(),
             warm: false,
+            group: None,
         }
     }
 }
@@ -405,7 +410,13 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
                 return Err(invalid("placement.hosts", "must name at least one host"));
             }
             if names.iter().collect::<BTreeSet<_>>().len() != names.len() {
-                return Err(invalid("placement.hosts", "must not repeat a host"));
+                // ADR 0028 §2: a group's repeat is a topology error.
+                return Err(if crate::topology::declares_group(deployment) {
+                    crate::topology::GroupRefusal::TopologyInvalid
+                        .at("placement.hosts", "must not repeat a host")
+                } else {
+                    invalid("placement.hosts", "must not repeat a host")
+                });
             }
             placement.hosts = Some(names);
         }
@@ -469,13 +480,21 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
                 .ok_or_else(|| invalid("lifecycle.warm", "must be true or false"))?;
         }
     }
-    let spec = InstanceSpec {
+    let mut spec = InstanceSpec {
         instances,
         placement,
         warm,
+        group: None,
     };
-    // ADR 0013 §3: with an explicit allowed set the count must fit it.
-    if let Some(hosts) = &spec.placement.hosts {
+    spec.group = crate::topology::parse_group_shape(deployment, &spec)?;
+    // ADR 0013 §3: with an explicit allowed set the count must fit it. A group
+    // places its ranks on its named hosts instead (ADR 0028 §2).
+    if let Some(hosts) = spec
+        .placement
+        .hosts
+        .as_ref()
+        .filter(|_| spec.group.is_none())
+    {
         if !spec.placeable_on(hosts.len()) {
             return Err(invalid(
                 "instances",

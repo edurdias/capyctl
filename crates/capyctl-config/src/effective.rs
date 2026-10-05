@@ -742,6 +742,9 @@ struct DeploymentInput {
     _placement: Option<serde_json::Value>,
     #[serde(default, rename = "host")]
     _host: Option<serde_json::Value>,
+    /// ADR 0028 §2: parsed with the instance spec like `placement`.
+    #[serde(default, rename = "topology")]
+    _topology: Option<serde_json::Value>,
     /// SPEC §6.5 (ADR 0013 amendment 2026-09-23): `lifecycle.warm` is a
     /// deployment-level policy parsed with the instance spec; it never enters
     /// the per-host recipe or its fingerprint.
@@ -1066,7 +1069,7 @@ pub fn resolve_effective_with_checkpoint(
     let h: HostInput = decode_host(host)?;
     // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
     // declaration before resolving anything against this host.
-    crate::instances::parse_instance_spec(deployment)?;
+    let instance_spec = crate::instances::parse_instance_spec(deployment)?;
     if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",
@@ -1134,6 +1137,15 @@ pub fn resolve_effective_with_checkpoint(
             discrete,
         )
     });
+    // ADR 0028 §2: a group's shape and residency must fit the profile's engine.
+    if let Some(group) = &instance_spec.group {
+        let tier = match residency {
+            Residency::RestartOnly => "restart_only",
+            Residency::HostBacked => "host_backed",
+            Residency::Deep => "deep",
+        };
+        crate::group_support::check_engine_shape(raw_profile.engine.name(), group, tier)?;
+    }
     // Owner decision 2026-09-25: a deployment that states no memory (and no
     // resources) gets the default KV cache of the domain it runs in; its
     // request derives from the checkpoint's weights (ADR 0014 §5).

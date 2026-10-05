@@ -714,6 +714,8 @@ impl crate::Store {
                 instances,
                 placement,
                 warm,
+                // ADR 0028 §2: the group is not stored yet.
+                group: None,
             })
         })
         .transpose()
