@@ -282,7 +282,30 @@ pub(crate) fn reserve_increase_in_transaction(
     request: &GrantRequest,
     context: AdmissionContext<'_>,
 ) -> Result<GrantReceipt, ResourceStoreError> {
-    reserve_in_transaction(transaction, request, context, GrantTransition::Increase)
+    reserve_in_transaction(
+        transaction,
+        request,
+        context,
+        GrantTransition::Increase,
+        None,
+    )
+}
+
+/// ADR 0028 §5: [`reserve_increase_in_transaction`] for one member of a group
+/// instance, charged to `member_owner_id(deployment, instance, rank)`.
+pub(crate) fn reserve_member_increase_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &GrantRequest,
+    rank: u32,
+    context: AdmissionContext<'_>,
+) -> Result<GrantReceipt, ResourceStoreError> {
+    reserve_in_transaction(
+        transaction,
+        request,
+        context,
+        GrantTransition::Increase,
+        Some(rank),
+    )
 }
 
 enum GrantTransition {
@@ -293,6 +316,7 @@ fn reserve_in_transaction(
     request: &GrantRequest,
     context: AdmissionContext<'_>,
     transition: GrantTransition,
+    member: Option<u32>,
 ) -> Result<GrantReceipt, ResourceStoreError> {
     if request.id.is_empty()
         || request.owner_id.is_empty()
@@ -344,9 +368,14 @@ fn reserve_in_transaction(
     let Some((revision, generation, kind, operation_state, instance)) = state else {
         return Err(ResourceStoreError::Conflict);
     };
+    // ADR 0028 §5: a group member's owner names its instance and rank.
+    let owner = match member {
+        None => crate::instances::instance_owner_id(&request.deployment_id, instance),
+        Some(rank) => crate::groups::member_owner_id(&request.deployment_id, instance, rank),
+    };
     if revision != request.revision
         || generation != request.generation
-        || request.owner_id != crate::instances::instance_owner_id(&request.deployment_id, instance)
+        || request.owner_id != owner
         || kind != "model"
         || !matches!(operation_state.as_str(), "pending" | "running")
     {
@@ -381,9 +410,9 @@ fn reserve_in_transaction(
         .and_then(|e| e.checked_add(1))
         .ok_or(ResourceStoreError::Invalid)?;
     transaction.execute(
-        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index) VALUES(?1,?2,?3,?4)
+        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index,member_rank) VALUES(?1,?2,?3,?4,?5)
          ON CONFLICT(owner_id) DO UPDATE SET footprint_json=excluded.footprint_json",
-        params![request.owner_id, encoded, request.deployment_id, instance],
+        params![request.owner_id, encoded, request.deployment_id, instance, member],
     )?;
     transaction.execute(
         "UPDATE resource_ledger_meta SET epoch=?1 WHERE singleton=1",

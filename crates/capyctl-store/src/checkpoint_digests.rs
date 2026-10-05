@@ -318,7 +318,75 @@ pub(crate) fn is_resolved_host(
     resolved_host(tx, deployment, revision, effective, host_id)
 }
 
+/// ADR 0028 §6: one row per host and revision, holding that host's measurement.
+fn upsert_host_digest(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+    host_id: &str,
+    digest: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO checkpoint_host_digests(deployment_id,revision,host_id,digest,recorded_at_ms) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(deployment_id,revision,host_id) DO UPDATE SET digest=excluded.digest,recorded_at_ms=excluded.recorded_at_ms",
+        params![deployment, revision, host_id, digest, now_ms],
+    )?;
+    Ok(())
+}
+
 impl crate::Store {
+    /// ADR 0028 §6: record the digest `host_id` measured for its copy of one
+    /// revision's checkpoint. A later measurement by the same host replaces
+    /// it. Agreement across hosts is the caller's check over
+    /// [`Self::digests_for`]; the revision's own record is unchanged.
+    pub fn record_digest(
+        &self,
+        deployment: &str,
+        revision: i64,
+        host_id: &str,
+        digest: &str,
+    ) -> Result<()> {
+        if !is_checkpoint_digest(digest) || revision < 1 || host_id.trim().is_empty() {
+            return Err(CheckpointDigestError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let known: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1)",
+            [deployment],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(CheckpointDigestError::NotFound);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        upsert_host_digest(&tx, deployment, revision, host_id, digest, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// ADR 0028 §6: every host's recorded digest of one revision, by host id.
+    /// A single-host deployment has one entry, its host's.
+    pub fn digests_for(
+        &self,
+        deployment: &str,
+        revision: i64,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let rows = tx
+            .prepare(
+                "SELECT host_id,digest FROM checkpoint_host_digests WHERE deployment_id=?1 AND revision=?2",
+            )?
+            .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     /// The digest record of one revision, if it has one.
     pub fn checkpoint_digest(
         &self,
@@ -490,6 +558,8 @@ impl crate::Store {
         if !resolved_host(&tx, deployment, revision, &effective, host_id)? {
             return Err(CheckpointDigestError::UnresolvedHost);
         }
+        // ADR 0028 §6: the store keeps each host's own measurement as well.
+        upsert_host_digest(&tx, deployment, revision, host_id, digest, now_ms)?;
         let existing = match read(&tx, deployment, revision)? {
             Some(record) => record,
             None => {

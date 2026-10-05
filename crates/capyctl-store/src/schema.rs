@@ -935,6 +935,11 @@ CREATE TABLE IF NOT EXISTS parked_measurements(
 /// a store rolled back to an earlier version can reapply it.
 pub const SCHEMA_V40: &str = "-- checkpoint_digests.state_slot_bytes (migrate_v40)";
 
+/// v41 (ADR 0028 §5, §6): group plans and members, per-member resource owners,
+/// group endpoint leases, rendezvous port exclusions and per-host checkpoint
+/// digests. The steps are in `groups::migrate_v41`, which is idempotent.
+pub const SCHEMA_V41: &str = "-- group plans (groups::migrate_v41)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

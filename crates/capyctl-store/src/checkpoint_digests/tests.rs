@@ -114,6 +114,11 @@ fn an_accepted_revision_is_pending_until_a_host_measures_it() {
         Some(DIGEST)
     );
     assert!(store.pending_checkpoint_digests().unwrap().is_empty());
+    // T14, ADR 0028 §6: the measuring host's own row reads the same digest.
+    assert_eq!(
+        store.digests_for(&receipt.deployment_id, 1).unwrap(),
+        std::collections::BTreeMap::from([("lab".to_owned(), DIGEST.to_owned())])
+    );
     // A declared request is not rewritten: both sides keep resolving it
     // without weights, as the launch plan says.
     assert!(frozen_memory(&store, &receipt)

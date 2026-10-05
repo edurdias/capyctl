@@ -162,6 +162,7 @@ fn holds_anything(tx: &Transaction<'_>, deployment: &str) -> Result<bool, Lifecy
              OR EXISTS(SELECT 1 FROM endpoint_leases e JOIN runtime_bindings b ON b.id=e.binding_id WHERE b.deployment_id=?1)
              OR EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1)
              OR EXISTS(SELECT 1 FROM resource_owners WHERE deployment_id=?1)
+             OR EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND state!='settled')
              OR EXISTS(SELECT 1 FROM owners WHERE deployment_id=?1)
              OR EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1)
              OR EXISTS(SELECT 1 FROM lifecycle_runs WHERE deployment_id=?1 AND state NOT IN ('succeeded','failed'))
@@ -262,6 +263,19 @@ impl crate::Store {
         // Records about the checkpoint, never the checkpoint.
         tx.execute(
             "DELETE FROM checkpoint_digests WHERE deployment_id=?1",
+            [deployment],
+        )?;
+        tx.execute(
+            "DELETE FROM checkpoint_host_digests WHERE deployment_id=?1",
+            [deployment],
+        )?;
+        // ADR 0028 §11: settled group plans are history of a deleted deployment.
+        tx.execute(
+            "DELETE FROM group_members WHERE deployment_id=?1",
+            [deployment],
+        )?;
+        tx.execute(
+            "DELETE FROM group_plans WHERE deployment_id=?1",
             [deployment],
         )?;
         tx.execute(
