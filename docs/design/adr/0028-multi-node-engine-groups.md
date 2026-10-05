@@ -80,6 +80,9 @@ Decided on 2026-10-05, answering the design's open questions:
 - Groups of three or more hosts run live on rented machines after MN1-MN9 pass, with
   the cost confirmed first.
 
+Closed error codes and exit numbers are in the design's section 16 table
+(`docs/specs/2026-10-05-multi-node-groups-design.md`).
+
 The sections below mirror the design's sections 1 to 14; code cites them as
 `ADR 0028 §N`.
 
@@ -108,7 +111,10 @@ exact `placement.hosts`. Checked at deploy time:
   the first version (`group_shape_unsupported`).
 - `host:`, `placement.selector`, `strategy` and `max_per_host` are refused with a
   topology (`group_placement_required`); `instances` must be 1
-  (`group_instances_unsupported`). A standalone role refuses a topology.
+  (`group_instances_unsupported`). A standalone role refuses a topology with
+  `group_placement_required` (one host).
+- Duplicate hosts (after trimming), a zero dimension, or a host count that does not
+  divide TP x PP is `group_topology_invalid`.
 - `resources` and `engine_config.memory` are per member (§5). `devices` states one
   device per host.
 - Multi-node engine flags stay reserved; CapyCTL renders them from `topology` (§10).
@@ -143,7 +149,8 @@ Implemented for every deployment, single-host or group. Levels: the engine profi
    against (`engine_env_not_approved:<name>`). The profile's own `env` is
    host-authored and needs no approval, except for rule 1. The existing safe names
    (`MAX_JOBS`, `FLASHINFER_NVCC_THREADS`, `TOKENIZERS_PARALLELISM`,
-   `PYTHONUNBUFFERED`, `RUST_LOG`) keep their rules.
+   `PYTHONUNBUFFERED`, `RUST_LOG`) keep their rules at both levels and are admitted
+   at the deployment level without approval.
 3. An approval entry is upper-case `A`-`Z`, `0`-`9`, `_`, optionally ending in one
    `*`. A bare `*` is refused. Rule 1 is checked on the concrete name.
 4. The deployment's value overrides the profile's; the effective configuration shows
@@ -153,7 +160,7 @@ Implemented for every deployment, single-host or group. Levels: the engine profi
    on one host refuses the group. Rendered environments are equal across members
    apart from the per-host address variable.
 7. Values are bounded (4 KiB each, 64 names per level), single-line, and shown in
-   status. They are not secret storage.
+   status and the effective configuration. They are not secret storage.
 8. A deployment env change is a new revision; a profile env change changes the recipe
    fingerprint.
 
@@ -193,7 +200,9 @@ before any host is contacted.
 - **Memory per rank.** Every member's footprint is the deployment's `resources` (or
   the phases derived from `engine_config.memory`), charged on its host like a
   single-host instance (ADR 0007 phases, ADR 0013 managed limit and free reserve). The
-  head's API process is inside that figure. TensorFold's memory cap (ADR 0025) applies
+  head's API process is inside that figure, so the operator sizes for the head. On
+  unified-memory hosts (GB10) the device and system domains are one pool, as today.
+  TensorFold's memory cap (ADR 0025) applies
   per rank.
 - **All or nothing.** Every member is reserved in one store transaction under ADR 0007
   (fresh observations, epoch compare-and-swap on every named host), so two group plans
@@ -251,7 +260,8 @@ group (§11).
 The group is READY when the head passes the existing native readiness check for its
 engine (model readiness, not HTTP liveness). A TP or PP forward cannot complete without
 every rank, so a passing head check implies the collective works. Worker hosts never
-probe readiness. The router routes only to the head's ingress, opens the route only on
+probe readiness; SGLang's nonzero-rank health server always answers 200 and is
+never read. The router routes only to the head's ingress, opens the route only on
 READY (T30), and treats a group as one replica in balancing and failover. The
 initialization timeout is the deployment's `timeouts.initialize`.
 
@@ -285,12 +295,15 @@ configuration layer reads for the §2 checks.
   `tp_size: 1, nnodes: 1, node_rank: 0`) take the plan's values. TensorFold has no
   protected entry; its argv is checked in the adapter.
 - The recipe's own flags stay deployment `engine_config` or approved extra args and
-  must be equal on every member.
+  must be equal on every member; TensorFold requires equal context, drafting and
+  `--parallel` on both ranks.
 - **vLLM:** with `nnodes > 1` it chooses `mp`; `--headless` runs a bare executor that
-  joins the head's broadcast queue, which binds `VLLM_HOST_IP`. Sleep and wake are
+  joins the head's broadcast queue, which binds `VLLM_HOST_IP` (without it vLLM picks
+  the default-route interface). Sleep and wake are
   collective calls from the head that reach every rank.
 - **SGLang:** rank > 0 starts a dummy health server on `--host:--port`, hence the
-  worker loopback port. Rank > 0 ignores SIGTERM, so its stop normally escalates to
+  worker loopback port (two groups on one host would otherwise collide on the default
+  30000). Rank > 0 ignores SIGTERM, so its stop normally escalates to
   SIGKILL (§11). Release and resume go to rank 0, which broadcasts to every TP rank;
   cross-node behavior is inferred from source and proven only by the live row.
 - **TensorFold:** two ranks, one GPU each; rank 1 serves nothing. It has no sleep, so
@@ -316,7 +329,8 @@ configuration layer reads for the §2 checks.
   identities.
 - The rendezvous port is released only after every member settles.
 - **Recovery.** Under `recovery: reconcile`, a failed group relaunches as a new
-  generation and plan only after every member of the old one has settled.
+  generation and plan only after every member of the old one has settled. Attempts
+  count per instance.
 
 ### 12. Park and wake
 

@@ -193,9 +193,9 @@ and `tensorfold:request_latency_seconds` as engine latency series.
 
 Qualification covers host B (GB10, unified memory) only; discrete GPUs run
 TensorFold unqualified until a live row passes there. CPU and Fake-engine tests
-are not qualification. Out of scope: deep and host-backed residency, `--tp 2` (two-rank groups
-are in scope under ADR 0028), Apple Silicon and MLX, Docker, the recipes repository, `deploy --recipe`, and
-fetching or digesting a drafter.
+are not qualification. Out of scope: deep and host-backed residency, `--tp 2` (two-rank
+groups are in scope under ADR 0028), Apple Silicon and MLX, Docker, the recipes
+repository, `deploy --recipe`, and fetching or digesting a drafter.
 
 ## Amendment 2026-10-05 — multi-rank (ADR 0028)
 
