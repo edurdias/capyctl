@@ -128,7 +128,7 @@ class EnrollmentTests(unittest.TestCase):
         self.assertTrue(enrollment.enroll(self.fakes.scheduler))
         self.assertNotEqual((self.ask() or {}).get("status"), "observed")
 
-    # ADR 0014 A16: a speculative scheduler enrolls under a resident-weights
+    # ADR 0014 A17: a speculative scheduler enrolls under a resident-weights
     # scope and is observed; under a disk-reload scope it is refused.
     def test_a_speculative_scheduler_enrolls_only_with_resident_weights(self):
         from test_sglang_saver_residency import ServerArgs
@@ -177,7 +177,7 @@ class EnrollmentTests(unittest.TestCase):
 
     # ADR 0014 amendment A15 (found live 2026-10-03): a scheduler outside the
     # observed topology (here speculative decoding under a disk-reload scope,
-    # amendment A16) is not enrolled, and the
+    # amendment A17) is not enrolled, and the
     # engine's log says at which stage, with fixed words only.
     def test_a_refused_enrollment_names_its_stage(self):
         import io

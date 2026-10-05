@@ -1216,7 +1216,7 @@ pub(super) fn normalize_engine_config(
             // declared tier reaches the launch settings (ADR 0010).
             let memory_saver = parks;
             let cpu_weight_backup = inputs.residency == Residency::HostBacked;
-            // ADR 0014 amendment A16: with speculative decoding the park keeps
+            // ADR 0014 amendment A17: with speculative decoding the park keeps
             // the weights resident and releases the KV cache alone. SGLang's
             // weight release takes the draft model's weights too, and its disk
             // reload would load the target's checkpoint into the draft.

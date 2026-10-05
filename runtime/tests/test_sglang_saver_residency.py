@@ -269,7 +269,7 @@ class SaverResidencyTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "topology"):
             residency.topology(fakes.scheduler)
 
-    # ADR 0014 A16: a speculative scheduler's topology is the recipe's only
+    # ADR 0014 A17: a speculative scheduler's topology is the recipe's only
     # under a resident-weights launch, whose park never releases the draft's
     # weights; a launch that reloads from disk still refuses it.
     def test_topology_admits_speculative_decoding_only_with_resident_weights(self):

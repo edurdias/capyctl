@@ -380,7 +380,7 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         public = copy.deepcopy(self.public)
         public["settings"].update(cpu_weight_backup=True, weight_restore="cpu_backup")
         self.build(self.argv(public), self.payloads(public))
-        # ADR 0014 A16: resident weights need the memory saver and no backup.
+        # ADR 0014 A17: resident weights need the memory saver and no backup.
         public = copy.deepcopy(self.public)
         public["settings"].update(weight_restore="resident")
         self.build(self.argv(public), self.payloads(public))

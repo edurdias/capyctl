@@ -1,4 +1,4 @@
-//! ADR 0014 amendments A15 and A16: an SGLang deployment that runs
+//! ADR 0014 amendments A15 and A17: an SGLang deployment that runs
 //! speculative decoding parks with its weights resident. SGLang's weight
 //! release takes the draft model's weights with the target's, and its disk
 //! reload would load the target's checkpoint into the draft, so the park
@@ -60,7 +60,7 @@ fn sglang_settings(effective: &capyctl_config::effective::EffectiveDeployment) -
     serde_json::to_value(&effective.engine_config).unwrap()
 }
 
-// T14 T21: amendment A16 parks it with its weights resident.
+// T14 T21: amendment A17 parks it with its weights resident.
 #[test]
 fn a_speculative_sglang_deployment_parks_with_its_weights_resident() {
     let (speculative, host) = deployment("sglang", dflash());

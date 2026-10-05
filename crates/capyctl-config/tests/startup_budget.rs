@@ -247,7 +247,7 @@ fn speculative(engine: &str, draft: bool) -> (Value, Value) {
                 "DFLASH"
             ]),
         };
-        // Pinned to restarting, as the A8 measurement ran (amendment A16 lets
+        // Pinned to restarting, as the A8 measurement ran (amendment A17 lets
         // a speculative SGLang deployment park with its weights resident).
         if engine == "sglang" {
             deployment["residency"] = json!("restart_only");

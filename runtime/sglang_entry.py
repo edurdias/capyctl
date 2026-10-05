@@ -225,7 +225,7 @@ def _validate_settings(settings):
         _boolean(settings[name])
     _integer(settings["tokenizer_workers"], 1, 1024)
     expected_restore = "cpu_backup" if settings["cpu_weight_backup"] else "disk_reload"
-    # ADR 0014 A16: a park that keeps the weights mapped needs the saver and
+    # ADR 0014 A17: a park that keeps the weights mapped needs the saver and
     # no weights backup.
     if (settings["weight_restore"] != "resident" or settings["memory_saver"] is not True
             or settings["cpu_weight_backup"] is not False):

@@ -1091,7 +1091,7 @@ pub fn resolve_effective_with_checkpoint(
     // is named in the provenance so a re-resolution with the measured weights
     // chooses again (ADR 0014 §7).
     let residency_defaulted = d.residency.is_none();
-    // ADR 0014 amendments A15 and A16: SGLang parks a speculative deployment
+    // ADR 0014 amendments A15 and A17: SGLang parks a speculative deployment
     // with its weights resident, never through the host-RAM tier.
     let sglang_speculative = raw_profile.engine == Engine::Sglang
         && crate::engine_policy::sglang_speculative(
@@ -1111,7 +1111,7 @@ pub fn resolve_effective_with_checkpoint(
     }
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
-        // A16: a speculative SGLang deployment never defaults to the host-RAM
+        // A17: a speculative SGLang deployment never defaults to the host-RAM
         // tier, so it is sized as on a unified host (`deep`).
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)

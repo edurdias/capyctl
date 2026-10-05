@@ -287,7 +287,7 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
             .into_iter()
             .flatten()
             .any(|name| !capyctl_config::parsers::valid_value(name))
-        // ADR 0014 A16: `resident` needs the memory saver and no backup.
+        // ADR 0014 A17: `resident` needs the memory saver and no backup.
         || (s.weight_restore != expected_restore
             && !(s.weight_restore == "resident" && s.memory_saver && !s.cpu_weight_backup))
         || s.extra_args.len() > MAX_EXTRA_ARGS

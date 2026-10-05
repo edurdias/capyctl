@@ -51,7 +51,7 @@ pub struct ObservationAccess<'a> {
     pub executable: &'a str,
     pub inference_key: &'a str,
     pub admin_key: &'a str,
-    /// ADR 0014 amendment A16: the launch parks with its weights resident, so
+    /// ADR 0014 amendment A17: the launch parks with its weights resident, so
     /// a released saver map is the KV cache unmapped and the weights mapped.
     pub resident_weights: bool,
 }
@@ -176,7 +176,7 @@ pub struct SglangAdapter {
     /// weights from the pinned host copy and the reload step has nothing to
     /// send. Fixed by the frozen settings at construction, never by a command.
     cpu_weight_backup: bool,
-    /// ADR 0014 amendment A16: the frozen launch's park keeps the weights
+    /// ADR 0014 amendment A17: the frozen launch's park keeps the weights
     /// resident (`weight_restore: resident`, SGLang with speculative
     /// decoding): release and resume name the KV cache alone, and the reload
     /// step has nothing to send.
@@ -544,7 +544,7 @@ impl SglangAdapter {
         // sends no `update_weights_from_disk`. It still reports
         // `WeightsUsable` only from the saver observations around it, and the
         // fresh probe after the flush proves the model usable.
-        // ADR 0014 A16: resident weights were never released, so there is
+        // ADR 0014 A17: resident weights were never released, so there is
         // nothing to reload either.
         let host_restored = command.action == RuntimeAction::ReloadWeights
             && (self.cpu_weight_backup || self.resident_weights);

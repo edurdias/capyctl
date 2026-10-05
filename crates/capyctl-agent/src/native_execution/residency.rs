@@ -151,7 +151,7 @@ pub(super) struct HostSglangObserver {
     idle: EngineIdle,
     content: [(bool, bool); 2],
     calls: AtomicUsize,
-    /// ADR 0014 amendment A16: the frozen launch parks with its weights
+    /// ADR 0014 amendment A17: the frozen launch parks with its weights
     /// resident (`weight_restore: resident`).
     resident_weights: bool,
 }

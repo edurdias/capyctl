@@ -55,7 +55,7 @@ fn checkpoint_refusal(error: CheckpointError) -> &'static str {
 /// or a live run proves a disk reload of modelopt weights works on the
 /// installed SGLang. vLLM is not affected by this rule.
 ///
-/// ADR 0014 amendment A16: a launch whose park keeps the weights resident
+/// ADR 0014 amendment A17: a launch whose park keeps the weights resident
 /// reloads nothing from disk, so the rule does not apply to it.
 fn deep_wake_cannot_reload(effective: &capyctl_config::effective::EffectiveDeployment) -> bool {
     let resident = matches!(
@@ -534,7 +534,7 @@ mod tests {
         .unwrap()
     }
 
-    /// ADR 0014 amendment A16: a park that keeps the weights resident reloads
+    /// ADR 0014 amendment A17: a park that keeps the weights resident reloads
     /// nothing from disk, so the modelopt reload rule does not refuse it.
     // T21
     #[test]

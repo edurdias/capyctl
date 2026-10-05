@@ -43,7 +43,7 @@ class HostBackedBindingTest(unittest.TestCase):
         with self.assertRaises(sglang_saver_binding.SaverBindingError):
             sglang_saver_binding.check_values(values, weight_restore="cpu_backup")
 
-    # ADR 0014 A16: a resident-weights launch keeps no weights backup at all.
+    # ADR 0014 A17: a resident-weights launch keeps no weights backup at all.
     def test_resident_weights_take_no_backup(self):
         sglang_saver_binding.check_values(dict(BASE_VALUES), weight_restore="resident")
         for values in (dict(BASE_VALUES, enable_weights_cpu_backup=True),

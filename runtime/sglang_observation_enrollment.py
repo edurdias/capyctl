@@ -36,7 +36,7 @@ ENV_DIR = "CAPYCTL_OBSERVATION_DIR"
 ENV_SCOPE = "CAPYCTL_OBSERVATION_SCOPE"
 # ADR 0019: the launch's declared weight restore, which decides whether the
 # saver's weights region may hold a CPU backup (`cpu_backup`, host_backed) and
-# whether a speculative scheduler is admitted (`resident`, ADR 0014 A16).
+# whether a speculative scheduler is admitted (`resident`, ADR 0014 A17).
 ENV_RESTORE = "CAPYCTL_OBSERVATION_WEIGHT_RESTORE"
 WEIGHT_RESTORES = ("disk_reload", "cpu_backup", "resident")
 

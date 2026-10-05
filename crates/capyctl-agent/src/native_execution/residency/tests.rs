@@ -355,7 +355,7 @@ async fn sglang_parks_and_restores_through_its_persisted_controls() {
     );
 }
 
-/// ADR 0014 amendment A16: a launch whose weights stay resident (SGLang with
+/// ADR 0014 amendment A17: a launch whose weights stay resident (SGLang with
 /// speculative decoding) parks the KV cache alone on the remote host too: the
 /// saver shows the weights still mapped, and the wake sends no disk reload.
 // T22 T16

@@ -945,10 +945,10 @@ speculative algorithm, a wake that restores the draft's weights (its own path on
 reload, or the draft's host-RAM backup), and a live check that drafts are still accepted
 after a wake. SGLang 0.5.20 also could not reload ModelOpt (NVFP4) weights from disk (ADR
 0019 §5), so for this checkpoint the wake has to be proven on the installed build.
-Amendment A16 takes this up: the park keeps the weights resident and reloads nothing, and
+Amendment A17 takes this up: the park keeps the weights resident and reloads nothing, and
 the default and the refusal of `deep` above no longer apply.
 
-## Amendment A16: SGLang parks a speculative deployment with its weights resident (owner decision 2026-10-03)
+## Amendment A17: SGLang parks a speculative deployment with its weights resident (owner decision 2026-10-03)
 
 Problem: amendment A15 left a speculative SGLang deployment `restart_only` (258 s from a stop
 to ready for Qwen3.8-27B NVFP4 with DFlash2). Its follow-up asked for a park that keeps the

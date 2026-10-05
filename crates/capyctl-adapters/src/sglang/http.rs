@@ -56,7 +56,7 @@ pub(super) struct ControlHttp {
     admin: HeaderValue,
     checkpoint: String,
     model: String,
-    /// ADR 0014 amendment A16: the launch's park keeps the weights resident,
+    /// ADR 0014 amendment A17: the launch's park keeps the weights resident,
     /// so release and resume name the KV cache region alone.
     resident_weights: bool,
 }
@@ -252,7 +252,7 @@ impl ControlHttp {
         action: RuntimeAction,
         timeout: Duration,
     ) -> Result<(), RuntimeError> {
-        // ADR 0014 amendment A16: a resident-weights park leaves the weights
+        // ADR 0014 amendment A17: a resident-weights park leaves the weights
         // region (the draft model's included) mapped.
         let tags = if self.resident_weights {
             json!({"tags":["kv_cache"]})

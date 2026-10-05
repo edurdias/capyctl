@@ -390,7 +390,7 @@ async fn host_backed_restores_from_host_ram_without_a_disk_reload() {
     );
 }
 
-/// ADR 0014 amendment A16: a launch whose weights stay resident (SGLang with
+/// ADR 0014 amendment A17: a launch whose weights stay resident (SGLang with
 /// speculative decoding, `weight_restore: resident`) parks by releasing the
 /// KV cache region alone, so the draft model's weights never leave the device.
 /// The resume asks for that region back and the reload step sends no

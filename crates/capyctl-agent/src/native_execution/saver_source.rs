@@ -323,7 +323,7 @@ pub(super) struct SaverFacts {
 /// mapped, or one tag resident while the other is released is partial evidence:
 /// unknown, which closes every action and leaves an effect uncertain.
 ///
-/// ADR 0014 amendment A16: a launch whose weights stay resident is released
+/// ADR 0014 amendment A17: a launch whose weights stay resident is released
 /// when its KV cache is unmapped and its weights are still fully mapped; for
 /// it, released weights are the partial map.
 pub(super) fn saver_facts(
