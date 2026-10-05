@@ -1,5 +1,7 @@
 # Multi-host Engine Groups Implementation Plan
 
+> Superseded on 2026-10-05 by `docs/plans/2026-10-05-multi-node-groups.md`. Kept for history; do not implement from this document.
+
 **Execution:** implement task by task in order; each task ends green on its own tests and is committed before the next starts. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run one engine instance across N named hosts (tensor parallel × pipeline parallel, one device per host in this version) through mllm, starting with vLLM native multi-node, with per-rank reservations, concurrent fan-out launch, head-only readiness, group-wide deep park with per-rank evidence, whole-group stop on any rank failure, and a live reproduction of the published two-host Qwen3.8-Flash-Next run through the router.

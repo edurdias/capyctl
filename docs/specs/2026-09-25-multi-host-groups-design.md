@@ -1,5 +1,7 @@
 # Multi-host engine groups — design
 
+> Superseded on 2026-10-05 by `docs/specs/2026-10-05-multi-node-groups-design.md`. Kept for history; do not implement from this document.
+
 Date: 2026-09-25. Status: owner-decided. The owner's decisions of 2026-09-25 are
 recorded in "Decisions" below. The six design choices those decisions left open were
 settled by the owner on PR #42 the same day and are recorded under "Owner decisions
