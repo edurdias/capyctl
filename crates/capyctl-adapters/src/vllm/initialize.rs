@@ -80,6 +80,9 @@ fn engine_environment(
             env.insert((*name).to_string(), value);
         }
     }
+    // ADR 0028 §2.1: the resolved engine env and the toolchain come before
+    // everything CapyCTL renders, so a rendered or fixed value is never replaced.
+    env.extend(toolchain.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.extend(rendered.iter().map(|(k, v)| (k.clone(), v.clone())));
     // Spec §3: the keys ride the environment, never argv.
     env.insert("VLLM_API_KEY".into(), key.to_string());
@@ -95,7 +98,6 @@ fn engine_environment(
         SYSTEM_PATH,
     );
     env.insert("PATH".into(), path);
-    env.extend(toolchain.iter().map(|(k, v)| (k.clone(), v.clone())));
     // ADR 0012 / T21: no vLLM plugin loads; SPEC §9.1: no bytecode is
     // written beside capyctl's checked runtime source.
     env.insert("VLLM_PLUGINS".into(), String::new());
@@ -103,7 +105,10 @@ fn engine_environment(
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
-    env.retain(|name, _| ENGINE_ENV_ALLOWLIST.contains(&name.as_str()));
+    // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
+    env.retain(|name, _| {
+        ENGINE_ENV_ALLOWLIST.contains(&name.as_str()) || plan.build_env.contains_key(name)
+    });
     env
 }
 
@@ -131,9 +136,10 @@ pub(super) async fn initialize(
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
     // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
-    let (toolchain, limits) = crate::engine_env::toolchain_environment(
-        plan.cuda_home.as_deref(),
+    let (toolchain, limits) = crate::engine_env::launch_environment_noted(
         &plan.build_env,
+        Some(&plan.engine_bin),
+        plan.cuda_home.as_deref(),
         crate::engine_env::mem_available_bytes(),
         crate::engine_env::cpu_count(),
     );

@@ -45,6 +45,7 @@ pub use checkpoint::{
     CHECKPOINT_DIGEST_PREFIX,
 };
 
+use crate::engine_env::{resolve_engine_env, ApprovedEnv, ResolvedEnv};
 use crate::engine_policy::{
     normalize_option_name, validate_profile_args, validate_profile_env, ExtraArgsPolicy,
 };
@@ -188,6 +189,11 @@ pub struct EffectiveDeployment {
     /// values capyctl derived or defaulted named in its provenance (T14).
     pub engine_config: LaunchSettings,
     pub profile: RuntimeProfile,
+    /// ADR 0028 §2.1 rule 4: the engine environment, each variable with its
+    /// source. Absent while the deployment sets none, so a configuration
+    /// without one serializes exactly as before.
+    #[serde(skip_serializing_if = "ResolvedEnv::has_no_deployment_entries")]
+    pub engine_env: ResolvedEnv,
     pub host: HostPolicy,
     pub recipe_fingerprint: String,
 }
@@ -367,6 +373,9 @@ pub struct Security {
     /// ADR 0014 §8: directories an approved path option may name.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub approved_paths: Vec<String>,
+    /// ADR 0028 §2.1: environment names and globs a deployment may set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_env: Vec<String>,
     /// ADR 0008 (owner decision 2026-09-23): what a launch does when the
     /// installation no longer measures to the fingerprint recorded at
     /// registration. Shown only when the host declared `refuse`, so a profile
@@ -413,6 +422,8 @@ struct RawSecurity {
     #[serde(default)]
     approved_paths: Vec<String>,
     #[serde(default)]
+    approved_env: Vec<String>,
+    #[serde(default)]
     installation_drift: InstallationDrift,
 }
 
@@ -437,6 +448,7 @@ impl From<RawSecurity> for Security {
             extra_args: raw.extra_args,
             approved_options: raw.approved_options,
             approved_paths: raw.approved_paths,
+            approved_env: raw.approved_env,
             installation_drift: raw.installation_drift,
         }
     }
@@ -1142,6 +1154,11 @@ pub fn resolve_effective_with_checkpoint(
         d.runtime_profile_revision.unwrap_or(raw_profile.revision),
         residency,
     )?;
+    // ADR 0028 §2.1: the deployment's env resolves against its own profile.
+    let approved_env = ApprovedEnv::parse(&profile.security.approved_env)
+        .map_err(|e| invalid("runtime_profiles.security.approved_env", e.code()))?;
+    let engine_env = resolve_engine_env(&profile.env, &approved_env, d.engine_config.env())
+        .map_err(|e| invalid("engine_config.env", e.code()))?;
     let model = core::normalize_model(
         d.model,
         Some(&host.model_store),
@@ -1267,7 +1284,8 @@ pub fn resolve_effective_with_checkpoint(
         facts,
         raw_profile.engine,
     )?;
-    let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &engine_config, &host)?;
+    let recipe_fingerprint =
+        core::recipe_fingerprint(&recipe, &profile, &engine_config, &engine_env, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
@@ -1292,6 +1310,7 @@ pub fn resolve_effective_with_checkpoint(
             security: profile.security,
             log_policy: profile.log_policy,
         },
+        engine_env,
         host,
         recipe_fingerprint,
     })

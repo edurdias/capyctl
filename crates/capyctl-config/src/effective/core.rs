@@ -77,12 +77,10 @@ pub(super) fn normalize_profile(
     let sleep_mode = raw_profile.security.deep_park.is_enabled() && residency.parks();
     validate_profile_args(raw_profile.engine, &raw_profile.args, sleep_mode)
         .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
-    validate_profile_env(&raw_profile.env).map_err(|_| {
-        invalid(
-            "runtime_profiles.env",
-            "environment name is not allowlisted, or a build limit is not a positive integer",
-        )
-    })?;
+    // ADR 0028 §2.1: a profile's own env needs no approval; owned names and
+    // malformed entries are refused with the closed reason.
+    validate_profile_env(&raw_profile.env)
+        .map_err(|reason| invalid("runtime_profiles.env", reason))?;
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
     // with the checkpoint. There are models that need it, but a profile may only
     // pass it where the host has said so in as many words.
@@ -782,6 +780,7 @@ pub(super) fn recipe_fingerprint(
     d: &NormalizedRecipe,
     profile: &NormalizedProfile,
     engine_config: &LaunchSettings,
+    engine_env: &ResolvedEnv,
     host: &HostPolicy,
 ) -> Result<String, ConfigError> {
     let resources = &d.resources;
@@ -810,6 +809,12 @@ pub(super) fn recipe_fingerprint(
         extra_args_policy: ExtraArgsPolicy,
         approved_options: &'a [String],
         approved_paths: &'a [String],
+        // ADR 0028 §2.1: shown only when declared, so every earlier
+        // fingerprint keeps its identity.
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        approved_env: &'a [String],
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        deployment_env: BTreeMap<String, String>,
         runtime_auth: bool,
         admin_auth: bool,
         log_policy: &'a LogPolicy,
@@ -838,6 +843,8 @@ pub(super) fn recipe_fingerprint(
         extra_args_policy: profile.security.extra_args,
         approved_options: &profile.security.approved_options,
         approved_paths: &profile.security.approved_paths,
+        approved_env: &profile.security.approved_env,
+        deployment_env: engine_env.deployment_values(),
         runtime_auth: profile.security.credential_ref.is_some(),
         admin_auth: profile.security.admin_credential_ref.is_some(),
         log_policy: &profile.log_policy,

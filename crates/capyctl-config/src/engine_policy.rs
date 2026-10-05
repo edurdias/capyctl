@@ -656,19 +656,6 @@ const VLLM_SHAPED: &[&str] = &[
 // ADR 0023 §3: TensorFold's --vision is a prefix of --vision-urls.
 const ORDINARY_EXACT: &[&str] = &["--reasoning-parser", "--vision"];
 
-const SAFE_ENV: &[&str] = &[
-    "RUST_LOG",
-    "TOKENIZERS_PARALLELISM",
-    "PYTHONUNBUFFERED",
-    // Owner decision 2026-09-25: overrides of the JIT build limits capyctl
-    // computes at launch (capyctl-adapters engine_env.rs). Positive integers only.
-    "MAX_JOBS",
-    "FLASHINFER_NVCC_THREADS",
-];
-
-/// Profile `env` names whose value must be a positive integer.
-const COUNT_ENV: &[&str] = &["MAX_JOBS", "FLASHINFER_NVCC_THREADS"];
-
 /// ADR 0014 §8, SPEC §8.2: the environment variable carrying the host's
 /// approvals for sensitive extra arguments to the protected entries, which
 /// gate the destinations the engine's own parser resolved
@@ -1116,12 +1103,14 @@ pub fn validate_rendered_args(
     Ok(())
 }
 
+/// ADR 0028 §2.1: the profile half of engine environment resolution. The
+/// error is the closed reason code or the detail naming the entry.
 pub fn validate_profile_env(env: &BTreeMap<String, String>) -> Result<(), String> {
-    env.iter()
-        .find(|(name, value)| {
-            !SAFE_ENV.contains(&name.as_str())
-                || COUNT_ENV.contains(&name.as_str())
-                    && !value.parse::<u32>().is_ok_and(|count| count >= 1)
-        })
-        .map_or(Ok(()), |(name, _)| Err(name.clone()))
+    crate::engine_env::resolve_engine_env(
+        env,
+        &crate::engine_env::ApprovedEnv::default(),
+        &BTreeMap::new(),
+    )
+    .map(|_| ())
+    .map_err(|refusal| refusal.code())
 }

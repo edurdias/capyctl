@@ -139,7 +139,7 @@ pub fn plan_from_effective(
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(|parent| parent.to_string_lossy().into_owned()),
         cuda_home: profile.cuda_home.clone(),
-        build_env: crate::engine_env::build_overrides(&profile.env),
+        build_env: effective.engine_env.values(),
         model_path,
         port,
         served_model_name,

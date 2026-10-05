@@ -242,6 +242,22 @@ fn the_engine_environment_is_closed() {
     assert!(!env.contains_key("TENSORFOLD_CUDA_MEMORY_LIMIT_GB"));
 }
 
+// T37: the resolved engine env joins the closed allowlist, and CapyCTL's own
+// values are never replaced by it.
+#[test]
+fn the_resolved_engine_env_is_admitted_but_never_wins() {
+    let mut input = plan();
+    input.build_env = BTreeMap::from([
+        ("MBX_FUSED_DRAFT".to_string(), "1".to_string()),
+        ("CAPYCTL_ENGINE_LOG".to_string(), "/elsewhere".to_string()),
+    ]);
+    let rendered = render_command(&input).unwrap().env;
+    let toolchain = input.build_env.clone();
+    let env = engine_environment(&rendered, &input, &|_| None, &toolchain);
+    assert_eq!(env["MBX_FUSED_DRAFT"], "1");
+    assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
+}
+
 // T41 (found live 2026-10-03: TensorFold 0.6.3 grew to 74 GiB under a 58 GiB
 // declaration, sizing its caches from the machine's free memory): the
 // deployment's declared allocation caps TensorFold's CUDA budget through

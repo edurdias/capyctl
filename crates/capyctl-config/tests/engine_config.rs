@@ -841,7 +841,8 @@ fn a_profile_cuda_home_is_absolute_and_only_fingerprinted_when_set() {
 }
 
 /// Owner decision 2026-09-25: a profile `env` may override the JIT build
-/// limits with a positive integer; anything else stays refused.
+/// limits with a positive integer; anything else stays refused. (ADR 0028
+/// §2.1: other non-owned names are now admitted, so they are not refused here.)
 // T21
 #[test]
 fn profile_env_build_limits_are_positive_integers() {
@@ -854,7 +855,6 @@ fn profile_env_build_limits_are_positive_integers() {
         ("MAX_JOBS", "0"),
         ("MAX_JOBS", "many"),
         ("FLASHINFER_NVCC_THREADS", "-1"),
-        ("NVCC_APPEND_FLAGS", "-O0"),
     ] {
         let mut bad = host.clone();
         bad["runtime_profiles"]["local"]["env"] = json!({ name: value });

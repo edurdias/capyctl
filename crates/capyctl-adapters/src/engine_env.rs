@@ -14,8 +14,9 @@
 //! - `FLASHINFER_NVCC_THREADS`: threads inside each FlashInfer `nvcc`; each one
 //!   multiplies a job's memory, so capyctl pins FlashInfer's own default of 1.
 //!
-//! A profile's `env` may set `MAX_JOBS` or `FLASHINFER_NVCC_THREADS` (positive
-//! integers, checked when the profile is resolved); its value wins. vLLM's
+//! The resolved engine env (ADR 0028 §2.1) may set `MAX_JOBS` or
+//! `FLASHINFER_NVCC_THREADS` (positive integers, checked when it is resolved);
+//! its value wins. vLLM's
 //! `NVCC_THREADS` applies only when vLLM itself is built, so it is not set.
 
 use std::collections::BTreeMap;
@@ -27,9 +28,6 @@ pub use capyctl_config::toolchain::SYSTEM_PATH;
 
 /// Memory one JIT compile job is budgeted.
 pub const BUILD_JOB_BYTES: u64 = 8 << 30;
-
-/// The profile `env` names that override the computed build limits.
-pub const BUILD_ENV_OVERRIDES: &[&str] = &["MAX_JOBS", "FLASHINFER_NVCC_THREADS"];
 
 /// `clamp(floor(available / 8 GiB), 1, cpus)`; an unknown `available` gives 1.
 pub fn build_job_cap(available_bytes: Option<u64>, cpus: usize) -> usize {
@@ -110,13 +108,40 @@ pub fn toolchain_environment(
     (env, line)
 }
 
-/// The profile `env` entries that override the build limits.
-pub fn build_overrides(profile_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    profile_env
-        .iter()
-        .filter(|(name, _)| BUILD_ENV_OVERRIDES.contains(&name.as_str()))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
+/// ADR 0028 §2.1: the whole launch environment of an engine, in one place: the
+/// resolved engine env first, then CapyCTL's own values, which win. `engine_exe`
+/// is the engine executable; its directory leads the PATH. The second value is
+/// the log line naming the chosen build limit.
+pub fn launch_environment_noted(
+    resolved: &BTreeMap<String, String>,
+    engine_exe: Option<&str>,
+    cuda_home: Option<&str>,
+    available_bytes: Option<u64>,
+    cpus: usize,
+) -> (BTreeMap<String, String>, String) {
+    let mut env = resolved.clone();
+    let engine_bin = engine_exe
+        .and_then(|exe| std::path::Path::new(exe).parent())
+        .and_then(|dir| dir.to_str())
+        .filter(|dir| !dir.is_empty());
+    env.insert(
+        "PATH".to_owned(),
+        tool_path(engine_bin, cuda_home, SYSTEM_PATH),
+    );
+    let (toolchain, line) = toolchain_environment(cuda_home, resolved, available_bytes, cpus);
+    env.extend(toolchain);
+    (env, line)
+}
+
+/// [`launch_environment_noted`] without the log line.
+pub fn launch_environment(
+    resolved: &BTreeMap<String, String>,
+    engine_exe: Option<&str>,
+    cuda_home: Option<&str>,
+    available_bytes: u64,
+    cpus: usize,
+) -> BTreeMap<String, String> {
+    launch_environment_noted(resolved, engine_exe, cuda_home, Some(available_bytes), cpus).0
 }
 
 #[cfg(test)]
@@ -124,6 +149,21 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    // T37: the launch environment carries the resolved engine env; CapyCTL's own values win.
+    #[test]
+    fn launch_environment_includes_resolved_engine_env() {
+        let resolved = BTreeMap::from([("MBX_FUSED_DRAFT".to_owned(), "1".to_owned())]);
+        let env = launch_environment(&resolved, Some("/opt/venv/bin/vllm"), None, 8 << 30, 4);
+        assert_eq!(env["MBX_FUSED_DRAFT"], "1");
+        assert!(env["PATH"].starts_with("/opt/venv/bin"));
+        // CapyCTL's computed limits and PATH are not replaced by a resolved name
+        // of the same spelling beyond the documented MAX_JOBS override.
+        let overridden = BTreeMap::from([("MAX_JOBS".to_owned(), "2".to_owned())]);
+        let env = launch_environment(&overridden, None, None, 64 << 30, 8);
+        assert_eq!(env["MAX_JOBS"], "2");
+        assert_eq!(env["FLASHINFER_NVCC_THREADS"], "1");
+    }
 
     // T21 (SPEC §13.3 amendment): the job cap follows free memory, bounded by 1
     // and the CPU count.
@@ -177,11 +217,5 @@ mod tests {
         assert_eq!(env["MAX_JOBS"], "2");
         assert!(!env.contains_key("CUDA_HOME"));
         assert!(line.contains("profile env"), "{line}");
-        let profile: BTreeMap<String, String> = [
-            ("RUST_LOG".into(), "info".into()),
-            ("FLASHINFER_NVCC_THREADS".into(), "2".into()),
-        ]
-        .into();
-        assert_eq!(build_overrides(&profile).len(), 1);
     }
 }

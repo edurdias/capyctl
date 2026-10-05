@@ -204,9 +204,17 @@ pub(super) struct RawEngineConfig {
     accept_extra_args: Option<bool>,
     #[serde(default)]
     extra_args: Option<Vec<String>>,
+    // ADR 0028 §2.1: the deployment's engine environment.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 impl RawEngineConfig {
+    /// The engine environment as written (resolved against the profile later).
+    pub(super) fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
     /// The extra engine arguments as written (validated later).
     pub(super) fn extra_args(&self) -> &[String] {
         self.extra_args.as_deref().unwrap_or_default()
@@ -1426,6 +1434,12 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
     if raw.tensorfold.is_none() {
         if let Some(object) = declared.as_object_mut() {
             object.remove("tensorfold");
+        }
+    }
+    // ADR 0028 §2.1: likewise the environment, only when declared.
+    if !raw.env.is_empty() {
+        if let Some(object) = declared.as_object_mut() {
+            object.insert("env".into(), serde_json::json!(raw.env));
         }
     }
     Ok(declared)

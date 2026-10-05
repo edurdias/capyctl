@@ -147,8 +147,5 @@ pub fn frozen_from_effective(
         admin_ref,
         settings.clone(),
     )
-    .with_toolchain(
-        profile.cuda_home.clone(),
-        crate::engine_env::build_overrides(&profile.env),
-    ))
+    .with_toolchain(profile.cuda_home.clone(), effective.engine_env.values()))
 }
