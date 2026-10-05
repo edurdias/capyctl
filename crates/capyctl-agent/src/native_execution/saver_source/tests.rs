@@ -37,6 +37,8 @@ struct Engine {
     busy: bool,
     /// The launch enrolled no observation.
     unenrolled: bool,
+    /// The last release named the KV cache alone: the weights stay mapped.
+    weights_kept: bool,
 }
 type Shared = Arc<Mutex<Engine>>;
 
@@ -44,6 +46,7 @@ async fn serve(
     State(engine): State<Shared>,
     uri: Uri,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
     let bearer = headers.get("authorization").and_then(|v| v.to_str().ok());
     let mut e = engine.lock().unwrap();
@@ -64,6 +67,10 @@ async fn serve(
             e.calls.push(path.into());
             match path {
                 "/release_memory_occupation" => {
+                    let tags: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    e.weights_kept = !tags["tags"]
+                        .as_array()
+                        .is_some_and(|tags| tags.iter().any(|tag| tag == "weights"));
                     e.released = true;
                     "null".into_response()
                 }
@@ -92,7 +99,11 @@ impl SaverResidency for Saver {
         {
             return Err(SaverUnavailable);
         }
-        let weights = if e.released { 0 } else { 1 << 20 };
+        let weights = if e.released && !e.weights_kept {
+            0
+        } else {
+            1 << 20
+        };
         let kv = if e.released || e.weights_only {
             0
         } else {
@@ -134,7 +145,7 @@ async fn stand() -> Stand {
     }
 }
 
-fn frozen(endpoint: String) -> NativeLaunch {
+fn frozen_with(endpoint: String, weight_restore: &str) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             binding_id: BINDING.into(),
@@ -184,7 +195,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
             reasoning_parser: None,
             memory_saver: true,
             cpu_weight_backup: false,
-            weight_restore: "disk_reload".into(),
+            weight_restore: weight_restore.into(),
             extra_args: Vec::new(),
             provenance: Default::default(),
         },
@@ -259,12 +270,19 @@ fn command(action: RuntimeAction, step: &str, identities: &[ProcessIdentity]) ->
 }
 
 fn adapter(stand: &Stand) -> SglangAdapter {
+    adapter_with(stand, "disk_reload")
+}
+
+fn adapter_with(stand: &Stand, weight_restore: &str) -> SglangAdapter {
     let observer: Arc<dyn SglangRuntimeObserver> = Arc::new(LaunchSglangObserver::new(Arc::new(
         Saver(stand.engine.clone()),
     )));
-    SglangAdapter::from_frozen(&frozen(stand.endpoint.clone()), Some(observer))
-        .unwrap()
-        .with_credentials("inference-key".into(), "admin-key".into())
+    SglangAdapter::from_frozen(
+        &frozen_with(stand.endpoint.clone(), weight_restore),
+        Some(observer),
+    )
+    .unwrap()
+    .with_credentials("inference-key".into(), "admin-key".into())
 }
 
 fn member() -> capyctl_adapters::traits::MemberRef {
@@ -324,6 +342,67 @@ async fn an_embedded_sglang_parks_and_restores_on_saver_evidence() {
             "/v1/chat/completions"
         ]
     );
+}
+
+/// ADR 0014 amendment A17: a launch whose weights stay resident (SGLang with
+/// speculative decoding) parks when the saver shows the KV cache released and
+/// the weights still fully mapped, and wakes without a disk reload.
+// T22 T16
+#[tokio::test]
+async fn an_embedded_launch_with_resident_weights_parks_its_kv_cache_alone() {
+    let stand = stand().await;
+    let group = group();
+    let adapter = adapter_with(&stand, "resident");
+    assert!(adapter.prepare_park(&member()).await.unwrap().quiescent);
+    let parked = adapter
+        .execute_persisted(&command(RuntimeAction::Park, "park", &group.identities))
+        .await
+        .unwrap();
+    assert_eq!(parked.facts, [Milestone::MemoryReleased]);
+    for (action, step) in [
+        (RuntimeAction::Restore, "restore"),
+        (RuntimeAction::ReloadWeights, "restore:reload"),
+        (RuntimeAction::InvalidateCache, "restore:cache"),
+        (RuntimeAction::Probe, "restore:probe"),
+    ] {
+        adapter
+            .execute_persisted(&command(action, step, &group.identities))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        stand.engine.lock().unwrap().calls,
+        [
+            "/release_memory_occupation",
+            "/resume_memory_occupation",
+            "/flush_cache",
+            "/v1/chat/completions"
+        ]
+    );
+}
+
+/// The same saver map (weights mapped, KV cache released) is partial evidence
+/// for a launch that reloads its weights from disk.
+// T22 T20
+#[test]
+fn weights_left_mapped_count_as_released_only_when_they_stay_resident() {
+    let kept = SaverMapped {
+        real_saver: true,
+        weight_bytes: 1 << 20,
+        kv_bytes: 0,
+        weight_virtual_bytes: 1 << 20,
+        kv_virtual_bytes: 1 << 20,
+    };
+    let mapped = Ok(kept);
+    assert!(saver_facts(&mapped, false).is_none());
+    assert!(saver_facts(&mapped, true).is_some_and(|f| f.released && !f.resident));
+    // Weights released under a resident launch are not its park either.
+    let gone = Ok(SaverMapped {
+        weight_bytes: 0,
+        ..kept
+    });
+    assert!(saver_facts(&gone, true).is_none());
+    assert!(saver_facts(&gone, false).is_some_and(|f| f.released));
 }
 
 /// W5: an embedded launch with engine work, or with no enrolled observation,

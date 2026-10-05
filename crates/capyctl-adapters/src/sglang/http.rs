@@ -56,6 +56,9 @@ pub(super) struct ControlHttp {
     admin: HeaderValue,
     checkpoint: String,
     model: String,
+    /// ADR 0014 amendment A17: the launch's park keeps the weights resident,
+    /// so release and resume name the KV cache region alone.
+    resident_weights: bool,
 }
 
 pub(super) fn uncertain() -> RuntimeError {
@@ -175,7 +178,14 @@ impl ControlHttp {
             model,
             inference: header(inference)?,
             admin: header(admin)?,
+            resident_weights: false,
         })
+    }
+
+    /// Park and wake the KV cache region alone (`weight_restore: resident`).
+    pub(super) fn with_resident_weights(mut self, resident: bool) -> Self {
+        self.resident_weights = resident;
+        self
     }
 
     /// Served model ids from `/v1/models`, guarded by the inference key the
@@ -242,15 +252,16 @@ impl ControlHttp {
         action: RuntimeAction,
         timeout: Duration,
     ) -> Result<(), RuntimeError> {
+        // ADR 0014 amendment A17: a resident-weights park leaves the weights
+        // region (the draft model's included) mapped.
+        let tags = if self.resident_weights {
+            json!({"tags":["kv_cache"]})
+        } else {
+            json!({"tags":["kv_cache","weights"]})
+        };
         let (path, body) = match action {
-            RuntimeAction::Park => (
-                "/release_memory_occupation",
-                json!({"tags":["kv_cache","weights"]}),
-            ),
-            RuntimeAction::Restore => (
-                "/resume_memory_occupation",
-                json!({"tags":["kv_cache","weights"]}),
-            ),
+            RuntimeAction::Park => ("/release_memory_occupation", tags),
+            RuntimeAction::Restore => ("/resume_memory_occupation", tags),
             RuntimeAction::ReloadWeights => (
                 "/update_weights_from_disk",
                 json!({"model_path":self.checkpoint,"load_format":"auto","abort_all_requests":false,"is_async":false,"keep_pause":false,"recapture_cuda_graph":false,"flush_cache":true}),

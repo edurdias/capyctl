@@ -35,9 +35,10 @@ import stat
 ENV_DIR = "CAPYCTL_OBSERVATION_DIR"
 ENV_SCOPE = "CAPYCTL_OBSERVATION_SCOPE"
 # ADR 0019: the launch's declared weight restore, which decides whether the
-# saver's weights region may hold a CPU backup (`cpu_backup`, host_backed).
+# saver's weights region may hold a CPU backup (`cpu_backup`, host_backed) and
+# whether a speculative scheduler is admitted (`resident`, ADR 0014 A17).
 ENV_RESTORE = "CAPYCTL_OBSERVATION_WEIGHT_RESTORE"
-WEIGHT_RESTORES = ("disk_reload", "cpu_backup")
+WEIGHT_RESTORES = ("disk_reload", "cpu_backup", "resident")
 
 # The live listener, retained for the scheduler process lifetime.
 _ENROLLED = []
@@ -158,7 +159,7 @@ def enroll(scheduler):
             scheduler, binding_id=binding, incarnation_id=incarnation, expected_owner=owner,
             build=build,
             observe=functools.partial(residency.observe_scheduler_saver, weight_restore=restore),
-            topology=residency.topology)
+            topology=functools.partial(residency.topology, weight_restore=restore))
         stage = "listen"
         server = SchedulerObservationServer.start(
             path=os.path.join(directory, binding + ".sock"), bridge=bridge, binding_id=binding,

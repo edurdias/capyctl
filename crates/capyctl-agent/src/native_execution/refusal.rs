@@ -54,8 +54,17 @@ fn checkpoint_refusal(error: CheckpointError) -> &'static str {
 /// the declared quantization method, not a probe result. Lift it once a probe
 /// or a live run proves a disk reload of modelopt weights works on the
 /// installed SGLang. vLLM is not affected by this rule.
+///
+/// ADR 0014 amendment A17: a launch whose park keeps the weights resident
+/// reloads nothing from disk, so the rule does not apply to it.
 fn deep_wake_cannot_reload(effective: &capyctl_config::effective::EffectiveDeployment) -> bool {
+    let resident = matches!(
+        &effective.engine_config,
+        capyctl_domain::launch::LaunchSettings::Sglang(settings)
+            if settings.weight_restore == "resident"
+    );
     effective.profile.engine == capyctl_config::engine_policy::Engine::Sglang
+        && !resident
         && effective
             .engine_config
             .common()
@@ -482,6 +491,63 @@ mod tests {
             &source["input"]["host"],
         )
         .unwrap()
+    }
+
+    /// An SGLang deployment declaring a modelopt quantization, with or without
+    /// speculative decoding (the config crate's own fixture).
+    fn sglang_modelopt(speculative: bool) -> EffectiveDeployment {
+        let all: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+        ))
+        .unwrap();
+        let (mut deployment, mut host) = (all["deployment"].clone(), all["host"].clone());
+        let object = deployment.as_object_mut().unwrap();
+        object.remove("resources");
+        object.remove("residency");
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = "sglang".into();
+        profile["args"] = serde_json::json!([]);
+        profile["security"]["admin_credential_ref"] = "secret://engine-admin".into();
+        profile["security"]["approved_options"] =
+            serde_json::json!(["--speculative-draft-model-path"]);
+        profile["security"]["approved_paths"] = serde_json::json!(["/srv/drafters"]);
+        deployment["engine_config"]["memory"] =
+            serde_json::json!({"request": "40GiB", "kv_cache": "8GiB"});
+        deployment["engine_config"]["quantization"] = "modelopt_fp4".into();
+        if speculative {
+            deployment["engine_config"]["accept_extra_args"] = true.into();
+            deployment["engine_config"]["extra_args"] = serde_json::json!([
+                "--speculative-draft-model-path",
+                "/srv/drafters/d",
+                "--speculative-algorithm",
+                "DFLASH"
+            ]);
+        }
+        capyctl_config::effective::resolve_effective_with_checkpoint(
+            &deployment,
+            &host,
+            capyctl_config::effective::CheckpointFacts {
+                weights_bytes: Some(GIB),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// ADR 0014 amendment A17: a park that keeps the weights resident reloads
+    /// nothing from disk, so the modelopt reload rule does not refuse it.
+    // T21
+    #[test]
+    fn a_resident_weights_park_is_not_refused_for_a_disk_reload() {
+        let deep = sglang_modelopt(false);
+        assert_eq!(deep.residency, capyctl_config::effective::Residency::Deep);
+        assert!(deep_wake_cannot_reload(&deep));
+        let resident = sglang_modelopt(true);
+        assert_eq!(
+            resident.residency,
+            capyctl_config::effective::Residency::Deep
+        );
+        assert!(!deep_wake_cannot_reload(&resident));
     }
 
     fn domain(

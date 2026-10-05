@@ -51,6 +51,9 @@ pub struct ObservationAccess<'a> {
     pub executable: &'a str,
     pub inference_key: &'a str,
     pub admin_key: &'a str,
+    /// ADR 0014 amendment A17: the launch parks with its weights resident, so
+    /// a released saver map is the KV cache unmapped and the weights mapped.
+    pub resident_weights: bool,
 }
 
 /// The coordinator supplies this trusted seam. Each call must inspect current
@@ -173,6 +176,11 @@ pub struct SglangAdapter {
     /// weights from the pinned host copy and the reload step has nothing to
     /// send. Fixed by the frozen settings at construction, never by a command.
     cpu_weight_backup: bool,
+    /// ADR 0014 amendment A17: the frozen launch's park keeps the weights
+    /// resident (`weight_restore: resident`, SGLang with speculative
+    /// decoding): release and resume name the KV cache alone, and the reload
+    /// step has nothing to send.
+    resident_weights: bool,
 }
 
 impl SglangAdapter {
@@ -216,6 +224,7 @@ impl SglangAdapter {
             extra_approvals: None,
             launched: Mutex::new(None),
             cpu_weight_backup: frozen.settings().cpu_weight_backup,
+            resident_weights: frozen.settings().weight_restore == "resident",
         })
     }
 
@@ -268,6 +277,7 @@ impl SglangAdapter {
                 executable: &self.executable,
                 inference_key: inference,
                 admin_key: admin,
+                resident_weights: self.resident_weights,
             }),
             _ => Err(uncertain()),
         }
@@ -288,7 +298,8 @@ impl SglangAdapter {
             inference.clone(),
             admin.clone(),
         )
-        .ok();
+        .ok()
+        .map(|http| http.with_resident_weights(self.resident_weights));
         self.forward = crate::forward::ChatHttp::new(
             self.base.clone(),
             self.served_name.clone(),
@@ -533,8 +544,10 @@ impl SglangAdapter {
         // sends no `update_weights_from_disk`. It still reports
         // `WeightsUsable` only from the saver observations around it, and the
         // fresh probe after the flush proves the model usable.
-        let host_restored =
-            command.action == RuntimeAction::ReloadWeights && self.cpu_weight_backup;
+        // ADR 0014 A17: resident weights were never released, so there is
+        // nothing to reload either.
+        let host_restored = command.action == RuntimeAction::ReloadWeights
+            && (self.cpu_weight_backup || self.resident_weights);
         if command.action != RuntimeAction::Drain && !host_restored {
             self.http
                 .as_ref()

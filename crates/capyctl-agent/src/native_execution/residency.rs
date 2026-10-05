@@ -151,13 +151,16 @@ pub(super) struct HostSglangObserver {
     idle: EngineIdle,
     content: [(bool, bool); 2],
     calls: AtomicUsize,
+    /// ADR 0014 amendment A17: the frozen launch parks with its weights
+    /// resident (`weight_restore: resident`).
+    resident_weights: bool,
 }
 
 impl HostSglangObserver {
     async fn observation(&self) -> SglangRuntimeObservation {
         let (weights, cache) = self.content[self.calls.fetch_add(1, Ordering::SeqCst).min(1)];
         let mapped = read_saver(&self.saver, self.scope.clone()).await;
-        let facts = saver_facts(&mapped);
+        let facts = saver_facts(&mapped, self.resident_weights);
         let identities = (self.live)();
         let in_flight = (self.in_flight)();
         let idle = (self.idle)().await;
@@ -282,6 +285,10 @@ impl Run<'_> {
             idle: idle.clone(),
             content: content(command.action),
             calls: AtomicUsize::new(0),
+            resident_weights: match &self.driver {
+                Driver::Sglang { frozen, .. } => frozen.settings().weight_restore == "resident",
+                Driver::Vllm(_) => false,
+            },
         })
     }
 

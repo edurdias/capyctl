@@ -946,6 +946,8 @@ speculative algorithm, a wake that restores the draft's weights (its own path on
 reload, or the draft's host-RAM backup), and a live check that drafts are still accepted
 after a wake. SGLang 0.5.20 also could not reload ModelOpt (NVFP4) weights from disk (ADR
 0019 §5), so for this checkpoint the wake has to be proven on the installed build.
+Amendment A17 takes this up: the park keeps the weights resident and reloads nothing, and
+the default and the refusal of `deep` above no longer apply.
 
 ## Amendment A16: a derived SGLang request holds the hybrid state (2026-10-04)
 
@@ -1038,3 +1040,96 @@ Evidence: `crates/capyctl-config/src/context_fit/sglang_pool/tests.rs`
 `a_derived_request_reserves_the_state_that_fits`), `crates/capyctl-adapters/tests/context_fit.rs`
 (`a_derived_request_holds_the_state_of_its_running_requests`,
 `sglang_sizes_a_hybrid_models_state_beside_its_kv_cache`).
+
+## Amendment A17: SGLang parks a speculative deployment with its weights resident (owner decision 2026-10-03)
+
+Problem: amendment A15 left a speculative SGLang deployment `restart_only` (258 s from a stop
+to ready for Qwen3.8-27B NVFP4 with DFlash2). Its follow-up asked for a park that keeps the
+draft model working after a wake.
+
+Options, read in SGLang 0.5.21's source:
+
+- **Restore target and draft separately from disk.** `/update_weights_from_disk` takes a
+  model path and no runner selector. `SchedulerWeightUpdaterManager.update_weights_from_disk`
+  sends it to every weight runner (`_select_runners()` with its default `all`), and the draft
+  runner sets its `model_config.model_path` to that path and loads the target's checkpoint.
+  Only the tensor, distributed and checksum routes take a `selector`, and they need the
+  weights from the caller. Not possible over SGLang's routes.
+- **Keep a host-RAM copy (`host_backed`).** The resume restores the target's weights from
+  `--enable-weights-cpu-backup`, but the reload would still send the target's path to the
+  draft runner if it reloaded, and the draft's own copy (`--enable-draft-weights-cpu-backup`)
+  is not part of the recipe. On unified memory a host-RAM copy frees nothing (ADR 0010
+  decision 5). Not taken.
+- **Release only the KV cache, keep the weights mapped.** `release_memory_occupation` takes
+  `tags`; with `["kv_cache"]` it pauses the KV cache region only (the KV pools, the draft's
+  included, and the hybrid model's recurrent-state pool, which SGLang allocates in the same
+  region) and flushes the radix cache. The weights region, the target's and the draft's, is
+  never touched, so nothing has to be reloaded. Taken: it is the only one of the three that
+  restores the draft correctly on 0.5.21, and the smallest change.
+
+Rule:
+
+- An SGLang deployment whose arguments name `--speculative-algorithm` parks `deep` again:
+  that is its default when the profile parks, and it may state it. Its launch settings carry
+  `weight_restore: resident` (beside `disk_reload` and `cpu_backup`) with the memory saver on
+  and no weights backup.
+- A `resident` launch parks with `release_memory_occupation {"tags":["kv_cache"]}` and wakes
+  with `resume_memory_occupation {"tags":["kv_cache"]}`, the cache flush and the fresh probe.
+  The reload step sends nothing, as under `host_backed`, and reports `WeightsUsable` only from
+  the saver observations around it.
+- The saver evidence follows: for a `resident` launch, released means the KV cache region
+  unmapped and the weights region still fully mapped. Released weights are a partial map
+  (unknown, uncertain), as a mapped weights region still is for a `disk_reload` launch.
+- The scheduler observation admits a named `speculative_algorithm` only under a `resident`
+  scope; under `disk_reload` or `cpu_backup` it still refuses the topology (A15).
+- The rule that refuses a `deep` SGLang launch declaring a modelopt quantization (SGLang
+  0.5.20 could not reload such weights from disk, ADR 0019 §5) does not apply to a
+  `resident` launch, which reloads nothing.
+- `host_backed` with speculative decoding is still refused when it is resolved, now naming
+  `deep` as the way out. A deployment stating `restart_only` keeps it.
+- The parked phase is charged as before: the placeholder until the first park is measured,
+  then the measured residue (A13). The weights stay in memory, so the measured residue is
+  about the weights, the CUDA graphs and SGLang's runtime; the first park after an upgrade
+  is the undercharged one A13 describes, checked against observed free memory at launch.
+
+What this frees: the KV cache and the state pool, not the weights. For the 27B deployment
+below that was 31 to 32 GiB of its 65 GiB request; the weights (21.2 GB, and 3.3 GB of draft
+model) stay.
+
+Evidence: `crates/capyctl-config/tests/sglang_speculative_residency.rs`,
+`resident_weights_park_the_kv_cache_alone_and_wake_without_a_reload` (adapter),
+`an_embedded_launch_with_resident_weights_parks_its_kv_cache_alone`,
+`weights_left_mapped_count_as_released_only_when_they_stay_resident`,
+`sglang_with_resident_weights_parks_its_kv_cache_alone` and
+`a_resident_weights_park_is_not_refused_for_a_disk_reload` (agent), and the runtime tests
+`test_topology_admits_speculative_decoding_only_with_resident_weights`,
+`test_resident_weights_take_no_backup` and
+`test_a_speculative_scheduler_enrolls_only_with_resident_weights`.
+
+Live (2026-10-05, GB10, SGLang 0.5.21, Qwen3.8-27B NVFP4 with DFlash2 and 8 draft tokens,
+`quantization: modelopt`, fp8 KV, request 65 GiB, KV cache 16 GiB, 8 running requests, managed
+limit 80 %, CUDA graphs on, no residency stated):
+
+- The deployment resolved `deep`, and its launch rendered the memory saver and
+  `weight_restore: resident`. It started in 242 to 293 s.
+- Three park and wake cycles, each on a fresh deployment (see the parked limit below). Each
+  park completed in about 1.1 s, and the host's used memory fell from 74 to 77 GiB to 43 to
+  44 GiB. The parked charge measured 33.4 GiB (35.89 GB) each time, against the 2 GiB
+  placeholder of the first park.
+- The wake on request: the first answer after a park started 2.0, 2.0 and 2.4 s after the
+  request (0.16 to 0.17 s when ready), and the rest of the answer decoded at the same speed as
+  before the park.
+- Draft acceptance, from SGLang's `generation_tokens_total` and `spec_verify_calls_total` over
+  each 512-token greedy answer: 4.53, 4.79 and 4.88 tokens per verify step on three prompts
+  before every park, and 4.51 (the wake probe's 2 tokens and one step included), 4.79 and
+  4.88 after every wake.
+- Greedy output (temperature 0, 512 tokens) was token for token identical on each of the three
+  prompts across 12 answers: a first start and a restart, before and after each park.
+
+Found with it, not changed here: a deployment's measured parked residue (33.4 GiB) is above a
+128 GB GB10 standalone's parked limit (a quarter of the memory, about 30 GiB, which a
+standalone does not let a setting raise). After the first park of a revision is measured, its
+next park is refused `park_parked_capacity` and the deployment stays ready (found on the same
+run: two later parks of one deployment were refused that way, leaving it serving). Such a
+deployment therefore parks once per revision on that host until the parked limit is raised
+or made settable on a standalone.

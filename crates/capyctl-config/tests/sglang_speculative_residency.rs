@@ -1,9 +1,9 @@
-//! ADR 0014 amendment A15 (owner decision 2026-10-03): SGLang does not park a
-//! deployment that runs speculative decoding. Its park releases the draft
-//! model's weights with the target's, and its deep wake reloads them from the
-//! target's checkpoint, so the draft would wake without its weights. Such a
-//! deployment defaults to `restart_only`, and one that asks to park is refused
-//! when it is resolved. CPU-only resolution tests; none of this qualifies an
+//! ADR 0014 amendments A15 and A17: an SGLang deployment that runs
+//! speculative decoding parks with its weights resident. SGLang's weight
+//! release takes the draft model's weights with the target's, and its disk
+//! reload would load the target's checkpoint into the draft, so the park
+//! releases the KV cache alone (`weight_restore: resident`). `host_backed` is
+//! refused: the draft model has no host-RAM copy. CPU-only resolution tests; none of this qualifies an
 //! engine recipe (SPEC §18).
 
 use capyctl_config::effective::{resolve_effective_with_checkpoint, CheckpointFacts, Residency};
@@ -55,15 +55,23 @@ fn dflash() -> Value {
     ])
 }
 
-// T14 T21
+/// The SGLang launch settings an effective deployment renders.
+fn sglang_settings(effective: &capyctl_config::effective::EffectiveDeployment) -> Value {
+    serde_json::to_value(&effective.engine_config).unwrap()
+}
+
+// T14 T21: amendment A17 parks it with its weights resident.
 #[test]
-fn a_speculative_sglang_deployment_defaults_to_restart_only() {
+fn a_speculative_sglang_deployment_parks_with_its_weights_resident() {
     let (speculative, host) = deployment("sglang", dflash());
     let effective = resolve_effective_with_checkpoint(&speculative, &host, weights()).unwrap();
-    assert_eq!(effective.residency, Residency::RestartOnly);
-    let provenance = serde_json::to_value(&effective.engine_config).unwrap()["provenance"].clone();
+    assert_eq!(effective.residency, Residency::Deep);
+    let settings = sglang_settings(&effective);
+    assert_eq!(settings["memory_saver"], json!(true));
+    assert_eq!(settings["cpu_weight_backup"], json!(false));
+    assert_eq!(settings["weight_restore"], json!("resident"));
     assert_eq!(
-        provenance["residency"],
+        settings["provenance"]["residency"],
         json!(SettingSource::CapyctlDefault)
     );
     // The `=` spelling and an abbreviation name the same option.
@@ -75,7 +83,19 @@ fn a_speculative_sglang_deployment_defaults_to_restart_only() {
         ]),
     );
     let effective = resolve_effective_with_checkpoint(&spelled, &host, weights()).unwrap();
-    assert_eq!(effective.residency, Residency::RestartOnly);
+    assert_eq!(effective.residency, Residency::Deep);
+    assert_eq!(
+        sglang_settings(&effective)["weight_restore"],
+        json!("resident")
+    );
+    // Stated, `deep` is the same park.
+    let (mut stated, host) = deployment("sglang", dflash());
+    stated["residency"] = json!("deep");
+    let effective = resolve_effective_with_checkpoint(&stated, &host, weights()).unwrap();
+    assert_eq!(
+        sglang_settings(&effective)["weight_restore"],
+        json!("resident")
+    );
 }
 
 // T14 T21: without speculative decoding SGLang still parks by default, and
@@ -85,6 +105,10 @@ fn other_deployments_keep_the_parking_default() {
     let (plain, host) = deployment("sglang", json!([]));
     let effective = resolve_effective_with_checkpoint(&plain, &host, weights()).unwrap();
     assert_eq!(effective.residency, Residency::Deep);
+    assert_eq!(
+        sglang_settings(&effective)["weight_restore"],
+        json!("disk_reload")
+    );
     let (vllm, host) = deployment(
         "vllm",
         json!([
@@ -96,26 +120,23 @@ fn other_deployments_keep_the_parking_default() {
     assert_eq!(effective.residency, Residency::Deep);
 }
 
-// T14 T21: a speculative SGLang deployment that asks to park is refused with
-// the reason, before anything is launched.
+// T14 T21: `host_backed` is still refused: its wake restores the target's
+// weights from host RAM and the draft model has no copy there.
 #[test]
-fn a_speculative_sglang_deployment_that_asks_to_park_is_refused() {
-    for residency in ["deep", "host_backed"] {
-        let (mut speculative, host) = deployment("sglang", dflash());
-        speculative["residency"] = json!(residency);
-        let error = resolve_effective_with_checkpoint(&speculative, &host, weights()).unwrap_err();
-        assert_eq!(
-            error.code,
-            ConfigErrorCode::UnsupportedCombination,
-            "{error}"
-        );
-        assert_eq!(error.path, "residency");
-        assert!(
-            error.to_string().contains("speculative decoding")
-                && error.to_string().contains("restart_only"),
-            "{error}"
-        );
-    }
+fn a_speculative_sglang_deployment_that_asks_for_host_backed_is_refused() {
+    let (mut speculative, host) = deployment("sglang", dflash());
+    speculative["residency"] = json!("host_backed");
+    let error = resolve_effective_with_checkpoint(&speculative, &host, weights()).unwrap_err();
+    assert_eq!(
+        error.code,
+        ConfigErrorCode::UnsupportedCombination,
+        "{error}"
+    );
+    assert_eq!(error.path, "residency");
+    assert!(
+        error.to_string().contains("speculative decoding") && error.to_string().contains("deep"),
+        "{error}"
+    );
     let (mut stated, host) = deployment("sglang", dflash());
     stated["residency"] = json!("restart_only");
     let effective = resolve_effective_with_checkpoint(&stated, &host, weights()).unwrap();

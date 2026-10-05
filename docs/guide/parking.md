@@ -18,6 +18,10 @@ CapyCTL picks the way from your hardware:
   the model parks deep instead.
 - On unified memory, a model parks deep: its weights are dropped, and a wake
   reloads them from disk.
+- SGLang with speculative decoding (`--speculative-algorithm`) parks with its
+  weights in memory: only the KV cache is given back, and a wake reloads
+  nothing. SGLang would otherwise drop the draft model's weights and reload
+  the target's checkpoint into it. `residency: host_backed` is refused for it.
 
 To choose yourself, set `residency: host_backed` (host RAM, discrete cards
 only), `residency: deep` or `residency: restart_only` in the deployment.

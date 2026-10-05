@@ -269,6 +269,28 @@ class SaverResidencyTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "topology"):
             residency.topology(fakes.scheduler)
 
+    # ADR 0014 A17: a speculative scheduler's topology is the recipe's only
+    # under a resident-weights launch, whose park never releases the draft's
+    # weights; a launch that reloads from disk still refuses it.
+    def test_topology_admits_speculative_decoding_only_with_resident_weights(self):
+        fakes = Fakes(self)
+        fakes.scheduler.server_args = ServerArgs(speculative_algorithm="DFLASH")
+        residency.topology(fakes.scheduler, weight_restore="resident")
+        for restore in ("disk_reload", "cpu_backup"):
+            with self.assertRaisesRegex(BridgeError, "topology"):
+                residency.topology(fakes.scheduler, weight_restore=restore)
+        with self.assertRaisesRegex(BridgeError, "topology"):
+            residency.topology(fakes.scheduler)
+        for value in ("", 1, b"DFLASH"):
+            fakes.scheduler.server_args = ServerArgs(speculative_algorithm=value)
+            with self.assertRaisesRegex(BridgeError, "topology"):
+                residency.topology(fakes.scheduler, weight_restore="resident")
+        fakes.scheduler.server_args = ServerArgs(speculative_algorithm="DFLASH", tp_size=2)
+        with self.assertRaisesRegex(BridgeError, "topology"):
+            residency.topology(fakes.scheduler, weight_restore="resident")
+        fakes.scheduler.server_args = ServerArgs()
+        residency.topology(fakes.scheduler, weight_restore="resident")
+
     def test_cuda_driver_maps_retain_statuses(self):
         class Call:
             def __init__(self, status, release=0):

@@ -128,6 +128,23 @@ class EnrollmentTests(unittest.TestCase):
         self.assertTrue(enrollment.enroll(self.fakes.scheduler))
         self.assertNotEqual((self.ask() or {}).get("status"), "observed")
 
+    # ADR 0014 A17: a speculative scheduler enrolls under a resident-weights
+    # scope and is observed; under a disk-reload scope it is refused.
+    def test_a_speculative_scheduler_enrolls_only_with_resident_weights(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.fakes.scheduler.server_args = ServerArgs(speculative_algorithm="DFLASH")
+        self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION,
+                                                     "resident"))
+        self.assertEqual(os.environ[enrollment.ENV_RESTORE], "resident")
+        self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+        self.assertEqual(self.ask()["status"], "observed")
+
+    def test_a_speculative_scheduler_under_a_disk_reload_scope_is_refused(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.fakes.scheduler.server_args = ServerArgs(speculative_algorithm="DFLASH")
+        self.scope()
+        self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+
     def test_an_unknown_weight_restore_publishes_no_scope(self):
         self.assertFalse(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION,
                                                       "cpu"))
@@ -159,7 +176,8 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.directory.name), [Path(self.library).name])
 
     # ADR 0014 amendment A15 (found live 2026-10-03): a scheduler outside the
-    # observed topology (here speculative decoding) is not enrolled, and the
+    # observed topology (here speculative decoding under a disk-reload scope,
+    # amendment A17) is not enrolled, and the
     # engine's log says at which stage, with fixed words only.
     def test_a_refused_enrollment_names_its_stage(self):
         import io

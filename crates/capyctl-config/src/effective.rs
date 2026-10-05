@@ -938,10 +938,11 @@ const TENSORFOLD_NEEDS_RESOURCES: &str =
     "a TensorFold deployment states resources: TensorFold sizes \
     itself from free memory, and its Ready allocation is the cap it is launched with";
 
-const SGLANG_SPECULATIVE_PARKS: &str =
+const SGLANG_SPECULATIVE_HOST_BACKED: &str =
     "capability_missing: SGLang cannot park a deployment with speculative decoding \
-    (`--speculative-algorithm`): its park releases the draft model's weights and its wake \
-    does not restore them; use restart_only";
+    (`--speculative-algorithm`) as host_backed: its wake restores the target's weights from \
+    host RAM and the draft model has no copy there; use deep (the weights stay resident) or \
+    restart_only";
 
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
@@ -1090,7 +1091,8 @@ pub fn resolve_effective_with_checkpoint(
     // is named in the provenance so a re-resolution with the measured weights
     // chooses again (ADR 0014 §7).
     let residency_defaulted = d.residency.is_none();
-    // ADR 0014 amendment A15: SGLang does not park a speculative deployment.
+    // ADR 0014 amendments A15 and A17: SGLang parks a speculative deployment
+    // with its weights resident, never through the host-RAM tier.
     let sglang_speculative = raw_profile.engine == Engine::Sglang
         && crate::engine_policy::sglang_speculative(
             &raw_profile
@@ -1100,23 +1102,23 @@ pub fn resolve_effective_with_checkpoint(
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-    if sglang_speculative && d.residency.is_some_and(Residency::parks) {
+    if sglang_speculative && d.residency == Some(Residency::HostBacked) {
         return Err(ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
             "residency",
-            SGLANG_SPECULATIVE_PARKS,
+            SGLANG_SPECULATIVE_HOST_BACKED,
         ));
     }
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
-        let discrete =
-            device_sizing.map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6: TensorFold never parks, so its default is restart_only,
-        // as it is for SGLang with speculative decoding (A15).
+        // A17: a speculative SGLang deployment never defaults to the host-RAM
+        // tier, so it is sized as on a unified host (`deep`).
+        let discrete = device_sizing
+            .filter(|_| !sglang_speculative)
+            .map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
+        // ADR 0023 §6: TensorFold never parks, so its default is restart_only.
         crate::deployment_defaults::default_residency(
-            raw_profile.security.deep_park.is_enabled()
-                && raw_profile.engine != Engine::Tensorfold
-                && !sglang_speculative,
+            raw_profile.security.deep_park.is_enabled() && raw_profile.engine != Engine::Tensorfold,
             discrete,
         )
     });
