@@ -823,7 +823,8 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   (float32 by default, or `--mamba-ssm-dtype`).
 - The running requests are the deployment's `max_concurrent_requests`. Undeclared, they are
   the most, up to CapyCTL's in-flight bound (32, `MAX_REQUESTS_PER_DEPLOYMENT`), whose state
-  fits, passed as `--max-running-requests`.
+  fits, passed as `--max-running-requests`. (Since 2026-10-05, up to 8: see the note on
+  amendment A16.)
 - The static pool rendered is the weights (with the draft model's, amendment A6), the KV
   cache, the state and 2 GiB of SGLang's own allocations (CUDA context, workspaces, load
   buffers), never less than the request less the margin nor more than the request; what it
@@ -846,7 +847,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   request holds the weights, the KV cache and the margin, and nothing for the state, so on
   unified memory the state may take up to half of the margin; the other half stays for
   SGLang's runtime outside its static pool. The static pool grows by what the state takes.
-  The running requests are the most, up to the declared count (or 32), that fit, and the
+  The running requests are the most, up to the declared count (or 8, note on A16), that fit, and the
   launch is refused only when one request does not fit. A discrete device lends nothing
   from its margin.
 - On a discrete device (found live 2026-10-04, FrogNano-4B BF16 on a 16 GB laptop GPU), a
@@ -854,7 +855,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   weights and the KV cache, and its margin lends nothing, so every hybrid deployment that
   stated no memory was refused for one running request. CapyCTL chose that KV cache as
   well, so the state takes up to half of it: the running requests are the most, up to the
-  declared count (or 32), whose state fits half the KV cache, the KV pool
+  declared count (or 8, note on A16), whose state fits half the KV cache, the KV pool
   (`--max-total-tokens`) is the KV cache less that state, and the fitted context is held to
   that pool. FrogNano-4B there runs 7 requests at 63920 tokens of context (it fitted 120512
   and was refused). The launch is refused only when one request's state exceeds half the KV
@@ -864,7 +865,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   400 naming the limit.
 - `status` sizes a deployment on a device domain as the launch does, before a card total is
   observed, so its warning and a refused start name the same memory request.
-- When the state holds fewer running requests than the declared count (or 32),
+- When the state holds fewer running requests than the declared count (or the router's 32),
   `status deployment` says "Running limited to N requests by the state cache", and the
   status JSON carries `context.running_limit` (standalone; a remote host decides at launch).
 - Arguments that size the state pool themselves (`--max-mamba-cache-size`,
@@ -968,7 +969,8 @@ Rule:
   so the host resolves the same request. The host refuses a launch whose state slot is
   not the one it reads, as it refuses other weights.
 - A derived request then holds the state of its running requests: the declared
-  `max_concurrent_requests`, else CapyCTL's in-flight bound (32), lowered to the most whose
+  `max_concurrent_requests`, else 8 (the note below; first CapyCTL's in-flight bound, 32),
+  lowered to the most whose
   request still fits the memory domain beside the engine's CUDA context (and, on unified
   memory, the first-start graph allowance). The state is amendment A14's: `(5 × running +
   1)` slots, plus `(running + 1) × draft tokens` with speculative decoding. On unified
@@ -988,9 +990,9 @@ Rule:
   mismatch; one that reports another is.
 
 Consequence: Qwen3.8-27B NVFP4 (153944064 bytes a slot) at the default 4 GiB KV cache now
-asks for about 23 GiB more and runs 32 requests where the host holds them; with DFlash2
-(8 draft tokens) the state of 32 requests is about 61 GiB, so a deployment that wants less
-states `max_concurrent_requests`. On a 16 GB laptop GPU FrogNano-4B BF16 at the default
+asked for about 23 GiB more and ran 32 requests where the host held them; with DFlash2
+(8 draft tokens) the state of 32 requests was about 61 GiB. The note below lowers the
+default to 8 requests: about 6 GiB, and 16 GiB with DFlash2. On a 16 GB laptop GPU FrogNano-4B BF16 at the default
 KV cache leaves no room for a slot beside it and keeps amendment A14's sizing (7 requests
 out of the KV cache); with a 2 GiB KV cache its request holds 7 requests' state and the KV
 pool keeps the whole 2 GiB.
@@ -1010,3 +1012,29 @@ Evidence: `crates/capyctl-adapters/tests/context_fit.rs`
 `an_explicit_or_legacy_request_reserves_no_state`, `the_state_slot_travels_with_the_snapshot`,
 `a_derived_discrete_request_holds_the_state_the_card_fits`) and
 `the_state_slot_is_recorded_and_sizes_a_derived_request` (store).
+
+### Note on amendment A16: hybrid SGLang runs 8 requests by default (2026-10-05)
+
+Owner decision 2026-10-05. The state a derived request reserves grows with the running
+requests, and the router's bound made it large: Qwen3.8-27B NVFP4 with DFlash2 reserved
+about 61 GiB of state for 32 requests on a GB10.
+
+Rule: on a gated-delta-net hybrid SGLang deployment that does not set
+`max_concurrent_requests`, the running requests are the most, up to 8
+(`capyctl_domain::launch::SGLANG_HYBRID_DEFAULT_RUNNING`, TensorFold's default,
+`TENSORFOLD_DEFAULT_PARALLEL`), whose state fits, instead of up to the router's bound. The
+state a derived request reserves, the state pool (`--max-mamba-cache-size`) and
+`--max-running-requests` all use that count, for derived and explicit requests alike. The
+router still admits 32 requests per deployment; the others wait in SGLang's queue, as with
+TensorFold, and `status deployment` says "Running limited to 8 requests by the state
+cache". A declared `max_concurrent_requests` is honored as before, up to 32 or beyond. A
+dense SGLang deployment is unchanged: its state does not scale with the running requests.
+
+Consequence: Qwen3.8-27B NVFP4 at the default 4 GiB KV cache asks for about 6 GiB of state
+(8 requests) instead of 23 GiB; with DFlash2 about 16 GiB instead of 61 GiB.
+
+Evidence: `crates/capyctl-config/src/context_fit/sglang_pool/tests.rs`
+(`a_hybrid_models_state_is_sized_beside_its_kv_cache`,
+`a_derived_request_reserves_the_state_that_fits`), `crates/capyctl-adapters/tests/context_fit.rs`
+(`a_derived_request_holds_the_state_of_its_running_requests`,
+`sglang_sizes_a_hybrid_models_state_beside_its_kv_cache`).

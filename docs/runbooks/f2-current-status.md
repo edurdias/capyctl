@@ -1,5 +1,19 @@
 # Current implementation and launch status
 
+## Hybrid SGLang runs 8 requests by default — 2026-10-05 (branch `fix/sglang-hybrid-default-8`)
+
+Owner decision 2026-10-05, the note on ADR 0014 amendment A16. A gated-delta-net hybrid
+SGLang deployment without `max_concurrent_requests` runs up to 8 requests
+(`SGLANG_HYBRID_DEFAULT_RUNNING`, TensorFold's default) instead of up to 32: the state a
+derived request reserves, `--max-mamba-cache-size` and `--max-running-requests` all use 8.
+The router still admits 32 per deployment; dense SGLang is unchanged. Qwen3.8-27B with
+DFlash2 reserves about 16 GiB of state instead of 61 GiB.
+
+Live on the laptop (16 GB GPU, SGLang 0.5.21, FrogNano-4B BF16, standalone, isolated state,
+`memory.kv_cache: 1GiB`, where the card holds 10 requests' state): status showed "Running
+limited to 8 requests by the state cache", SGLang got `max_running_requests` 8 and
+`max_mamba_cache_size` 40, started, and answered 12 concurrent requests. Not run on a GB10.
+
 ## Derived SGLang requests hold the hybrid state — 2026-10-04 (branch `feat/sglang-state-facts`)
 
 ADR 0014 amendment A16 closes A14's follow-up. The host that measures a checkpoint also
