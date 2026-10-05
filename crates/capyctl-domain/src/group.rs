@@ -170,7 +170,13 @@ impl GroupPlan {
         rendezvous_port: u16,
         generation: i64,
     ) -> Result<Self, GroupIdentityError> {
-        if members.len() < 2 || rendezvous_port == 0 || generation <= 0 {
+        if members.len() < 2
+            || rendezvous_port == 0
+            || generation <= 0
+            || topology.tensor_parallel == 0
+            || topology.pipeline_parallel == 0
+            || topology.local_ranks == 0
+        {
             return Err(GroupIdentityError);
         }
         let mut hosts = BTreeSet::new();

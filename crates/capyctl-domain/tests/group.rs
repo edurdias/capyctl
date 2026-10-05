@@ -147,3 +147,55 @@ fn host_evidence_cannot_mix_boots_or_duplicate_local_pids() {
     let duplicate = vec![first, second];
     assert!(verify_group_processes(&duplicate, &duplicate).is_err());
 }
+
+// T27: a zero parallelism dimension is never a topology, even when the products agree.
+#[test]
+fn zero_group_dimensions_are_refused() {
+    let e = GroupEngine::Vllm;
+    let base = members(2, e);
+    let zero_ranks = GroupTopology {
+        tensor_parallel: 2,
+        pipeline_parallel: 1,
+        local_ranks: 0,
+    };
+    let mut no_devices = base.clone();
+    no_devices.iter_mut().for_each(|m| m.devices.clear());
+    assert!(GroupPlan::new(e, no_devices, zero_ranks, 25000, 1).is_err());
+    // The products agree (0 == 2 * 0) but there is no parallelism at all.
+    let all_zero = GroupTopology {
+        tensor_parallel: 0,
+        pipeline_parallel: 1,
+        local_ranks: 0,
+    };
+    let mut bare = base.clone();
+    bare.iter_mut().for_each(|m| m.devices.clear());
+    assert!(GroupPlan::new(e, bare, all_zero, 25000, 1).is_err());
+    assert!(GroupPlan::new(e, base.clone(), topo(0, 1), 25000, 1).is_err());
+    assert!(GroupPlan::new(e, base.clone(), topo(2, 0), 25000, 1).is_err());
+    assert!(GroupPlan::new(e, base, topo(2, 1), 25000, 1).is_ok());
+}
+
+// T27: remaining per-member shape rules, one violation at a time.
+#[test]
+fn member_shape_violations_are_refused() {
+    let s = GroupEngine::Sglang;
+    let base = members(2, s);
+    let mutate = |f: &dyn Fn(&mut Vec<MemberPlan>)| {
+        let mut m = base.clone();
+        f(&mut m);
+        GroupPlan::new(s, m, topo(2, 1), 25000, 1)
+    };
+    assert!(mutate(&|_| {}).is_ok());
+    assert!(mutate(&|m| m[1].peer_address = "0.0.0.0".parse().unwrap()).is_err());
+    assert!(mutate(&|m| m[1].peer_address = "224.0.0.1".parse().unwrap()).is_err());
+    assert!(mutate(&|m| m[1].profile_name.clear()).is_err());
+    assert!(mutate(&|m| m[1].profile_fingerprint.clear()).is_err());
+    assert!(mutate(&|m| m[1].devices[0] = " ".into()).is_err());
+    assert!(mutate(&|m| m[0].service_port = Some(0)).is_err());
+    assert!(mutate(&|m| m[1].worker_port = Some(0)).is_err());
+    assert!(mutate(&|m| m[0].worker_port = Some(8101)).is_err());
+    assert!(mutate(&|m| m[1].member.member_id = "worker-2".into()).is_err());
+    let t = GroupEngine::Tensorfold;
+    assert!(GroupPlan::new(t, members(2, t), topo(1, 2), 25000, 1).is_err());
+    assert!(GroupPlan::new(t, members(2, t), topo(2, 2), 25000, 1).is_err());
+}
