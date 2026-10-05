@@ -167,6 +167,8 @@ pub fn declared(connect: &pb::Connect) -> Option<BTreeSet<String>> {
 
 /// The server-to-host features `command` carries, in catalogue order. An
 /// absent (default) field needs nothing: it encodes exactly as the baseline.
+/// The exception is a group action: every Prepare and Launch always needs
+/// `engine_groups` (ADR 0028 §14), whatever its plan holds.
 pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     use pb::execute_member::Action;
     let mut needs = Vec::new();

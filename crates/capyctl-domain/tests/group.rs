@@ -197,5 +197,13 @@ fn member_shape_violations_are_refused() {
     assert!(mutate(&|m| m[1].member.member_id = "worker-2".into()).is_err());
     let t = GroupEngine::Tensorfold;
     assert!(GroupPlan::new(t, members(2, t), topo(1, 2), 25000, 1).is_err());
-    assert!(GroupPlan::new(t, members(2, t), topo(2, 2), 25000, 1).is_err());
+    // PP != 1 alone: two ranks per member, devices cover tp 2 x pp 2.
+    let mut wide = members(2, t);
+    wide.iter_mut().for_each(|m| m.devices.push("gpu1".into()));
+    let two_ranks = GroupTopology {
+        tensor_parallel: 2,
+        pipeline_parallel: 2,
+        local_ranks: 2,
+    };
+    assert!(GroupPlan::new(t, wide, two_ranks, 25000, 1).is_err());
 }
