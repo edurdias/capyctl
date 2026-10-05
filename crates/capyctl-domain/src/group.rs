@@ -91,70 +91,162 @@ pub fn verify_group_processes(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRole {
+    Head,
+    Worker,
+}
+
+/// ADR 0028 §4: the engines a multi-node group can run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupEngine {
+    Vllm,
+    Sglang,
+    Tensorfold,
+}
+impl GroupEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+            Self::Tensorfold => "tensorfold",
+        }
+    }
+}
+
+/// ADR 0028 §4: the parallelism the group spans. `local_ranks` is the number of
+/// devices (ranks) each member contributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupTopology {
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+    pub local_ranks: u32,
+}
+
+/// ADR 0028 §4: the member id of a rank: `head` for rank 0, `worker-<r>` after.
+pub fn member_id(rank: u32) -> String {
+    if rank == 0 {
+        "head".into()
+    } else {
+        format!("worker-{rank}")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberPlan {
     pub member: MemberKey,
     pub rank: u32,
+    pub role: MemberRole,
     pub profile_name: String,
     pub profile_fingerprint: String,
     pub checkpoint_fingerprint: String,
+    /// R7: this host's own path of the materialized source.
+    pub model_path: String,
     pub devices: Vec<String>,
     pub peer_address: std::net::IpAddr,
-    pub service_port: u16,
+    /// Only the head serves the API.
+    pub service_port: Option<u16>,
+    /// The loopback port of a SGLang worker; no other member has one.
+    pub worker_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupPlan {
+    engine: GroupEngine,
     members: Vec<MemberPlan>,
+    topology: GroupTopology,
     rendezvous_port: u16,
+    generation: i64,
 }
 impl GroupPlan {
-    /// SPEC §11: this contract permits only the reviewed two-host TP2/DP1 shape.
-    /// Recipe qualification remains a separate prerequisite; shape grants no launch authority.
-    pub fn two_host(
+    /// ADR 0028 §4: an N-member plan, ranks in order, one head, one engine
+    /// recipe and checkpoint across members, and a topology the devices cover.
+    /// Recipe qualification remains a separate prerequisite; shape grants no
+    /// launch authority.
+    pub fn new(
+        engine: GroupEngine,
         members: Vec<MemberPlan>,
+        topology: GroupTopology,
         rendezvous_port: u16,
+        generation: i64,
     ) -> Result<Self, GroupIdentityError> {
-        if members.len() != 2 || rendezvous_port == 0 {
+        if members.len() < 2 || rendezvous_port == 0 || generation <= 0 {
             return Err(GroupIdentityError);
         }
-        let mut ranks = BTreeSet::new();
         let mut hosts = BTreeSet::new();
-        for member in &members {
-            if member.member.host_id.trim().is_empty()
-                || member.member.member_id.trim().is_empty()
+        let mut peers = BTreeSet::new();
+        for (index, member) in members.iter().enumerate() {
+            let rank = index as u32;
+            let head = index == 0;
+            let worker_port_ok = if head {
+                member.worker_port.is_none()
+            } else if engine == GroupEngine::Sglang {
+                member.worker_port.is_some_and(|port| port != 0)
+            } else {
+                member.worker_port.is_none()
+            };
+            let service_port_ok = if head {
+                member.service_port.is_some_and(|port| port != 0)
+            } else {
+                member.service_port.is_none()
+            };
+            if member.rank != rank
+                || (member.role == MemberRole::Head) != head
+                || member.member.member_id != member_id(rank)
+                || member.member.host_id.trim().is_empty()
                 || !hosts.insert(&member.member.host_id)
-                || member.rank > 1
-                || !ranks.insert(member.rank)
                 || member.profile_name.trim().is_empty()
                 || member.profile_fingerprint.trim().is_empty()
                 || member.checkpoint_fingerprint.trim().is_empty()
-                || member.service_port == 0
+                || member.model_path.trim().is_empty()
+                || member.devices.len() != topology.local_ranks as usize
+                || member.devices.iter().any(|d| d.trim().is_empty())
+                || !service_port_ok
+                || !worker_port_ok
                 || member.peer_address.is_unspecified()
                 || member.peer_address.is_multicast()
                 || member.peer_address.is_loopback()
-                || member.devices.len() != 1
-                || member.devices[0].trim().is_empty()
+                || !peers.insert(member.peer_address)
+                || member.profile_fingerprint != members[0].profile_fingerprint
+                || member.checkpoint_fingerprint != members[0].checkpoint_fingerprint
             {
                 return Err(GroupIdentityError);
             }
         }
-        if members[0].profile_fingerprint != members[1].profile_fingerprint
-            || members[0].checkpoint_fingerprint != members[1].checkpoint_fingerprint
-            || members[0].peer_address == members[1].peer_address
+        let ranks = members.len() as u64 * u64::from(topology.local_ranks);
+        if u64::from(topology.tensor_parallel) * u64::from(topology.pipeline_parallel) != ranks
+            || (engine == GroupEngine::Tensorfold
+                && (members.len() != 2
+                    || topology.tensor_parallel != 2
+                    || topology.pipeline_parallel != 1))
         {
             return Err(GroupIdentityError);
         }
         Ok(Self {
+            engine,
             members,
+            topology,
             rendezvous_port,
+            generation,
         })
+    }
+    pub fn engine(&self) -> GroupEngine {
+        self.engine
     }
     pub fn members(&self) -> &[MemberPlan] {
         &self.members
     }
+    pub fn head(&self) -> &MemberPlan {
+        &self.members[0]
+    }
+    pub fn topology(&self) -> GroupTopology {
+        self.topology
+    }
     pub fn rendezvous_port(&self) -> u16 {
         self.rendezvous_port
+    }
+    pub fn generation(&self) -> i64 {
+        self.generation
     }
 }
 
