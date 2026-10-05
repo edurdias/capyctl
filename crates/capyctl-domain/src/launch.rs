@@ -197,6 +197,12 @@ pub struct SglangLaunchSettings {
     /// derived where the checkpoint is read at launch; never declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_mamba_cache_size: Option<u32>,
+    /// ADR 0014, note on amendment A14: what the fraction rendered for a
+    /// discrete GPU carries beyond the static pool when CapyCTL fixed the
+    /// pools, so SGLang's own profile reaches them; derived at launch, never
+    /// declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_allowance_bytes: Option<i64>,
     /// SGLang accepts `-1` to disable chunked prefill.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunked_prefill_size: Option<i32>,

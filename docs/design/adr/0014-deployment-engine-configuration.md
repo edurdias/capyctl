@@ -861,7 +861,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   cache. A declared `max_total_tokens` keeps its pool and lends nothing. Open: SGLang's own
   allocations inside a discrete static pool are not modelled (it keeps its static pool), so
   that start held 42741 of the 63935 KV tokens passed and answered a longer input with a
-  400 naming the limit.
+  400 naming the limit. Closed by the note on amendment A14 below.
 - `status` sizes a deployment on a device domain as the launch does, before a card total is
   observed, so its warning and a refused start name the same memory request.
 - When the state holds fewer running requests than the declared count (or 32),
@@ -887,6 +887,46 @@ Follow-up: a derived request should include the state for its running requests. 
 the state's bytes as a checkpoint fact beside the weights (measured by the host that reads
 the checkpoint, sent with the measurement, recorded with the revision), since resolution
 reads no checkpoint file. Until then the margin lends it.
+
+## Note on amendment A14: SGLang's fraction on a discrete GPU (2026-10-04)
+
+Problem: the open item of amendment A14. On a 16 GB laptop GPU, FrogNano-4B BF16 with no
+memory stated showed a context of 63920 tokens, but SGLang 0.5.21 held 42778 KV tokens of
+the 63935 passed and refused any input over 42772 tokens. With `memory.kv_cache: 2GiB` it
+held 44328 of 65536. The gap was the same, about 0.65 GiB, at both sizes.
+
+Cause, read in SGLang 0.5.21 (`KVCacheConfigurator._profile_available_bytes`): SGLang sizes
+its pools from `mem_fraction_static` times the GPU memory free when its scheduler starts
+(after its own CUDA context; the driver's reserve and other processes' memory are not in
+it), less what is already allocated (the weights) and a multimodal reservation
+(`SGLANG_VLM_CACHE_SIZE_MB`, 100 MiB, for a multimodal checkpoint such as Qwen3.5's). CapyCTL
+renders the fraction against the card's total (ADR 0019). Measured: the card totals 15.99
+GiB, SGLang's baseline was 15.24 GiB, so a fraction of 0.7727 gave its pools
+0.7727 × 0.75 GiB less than the static pool, plus the 100 MiB. CUDA graphs, the sampler and
+the chunked-prefill activations are not part of it: they are allocated after the pools,
+outside the static fraction.
+
+Rule: on a discrete GPU, when CapyCTL fixes SGLang's pools (the KV pool in tokens, and on a
+hybrid model the state pool in slots, by CapyCTL or `--max-mamba-cache-size`), the
+fraction is rendered from the static pool plus 1 GiB (`DISCRETE_BASELINE_ALLOWANCE_BYTES`,
+the closed memory object's `static_allowance_bytes`), never above 0.9999 of the card. SGLang
+allocates only the pools it is told, so the allowance lets its profile reach them and takes
+nothing more. The status context and the KV pool are unchanged. Unified memory keeps its
+static pool with SGLang's own allocations (amendment A14), a pool left to SGLang's sizing
+(an unmodelled shape, a state pool sized by `--mamba-full-memory-ratio`) gets no allowance,
+and so does vLLM.
+
+Live (2026-10-04, the same laptop, SGLang 0.5.21, FrogNano-4B BF16, nothing stated): the
+fraction rose from 0.7727 to 0.8352, SGLang held all 63935 KV tokens passed
+(`max_total_num_tokens=63935`), status showed a context of 63920 and 7 running requests, a
+63820-token prompt (the context less 100) and a 63910-token one were answered, and the card
+held 14478 MiB, inside the 14.5 GiB CapyCTL charged. SGLang's longest input is the context
+less 6 (`max_req_input_len`).
+
+Not covered in full: other processes' memory on the card when SGLang starts (a parked
+engine's residue, for one) is outside its baseline too. The allowance covers the fraction
+of about 1 GiB in all; beyond that SGLang's KV pool is short again by the fraction of the
+rest, as before this note.
 
 ## Amendment A15: SGLang does not park a speculative deployment (owner decision 2026-10-03)
 

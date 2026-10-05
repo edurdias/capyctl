@@ -39,7 +39,7 @@ mod sglang_pool;
 mod vllm_hybrid;
 pub use sglang_pool::{
     sglang_pool, sglang_pool_for_effective, sglang_pool_for_launch, static_pool_bytes, SglangPool,
-    STATE_SLOTS_PER_REQUEST,
+    DISCRETE_BASELINE_ALLOWANCE_BYTES, STATE_SLOTS_PER_REQUEST,
 };
 pub use vllm_hybrid::VllmFit;
 

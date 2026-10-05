@@ -62,6 +62,7 @@ fn settings(request: i64, kv: i64, weights: Option<i64>) -> SglangLaunchSettings
         },
         max_total_tokens: None,
         max_mamba_cache_size: None,
+        static_allowance_bytes: None,
         chunked_prefill_size: None,
         tokenizer_workers: 1,
         tool_call_parser: None,
@@ -488,4 +489,37 @@ fn a_derived_unified_request_keeps_its_kv_pool() {
     assert_eq!(found.max_total_tokens, Some((4 * GIB / 32768) as u32));
     assert_eq!(found.max_mamba_cache_size, Some(5 * 16));
     assert_eq!(found.running_limit, Some(16));
+}
+
+// ADR 0014, note on amendment A14 (found live 2026-10-04): on a discrete GPU
+// whose pools CapyCTL fixes, the rendered fraction carries an allowance for
+// what SGLang's baseline does not count. Unified memory, a pool left to
+// SGLang, and a state pool sized by a ratio get none.
+#[test]
+fn a_discrete_launch_with_fixed_pools_carries_the_baseline_allowance() {
+    let target = frognano_4b();
+    let allowance = Some(DISCRETE_BASELINE_ALLOWANCE_BYTES);
+    let discrete = derived_discrete(LAPTOP_KV, FROGNANO_WEIGHTS);
+    assert_eq!(
+        pool(&discrete, &target).unwrap().static_allowance,
+        allowance
+    );
+    let mut plain = settings(12 * GIB, 2 * GIB, Some(8 * GIB));
+    plain.memory.device_total_bytes = Some(16 * GIB);
+    assert_eq!(pool(&plain, &dense()).unwrap().static_allowance, allowance);
+    let unified = derived(4 * GIB, FROGNANO_WEIGHTS);
+    assert_eq!(pool(&unified, &target).unwrap().static_allowance, None);
+    let sliding = json!({
+        "num_hidden_layers": 4, "num_attention_heads": 8, "hidden_size": 1024,
+        "max_position_embeddings": 4096, "torch_dtype": "bfloat16", "sliding_window": 1024,
+    });
+    let mut declared = plain.clone();
+    declared.max_total_tokens = Some(4096);
+    assert_eq!(pool(&declared, &sliding).unwrap().static_allowance, None);
+    let mut ratio = discrete.clone();
+    ratio.extra_args = vec!["--mamba-full-memory-ratio".into(), "0.5".into()];
+    assert_eq!(pool(&ratio, &target).unwrap().static_allowance, None);
+    let mut slots = discrete;
+    slots.extra_args = vec!["--max-mamba-cache-size".into(), "20".into()];
+    assert_eq!(pool(&slots, &target).unwrap().static_allowance, allowance);
 }

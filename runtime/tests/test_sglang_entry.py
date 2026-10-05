@@ -401,6 +401,19 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
                 public = copy.deepcopy(self.public)
                 public["settings"]["memory"] = dict(discrete, **{key: value})
                 self.rejects(self.argv(public), self.payloads(public))
+        # ADR 0014, note on amendment A14: a discrete launch may carry the
+        # baseline allowance, a positive integer; a unified one never does.
+        public = copy.deepcopy(self.public)
+        public["settings"]["memory"] = dict(discrete, static_allowance_bytes=1 << 30)
+        self.build(self.argv(public), self.payloads(public))
+        for value in (0, True, "1", 1 << 40):
+            with self.subTest(static_allowance_bytes=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["memory"] = dict(discrete, static_allowance_bytes=value)
+                self.rejects(self.argv(public), self.payloads(public))
+        public = copy.deepcopy(self.public)
+        public["settings"]["memory"]["static_allowance_bytes"] = 1 << 30
+        self.rejects(self.argv(public), self.payloads(public))
 
     def test_memory_request_is_closed_and_static_share_is_request_minus_margin(self):
         for key, value in (("request_bytes", 0), ("request_bytes", True),

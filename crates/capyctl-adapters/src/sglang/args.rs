@@ -314,7 +314,7 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         "memory_saver": s.memory_saver,
         "cpu_weight_backup": s.cpu_weight_backup,
         "weight_restore": s.weight_restore,
-        "memory": public_memory(memory, margin_bytes, static_bytes),
+        "memory": public_memory(memory, margin_bytes, static_bytes, s.static_allowance_bytes),
         "extra_args": s.extra_args,
     });
     // ADR 0014 amendment A14: present only when CapyCTL sized a hybrid
@@ -342,10 +342,16 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
 /// discrete device (design §6): the entry then sizes `mem_fraction_static`
 /// against the card's total instead of `MemAvailable`, and a unified launch
 /// renders exactly as before.
+///
+/// ADR 0014, note on amendment A14 (found live 2026-10-04): on a discrete
+/// device whose pools CapyCTL fixed, `static_allowance_bytes` is what the
+/// fraction carries beyond the static pool, because SGLang takes its fraction
+/// of the GPU memory free when it starts rather than of the card's total.
 fn public_memory(
     memory: &capyctl_domain::launch::MemoryRequest,
     margin_bytes: i64,
     static_bytes: i64,
+    static_allowance_bytes: Option<i64>,
 ) -> Value {
     let mut rendered = json!({
         "request_bytes": memory.request_bytes,
@@ -355,6 +361,9 @@ fn public_memory(
     });
     if let Some(total) = memory.device_total_bytes {
         rendered["device_total_bytes"] = json!(total);
+        if let Some(allowance) = static_allowance_bytes.filter(|bytes| *bytes > 0) {
+            rendered["static_allowance_bytes"] = json!(allowance);
+        }
     }
     rendered
 }

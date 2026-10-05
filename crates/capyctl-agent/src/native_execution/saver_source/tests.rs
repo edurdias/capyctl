@@ -176,6 +176,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
             },
             max_total_tokens: None,
             max_mamba_cache_size: None,
+            static_allowance_bytes: None,
             chunked_prefill_size: None,
             tokenizer_workers: 1,
             tool_call_parser: None,

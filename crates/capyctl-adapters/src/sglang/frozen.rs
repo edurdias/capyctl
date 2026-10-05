@@ -53,6 +53,7 @@ pub fn frozen_from_effective(
         settings.common.max_concurrent_requests = Some(running);
     }
     settings.max_mamba_cache_size = pool.max_mamba_cache_size;
+    settings.static_allowance_bytes = pool.static_allowance;
     // The static pool holds the weights, the KV cache, the state and SGLang's
     // own allocations (unified memory only): what it takes beyond the request
     // less the margin comes out of the margin.

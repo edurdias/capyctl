@@ -60,6 +60,20 @@ pub const STATE_SLOTS_PER_REQUEST: u64 = 5;
 /// A placeholder until measured per model.
 pub const STATIC_OVERHEAD_BYTES: u64 = 2 << 30;
 
+/// What the fraction rendered for a discrete GPU carries beyond the static
+/// pool when CapyCTL caps SGLang's pools (ADR 0014, note on amendment A14).
+/// SGLang 0.5.21 sizes its pools from `mem_fraction_static` times the GPU
+/// memory free when it starts (`_profile_available_bytes`: after its own CUDA
+/// context, without the driver's reserve or other processes' memory), less
+/// what it allocates after that baseline besides the weights (100 MiB of
+/// multimodal cache, `SGLANG_VLM_CACHE_SIZE_MB`); CapyCTL renders the fraction
+/// against the card's total. Found live 2026-10-04 (FrogNano-4B BF16, a 16 GB
+/// laptop GPU): 15.24 GiB free at SGLang's baseline of a 15.99 GiB card, so
+/// its pools were 0.65 GiB short and it held 42778 of 63935 KV tokens. The
+/// allowance only lets SGLang's profile reach the pools CapyCTL passes: with
+/// `--max-total-tokens` and the state slots fixed, it allocates no more.
+pub const DISCRETE_BASELINE_ALLOWANCE_BYTES: i64 = 1 << 30;
+
 /// What CapyCTL tells SGLang about its pools; `None` leaves a setting as the
 /// deployment (or the engine) has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -80,6 +94,10 @@ pub struct SglangPool {
     pub static_bytes: Option<i64>,
     /// Why a pool is left to SGLang, or how it was sized.
     pub reason: Option<String>,
+    /// [`DISCRETE_BASELINE_ALLOWANCE_BYTES`], when the launch is on a
+    /// discrete device and its pools are fixed: the KV pool in tokens and, on
+    /// a hybrid model, the state pool in slots.
+    pub static_allowance: Option<i64>,
 }
 
 /// ADR 0014 §5: SGLang's static pool and the margin left outside it. A
@@ -191,7 +209,7 @@ fn kv_element(settings: &SglangLaunchSettings, shape: &KvShape) -> Result<u64, S
 
 fn left_to_sglang(reason: impl Into<String>) -> SglangPool {
     SglangPool {
-        reason: Some(format!("{}; SGLang sizes its pools itself", reason.into())),
+        reason: Some(format!("{}{LEFT_TO_SGLANG}", reason.into())),
         ..SglangPool::default()
     }
 }
@@ -215,6 +233,41 @@ fn state_bytes(running: u64, state: u64, draft_tokens: u64) -> Option<u64> {
 /// draft model's) at `checkpoint_root`. `Err` is a refusal: the state the
 /// running requests need does not fit the memory request.
 pub fn sglang_pool(
+    settings: &SglangLaunchSettings,
+    profile_args: &[String],
+    config: Result<&Value, String>,
+    draft: Option<Result<&Value, &str>>,
+) -> Result<SglangPool, String> {
+    let hybrid = config
+        .as_ref()
+        .ok()
+        .is_some_and(|config| gated_delta_attention_layers(config).is_some());
+    let mut pool = sized_pool(settings, profile_args, config, draft)?;
+    // Note on amendment A14: the fraction lets SGLang's profile reach pools
+    // it cannot exceed. A pool left to SGLang's own sizing gets none, so
+    // SGLang never takes more than the grant.
+    let modelled = !pool
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.ends_with(LEFT_TO_SGLANG));
+    let kv_fixed = pool.max_total_tokens.is_some() || settings.max_total_tokens.is_some();
+    let args: Vec<String> = profile_args
+        .iter()
+        .chain(&settings.extra_args)
+        .cloned()
+        .collect();
+    let state_fixed = !hybrid
+        || pool.max_mamba_cache_size.is_some()
+        || option_value(&args, "--max-mamba-cache-size").0;
+    if settings.memory.device_total_bytes.is_some() && modelled && kv_fixed && state_fixed {
+        pool.static_allowance = Some(DISCRETE_BASELINE_ALLOWANCE_BYTES);
+    }
+    Ok(pool)
+}
+
+const LEFT_TO_SGLANG: &str = "; SGLang sizes its pools itself";
+
+fn sized_pool(
     settings: &SglangLaunchSettings,
     profile_args: &[String],
     config: Result<&Value, String>,
