@@ -120,7 +120,10 @@ fn engine_add_channels() {
             .unwrap();
     assert_eq!(profile_env["A_B"], "flag");
     assert_eq!(profile_env["C_D"], "2");
-    assert_eq!(approved, vec!["MBX_*", "SGL_X"]);
+    assert_eq!(approved, vec!["MBX_*"]);
+    // R9: with no --approve-env, the variable is used.
+    let (_, from_variable) = capyctl_cli::engine::engine_add_env(&[], &[], &env).unwrap();
+    assert_eq!(from_variable, vec!["MBX_*", "SGL_X"]);
 }
 
 // T21, T03 (R9): engine add refuses owned names, repeats, and bad approvals.

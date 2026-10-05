@@ -506,7 +506,7 @@ enum EngineArgs {
         /// A name, or a name ending in `*`, deployments may set in
         /// engine_config.env, such as MBX_* (repeatable). Written as
         /// security.approved_env. Also read from CAPYCTL_APPROVE_ENV
-        /// (`GLOB;GLOB`).
+        /// (`GLOB;GLOB`), used only when no --approve-env is given.
         #[arg(long = "approve-env", value_name = "GLOB")]
         approved_env: Vec<String>,
     },
@@ -1456,7 +1456,6 @@ fn parse_model_sources_path(text: &str) -> Result<PathBuf, String> {
         .map_err(|error| error.detail)
 }
 
-/// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
 /// ADR 0028 §2.1: `K=V`, split on the first `=`. A missing `=` or an empty
 /// name is a usage error; the name itself is checked when the entry is merged.
 pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
@@ -1466,6 +1465,7 @@ pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
     }
 }
 
+/// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
 fn parse_hf_endpoint(text: &str) -> Result<String, String> {
     capyctl_config::model_settings::hf_endpoint("--hf-endpoint", text).map_err(|error| error.detail)
 }

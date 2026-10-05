@@ -345,17 +345,23 @@ pub fn engine_add_env(
             return Err(EnvRefusal::Conflict(name));
         }
     }
-    let mut approved = approvals.to_vec();
-    for glob in env("CAPYCTL_APPROVE_ENV")
-        .unwrap_or_default()
-        .split(';')
-        .map(str::trim)
-        .filter(|glob| !glob.is_empty())
-    {
-        if !approved.iter().any(|seen| seen == glob) {
-            approved.push(glob.to_owned());
+    // R9: approvals follow flag > env; any --approve-env replaces the variable.
+    let approved: Vec<String> = if approvals.is_empty() {
+        let mut from_variable: Vec<String> = Vec::new();
+        for glob in env("CAPYCTL_APPROVE_ENV")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|glob| !glob.is_empty())
+        {
+            if !from_variable.iter().any(|seen| seen == glob) {
+                from_variable.push(glob.to_owned());
+            }
         }
-    }
+        from_variable
+    } else {
+        approvals.to_vec()
+    };
     ApprovedEnv::parse(&approved)?;
     Ok((profile_env, approved))
 }

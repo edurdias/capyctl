@@ -607,11 +607,12 @@ fn profile_document_saves_env_and_approvals() {
 // T39: a profile added without the flags is written exactly as before.
 #[test]
 fn profile_without_flags_is_unchanged() {
+    let fixture = spec(Engine::Vllm);
     // Frozen copy of the document written before the env fields existed.
     let before = serde_json::json!({
         "engine": "vllm",
         "revision": 1,
-        "executable": "/home/u/venv/bin/vllm",
+        "executable": fixture.executable.to_string_lossy(),
         "build_fingerprint": "0.29.0",
         "args": [],
         "env": {},
@@ -623,5 +624,5 @@ fn profile_without_flags_is_unchanged() {
             "admin_credential_ref": "secret://admin-key",
         },
     });
-    assert_eq!(profile_document(&spec(Engine::Vllm)), before);
+    assert_eq!(profile_document(&fixture), before);
 }
