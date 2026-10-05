@@ -10,7 +10,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// ADR 0028 §2.1 rule 1: whole families CapyCTL renders or closes.
-pub const OWNED_PREFIXES: &[&str] = &["NCCL_", "GLOO_", "MASTER_", "CAPYCTL_", "LD_"];
+/// `PYTHON` takes every interpreter switch (`PYTHONHOME`, `PYTHONSTARTUP`, ...);
+/// the safe name `PYTHONUNBUFFERED` is the one exception ([`is_owned`]).
+pub const OWNED_PREFIXES: &[&str] = &["NCCL_", "GLOO_", "MASTER_", "CAPYCTL_", "LD_", "PYTHON"];
 
 /// ADR 0028 §2.1 rule 1: single names CapyCTL renders or closes, across all
 /// three engines.
@@ -26,6 +28,18 @@ pub const OWNED_NAMES: &[&str] = &[
     "PYTHONPATH",
     "CUDA_HOME",
     "CUDA_VISIBLE_DEVICES",
+    // ADR 0028 §2.1 (coordinator ruling): every other name the adapters pin or
+    // render in their fixed environments.
+    "HOME",
+    "CUDA_DEVICE_ORDER",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "VLLM_PLUGINS",
+    "VLLM_SERVER_DEV_MODE",
+    "VLLM_API_KEY",
+    "TORCH_EXTENSIONS_DIR",
+    "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+    "TENSORFOLD_NO_UPDATE_CHECK",
 ];
 
 /// ADR 0028 §2.1 rule 2: the existing safe names. They need no approval and
@@ -50,6 +64,9 @@ const MAX_NAME_BYTES: usize = 128;
 /// spelling of an owned name is not a way around it.
 pub fn is_owned(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
+    if SAFE_NAMES.contains(&upper.as_str()) {
+        return false;
+    }
     OWNED_NAMES.contains(&upper.as_str())
         || OWNED_PREFIXES
             .iter()
@@ -146,6 +163,16 @@ pub enum EnvSource {
     Deployment,
 }
 
+/// What output shows in place of an environment value.
+pub const REDACTED: &str = "<redacted>";
+
+/// One variable as output shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RedactedVar {
+    pub value: &'static str,
+    pub source: EnvSource,
+}
+
 /// The engine environment after merging: each variable with its value and source.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ResolvedEnv {
@@ -168,6 +195,24 @@ impl ResolvedEnv {
             .iter()
             .filter(|(_, (_, source))| *source == EnvSource::Deployment)
             .map(|(name, (value, _))| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    /// ADR 0028 §2.1: the view every user-facing rendering uses. Values stay
+    /// stored (they feed the fingerprint and the launch); output shows the name
+    /// and source only.
+    pub fn redacted(&self) -> BTreeMap<String, RedactedVar> {
+        self.vars
+            .iter()
+            .map(|(name, (_, source))| {
+                (
+                    name.clone(),
+                    RedactedVar {
+                        value: REDACTED,
+                        source: *source,
+                    },
+                )
+            })
             .collect()
     }
 

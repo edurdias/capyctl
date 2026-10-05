@@ -51,7 +51,7 @@ fn profile_env_needs_no_approval() {
 // T21, T37, Review Focus 1: owned names are refused at both levels, even through wide globs.
 #[test]
 fn owned_names_are_never_settable() {
-    let a = approved(&["N*", "G*", "M*", "V*", "S*", "T*", "H*"]);
+    let a = approved(&["N*", "G*", "M*", "V*", "S*", "T*", "H*", "P*", "C*"]);
     for name in [
         "NCCL_IB_HCA",
         "GLOO_SOCKET_IFNAME",
@@ -67,6 +67,19 @@ fn owned_names_are_never_settable() {
         "LD_PRELOAD",
         "PATH",
         "CUDA_VISIBLE_DEVICES",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "VLLM_PLUGINS",
+        "VLLM_SERVER_DEV_MODE",
+        "VLLM_API_KEY",
+        "TORCH_EXTENSIONS_DIR",
+        "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+        "TENSORFOLD_NO_UPDATE_CHECK",
+        "HOME",
+        "CUDA_DEVICE_ORDER",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
     ] {
         let e = resolve_engine_env(&map(&[]), &a, &map(&[(name, "x")])).unwrap_err();
         assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
@@ -116,4 +129,37 @@ fn values_are_bounded_and_safe_names_keep_rules() {
     assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MBX_X", &"x".repeat(4097))])).is_err());
     assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MAX_JOBS", "4")])).is_ok());
     assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MAX_JOBS", "0")])).is_err());
+}
+
+// ADR 0028 §2.1: PYTHONUNBUFFERED is the one PYTHON name that stays settable;
+// an approval entry inside the owned PYTHON family is refused.
+#[test]
+fn python_family_is_owned_except_the_safe_name() {
+    assert!(resolve_engine_env(
+        &map(&[("PYTHONUNBUFFERED", "1")]),
+        &approved(&[]),
+        &map(&[])
+    )
+    .is_ok());
+    assert!(ApprovedEnv::parse(&["PYTHONHOME".to_string()]).is_err());
+    assert!(ApprovedEnv::parse(&["PYTHONSTART*".to_string()]).is_err());
+}
+
+// ADR 0028 §2.1: output carries name and source, never the value.
+#[test]
+fn redacted_view_hides_values_and_keeps_sources() {
+    let r = resolve_engine_env(
+        &map(&[("HF_TOKEN", "hf_secret")]),
+        &approved(&["MBX_*"]),
+        &map(&[("MBX_X", "also-secret")]),
+    )
+    .unwrap();
+    let shown = serde_json::to_string(&r.redacted()).unwrap();
+    assert!(!shown.contains("secret"), "{shown}");
+    assert!(
+        shown.contains("\"HF_TOKEN\":{\"value\":\"<redacted>\",\"source\":\"profile\"}"),
+        "{shown}"
+    );
+    assert!(shown.contains("\"source\":\"deployment\""), "{shown}");
+    assert_eq!(r.values()["HF_TOKEN"], "hf_secret");
 }
