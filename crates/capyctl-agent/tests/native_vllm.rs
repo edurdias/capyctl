@@ -410,6 +410,16 @@ impl Fixture {
         })
     }
 
+    /// ADR 0028 §2.1: the resolved engine env names this fixture's launch
+    /// carries (the golden profile's `RUST_LOG`).
+    fn resolved_env_names(&self) -> Vec<String> {
+        let local =
+            capyctl_config::remote_resources::local_host_document(&self.config.document).unwrap();
+        let effective =
+            capyctl_config::effective::resolve_effective(&self.deployment, &local).unwrap();
+        effective.engine_env.values().into_keys().collect()
+    }
+
     fn stop(&self, launch: &MemberCommand) -> MemberCommand {
         sign(MemberCommand {
             identity: identity("stop", "retained", &launch.identity.profile_fingerprint),
@@ -584,14 +594,21 @@ async fn initialize_serve_and_stop(deep_park: bool) {
     // SPEC §9.1 / T21: the development routes are keyed apart from inference.
     assert_eq!(record["has_admin_key"], true);
     // SPEC §13.3 / T21: the engine saw only the closed allowlist (the
-    // interpreter itself may add a few of its own).
+    // interpreter itself may add a few of its own); ADR 0028 §2.1: the
+    // resolved engine env's names join the fixed list, and reach the engine.
     let env: Vec<String> = serde_json::from_value(record["env"].clone()).unwrap();
+    let resolved = fixture.resolved_env_names();
+    assert!(!resolved.is_empty());
     for name in &env {
         assert!(
             capyctl_adapters::vllm::ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
+                || resolved.contains(name)
                 || ["PWD", "SHLVL", "_", "LC_CTYPE"].contains(&name.as_str()),
             "{name} reached the engine"
         );
+    }
+    for name in &resolved {
+        assert!(env.contains(name), "{name} missing from the engine");
     }
     assert!(env.iter().any(|n| n == "VLLM_PLUGINS"));
     let keys = host
