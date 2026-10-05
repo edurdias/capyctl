@@ -649,6 +649,216 @@ environments only. Rows for 3+ hosts (14, 15, 16) need rented machines.
    keep `instances: 1` and one device per host; run one 3- or 4-host live row on rented
    machines after MN1–MN9 pass, with the cost confirmed first.
 
+### From 2026-10-04 review
+
+Findings from the document review of 2026-10-04, deferred for the owner. None of them is
+applied above.
+
+- **Group plan cannot precede host materialization** — §4 Group plan / §6 Weights (P1, whole-document (independent pass), coherence, confidence 100)
+
+  The controller cannot construct the immutable group plan because its required
+  per-host paths and checkpoint fingerprint are learned only by contacting and
+  materializing on each host, while §4 requires the plan to be persisted before any
+  host contact. Implementers must otherwise violate either the ordering guarantee or
+  the plan's completeness and immutability.
+
+- **Binding deep-park decision excludes TensorFold** — Owner decision 2 / §12 Park and wake (P1, whole-document (independent pass), confidence 100)
+
+  The release cannot simultaneously satisfy the binding day-one group-wide
+  sleep/wake requirement and ship TensorFold as restart-only. This leaves acceptance
+  and capability behavior dependent on which section an implementer treats as
+  authoritative; explicitly limiting the binding decision to engines with collective
+  sleep support makes TensorFold's documented restart behavior implementable.
+
+- **World-size-one topology has conflicting placement semantics** — §2 Deployment configuration (P1, whole-document (independent pass), confidence 100)
+
+  A deployment with an explicit TP 1 × PP 1 topology cannot reliably behave like the
+  promised byte-identical single-host case: the same rules refuse its normal
+  placement fields and reject it in standalone mode. Users and validators will
+  therefore disagree over whether that configuration is valid and how it selects its
+  host.
+
+- **Arbitrary-N and PP support outruns qualification** — 17. Testing (P1, adversarial (independent pass), whole-document (independent pass), confidence 100)
+
+  Users can configure advertised multi-host PP and arbitrary-N shapes that have
+  never crossed the live qualification boundary, so a release may accept
+  configurations whose coordination, shutdown, and recovery behavior was
+  demonstrated only in simulations. Two-host TP cannot falsify assumptions specific
+  to PP staging or three-plus-host failure fan-out. Gating supported shapes to
+  live-qualified rows keeps the exposed capability aligned with available evidence.
+
+- **Engine environment lacks required environment-variable inputs** — §2.1 Engine environment / §18 Documentation (P1, whole-document (independent pass), confidence 100)
+
+  The CLI and configuration implementation cannot honor the project's declared
+  three-way setting contract because no environment-variable representation or
+  encoding is defined for profile variables, deployment variables, or approvals.
+  Precedence and conflict behavior are consequently unspecified for one required
+  input channel, and the promised operations documentation cannot be written from
+  the contract.
+
+- **Environment values exposed through status** — 2.1 Engine environment (P1, security, security (independent pass) (+1 anchor), confidence 100)
+
+  A deployment author who places a credential or token in an approved environment
+  variable will have that value persisted and returned through status and
+  effective-configuration surfaces. Calling the feature non-secret storage warns
+  users but does not prevent accidental disclosure. Treating values as
+  sensitive-by-default and redacting them from output closes the direct exposure
+  path.
+
+- **Exact-token canary assumes bitwise determinism across TP collectives** — §12 Park and wake (P1, adversarial, confidence 75)
+
+  A healthy group can fail its canary and get stopped and relaunched, which means
+  reloading about 135 GB of weights per host, with no fault present. Greedy decoding
+  over NCCL all-reduce is not guaranteed to give the same bits from run to run: the
+  reduction order and algorithm can change between the first-readiness run and a
+  post-wake run, and a near-tie logit then flips a token. The design treats any
+  token difference as corruption, and no test checks how often a healthy group
+  produces one. MN4 runs only 5 cycles, which is too few to measure that
+  false-positive rate.
+
+- **Stated problem (catalog models 8-16) is mostly unsolved by this milestone** — Problem; §17.2 catalog table (P1, adversarial, adversarial (independent pass), scope-guardian, confidence 75)
+
+  The motivation is that half the pinned catalog needs two or more machines. By the
+  design's own table, though, 9, 10, 11 and 13 wait for containers, 14, 15 and 16
+  need 3+ hosts that are out of first-version live scope, 12 is unvalidated, and 8
+  on vLLM depends on a patched build. All success criteria could pass while zero
+  catalog models run through CapyCTL groups on the shipped engines. Users and the
+  downstream integration would then see the 'multi-machine serving' gap as closed
+  when it is not.
+
+- **Unset GLOO interface binds loopback on default Ubuntu hosts** — §10 Engine adapters (common rules); Open question 1 (P1, feasibility, confidence 75)
+
+  vLLM and SGLang ranks may never form a cross-host group, so MN1/MN2 fail at
+  bring-up instead of just running slower. Both engines build gloo CPU groups. With
+  GLOO_SOCKET_IFNAME unset, torch's ProcessGroupGloo binds whatever address the
+  hostname resolves to and only falls back to loopback otherwise (the libtorch_cpu
+  string: 'Using the loopback address as fallback ... set ... GLOO_SOCKET_IFNAME').
+  Ubuntu-based hosts map the hostname to 127.0.1.1 by default, so gloo binds
+  loopback and the remote rank cannot connect. On a host whose hostname resolves to
+  a LAN or tailnet address, gloo uses that network instead of the direct link. Open
+  question 1 treats GLOO_SOCKET_IFNAME as a performance knob to revisit only if MN9
+  misses its bar, but this is a bring-up blocker. Picking which interface gloo binds
+  is an address choice, not a transport choice. That fits the doc's own rule that
+  'addresses are not transport', since CapyCTL already confirms the peer address is
+  on a local interface.
+
+- **SGLang wake path: make `group_model_path_mismatch` firm or drop it** — §6 Weights (item 4), §12 Park and wake, §16 Error codes (P1, feasibility, scope-guardian (contradiction), confidence 75)
+
+  SGLang group wakes will fail on the worker whenever the hosts store the model at
+  different paths, so MN4 hits an error the design treats as an open live question.
+  The source already answers that question. CapyCTL's SGLang wake posts
+  `/update_weights_from_disk` with `model_path: self.checkpoint`, which is the
+  head's path (crates/capyctl-adapters/src/sglang/http.rs:256). Rank 0 broadcasts
+  that request, and each TP rank's weight updater loads `recv_req.model_path` from
+  its own filesystem (sglang 0.5.21 scheduler_components/weight_updater.py). vLLM
+  does not have this problem: its `reload_weights` collective sends no path. So this
+  is known for SGLang today and does not need live bring-up to find out. Opposing
+  view (scope-guardian): An error code, refusal path and tests are specified for a
+  condition the document says may never occur. Building it ahead of a live finding
+  is speculative; if it is needed, live bring-up will show it. Trade-off:
+  feasibility would make the refusal unconditional for SGLang groups with deep
+  residency; scope-guardian would remove the code until a live row needs it.
+
+- **No detection for a hung rank or failed interconnect after READY** — §9 Readiness and the router; §11 Stop, failure and settlement (P1, adversarial, confidence 75)
+
+  Most real group failures leave every process alive: the direct link drops, a GPU
+  throws an Xid, or one rank stalls in NCCL. The design counts only process exit,
+  launch failure or failed readiness as a failure, and readiness is checked once at
+  bring-up. A stalled group keeps its route open, and requests hang at the head
+  until client timeouts, maybe indefinitely. The design's own fake harness models
+  this case ('a rank exit leaves the others alive but not serving (as NCCL hangs)'),
+  but nothing in the lifecycle acts on it.
+
+- **Per-member park evidence skips SGLang's saver-map contract** — §12 Park and wake (P1, feasibility, confidence 75)
+
+  §12 settles a park from each host's `process_residency` sample. The existing
+  SGLang park only counts a release when the enrolled scheduler's saver map shows
+  every allocation unmapped. It refuses a park before any engine call when the
+  launch enrolled no saver observation
+  (crates/capyctl-agent/src/native_execution/residency.rs module doc;
+  runtime/sglang_entry.py `_observation_target`). A worker's schedulers run on host
+  B, and nothing in the design makes host B pass its observation directory to the
+  worker launch or report saver facts. The implementer is left with two bad options:
+  weaken SGLang park evidence to process sampling for groups, which breaks the
+  existing rule, or find the worker has no observation and the park is refused. The
+  plan's Task 19 inherits the same gap.
+
+- **Owned env list misses names that switch security controls** — §2.1 Engine environment, rule 1 (P1, security, confidence 75)
+
+  A deployer can switch off launch controls through an approved environment
+  variable, because the list of names nobody may set misses several variables
+  CapyCTL already pins. `VLLM_PLUGINS` is pinned empty as the plugin closure,
+  `VLLM_SERVER_DEV_MODE` gates the dev controls, `VLLM_API_KEY` is the engine key,
+  `TORCH_EXTENSIONS_DIR` is a private build cache that ADR 0023 says loads code on
+  every start, and `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` is the ADR 0025 cap.
+  Interpreter variables (`PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONSTARTUP`,
+  `PYTHONINSPECT`) can redirect what code gets imported. A host admin who approves a
+  broad glob such as `VLLM_*` (the plan's own test approves `V*`, `T*`, `S*`) lets
+  anyone with deploy rights load plugins, turn on dev mode or get around the memory
+  cap on that host. Rule 4 also never says whether CapyCTL's own pinned value or the
+  user's value wins, so an implementer may let the user value win. Making every name
+  in the adapters' fixed allowlists owned, plus the `PYTHON*` prefix apart from
+  `PYTHONUNBUFFERED`, closes this. The rule's own logic already covers it ('names
+  CapyCTL already renders or closes'); the enumeration just stops short.
+
+- **Risk statement understates exposure: pickle over open ports** — §13 Ports and peer exposure (security), Risk statement (P1, security, confidence 75)
+
+  The owner accepts the trust-the-network risk on a description that is too mild.
+  The risk statement says an attacker 'may be able to inject tensors', but vLLM's
+  broadcast queue and the Gloo object broadcasts used by vLLM and SGLang carry
+  pickled Python objects. torch.distributed's object collectives use pickle too, and
+  vLLM's security guidance calls inter-node traffic insecure for this reason. Anyone
+  on any interface, a tailnet included, can therefore likely run code as the
+  engine's user, and from there read the per-launch engine and admin keys in that
+  process's environment. The listener list also leaves out Gloo's CPU-group ports.
+  This does not reopen the settled decision. It corrects what the ADR 0012
+  amendment, the status line and the docs tell the operator, so the 'keep group
+  hosts on a private link' advice carries its real weight.
+
+- **Group readiness lacks collective inference proof** — 9. Readiness and the router (P1, adversarial (independent pass), confidence 75)
+
+  The router can expose a group whose head reports model readiness while a worker
+  collective is stalled, causing the first real request to hang or fail. The claim
+  that head readiness implies a working collective is warranted only if that check
+  completes an actual distributed forward pass. Requiring a bounded inference probe
+  before READY directly tests the property on which routing depends.
+
+- **Port held by another process is drawn again on every retry** — §5 Rendezvous port; §7 Prepare (P1, feasibility, adversarial, adversarial (independent pass) (+1 anchor), confidence 100)
+
+  The allocator takes the lowest port in the head's range that no unsettled group
+  plan holds. If a process outside CapyCTL holds that port, Prepare refuses
+  `rendezvous_port_in_use`, every member is released, and the next deploy or
+  recovery relaunch draws the same port again. One stray listener therefore blocks
+  group work on that head even though the rest of the range is free. Prepare also
+  probes the port only on the peer address, while §13 says the torch store binds
+  every interface. A listener on another address of that port passes the probe, and
+  the engine then fails to bind at launch, which becomes a group member failure
+  instead of a typed prepare refusal.
+
+- **MN9 vLLM bar compares stock 0.30.0 to a patched-build recipe** — §17.2 Live on two GB10 hosts (MN9) (P2, adversarial, feasibility (+1 anchor), confidence 100)
+
+  MN9's 10% bar for vLLM uses the published two-Spark recipe's numbers, but the
+  design notes elsewhere that this recipe ran on a patched 0.30 and that stock
+  0.30.0 is unverified. On top of that, the recipe sets NCCL variables that decision
+  4 forbids. A miss could therefore come from the engine patch rather than CapyCTL,
+  and the row cannot tell which, so the pass/fail result would not support the
+  release decision.
+
+- **require_rdma summary says host checks refuse; compaction never does** — Owner decisions (carried forward) vs §7 table (P2, coherence, confidence 75)
+
+  The carried-forward summary says host checks warn by default and refuse under
+  require_rdma: true, but the §7 table makes compaction warn in both modes. An
+  implementer or test author following the summary would make compaction refuse
+  under require_rdma. The detailed table (and the implementation plan: 'compaction
+  never refuses') is authoritative.
+
+- **validate config multi-host resolution is an adjacent feature** — 15. Status and CLI (P2, scope-guardian, confidence 75)
+
+  Resolving a group deployment against every named host document via `--host` adds
+  new CLI behavior that no owner decision or goal asks for, against the 'minimal
+  fix, no adjacent features' rule. It adds multi-document loading, per-host profile
+  resolution and its own error surface to build and test.
+
 ## Known risks
 
 - **Unauthenticated peer listeners** on every interface during a run (§13).
