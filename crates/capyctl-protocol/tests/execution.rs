@@ -558,6 +558,11 @@ mod groups {
                 ..shape(GroupEngine::Sglang)
             })),
         ];
+        // Only the engine differs.
+        assert_ne!(
+            digest(sample_group_plan(GroupEngine::Vllm)),
+            digest(sample_group_plan(GroupEngine::Tensorfold))
+        );
         for variant in &variants {
             assert_ne!(*variant, base);
         }

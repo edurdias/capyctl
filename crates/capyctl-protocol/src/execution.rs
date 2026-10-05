@@ -354,7 +354,9 @@ pub struct MemberCommand {
 impl TryFrom<pb::GroupLaunchPlan> for GroupPlan {
     type Error = GroupIdentityError;
     // ADR 0028 §14: every field is decoded from the wire and the plan is
-    // validated by `GroupPlan::new`; nothing is assumed.
+    // validated by `GroupPlan::new`; nothing is assumed. A legacy group entry
+    // without role or engine is refused: no production path sent a group Launch
+    // before ADR 0028.
     fn try_from(plan: pb::GroupLaunchPlan) -> Result<Self, Self::Error> {
         let port = |value: u32| -> Result<Option<u16>, GroupIdentityError> {
             match value {
