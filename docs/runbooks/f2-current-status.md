@@ -1,6 +1,6 @@
 # Current implementation and launch status
 
-## Short form of `resources` — 2026-10-04 (branch `feat/short-resources`)
+## Short form of `resources`, after 0.1.2 — 2026-10-04 (branch `feat/short-resources`)
 
 Owner decision, recorded in ADR 0023 §4: `resources: {gpu: 11GiB, ram: 2GiB}`
 stands for the five phases of a model that restarts. Where the document meets
