@@ -658,6 +658,22 @@ struct RoleSettingsArgs {
     /// and local_engine.cuda_home.
     #[arg(long, value_name = "DIR", value_parser = parse_engine_path)]
     cuda_home: Option<PathBuf>,
+    // ADR 0028 §3: the host's group policy. (A `//` comment: a doc comment
+    // would become user-facing help text.)
+    /// The address this host's group peers reach it on, an IP address such
+    /// as 192.0.2.10 (default none). Wins over
+    /// CAPYCTL_PEER_ADDRESS and resource_policy.groups.peer_address.
+    #[arg(long, value_name = "IP", value_parser = parse_peer_address)]
+    peer_address: Option<std::net::IpAddr>,
+    /// The group rendezvous port range, `start-end` (default
+    /// 25000-25099). Wins over CAPYCTL_RENDEZVOUS_PORTS and
+    /// resource_policy.groups.rendezvous_port_range.
+    #[arg(long, value_name = "START-END", value_parser = parse_rendezvous_ports)]
+    rendezvous_ports: Option<(u16, u16)>,
+    /// Groups on this host require RDMA between their hosts (default false). Wins over CAPYCTL_REQUIRE_RDMA and
+    /// resource_policy.groups.require_rdma.
+    #[arg(long, value_name = "true|false", value_parser = parse_require_rdma)]
+    require_rdma: Option<bool>,
 }
 
 // Owner decision 2026-09-25: the generic override of any YAML setting of the
@@ -704,6 +720,9 @@ impl RoleSettingsArgs {
             runtime_dir: self.runtime_dir.clone(),
             engine_ports: self.engine_ports,
             cuda_home: self.cuda_home.clone(),
+            peer_address: self.peer_address,
+            rendezvous_ports: self.rendezvous_ports,
+            require_rdma: self.require_rdma,
         }
     }
 }
@@ -1493,6 +1512,23 @@ fn parse_installation_drift(
 ) -> Result<capyctl_config::effective::InstallationDrift, String> {
     capyctl_config::engine_settings::drift("--installation-drift", text)
         .map_err(|error| error.detail)
+}
+
+/// ADR 0028 §3: `--peer-address <ip>`.
+fn parse_peer_address(text: &str) -> Result<std::net::IpAddr, String> {
+    capyctl_config::groups_policy::peer_address("--peer-address", text)
+        .map_err(|error| error.detail)
+}
+
+/// ADR 0028 §3: `--rendezvous-ports start-end`.
+fn parse_rendezvous_ports(text: &str) -> Result<(u16, u16), String> {
+    capyctl_config::engine_settings::port_range("--rendezvous-ports", text)
+        .map_err(|error| error.detail)
+}
+
+/// ADR 0028 §3: `--require-rdma true|false`.
+fn parse_require_rdma(text: &str) -> Result<bool, String> {
+    capyctl_config::engine_settings::boolean("--require-rdma", text).map_err(|error| error.detail)
 }
 
 /// Owner rule 2026-09-25: `--engine-ports start-end`.

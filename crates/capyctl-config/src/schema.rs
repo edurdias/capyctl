@@ -282,6 +282,18 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // Host policy, published with the host document; never asserted by a
         // deployment.
         ("labels", FieldSpec::MapOf(&SCALAR)),
+        // ADR 0028 §3: the host's multi-node group policy.
+        (
+            "groups",
+            FieldSpec::Struct(&[
+                ("peer_address", SCALAR),
+                (
+                    "rendezvous_port_range",
+                    FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
+                ),
+                ("require_rdma", SCALAR),
+            ]),
+        ),
     ];
     const SECURITY: &[(&str, FieldSpec)] = &[
         // Spec §3: `deep_park` replaces `experimental_controls`. It is a switch over
