@@ -40,6 +40,10 @@ pub const OWNED_NAMES: &[&str] = &[
     "TORCH_EXTENSIONS_DIR",
     "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
     "TENSORFOLD_NO_UPDATE_CHECK",
+    // Ruling R17: the engine port clashes with group ports; the other is a
+    // security switch.
+    "VLLM_PORT",
+    "VLLM_ALLOW_INSECURE_SERIALIZATION",
 ];
 
 /// ADR 0028 §2.1 rule 2: the existing safe names. They need no approval and
@@ -174,9 +178,18 @@ pub struct RedactedVar {
 }
 
 /// The engine environment after merging: each variable with its value and source.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ResolvedEnv {
     pub vars: BTreeMap<String, (String, EnvSource)>,
+}
+
+/// Debug shows names and sources only: values may hold tokens.
+impl std::fmt::Debug for ResolvedEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEnv")
+            .field("vars", &self.redacted())
+            .finish()
+    }
 }
 
 impl ResolvedEnv {

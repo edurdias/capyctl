@@ -258,6 +258,18 @@ fn the_resolved_engine_env_is_admitted_but_never_wins() {
     assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
 }
 
+// ADR 0028 §2.1: Debug output names the resolved env, never its values.
+#[test]
+fn the_plan_debug_output_hides_env_values() {
+    let mut input = plan();
+    input.build_env = BTreeMap::from([("HF_TOKEN".to_string(), "hf_secret".to_string())]);
+    let shown = format!("{input:?}");
+    assert!(
+        shown.contains("HF_TOKEN") && !shown.contains("hf_secret"),
+        "{shown}"
+    );
+}
+
 // T41 (found live 2026-10-03: TensorFold 0.6.3 grew to 74 GiB under a 58 GiB
 // declaration, sizing its caches from the machine's free memory): the
 // deployment's declared allocation caps TensorFold's CUDA budget through

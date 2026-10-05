@@ -67,6 +67,8 @@ fn owned_names_are_never_settable() {
         "LD_PRELOAD",
         "PATH",
         "CUDA_VISIBLE_DEVICES",
+        "VLLM_PORT",
+        "VLLM_ALLOW_INSECURE_SERIALIZATION",
         "PYTHONHOME",
         "PYTHONSTARTUP",
         "PYTHONPATH",
@@ -162,4 +164,16 @@ fn redacted_view_hides_values_and_keeps_sources() {
     );
     assert!(shown.contains("\"source\":\"deployment\""), "{shown}");
     assert_eq!(r.values()["HF_TOKEN"], "hf_secret");
+}
+
+// ADR 0028 §2.1: Debug output never carries a value.
+#[test]
+fn debug_output_hides_values() {
+    let r = resolve_engine_env(
+        &map(&[("HF_TOKEN", "hf_secret")]),
+        &approved(&[]),
+        &map(&[]),
+    )
+    .unwrap();
+    assert!(!format!("{r:?}").contains("hf_secret"));
 }

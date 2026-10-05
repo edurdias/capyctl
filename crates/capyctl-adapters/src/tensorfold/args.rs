@@ -29,7 +29,7 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
 /// Variables taken from the agent's own environment.
 const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES"];
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct PlanInputTensorfold {
     pub engine_bin: String,
     pub engine_path_extra: Option<String>,
@@ -59,6 +59,33 @@ pub struct PlanInputTensorfold {
     /// allocation on the GPU's memory, which caps TensorFold's CUDA budget
     /// (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`). `None` renders no cap.
     pub memory_limit_bytes: Option<i64>,
+}
+
+/// ADR 0028 §2.1: `build_env` values may hold tokens, so Debug prints its names only.
+impl std::fmt::Debug for PlanInputTensorfold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanInputTensorfold")
+            .field("engine_bin", &self.engine_bin)
+            .field("engine_path_extra", &self.engine_path_extra)
+            .field("cuda_home", &self.cuda_home)
+            .field("build_env", &self.build_env.keys().collect::<Vec<_>>())
+            .field("model_path", &self.model_path)
+            .field("served_model_name", &self.served_model_name)
+            .field("port", &self.port)
+            .field("context_length", &self.context_length)
+            .field("kv_dtype", &self.kv_dtype)
+            .field("max_tokens", &self.max_tokens)
+            .field("thinking", &self.thinking)
+            .field("parallel", &self.parallel)
+            .field("engine_args", &self.engine_args)
+            .field("extra_args", &self.extra_args)
+            .field("extensions_dir", &self.extensions_dir)
+            .field("engine_log", &self.engine_log)
+            .field("cuda_namespace", &self.cuda_namespace)
+            .field("warm_startup_ms", &self.warm_startup_ms)
+            .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
