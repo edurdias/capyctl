@@ -949,7 +949,6 @@ after a wake. SGLang 0.5.20 also could not reload ModelOpt (NVFP4) weights from 
 Amendment A17 takes this up: the park keeps the weights resident and reloads nothing, and
 the default and the refusal of `deep` above no longer apply.
 
-
 ## Amendment A16: a derived SGLang request holds the hybrid state (2026-10-04)
 
 Problem: the follow-up of amendment A14. A request CapyCTL derived held the weights, the KV
