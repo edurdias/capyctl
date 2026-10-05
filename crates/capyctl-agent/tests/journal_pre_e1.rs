@@ -87,6 +87,7 @@ fn a_pre_e1_launch_command_re_decodes_from_the_journal_unchanged() {
             // Journaled before WE3: no recorded checkpoint.
             checkpoint_digest: String::new(),
             checkpoint_weights_bytes: None,
+            checkpoint_state_slot_bytes: None,
             startup_bytes: None,
         }),
     };

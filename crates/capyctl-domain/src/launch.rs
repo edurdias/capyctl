@@ -26,6 +26,16 @@ pub const MAX_REQUESTS_PER_DEPLOYMENT: u32 = 32;
 /// router's other requests wait in TensorFold's queue.
 pub const TENSORFOLD_DEFAULT_PARALLEL: u32 = 8;
 
+/// ADR 0014 amendment A16 (owner decision 2026-10-05): the requests SGLang
+/// runs at once (`--max-running-requests`) on a hybrid model, and the
+/// recurrent state CapyCTL sizes and reserves for them, unless the deployment
+/// sets `max_concurrent_requests`. SGLang keeps a state slot set per running
+/// request, so the reservation grows with the count: for Qwen3.8-27B with
+/// DFlash2 the router's bound (32) held about 61 GiB of state. TensorFold's
+/// default, for the same reason; the router's other requests wait in SGLang's
+/// queue. A dense model keeps the router's bound.
+pub const SGLANG_HYBRID_DEFAULT_RUNNING: u32 = TENSORFOLD_DEFAULT_PARALLEL;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "engine", rename_all = "lowercase")]
 pub enum LaunchSettings {
@@ -161,6 +171,18 @@ pub struct MemoryRequest {
     /// before the allowance existed, which re-derives without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_graphs_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
+    /// state on SGLang, a checkpoint fact the host measured from
+    /// `config.json` beside the weights. Recorded so a snapshot re-derives
+    /// identically; absent for any other model or engine, and in a revision
+    /// measured before the fact existed, which keeps its sizing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_slot_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: the recurrent state a derived request holds
+    /// for its running requests (their slots, the padding slot and any
+    /// draft-token states). Absent when the request holds none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

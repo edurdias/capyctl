@@ -823,7 +823,8 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   (float32 by default, or `--mamba-ssm-dtype`).
 - The running requests are the deployment's `max_concurrent_requests`. Undeclared, they are
   the most, up to CapyCTL's in-flight bound (32, `MAX_REQUESTS_PER_DEPLOYMENT`), whose state
-  fits, passed as `--max-running-requests`.
+  fits, passed as `--max-running-requests`. (Since 2026-10-05, up to 8: see the note on
+  amendment A16.)
 - The static pool rendered is the weights (with the draft model's, amendment A6), the KV
   cache, the state and 2 GiB of SGLang's own allocations (CUDA context, workspaces, load
   buffers), never less than the request less the margin nor more than the request; what it
@@ -846,7 +847,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   request holds the weights, the KV cache and the margin, and nothing for the state, so on
   unified memory the state may take up to half of the margin; the other half stays for
   SGLang's runtime outside its static pool. The static pool grows by what the state takes.
-  The running requests are the most, up to the declared count (or 32), that fit, and the
+  The running requests are the most, up to the declared count (or 8, note on A16), that fit, and the
   launch is refused only when one request does not fit. A discrete device lends nothing
   from its margin.
 - On a discrete device (found live 2026-10-04, FrogNano-4B BF16 on a 16 GB laptop GPU), a
@@ -854,7 +855,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   weights and the KV cache, and its margin lends nothing, so every hybrid deployment that
   stated no memory was refused for one running request. CapyCTL chose that KV cache as
   well, so the state takes up to half of it: the running requests are the most, up to the
-  declared count (or 32), whose state fits half the KV cache, the KV pool
+  declared count (or 8, note on A16), whose state fits half the KV cache, the KV pool
   (`--max-total-tokens`) is the KV cache less that state, and the fitted context is held to
   that pool. FrogNano-4B there runs 7 requests at 63920 tokens of context (it fitted 120512
   and was refused). The launch is refused only when one request's state exceeds half the KV
@@ -864,7 +865,7 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   400 naming the limit.
 - `status` sizes a deployment on a device domain as the launch does, before a card total is
   observed, so its warning and a refused start name the same memory request.
-- When the state holds fewer running requests than the declared count (or 32),
+- When the state holds fewer running requests than the declared count (or the router's 32),
   `status deployment` says "Running limited to N requests by the state cache", and the
   status JSON carries `context.running_limit` (standalone; a remote host decides at launch).
 - Arguments that size the state pool themselves (`--max-mamba-cache-size`,
@@ -886,7 +887,7 @@ refused before). Amendment A10's note that SGLang sizes its state itself no long
 Follow-up: a derived request should include the state for its running requests. That needs
 the state's bytes as a checkpoint fact beside the weights (measured by the host that reads
 the checkpoint, sent with the measurement, recorded with the revision), since resolution
-reads no checkpoint file. Until then the margin lends it.
+reads no checkpoint file. Until then the margin lends it. Closed by amendment A16.
 
 ## Amendment A15: SGLang does not park a speculative deployment (owner decision 2026-10-03)
 
@@ -947,6 +948,99 @@ after a wake. SGLang 0.5.20 also could not reload ModelOpt (NVFP4) weights from 
 0019 §5), so for this checkpoint the wake has to be proven on the installed build.
 Amendment A17 takes this up: the park keeps the weights resident and reloads nothing, and
 the default and the refusal of `deep` above no longer apply.
+
+
+## Amendment A16: a derived SGLang request holds the hybrid state (2026-10-04)
+
+Problem: the follow-up of amendment A14. A request CapyCTL derived held the weights, the KV
+cache and the margin, and nothing for a hybrid model's recurrent state, so on unified memory
+the state borrowed up to half of the margin and on a discrete GPU up to half of the KV
+cache. Qwen3.8-27B at the default 4 GiB KV cache ran 5 requests on a host with room for
+all 32.
+
+Rule:
+
+- The state of one request slot is a checkpoint fact, like the weights. The host that
+  measures the checkpoint reads it from `config.json` with the launch's arguments
+  (`--mamba-ssm-dtype`), as amendment A14 sizes a slot, and sends it with the digest
+  (`CheckpointDigestEvidence.state_slot_bytes`). Only an SGLang deployment of a
+  gated-delta-net hybrid has one.
+- The server records it with the digest (`checkpoint_digests.state_slot_bytes`, schema
+  v40) and re-resolves a provisional revision with it and the weights. The revision
+  records it (`memory.state_slot_bytes`), and every launch carries it
+  (`SingleLaunchPlan.checkpoint_state_slot_bytes`, capability `checkpoint_state_slot`),
+  so the host resolves the same request. The host refuses a launch whose state slot is
+  not the one it reads, as it refuses other weights.
+- A derived request then holds the state of its running requests: the declared
+  `max_concurrent_requests`, else 8 (the note below; first CapyCTL's in-flight bound, 32),
+  lowered to the most whose
+  request still fits the memory domain beside the engine's CUDA context (and, on unified
+  memory, the first-start graph allowance). The state is amendment A14's: `(5 × running +
+  1)` slots, plus `(running + 1) × draft tokens` with speculative decoding. On unified
+  memory the request is weights + KV cache + margin + state; on a discrete GPU it is
+  (weights + state) × 1.10 + KV cache, so the static pool holds the state. The revision
+  records the state it holds (`memory.state_bytes`).
+- A request that holds its state lends nothing more: no margin, no KV cache. The KV pool is
+  the whole KV cache and the running requests are those the state was sized for;
+  `status deployment` says "Running limited to N requests by the state cache" when they
+  are fewer than the bound.
+- Nothing is reserved, and amendment A14 applies unchanged, when the request is declared
+  (explicit requests stay strict), when `resources:` are declared, when the arguments size
+  the state pool (`--max-mamba-cache-size`, `--mamba-full-memory-ratio`), with speculative
+  decoding and no draft-token count, when not even one running request fits the domain,
+  and for a revision without the fact: one measured before this amendment, or by an older
+  host. A host recorded with the fact that later reports none (an older host) is not a
+  mismatch; one that reports another is.
+
+Consequence: Qwen3.8-27B NVFP4 (153944064 bytes a slot) at the default 4 GiB KV cache now
+asked for about 23 GiB more and ran 32 requests where the host held them; with DFlash2
+(8 draft tokens) the state of 32 requests was about 61 GiB. The note below lowers the
+default to 8 requests: about 6 GiB, and 16 GiB with DFlash2. On a 16 GB laptop GPU FrogNano-4B BF16 at the default
+KV cache leaves no room for a slot beside it and keeps amendment A14's sizing (7 requests
+out of the KV cache); with a 2 GiB KV cache its request holds 7 requests' state and the KV
+pool keeps the whole 2 GiB.
+
+Live (2026-10-04, a 16 GB laptop GPU, standalone, SGLang 0.5.21, FrogNano-4B-2609 BF16 from a
+local Hugging Face snapshot): the digest recorded the state slot beside the weights
+(`state_slot_bytes` 51511296 in `status deployment --json`). With `memory.kv_cache: 2GiB`
+the derived request held the state of 7 requests, status showed 7 running requests and a
+context of 65536 tokens (the whole 2 GiB KV cache), and the engine started and answered.
+With nothing stated the card held no slot beside the default KV cache, so the deployment
+kept amendment A14's sizing (7 requests, 63920 tokens). In both, SGLang held fewer KV tokens
+than passed (44328 and 42778), the discrete fraction gap closed by the note on amendment A14.
+
+Evidence: `crates/capyctl-adapters/tests/context_fit.rs`
+(`a_derived_request_holds_the_state_of_its_running_requests`,
+`a_derived_request_reserves_the_state_its_domain_holds`,
+`an_explicit_or_legacy_request_reserves_no_state`, `the_state_slot_travels_with_the_snapshot`,
+`a_derived_discrete_request_holds_the_state_the_card_fits`) and
+`the_state_slot_is_recorded_and_sizes_a_derived_request` (store).
+
+### Note on amendment A16: hybrid SGLang runs 8 requests by default (2026-10-05)
+
+Owner decision 2026-10-05. The state a derived request reserves grows with the running
+requests, and the router's bound made it large: Qwen3.8-27B NVFP4 with DFlash2 reserved
+about 61 GiB of state for 32 requests on a GB10.
+
+Rule: on a gated-delta-net hybrid SGLang deployment that does not set
+`max_concurrent_requests`, the running requests are the most, up to 8
+(`capyctl_domain::launch::SGLANG_HYBRID_DEFAULT_RUNNING`, TensorFold's default,
+`TENSORFOLD_DEFAULT_PARALLEL`), whose state fits, instead of up to the router's bound. The
+state a derived request reserves, the state pool (`--max-mamba-cache-size`) and
+`--max-running-requests` all use that count, for derived and explicit requests alike. The
+router still admits 32 requests per deployment; the others wait in SGLang's queue, as with
+TensorFold, and `status deployment` says "Running limited to 8 requests by the state
+cache". A declared `max_concurrent_requests` is honored as before, up to 32 or beyond. A
+dense SGLang deployment is unchanged: its state does not scale with the running requests.
+
+Consequence: Qwen3.8-27B NVFP4 at the default 4 GiB KV cache asks for about 6 GiB of state
+(8 requests) instead of 23 GiB; with DFlash2 about 16 GiB instead of 61 GiB.
+
+Evidence: `crates/capyctl-config/src/context_fit/sglang_pool/tests.rs`
+(`a_hybrid_models_state_is_sized_beside_its_kv_cache`,
+`a_derived_request_reserves_the_state_that_fits`), `crates/capyctl-adapters/tests/context_fit.rs`
+(`a_derived_request_holds_the_state_of_its_running_requests`,
+`sglang_sizes_a_hybrid_models_state_beside_its_kv_cache`).
 
 ## Amendment A17: SGLang parks a speculative deployment with its weights resident (owner decision 2026-10-03)
 

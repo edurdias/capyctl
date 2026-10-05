@@ -928,6 +928,13 @@ CREATE TABLE IF NOT EXISTS parked_measurements(
 );
 "#;
 
+/// v40 (ADR 0014 amendment A16): the hybrid state slot a host measured from
+/// the checkpoint's `config.json` beside the weights, recorded with the
+/// digest. Absent for any other model, and on rows recorded before v40. The
+/// column is added by `checkpoint_digests::migrate_v40` only when missing, so
+/// a store rolled back to an earlier version can reapply it.
+pub const SCHEMA_V40: &str = "-- checkpoint_digests.state_slot_bytes (migrate_v40)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

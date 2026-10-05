@@ -37,9 +37,10 @@ use crate::engine_policy::{option_names, typed_field_option, Engine};
 
 mod sglang_pool;
 mod vllm_hybrid;
+pub(crate) use sglang_pool::{derived_request_bytes, derived_state_reserve};
 pub use sglang_pool::{
-    sglang_pool, sglang_pool_for_effective, sglang_pool_for_launch, static_pool_bytes, SglangPool,
-    STATE_SLOTS_PER_REQUEST,
+    sglang_pool, sglang_pool_for_effective, sglang_pool_for_launch, sglang_state_slot_bytes,
+    static_pool_bytes, SglangPool, STATE_SLOTS_PER_REQUEST,
 };
 pub use vllm_hybrid::VllmFit;
 

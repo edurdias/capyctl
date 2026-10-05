@@ -156,6 +156,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
         coordinator_session_id: "01K00000000000000000000004".into(),
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
         startup_bytes: None,
     });
     let launch = sign(launch);
@@ -312,6 +313,7 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
         coordinator_session_id: "01K00000000000000000000004".into(),
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
         startup_bytes: None,
     });
     let launch = sign(launch);

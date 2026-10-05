@@ -291,6 +291,7 @@ fn launch() -> MemberAction {
         coordinator_session_id: "01K00000000000000000000004".into(),
         checkpoint_digest: format!("sha256:{}", "1".repeat(64)),
         checkpoint_weights_bytes: Some(1 << 30),
+        checkpoint_state_slot_bytes: None,
         startup_bytes: Some(2 << 30),
     })
 }

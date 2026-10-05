@@ -11,6 +11,19 @@ Unreleased.
   sum. The five phases are still accepted, and `capyctl validate config` shows
   what the short form stands for. See the TensorFold section of the
   [engines guide](../guide/engines.md).
+- **SGLang hybrid models get their concurrency.** When you state no memory
+  request, CapyCTL now adds a hybrid model's per-request state to the request it
+  derives, for `max_concurrent_requests` (or 8) as far as the machine holds it,
+  instead of borrowing it from the margin or the KV cache. Qwen3.8-27B at the
+  default KV cache runs 8 requests where it ran 5, and asks for about 6 GiB
+  more (16 GiB with DFlash2). A revision measured before this release keeps its
+  sizing; a new revision of it gets the state.
+- **SGLang hybrid models run 8 requests by default.** Without
+  `max_concurrent_requests`, a hybrid model on SGLang runs up to 8 requests at
+  once, as TensorFold does, instead of up to 32; dense models are unchanged.
+  The router still accepts 32 per deployment and the rest wait in SGLang's
+  queue. Set `max_concurrent_requests` to run more, and CapyCTL sizes the state
+  for that count.
 - **SGLang with speculative decoding parks again.** A deployment with
   `--speculative-algorithm` in its arguments parks `deep` by default instead of
   restarting: the park gives back the KV cache and keeps the weights, the

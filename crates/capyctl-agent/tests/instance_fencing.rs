@@ -79,6 +79,7 @@ fn launch(id: &str, deployment: &str, instance: u32, generation: i64, slot: u8) 
             coordinator_session_id: "01K00000000000000000000400".into(),
             checkpoint_digest: String::new(),
             checkpoint_weights_bytes: None,
+            checkpoint_state_slot_bytes: None,
             startup_bytes: None,
         }),
     })
