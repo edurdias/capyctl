@@ -4,7 +4,8 @@
 //! command identities before acknowledging or performing any effect.
 use crate::pb;
 use capyctl_domain::group::{
-    CommandIdentity, GroupIdentityError, GroupPlan, MemberKey, MemberPlan,
+    CommandIdentity, GroupEngine, GroupIdentityError, GroupPlan, GroupTopology, MemberKey,
+    MemberPlan, MemberRole,
 };
 
 /// SPEC §§3, 7, 13: only local approved profile resolution may render a launch.
@@ -363,20 +364,46 @@ impl TryFrom<pb::GroupLaunchPlan> for GroupPlan {
                         member_id: m.member_id,
                     },
                     rank: m.rank,
+                    role: if m.rank == 0 {
+                        MemberRole::Head
+                    } else {
+                        MemberRole::Worker
+                    },
                     profile_name: m.profile_name,
                     profile_fingerprint: m.profile_fingerprint,
                     checkpoint_fingerprint: m.checkpoint_fingerprint,
+                    // Interim: the wire does not yet carry engine, topology,
+                    // generation, model path or worker port (Task 7 adds them).
+                    // Until then a decoded plan takes a placeholder path and the
+                    // legacy vLLM shape, so the existing wire still round-trips.
+                    model_path: "-".into(),
                     devices: m.devices,
                     peer_address: m.peer_address.parse().map_err(|_| GroupIdentityError)?,
-                    service_port: m.service_port.try_into().map_err(|_| GroupIdentityError)?,
+                    // A worker serves no API; the wire writes its port as zero.
+                    service_port: if m.rank == 0 {
+                        Some(m.service_port.try_into().map_err(|_| GroupIdentityError)?)
+                    } else if m.service_port == 0 {
+                        None
+                    } else {
+                        return Err(GroupIdentityError);
+                    },
+                    worker_port: None,
                 })
             })
             .collect::<Result<Vec<_>, GroupIdentityError>>()?;
-        Self::two_host(
+        let topology = GroupTopology {
+            tensor_parallel: members.len() as u32,
+            pipeline_parallel: 1,
+            local_ranks: 1,
+        };
+        Self::new(
+            GroupEngine::Vllm,
             members,
+            topology,
             plan.rendezvous_port
                 .try_into()
                 .map_err(|_| GroupIdentityError)?,
+            1,
         )
     }
 }
@@ -584,7 +611,7 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
                 checkpoint_fingerprint: member.checkpoint_fingerprint.clone(),
                 devices: member.devices.clone(),
                 peer_address: member.peer_address.to_string(),
-                service_port: member.service_port.into(),
+                service_port: member.service_port.unwrap_or(0).into(),
             })
             .collect(),
         rendezvous_port: plan.rendezvous_port().into(),

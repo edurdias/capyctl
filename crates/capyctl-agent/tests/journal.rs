@@ -137,26 +137,42 @@ fn sign(mut command: MemberCommand) -> MemberCommand {
     command
 }
 fn launch(id: &str) -> MemberCommand {
-    use capyctl_domain::group::{GroupPlan, MemberPlan};
+    use capyctl_domain::group::{
+        member_id, GroupEngine, GroupPlan, GroupTopology, MemberPlan, MemberRole,
+    };
     let mut c = command(id);
     c.action = MemberAction::Launch(
-        GroupPlan::two_host(
+        GroupPlan::new(
+            GroupEngine::Vllm,
             (0..2)
                 .map(|rank| MemberPlan {
                     member: MemberKey {
                         host_id: if rank == 0 { "host" } else { "peer" }.into(),
-                        member_id: if rank == 0 { "head" } else { "worker" }.into(),
+                        member_id: member_id(rank),
                     },
                     rank,
+                    role: if rank == 0 {
+                        MemberRole::Head
+                    } else {
+                        MemberRole::Worker
+                    },
                     profile_name: "controlled-child".into(),
                     profile_fingerprint: "approved".into(),
                     checkpoint_fingerprint: "checkpoint".into(),
+                    model_path: "/models/m".into(),
                     devices: vec!["gpu:0".into()],
                     peer_address: format!("10.0.0.{}", rank + 1).parse().unwrap(),
-                    service_port: 31000,
+                    service_port: (rank == 0).then_some(31000),
+                    worker_port: None,
                 })
                 .collect(),
+            GroupTopology {
+                tensor_parallel: 2,
+                pipeline_parallel: 1,
+                local_ranks: 1,
+            },
             32000,
+            1,
         )
         .unwrap(),
     );

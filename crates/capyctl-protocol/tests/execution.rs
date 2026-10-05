@@ -111,8 +111,10 @@ fn canonical_digest_binds_identity_deadline_and_action() {
 
 // T27/T34: member ordering is not a new effect, but rank topology is bound.
 #[test]
-fn group_digest_is_order_independent_and_binds_rendezvous() {
-    use capyctl_domain::group::{GroupPlan, MemberKey, MemberPlan};
+fn group_digest_is_stable_and_binds_rendezvous() {
+    use capyctl_domain::group::{
+        member_id, GroupEngine, GroupPlan, GroupTopology, MemberKey, MemberPlan, MemberRole,
+    };
     use capyctl_protocol::execution::MemberAction;
     let members: Vec<_> = (0..2)
         .map(|rank| MemberPlan {
@@ -122,28 +124,43 @@ fn group_digest_is_order_independent_and_binds_rendezvous() {
                 } else {
                     "other".into()
                 },
-                member_id: format!("rank-{rank}"),
+                member_id: member_id(rank),
             },
             rank,
+            role: if rank == 0 {
+                MemberRole::Head
+            } else {
+                MemberRole::Worker
+            },
             profile_name: "sglang".into(),
             profile_fingerprint: "pinned".into(),
             checkpoint_fingerprint: "checkpoint".into(),
+            model_path: "/models/m".into(),
             devices: vec!["gpu-0".into()],
             peer_address: format!("192.0.2.{}", rank + 10).parse().unwrap(),
-            service_port: 30000,
+            service_port: (rank == 0).then_some(30000),
+            worker_port: (rank > 0).then_some(30001),
         })
         .collect();
+    let topology = GroupTopology {
+        tensor_parallel: 2,
+        pipeline_parallel: 1,
+        local_ranks: 1,
+    };
+    let plan = |members: Vec<MemberPlan>, port: u16| {
+        GroupPlan::new(GroupEngine::Sglang, members, topology, port, 1).unwrap()
+    };
     let mut original = MemberCommand::try_from(command()).unwrap();
-    original.action = MemberAction::Launch(GroupPlan::two_host(members.clone(), 29500).unwrap());
+    original.identity.member.member_id = member_id(0);
+    original.action = MemberAction::Launch(plan(members.clone(), 29500));
     original.identity.payload_digest = original.canonical_digest();
     original.verify_digest().unwrap();
-    let mut reversed = members.clone();
-    reversed.reverse();
+    // ADR 0028 §4: members are held in rank order, so the digest has no order to ignore.
     let mut reordered = original.clone();
-    reordered.action = MemberAction::Launch(GroupPlan::two_host(reversed, 29500).unwrap());
+    reordered.action = MemberAction::Launch(plan(members.clone(), 29500));
     assert_eq!(reordered.canonical_digest(), original.canonical_digest());
     reordered.verify_digest().unwrap();
-    reordered.action = MemberAction::Launch(GroupPlan::two_host(members, 29501).unwrap());
+    reordered.action = MemberAction::Launch(plan(members, 29501));
     assert!(reordered.verify_digest().is_err());
 }
 
