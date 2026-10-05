@@ -10,6 +10,8 @@ pub mod development_controls;
 pub mod dispatch;
 pub mod enrollment;
 pub mod events;
+// ADR 0028 §5, §11: multi-node group plans, member owners and settlement.
+pub mod groups;
 pub mod host_drain;
 pub mod host_publication;
 pub mod host_versions;

@@ -9,7 +9,8 @@ use crate::schema::{
     SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
-    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -55,6 +56,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V39,
     // ADR 0014 amendment A16: the hybrid state slot beside the weights.
     SCHEMA_V40,
+    // ADR 0028 §5, §6: multi-node group plans and per-host digests.
+    SCHEMA_V41,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -74,6 +77,12 @@ pub fn latest_version() -> i64 {
 /// under assumptions that no longer hold. Nothing is written before the
 /// refusal.
 pub fn apply(conn: &Connection) -> Result<(), StoreError> {
+    apply_through(conn, latest_version())
+}
+
+/// [`apply`], stopping after version `last`. Tests use it to build a store as
+/// an older binary left it.
+fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
     let migrations_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
@@ -99,7 +108,7 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
     }
     for (index, sql) in MIGRATIONS.iter().enumerate() {
         let version = (index + 1) as i64;
-        if version <= current {
+        if version <= current || version > last {
             continue;
         }
         let tx = conn.unchecked_transaction()?;
@@ -132,6 +141,10 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
         if version == 40 {
             // ADR 0014 amendment A16: the hybrid state slot beside the weights.
             crate::checkpoint_digests::migrate_v40(&tx)?;
+        }
+        if version == 41 {
+            // ADR 0028 §5, §6: group plans, member owners, per-host digests.
+            crate::groups::migrate_v41(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -281,6 +294,87 @@ mod tests {
             .unwrap();
         assert_eq!(max, MIGRATIONS.len() as i64);
         assert_eq!(count, MIGRATIONS.len() as i64);
+    }
+
+    /// ADR 0028 §5, §6 (v41): resource owners, endpoint leases and recorded
+    /// digests from v40 are carried across; members get their own owners and
+    /// worker leases, and each host's digest has its own row.
+    // T14 T27 T33
+    #[test]
+    fn v41_adds_group_tables_and_carries_rows_across() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 40).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO effective_revisions VALUES('a',1,'{"host":{"name":"host-a"}}','fa');
+            INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index) VALUES('a','{}','a',0),('deployment:a/instance:1','{}','a',1);
+            INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES('binding-a','a',1,'ia','managed','{}','[]','live');
+            INSERT INTO endpoint_leases(host_id,host,port,binding_id) VALUES('host-a','127.0.0.1',20000,'binding-a');"#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','host-a',NULL,?1,10,0,NULL,5)",
+            [&digest],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let owners: Vec<(String, u32, Option<u32>)> = conn
+            .prepare(
+                "SELECT owner_id,instance_index,member_rank FROM resource_owners ORDER BY owner_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            owners,
+            vec![
+                ("a".into(), 0, None),
+                ("deployment:a/instance:1".into(), 1, None)
+            ]
+        );
+        let lease: (String, Option<String>) = conn
+            .query_row(
+                "SELECT binding_id,group_owner FROM endpoint_leases WHERE port=20000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease, ("binding-a".into(), None));
+        let host_digest: (String, String, i64) = conn
+            .query_row("SELECT host_id,digest,recorded_at_ms FROM checkpoint_host_digests WHERE deployment_id='a' AND revision=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(host_digest, ("host-a".into(), digest, 5));
+        // Members of one instance each get an owner; a second instance-form
+        // owner of the same instance, or a member owner in the wrong form, is refused.
+        conn.execute("INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index,member_rank) VALUES('deployment:a/instance:2/member:0','{}','a',2,0),('deployment:a/instance:2/member:1','{}','a',2,1)", []).unwrap();
+        assert!(conn.execute("INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index,member_rank) VALUES('deployment:a/instance:2/member:3','{}','a',2,2)", []).is_err());
+        assert!(conn.execute("INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index) VALUES('a2','{}','a',0)", []).is_err());
+        // A lease is held by a binding or by a group member, never both or neither.
+        conn.execute("INSERT INTO endpoint_leases(host_id,host,port,binding_id,group_owner) VALUES('host-b','127.0.0.1',8100,NULL,'deployment:a/instance:2/member:1')", []).unwrap();
+        assert!(conn.execute("INSERT INTO endpoint_leases(host_id,host,port,binding_id,group_owner) VALUES('host-b','127.0.0.1',8101,NULL,NULL)", []).is_err());
+        assert!(conn.execute("INSERT INTO endpoint_leases(host_id,host,port,binding_id,group_owner) VALUES('host-b','127.0.0.1',8100,'binding-a',NULL)", []).is_err());
+        // Group member states are closed.
+        conn.execute(
+            "INSERT INTO group_plans VALUES('a',2,1,'{}','host-a',25000,'active')",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute("INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state) VALUES('a',2,1,0,'host-a','deployment:a/instance:2/member:0','gone')", []).is_err());
+        conn.execute("INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state) VALUES('a',2,1,0,'host-a','deployment:a/instance:2/member:0','reserved')", []).unwrap();
+        // One unsettled plan holds a rendezvous port on its head.
+        assert!(conn
+            .execute(
+                "INSERT INTO group_plans VALUES('a',3,1,'{}','host-a',25000,'active')",
+                []
+            )
+            .is_err());
     }
 
     #[test]
