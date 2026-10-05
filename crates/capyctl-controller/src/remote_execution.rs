@@ -448,6 +448,9 @@ impl EngineAdapter for RemoteEngine {
         if plan.startup_bytes.is_some() {
             needs.push(capabilities::STARTUP_BYTES);
         }
+        if plan.checkpoint_state_slot_bytes.is_some() {
+            needs.push(capabilities::CHECKPOINT_STATE_SLOT);
+        }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
@@ -959,6 +962,8 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             // ADR 0014 §5: the host resolves with the facts this revision was
             // frozen with, so both sides derive the same memory request.
             checkpoint_weights_bytes: work.effective().engine_config.memory().weights_bytes,
+            // ADR 0014 amendment A16: and the hybrid state slot beside them.
+            checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
             // Owner decision 2026-09-23: the peak this launch reserved.
             startup_bytes: Some(work.startup_reservation().bytes),
             checkpoint_digest,
@@ -1036,6 +1041,7 @@ mod tests {
                 coordinator_session_id: "session".into(),
                 checkpoint_digest: String::new(),
                 checkpoint_weights_bytes: None,
+                checkpoint_state_slot_bytes: None,
                 startup_bytes: None,
             },
             ingress_gate_key: [7; 32],

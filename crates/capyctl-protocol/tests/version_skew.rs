@@ -186,6 +186,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
             String::new()
         },
         checkpoint_weights_bytes: digest.then_some(1 << 30),
+        checkpoint_state_slot_bytes: None,
         startup_bytes: startup.then_some(2 << 30),
     })
 }
@@ -264,6 +265,19 @@ fn every_post_baseline_field_names_its_capability() {
             wire(launch(true, true), 1),
             vec![CHECKPOINT_DIGEST, STARTUP_BYTES, INSTANCE_INDEX],
         ),
+        (
+            wire(
+                match launch(true, true) {
+                    MemberAction::LaunchSingle(mut plan) => {
+                        plan.checkpoint_state_slot_bytes = Some(10 << 20);
+                        MemberAction::LaunchSingle(plan)
+                    }
+                    _ => unreachable!(),
+                },
+                0,
+            ),
+            vec![CHECKPOINT_DIGEST, STARTUP_BYTES, CHECKPOINT_STATE_SLOT],
+        ),
         (wire(MemberAction::Inspect, 2), vec![INSTANCE_INDEX]),
         (
             wire(
@@ -314,6 +328,7 @@ fn every_post_baseline_field_names_its_capability() {
             TERMINATE_RECORDED_PROCESSES,
             LIVE_PROFILE_UPDATE,
             DEVICE_MEMORY_DOMAINS,
+            CHECKPOINT_STATE_SLOT,
         ]
         .contains(name)
         {

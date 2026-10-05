@@ -92,6 +92,10 @@ pub struct CheckpointDigest {
     pub digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weights_bytes: Option<i64>,
+    /// ADR 0014 amendment A16: the hybrid state slot measured beside the
+    /// weights, for a model that keeps one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_slot_bytes: Option<i64>,
     /// The frozen revision waits for this digest before it may activate.
     pub provisional: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,23 @@ pub(crate) fn insert_accepted(
     Ok(())
 }
 
+/// v40 (ADR 0014 amendment A16): add `checkpoint_digests.state_slot_bytes`
+/// unless a store rolled back from v40 or later still has it.
+pub(crate) fn migrate_v40(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('checkpoint_digests') WHERE name='state_slot_bytes')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE checkpoint_digests ADD COLUMN state_slot_bytes INTEGER
+               CHECK(state_slot_bytes IS NULL OR state_slot_bytes>0);",
+        )?;
+    }
+    Ok(())
+}
+
 /// SPEC §6, ADR 0014 §7: activation of a revision waits while its frozen
 /// resources depend on a digest still pending, and is refused while its
 /// checkpoint is known not to be the declared or recorded one.
@@ -189,7 +210,8 @@ fn closed_refusal(text: &str) -> bool {
     CLOSED_REFUSALS.iter().any(|code| text.starts_with(code))
 }
 
-/// One stored row: state, host, expected, digest, weights, provisional, diagnostic.
+/// One stored row: state, host, expected, digest, weights, provisional,
+/// diagnostic, state slot.
 type StoredRow = (
     String,
     String,
@@ -198,24 +220,35 @@ type StoredRow = (
     Option<i64>,
     bool,
     Option<String>,
+    Option<i64>,
 );
 
 fn read(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Option<CheckpointDigest>> {
     let row: Option<StoredRow> = tx
         .query_row(
-            "SELECT state,host_id,expected,digest,weights_bytes,provisional,diagnostic FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
+            "SELECT state,host_id,expected,digest,weights_bytes,provisional,diagnostic,state_slot_bytes FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
             params![deployment, revision],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )
         .optional()?;
     row.map(
-        |(state, host_id, expected, digest, weights_bytes, provisional, diagnostic)| {
+        |(
+            state,
+            host_id,
+            expected,
+            digest,
+            weights_bytes,
+            provisional,
+            diagnostic,
+            state_slot_bytes,
+        )| {
             Ok(CheckpointDigest {
                 state: DigestState::parse(&state)?,
                 host_id,
                 expected,
                 digest,
                 weights_bytes,
+                state_slot_bytes,
                 provisional,
                 diagnostic,
             })
@@ -412,7 +445,41 @@ impl crate::Store {
         weights_bytes: i64,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
-        if !is_checkpoint_digest(digest) || weights_bytes < 0 || now_ms < 0 || host_id.is_empty() {
+        self.record_checkpoint_measurement(
+            session,
+            deployment,
+            revision,
+            host_id,
+            digest,
+            weights_bytes,
+            None,
+            now_ms,
+        )
+    }
+
+    /// [`Self::record_checkpoint_digest`] with the hybrid state slot the host
+    /// measured beside the weights (ADR 0014 amendment A16), which a
+    /// provisional revision is re-resolved with too. Once recorded, a
+    /// measurement naming another state slot is a mismatch, as for the
+    /// weights; one naming none (an older host) is not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_checkpoint_measurement(
+        &self,
+        session: &CoordinatorSession,
+        deployment: &str,
+        revision: i64,
+        host_id: &str,
+        digest: &str,
+        weights_bytes: i64,
+        state_slot_bytes: Option<i64>,
+        now_ms: i64,
+    ) -> Result<RecordOutcome> {
+        if !is_checkpoint_digest(digest)
+            || weights_bytes < 0
+            || state_slot_bytes.is_some_and(|bytes| bytes <= 0)
+            || now_ms < 0
+            || host_id.is_empty()
+        {
             return Err(CheckpointDigestError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -434,7 +501,10 @@ impl crate::Store {
         match existing.state {
             DigestState::Recorded => {
                 let same = existing.digest.as_deref() == Some(digest)
-                    && existing.weights_bytes == Some(weights_bytes);
+                    && existing.weights_bytes == Some(weights_bytes)
+                    && (existing.state_slot_bytes.is_none()
+                        || state_slot_bytes.is_none()
+                        || existing.state_slot_bytes == state_slot_bytes);
                 tx.commit()?;
                 return Ok(if same {
                     RecordOutcome::Recorded {
@@ -461,8 +531,8 @@ impl crate::Store {
             .is_some_and(|expected| expected != digest)
         {
             tx.execute(
-                "UPDATE checkpoint_digests SET state='mismatch',digest=?3,weights_bytes=?4,host_id=?5,diagnostic=NULL,updated_at_ms=?6 WHERE deployment_id=?1 AND revision=?2",
-                params![deployment, revision, digest, weights_bytes, host_id, now_ms],
+                "UPDATE checkpoint_digests SET state='mismatch',digest=?3,weights_bytes=?4,host_id=?5,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7 WHERE deployment_id=?1 AND revision=?2",
+                params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes],
             )?;
             tx.commit()?;
             return Ok(RecordOutcome::Mismatch);
@@ -478,6 +548,7 @@ impl crate::Store {
             }
             let facts = CheckpointFacts {
                 weights_bytes: Some(weights_bytes),
+                state_slot_bytes,
                 ..Default::default()
             };
             // Final review I7 (design §7): each GPU of a multi-GPU host is
@@ -637,8 +708,8 @@ impl crate::Store {
             }
         }
         tx.execute(
-            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6 WHERE deployment_id=?1 AND revision=?2",
-            params![deployment, revision, digest, weights_bytes, host_id, now_ms],
+            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7 WHERE deployment_id=?1 AND revision=?2",
+            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes],
         )?;
         tx.commit()?;
         Ok(RecordOutcome::Recorded {

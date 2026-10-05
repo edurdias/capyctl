@@ -220,6 +220,69 @@ fn a_derived_memory_request_waits_for_the_digest_then_resolves_exactly() {
         .unwrap();
 }
 
+// T14 (ADR 0014 amendment A16): the hybrid state slot a host measures beside
+// the weights is recorded with the digest, and a provisional SGLang revision
+// is re-resolved with it, so its derived request holds the state. Once
+// recorded, another slot is a mismatch; an older host naming none is not.
+#[test]
+fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
+    let (store, session, mut config, mut host) = setup();
+    host["runtime_profiles"]["local"]["engine"] = json!("sglang");
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+        json!("secret://admin-key");
+    host["runtime_profiles"]["local"]["args"] = json!([]);
+    config.as_object_mut().unwrap().remove("resources");
+    config["engine_config"] = json!({"memory": {"kv_cache": "4GiB"}});
+    let receipt = deploy(&store, &session, "hybrid", &config, &host);
+    let id = &receipt.deployment_id;
+    let (weights, slot): (i64, i64) = (2 << 30, 10 << 20);
+    assert!(matches!(
+        store.record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(0), 2),
+        Err(CheckpointDigestError::Invalid)
+    ));
+    store
+        .record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(slot), 2)
+        .unwrap();
+    let memory = frozen_memory(&store, &receipt);
+    assert_eq!(memory["state_slot_bytes"], json!(slot));
+    assert_eq!(memory["state_bytes"], json!(161 * slot));
+    assert_eq!(
+        memory["request_bytes"],
+        json!(
+            weights
+                + (4 << 30)
+                + capyctl_config::effective::SGLANG_OVERHEAD_MARGIN_BYTES
+                + 161 * slot
+        )
+    );
+    let record = store.checkpoint_digest(id, 1).unwrap().unwrap();
+    assert_eq!(record.state_slot_bytes, Some(slot));
+    assert_eq!(
+        store
+            .record_checkpoint_measurement(
+                &session,
+                id,
+                1,
+                "lab",
+                DIGEST,
+                weights,
+                Some(slot + 1),
+                3
+            )
+            .unwrap(),
+        RecordOutcome::Mismatch
+    );
+    assert!(matches!(
+        store
+            .record_checkpoint_digest(&session, id, 1, "lab", DIGEST, weights, 3)
+            .unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    store
+        .accept_start(&session, &fence(&receipt), 100, 100_100)
+        .unwrap();
+}
+
 // T14 (P2): measured weights that leave no KV cache in a declared request make the
 // revision unusable; it never starts.
 #[test]

@@ -548,3 +548,206 @@ fn a_discrete_sglang_fraction_carries_the_baseline_allowance() {
     assert_eq!(settings["memory"]["static_bytes"], json!(88i64 << 30));
     assert!(settings["memory"].get("static_allowance_bytes").is_none());
 }
+
+/// The golden SGLang deployment stating `memory`, on a unified host managing
+/// `managed`, resolved with the measured weights and (ADR 0014 amendment A16)
+/// the state slot the host measured beside them.
+fn unified_sglang(
+    config: &Value,
+    weights: i64,
+    state_slot: Option<i64>,
+    managed: &str,
+    edit: impl FnOnce(&mut Value),
+) -> (tempfile::TempDir, EffectiveDeployment) {
+    let store = tempfile::tempdir().unwrap();
+    let checkpoint = store.path().join("toy");
+    std::fs::create_dir(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("config.json"), config.to_string()).unwrap();
+    let (mut deployment, mut host) = golden("sglang");
+    host["model_store"]["path"] = json!(store.path());
+    host["resource_policy"]["domains"]["unified"]["managed_limit"] = json!(managed);
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["engine_config"]["kv_cache_dtype"] = json!("fp8_e4m3");
+    edit(&mut deployment);
+    let facts = capyctl_config::effective::CheckpointFacts {
+        weights_bytes: Some(weights),
+        state_slot_bytes: state_slot,
+        ..Default::default()
+    };
+    let effective =
+        capyctl_config::effective::resolve_effective_with_checkpoint(&deployment, &host, facts)
+            .unwrap();
+    (store, effective)
+}
+
+const QWEN38_STATE: i64 = 153_944_064;
+const GIB: i64 = 1 << 30;
+
+// T14 (ADR 0014 amendment A16): with the state slot measured beside the
+// weights, a derived request holds the state of the in-flight bound's running
+// requests, so SGLang runs them all with the whole KV cache and nothing is
+// lent from the margin.
+#[test]
+fn a_derived_request_holds_the_state_of_its_running_requests() {
+    let weights = 21_920_000_000i64;
+    let (_store, effective) =
+        unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
+            d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+        });
+    let state = 161 * QWEN38_STATE;
+    let memory = effective.engine_config.memory();
+    assert_eq!(memory.state_slot_bytes, Some(QWEN38_STATE));
+    assert_eq!(memory.state_bytes, Some(state));
+    assert_eq!(memory.request_bytes, weights + 4 * GIB + 8 * GIB + state);
+    let settings = sglang_public(&effective);
+    assert_eq!(
+        settings["max_running_requests"],
+        json!(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
+    );
+    assert_eq!(settings["max_mamba_cache_size"], json!(160));
+    assert_eq!(settings["max_total_tokens"], json!(131072));
+    assert_eq!(
+        settings["memory"]["static_bytes"],
+        json!(weights + 4 * GIB + state + 2 * GIB)
+    );
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, None);
+    // A declared count reserves its own state.
+    let (_store, effective) =
+        unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
+            d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+            d["engine_config"]["max_concurrent_requests"] = json!(8);
+        });
+    assert_eq!(
+        effective.engine_config.memory().state_bytes,
+        Some(41 * QWEN38_STATE)
+    );
+    let settings = sglang_public(&effective);
+    assert_eq!(settings["max_running_requests"], json!(8));
+    assert_eq!(settings["max_mamba_cache_size"], json!(40));
+}
+
+// T14 (amendment A16): the state reserved is what the memory domain still
+// holds beside the request, the engine's CUDA context and the first-start
+// graph allowance; the running requests are limited to it, and status says so.
+#[test]
+fn a_derived_request_reserves_the_state_its_domain_holds() {
+    let weights = 21_920_000_000i64;
+    let (_store, effective) =
+        unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "48GiB", |d| {
+            d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+        });
+    // 48 GiB less 20.41 GiB of weights, 4 GiB of KV cache, 8 GiB of margin
+    // and 2.5 GiB of context and graphs leaves 91 slots: 18 requests.
+    let memory = effective.engine_config.memory();
+    assert_eq!(memory.state_bytes, Some(91 * QWEN38_STATE));
+    let charged = memory.request_bytes + (5 << 28) + (5 << 28);
+    assert!(charged <= 48 * GIB && charged + 5 * QWEN38_STATE > 48 * GIB);
+    let settings = sglang_public(&effective);
+    assert_eq!(settings["max_running_requests"], json!(18));
+    assert_eq!(settings["max_mamba_cache_size"], json!(90));
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, Some(18));
+}
+
+// T14 (amendment A16): an explicit request stays strict and reserves
+// nothing, and a revision measured before the fact keeps lending its margin.
+#[test]
+fn an_explicit_or_legacy_request_reserves_no_state() {
+    let weights = 21_920_000_000i64;
+    let (_store, effective) =
+        unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
+            d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
+        });
+    let memory = effective.engine_config.memory();
+    assert_eq!((memory.request_bytes, memory.state_bytes), (96 * GIB, None));
+    let (_store, effective) = unified_sglang(&qwen38_27b(), weights, None, "120GiB", |d| {
+        d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+    });
+    let memory = effective.engine_config.memory();
+    assert_eq!(memory.request_bytes, weights + 12 * GIB);
+    assert_eq!((memory.state_slot_bytes, memory.state_bytes), (None, None));
+    assert_eq!(sglang_public(&effective)["max_running_requests"], json!(5));
+}
+
+// T14 (amendment A16): a revision with the fact re-resolves from its
+// snapshot exactly, and a provisional one takes the reservation once the
+// digest records the weights and the state slot.
+#[test]
+fn the_state_slot_travels_with_the_snapshot() {
+    let weights = 21_920_000_000i64;
+    let (_store, effective) =
+        unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
+            d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+        });
+    let text = serde_json::to_string(&effective).unwrap();
+    let decoded = capyctl_config::effective::decode_effective_snapshot(&text).unwrap();
+    assert_eq!(decoded, effective);
+    let (_store, provisional) = unified_sglang(&qwen38_27b(), 0, None, "120GiB", |d| {
+        d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+    });
+    let facts = capyctl_config::effective::CheckpointFacts {
+        weights_bytes: Some(weights),
+        state_slot_bytes: Some(QWEN38_STATE),
+        ..Default::default()
+    };
+    let measured = capyctl_config::effective::resolve_snapshot_with_checkpoint(
+        &serde_json::to_string(&provisional).unwrap(),
+        facts,
+    )
+    .unwrap();
+    assert_eq!(
+        measured.engine_config.memory().state_bytes,
+        Some(161 * QWEN38_STATE)
+    );
+}
+
+// T14 (amendment A16, a 16 GB laptop GPU): the card holds no state beside
+// the default KV cache, so the default deployment keeps amendment A14's
+// sizing (7 requests out of the KV cache); with a smaller KV cache the
+// derived request holds the state that fits the card and the KV pool keeps
+// the whole KV cache.
+#[test]
+fn a_derived_discrete_request_holds_the_state_the_card_fits() {
+    let weights = 9_319_820_920i64;
+    let slot = 51_511_296i64;
+    let laptop = |edit: fn(&mut Value)| {
+        let (store, mut effective) = laptop_sglang(&frognano_4b(), weights, edit);
+        let facts = capyctl_config::effective::CheckpointFacts {
+            weights_bytes: Some(weights),
+            state_slot_bytes: Some(slot),
+            ..Default::default()
+        };
+        effective = capyctl_config::effective::resolve_snapshot_with_checkpoint(
+            &serde_json::to_string(&effective).unwrap(),
+            facts,
+        )
+        .unwrap();
+        (store, effective)
+    };
+    let (_store, effective) = laptop(|_| {});
+    assert_eq!(effective.engine_config.memory().state_bytes, None);
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, Some(7));
+    let (_store, effective) = laptop(|d| {
+        d["engine_config"]["memory"] = json!({"kv_cache": "2GiB"});
+    });
+    let memory = effective.engine_config.memory();
+    // 15797762136 managed, less 1.25 GiB of context and graphs and
+    // (weights + state) x 1.10 + 2 GiB, holds 36 slots: 7 requests.
+    assert_eq!(memory.state_bytes, Some(36 * slot));
+    assert_eq!(
+        memory.request_bytes,
+        (weights + 36 * slot) / 100 * 110 + 2 * GIB
+    );
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, Some(7));
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let settings = sglang_public(&sized);
+    assert_eq!(settings["max_running_requests"], json!(7));
+    assert_eq!(settings["max_mamba_cache_size"], json!(35));
+    assert_eq!(settings["max_total_tokens"], json!(2 * GIB / 32768));
+}

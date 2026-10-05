@@ -15,6 +15,22 @@ isolated state): before, SGLang held 42778 of 63935 KV tokens and refused inputs
 while status showed 63920; after, fraction 0.8352, `max_total_num_tokens=63935`, prompts of
 63820 and 63910 tokens answered, 14478 MiB on the card inside the 14.5 GiB charge. CPU and
 Fake-engine tests are not qualification.
+## Derived SGLang requests hold the hybrid state — 2026-10-04 (branch `feat/sglang-state-facts`)
+
+ADR 0014 amendment A16 closes A14's follow-up. The host that measures a checkpoint also
+reads one request slot of an SGLang hybrid model's recurrent state from `config.json`
+(`CheckpointDigestEvidence.state_slot_bytes`); the server records it with the digest
+(schema v40), re-resolves a provisional revision with it, and every launch carries it
+(`checkpoint_state_slot_bytes`, capability `checkpoint_state_slot`), which the host checks.
+A derived request then holds the state of `max_concurrent_requests` (or 32), as far as the
+domain holds it, and lends nothing more. Explicit requests, declared resources, args that
+size the state pool, and revisions without the fact keep A14's sizing.
+
+Live on the laptop (16 GB GPU, SGLang 0.5.21, FrogNano-4B BF16, standalone, isolated state):
+the fact was recorded (51511296 bytes); with a 2 GiB KV cache the derived request held 7
+requests' state and the KV pool kept the whole 2 GiB (context 65536); with nothing stated
+the card had no room for a slot, so A14's sizing stayed (7 requests, 63920 tokens). Not run
+on a GB10. CPU and Fake-engine tests are not qualification.
 
 ## Short form of `resources`, after 0.1.2 — 2026-10-04 (branch `feat/short-resources`)
 

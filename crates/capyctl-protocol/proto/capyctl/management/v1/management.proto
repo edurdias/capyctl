@@ -389,6 +389,9 @@ message SingleLaunchPlan {
   // launch until Ready (its cold phase), so the host re-checks the same peak.
   // Absent in commands from a server that predates the startup budget.
   optional int64 startup_bytes = 13;
+  // ADR 0014 amendment A16: the hybrid state slot the server resolved this
+  // revision with, beside the weights. Absent when it resolved without one.
+  optional int64 checkpoint_state_slot_bytes = 14;
 }
 // ADR 0014 §7 (WE3): measure one deployment's checkpoint on this host. The host
 // locates it from its own approved document and the deployment's model block;
@@ -546,6 +549,9 @@ message CheckpointDigestEvidence {
   uint64 total_bytes = 5;
   string reason = 6;         // refused only: a closed category
   bool full_rehash = 7;      // every file was hashed, not only the small ones
+  // ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
+  // state on SGLang, read from config.json; computed and mismatch only.
+  optional int64 state_slot_bytes = 8;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown
