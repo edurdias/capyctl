@@ -620,14 +620,26 @@ mod tests {
     // starts; a free one passes.
     #[test]
     fn a_leased_engine_port_in_use_is_a_port_conflict() {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = held.local_addr().unwrap().port();
+        // A released port can be taken by anything running in parallel, so
+        // the free case is checked first, on a port this test then holds
+        // itself to make the conflict.
+        let (port, held) = (0..100)
+            .find_map(|_| {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .ok()?
+                    .local_addr()
+                    .ok()?
+                    .port();
+                engine_port_free(port).ok()?;
+                let held = std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
+                Some((port, held))
+            })
+            .expect("a loopback port that is free, then held");
         assert_eq!(
             engine_port_free(port),
             Err(LaunchVerdict::Refused("port_conflict"))
         );
         drop(held);
-        assert_eq!(engine_port_free(port), Ok(()));
     }
 
     // T26: the unified single-pool behaviour is unchanged.

@@ -1172,6 +1172,11 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     ] {
         document[field] = fixture["host"][field].clone();
     }
+    // The leased engine port is one no other test binary hands out, not the
+    // fixture's fixed 8100-8199 range.
+    let port = capyctl_testkit::ports::free_port();
+    document["resource_policy"]["endpoint_port_range"] =
+        serde_json::json!({"start": port, "end": port});
     let config = HostConfig::parse(&document.to_string()).unwrap();
     let policy = capyctl_config::remote_resources::policy_fingerprint(&config.document);
     let recorded = CheckpointVerifier::in_memory()
@@ -1241,7 +1246,7 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
                 binding_id: "01K00000000000000000000001".into(),
                 incarnation: "01K00000000000000000000002".into(),
                 grant_id: "01K00000000000000000000003".into(),
-                service_port: 8100,
+                service_port: port,
                 issued_at_ms: 1,
                 coordinator_session_id: "01K00000000000000000000004".into(),
                 checkpoint_digest: recorded,
@@ -1369,7 +1374,7 @@ fn launch_command(
                 binding_id: "01K00000000000000000000001".into(),
                 incarnation: "01K00000000000000000000002".into(),
                 grant_id: "01K00000000000000000000003".into(),
-                service_port: 8100,
+                service_port: capyctl_testkit::ports::free_port(),
                 issued_at_ms: 1,
                 coordinator_session_id: "01K00000000000000000000004".into(),
                 checkpoint_digest: String::new(),

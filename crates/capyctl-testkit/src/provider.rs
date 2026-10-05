@@ -72,7 +72,9 @@ pub fn fake_installation() -> EngineInstallation {
         args: Vec::new(),
         installation_drift: Default::default(),
         cuda_home: None,
-        engine_ports: (8100, 8199),
+        // A range of this test binary's own, so test binaries running in
+        // parallel never lease, probe or bind each other's engine ports.
+        engine_ports: crate::ports::fake_engine_ports(),
         registered: None,
     }
 }

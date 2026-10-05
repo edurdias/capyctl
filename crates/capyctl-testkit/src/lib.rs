@@ -21,6 +21,7 @@ pub mod fake_engine;
 pub mod fake_launcher;
 pub mod fixture;
 mod lifecycle;
+pub mod ports;
 mod provider;
 mod scripted_tool;
 
