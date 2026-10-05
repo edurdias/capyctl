@@ -8,6 +8,7 @@ pub mod defaults;
 // and the defaults that complete it, shared by every role.
 pub mod deployment_defaults;
 pub mod effective;
+pub mod engine_env;
 pub mod engine_policy;
 // Owner rule 2026-09-25: the engine-installation settings of a role, three
 // ways (flag > environment > YAML > default), shared by host and standalone.

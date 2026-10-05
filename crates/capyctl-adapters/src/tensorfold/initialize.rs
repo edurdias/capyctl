@@ -40,9 +40,10 @@ pub(super) async fn initialize(
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    let (toolchain, limits) = crate::engine_env::toolchain_environment(
-        plan.cuda_home.as_deref(),
+    let (toolchain, limits) = crate::engine_env::launch_environment_noted(
         &plan.build_env,
+        Some(&plan.engine_bin),
+        plan.cuda_home.as_deref(),
         crate::engine_env::mem_available_bytes(),
         crate::engine_env::cpu_count(),
     );

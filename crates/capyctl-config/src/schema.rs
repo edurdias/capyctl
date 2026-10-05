@@ -299,6 +299,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // name, and the directories an approved path option may name.
         ("approved_options", FieldSpec::Seq(&SCALAR)),
         ("approved_paths", FieldSpec::Seq(&SCALAR)),
+        // ADR 0028 §2.1: environment names and globs a deployment may set.
+        ("approved_env", FieldSpec::Seq(&SCALAR)),
         // ADR 0008 (owner decision 2026-09-23): `warn` (default) or `refuse`
         // when a launch finds the installation drifted from its registration.
         ("installation_drift", SCALAR),
@@ -345,6 +347,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
+        // ADR 0028 §2.1: engine environment, names approved by the profile.
+        ("env", FieldSpec::MapOf(&SCALAR)),
     ]);
     const PROFILE: FieldSpec = FieldSpec::Struct(&[
         ("engine", SCALAR),

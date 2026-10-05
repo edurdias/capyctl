@@ -241,6 +241,9 @@ pub fn engine_environment(
             env.insert((*name).to_owned(), value);
         }
     }
+    // ADR 0028 §2.1: the resolved engine env and the toolchain come before
+    // everything CapyCTL renders, so a rendered or fixed value is never replaced.
+    env.extend(toolchain.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.extend(rendered.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.insert(
         "PATH".into(),
@@ -250,10 +253,12 @@ pub fn engine_environment(
             crate::engine_env::SYSTEM_PATH,
         ),
     );
-    env.extend(toolchain.iter().map(|(k, v)| (k.clone(), v.clone())));
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
-    env.retain(|name, _| ENGINE_ENV_ALLOWLIST.contains(&name.as_str()));
+    // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
+    env.retain(|name, _| {
+        ENGINE_ENV_ALLOWLIST.contains(&name.as_str()) || plan.build_env.contains_key(name)
+    });
     env
 }

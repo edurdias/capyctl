@@ -777,9 +777,14 @@ fn resolver_rejects_reserved_profile_arguments_and_accepts_ordinary_ones() {
     resolve_effective(&deployment, &host).expect("ordinary host-fixed arguments pass");
 }
 
+// ADR 0028 §2.1: a profile's own env is host-authored, so an ordinary name
+// such as `SURPRISE` is admitted; only CapyCTL-owned names are refused.
 #[test]
-fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
-    for name in ["HF_TOKEN", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "SURPRISE"] {
+fn resolver_rejects_owned_environment_names_and_admits_ordinary_ones() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["env"] = serde_json::json!({"SURPRISE": "1"});
+    resolve_effective(&deployment, &host).expect("an ordinary profile env name resolves");
+    for name in ["LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "PATH", "NCCL_DEBUG"] {
         let (deployment, mut host) = fixture();
         host["runtime_profiles"]["local"]["env"] = serde_json::json!({name: "secret-value"});
         assert!(resolve_effective(&deployment, &host).is_err(), "{name}");
@@ -1955,5 +1960,58 @@ fn a_request_declared_on_a_discrete_gpu_is_sized_for_the_card() {
     assert_eq!(
         unified.engine_config.memory().kv_cache_bytes,
         20 * GIB - weights - capyctl_config::effective::overhead_margin(Engine::Vllm)
+    );
+}
+
+// T14, T39: no env keeps the fingerprint; a deployment env shows with its source.
+#[test]
+fn engine_env_is_in_the_effective_configuration() {
+    let (mut deployment, mut host) = fixture();
+    let before = resolve_effective(&deployment, &host).unwrap();
+    // The fixture's profile env alone does not add `engine_env` to the document.
+    assert!(!serde_json::to_string(&before)
+        .unwrap()
+        .contains("engine_env"));
+    host["runtime_profiles"]["local"]["security"]["approved_env"] = serde_json::json!(["MBX_*"]);
+    deployment["engine_config"]["env"] = serde_json::json!({"MBX_FUSED_DRAFT": "1"});
+    let after = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        after.engine_env.vars["MBX_FUSED_DRAFT"],
+        (
+            "1".to_string(),
+            capyctl_config::engine_env::EnvSource::Deployment
+        )
+    );
+    assert_ne!(before.recipe_fingerprint, after.recipe_fingerprint);
+    let (plain_deployment, plain_host) = fixture();
+    let plain_again = resolve_effective(&plain_deployment, &plain_host).unwrap();
+    assert_eq!(before.recipe_fingerprint, plain_again.recipe_fingerprint);
+}
+
+// T37: a deployment env name without an approval on its profile is refused.
+#[test]
+fn deployment_engine_env_needs_the_profile_approval() {
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["env"] = serde_json::json!({"MBX_FUSED_DRAFT": "1"});
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("engine_env_not_approved:MBX_FUSED_DRAFT"),
+        "{error}"
+    );
+}
+
+// T21: a profile may not set an owned name.
+#[test]
+fn a_profile_env_may_not_set_an_owned_name() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["env"] = serde_json::json!({"NCCL_IB_HCA": "mlx5_0"});
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("engine_env_reserved:NCCL_IB_HCA"),
+        "{error}"
     );
 }

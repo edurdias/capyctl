@@ -139,6 +139,11 @@ pub(super) async fn initialize(
         launch.frozen.cuda_home(),
         "/usr/bin:/bin",
     );
+    // ADR 0028 §2.1: the resolved engine env; what CapyCTL rendered or sets
+    // below is never replaced by it.
+    for (name, value) in launch.frozen.build_env() {
+        cmd.env.entry(name.clone()).or_insert_with(|| value.clone());
+    }
     cmd.env.insert("PATH".into(), tool_path);
     // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
     let (toolchain, limits) = crate::engine_env::toolchain_environment(
