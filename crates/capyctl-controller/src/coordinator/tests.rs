@@ -3520,17 +3520,11 @@ mod native {
         // The store probe-binds a free port of the host's range at lease time,
         // and the stub engine then binds it. The golden fixture's fixed
         // 8100-8199 range is shared with other tests running in parallel, so
-        // one could take the leased port in between; this test leases from a
-        // range of its own instead, chosen at random below 20000 (clear of the
-        // CLI tests' ports and of the kernel's ephemeral range, where outbound
-        // connections land).
-        const RANGE: u16 = 100;
-        let base = {
-            let seed = (std::process::id() as u64) ^ (realtime_ms() as u64);
-            10_000 + (seed % u64::from(10_000 - RANGE)) as u16
-        };
+        // one could take the leased port in between; this test leases from
+        // ports no other test binary running now hands out.
+        let ports = capyctl_testkit::ports::free_ports(100, true);
         host["resource_policy"]["endpoint_port_range"] =
-            json!({"start": base, "end": base + RANGE - 1});
+            json!({"start": ports[0], "end": ports[99]});
         let (dir, owner) = {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();

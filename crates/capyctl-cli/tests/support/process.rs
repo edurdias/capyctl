@@ -17,18 +17,16 @@
 //!   from the kernel's ephemeral range, which is exactly where every outbound
 //!   connection in a parallel test (a reqwest client, a gRPC channel, a CLI
 //!   child) picks its local port. [`free_port`] and [`free_ports`] choose from
-//!   below that range instead, from a randomized start, never hand out the same
-//!   port twice in one test binary, and check every port of a set while holding
-//!   all of them, so a set is internally distinct and free when chosen.
+//!   below that range instead, through `capyctl_testkit::ports`: each test
+//!   binary claims blocks of ports under a file lock, so no two binaries running
+//!   at once hand out the same port, and every port of a set is checked while
+//!   holding all of them, so a set is internally distinct and free when chosen.
 //!
 //! None of this is qualification of any engine recipe (SPEC §18).
 
-use std::collections::HashSet;
-use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A child process that is killed, with its whole process group, when this
@@ -165,66 +163,11 @@ pub fn output_within(command: &mut Command, within: Duration) -> Output {
     }
 }
 
-/// Ports this test binary has handed out; never handed out twice.
-static TAKEN: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
-/// The lowest port the pool uses; below it sit well-known and registered
-/// services a developer machine may run.
-const POOL_LOW: u16 = 20_000;
-
-/// The pool's upper bound (exclusive): the start of the kernel's ephemeral
-/// range, where outbound connections take their local ports.
-fn pool_high() -> u16 {
-    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .ok()
-        .and_then(|text| text.split_whitespace().next()?.parse::<u16>().ok())
-        .filter(|low| *low > POOL_LOW + 1_000)
-        .unwrap_or(32_768)
-}
-
-/// A random offset, so concurrent test binaries start in different places.
-fn random() -> u64 {
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u32(std::process::id());
-    hasher.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default(),
-    );
-    hasher.finish()
-}
-
 /// `count` loopback ports, `consecutive` or not, each bindable at the moment
-/// the whole set is chosen and none handed out before by this binary.
+/// the whole set is chosen and none handed out before by any test binary
+/// running now (`capyctl_testkit::ports`).
 pub fn free_ports(count: usize, consecutive: bool) -> Vec<u16> {
-    assert!(count > 0);
-    let high = pool_high();
-    let span = u64::from(high - POOL_LOW);
-    let mut taken = TAKEN.lock().unwrap_or_else(|error| error.into_inner());
-    let taken = taken.get_or_insert_with(HashSet::new);
-    for _ in 0..10_000 {
-        let start = POOL_LOW + (random() % span) as u16;
-        let mut chosen = Vec::with_capacity(count);
-        let mut held = Vec::with_capacity(count);
-        let mut port = start;
-        while chosen.len() < count && port < high {
-            let free = !taken.contains(&port)
-                && std::net::TcpListener::bind(("127.0.0.1", port))
-                    .map(|listener| held.push(listener))
-                    .is_ok();
-            if free {
-                chosen.push(port);
-            } else if consecutive {
-                break;
-            }
-            port += 1;
-        }
-        if chosen.len() == count {
-            taken.extend(chosen.iter().copied());
-            return chosen;
-        }
-    }
-    panic!("no {count} free loopback ports below the ephemeral range");
+    capyctl_testkit::ports::free_ports(count, consecutive)
 }
 
 /// One loopback port (see [`free_ports`]).

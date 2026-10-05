@@ -2023,6 +2023,9 @@ mod tests {
         ] {
             document[field] = fixture["host"][field].clone();
         }
+        // Plans lease a free port at runtime (`closed_port`), not the
+        // fixture's fixed 8100-8199, which tests running in parallel share.
+        document["resource_policy"]["endpoint_port_range"] = wide_ports();
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let executor = NativeHostExecution::new(
             HostJournal::open(root.path(), "controller", "host").unwrap(),
@@ -2069,7 +2072,7 @@ mod tests {
                 binding_id: "01K00000000000000000000001".into(),
                 incarnation: "01K00000000000000000000002".into(),
                 grant_id: "01K00000000000000000000003".into(),
-                service_port: 8100,
+                service_port: closed_port(),
                 issued_at_ms: 1,
                 coordinator_session_id: "01K00000000000000000000004".into(),
                 checkpoint_digest: String::new(),
@@ -2152,6 +2155,9 @@ mod tests {
         ] {
             document[field] = fixture["host"][field].clone();
         }
+        // Plans lease a free port at runtime (`closed_port`), not the
+        // fixture's fixed 8100-8199, which tests running in parallel share.
+        document["resource_policy"]["endpoint_port_range"] = wide_ports();
         edit(&mut document);
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let policy = capyctl_config::remote_resources::policy_fingerprint(&config.document);
@@ -2210,7 +2216,7 @@ mod tests {
             binding_id: "01K00000000000000000000001".into(),
             incarnation: "01K00000000000000000000002".into(),
             grant_id: "01K00000000000000000000003".into(),
-            service_port: 8100,
+            service_port: closed_port(),
             issued_at_ms: 1,
             coordinator_session_id: "01K00000000000000000000004".into(),
             checkpoint_digest: digest.into(),
@@ -2745,6 +2751,9 @@ mod tests {
         ] {
             document[field] = fixture["host"][field].clone();
         }
+        // Plans lease a free port at runtime (`closed_port`), not the
+        // fixture's fixed 8100-8199, which tests running in parallel share.
+        document["resource_policy"]["endpoint_port_range"] = wide_ports();
         let profile = &mut document["runtime_profiles"]["local"];
         profile["engine"] = "sglang".into();
         profile["args"] = serde_json::json!([]);
@@ -2891,7 +2900,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
-        let (launch, plan) = tensorfold_launch(&deployment, &policy, 8100);
+        let (launch, plan) = tensorfold_launch(&deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
         let (input, built) = executor.tensorfold_plan(&effective, &plan).unwrap();
         assert!(!built);
@@ -2914,7 +2923,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
-        let (launch, plan) = tensorfold_launch(&deployment, &policy, 8100);
+        let (launch, plan) = tensorfold_launch(&deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
         let (input, _) = executor.tensorfold_plan(&effective, &plan).unwrap();
         let extension =
@@ -2941,7 +2950,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o777),
         )
         .unwrap();
-        let (launch, _) = tensorfold_launch(&deployment, &policy, 8100);
+        let (launch, _) = tensorfold_launch(&deployment, &policy, closed_port());
         assert!(matches!(
             executor.resolve(&launch),
             Err(JournalError::Unauthorized)
@@ -2956,7 +2965,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
-        let (launch, _) = tensorfold_launch(&deployment, &policy, 8100);
+        let (launch, _) = tensorfold_launch(&deployment, &policy, closed_port());
         let session = executor.journal.connect().unwrap();
         executor.connected(session).unwrap();
         executor
@@ -3066,6 +3075,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         port
+    }
+
+    /// An engine port range every [`closed_port`] falls in.
+    fn wide_ports() -> serde_json::Value {
+        serde_json::json!({"start": 1024, "end": 65535})
     }
 
     /// A port nobody listens on.
