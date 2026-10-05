@@ -1528,3 +1528,66 @@ async fn a_host_lacking_the_profile_is_refused_while_another_has_it() {
         "{hosts:?}"
     );
 }
+
+/// ADR 0028 §5 interim (Task 4 fix, R19): a server deploy of a multi-node group
+/// is refused until group activation lands; nothing is published.
+// T03
+#[tokio::test]
+async fn a_registry_group_deploy_is_refused_until_activation_lands() {
+    let (_directory, state, mut config, _host) = fixture();
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    config.as_object_mut().unwrap().remove("host");
+    config.as_object_mut().unwrap().remove("devices");
+    config["topology"] = json!({"tensor_parallel": 2});
+    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "group",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 501);
+    let body = json_response(response).await;
+    assert_eq!(body["error"]["code"], "group_shape_unsupported", "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "multi-node group activation is not available yet"
+    );
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 0);
+}
+
+/// ADR 0028 §2: standalone (the embedded host) is one host; a group is refused.
+// T03 T14
+#[tokio::test]
+async fn an_embedded_group_deploy_is_refused_group_placement_required() {
+    let (_directory, state, mut config, host) = fixture();
+    let router = app(state.clone(), host);
+    config.as_object_mut().unwrap().remove("host");
+    config.as_object_mut().unwrap().remove("devices");
+    config["topology"] = json!({"tensor_parallel": 2});
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "embedded-group",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body = json_response(response).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("group_placement_required"),
+        "{body}"
+    );
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 0);
+}

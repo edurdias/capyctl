@@ -1059,17 +1059,17 @@ pub fn resolve_effective_with_checkpoint(
     // Owner decision 2026-09-25 (ADR 0014 amendment): complete a minimal
     // document, first from itself, then from this host. A full document is
     // unchanged by both.
-    let completed = {
+    let (completed, instance_spec) = {
         let mut document = deployment.clone();
         crate::deployment_defaults::expand(&mut document)?;
-        crate::deployment_defaults::for_host(&document, host)?
+        // ADR 0013 §2–3: the declaration is validated as written; the host's
+        // defaults fill a device only afterwards, and a group names none.
+        let spec = crate::instances::parse_instance_spec(&document)?;
+        (crate::deployment_defaults::for_host(&document, host)?, spec)
     };
     let deployment = &completed;
     let mut d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode_host(host)?;
-    // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
-    // declaration before resolving anything against this host.
-    let instance_spec = crate::instances::parse_instance_spec(deployment)?;
     if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",

@@ -744,7 +744,7 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         "reconciliation_required" => "unreconciled",
         // SPEC §6.4: a stop is still being confirmed; nothing was started.
         "still_stopping" => "still_stopping",
-        "unsupported_capability" => "unsupported",
+        "unsupported_capability" | "group_shape_unsupported" => "unsupported",
         "not_found" => "not_found",
         "invalid_config" | "invalid_request" | "body_too_large" => "invalid_config",
         // A command whose response deadline passed may still complete; the
