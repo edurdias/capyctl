@@ -163,6 +163,21 @@ mod tests {
         let env = launch_environment(&overridden, None, None, 64 << 30, 8);
         assert_eq!(env["MAX_JOBS"], "2");
         assert_eq!(env["FLASHINFER_NVCC_THREADS"], "1");
+        // ADR 0028 §2.1: CapyCTL's values are applied last. Owned names cannot
+        // reach here through resolution, but the function holds regardless.
+        let colliding = BTreeMap::from([
+            ("PATH".to_owned(), "/evil".to_owned()),
+            ("CUDA_HOME".to_owned(), "/evil".to_owned()),
+        ]);
+        let env = launch_environment(
+            &colliding,
+            Some("/opt/venv/bin/vllm"),
+            Some("/cuda"),
+            8 << 30,
+            4,
+        );
+        assert!(env["PATH"].starts_with("/opt/venv/bin"));
+        assert_eq!(env["CUDA_HOME"], "/cuda");
     }
 
     // T21 (SPEC §13.3 amendment): the job cap follows free memory, bounded by 1
