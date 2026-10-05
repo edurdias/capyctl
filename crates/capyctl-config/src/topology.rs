@@ -72,14 +72,17 @@ fn dimension(raw: &Value, key: &str) -> Result<u32, ConfigError> {
     }
 }
 
-/// Whether the document declares a topology whose world size is above one.
-/// Lenient: a malformed dimension is reported by [`parse_group_shape`].
+/// Whether the document declares a topology that is not the single-host one:
+/// any stated dimension other than 1, valid or not, so a malformed group is
+/// refused with the group codes. [`parse_group_shape`] reports the dimension.
 pub(crate) fn declares_group(deployment: &Value) -> bool {
     let Some(raw) = deployment.get("topology").filter(|v| !v.is_null()) else {
         return false;
     };
-    let dim = |key: &str| raw.get(key).and_then(Value::as_u64).unwrap_or(1);
-    dim("tensor_parallel").saturating_mul(dim("pipeline_parallel")) > 1
+    ["tensor_parallel", "pipeline_parallel"].iter().any(|key| {
+        raw.get(*key)
+            .is_some_and(|v| !v.is_null() && v.as_u64() != Some(1))
+    })
 }
 
 pub fn parse_group_shape(

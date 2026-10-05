@@ -509,7 +509,13 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
         .get("devices")
         .and_then(Value::as_array)
         .is_some_and(|devices| devices.iter().any(|d| d.get("id").is_some()));
-    if names_devices && spec.placement.hosts.as_ref().is_some_and(|h| h.len() > 1) {
+    // A group's ranks each hold one device on their own host (ADR 0028 §2), so
+    // a device id there is that host's, and the rule is for the scheduler's
+    // multi-host sets only.
+    if names_devices
+        && spec.group.is_none()
+        && spec.placement.hosts.as_ref().is_some_and(|h| h.len() > 1)
+    {
         return Err(invalid(
             "devices",
             "named devices require an allowed set of exactly one host",

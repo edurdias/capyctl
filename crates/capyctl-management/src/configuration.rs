@@ -44,6 +44,8 @@ pub enum ConfigurationFailure {
     QueueFull,
     DeadlineExceeded,
     Unsupported,
+    /// ADR 0028 §5: a multi-node group deployment before group activation exists.
+    GroupUnsupported,
     NotFound,
     RevisionConflict,
     IdempotencyConflict,
@@ -200,6 +202,12 @@ impl ConfigurationFailure {
                 "deadline_exceeded",
                 "Command response deadline exceeded; retry with the same idempotency key",
                 true,
+            ),
+            GroupUnsupported => (
+                StatusCode::NOT_IMPLEMENTED,
+                "group_shape_unsupported",
+                "multi-node group activation is not available yet",
+                false,
             ),
             Unsupported => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -674,6 +682,11 @@ fn registry_targets(
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, config_json)?;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
+    // TODO(ADR 0028 §5, Task 16): remove when group activation lands. Until then
+    // the placement reads only `placement_json` and would launch one host.
+    if spec.group.is_some() {
+        return Err(ConfigurationFailure::GroupUnsupported);
+    }
     let allowed: Vec<String> = match &spec.placement.hosts {
         Some(hosts) => hosts.clone(),
         None => store

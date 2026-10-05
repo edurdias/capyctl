@@ -714,7 +714,8 @@ impl crate::Store {
                 instances,
                 placement,
                 warm,
-                // ADR 0028 §2: the group is not stored yet.
+                // ADR 0028 §2: a group is read from the revision's config_json,
+                // never from these rows, so it is `None` here by design.
                 group: None,
             })
         })

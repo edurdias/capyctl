@@ -157,3 +157,58 @@ fn engine_shape_support() {
     assert!(group_support("sglang").unwrap().worker_listens);
     assert!(!group_support("vllm").unwrap().worker_listens);
 }
+
+fn group_fixture(engine: &str) -> (serde_json::Value, serde_json::Value) {
+    let all: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/f2-deployment.json")).unwrap();
+    let (mut deployment, mut host) = (all["deployment"].clone(), all["host"].clone());
+    if engine == "tensorfold" {
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = "tensorfold".into();
+        profile["executable"] = "/opt/tf/bin/tensorfold".into();
+        profile["build_fingerprint"] = "0.6.0".into();
+        profile["args"] = json!([]);
+        deployment["engine_config"] = json!({"context_length": 8192});
+    }
+    deployment.as_object_mut().unwrap().remove("host");
+    deployment.as_object_mut().unwrap().remove("residency");
+    deployment["topology"] = json!({"tensor_parallel": 2});
+    deployment["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    (deployment, host)
+}
+
+// T03, T22: a two-host TensorFold group defaults to restart_only; an explicit
+// deep residency is refused capability_missing:deep_park.
+#[test]
+fn tensorfold_group_resolves_restart_only_and_refuses_deep() {
+    use capyctl_config::effective::{resolve_effective, Residency};
+    let (mut deployment, mut host) = group_fixture("tensorfold");
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+    let resolved = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(resolved.residency, Residency::RestartOnly);
+    deployment["residency"] = "deep".into();
+    let err = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(
+        err.to_string().contains("capability_missing:deep_park"),
+        "{err}"
+    );
+}
+
+// T03, T22: a vLLM TP2 group resolves with its default residency.
+#[test]
+fn vllm_group_resolves_with_default_residency() {
+    use capyctl_config::effective::resolve_effective;
+    let (deployment, host) = group_fixture("vllm");
+    resolve_effective(&deployment, &host).unwrap();
+}
+
+// T03: a zero dimension with a repeated host is a topology error.
+#[test]
+fn zero_dimension_with_repeated_host_is_topology_invalid() {
+    let err = parse_instance_spec(&doc(json!({
+        "topology": {"tensor_parallel": 0},
+        "placement": {"hosts": ["a", "a"]}
+    })))
+    .unwrap_err();
+    assert!(err.to_string().contains("group_topology_invalid"), "{err}");
+}
