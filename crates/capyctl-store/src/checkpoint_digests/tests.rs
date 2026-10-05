@@ -222,7 +222,8 @@ fn a_derived_memory_request_waits_for_the_digest_then_resolves_exactly() {
 
 // T14 (ADR 0014 amendment A16): the hybrid state slot a host measures beside
 // the weights is recorded with the digest, and a provisional SGLang revision
-// is re-resolved with it, so its derived request holds the state. Once
+// is re-resolved with it, so its derived request holds the state (of the
+// hybrid default of 8 running requests, 41 slots). Once
 // recorded, another slot is a mismatch; an older host naming none is not.
 #[test]
 fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
@@ -245,14 +246,14 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
         .unwrap();
     let memory = frozen_memory(&store, &receipt);
     assert_eq!(memory["state_slot_bytes"], json!(slot));
-    assert_eq!(memory["state_bytes"], json!(161 * slot));
+    assert_eq!(memory["state_bytes"], json!(41 * slot));
     assert_eq!(
         memory["request_bytes"],
         json!(
             weights
                 + (4 << 30)
                 + capyctl_config::effective::SGLANG_OVERHEAD_MARGIN_BYTES
-                + 161 * slot
+                + 41 * slot
         )
     );
     let record = store.checkpoint_digest(id, 1).unwrap().unwrap();

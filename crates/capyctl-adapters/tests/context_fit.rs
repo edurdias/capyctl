@@ -315,19 +315,17 @@ fn sglang_sizes_a_hybrid_models_state_beside_its_kv_cache() {
     });
     let settings = sglang_public(&effective);
     assert_eq!(settings["max_total_tokens"], json!(524288));
-    assert_eq!(
-        settings["max_running_requests"],
-        json!(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
-    );
-    assert_eq!(settings["max_mamba_cache_size"], json!(160));
+    // Undeclared, the hybrid default (owner decision 2026-10-05).
+    assert_eq!(settings["max_running_requests"], json!(8));
+    assert_eq!(settings["max_mamba_cache_size"], json!(40));
     // A declared count is kept, and its state sized.
     let (_store, effective) = sized_sglang(&qwen38_27b(), Some(weights), |d| {
         d["engine_config"]["memory"] = json!({"request": "96GiB", "kv_cache": "16GiB"});
-        d["engine_config"]["max_concurrent_requests"] = json!(8);
+        d["engine_config"]["max_concurrent_requests"] = json!(16);
     });
     let settings = sglang_public(&effective);
-    assert_eq!(settings["max_running_requests"], json!(8));
-    assert_eq!(settings["max_mamba_cache_size"], json!(40));
+    assert_eq!(settings["max_running_requests"], json!(16));
+    assert_eq!(settings["max_mamba_cache_size"], json!(80));
 }
 
 // T14 (amendment A14): a state that does not fit the memory request is
@@ -585,9 +583,9 @@ const QWEN38_STATE: i64 = 153_944_064;
 const GIB: i64 = 1 << 30;
 
 // T14 (ADR 0014 amendment A16): with the state slot measured beside the
-// weights, a derived request holds the state of the in-flight bound's running
-// requests, so SGLang runs them all with the whole KV cache and nothing is
-// lent from the margin.
+// weights, a derived request holds the state of its running requests (the
+// hybrid default of 8, owner decision 2026-10-05), so SGLang runs them all
+// with the whole KV cache and nothing is lent from the margin.
 #[test]
 fn a_derived_request_holds_the_state_of_its_running_requests() {
     let weights = 21_920_000_000i64;
@@ -595,37 +593,37 @@ fn a_derived_request_holds_the_state_of_its_running_requests() {
         unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
             d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
         });
-    let state = 161 * QWEN38_STATE;
+    let state = 41 * QWEN38_STATE;
     let memory = effective.engine_config.memory();
     assert_eq!(memory.state_slot_bytes, Some(QWEN38_STATE));
     assert_eq!(memory.state_bytes, Some(state));
     assert_eq!(memory.request_bytes, weights + 4 * GIB + 8 * GIB + state);
     let settings = sglang_public(&effective);
-    assert_eq!(
-        settings["max_running_requests"],
-        json!(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT)
-    );
-    assert_eq!(settings["max_mamba_cache_size"], json!(160));
+    assert_eq!(settings["max_running_requests"], json!(8));
+    assert_eq!(settings["max_mamba_cache_size"], json!(40));
     assert_eq!(settings["max_total_tokens"], json!(131072));
     assert_eq!(
         settings["memory"]["static_bytes"],
         json!(weights + 4 * GIB + state + 2 * GIB)
     );
+    // Status shows the limit below the router's in-flight bound.
     let fit = capyctl_config::context_fit::fit_for_effective(&effective);
-    assert_eq!(fit.running_limit, None);
+    assert_eq!(fit.running_limit, Some(8));
     // A declared count reserves its own state.
     let (_store, effective) =
         unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "120GiB", |d| {
             d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
-            d["engine_config"]["max_concurrent_requests"] = json!(8);
+            d["engine_config"]["max_concurrent_requests"] = json!(32);
         });
     assert_eq!(
         effective.engine_config.memory().state_bytes,
-        Some(41 * QWEN38_STATE)
+        Some(161 * QWEN38_STATE)
     );
     let settings = sglang_public(&effective);
-    assert_eq!(settings["max_running_requests"], json!(8));
-    assert_eq!(settings["max_mamba_cache_size"], json!(40));
+    assert_eq!(settings["max_running_requests"], json!(32));
+    assert_eq!(settings["max_mamba_cache_size"], json!(160));
+    let fit = capyctl_config::context_fit::fit_for_effective(&effective);
+    assert_eq!(fit.running_limit, None);
 }
 
 // T14 (amendment A16): the state reserved is what the memory domain still
@@ -637,6 +635,7 @@ fn a_derived_request_reserves_the_state_its_domain_holds() {
     let (_store, effective) =
         unified_sglang(&qwen38_27b(), weights, Some(QWEN38_STATE), "48GiB", |d| {
             d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+            d["engine_config"]["max_concurrent_requests"] = json!(32);
         });
     // 48 GiB less 20.41 GiB of weights, 4 GiB of KV cache, 8 GiB of margin
     // and 2.5 GiB of context and graphs leaves 91 slots: 18 requests.
@@ -699,7 +698,7 @@ fn the_state_slot_travels_with_the_snapshot() {
     .unwrap();
     assert_eq!(
         measured.engine_config.memory().state_bytes,
-        Some(161 * QWEN38_STATE)
+        Some(41 * QWEN38_STATE)
     );
 }
 

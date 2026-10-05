@@ -139,12 +139,17 @@ fn a_hybrid_models_state_is_sized_beside_its_kv_cache() {
         found.static_bytes,
         Some(weights + 16 * GIB + 21 * STATE as i64 + overhead)
     );
-    // A larger request runs CapyCTL's whole in-flight bound.
+    // A larger request runs CapyCTL's hybrid default (owner decision
+    // 2026-10-05), below the router's in-flight bound.
     let found = pool(&fp8(settings(96 * GIB, 16 * GIB, Some(weights))), &target).unwrap();
-    assert_eq!(
-        found.max_running_requests,
-        Some(MAX_REQUESTS_PER_DEPLOYMENT)
-    );
+    assert_eq!(found.max_running_requests, Some(8));
+    assert_eq!(found.max_mamba_cache_size, Some(40));
+    assert_eq!(found.running_limit, Some(8));
+    // A declared count above the default is honored.
+    let mut many = fp8(settings(96 * GIB, 16 * GIB, Some(weights)));
+    many.common.max_concurrent_requests = Some(MAX_REQUESTS_PER_DEPLOYMENT);
+    let found = pool(&many, &target).unwrap();
+    assert_eq!(found.max_running_requests, None);
     assert_eq!(found.max_mamba_cache_size, Some(160));
     assert_eq!(found.running_limit, None);
     // A declared count is used as declared, and not repeated.
@@ -209,12 +214,14 @@ fn arguments_that_size_the_state_pool_win() {
         assert_eq!(found.max_mamba_cache_size, None, "{extra:?}");
     }
     // `--mamba-ssm-dtype bfloat16` halves the temporal state: 48 ×
-    // (61440 + 1572864) bytes per slot, so 9 requests fit where 4 did.
-    let mut halved = fp8(settings(48 * GIB, 16 * GIB, Some(21_920_000_000)));
+    // (61440 + 1572864) bytes per slot, so 4 requests fit where 2 did.
+    let plain = fp8(settings(46 * GIB, 16 * GIB, Some(21_920_000_000)));
+    assert_eq!(pool(&plain, &target).unwrap().max_running_requests, Some(2));
+    let mut halved = plain.clone();
     halved.extra_args = ["--mamba-ssm-dtype", "bfloat16"].map(String::from).to_vec();
     assert_eq!(
         pool(&halved, &target).unwrap().max_running_requests,
-        Some(9)
+        Some(4)
     );
 }
 
@@ -489,8 +496,10 @@ fn a_derived_unified_request_keeps_its_kv_pool() {
     unified.common.kv_cache_dtype = None;
     let found = pool(&unified, &target).unwrap();
     assert_eq!(found.max_total_tokens, Some((4 * GIB / 32768) as u32));
-    assert_eq!(found.max_mamba_cache_size, Some(5 * 16));
-    assert_eq!(found.running_limit, Some(16));
+    // Half the margin holds 16 requests; the hybrid default runs 8.
+    assert_eq!(found.max_mamba_cache_size, Some(5 * 8));
+    assert_eq!(found.max_running_requests, Some(8));
+    assert_eq!(found.running_limit, Some(8));
 }
 
 // ADR 0014, note on amendment A14 (found live 2026-10-04): on a discrete GPU
@@ -548,18 +557,23 @@ fn the_state_slot_is_read_from_the_checkpoint() {
 #[test]
 fn a_derived_request_reserves_the_state_that_fits() {
     let all = |_: u64| true;
+    // Undeclared, the hybrid default (owner decision 2026-10-05): 8 requests.
     assert_eq!(
         derived_state_reserve(STATE, &[], None, all),
+        Some(41 * STATE)
+    );
+    assert_eq!(
+        derived_state_reserve(STATE, &[], Some(32), all),
         Some(161 * STATE)
     );
     assert_eq!(
         derived_state_reserve(STATE, &[], Some(8), all),
         Some(41 * STATE)
     );
-    let under = |bytes: u64| bytes <= 91 * STATE;
+    let under = |bytes: u64| bytes <= 31 * STATE;
     assert_eq!(
         derived_state_reserve(STATE, &[], None, under),
-        Some(91 * STATE)
+        Some(31 * STATE)
     );
     assert_eq!(derived_state_reserve(STATE, &[], None, |_| false), None);
     // Draft-token states are reserved with the slots.

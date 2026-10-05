@@ -19,8 +19,14 @@ Unreleased.
   allocates only the KV cache and state CapyCTL sized.
 - **SGLang hybrid models get their concurrency.** When you state no memory
   request, CapyCTL now adds a hybrid model's per-request state to the request it
-  derives, for `max_concurrent_requests` (or 32) as far as the machine holds it,
+  derives, for `max_concurrent_requests` (or 8) as far as the machine holds it,
   instead of borrowing it from the margin or the KV cache. Qwen3.8-27B at the
-  default KV cache runs 32 requests where it ran 5, and asks for about 23 GiB
-  more; state `max_concurrent_requests` to ask for less. A revision measured
-  before this release keeps its sizing; a new revision of it gets the state.
+  default KV cache runs 8 requests where it ran 5, and asks for about 6 GiB
+  more (16 GiB with DFlash2). A revision measured before this release keeps its
+  sizing; a new revision of it gets the state.
+- **SGLang hybrid models run 8 requests by default.** Without
+  `max_concurrent_requests`, a hybrid model on SGLang runs up to 8 requests at
+  once, as TensorFold does, instead of up to 32; dense models are unchanged.
+  The router still accepts 32 per deployment and the rest wait in SGLang's
+  queue. Set `max_concurrent_requests` to run more, and CapyCTL sizes the state
+  for that count.
