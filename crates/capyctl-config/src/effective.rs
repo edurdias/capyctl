@@ -826,6 +826,10 @@ struct RawHostPolicy {
     /// `instances::host_labels`; they select hosts and change no resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     labels: Option<BTreeMap<String, String>>,
+    /// ADR 0028 §3: the host's group policy, parsed by `groups_policy`. It is
+    /// not part of the normalized policy, so a host without it keeps its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    groups: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -925,6 +929,7 @@ pub fn compose_resource_policy(
                 .then(|| format!("{}ms", controls.queue.stream_idle_ms)),
         }),
         labels: None,
+        groups: None,
     };
     serde_json::to_value(&raw).expect("Raw* composition types always encode to JSON")
 }
@@ -1038,6 +1043,8 @@ fn raw_recipe(raw: RawRecipe) -> Result<RecipeFootprints, ConfigError> {
 /// Decode a host document, refusing moved fields with a pointer first.
 fn decode_host(host: &serde_json::Value) -> Result<HostInput, ConfigError> {
     engine_config::refuse_moved_profile_fields(host)?;
+    // ADR 0028 §3: a malformed groups block is refused with the host.
+    crate::groups_policy::stated_groups(host)?;
     decode(host, "host")
 }
 

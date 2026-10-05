@@ -20,6 +20,9 @@
 //! | runtime directory | `runtime_dir` | `--runtime-dir` | `CAPYCTL_RUNTIME_DIR` |
 //! | engine port range | `resource_policy.endpoint_port_range` | `--engine-ports` | `CAPYCTL_ENGINE_PORTS` |
 //! | CUDA toolkit | `local_engine.cuda_home` | `--cuda-home` | `CAPYCTL_CUDA_HOME` |
+//! | group peer address (ADR 0028 §3) | `resource_policy.groups.peer_address` | `--peer-address` | `CAPYCTL_PEER_ADDRESS` |
+//! | group rendezvous ports (ADR 0028 §3) | `resource_policy.groups.rendezvous_port_range` | `--rendezvous-ports` | `CAPYCTL_RENDEZVOUS_PORTS` |
+//! | group RDMA requirement (ADR 0028 §3) | `resource_policy.groups.require_rdma` | `--require-rdma` | `CAPYCTL_REQUIRE_RDMA` |
 //!
 //! The `local_engine` executables declare the role's unnamed installation:
 //! one of them is the runtime profile `local`; several are `local-vllm`,
@@ -50,6 +53,12 @@ pub const RUNTIME_DIR_ENV: &str = "CAPYCTL_RUNTIME_DIR";
 /// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root of
 /// the role's own installation, published as its profile's `cuda_home`.
 pub const CUDA_HOME_ENV: &str = "CAPYCTL_CUDA_HOME";
+/// ADR 0028 §3: the address this host's group peers reach it on.
+pub const PEER_ADDRESS_ENV: &str = "CAPYCTL_PEER_ADDRESS";
+/// ADR 0028 §3: the group rendezvous port range, `start-end`.
+pub const RENDEZVOUS_PORTS_ENV: &str = "CAPYCTL_RENDEZVOUS_PORTS";
+/// ADR 0028 §3: whether a group on this host requires RDMA.
+pub const REQUIRE_RDMA_ENV: &str = "CAPYCTL_REQUIRE_RDMA";
 /// The engines' loopback port range, `start-end`, for either role.
 pub const ENGINE_PORTS_ENV: &str = "CAPYCTL_ENGINE_PORTS";
 /// The standalone-only name [`ENGINE_PORTS_ENV`] replaces. Still read, after
@@ -80,6 +89,10 @@ pub struct EngineOverrides {
     pub runtime_dir: Option<PathBuf>,
     pub engine_ports: Option<(u16, u16)>,
     pub cuda_home: Option<PathBuf>,
+    /// ADR 0028 §3: the host's group policy.
+    pub peer_address: Option<std::net::IpAddr>,
+    pub rendezvous_ports: Option<(u16, u16)>,
+    pub require_rdma: Option<bool>,
 }
 
 impl EngineOverrides {
@@ -98,6 +111,9 @@ impl EngineOverrides {
             runtime_dir: self.runtime_dir.or(lower.runtime_dir),
             engine_ports: self.engine_ports.or(lower.engine_ports),
             cuda_home: self.cuda_home.or(lower.cuda_home),
+            peer_address: self.peer_address.or(lower.peer_address),
+            rendezvous_ports: self.rendezvous_ports.or(lower.rendezvous_ports),
+            require_rdma: self.require_rdma.or(lower.require_rdma),
         }
     }
 
@@ -152,6 +168,15 @@ impl EngineOverrides {
                             )
                         })
                 })
+                .transpose()?,
+            peer_address: text(PEER_ADDRESS_ENV)
+                .map(|value| crate::groups_policy::peer_address(PEER_ADDRESS_ENV, &value))
+                .transpose()?,
+            rendezvous_ports: get(RENDEZVOUS_PORTS_ENV)
+                .map(|value| port_range(RENDEZVOUS_PORTS_ENV, &value))
+                .transpose()?,
+            require_rdma: text(REQUIRE_RDMA_ENV)
+                .map(|value| boolean(REQUIRE_RDMA_ENV, &value))
                 .transpose()?,
         })
     }
@@ -233,7 +258,11 @@ impl EngineOverrides {
                 Some(checked_range(path, start, end)?)
             }
         };
+        let groups = crate::groups_policy::stated_groups(block)?;
         Ok(Self {
+            peer_address: groups.peer_address,
+            rendezvous_ports: groups.rendezvous_ports,
+            require_rdma: groups.require_rdma,
             vllm: path_of(local.get("vllm"), "local_engine.vllm")?,
             sglang: path_of(local.get("sglang"), "local_engine.sglang")?,
             tensorfold: path_of(local.get("tensorfold"), "local_engine.tensorfold")?,
@@ -390,6 +419,11 @@ pub struct EngineSettings {
     /// Stated, or `None`: the engine PATH stays minimal (nothing is detected
     /// for the role's own installation; `capyctl engine add` detects one).
     pub cuda_home: Option<PathBuf>,
+    /// ADR 0028 §3: stated, or `None` (no peer address; the default range;
+    /// RDMA not required).
+    pub peer_address: Option<std::net::IpAddr>,
+    pub rendezvous_ports: Option<(u16, u16)>,
+    pub require_rdma: Option<bool>,
 }
 
 /// Owner rule 2026-09-25: CLI flag > environment > YAML > default, setting by
@@ -413,6 +447,9 @@ pub fn resolve(
         runtime_dir: merged.runtime_dir,
         engine_ports: merged.engine_ports,
         cuda_home: merged.cuda_home,
+        peer_address: merged.peer_address,
+        rendezvous_ports: merged.rendezvous_ports,
+        require_rdma: merged.require_rdma,
     }
 }
 
@@ -494,6 +531,30 @@ pub fn apply_to_host_with(
             .entry("resource_policy")
             .or_insert_with(|| Value::Object(Map::new()));
         policy["endpoint_port_range"] = json!({"start": start, "end": end});
+    }
+    // ADR 0028 §3: only a stated setting is written, so a host that states no
+    // group policy publishes no `groups` block and keeps its policy digest.
+    if settings.peer_address.is_some()
+        || settings.rendezvous_ports.is_some()
+        || settings.require_rdma.is_some()
+    {
+        let policy = object
+            .entry("resource_policy")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let groups = policy
+            .as_object_mut()
+            .ok_or_else(|| refuse("resource_policy", "must be a mapping"))?
+            .entry("groups")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(address) = settings.peer_address {
+            groups["peer_address"] = json!(address.to_string());
+        }
+        if let Some((start, end)) = settings.rendezvous_ports {
+            groups["rendezvous_port_range"] = json!({"start": start, "end": end});
+        }
+        if let Some(required) = settings.require_rdma {
+            groups["require_rdma"] = json!(required);
+        }
     }
     let installations = settings.installations();
     if installations.is_empty() {
@@ -599,6 +660,20 @@ pub fn carry_start_settings(running: &Value, reloaded: &mut Value) {
         }
         (None, Some(Value::Object(policy))) => {
             policy.remove("endpoint_port_range");
+        }
+        (None, _) => {}
+    }
+    // ADR 0028 §3: the group policy is a start setting too.
+    let running_groups = running
+        .get("resource_policy")
+        .and_then(|policy| policy.get("groups"));
+    match (running_groups, object.get_mut("resource_policy")) {
+        (Some(groups), Some(policy)) => policy["groups"] = groups.clone(),
+        (Some(groups), None) => {
+            object.insert("resource_policy".into(), json!({"groups": groups}));
+        }
+        (None, Some(Value::Object(policy))) => {
+            policy.remove("groups");
         }
         (None, _) => {}
     }

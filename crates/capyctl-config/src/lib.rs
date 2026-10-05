@@ -15,6 +15,8 @@ pub mod engine_policy;
 pub mod engine_settings;
 pub mod error;
 pub mod group_support;
+// ADR 0028 §3: a host's group policy (peer address, rendezvous ports, require_rdma).
+pub mod groups_policy;
 pub mod instances;
 // ADR 0019, design §9: the one-time move of the old loopback inference bind.
 // ADR 0008: declared model sources and the host's model-source policy.

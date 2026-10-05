@@ -735,6 +735,13 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             "9000-9099",
             "--cuda-home",
             "/usr/local/cuda-13.0",
+            // T14: ADR 0028 §3 group policy flags, on both roles.
+            "--peer-address",
+            "192.0.2.10",
+            "--rendezvous-ports",
+            "26000-26009",
+            "--require-rdma",
+            "true",
             "--model-sources-path",
             "/data/downloads",
             "--hf-endpoint",
@@ -760,6 +767,9 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
                 runtime_dir: Some("/opt/capyctl/runtime".into()),
                 engine_ports: Some((9000, 9099)),
                 cuda_home: Some("/usr/local/cuda-13.0".into()),
+                peer_address: Some("192.0.2.10".parse().unwrap()),
+                rendezvous_ports: Some((26000, 26009)),
+                require_rdma: Some(true),
             }
         );
         assert_eq!(
@@ -775,6 +785,10 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             ("--trust-remote-code", "yes"),
             ("--installation-drift", "ignore"),
             ("--engine-ports", "80-90"),
+            ("--peer-address", "127.0.0.1"),
+            ("--peer-address", "0.0.0.0"),
+            ("--rendezvous-ports", "26009-26000"),
+            ("--require-rdma", "maybe"),
             ("--hf-endpoint", "http://mirror.example"),
         ] {
             assert!(
