@@ -213,6 +213,8 @@ fn spec(engine: Engine) -> ProfileSpec {
         cuda_home: None,
         approved_options: vec![],
         approved_paths: vec![],
+        env: Default::default(),
+        approved_env: vec![],
     }
 }
 
@@ -574,4 +576,52 @@ fn a_known_engine_kind_is_still_validated_strictly() {
             "a broken profile is still refused: {broken}"
         );
     }
+}
+
+// T14: engine add --env/--approve-env are saved in the profile and checked like YAML.
+#[test]
+fn profile_document_saves_env_and_approvals() {
+    let mut spec = spec(Engine::Vllm);
+    spec.env = std::collections::BTreeMap::from([(
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING".to_owned(),
+        "1".to_owned(),
+    )]);
+    spec.approved_env = vec!["MBX_*".into()];
+    let doc = profile_document(&spec);
+    assert_eq!(doc["env"]["TORCH_NCCL_ASYNC_ERROR_HANDLING"], "1");
+    assert_eq!(
+        doc["security"]["approved_env"],
+        serde_json::json!(["MBX_*"])
+    );
+    check_profile("p", &doc).unwrap();
+    spec.env.insert("NCCL_DEBUG".into(), "INFO".into());
+    let refused = check_profile("p", &profile_document(&spec)).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("engine_env_reserved:NCCL_DEBUG"),
+        "{refused}"
+    );
+}
+
+// T39: a profile added without the flags is written exactly as before.
+#[test]
+fn profile_without_flags_is_unchanged() {
+    // Frozen copy of the document written before the env fields existed.
+    let before = serde_json::json!({
+        "engine": "vllm",
+        "revision": 1,
+        "executable": "/home/u/venv/bin/vllm",
+        "build_fingerprint": "0.29.0",
+        "args": [],
+        "env": {},
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+        "security": {
+            "deep_park": "enabled",
+            "trust_remote_code": false,
+            "credential_ref": "secret://engine-key",
+            "admin_credential_ref": "secret://admin-key",
+        },
+    });
+    assert_eq!(profile_document(&spec(Engine::Vllm)), before);
 }

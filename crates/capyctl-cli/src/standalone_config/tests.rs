@@ -1197,6 +1197,8 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             cuda_home: None,
             approved_options: vec![],
             approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
         },
     );
     [("vllm-patched".to_string(), profile)]
@@ -1980,6 +1982,8 @@ fn drafter_profile(options: &[&str], paths: &[&str]) -> serde_json::Value {
         cuda_home: None,
         approved_options: options.iter().map(|o| o.to_string()).collect(),
         approved_paths: paths.iter().map(|p| p.to_string()).collect(),
+        env: Default::default(),
+        approved_env: vec![],
     })
 }
 

@@ -434,6 +434,7 @@ mod tests {
             wait,
             revision: None,
             hf_endpoint: None,
+            engine_env: vec![],
         }
     }
 
@@ -545,6 +546,8 @@ mod tests {
             args: vec![],
             approved_options: vec![],
             approved_paths: vec![],
+            env: vec![],
+            approved_env: vec![],
         };
         let value = json!({"profile": "vllm", "engine": "vllm", "version": "0.29.0", "executable": "/v/bin/vllm",
             "deep_park": "enabled", "cuda_home": "/usr/local/cuda", "engines_file": "/c/engines.yaml",
@@ -679,6 +682,8 @@ mod tests {
                 args: vec![],
                 approved_options: vec![],
                 approved_paths: vec![],
+                env: vec![],
+                approved_env: vec![],
             },
             Command::EngineList,
             Command::EngineRemove {

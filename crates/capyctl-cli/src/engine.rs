@@ -11,12 +11,14 @@ use capyctl_agent::engines::{
     check_version, detect, resolve, Resolved, ScanBounds, ScanRoots, VERSION_CHECK_TIMEOUT,
 };
 use capyctl_config::effective::InstallationDrift;
+use capyctl_config::engine_env::{is_owned, ApprovedEnv, EnvRefusal};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::registration::{
     check_profile, lock_engines_for, profile_document, valid_profile_name, write_engines,
     EnginesFile, ProfileSpec, ENVIRONMENT_PROFILES,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -98,7 +100,12 @@ pub async fn execute_with(
             args,
             approved_options,
             approved_paths,
+            env: env_flags,
+            approved_env,
         } => {
+            // ADR 0028 §2.1: refused before anything runs or is written.
+            let (profile_env, approved_env) = engine_add_env(env_flags, approved_env, env)
+                .map_err(|r| error("invalid_config", r.code()))?;
             let target = resolve_target(config, state_dir, env)?;
             add(
                 &target,
@@ -110,6 +117,8 @@ pub async fn execute_with(
                     args,
                     options: approved_options,
                     paths: approved_paths,
+                    env: profile_env,
+                    approved_env,
                 },
                 Toolchain {
                     cuda_home_env: env("CUDA_HOME"),
@@ -311,6 +320,44 @@ struct Extras<'a> {
     args: &'a [String],
     options: &'a [String],
     paths: &'a [PathBuf],
+    /// ADR 0028 §2.1: `--env` and `--approve-env`, merged with their variables.
+    env: BTreeMap<String, String>,
+    approved_env: Vec<String>,
+}
+
+/// ADR 0028 §2.1 and R9: `--env` with `CAPYCTL_ENGINE_ADD_ENV`, `--approve-env`
+/// with `CAPYCTL_APPROVE_ENV`. A flag beats the variable for one name; a name
+/// given twice by flag is a conflict. An owned name or a malformed approval is
+/// refused here, before anything runs.
+pub fn engine_add_env(
+    flags: &[(String, String)],
+    approvals: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(BTreeMap<String, String>, Vec<String>), EnvRefusal> {
+    let entries =
+        crate::client::engine_env_with_channels(flags, env("CAPYCTL_ENGINE_ADD_ENV").as_deref())?;
+    let mut profile_env = BTreeMap::new();
+    for (name, value) in entries {
+        if is_owned(&name) {
+            return Err(EnvRefusal::Reserved(name));
+        }
+        if profile_env.insert(name.clone(), value).is_some() {
+            return Err(EnvRefusal::Conflict(name));
+        }
+    }
+    let mut approved = approvals.to_vec();
+    for glob in env("CAPYCTL_APPROVE_ENV")
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|glob| !glob.is_empty())
+    {
+        if !approved.iter().any(|seen| seen == glob) {
+            approved.push(glob.to_owned());
+        }
+    }
+    ApprovedEnv::parse(&approved)?;
+    Ok((profile_env, approved))
 }
 
 /// Where `engine add` looks for TensorFold's build toolchain.
@@ -420,6 +467,8 @@ async fn add(
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
         args: extras.args.to_vec(),
+        env: extras.env.clone(),
+        approved_env: extras.approved_env.clone(),
         cuda_home,
         approved_options: extras.options.to_vec(),
         approved_paths: extras

@@ -108,6 +108,9 @@ pub enum Command {
         /// Owner rule 2026-09-25: `--hf-endpoint`, the endpoint an unpinned
         /// `hf:` reference is pinned against.
         hf_endpoint: Option<String>,
+        /// ADR 0028 §2.1: `--engine-env K=V` entries, merged into the
+        /// document's `engine_config.env` before submission.
+        engine_env: Vec<(String, String)>,
     },
     Status {
         deployment: String,
@@ -182,6 +185,10 @@ pub enum Command {
         /// ADR 0014 §8: `security.approved_options` and `approved_paths`.
         approved_options: Vec<String>,
         approved_paths: Vec<PathBuf>,
+        /// ADR 0028 §2.1: `--env K=V`, the profile's own engine environment.
+        env: Vec<(String, String)>,
+        /// ADR 0028 §2.1: `--approve-env GLOB`, `security.approved_env`.
+        approved_env: Vec<String>,
     },
     /// ADR 0018 §1: this machine's runtime profiles.
     EngineList,
@@ -491,6 +498,17 @@ enum EngineArgs {
         /// security.approved_paths.
         #[arg(long = "approve-path", value_name = "DIR")]
         approved_paths: Vec<PathBuf>,
+        /// An engine environment variable every launch with this profile sets
+        /// (repeatable). Also read from CAPYCTL_ENGINE_ADD_ENV (`K=V;K=V`); a
+        /// flag wins over it. Shown in status; not secret storage.
+        #[arg(long = "env", value_name = "K=V", value_parser = parse_env_flag)]
+        env: Vec<(String, String)>,
+        /// A name, or a name ending in `*`, deployments may set in
+        /// engine_config.env, such as MBX_* (repeatable). Written as
+        /// security.approved_env. Also read from CAPYCTL_APPROVE_ENV
+        /// (`GLOB;GLOB`).
+        #[arg(long = "approve-env", value_name = "GLOB")]
+        approved_env: Vec<String>,
     },
     /// This machine's runtime profiles and whether the server accepted them.
     List,
@@ -898,6 +916,13 @@ enum DeployArgs {
         /// model_sources.huggingface_endpoint.
         #[arg(long, value_name = "URL")]
         hf_endpoint: Option<String>,
+        /// An engine environment variable for this deployment, saved under
+        /// engine_config.env (repeatable). Its name must match the profile's
+        /// approved environment. Also read from CAPYCTL_ENGINE_ENV
+        /// (`K=V;K=V`); a flag wins over it. Shown in status; not secret
+        /// storage.
+        #[arg(long = "engine-env", value_name = "K=V", value_parser = parse_env_flag)]
+        engine_env: Vec<(String, String)>,
     },
 }
 
@@ -1030,6 +1055,7 @@ impl From<CliCommand> for Command {
                     wait,
                     revision,
                     hf_endpoint,
+                    engine_env,
                     ..
                 } => Command::Deploy {
                     file,
@@ -1037,6 +1063,7 @@ impl From<CliCommand> for Command {
                     wait,
                     revision,
                     hf_endpoint,
+                    engine_env,
                 },
             },
             CliCommand::Status { resource } => match resource {
@@ -1109,6 +1136,8 @@ impl From<CliCommand> for Command {
                     args,
                     approved_options,
                     approved_paths,
+                    env,
+                    approved_env,
                 } => Command::EngineAdd {
                     path,
                     name,
@@ -1117,6 +1146,8 @@ impl From<CliCommand> for Command {
                     args,
                     approved_options,
                     approved_paths,
+                    env,
+                    approved_env,
                 },
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },
@@ -1426,6 +1457,15 @@ fn parse_model_sources_path(text: &str) -> Result<PathBuf, String> {
 }
 
 /// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
+/// ADR 0028 §2.1: `K=V`, split on the first `=`. A missing `=` or an empty
+/// name is a usage error; the name itself is checked when the entry is merged.
+pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
+        _ => Err(format!("`{raw}` must be NAME=VALUE with a non-empty name")),
+    }
+}
+
 fn parse_hf_endpoint(text: &str) -> Result<String, String> {
     capyctl_config::model_settings::hf_endpoint("--hf-endpoint", text).map_err(|error| error.detail)
 }

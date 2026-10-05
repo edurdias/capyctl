@@ -8,6 +8,7 @@ use crate::effective::InstallationDrift;
 use crate::engine_policy::Engine;
 use crate::{parse_strict, ConfigError, ConfigErrorCode, ConfigKind};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -418,6 +419,12 @@ pub struct ProfileSpec {
     /// ADR 0014 §8: the directories an approved path option may name
     /// (`--approve-path`), written as `security.approved_paths`.
     pub approved_paths: Vec<String>,
+    /// ADR 0028 §2.1: the profile's own engine environment (`--env`), written
+    /// as `env`. Checked like YAML by [`check_profile`].
+    pub env: BTreeMap<String, String>,
+    /// ADR 0028 §2.1: the names and globs deployments may set
+    /// (`--approve-env`), written as `security.approved_env`.
+    pub approved_env: Vec<String>,
 }
 
 /// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
@@ -484,13 +491,17 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
         security["installation_drift"] = "refuse".into();
     }
     put_approvals(&mut security, &spec.approved_options, &spec.approved_paths);
+    // ADR 0028 §2.1: stated only when non-empty, so a default profile is unchanged.
+    if !spec.approved_env.is_empty() {
+        security["approved_env"] = serde_json::json!(spec.approved_env);
+    }
     let mut profile = serde_json::json!({
         "engine": spec.engine.name(),
         "revision": 1,
         "executable": spec.executable.to_string_lossy(),
         "build_fingerprint": spec.build_fingerprint,
         "args": spec.args,
-        "env": {},
+        "env": spec.env,
         "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
         "security": security,
     });

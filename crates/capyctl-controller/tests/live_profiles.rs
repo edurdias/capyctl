@@ -269,6 +269,8 @@ fn with_vllm(host: &str) -> pb::ReportInventory {
             cuda_home: None,
             approved_options: vec![],
             approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
         },
     );
     inventory.approved_host_config_json = document.to_string();
