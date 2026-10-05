@@ -1184,6 +1184,7 @@ pub fn resolve_effective_with_checkpoint(
                 Some(_) => None,
                 None => device_sizing,
             },
+            domain_limit: core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
         },
     )?;
     {

@@ -34,6 +34,10 @@ pub const CHECKPOINT_DIGEST: &str = "checkpoint_digest";
 pub const CHECKPOINT_SIZE_ONLY: &str = "checkpoint_size_only";
 /// Owner decision 2026-09-23: a LaunchSingle plan's `startup_bytes`.
 pub const STARTUP_BYTES: &str = "startup_bytes";
+/// ADR 0014 amendment A16: a LaunchSingle plan's
+/// `checkpoint_state_slot_bytes` (and `CheckpointDigestEvidence.state_slot_bytes`
+/// from the host).
+pub const CHECKPOINT_STATE_SLOT: &str = "checkpoint_state_slot";
 /// ADR 0013 §5: a nonzero `CommandIdentity.instance_index`.
 pub const INSTANCE_INDEX: &str = "instance_index";
 /// ADR 0014 §7, owner decision 5 (2026-09-22): `ExecuteMember.restore_checkpoint_digest`.
@@ -105,6 +109,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (INSTALLATION_FINGERPRINT, Direction::HostToServer),
     (LIVE_PROFILE_UPDATE, Direction::ServerToHost),
     (DEVICE_MEMORY_DOMAINS, Direction::ServerToHost),
+    (CHECKPOINT_STATE_SLOT, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -165,6 +170,9 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
             if plan.startup_bytes.is_some() {
                 needs.push(STARTUP_BYTES);
+            }
+            if plan.checkpoint_state_slot_bytes.is_some() {
+                needs.push(CHECKPOINT_STATE_SLOT);
             }
         }
         Some(Action::DigestCheckpoint(request)) => {

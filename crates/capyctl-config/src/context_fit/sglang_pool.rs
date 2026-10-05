@@ -327,17 +327,31 @@ pub fn sglang_pool(
         return Ok(pool);
     };
     let (margin, static_bytes) = static_pool_bytes(memory);
-    let room = u64::try_from(static_bytes)
-        .unwrap_or(0)
-        .saturating_sub(weights.saturating_add(kv));
     let need = |running: u32| state_bytes(u64::from(running), hybrid.state_bytes, draft_tokens);
     // Owner decision 2026-10-03: a request CapyCTL derived (weights + KV +
-    // margin, nothing for the state) fits what it can, the state taking up to
-    // half of the margin on unified memory; the other half stays for SGLang's
-    // runtime outside its static pool. An explicit request is strict.
+    // margin) fits what it can, the state taking up to half of the margin on
+    // unified memory; the other half stays for SGLang's runtime outside its
+    // static pool. An explicit request is strict.
     let derived = derived_request(settings, weights);
+    // Amendment A16: a derived request holds the state it reserved. On a
+    // discrete device the static pool (the request less a tenth of its
+    // weights share) may fall short of it by the whole-percent rounding.
+    let reserved = if derived {
+        memory
+            .state_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let room = u64::try_from(static_bytes)
+        .unwrap_or(0)
+        .saturating_sub(weights.saturating_add(kv))
+        .max(reserved);
     let discrete = memory.device_total_bytes.is_some();
-    let borrowable = if derived && !discrete {
+    // Amendment A16: a request that holds its state lends nothing more.
+    let lends = derived && reserved == 0;
+    let borrowable = if lends && !discrete {
         u64::try_from(margin / 2).unwrap_or(0)
     } else {
         0
@@ -348,7 +362,7 @@ pub fn sglang_pool(
     // refused. CapyCTL chose that KV cache too: the state takes up to half of
     // it, and the KV pool (and the fitted context) holds what is left. A
     // declared `max_total_tokens` is the deployment's own pool and keeps it.
-    let from_kv = if derived && discrete && settings.max_total_tokens.is_none() {
+    let from_kv = if lends && discrete && settings.max_total_tokens.is_none() {
         kv / 2
     } else {
         0
@@ -477,24 +491,93 @@ fn smallest_request(memory: &MemoryRequest, held: u64, needed: u64) -> Option<i6
     Some(fit)
 }
 
-/// The request was derived from the weights, so it holds nothing for a
-/// hybrid model's state: weights + KV + margin, or on a discrete device the
-/// weights x 1.10 + KV (discrete GPU design §3).
+/// The request was derived from the weights: weights + KV + margin, or on a
+/// discrete device the weights x 1.10 + KV (discrete GPU design §3), plus the
+/// state it reserved (amendment A16), if any.
 fn derived_request(settings: &SglangLaunchSettings, weights: u64) -> bool {
     let memory = &settings.memory;
-    let kv = u64::try_from(memory.kv_cache_bytes).unwrap_or(0);
-    let derived = if memory.device_total_bytes.is_some() {
-        (weights / 100)
-            .checked_mul(110)
-            .and_then(|scaled| scaled.checked_add(kv))
-    } else {
-        weights
-            .checked_add(kv)
-            .and_then(|sum| sum.checked_add(u64::try_from(memory.margin_bytes).ok()?))
-    };
+    let derived = i64::try_from(weights).ok().and_then(|weights| {
+        derived_request_bytes(
+            weights,
+            memory.kv_cache_bytes,
+            memory.margin_bytes,
+            memory.state_bytes.unwrap_or(0),
+            memory.device_total_bytes.is_some(),
+        )
+    });
     settings.provenance.get("memory.request")
         == Some(&capyctl_domain::launch::SettingSource::Derived)
-        && u64::try_from(memory.request_bytes).ok() == derived
+        && Some(memory.request_bytes) == derived
+}
+
+/// ADR 0014 amendment A16: one request slot of SGLang's recurrent state for
+/// the checkpoint at `checkpoint_root` (`config.json`), as a launch with
+/// `args` sizes it (`--mamba-ssm-dtype`); `None` for any other shape or an
+/// unreadable configuration. The host that measures the checkpoint records
+/// it beside the weights, so resolution, which reads no checkpoint file, can
+/// size a derived request for the state.
+pub fn sglang_state_slot_bytes(checkpoint_root: &Path, args: &[String]) -> Option<i64> {
+    let config = read_model_config(checkpoint_root).ok()?;
+    let (_, ssm_dtype) = option_value(args, "--mamba-ssm-dtype");
+    let hybrid = gated_delta_hybrid(&config, ssm_dtype.as_deref())?;
+    i64::try_from(hybrid.state_bytes)
+        .ok()
+        .filter(|bytes| *bytes > 0)
+}
+
+/// ADR 0014 amendment A16: the state a derived request reserves, for `slot`
+/// bytes a slot: that of the most running requests, up to the declared count
+/// (or CapyCTL's in-flight bound), whose request still `fits`. `None` when
+/// none fits, when the arguments size the state pool themselves, or with
+/// speculative decoding and no draft-token count: the launch then sizes the
+/// state as before.
+pub(crate) fn derived_state_reserve(
+    slot: u64,
+    args: &[String],
+    declared: Option<u32>,
+    fits: impl Fn(u64) -> bool,
+) -> Option<u64> {
+    if ["--max-mamba-cache-size", "--mamba-full-memory-ratio"]
+        .iter()
+        .any(|option| option_value(args, option).0)
+    {
+        return None;
+    }
+    let draft_tokens = if option_value(args, "--speculative-algorithm").0 {
+        option_value(args, "--speculative-num-draft-tokens")
+            .1?
+            .parse::<u64>()
+            .ok()?
+    } else {
+        0
+    };
+    (1..=declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT))
+        .rev()
+        .filter_map(|running| state_bytes(u64::from(running), slot, draft_tokens))
+        .find(|bytes| fits(*bytes))
+}
+
+/// The memory request CapyCTL derives for `weights`, the KV cache, the
+/// margin and `state` bytes of recurrent state (amendment A16, zero for
+/// none): weights + KV + margin + state, or on a discrete device (weights +
+/// state) x 1.10 + KV (discrete GPU design §3).
+pub(crate) fn derived_request_bytes(
+    weights: i64,
+    kv: i64,
+    margin: i64,
+    state: i64,
+    discrete: bool,
+) -> Option<i64> {
+    if discrete {
+        (weights.checked_add(state)? / 100)
+            .checked_mul(110)?
+            .checked_add(kv)
+    } else {
+        weights
+            .checked_add(kv)?
+            .checked_add(margin)?
+            .checked_add(state)
+    }
 }
 
 fn state_slots(running: u32) -> Option<u32> {

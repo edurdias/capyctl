@@ -516,6 +516,7 @@ impl NativeHostExecution {
         // resolved this revision with, so both sides derive the same request.
         let facts = capyctl_config::effective::CheckpointFacts {
             weights_bytes: plan.checkpoint_weights_bytes,
+            state_slot_bytes: plan.checkpoint_state_slot_bytes,
             ..Default::default()
         };
         let mut effective =
@@ -616,6 +617,12 @@ impl NativeHostExecution {
         {
             return Err(CheckpointError::Mismatch);
         }
+        // ADR 0014 amendment A16: likewise the hybrid state slot it reads.
+        if plan.checkpoint_state_slot_bytes.is_some()
+            && plan.checkpoint_state_slot_bytes != effective.state_slot_bytes()
+        {
+            return Err(CheckpointError::Mismatch);
+        }
         Ok(())
     }
 
@@ -671,12 +678,14 @@ impl NativeHostExecution {
                         checkpoints.measure(&location.model_store, &location.checkpoint)?;
                     let weights =
                         with_drafter(&checkpoints, &location, verified.manifest.weights_bytes)?;
-                    Ok::<_, CheckpointError>((verified, weights))
+                    // ADR 0014 amendment A16: the hybrid state slot, beside
+                    // the weights, from the checkpoint's configuration.
+                    Ok::<_, CheckpointError>((verified, weights, location.state_slot_bytes()))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok((verified, weights_bytes)) => {
+                    Ok((verified, weights_bytes, state_slot_bytes)) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -690,6 +699,7 @@ impl NativeHostExecution {
                             total_bytes: manifest.total_bytes,
                             reason: String::new(),
                             full_rehash: verified.full_rehash,
+                            state_slot_bytes,
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -2077,6 +2087,7 @@ mod tests {
                 coordinator_session_id: "01K00000000000000000000004".into(),
                 checkpoint_digest: String::new(),
                 checkpoint_weights_bytes: None,
+                checkpoint_state_slot_bytes: None,
                 startup_bytes: None,
             }),
         };
@@ -2221,6 +2232,7 @@ mod tests {
             coordinator_session_id: "01K00000000000000000000004".into(),
             checkpoint_digest: digest.into(),
             checkpoint_weights_bytes: None,
+            checkpoint_state_slot_bytes: None,
             startup_bytes: None,
         };
         let command = MemberCommand {
@@ -2263,6 +2275,7 @@ mod tests {
         // Weights the server did not resolve with are refused as well.
         let weighed = SingleLaunchPlan {
             checkpoint_weights_bytes: Some(1),
+            checkpoint_state_slot_bytes: None,
             startup_bytes: None,
             ..plan.clone()
         };
@@ -2276,6 +2289,15 @@ mod tests {
             executor
                 .verify_checkpoint(&effective, &weighed)
                 .unwrap_err(),
+            CheckpointError::Mismatch
+        );
+        // ADR 0014 amendment A16: so is a state slot this host does not read.
+        let stated = SingleLaunchPlan {
+            checkpoint_state_slot_bytes: Some(1),
+            ..plan.clone()
+        };
+        assert_eq!(
+            executor.verify_checkpoint(&effective, &stated).unwrap_err(),
             CheckpointError::Mismatch
         );
         // Pre-WE3 plan: adoptable, never launched, and woken only against the
@@ -2474,6 +2496,7 @@ mod tests {
             let (launch, plan) = launch_with(&deployment, &policy, &recorded);
             let plan = SingleLaunchPlan {
                 checkpoint_weights_bytes: Some(weights),
+                checkpoint_state_slot_bytes: None,
                 ..plan
             };
             let launch = MemberCommand {
@@ -2524,6 +2547,8 @@ mod tests {
         assert_eq!(computed.weights_bytes, 7);
         assert_eq!(computed.file_count, 2);
         assert!(computed.full_rehash);
+        // ADR 0014 amendment A16: no hybrid state slot for a vLLM launch.
+        assert_eq!(computed.state_slot_bytes, None);
         // Owner decision 2026-09-23 (solo first start): a size-only request
         // sizes the weight files with the same confined walk and hashes nothing.
         let mut sizing = digest(&deployment, &policy, None);

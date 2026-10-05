@@ -217,3 +217,43 @@ fn a_checkpoint_location_names_the_draft_model_it_loads_beside() {
     );
     assert_eq!(located("vllm", json!([])), None);
 }
+
+// ADR 0014 amendment A16: the host that measures an SGLang deployment's
+// checkpoint also reads its hybrid state slot from `config.json`, with the
+// launch's arguments; another engine, or a model without the state, has none.
+#[test]
+fn a_checkpoint_location_reads_the_hybrid_state_slot_for_sglang() {
+    let store = tempfile::tempdir().unwrap();
+    std::fs::create_dir(store.path().join("toy")).unwrap();
+    let mut types = Vec::new();
+    for _ in 0..8 {
+        types.extend(["linear_attention", "linear_attention", "linear_attention"]);
+        types.push("full_attention");
+    }
+    let config = json!({"model_type": "qwen3_5", "text_config": {
+        "num_hidden_layers": 32, "num_key_value_heads": 4, "head_dim": 256,
+        "layer_types": types, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+    }});
+    std::fs::write(store.path().join("toy/config.json"), config.to_string()).unwrap();
+    let located = |engine: &str, args: Value| {
+        let (mut deployment, mut host) = fixture();
+        host["model_store"]["path"] = json!(store.path());
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = json!(engine);
+        profile["args"] = json!([]);
+        deployment["model"]["path"] = json!("toy");
+        deployment["engine_config"]["accept_extra_args"] = json!(true);
+        deployment["engine_config"]["extra_args"] = args;
+        checkpoint_location(&deployment, &host)
+            .unwrap()
+            .state_slot_bytes()
+    };
+    // FrogNano-4B: 24 x (8192 x 3 x 2 + 32 x 128 x 128 x 4).
+    assert_eq!(located("sglang", json!([])), Some(51_511_296));
+    assert_eq!(
+        located("sglang", json!(["--mamba-ssm-dtype", "bfloat16"])),
+        Some(24 * (49_152 + 1_048_576))
+    );
+    assert_eq!(located("vllm", json!([])), None);
+}

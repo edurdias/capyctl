@@ -111,8 +111,10 @@ the KV cache and that state. With a `memory.request` you state, CapyCTL runs
 your `max_concurrent_requests` (or as many as fit, up to 32) and refuses to start
 when they do not fit, naming the memory request they need: Qwen3.8-27B with
 DFlash2, a 16 GiB KV cache and 8 requests needs about 65 GiB. Without one,
-CapyCTL runs as many requests as fit and `capyctl status deployment` says
-"Running limited to N requests by the state cache".
+CapyCTL adds that state to the memory request it derives, for your
+`max_concurrent_requests` (or 32), as far as the GPU or the memory pool holds
+it, and `capyctl status deployment` says "Running limited to N requests by the
+state cache" when it holds fewer.
 
 ## TensorFold
 

@@ -178,6 +178,7 @@ fn a_revision_frozen_before_the_budget_still_decodes_with_its_request() {
         &host,
         CheckpointFacts {
             weights_bytes: Some(30 * GIB),
+            state_slot_bytes: None,
             legacy_startup: true,
             legacy_overhead: true,
             legacy_startup_graphs: true,

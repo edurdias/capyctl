@@ -299,11 +299,23 @@ pub(super) fn declared_engine_config(
                 .ok_or_else(|| invalid("snapshot.engine_config", "weights_bytes invalid"))?,
         ),
     };
+    // ADR 0014 amendment A16: the state slot the host measured beside the
+    // weights; a revision without it keeps its sizing.
+    let state_slot_bytes = match memory.get("state_slot_bytes") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| invalid("snapshot.engine_config", "state_slot_bytes invalid"))?,
+        ),
+    };
     Ok((
         Value::Object(block),
         provenance.contains_key("resources"),
         CheckpointFacts {
             weights_bytes,
+            state_slot_bytes,
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),

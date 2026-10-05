@@ -173,6 +173,8 @@ fn frozen(endpoint: String) -> NativeLaunch {
                 device_total_bytes: None,
                 overhead_bytes: None,
                 startup_graphs_bytes: None,
+                state_slot_bytes: None,
+                state_bytes: None,
             },
             max_total_tokens: None,
             max_mamba_cache_size: None,
