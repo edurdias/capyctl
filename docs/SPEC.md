@@ -470,6 +470,10 @@ A designated lead agent invokes each engine-level collective operation through t
 
 If one member fails, coordinate recovery according to the engine recipe; otherwise restart the full group. Autonomous rank replacement is not assumed safe. A disconnected worker can still be consuming memory; lease expiry never makes it free. Keep reservations quarantined until reconnection/reconciliation or explicit fencing establishes cleanup.
 
+> **Amended by [ADR 0028](design/adr/0028-multi-node-engine-groups.md)** (owner decisions 2026-09-25 and 2026-10-05).
+
+Groups run on named hosts in rank order, the first host being the head (the only member that serves HTTP), for vLLM, SGLang and TensorFold. Each member is reserved and settles on its own host's evidence only; the group is READY on the head's readiness check, and a post-wake canary guards deep park and wake (ADR 0028 §5, §9, §11, §12).
+
 ## 12. KV-cache integration and data lifetime
 
 Model parking reduces inactive weight residency. Persistent KV caching can preserve reusable computation. Neither promises that every live block, active attention state, or entire conversation survives a switch.
@@ -609,6 +613,10 @@ The engines file is CapyCTL-owned operational state, not administrator YAML: Cap
 > **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
 
 CapyCTL never rewrites an administrator document. ADR 0019 had sanctioned a one-time migration of the old loopback inference default; it was removed before 0.1.0 (owner decision 2026-09-29), so a stated inference bind, loopback included, is always honoured as written.
+
+> **Amended by [ADR 0028](design/adr/0028-multi-node-engine-groups.md)** (owner decisions 2026-09-25 and 2026-10-05).
+
+A deployment gains `topology` (`tensor_parallel`, `pipeline_parallel`) with exact `placement.hosts`, and `engine_config.env` with `capyctl deploy --engine-env`. A host document gains `resource_policy.groups` (`peer_address`, `rendezvous_port_range`, `require_rdma`; flags `--peer-address`, `--rendezvous-ports`, `--require-rdma`; environment `CAPYCTL_PEER_ADDRESS`, `CAPYCTL_RENDEZVOUS_PORTS`, `CAPYCTL_REQUIRE_RDMA`). A profile gains `env` and `security.approved_env` (`capyctl engine add --env`, `--approve-env`).
 
 ### 15.2 No-config behavior
 
@@ -837,7 +845,7 @@ model:
 runtime_profile: sglang-patched
 placement:
   hosts: ["host-a", "host-b"]
-  head: host-a
+  # the first host is the head
 topology:
   tensor_parallel: 2
   pipeline_parallel: 1
@@ -868,7 +876,7 @@ kv_cache:
 
 The 6 GiB private host cache is included in each applicable phase total, not added again. Its actual retention must fit the parked budget or parking fails/requires reclamation. Disk namespaces survive according to retention policy and remain charged. `required` means an unsupported cache integration blocks this deployment, rather than silently changing semantics. This is a topology/resource example, not proof that any named model supports the chosen combination.
 
-This example is one instance whose engine group spans two hosts. Load-balanced instances are a different shape: `instances: 2` with `placement: {hosts: [host-a, host-b], strategy: spread, max_per_host: 1}` and a single-host topology runs two independent engine groups behind one route (ADR 0013). Multi-host group placement is not yet specified.
+This example is one instance whose engine group spans two hosts. Load-balanced instances are a different shape: `instances: 2` with `placement: {hosts: [host-a, host-b], strategy: spread, max_per_host: 1}` and a single-host topology runs two independent engine groups behind one route (ADR 0013). Group placement: ADR 0028.
 
 A shared-cache variant must reference a registered service identity instead of declaring independent full service allocations per deployment. Until a service/quota schema and backend tests exist, reject that variant clearly; do not implement fake shared quotas with per-client files. The unique-owner accounting contract is required from the foundation milestone even while additional backends are added later.
 
@@ -1006,6 +1014,8 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
 | T41 | TensorFold conformance | Detection reads metadata only; `engine add` refuses a missing toolchain on the closed PATH; launch arguments and reserved flags; readiness from `/health` and the model list; drain waits for `requests_running: 0` and `busy: false`, signals an exited, not listening or unanswering engine, and leaves one still answering busy unsignalled; `restart_only` park and wake; `deep` refused; a drafter repository id refused; `local_engine.tensorfold` three ways (ADR 0023). |
 
+Multi-node live rows MN1–MN9 (ADR 0028) supplement T16, T20, T22, T30–T32 on two hosts.
+
 The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a live-verified deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
 
 ## 21. Revision history and source boundary
@@ -1016,6 +1026,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
+- 2026-10-05, [ADR 0028](design/adr/0028-multi-node-engine-groups.md): multi-node engine groups for vLLM, SGLang and TensorFold (§11, §15, §16.4, §20).
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 - 2026-10-01, [ADR 0023](design/adr/0023-tensorfold-engine.md): TensorFold as the third engine, `restart_only`, registered with `engine add` (§1, §9.3, §9.4, T41).
 - 2026-10-01, [live follow-ups](specs/2026-10-01-live-followups-design.md): Hugging Face link chains (ADR 0014 A5), a role with no engine (§8, T02, ADR 0018 A2), upstream cancel on client hang-up (§10, T17).

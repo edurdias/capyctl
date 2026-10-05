@@ -52,9 +52,9 @@ placement and runtime identity.
 
 An instance is not a TP2 group member. A TP2 instance is one engine group spanning two
 hosts (SPEC §11); `instances: 2` of a TP1 recipe is two independent engine groups. The
-two compose: a TP2 deployment with `instances: 2` would need four host slots. TP2 stays
-parked; this ADR places single-host instances only and refuses a multi-host `topology`
-with a named error until group placement is designed.
+two compose: a TP2 deployment with `instances: 2` would need four host slots. This ADR
+places single-host instances only and refuses a multi-host `topology` with a named
+error; group placement is designed in ADR 0028, which lifts that refusal.
 
 ### 2. Deployment document
 
@@ -306,8 +306,8 @@ or derived request, never a sampled value.
    `max_parked` and aggregate residual budgets (SPEC §6.5) count instances, not
    deployments. A deployment with many instances can exhaust `max_parked` alone.
 7. **TP2 composition.** Group placement (k hosts per instance, rendezvous, rank
-   readiness) is deferred with the rest of TP2; the refusal in decision 1 must stay until
-   it is designed.
+   readiness) is designed in ADR 0028; the refusal in decision 1 stays until that
+   ADR is implemented.
 8. **Evidence.** None of this is qualified. Instance rows need live runs on both Sparks;
    CPU and Fake-engine tests only validate the logic.
 
@@ -363,3 +363,9 @@ claim at a time, the plan releases every launch occupying the host (decision 4
 `occupied`), and refuses the host while any occupant is not an eligible READY victim.
 
 Evidence: CPU and Fake-engine tests only; not live-verified.
+
+## Amendment 2026-10-05 — group placement (ADR 0028)
+
+Decision 1's refusal of a multi-host `topology` is replaced by ADR 0028: a group is one
+instance whose members run on exactly the hosts named in `placement.hosts`, head first,
+with `instances: 1`. Instances of a single-host recipe are unchanged.
