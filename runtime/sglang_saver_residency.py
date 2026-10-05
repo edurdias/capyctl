@@ -72,13 +72,23 @@ def server_arg(args, name):
     return values[name]
 
 
-def topology(scheduler):
-    """The recipe's single-rank topology, or BridgeError('topology')."""
+def topology(scheduler, weight_restore="disk_reload"):
+    """The recipe's single-rank topology, or BridgeError('topology').
+
+    ADR 0014 A16: speculative decoding (a named `speculative_algorithm`) is
+    admitted only for a `resident` launch. SGLang 0.5.21 releases the draft
+    model's weights with the target's and reloads every weight runner from the
+    target's checkpoint, so only a park that never releases the weights region
+    keeps the draft intact.
+    """
     try:
         args = saver._exact(saver._fields(scheduler).get("server_args"),
                             "sglang.srt.server_args", "ServerArgs")
         for name, value in _TOPOLOGY.items():
             current = server_arg(args, name)
+            if (name == "speculative_algorithm" and weight_restore == "resident"
+                    and type(current) is str and current != ""):
+                continue
             if type(current) is not type(value) or current != value:
                 raise BridgeError("topology")
     except BridgeError:

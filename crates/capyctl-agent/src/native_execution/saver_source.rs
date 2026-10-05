@@ -322,7 +322,14 @@ pub(super) struct SaverFacts {
 /// SPEC §9.2, T20: only a whole map is evidence. Missing pools, a tag partly
 /// mapped, or one tag resident while the other is released is partial evidence:
 /// unknown, which closes every action and leaves an effect uncertain.
-pub(super) fn saver_facts(mapped: &Result<SaverMapped, SaverUnavailable>) -> Option<SaverFacts> {
+///
+/// ADR 0014 amendment A16: a launch whose weights stay resident is released
+/// when its KV cache is unmapped and its weights are still fully mapped; for
+/// it, released weights are the partial map.
+pub(super) fn saver_facts(
+    mapped: &Result<SaverMapped, SaverUnavailable>,
+    resident_weights: bool,
+) -> Option<SaverFacts> {
     let mapped = mapped.as_ref().ok()?;
     if mapped.weight_virtual_bytes == 0
         || mapped.kv_virtual_bytes == 0
@@ -331,9 +338,14 @@ pub(super) fn saver_facts(mapped: &Result<SaverMapped, SaverUnavailable>) -> Opt
     {
         return None;
     }
-    let resident = mapped.weight_bytes == mapped.weight_virtual_bytes
-        && mapped.kv_bytes == mapped.kv_virtual_bytes;
-    let released = mapped.weight_bytes == 0 && mapped.kv_bytes == 0;
+    let weights_mapped = mapped.weight_bytes == mapped.weight_virtual_bytes;
+    let resident = weights_mapped && mapped.kv_bytes == mapped.kv_virtual_bytes;
+    let released = mapped.kv_bytes == 0
+        && if resident_weights {
+            weights_mapped
+        } else {
+            mapped.weight_bytes == 0
+        };
     (resident || released).then_some(SaverFacts {
         real_saver: mapped.real_saver,
         resident,
@@ -443,7 +455,7 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
             access.inference_key,
         )
         .await;
-        let facts = saver_facts(&mapped);
+        let facts = saver_facts(&mapped, access.resident_weights);
         let (weights, cache) = content(command.action)[usize::from(after)];
         Ok(SglangRuntimeObservation {
             token: c.token.clone(),
@@ -471,7 +483,9 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
             access.inference_key,
         )
         .await;
-        idle == Ok(true) && saver_facts(&mapped).is_some_and(|f| f.real_saver && f.resident)
+        idle == Ok(true)
+            && saver_facts(&mapped, access.resident_weights)
+                .is_some_and(|f| f.real_saver && f.resident)
     }
 
     fn observation_dir(&self) -> Option<PathBuf> {

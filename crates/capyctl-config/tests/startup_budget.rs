@@ -247,8 +247,8 @@ fn speculative(engine: &str, draft: bool) -> (Value, Value) {
                 "DFLASH"
             ]),
         };
-        // ADR 0014 amendment A15: SGLang does not park a speculative
-        // deployment, so it restarts.
+        // Pinned to restarting, as the A8 measurement ran (amendment A16 lets
+        // a speculative SGLang deployment park with its weights resident).
         if engine == "sglang" {
             deployment["residency"] = json!("restart_only");
         }

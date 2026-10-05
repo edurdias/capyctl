@@ -123,8 +123,9 @@ def _exact(value, module_name, class_name):
 
 
 # The launch's declared weight restore (sglang_entry: `cpu_backup` exactly when
-# the deployment is `host_backed`, else `disk_reload`).
-WEIGHT_RESTORES = ("disk_reload", "cpu_backup")
+# the deployment is `host_backed`; `resident` when its park keeps the weights
+# mapped, ADR 0014 A16; else `disk_reload`).
+WEIGHT_RESTORES = ("disk_reload", "cpu_backup", "resident")
 
 
 def check_values(values, weight_restore):

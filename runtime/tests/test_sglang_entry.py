@@ -380,6 +380,15 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         public = copy.deepcopy(self.public)
         public["settings"].update(cpu_weight_backup=True, weight_restore="cpu_backup")
         self.build(self.argv(public), self.payloads(public))
+        # ADR 0014 A16: resident weights need the memory saver and no backup.
+        public = copy.deepcopy(self.public)
+        public["settings"].update(weight_restore="resident")
+        self.build(self.argv(public), self.payloads(public))
+        for changed in (dict(memory_saver=False), dict(cpu_weight_backup=True)):
+            with self.subTest(changed=changed):
+                public = copy.deepcopy(self.public)
+                public["settings"].update(weight_restore="resident", **changed)
+                self.rejects(self.argv(public), self.payloads(public))
 
     # T26: discrete GPU design §6. The card's total rides the closed memory
     # object only on a discrete device, as a positive integer, and there the

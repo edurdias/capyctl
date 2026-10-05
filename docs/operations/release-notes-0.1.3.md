@@ -11,3 +11,10 @@ Unreleased.
   sum. The five phases are still accepted, and `capyctl validate config` shows
   what the short form stands for. See the TensorFold section of the
   [engines guide](../guide/engines.md).
+- **SGLang with speculative decoding parks again.** A deployment with
+  `--speculative-algorithm` in its arguments parks `deep` by default instead of
+  restarting: the park gives back the KV cache and keeps the weights, the
+  draft model's included, so a wake reloads nothing. It frees less than a
+  model without a draft model (the weights stay in memory), and the parked
+  charge is measured on the first park. `residency: host_backed` is still
+  refused for it; a deployment that states `restart_only` keeps restarting.

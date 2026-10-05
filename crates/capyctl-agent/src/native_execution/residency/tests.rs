@@ -39,6 +39,8 @@ struct Engine {
     busy: bool,
     /// The enrolled scheduler fixture the controls drive, when present.
     enrolled: Option<Arc<Mutex<Enrolled>>>,
+    /// A release naming the KV cache alone leaves the weights mapped.
+    weights_kept: bool,
 }
 type Shared = Arc<Mutex<Engine>>;
 
@@ -46,6 +48,7 @@ async fn control(
     State(engine): State<Shared>,
     uri: Uri,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
     if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer admin-key") {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -54,6 +57,10 @@ async fn control(
     e.calls.push(uri.path().to_string());
     match uri.path() {
         "/release_memory_occupation" => {
+            let tags: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            e.weights_kept = !tags["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "weights"));
             if e.partial {
                 e.weights_only_released = true;
             } else {
@@ -105,7 +112,7 @@ impl SaverResidency for Saver {
         }
         let engine = self.engine.lock().unwrap();
         let kv = if engine.released { 0 } else { 1 << 20 };
-        let weights = if engine.released || engine.weights_only_released {
+        let weights = if (engine.released && !engine.weights_kept) || engine.weights_only_released {
             0
         } else {
             1 << 20
@@ -138,6 +145,10 @@ fn frozen(endpoint: String) -> NativeLaunch {
 }
 
 fn frozen_at(endpoint: String, executable: &str) -> NativeLaunch {
+    frozen_restoring(endpoint, executable, "disk_reload")
+}
+
+fn frozen_restoring(endpoint: String, executable: &str, weight_restore: &str) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             binding_id: BINDING.into(),
@@ -185,7 +196,7 @@ fn frozen_at(endpoint: String, executable: &str) -> NativeLaunch {
             reasoning_parser: None,
             memory_saver: true,
             cpu_weight_backup: false,
-            weight_restore: "disk_reload".into(),
+            weight_restore: weight_restore.into(),
             extra_args: Vec::new(),
             provenance: Default::default(),
         },
@@ -339,6 +350,42 @@ async fn sglang_parks_and_restores_through_its_persisted_controls() {
             "/release_memory_occupation",
             "/resume_memory_occupation",
             "/update_weights_from_disk",
+            "/flush_cache"
+        ]
+    );
+}
+
+/// ADR 0014 amendment A16: a launch whose weights stay resident (SGLang with
+/// speculative decoding) parks the KV cache alone on the remote host too: the
+/// saver shows the weights still mapped, and the wake sends no disk reload.
+// T22 T16
+#[tokio::test]
+async fn sglang_with_resident_weights_parks_its_kv_cache_alone() {
+    let stand = stand().await;
+    let (command, plan, expected) = (park_command(), plan(), identities());
+    let frozen = frozen_restoring(stand.endpoint.clone(), "/opt/sglang/python", "resident");
+    let run = Run {
+        driver: driver_with(&stand, saver(&stand, true), 0, frozen, identities()),
+        command: &command,
+        plan: &plan,
+        expected: &expected,
+        stop_at_ms: capyctl_protocol::now_unix_ms() + 20_000,
+    };
+    assert!(run.quiescent().await);
+    run.run(RuntimeAction::Park, true).await.ok().unwrap();
+    assert_eq!(run.saver_mapped_bytes().await, Some(1 << 20));
+    for (action, first) in [
+        (RuntimeAction::Restore, true),
+        (RuntimeAction::ReloadWeights, false),
+        (RuntimeAction::InvalidateCache, false),
+    ] {
+        run.run(action, first).await.ok().unwrap();
+    }
+    assert_eq!(
+        stand.engine.lock().unwrap().calls,
+        [
+            "/release_memory_occupation",
+            "/resume_memory_occupation",
             "/flush_cache"
         ]
     );

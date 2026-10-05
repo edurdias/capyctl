@@ -390,6 +390,48 @@ async fn host_backed_restores_from_host_ram_without_a_disk_reload() {
     );
 }
 
+/// ADR 0014 amendment A16: a launch whose weights stay resident (SGLang with
+/// speculative decoding, `weight_restore: resident`) parks by releasing the
+/// KV cache region alone, so the draft model's weights never leave the device.
+/// The resume asks for that region back and the reload step sends no
+/// `update_weights_from_disk`: the weights were never released, and that call
+/// would load the target's checkpoint into the draft model too. Fake-engine
+/// tests are not qualification of a native SGLang recipe.
+// T16 T20 T22
+#[tokio::test]
+async fn resident_weights_park_the_kv_cache_alone_and_wake_without_a_reload() {
+    let mut settings = capyctl_testkit::sglang_launch_settings();
+    settings.weight_restore = "resident".into();
+    let f = Fixture::with_settings(settings).await;
+    for (action, step, reply, fact) in [
+        (RuntimeAction::Park, "park", "null".to_owned(), Milestone::MemoryReleased),
+        (RuntimeAction::Restore, "resume", "null".to_owned(), Milestone::AllocationsRestored),
+        (RuntimeAction::ReloadWeights, "reload", "null".to_owned(), Milestone::WeightsUsable),
+        (RuntimeAction::InvalidateCache, "flush", FLUSH_RESPONSE.into(), Milestone::CacheValid),
+        (RuntimeAction::Probe, "probe", json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}).to_string(), Milestone::ModelUsable),
+    ] {
+        f.reply(StatusCode::OK, &reply);
+        if action == RuntimeAction::ReloadWeights {
+            *f.server.observer.1.lock().unwrap() = true;
+        }
+        let result = f.adapter.execute_persisted(&f.next(action, step)).await;
+        assert_eq!(result.unwrap().facts, vec![fact], "{action:?}");
+    }
+    let requests = f.requests();
+    let paths: Vec<_> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/release_memory_occupation",
+            "/resume_memory_occupation",
+            "/flush_cache?timeout=0",
+            "/v1/chat/completions"
+        ]
+    );
+    assert_eq!(requests[0].body, json!({"tags":["kv_cache"]}));
+    assert_eq!(requests[1].body, json!({"tags":["kv_cache"]}));
+}
+
 /// The reload step under `host_backed` still needs its evidence: with no
 /// allocations observed it is uncertain and sends nothing.
 // T20 T22
