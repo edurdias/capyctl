@@ -194,6 +194,16 @@ message ReportInventory {
   // each instance of a deployment by its own generation, so two instances of
   // one deployment may share the host (ADR 0013 §4, owner decision P1).
   string launch_claims = 7;
+  // ADR 0028 §14 (additive, capability `engine_groups`): what this host
+  // reports for multi-node groups. Absent from a host without the capability.
+  GroupInventory group = 8;
+}
+// ADR 0028 §14: the host's group-relevant facts. `peer_address` is the
+// address this host offers to group peers; `findings` are the preflight
+// findings the host computed (for example, RDMA absent). No transport fields.
+message GroupInventory {
+  string peer_address = 1;
+  repeated string findings = 2;
 }
 message DomainObservation {
   string domain_id = 1;        // stable local identity
@@ -358,11 +368,21 @@ message GroupMemberPlan {
   string checkpoint_fingerprint = 6;
   repeated string devices = 7;
   string peer_address = 8;
+  // ADR 0028 §14: `service_port` 0 now means "none" (a worker serves no API).
   uint32 service_port = 9;
+  string role = 10;            // "head" | "worker"
+  string model_path = 11;      // this host's own path of the materialized source
+  uint32 worker_port = 12;     // 0 = none; SGLang workers only
 }
 message GroupLaunchPlan {
   repeated GroupMemberPlan members = 1;
   uint32 rendezvous_port = 2;
+  // ADR 0028 §14: engine and topology are bound by the payload digest.
+  string engine = 3;           // "vllm" | "sglang" | "tensorfold"
+  uint32 tensor_parallel = 4;
+  uint32 pipeline_parallel = 5;
+  uint32 local_ranks = 6;
+  int64 generation = 7;
 }
 // Standalone native lifecycle uses a separate shape from the pinned TP2 group.
 // The host resolves this strict deployment manifest against its own approved

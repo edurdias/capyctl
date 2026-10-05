@@ -71,6 +71,12 @@ pub const LIVE_PROFILE_UPDATE: &str = "live_profile_update";
 /// host is refused `host_capability_missing:device_memory_domains` before
 /// anything is sent. A unified host needs it for nothing.
 pub const DEVICE_MEMORY_DOMAINS: &str = "device_memory_domains";
+/// ADR 0028 §14: multi-node engine groups. Covers the Prepare and Launch group
+/// plans' engine, topology, generation, role, model path and worker port, and
+/// `ReportInventory.group`. The server places a group member only on a host
+/// that declared it; any other host is refused
+/// `host_capability_missing:engine_groups` before anything is sent.
+pub const ENGINE_GROUPS: &str = "engine_groups";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -110,6 +116,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (LIVE_PROFILE_UPDATE, Direction::ServerToHost),
     (DEVICE_MEMORY_DOMAINS, Direction::ServerToHost),
     (CHECKPOINT_STATE_SLOT, Direction::ServerToHost),
+    (ENGINE_GROUPS, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -175,6 +182,8 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
                 needs.push(CHECKPOINT_STATE_SLOT);
             }
         }
+        // ADR 0028 §14: a group plan carries fields an older host would drop.
+        Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
         Some(Action::DigestCheckpoint(request)) => {
             needs.push(CHECKPOINT_DIGEST);
             if request.size_only {
@@ -234,6 +243,13 @@ pub fn is_gate_refusal(reason: &str) -> bool {
             .strip_prefix(HOST_CAPABILITY_MISSING)
             .and_then(|rest| rest.strip_prefix(':'))
             .is_some_and(|name| CATALOGUE.iter().any(|(known, _)| *known == name))
+}
+
+/// ADR 0028 §14: the typed refusal for placing a group member on a host that
+/// did not declare `engine_groups`, or `None` when it may be placed. The server
+/// calls this before it sends anything for the group.
+pub fn group_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(ENGINE_GROUPS)).then(|| missing(ENGINE_GROUPS))
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state
