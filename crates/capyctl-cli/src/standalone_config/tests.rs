@@ -576,6 +576,44 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     );
 }
 
+/// ADR 0028 §2: standalone is one host, so a deployment with a topology above
+/// world size one is refused `group_placement_required`.
+// T14
+#[test]
+fn a_standalone_deployment_with_a_group_topology_is_refused() {
+    let mut deployment = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        Engine::Vllm,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
+        DEFAULT_REQUEST_DEADLINE,
+        false,
+        "local",
+    )
+    .expect("the unified template");
+    deployment["topology"] = serde_json::json!({"tensor_parallel": 2});
+    for placement in [
+        serde_json::json!({}),
+        serde_json::json!({"placement": {"hosts": ["a", "b"]}}),
+    ] {
+        let mut candidate = deployment.clone();
+        candidate.as_object_mut().unwrap().remove("host");
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .extend(placement.as_object().unwrap().clone());
+        let error = capyctl_config::topology::refuse_in_standalone(&candidate)
+            .expect_err("a group is refused in standalone");
+        assert!(error.to_string().contains("group_placement_required"));
+    }
+    // World size one is the single-host path.
+    deployment["topology"] = serde_json::json!({"tensor_parallel": 1});
+    capyctl_config::topology::refuse_in_standalone(&deployment).expect("world size one");
+}
+
 /// A copy of capyctl's runtime modules the way a prepared installation carries
 /// them (SPEC §9.1 / T21): this user's, not group- or other-writable, whatever
 /// the umask of the checkout they come from.

@@ -574,6 +574,11 @@ impl ConfigurationSource for SharedConfigurationSource {
                 // nothing, when the embedded host does not publish the profile.
                 let (ConfigurationCommand::Create { config_json }
                 | ConfigurationCommand::Replace { config_json, .. }) = &command;
+                // ADR 0028 §2: standalone is one host and cannot run a group.
+                capyctl_config::topology::refuse_in_standalone(&capyctl_config::parse_strict(
+                    capyctl_config::ConfigKind::Deployment,
+                    config_json,
+                )?)?;
                 if !retry {
                     require_published(config_json, vec![(id.clone(), document.clone())])?;
                 }

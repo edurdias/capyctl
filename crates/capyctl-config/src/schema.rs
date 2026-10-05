@@ -501,6 +501,14 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                         ("max_per_host", SCALAR),
                     ]),
                 ),
+                // ADR 0028 §2: the multi-node topology.
+                (
+                    "topology",
+                    FieldSpec::Struct(&[
+                        ("tensor_parallel", SCALAR),
+                        ("pipeline_parallel", SCALAR),
+                    ]),
+                ),
                 ("model", FieldSpec::ScalarOrStruct(MODEL)),
                 ("routes", FieldSpec::Seq(&SCALAR)),
                 ("runtime_profile", SCALAR),
