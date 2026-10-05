@@ -51,11 +51,14 @@ pub struct EmbeddedHost {
     /// The role's configured engine port range, published with or without
     /// an installation.
     engine_ports: (u16, u16),
+    /// ADR 0028 §3: the role's group policy, published in every document.
+    groups: capyctl_config::groups_policy::StatedGroups,
 }
 
 impl EmbeddedHost {
     /// Register (measure) every installation and build the host document.
     /// Blocking: registration reads each installation's files.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         named: Vec<NamedInstallation>,
         environment_fingerprint: String,
@@ -64,6 +67,7 @@ impl EmbeddedHost {
         shape: HostShape,
         models: ModelSettings,
         engine_ports: (u16, u16),
+        groups: capyctl_config::groups_policy::StatedGroups,
     ) -> Arc<Self> {
         let named = with_models(named, &models);
         let mut document = crate::standalone_config::host_policy(
@@ -75,6 +79,9 @@ impl EmbeddedHost {
             engine_ports,
         );
         models.write_into(&mut document);
+        groups
+            .write_into(&mut document)
+            .expect("a generated host document is a mapping");
         let installations = EmbeddedInstallations::new();
         for n in &named {
             installations.register(
@@ -93,6 +100,7 @@ impl EmbeddedHost {
             shape,
             models,
             engine_ports,
+            groups,
         })
     }
 
@@ -137,6 +145,9 @@ impl EmbeddedHost {
             self.engine_ports,
         );
         self.models.write_into(&mut document);
+        self.groups
+            .write_into(&mut document)
+            .expect("a generated host document is a mapping");
         document
     }
 

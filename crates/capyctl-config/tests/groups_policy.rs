@@ -34,6 +34,10 @@ fn unsafe_values_are_refused() {
         json!({"peer_address": "0.0.0.0"}),
         json!({"peer_address": "224.0.0.1"}),
         json!({"peer_address": "::1"}),
+        json!({"peer_address": "::ffff:127.0.0.1"}),
+        json!({"peer_address": "::ffff:0.0.0.0"}),
+        json!({"peer_address": "::ffff:224.0.0.1"}),
+        json!({"peer_address": "255.255.255.255"}),
         json!({"peer_address": "not-an-ip"}),
         json!({"rendezvous_port_range": {"start": 26009, "end": 26000}}),
         json!({"rendezvous_port_range": {"start": 80, "end": 90}}),
@@ -130,6 +134,43 @@ fn groups_settings_precedence() {
     );
     assert_eq!(policy["groups"]["peer_address"], "192.0.2.10");
     assert!(policy["groups"].get("rendezvous_port_range").is_none());
+    // Each setting resolves independently across all three layers.
+    let yaml = json!({"resource_policy": {"groups": {
+        "rendezvous_port_range": {"start": 27000, "end": 27009}, "require_rdma": true}}});
+    let env = EngineOverrides::from_env(&|key| {
+        [
+            ("CAPYCTL_RENDEZVOUS_PORTS", "26000-26009"),
+            ("CAPYCTL_REQUIRE_RDMA", "false"),
+        ]
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| (*v).to_owned())
+    })
+    .unwrap();
+    let none = EngineOverrides::default();
+    let policy = resolved(&yaml, &env, &none);
+    assert_eq!(
+        policy["groups"]["rendezvous_port_range"],
+        json!({"start": 26000, "end": 26009})
+    );
+    assert_eq!(policy["groups"]["require_rdma"], false);
+    let flags = EngineOverrides {
+        rendezvous_ports: Some((28000, 28009)),
+        require_rdma: Some(true),
+        ..Default::default()
+    };
+    let policy = resolved(&yaml, &env, &flags);
+    assert_eq!(
+        policy["groups"]["rendezvous_port_range"],
+        json!({"start": 28000, "end": 28009})
+    );
+    assert_eq!(policy["groups"]["require_rdma"], true);
+    let policy = resolved(&yaml, &none, &none);
+    assert_eq!(
+        policy["groups"]["rendezvous_port_range"],
+        json!({"start": 27000, "end": 27009})
+    );
+    assert_eq!(policy["groups"]["require_rdma"], true);
     // Nothing stated anywhere: no block is injected.
     let policy = resolved(
         &json!({"resource_policy": {}}),

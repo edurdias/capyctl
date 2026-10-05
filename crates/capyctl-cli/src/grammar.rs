@@ -670,7 +670,8 @@ struct RoleSettingsArgs {
     /// resource_policy.groups.rendezvous_port_range.
     #[arg(long, value_name = "START-END", value_parser = parse_rendezvous_ports)]
     rendezvous_ports: Option<(u16, u16)>,
-    /// Groups on this host require RDMA between their hosts (default false). Wins over CAPYCTL_REQUIRE_RDMA and
+    /// Refuse group work on this host when RDMA tuning (memlock, infiniband)
+    /// is missing (default false). Wins over CAPYCTL_REQUIRE_RDMA and
     /// resource_policy.groups.require_rdma.
     #[arg(long, value_name = "true|false", value_parser = parse_require_rdma)]
     require_rdma: Option<bool>,

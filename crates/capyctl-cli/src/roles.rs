@@ -1013,6 +1013,7 @@ impl EngineProvider for EnvEngineProvider {
                 root
             }
         };
+        let groups = settings.groups();
         Ok(RoleSettings {
             runtime_dir: runtime_dir(settings.runtime_dir, self.managed_runtime.as_deref())?,
             engine_ports: settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS),
@@ -1021,6 +1022,7 @@ impl EngineProvider for EnvEngineProvider {
             // installation names its CUDA toolkit explicitly (`--cuda-home`,
             // `CAPYCTL_CUDA_HOME` or `local_engine.cuda_home`); nothing is detected.
             cuda_home: settings.cuda_home,
+            groups,
         })
     }
 
@@ -1799,6 +1801,10 @@ async fn start_standalone_in(
         );
         models.write_into(&mut host);
         crate::standalone_config::apply_stated_queue(&mut host, &stated_host);
+        // ADR 0028 §3: the host's group policy, by the shared writer.
+        role.groups
+            .write_into(&mut host)
+            .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
         crate::standalone_config::apply_stated_memory(&mut host, &stated_host, capacity_bytes)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
         // The host's own policy, normalized exactly as resolution normalizes
@@ -1865,6 +1871,7 @@ async fn start_standalone_in(
             models.clone(),
         );
         let engine_ports = role.engine_ports;
+        let groups = role.groups.clone();
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
                 named,
@@ -1874,6 +1881,7 @@ async fn start_standalone_in(
                 shape,
                 models,
                 engine_ports,
+                groups,
             )
         })
         .await

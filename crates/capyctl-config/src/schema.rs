@@ -126,6 +126,16 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         FieldSpec::Struct(&[("max_buffered_bytes_total", UNIT)]),
     )];
     const TLS: &[(&str, FieldSpec)] = &[("mode", SCALAR), ("identity_dir", SCALAR)];
+    // ADR 0028 §3: the group policy, stated the same way on a host and on
+    // standalone (owner rule: standalone is a server plus one host).
+    const GROUPS: FieldSpec = FieldSpec::Struct(&[
+        ("peer_address", SCALAR),
+        (
+            "rendezvous_port_range",
+            FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
+        ),
+        ("require_rdma", SCALAR),
+    ]);
     const RESOURCE_POLICY: &[(&str, FieldSpec)] = &[
         ("allowed_devices", SCALAR),
         (
@@ -146,6 +156,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // SPEC §10, §16.2 (owner rule 2026-09-25: standalone is a server and
         // one host): the queue bounds, as on a host.
         ("queue", FieldSpec::Struct(QUEUE)),
+        ("groups", GROUPS),
     ];
     const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
     const ALLOCATION: FieldSpec = FieldSpec::Struct(&[
@@ -283,17 +294,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // deployment.
         ("labels", FieldSpec::MapOf(&SCALAR)),
         // ADR 0028 §3: the host's multi-node group policy.
-        (
-            "groups",
-            FieldSpec::Struct(&[
-                ("peer_address", SCALAR),
-                (
-                    "rendezvous_port_range",
-                    FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
-                ),
-                ("require_rdma", SCALAR),
-            ]),
-        ),
+        ("groups", GROUPS),
     ];
     const SECURITY: &[(&str, FieldSpec)] = &[
         // Spec §3: `deep_park` replaces `experimental_controls`. It is a switch over

@@ -125,10 +125,12 @@ impl EngineOverrides {
     /// The environment's layer, read through `get` (the raw value; `None`
     /// when unset). An empty value is unset for the paths, the fingerprint,
     /// the arguments and the KV cache (the shape a mistyped export leaves);
-    /// SPEC §15.3 (T03): for the switches and the port range it is refused,
-    /// because a mistyped opt-out silently left on is the failure those
-    /// switches exist to prevent. A malformed value is refused with the
-    /// variable's name.
+    /// SPEC §15.3 (T03): for the deep-park and drift switches and the port
+    /// ranges it is refused, because a mistyped opt-out silently left on is
+    /// the failure those switches exist to prevent. Exceptions, where an
+    /// empty value is unset: `CAPYCTL_TRUST_REMOTE_CODE`,
+    /// `CAPYCTL_REQUIRE_RDMA` and `CAPYCTL_PEER_ADDRESS`. A malformed value
+    /// is refused with the variable's name.
     pub fn from_env(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let text = |key: &str| get(key).filter(|value| !value.is_empty());
         let ports = match get(ENGINE_PORTS_ENV) {
@@ -454,6 +456,15 @@ pub fn resolve(
 }
 
 impl EngineSettings {
+    /// ADR 0028 §3: the group settings a layer stated.
+    pub fn groups(&self) -> crate::groups_policy::StatedGroups {
+        crate::groups_policy::StatedGroups {
+            peer_address: self.peer_address,
+            rendezvous_ports: self.rendezvous_ports,
+            require_rdma: self.require_rdma,
+        }
+    }
+
     /// ADR 0018 §5, ADR 0023 §2: the role's own installations and their
     /// profile names: one executable is `local`; several are `local-<engine>`.
     pub fn installations(&self) -> Vec<(&'static str, Engine, PathBuf)> {
@@ -519,6 +530,9 @@ pub fn apply_to_host_with(
              deployment instead",
         ));
     }
+    // ADR 0028 §3: only a stated setting is written, so a host that states no
+    // group policy publishes no `groups` block and keeps its policy digest.
+    settings.groups().write_into(document)?;
     let object = document
         .as_object_mut()
         .ok_or_else(|| refuse("", "the host document is not a mapping"))?;
@@ -531,30 +545,6 @@ pub fn apply_to_host_with(
             .entry("resource_policy")
             .or_insert_with(|| Value::Object(Map::new()));
         policy["endpoint_port_range"] = json!({"start": start, "end": end});
-    }
-    // ADR 0028 §3: only a stated setting is written, so a host that states no
-    // group policy publishes no `groups` block and keeps its policy digest.
-    if settings.peer_address.is_some()
-        || settings.rendezvous_ports.is_some()
-        || settings.require_rdma.is_some()
-    {
-        let policy = object
-            .entry("resource_policy")
-            .or_insert_with(|| Value::Object(Map::new()));
-        let groups = policy
-            .as_object_mut()
-            .ok_or_else(|| refuse("resource_policy", "must be a mapping"))?
-            .entry("groups")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(address) = settings.peer_address {
-            groups["peer_address"] = json!(address.to_string());
-        }
-        if let Some((start, end)) = settings.rendezvous_ports {
-            groups["rendezvous_port_range"] = json!({"start": start, "end": end});
-        }
-        if let Some(required) = settings.require_rdma {
-            groups["require_rdma"] = json!(required);
-        }
     }
     let installations = settings.installations();
     if installations.is_empty() {
