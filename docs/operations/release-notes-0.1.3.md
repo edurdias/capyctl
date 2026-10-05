@@ -18,3 +18,8 @@ Unreleased.
   model without a draft model (the weights stay in memory), and the parked
   charge is measured on the first park. `residency: host_backed` is still
   refused for it; a deployment that states `restart_only` keeps restarting.
+  On a 128 GB GB10, Qwen3.8-27B NVFP4 with DFlash2 parks in about a second,
+  holds 33.4 GiB parked and answers about 2 s after a request wakes it. That
+  is above a standalone's parked limit (a quarter of the memory), so once
+  that is measured on its first park, later parks are refused and it stays
+  loaded.

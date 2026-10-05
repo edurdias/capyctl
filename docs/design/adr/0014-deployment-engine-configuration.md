@@ -1000,8 +1000,8 @@ Rule:
   is the undercharged one A13 describes, checked against observed free memory at launch.
 
 What this frees: the KV cache and the state pool, not the weights. For the 27B deployment
-above that is the 16 GiB KV cache and the state pool of its running requests, about half of
-its 65 GiB request; the weights (21.2 GB and 3.3 GB of draft model) stay.
+below that was 31 to 32 GiB of its 65 GiB request; the weights (21.2 GB, and 3.3 GB of draft
+model) stay.
 
 Evidence: `crates/capyctl-config/tests/sglang_speculative_residency.rs`,
 `resident_weights_park_the_kv_cache_alone_and_wake_without_a_reload` (adapter),
@@ -1013,6 +1013,30 @@ Evidence: `crates/capyctl-config/tests/sglang_speculative_residency.rs`,
 `test_resident_weights_take_no_backup` and
 `test_a_speculative_scheduler_enrolls_only_with_resident_weights`.
 
-Live: pending (GB10, SGLang 0.5.21, Qwen3.8-27B NVFP4 with DFlash2, request 65 GiB, KV cache
-16 GiB). To record: the measured parked charge, the wake time, the draft acceptance before
-the park and after each of three wakes, and greedy output identical before and after.
+Live (2026-10-05, GB10, SGLang 0.5.21, Qwen3.8-27B NVFP4 with DFlash2 and 8 draft tokens,
+`quantization: modelopt`, fp8 KV, request 65 GiB, KV cache 16 GiB, 8 running requests, managed
+limit 80 %, CUDA graphs on, no residency stated):
+
+- The deployment resolved `deep`, and its launch rendered the memory saver and
+  `weight_restore: resident`. It started in 242 to 293 s.
+- Three park and wake cycles, each on a fresh deployment (see the parked limit below). Each
+  park completed in about 1.1 s, and the host's used memory fell from 74 to 77 GiB to 43 to
+  44 GiB. The parked charge measured 33.4 GiB (35.89 GB) each time, against the 2 GiB
+  placeholder of the first park.
+- The wake on request: the first answer after a park started 2.0, 2.0 and 2.4 s after the
+  request (0.16 to 0.17 s when ready), and the rest of the answer decoded at the same speed as
+  before the park.
+- Draft acceptance, from SGLang's `generation_tokens_total` and `spec_verify_calls_total` over
+  each 512-token greedy answer: 4.53, 4.79 and 4.88 tokens per verify step on three prompts
+  before every park, and 4.51 (the wake probe's 2 tokens and one step included), 4.79 and
+  4.88 after every wake.
+- Greedy output (temperature 0, 512 tokens) was token for token identical on each of the three
+  prompts across 12 answers: a first start and a restart, before and after each park.
+
+Found with it, not changed here: a deployment's measured parked residue (33.4 GiB) is above a
+128 GB GB10 standalone's parked limit (a quarter of the memory, about 30 GiB, which a
+standalone does not let a setting raise). After the first park of a revision is measured, its
+next park is refused `park_parked_capacity` and the deployment stays ready (found on the same
+run: two later parks of one deployment were refused that way, leaving it serving). Such a
+deployment therefore parks once per revision on that host until the parked limit is raised
+or made settable on a standalone.
