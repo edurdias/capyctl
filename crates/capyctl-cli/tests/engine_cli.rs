@@ -106,6 +106,8 @@ fn add(path: &Path) -> Command {
         args: vec![],
         approved_options: vec![],
         approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
     }
 }
 
@@ -156,6 +158,8 @@ async fn add_records_approved_options_and_paths() {
         args: vec![],
         approved_options: vec!["--speculative-config".into()],
         approved_paths: vec!["/srv/drafters".into()],
+        env: vec![],
+        approved_env: vec![],
     };
     execute(&approving, Some(&document), dir.path())
         .await
@@ -175,6 +179,8 @@ async fn add_records_approved_options_and_paths() {
         args: vec![],
         approved_options: vec!["--speculative-config".into()],
         approved_paths: vec!["drafters".into()],
+        env: vec![],
+        approved_env: vec![],
     };
     let error = execute(&relative, Some(&document), dir.path())
         .await
@@ -217,6 +223,8 @@ async fn add_refuses_an_existing_name() {
         args: vec![],
         approved_options: vec![],
         approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
     };
     assert_eq!(
         execute(&named, Some(&document), dir.path())
@@ -363,6 +371,8 @@ async fn add_disables_deep_park_when_the_probe_reports_it_missing() {
         args: vec![],
         approved_options: vec![],
         approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
     };
     execute(&asked, Some(&document), dir.path()).await.unwrap();
     assert_eq!(
@@ -389,6 +399,8 @@ async fn add_without_a_path_needs_a_terminal() {
         args: vec![],
         approved_options: vec![],
         approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
     };
     assert_eq!(
         execute(&command, Some(&document), dir.path())
@@ -961,6 +973,8 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
         args: vec![],
         approved_options: vec![],
         approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
     };
     let error = execute(&asked, Some(&document), dir.path())
         .await

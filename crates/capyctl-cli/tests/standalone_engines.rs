@@ -40,6 +40,8 @@ fn register(document: &std::path::Path, name: &str) {
             cuda_home: None,
             approved_options: vec![],
             approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -569,6 +571,8 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             cuda_home: None,
             approved_options: vec![],
             approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

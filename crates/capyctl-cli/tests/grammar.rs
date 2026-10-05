@@ -160,7 +160,7 @@ fn deploy_flags() {
     ])
     .unwrap();
     assert!(
-        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None, hf_endpoint: None} if f == std::path::Path::new("d.yaml"))
+        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None, hf_endpoint: None, ..} if f == std::path::Path::new("d.yaml"))
     );
 }
 
@@ -549,6 +549,8 @@ fn engine_commands_parse() {
             args: vec!["--max-num-seqs".into(), "8".into()],
             approved_options: vec!["--speculative-config".into()],
             approved_paths: vec!["/srv/drafters".into(), "/srv/other".into()],
+            env: vec![],
+            approved_env: vec![],
         }
     );
     assert_eq!(
@@ -560,7 +562,9 @@ fn engine_commands_parse() {
             drift: DriftChoice::Warn,
             args: vec![],
             approved_options: vec![],
-            approved_paths: vec![]
+            approved_paths: vec![],
+            env: vec![],
+            approved_env: vec![],
         }
     );
     assert_eq!(

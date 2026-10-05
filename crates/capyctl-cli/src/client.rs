@@ -4,6 +4,7 @@
 use crate::client_journal::RequestJournal;
 use crate::grammar::{Command, LifecycleAction, ListResource, Resource};
 use crate::output::StructuredError;
+use capyctl_config::engine_env::{is_owned, EnvRefusal};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1035,13 +1036,15 @@ pub async fn execute_with_start_options(
             file: Some(file),
             revision: Some(expected),
             hf_endpoint,
+            engine_env,
             ..
         } => {
             // SPEC §14: an explicit, revision-aware update of the deployment
             // the file names. The server refuses a stale revision
             // (`revision_conflict`) and replays an exact retry by request id.
-            let config =
+            let mut config =
                 read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
+            apply_engine_env(&mut config, engine_env)?;
             let name = config["name"]
                 .as_str()
                 .ok_or_else(|| error("invalid_config", "Deployment file names no deployment"))?
@@ -1087,9 +1090,11 @@ pub async fn execute_with_start_options(
             wait,
             revision: None,
             hf_endpoint,
+            engine_env,
         } => {
-            let config =
+            let mut config =
                 read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
+            apply_engine_env(&mut config, engine_env)?;
             api.begin_request(
                 &journal_root,
                 request_id,
@@ -1382,6 +1387,89 @@ pub fn pinned_installation(view: &Value, pinned: &Value) -> (Value, Option<Strin
         "state": "unregistered",
     });
     (installation, Some(note))
+}
+
+/// ADR 0028 §2.1: the environment variable that carries `--engine-env`
+/// entries, `K=V;K=V`.
+pub const ENGINE_ENV_VAR: &str = "CAPYCTL_ENGINE_ENV";
+
+/// ADR 0028 §2.1, owner rule (every setting three ways): the entries of the
+/// `--engine-env` flags and of `CAPYCTL_ENGINE_ENV` (`K=V` separated by `;`,
+/// each split on its first `=`, empty entries ignored). For one name the flag
+/// wins, so a name given by flag and by variable is no conflict. A flag
+/// repeated for one name stays in the result twice, which
+/// [`merge_engine_env`] refuses.
+pub fn engine_env_with_channels(
+    flags: &[(String, String)],
+    variable: Option<&str>,
+) -> Result<Vec<(String, String)>, EnvRefusal> {
+    let mut merged = flags.to_vec();
+    let mut from_variable: Vec<(String, String)> = Vec::new();
+    for entry in variable
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (name, value) = crate::grammar::parse_env_flag(entry)
+            .map_err(|detail| EnvRefusal::Invalid(format!("{ENGINE_ENV_VAR}: {detail}")))?;
+        if from_variable.iter().any(|(seen, _)| *seen == name) {
+            return Err(EnvRefusal::Conflict(name));
+        }
+        if !flags.iter().any(|(flagged, _)| *flagged == name) {
+            from_variable.push((name, value));
+        }
+    }
+    merged.extend(from_variable);
+    Ok(merged)
+}
+
+/// ADR 0028 §2.1: the entries by flag or variable go under
+/// `engine_config.env` of a deployment document. An owned name is refused
+/// before anything is sent (rule 1); a name already in the document, or
+/// given twice, is a conflict (rule 5). Approval is decided where the
+/// profile is known, at resolution.
+pub fn merge_engine_env(
+    document: &mut Value,
+    flags: &[(String, String)],
+) -> Result<(), EnvRefusal> {
+    if flags.is_empty() {
+        return Ok(());
+    }
+    let mut added = serde_json::Map::new();
+    for (name, value) in flags {
+        if is_owned(name) {
+            return Err(EnvRefusal::Reserved(name.clone()));
+        }
+        if document["engine_config"]["env"].get(name).is_some() || added.contains_key(name) {
+            return Err(EnvRefusal::Conflict(name.clone()));
+        }
+        added.insert(name.clone(), Value::String(value.clone()));
+    }
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| EnvRefusal::Invalid("a deployment document must be a mapping".into()))?;
+    let engine_config = root
+        .entry("engine_config")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let env = engine_config
+        .as_object_mut()
+        .ok_or_else(|| EnvRefusal::Invalid("engine_config must be a mapping".into()))?
+        .entry("env")
+        .or_insert_with(|| Value::Object(Default::default()));
+    env.as_object_mut()
+        .ok_or_else(|| EnvRefusal::Invalid("engine_config.env must be a mapping".into()))?
+        .extend(added);
+    Ok(())
+}
+
+/// The flags and `CAPYCTL_ENGINE_ENV` merged into `config` (see
+/// [`engine_env_with_channels`], [`merge_engine_env`]).
+fn apply_engine_env(config: &mut Value, flags: &[(String, String)]) -> Result<(), StructuredError> {
+    let variable = std::env::var(ENGINE_ENV_VAR).ok();
+    engine_env_with_channels(flags, variable.as_deref())
+        .and_then(|entries| merge_engine_env(config, &entries))
+        .map_err(|refusal| error("invalid_config", refusal.code()))
 }
 
 /// A deployment document from `--file`, bounded and strictly parsed, with
