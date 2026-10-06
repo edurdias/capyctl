@@ -23,6 +23,7 @@ fn command() -> pb::ServerToAgent {
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
+            group_member_launch: None,
         })),
     }
 }
@@ -134,7 +135,7 @@ fn group_digest_is_stable_and_binds_rendezvous() {
             },
             profile_name: "sglang".into(),
             profile_fingerprint: "pinned".into(),
-            checkpoint_fingerprint: "checkpoint".into(),
+            checkpoint_fingerprint: CHECKPOINT_DIGEST.into(),
             model_path: "/models/m".into(),
             devices: vec!["gpu-0".into()],
             peer_address: format!("192.0.2.{}", rank + 10).parse().unwrap(),
@@ -150,18 +151,56 @@ fn group_digest_is_stable_and_binds_rendezvous() {
     let plan = |members: Vec<MemberPlan>, port: u16| {
         GroupPlan::new(GroupEngine::Sglang, members, topology, port, 1).unwrap()
     };
+    let launch = |plan: GroupPlan| MemberAction::Launch {
+        member: group_member_launch("sglang", CHECKPOINT_DIGEST, 30000),
+        plan,
+    };
     let mut original = MemberCommand::try_from(command()).unwrap();
     original.identity.member.member_id = member_id(0);
-    original.action = MemberAction::Launch(plan(members.clone(), 29500));
+    original.action = launch(plan(members.clone(), 29500));
     original.identity.payload_digest = original.canonical_digest();
     original.verify_digest().unwrap();
     // ADR 0028 §4: members are held in rank order, so the digest has no order to ignore.
     let mut reordered = original.clone();
-    reordered.action = MemberAction::Launch(plan(members.clone(), 29500));
+    reordered.action = launch(plan(members.clone(), 29500));
     assert_eq!(reordered.canonical_digest(), original.canonical_digest());
     reordered.verify_digest().unwrap();
-    reordered.action = MemberAction::Launch(plan(members, 29501));
+    reordered.action = launch(plan(members, 29501));
     assert!(reordered.verify_digest().is_err());
+}
+
+/// A checkpoint digest in the canonical form a group plan records.
+const CHECKPOINT_DIGEST: &str =
+    "sha256:abababababababababababababababababababababababababababababababab";
+
+/// ADR 0028 §8 (ruling R29): one host's launch of its member of a group plan,
+/// shaped as a single-rank launch: `port` is the head's service port, or zero
+/// on a worker.
+fn group_member_launch(
+    profile: &str,
+    digest: &str,
+    port: u16,
+) -> capyctl_protocol::execution::SingleLaunchPlan {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    capyctl_protocol::execution::SingleLaunchPlan {
+        deployment_config: fixture["input"]["deployment"].to_string(),
+        profile_name: profile.into(),
+        checkpoint_fingerprint: "sha256:model".into(),
+        host_policy_fingerprint: "a".repeat(64),
+        binding_id: "01K00000000000000000000001".into(),
+        incarnation: "01K00000000000000000000002".into(),
+        grant_id: "01K00000000000000000000003".into(),
+        service_port: port,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: digest.into(),
+        checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
+        startup_bytes: None,
+    }
 }
 
 // T37: a digest never turns a malformed in-process value into a valid command.
@@ -249,6 +288,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         launch_failure: String::new(),
         source: None,
         kernel_builds: Vec::new(),
+        escalated: false,
     }
 }
 
@@ -427,7 +467,7 @@ fn kernel_builds_ride_a_usable_launch_only() {
 }
 
 mod groups {
-    use super::{command, MemberCommand};
+    use super::{command, group_member_launch, MemberCommand, CHECKPOINT_DIGEST};
     use capyctl_domain::group::{
         member_id, GroupEngine, GroupPlan, GroupTopology, MemberKey, MemberPlan, MemberRole,
     };
@@ -473,7 +513,7 @@ mod groups {
                 },
                 profile_name: "profile".into(),
                 profile_fingerprint: "pinned".into(),
-                checkpoint_fingerprint: "checkpoint".into(),
+                checkpoint_fingerprint: CHECKPOINT_DIGEST.into(),
                 model_path: shape.model_path.into(),
                 devices: vec!["gpu0".into()],
                 peer_address: format!("192.0.2.{}", rank + 10).parse().unwrap(),
@@ -502,8 +542,16 @@ mod groups {
         command.identity.payload_digest = command.canonical_digest();
         command
     }
+    /// ADR 0028 §8 (ruling R29): the head's Launch of `plan`, with its member
+    /// launch.
+    fn launch(plan: GroupPlan) -> MemberAction {
+        MemberAction::Launch {
+            member: group_member_launch("profile", CHECKPOINT_DIGEST, 30000),
+            plan,
+        }
+    }
     fn digest(plan: GroupPlan) -> [u8; 32] {
-        command_with(MemberAction::Launch(plan)).canonical_digest()
+        command_with(launch(plan)).canonical_digest()
     }
 
     // T34: group actions round-trip every member field, and the digest binds them.
@@ -515,7 +563,7 @@ mod groups {
             GroupEngine::Tensorfold,
         ] {
             for action in [
-                MemberAction::Launch(sample_group_plan(engine)),
+                launch(sample_group_plan(engine)),
                 MemberAction::Prepare(sample_group_plan(engine)),
             ] {
                 let command = command_with(action);
@@ -598,8 +646,7 @@ mod groups {
     // T34: a malformed wire plan never becomes a domain plan.
     #[test]
     fn malformed_wire_plan_is_refused() {
-        let good =
-            command_with(MemberAction::Launch(sample_group_plan(GroupEngine::Sglang))).to_wire();
+        let good = command_with(launch(sample_group_plan(GroupEngine::Sglang))).to_wire();
         assert!(decodes(good.clone()));
         let edits: &[fn(&mut pb::GroupLaunchPlan)] = &[
             |p| p.members[1].rank = 0,
@@ -639,7 +686,7 @@ mod groups {
         assert!(agent_capabilities().contains(&ENGINE_GROUPS.to_owned()));
         assert!(CATALOGUE.iter().any(|(name, _)| *name == ENGINE_GROUPS));
         for action in [
-            MemberAction::Launch(sample_group_plan(GroupEngine::Vllm)),
+            launch(sample_group_plan(GroupEngine::Vllm)),
             MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)),
         ] {
             assert_eq!(required(&command_with(action).to_wire()), [ENGINE_GROUPS]);
@@ -652,7 +699,7 @@ mod groups {
     fn drain_only_refuses_group_prepare_and_launch() {
         for action in [
             MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)),
-            MemberAction::Launch(sample_group_plan(GroupEngine::Vllm)),
+            launch(sample_group_plan(GroupEngine::Vllm)),
         ] {
             assert!(!drain_only_permits(&command_with(action).to_wire()));
         }
@@ -747,5 +794,191 @@ mod groups {
                 );
             }
         }
+    }
+
+    /// The worker's Launch of `plan` on host-1, its member launch naming `port`.
+    fn worker_launch(plan: GroupPlan, port: u16) -> MemberCommand {
+        let mut command = MemberCommand::try_from(command()).unwrap();
+        command.identity.member.host_id = "host-1".into();
+        command.identity.member.member_id = member_id(1);
+        command.action = MemberAction::Launch {
+            member: group_member_launch("profile", CHECKPOINT_DIGEST, port),
+            plan,
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+
+    // T30 T34 (ADR 0028 §8, ruling R29): a group Launch carries this host's own
+    // member launch, required there and refused anywhere else; it must be this
+    // member's (profile, recorded checkpoint, port) and the digest binds it.
+    #[test]
+    fn group_launch_carries_its_member_launch() {
+        let head = command_with(launch(sample_group_plan(GroupEngine::Vllm)));
+        head.verify_digest().unwrap();
+        // A worker serves nothing: its member launch names no port.
+        worker_launch(sample_group_plan(GroupEngine::Vllm), 0)
+            .verify_digest()
+            .unwrap();
+        assert!(worker_launch(sample_group_plan(GroupEngine::Vllm), 30000)
+            .verify_digest()
+            .is_err());
+        let member = head.to_wire().group_member_launch;
+        let mut bare = head.to_wire();
+        bare.group_member_launch = None;
+        assert!(!decodes(bare));
+        for other in [
+            MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)),
+            MemberAction::Inspect,
+        ] {
+            let mut wire = command_with(other).to_wire();
+            assert!(decodes(wire.clone()));
+            wire.group_member_launch = member.clone();
+            assert!(!decodes(wire));
+        }
+        type Edit = fn(&mut pb::SingleLaunchPlan);
+        let edits: [Edit; 6] = [
+            |m| m.profile_name = "other".into(),
+            |m| m.checkpoint_digest = format!("sha256:{}", "cd".repeat(32)),
+            |m| m.checkpoint_digest.clear(),
+            |m| m.service_port = 30001,
+            |m| m.service_port = 0,
+            |m| m.binding_id = "binding".into(),
+        ];
+        for (index, edit) in edits.iter().enumerate() {
+            let mut wire = head.to_wire();
+            edit(wire.group_member_launch.as_mut().unwrap());
+            assert!(!decodes(wire), "edit {index} was accepted");
+        }
+        let mut moved = head.clone();
+        let MemberAction::Launch { member, .. } = &mut moved.action else {
+            unreachable!()
+        };
+        member.grant_id = "01K00000000000000000000009".into();
+        assert_ne!(moved.canonical_digest(), head.canonical_digest());
+        assert!(moved.verify_digest().is_err());
+    }
+
+    // T30 (ADR 0028 §8, R7): a group Launch whose host checks fail again at
+    // launch is refused with one closed code (a group code or a policy
+    // category) on a completed result that claims nothing and names no binding.
+    #[test]
+    fn group_launch_refusal_is_closed_and_effect_free() {
+        use capyctl_protocol::execution::validate_result;
+        let command = command_with(launch(sample_group_plan(GroupEngine::Sglang)));
+        let result = |refused: &str| pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            owned_handle: command.identity.command_id.clone(),
+            refused: refused.into(),
+            ..Default::default()
+        };
+        for code in [
+            "peer_address_not_local",
+            "rendezvous_port_in_use:25001",
+            "group_checkpoint_mismatch",
+            "host_tuning_missing:memlock",
+            "insufficient_memory",
+            "checkpoint_mismatch",
+            "unauthorized",
+        ] {
+            validate_result(&command, &result(code)).unwrap();
+        }
+        for code in [
+            "host_tuning_warning:memlock",
+            "rendezvous_port_in_use:0",
+            "group_drift:tp",
+        ] {
+            assert!(validate_result(&command, &result(code)).is_err(), "{code}");
+        }
+        type Mutation = fn(&mut pb::MemberExecutionResult);
+        let mutations: [Mutation; 6] = [
+            |r| r.state = "launched".into(),
+            |r| r.claim_retained = true,
+            |r| r.owned_handle = "other".into(),
+            |r| r.binding_id = "01K00000000000000000000001".into(),
+            |r| r.incarnation = "01K00000000000000000000002".into(),
+            |r| {
+                r.processes.push(pb::OwnedProcessObservation {
+                    pid: 7,
+                    start_ticks: 1,
+                    role: "api".into(),
+                    boot_id: "boot".into(),
+                    presence: "alive".into(),
+                })
+            },
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut mutated = result("peer_address_not_local");
+            mutate(&mut mutated);
+            assert!(
+                validate_result(&command, &mutated).is_err(),
+                "mutation {index}"
+            );
+        }
+    }
+
+    // T30 (ADR 0028 §9): the head's launch may claim a usable model on its
+    // readiness; a worker's never does.
+    #[test]
+    fn only_the_head_launch_claims_a_usable_model() {
+        use capyctl_protocol::execution::validate_result;
+        let ready = |command: &MemberCommand| {
+            let process = |role: &str, pid| pb::OwnedProcessObservation {
+                role: role.into(),
+                pid,
+                boot_id: "boot".into(),
+                start_ticks: 7,
+                presence: "alive".into(),
+            };
+            pb::MemberExecutionResult {
+                identity: command.to_wire().identity,
+                state: "launched".into(),
+                owned_handle: command.identity.command_id.clone(),
+                processes: vec![process("api", 10), process("worker-0", 11)],
+                claim_retained: true,
+                model_usable: true,
+                binding_id: "01K00000000000000000000001".into(),
+                incarnation: "01K00000000000000000000002".into(),
+                ..Default::default()
+            }
+        };
+        let head = command_with(launch(sample_group_plan(GroupEngine::Vllm)));
+        validate_result(&head, &ready(&head)).unwrap();
+        let worker = worker_launch(sample_group_plan(GroupEngine::Vllm), 0);
+        assert!(validate_result(&worker, &ready(&worker)).is_err());
+        let mut unusable = ready(&worker);
+        unusable.model_usable = false;
+        validate_result(&worker, &unusable).unwrap();
+    }
+
+    // T31 (ADR 0028 §11, Review Focus 6): `escalated` is evidence of a
+    // completed Terminate only.
+    #[test]
+    fn escalation_rides_a_completed_terminate_only() {
+        use capyctl_protocol::execution::validate_result;
+        let terminate = command_with(MemberAction::Terminate {
+            owned_handle: "owned".into(),
+            recorded: Vec::new(),
+        });
+        let gone = pb::MemberExecutionResult {
+            identity: terminate.to_wire().identity,
+            state: "completed".into(),
+            owned_handle: "owned".into(),
+            escalated: true,
+            ..Default::default()
+        };
+        validate_result(&terminate, &gone).unwrap();
+        let mut accepted = gone.clone();
+        accepted.state = "accepted".into();
+        assert!(validate_result(&terminate, &accepted).is_err());
+        let head = command_with(launch(sample_group_plan(GroupEngine::Vllm)));
+        let launched = pb::MemberExecutionResult {
+            identity: head.to_wire().identity,
+            state: "completed".into(),
+            escalated: true,
+            ..Default::default()
+        };
+        assert!(validate_result(&head, &launched).is_err());
     }
 }

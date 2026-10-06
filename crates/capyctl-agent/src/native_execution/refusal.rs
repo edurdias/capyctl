@@ -249,8 +249,11 @@ impl NativeHostExecution {
         // Found live 2026-10-03: another program listening on the leased
         // engine port answered the new engine's readiness probe, which then
         // treated it as an engine it could not prove its own and stopped the
-        // launch. A port in use is refused before anything starts.
-        engine_port_free(plan.service_port)?;
+        // launch. A port in use is refused before anything starts. ADR 0028
+        // §8: a group worker other than SGLang's leases none.
+        if let Some(port) = super::leased_port(command) {
+            engine_port_free(port)?;
+        }
         if self.pre_admitted(command) {
             let refused = LaunchVerdict::Refused;
             let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
@@ -335,23 +338,34 @@ impl NativeHostExecution {
 
     /// SPEC §13: the terminal answer to a command the journal refused on local
     /// policy before recording it. Only a launch, Park or Restore has one; any
-    /// other refusal still fails the effect.
+    /// other refusal still fails the effect. `reason` is a closed code already
+    /// known (ADR 0028 §8: a group Launch's host checks); without one the
+    /// policy category is recomputed.
     pub(super) async fn refused(
         &self,
         command: &MemberCommand,
+        reason: Option<String>,
     ) -> Result<pb::MemberExecutionResult, SessionError> {
         let host = self.clone();
         let refused = command.clone();
-        let reason = tokio::task::spawn_blocking(move || host.refusal_reason(&refused))
-            .await
-            .map_err(|_| SessionError)?
-            .ok_or(SessionError)?;
+        let reason = match reason {
+            Some(reason) => reason,
+            None => tokio::task::spawn_blocking(move || host.refusal_reason(&refused))
+                .await
+                .map_err(|_| SessionError)?
+                .ok_or(SessionError)?
+                .to_owned(),
+        };
         let now = capyctl_protocol::now_unix_ms();
         let mut result = match &command.action {
-            MemberAction::LaunchSingle(_) => pb::MemberExecutionResult {
-                owned_handle: command.identity.command_id.clone(),
-                ..Default::default()
-            },
+            // ADR 0028 §8: a refused group Launch has the same shape, and
+            // names no binding.
+            MemberAction::LaunchSingle(_) | MemberAction::Launch { .. } => {
+                pb::MemberExecutionResult {
+                    owned_handle: command.identity.command_id.clone(),
+                    ..Default::default()
+                }
+            }
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
                 // The launch it names, as this host currently holds it, when
                 // it is this deployment's own; otherwise nothing is reported.
@@ -379,7 +393,7 @@ impl NativeHostExecution {
         result.state = "completed".into();
         result.observed_at_unix_ms = now;
         result.checkpoint = None;
-        result.refused = reason.into();
+        result.refused = reason;
         capyctl_protocol::execution::validate_result(command, &result).map_err(|_| SessionError)?;
         Ok(result)
     }
@@ -391,10 +405,12 @@ impl NativeHostExecution {
         match &command.action {
             // SPEC §§3.1, 7.3: the journal refused alone or beside the
             // launches it still claims; the reason is recomputed the same way.
-            MemberAction::LaunchSingle(plan) => Some(match self.admit_launch_here(command, plan) {
-                Err(LaunchVerdict::Refused(reason)) => reason,
-                _ => "unauthorized",
-            }),
+            MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
+                Some(match self.admit_launch_here(command, plan) {
+                    Err(LaunchVerdict::Refused(reason)) => reason,
+                    _ => "unauthorized",
+                })
+            }
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
                 // ADR 0012: only a parking tier (`deep`, or `host_backed`
                 // where it resolved, discrete GPU design §5) parks. A

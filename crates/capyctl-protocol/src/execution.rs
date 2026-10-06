@@ -47,6 +47,14 @@ fn recorded_checkpoint_ok(digest: &str, weights: Option<i64>) -> bool {
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
     fn try_from(plan: pb::SingleLaunchPlan) -> Result<Self, Self::Error> {
+        Self::decode(plan, false)
+    }
+}
+impl SingleLaunchPlan {
+    /// The wire plan, validated. ADR 0028 §8 (ruling R29): a group member's
+    /// launch (`group_member`) may name no service port, as a worker serves
+    /// nothing; every other field is held to the single-rank rules.
+    fn decode(plan: pb::SingleLaunchPlan, group_member: bool) -> Result<Self, GroupIdentityError> {
         fn ulid(value: &str) -> bool {
             value.len() == 26
                 && value
@@ -68,7 +76,7 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
             || !ulid(&plan.binding_id)
             || !ulid(&plan.incarnation)
             || !ulid(&plan.grant_id)
-            || plan.service_port == 0
+            || (plan.service_port == 0 && !group_member)
             || plan.issued_at_unix_ms < 0
             || !recorded_checkpoint_ok(&plan.checkpoint_digest, plan.checkpoint_weights_bytes)
             || plan.startup_bytes.is_some_and(|bytes| bytes <= 0)
@@ -103,8 +111,6 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
             checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
         })
     }
-}
-impl SingleLaunchPlan {
     fn to_wire(&self) -> pb::SingleLaunchPlan {
         pb::SingleLaunchPlan {
             deployment_config: capyctl_config::parse_strict(
@@ -258,7 +264,15 @@ impl TryFrom<pb::MaterializeSourceRequest> for MaterializeSourcePlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberAction {
     Prepare(GroupPlan),
-    Launch(GroupPlan),
+    /// ADR 0028 §8 (ruling R29): launch this host's member of a group plan.
+    /// `member` is this host's own launch of it, carried as a single-rank
+    /// launch is (deployment document, binding, incarnation, grant, checkpoint
+    /// facts); the host resolves and renders it from its own policy and the
+    /// plan's group arguments.
+    Launch {
+        plan: GroupPlan,
+        member: SingleLaunchPlan,
+    },
     LaunchSingle(SingleLaunchPlan),
     Inspect,
     /// SPEC §§6.1, 13.2: terminate one owned launch and report its processes'
@@ -305,6 +319,44 @@ pub enum MemberAction {
     /// engine resources; the store bytes a download reserves are the host's
     /// own filesystem accounting. Its result carries only source evidence.
     MaterializeSource(MaterializeSourcePlan),
+}
+
+impl MemberAction {
+    /// The single-rank launch plan a launch action carries: a LaunchSingle's
+    /// own, or a group Launch's member launch (ADR 0028 §8). `None` for any
+    /// other action.
+    pub fn launch_plan(&self) -> Option<&SingleLaunchPlan> {
+        match self {
+            Self::LaunchSingle(plan) | Self::Launch { member: plan, .. } => Some(plan),
+            _ => None,
+        }
+    }
+
+    /// The group plan of a group Launch; `None` for any other action.
+    pub fn group_launch(&self) -> Option<&GroupPlan> {
+        match self {
+            Self::Launch { plan, .. } => Some(plan),
+            _ => None,
+        }
+    }
+}
+
+/// ADR 0028 §8 (ruling R29): whether `member` is a coherent launch of the
+/// member `key` names in `plan`: that member's profile, its recorded
+/// checkpoint (the group plan records the checkpoint digest) and its leased
+/// port, the head's service port or none on a worker.
+pub fn group_member_launch_ok(
+    plan: &GroupPlan,
+    key: &MemberKey,
+    member: &SingleLaunchPlan,
+) -> bool {
+    plan.members().iter().any(|m| {
+        m.member == *key
+            && m.profile_name == member.profile_name
+            && !member.checkpoint_digest.is_empty()
+            && m.checkpoint_fingerprint == member.checkpoint_digest
+            && member.service_port == m.service_port.unwrap_or(0)
+    })
 }
 
 /// The most recorded process identities one Terminate may carry.
@@ -459,9 +511,21 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         {
             return Err(GroupIdentityError);
         }
+        // ADR 0028 §8 (ruling R29): a group Launch carries this host's member
+        // launch; nothing else does.
+        let mut member_launch = command.group_member_launch;
+        if member_launch.is_some() != matches!(command.action, Some(Action::Launch(_))) {
+            return Err(GroupIdentityError);
+        }
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
-            Action::Launch(plan) => MemberAction::Launch(plan.try_into()?),
+            Action::Launch(plan) => MemberAction::Launch {
+                plan: plan.try_into()?,
+                member: SingleLaunchPlan::decode(
+                    member_launch.take().ok_or(GroupIdentityError)?,
+                    true,
+                )?,
+            },
             Action::LaunchSingle(plan) => MemberAction::LaunchSingle(plan.try_into()?),
             Action::Inspect(true) => MemberAction::Inspect,
             Action::TerminateOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -489,14 +553,19 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             // newer peer's field, which decodes as no action) is never guessed.
             _ => return Err(GroupIdentityError),
         };
-        if let MemberAction::Prepare(plan) | MemberAction::Launch(plan) = &action {
+        if let MemberAction::Prepare(plan) | MemberAction::Launch { plan, .. } = &action {
             if !plan.members().iter().any(|m| {
                 m.member == identity.member && m.profile_fingerprint == identity.profile_fingerprint
             }) {
                 return Err(GroupIdentityError);
             }
         }
-        if let MemberAction::LaunchSingle(plan) = &action {
+        if let MemberAction::Launch { plan, member } = &action {
+            if !group_member_launch_ok(plan, &identity.member, member) {
+                return Err(GroupIdentityError);
+            }
+        }
+        if let Some(plan) = action.launch_plan() {
             if plan.issued_at_ms >= identity.deadline_ms {
                 return Err(GroupIdentityError);
             }
@@ -533,7 +602,7 @@ impl MemberCommand {
             }),
             action: Some(match &self.action {
                 MemberAction::Prepare(plan) => Action::Prepare(group_wire(plan)),
-                MemberAction::Launch(plan) => Action::Launch(group_wire(plan)),
+                MemberAction::Launch { plan, .. } => Action::Launch(group_wire(plan)),
                 MemberAction::LaunchSingle(plan) => Action::LaunchSingle(plan.to_wire()),
                 MemberAction::Inspect => Action::Inspect(true),
                 MemberAction::Terminate { owned_handle, .. } => {
@@ -569,6 +638,10 @@ impl MemberCommand {
                     })
                     .collect(),
                 _ => Vec::new(),
+            },
+            group_member_launch: match &self.action {
+                MemberAction::Launch { member, .. } => Some(member.to_wire()),
+                _ => None,
             },
         }
     }
@@ -668,15 +741,23 @@ pub fn validate_result(
             return Err(GroupIdentityError);
         }
     }
-    // ADR 0014 amendment A12: kernel builds belong to a usable launch only.
+    // ADR 0014 amendment A12: kernel builds belong to a usable launch only
+    // (ADR 0028 §9: a group's head is one).
     if !result.kernel_builds.is_empty()
-        && (!matches!(command.action, MemberAction::LaunchSingle(_))
+        && (command.action.launch_plan().is_none()
             || !result.model_usable
             || result.kernel_builds.len() > MAX_KERNEL_BUILDS
             || result
                 .kernel_builds
                 .iter()
                 .any(|b| b.from_unix_ms < 0 || b.from_unix_ms > b.until_unix_ms))
+    {
+        return Err(GroupIdentityError);
+    }
+    // ADR 0028 §11: escalation is evidence of a completed Terminate only.
+    if result.escalated
+        && !(matches!(command.action, MemberAction::Terminate { .. })
+            && result.state == "completed")
     {
         return Err(GroupIdentityError);
     }
@@ -770,6 +851,15 @@ pub fn validate_result(
                 result.state == "launched"
                     && result.binding_id == plan.binding_id
                     && result.incarnation == plan.incarnation
+                    && result.owned_handle == command.identity.command_id
+            }
+            // ADR 0028 §9: only the head serves; its readiness is the group's.
+            // A worker (no service port) never claims a usable model.
+            MemberAction::Launch { member, .. } => {
+                member.service_port != 0
+                    && result.state == "launched"
+                    && result.binding_id == member.binding_id
+                    && result.incarnation == member.incarnation
                     && result.owned_handle == command.identity.command_id
             }
             MemberAction::Probe { .. } => result.state == "completed" && named_binding,
@@ -897,8 +987,10 @@ pub fn is_prepare_refusal(reason: &str) -> bool {
 /// refused launch completed with no claim, no process and no usable model; a
 /// refused Park or Restore left the launch `unchanged`. ADR 0028 §7: a refused
 /// Prepare carries one closed group code (its effect-free shape is checked for
-/// every Prepare result by [`validate_prepare`]). No other action carries a
-/// refusal.
+/// every Prepare result by [`validate_prepare`]). ADR 0028 §8 (R7): a group
+/// Launch whose host checks fail again at launch is refused like a single
+/// launch, with either a closed group code or a closed policy category, and
+/// names no binding. No other action carries a refusal.
 fn validate_refusal(
     command: &MemberCommand,
     result: &pb::MemberExecutionResult,
@@ -921,6 +1013,14 @@ fn validate_refusal(
             (unchanged, is_policy_refusal(&result.refused))
         }
         MemberAction::Prepare(_) => (true, is_prepare_refusal(&result.refused)),
+        MemberAction::Launch { .. } => (
+            !result.claim_retained
+                && result.processes.is_empty()
+                && result.owned_handle == command.identity.command_id
+                && result.binding_id.is_empty()
+                && result.incarnation.is_empty(),
+            is_prepare_refusal(&result.refused) || is_policy_refusal(&result.refused),
+        ),
         _ => (false, false),
     };
     if !shape || !closed || result.state != "completed" || result.model_usable {
@@ -968,7 +1068,7 @@ fn validate_launch_failure(
     if result.launch_failure.is_empty() {
         return Ok(());
     }
-    let exited = matches!(command.action, MemberAction::LaunchSingle(_))
+    let exited = command.action.launch_plan().is_some()
         && result.state == "launched"
         && !result.model_usable
         && !result.processes.is_empty()

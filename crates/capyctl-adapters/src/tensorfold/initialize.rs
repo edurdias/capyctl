@@ -64,6 +64,30 @@ pub(super) async fn initialize(
         .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
     // ADR 0014 amendment A12: note any kernel build until the step ends.
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
+    // ADR 0028 §9, §10: rank 1 serves nothing and follows rank 0; readiness
+    // is the head's, so it is never polled or probed. Its step ends once its
+    // process is recorded and present.
+    if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
+        let log = plan.engine_log.clone();
+        return crate::group::worker_spawned(
+            context,
+            tools,
+            api,
+            builds,
+            || {
+                let tail = crate::launch_failure::log_tail(log.as_deref());
+                RuntimeError::LaunchFailed(format!(
+                    "{}; log tail:\n{tail}",
+                    crate::launch_failure::summary(&tail, None)
+                ))
+            },
+            format!(
+                "tensorfold {} group follower spawned; readiness is the head's",
+                adapter.fingerprint()
+            ),
+        )
+        .await;
+    }
     // ADR 0023 §4: the ordinary bound once a build exists, the
     // whole (first-build) deadline otherwise.
     let deadline = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);

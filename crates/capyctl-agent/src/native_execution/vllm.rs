@@ -15,9 +15,10 @@
 use super::NativeHostExecution;
 use crate::{ingress_identity::NativeCredentials, journal::JournalError, session::SessionError};
 use capyctl_adapters::vllm::{
-    park_policy, plan_from_effective, PlanInputVllm, VllmAdapter, VLLM_ENTRY,
+    park_policy, plan_from_effective, with_group, PlanInputVllm, VllmAdapter, VLLM_ENTRY,
 };
 use capyctl_config::effective::EffectiveDeployment;
+use capyctl_domain::group::GroupMemberArgs;
 use capyctl_protocol::execution::SingleLaunchPlan;
 use std::path::Path;
 
@@ -37,11 +38,14 @@ fn regular_file(path: &Path) -> bool {
 }
 
 impl NativeHostExecution {
-    /// The launch plan for this host, from locally resolved policy only.
+    /// The launch plan for this host, from locally resolved policy only. ADR
+    /// 0028 §10: a group member's plan takes its parallelism and group
+    /// arguments from the group plan (`with_group`).
     pub(super) fn vllm_plan(
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
+        group: Option<GroupMemberArgs>,
     ) -> Result<PlanInputVllm, JournalError> {
         let launch = plan_from_effective(
             effective,
@@ -54,6 +58,10 @@ impl NativeHostExecution {
             self.runtime_dir.to_string_lossy().into_owned(),
         )
         .map_err(|_| JournalError::Unauthorized)?;
+        let launch = match group {
+            Some(group) => with_group(launch, group),
+            None => launch,
+        };
         // SPEC §9.1 / T21: refuse a development-mode launch this host cannot
         // guard, at authorization time, before anything durable is recorded.
         if !launch.sleep_flags.is_empty() && !guard_present(&self.runtime_dir) {
@@ -75,24 +83,26 @@ impl NativeHostExecution {
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
+        group: Option<GroupMemberArgs>,
     ) -> Result<(), JournalError> {
-        self.vllm_plan(effective, plan).map(|_| ())
+        self.vllm_plan(effective, plan, group).map(|_| ())
     }
 
     /// The vLLM adapter for this launch's loopback engine. SPEC §13.3: the engine
     /// guards `/v1` with exactly the key ingress presents, so routed inference,
-    /// the launch readiness probe and a later fresh probe all share it.
+    /// the launch readiness probe and a later fresh probe all share it. ADR
+    /// 0028 §10 / ADR 0012: a headless group worker has no keys.
     pub(super) fn vllm_adapter(
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
-        keys: &NativeCredentials,
+        keys: Option<&NativeCredentials>,
         served: &str,
     ) -> Result<VllmAdapter, SessionError> {
         let endpoint: reqwest::Url = format!("http://{}", Self::endpoint(plan))
             .parse()
             .map_err(|_| SessionError)?;
-        Ok(VllmAdapter::new(
+        let adapter = VllmAdapter::new(
             endpoint,
             None,
             effective.profile.build_fingerprint.clone(),
@@ -101,11 +111,16 @@ impl NativeHostExecution {
         )
         // ADR 0010, discrete GPU design §5: the park level is the declared
         // residency of the approved launch, never the command's.
-        .with_residency(effective.residency)
-        .with_engine_key(hex::encode(keys.inference))
-        // SPEC §9.1 / T21: the development routes are keyed with the launch's
-        // admin credential, apart from the inference key ingress presents.
-        .with_admin_key(hex::encode(keys.admin)))
+        .with_residency(effective.residency);
+        Ok(match keys {
+            Some(keys) => adapter
+                .with_engine_key(hex::encode(keys.inference))
+                // SPEC §9.1 / T21: the development routes are keyed with the
+                // launch's admin credential, apart from the inference key
+                // ingress presents.
+                .with_admin_key(hex::encode(keys.admin)),
+            None => adapter,
+        })
     }
 }
 

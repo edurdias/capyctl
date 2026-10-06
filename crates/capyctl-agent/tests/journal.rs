@@ -140,9 +140,32 @@ fn launch(id: &str) -> MemberCommand {
     use capyctl_domain::group::{
         member_id, GroupEngine, GroupPlan, GroupTopology, MemberPlan, MemberRole,
     };
+    // ADR 0028 §6: a group plan records the checkpoint digest.
+    const DIGEST: &str = "sha256:abababababababababababababababababababababababababababababababab";
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
     let mut c = command(id);
-    c.action = MemberAction::Launch(
-        GroupPlan::new(
+    c.action = MemberAction::Launch {
+        // ADR 0028 §8 (ruling R29): this host's own member launch.
+        member: capyctl_protocol::execution::SingleLaunchPlan {
+            deployment_config: golden["input"]["deployment"].to_string(),
+            profile_name: "controlled-child".into(),
+            checkpoint_fingerprint: "sha256:model".into(),
+            host_policy_fingerprint: "a".repeat(64),
+            binding_id: "01K00000000000000000000001".into(),
+            incarnation: "01K00000000000000000000002".into(),
+            grant_id: "01K00000000000000000000003".into(),
+            service_port: 31000,
+            issued_at_ms: 1,
+            coordinator_session_id: "01K00000000000000000000004".into(),
+            checkpoint_digest: DIGEST.into(),
+            checkpoint_weights_bytes: None,
+            checkpoint_state_slot_bytes: None,
+            startup_bytes: None,
+        },
+        plan: GroupPlan::new(
             GroupEngine::Vllm,
             (0..2)
                 .map(|rank| MemberPlan {
@@ -158,7 +181,7 @@ fn launch(id: &str) -> MemberCommand {
                     },
                     profile_name: "controlled-child".into(),
                     profile_fingerprint: "approved".into(),
-                    checkpoint_fingerprint: "checkpoint".into(),
+                    checkpoint_fingerprint: DIGEST.into(),
                     model_path: "/models/m".into(),
                     devices: vec!["gpu:0".into()],
                     peer_address: format!("10.0.0.{}", rank + 1).parse().unwrap(),
@@ -175,7 +198,7 @@ fn launch(id: &str) -> MemberCommand {
             1,
         )
         .unwrap(),
-    );
+    };
     sign(c)
 }
 struct ChildPolicy {
@@ -566,12 +589,18 @@ fn adapter_launch_tools_preserve_gate_ownership_and_disconnect_fence() {
     let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
     let rendered = policy.render_launch(&c).unwrap();
     let api = tools
-        .spawn_durable("adapter-launch", &rendered.command)
+        .spawn_durable(
+            &c.action.launch_plan().unwrap().incarnation,
+            &rendered.command,
+        )
         .unwrap();
     let _cleanup = ChildCleanup(api.clone());
     assert_eq!(j.inspect_owned("adapter-launch").unwrap()[0].0, api);
     assert!(tools
-        .spawn_durable("adapter-launch", &rendered.command)
+        .spawn_durable(
+            &c.action.launch_plan().unwrap().incarnation,
+            &rendered.command
+        )
         .is_err());
     assert!(matches!(
         j.accept(s, &c, 10, policy.as_ref()).unwrap(),
@@ -623,7 +652,8 @@ fn a_claimed_launchs_running_child_keeps_a_build_lock() {
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
     let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
     let rendered = policy.render_launch(&c).unwrap();
-    let api = tools.spawn_durable("building", &rendered.command).unwrap();
+    let incarnation = &c.action.launch_plan().unwrap().incarnation;
+    let api = tools.spawn_durable(incarnation, &rendered.command).unwrap();
     let _cleanup = ChildCleanup(api.clone());
     assert_eq!(j.with_claimed_processes(|p| p.to_vec()).unwrap(), vec![api]);
     assert_eq!(clear(&j), 0);

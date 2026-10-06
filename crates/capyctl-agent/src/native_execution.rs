@@ -24,7 +24,7 @@ use capyctl_config::{
     effective::EffectiveDeployment, engine_policy::Engine, remote_roles::HostConfig,
 };
 use capyctl_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
-use capyctl_domain::group::GroupPlan;
+use capyctl_domain::group::{GroupEngine, GroupPlan, MemberPlan};
 use capyctl_protocol::{
     execution::{DigestCheckpointPlan, MemberAction, MemberCommand, SingleLaunchPlan},
     pb,
@@ -122,6 +122,9 @@ pub struct NativeHostExecution {
     /// command's canonical digest. A collector run is bounded at seconds, so it
     /// never runs under the journal's locks; the locked recheck reads this.
     lock_samples: Arc<Mutex<std::collections::HashMap<[u8; 32], LockSample>>>,
+    /// ADR 0028 §7, §10 (R11): where group checks read this host's
+    /// interfaces and probe its ports.
+    probes: crate::host_checks::HostProbes,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -229,6 +232,7 @@ impl NativeHostExecution {
             engine_cache: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            probes: Default::default(),
             gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
                 crate::gpu_memory::sample,
             ))),
@@ -295,9 +299,7 @@ impl NativeHostExecution {
         &self,
         command: &MemberCommand,
     ) -> Option<crate::gpu_memory::GpuSample> {
-        if !matches!(command.action, MemberAction::LaunchSingle(_)) {
-            return None;
-        }
+        command.action.launch_plan()?;
         let effective = self.resolve(command).ok()?;
         if !charges_device(&effective) {
             return None;
@@ -323,7 +325,7 @@ impl NativeHostExecution {
             return Ok(());
         }
         match &command.action {
-            MemberAction::LaunchSingle(plan) => {
+            MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
                 self.admit_launch_full(command, plan, GpuReading::Now)?
             }
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
@@ -431,6 +433,17 @@ impl NativeHostExecution {
             Some(crate::engine_cache::EngineCacheRoot::new(dir));
         self
     }
+    /// ADR 0028 §7, §10: read interfaces and probe ports through `probes`
+    /// instead of the host's own. Tests only: a test host holds documentation
+    /// addresses no machine has.
+    #[doc(hidden)]
+    pub fn with_host_probes(
+        mut self: Arc<Self>,
+        probes: crate::host_checks::HostProbes,
+    ) -> Arc<Self> {
+        Arc::make_mut(&mut self).probes = probes;
+        self
+    }
     /// Attach the SGLang saver observation source residency evidence needs.
     pub fn with_saver_residency(mut self: Arc<Self>, saver: Arc<dyn SaverResidency>) -> Arc<Self> {
         Arc::make_mut(&mut self).saver = Some(saver);
@@ -485,7 +498,7 @@ impl NativeHostExecution {
         command: &MemberCommand,
         retained: bool,
     ) -> Result<EffectiveDeployment, JournalError> {
-        let MemberAction::LaunchSingle(plan) = &command.action else {
+        let Some(plan) = command.action.launch_plan() else {
             return Err(JournalError::Unauthorized);
         };
         let config = capyctl_config::parse_strict(
@@ -533,21 +546,46 @@ impl NativeHostExecution {
         ) {
             cold.bytes = startup.max(ready.bytes);
         }
+        // ADR 0028 §4, §8: a group member runs on exactly the plan's devices,
+        // `local_ranks` of them; a single launch on exactly one.
+        let group = group_member(command);
+        let devices = group.map_or(1, |(plan, _)| plan.topology().local_ranks as usize);
         if !matches!(
             effective.profile.engine,
             Engine::Sglang | Engine::Vllm | Engine::Tensorfold
         )
             || effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
-            || effective.selected_devices.len() != 1
+            || effective.selected_devices.len() != devices
             // Discrete GPU design §7 (review decision): with a choice of
             // GPU the launch pins the selected one; one it cannot pin (no
             // published UUID, no `gpuN` index) is refused before any effect.
             || effective.cuda_namespace().is_err()
-            || plan.service_port < effective.host.endpoint_port_range.start
-            || plan.service_port > effective.host.endpoint_port_range.end
+            // ADR 0028 §8: a worker leases no service port; a SGLang worker
+            // leases its loopback port from the same range.
+            || leased_port(command).is_some_and(|port| {
+                port < effective.host.endpoint_port_range.start
+                    || port > effective.host.endpoint_port_range.end
+            })
         {
             return Err(JournalError::Unauthorized);
+        }
+        if let Some((plan, member)) = group {
+            // ADR 0028 §4: the member's engine and devices are the plan's.
+            let engine = match plan.engine() {
+                GroupEngine::Vllm => Engine::Vllm,
+                GroupEngine::Sglang => Engine::Sglang,
+                GroupEngine::Tensorfold => Engine::Tensorfold,
+            };
+            if effective.profile.engine != engine
+                || effective
+                    .selected_devices
+                    .iter()
+                    .map(|device| device.id.as_str())
+                    .ne(member.devices.iter().map(String::as_str))
+            {
+                return Err(JournalError::Unauthorized);
+            }
         }
         // ADR 0008: a downloaded checkpoint is inside the sources store.
         let root = effective
@@ -573,13 +611,27 @@ impl NativeHostExecution {
         if !(checkpoint.starts_with(root) || outside_allowed) || !checkpoint.is_dir() {
             return Err(JournalError::Unauthorized);
         }
+        // ADR 0028 §6 (R7): a member loads its own host's path of the
+        // checkpoint, the one its plan names.
+        if let Some((_, member)) = group {
+            if std::path::Path::new(&member.model_path).canonicalize().ok() != Some(checkpoint) {
+                return Err(JournalError::Unauthorized);
+            }
+        }
+        // R11: a new member needs its interface; a retained one is resolved
+        // to be probed, charged or stopped, never rendered again.
+        let args = match self.group_args(command) {
+            Ok(args) => args,
+            Err(_) if retained => None,
+            Err(error) => return Err(error),
+        };
         if effective.profile.engine == Engine::Vllm {
-            self.admit_vllm(&effective, plan)?;
+            self.admit_vllm(&effective, plan, args.clone())?;
         }
         // ADR 0023 §3: a new launch needs its private build directory; a
         // retained one is never blocked by it (a Terminate must still run).
         if effective.profile.engine == Engine::Tensorfold && !retained {
-            self.tensorfold_plan(&effective, plan)?;
+            self.tensorfold_plan(&effective, plan, args)?;
         }
         Ok(effective)
     }
@@ -847,13 +899,13 @@ impl NativeHostExecution {
                     policy.model_store,
                 )
             });
-        let facts = crate::host_checks::read_host_facts(std::path::Path::new("/"));
+        let facts = self.probes.facts(std::path::Path::new("/"));
         crate::host_checks::prepare_member(
             plan,
             &self.host_id,
             &facts,
             &policy,
-            crate::host_checks::port_free,
+            |address, port| self.probes.port_free(address, port),
             |path| {
                 let (sources, store) = roots.as_ref()?;
                 let path = std::path::Path::new(path);
@@ -870,6 +922,46 @@ impl NativeHostExecution {
                     .map(str::to_owned)
             },
         )
+    }
+
+    /// ADR 0028 §8 (R7): a group Launch's host checks, run again just before
+    /// it is journaled: the Prepare checks ([`Self::check_group`]) and, on a
+    /// SGLang head with DP attention, the ports SGLang derives from the
+    /// rendezvous port (R33). Blocking; the `Err` is one closed code.
+    pub(crate) fn check_group_launch(&self, command: &MemberCommand) -> Result<(), String> {
+        let MemberAction::Launch { plan, member } = &command.action else {
+            return Err("unauthorized".into());
+        };
+        self.check_group(plan)?;
+        crate::host_checks::derived_ports_held(
+            plan,
+            &self.host_id,
+            dp_attention(&member.deployment_config),
+            |address, port| self.probes.port_free(address, port),
+        )
+    }
+
+    /// ADR 0028 §10 (R11): this host's arguments for its member of a group
+    /// Launch, with the interface holding its peer address, which vLLM and
+    /// SGLang render (TensorFold renders none). A member whose address no
+    /// local interface holds is refused. `None` for a single launch.
+    fn group_args(
+        &self,
+        command: &MemberCommand,
+    ) -> Result<Option<capyctl_domain::group::GroupMemberArgs>, JournalError> {
+        let Some(plan) = command.action.group_launch() else {
+            return Ok(None);
+        };
+        let mut args = capyctl_adapters::group::member_args(plan, &self.host_id)
+            .ok_or(JournalError::Unauthorized)?;
+        if plan.engine() != GroupEngine::Tensorfold {
+            args.own_interface = Some(
+                self.probes
+                    .interface_for(args.own_address)
+                    .ok_or(JournalError::Unauthorized)?,
+            );
+        }
+        Ok(Some(args))
     }
 
     /// Where a digest request's checkpoint lives on this host, from this host's
@@ -899,7 +991,7 @@ impl NativeHostExecution {
     }
 
     fn scope(&self, command: &MemberCommand) -> Result<IngressScope, JournalError> {
-        let MemberAction::LaunchSingle(plan) = &command.action else {
+        let Some(plan) = command.action.launch_plan() else {
             return Err(JournalError::Unauthorized);
         };
         Ok(IngressScope {
@@ -918,38 +1010,53 @@ impl NativeHostExecution {
         format!("127.0.0.1:{}", plan.service_port)
     }
 
-    /// The frozen SGLang recipe for this host, from local policy only.
+    /// The frozen SGLang recipe for this host, from local policy only. ADR
+    /// 0028 §10: a group member carries its group arguments, and a worker
+    /// names its loopback port as its endpoint.
     fn sglang_frozen(
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
         served: &str,
+        group: Option<capyctl_domain::group::GroupMemberArgs>,
     ) -> Result<capyctl_domain::launch::NativeLaunch, SessionError> {
-        frozen_from_effective(
+        let endpoint = match group.as_ref().and_then(|group| group.worker_port) {
+            Some(port) => format!("127.0.0.1:{port}"),
+            None => Self::endpoint(plan),
+        };
+        let frozen = frozen_from_effective(
             effective,
             &plan.binding_id,
             &plan.incarnation,
-            &Self::endpoint(plan),
+            &endpoint,
             served.into(),
             format!("host-inference-{}", plan.binding_id),
             format!("host-admin-{}", plan.binding_id),
         )
-        .map_err(|_| SessionError)
+        .map_err(|_| SessionError)?;
+        Ok(match group {
+            Some(group) => frozen.with_group(group),
+            None => frozen,
+        })
     }
 
     /// Resolve the engine-specific launch before anything durable happens.
+    /// ADR 0028 §10: `group` is a group member's arguments (`None` for a
+    /// single launch), rendered by each engine in its own spelling.
     fn prepare(
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
         served: &str,
+        group: Option<capyctl_domain::group::GroupMemberArgs>,
     ) -> Result<PreparedLaunch, SessionError> {
         match effective.profile.engine {
             Engine::Sglang => Ok(PreparedLaunch::Sglang(Box::new(
-                self.sglang_frozen(effective, plan, served)?,
+                self.sglang_frozen(effective, plan, served, group)?,
             ))),
             Engine::Vllm => Ok(PreparedLaunch::Vllm(Box::new(
-                self.vllm_plan(effective, plan).map_err(|_| SessionError)?,
+                self.vllm_plan(effective, plan, group)
+                    .map_err(|_| SessionError)?,
             ))),
             Engine::Tensorfold => {
                 // ADR 0023 §3: a build killed mid way left its lock; cleared
@@ -965,7 +1072,7 @@ impl NativeHostExecution {
                         .map_err(|_| SessionError)?;
                 }
                 Ok(PreparedLaunch::Tensorfold(Box::new(
-                    self.tensorfold_plan(effective, plan)
+                    self.tensorfold_plan(effective, plan, group)
                         .map_err(|_| SessionError)?,
                 )))
             }
@@ -973,12 +1080,16 @@ impl NativeHostExecution {
     }
 
     /// The launching adapter for a prepared launch and its journal-gated tools.
+    /// `keys` are the launch's protected credentials: the API keys of a single
+    /// launch or a group head; for a deep SGLang group worker, its admin key is
+    /// its saver observation credential (ADR 0028 §12, R12); other workers
+    /// hold none (ADR 0012: the keyed surfaces are the head's).
     fn launch_adapter(
         &self,
         prepared: PreparedLaunch,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
-        keys: &NativeCredentials,
+        keys: Option<&NativeCredentials>,
         served: &str,
         tools: Arc<dyn OwnedProcessLaunch>,
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
@@ -993,9 +1104,11 @@ impl NativeHostExecution {
                 }
                 // SPEC §8.2 / T21: the host names the launch's rendezvous
                 // directory so it can remove it after the group is gone.
+                // ADR 0028 §10: a group member has no file rendezvous.
                 if let Some(dir) = self
                     .rendezvous
                     .as_ref()
+                    .filter(|_| frozen.group().is_none())
                     .and_then(|root| root.launch_dir(&plan.incarnation))
                 {
                     adapter = adapter.with_rendezvous_dir(dir);
@@ -1010,9 +1123,20 @@ impl NativeHostExecution {
                         security.trust_remote_code,
                     ),
                 );
+                let worker = frozen.group().is_some_and(|group| !group.is_head());
+                match keys {
+                    // ADR 0028 §12 (R12): the worker's own saver credential.
+                    Some(keys) if worker => {
+                        adapter = adapter.with_observation_credential(hex::encode(keys.admin));
+                    }
+                    Some(keys) => {
+                        adapter = adapter
+                            .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin));
+                    }
+                    None => {}
+                }
                 Box::new(
                     adapter
-                        .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin))
                         .with_launch(*frozen)
                         .with_tools(tools)
                         .with_session(plan.coordinator_session_id.clone())
@@ -1052,11 +1176,14 @@ impl NativeHostExecution {
     ) -> Result<Box<dyn NativeEngine>, SessionError> {
         Ok(match effective.profile.engine {
             Engine::Sglang => Box::new(
-                SglangAdapter::from_frozen(&self.sglang_frozen(effective, plan, served)?, None)
-                    .map_err(|_| SessionError)?
-                    .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin)),
+                SglangAdapter::from_frozen(
+                    &self.sglang_frozen(effective, plan, served, None)?,
+                    None,
+                )
+                .map_err(|_| SessionError)?
+                .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin)),
             ),
-            Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, keys, served)?),
+            Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
         })
     }
@@ -1064,6 +1191,12 @@ impl NativeHostExecution {
     /// SPEC §6.1: one accepted launch, for any supported engine. Readiness is
     /// published only on the adapter's model probe; a failure after the durable
     /// attempt leaves retained ownership for the controller, never a release.
+    ///
+    /// ADR 0028 §8, §9, §11: a group member launches through the same durable
+    /// path with its group arguments. The head is a single launch's twin
+    /// (keys, ingress, readiness). A worker opens no ingress, holds no API key
+    /// and never waits for readiness: its step ends once its processes are
+    /// recorded, and the reply carries them.
     async fn launch_native(
         &self,
         session: u64,
@@ -1087,12 +1220,30 @@ impl NativeHostExecution {
             .with_device_total(|index| device_total(sample.as_ref(), index))
             .map_err(|_| SessionError)?;
         let scope = self.scope(command).map_err(|_| SessionError)?;
-        let keys = self
-            .identities
-            .load(&scope, command.identity.payload_digest)
-            .map_err(|_| SessionError)?;
+        // ADR 0028 §9: only a launch with a service port serves (a single
+        // launch or a group head).
+        let serves = plan.service_port != 0;
+        let keys = if serves {
+            Some(
+                self.identities
+                    .load(&scope, command.identity.payload_digest)
+                    .map_err(|_| SessionError)?,
+            )
+        } else if worker_observes(&effective) {
+            // ADR 0028 §12 (R12): a deep SGLang worker enrolls its saver
+            // observation with its own per-launch credential, minted and kept
+            // here like every launch secret, never on argv or in the env.
+            Some(
+                self.identities
+                    .provision_worker(&scope, command.identity.payload_digest)
+                    .map_err(|_| SessionError)?,
+            )
+        } else {
+            None
+        };
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
-        let prepared = self.prepare(&effective, plan, &served)?;
+        let group = self.group_args(command).map_err(|_| SessionError)?;
+        let prepared = self.prepare(&effective, plan, &served, group)?;
         let tools = self
             .journal
             .launch_tools(
@@ -1101,20 +1252,23 @@ impl NativeHostExecution {
                 Arc::new(self.clone()),
             )
             .map_err(|_| SessionError)?;
-        let adapter = self.launch_adapter(prepared, &effective, plan, &keys, &served, tools)?;
-        self.ingress
-            .register(
-                scope.clone(),
-                Self::endpoint(plan).parse().map_err(|_| SessionError)?,
-                served,
-                keys.gate,
-                keys.inference,
-            )
-            .map_err(|_| SessionError)?;
-        // D9: load samples name the launch the controller holds as owned handle.
-        self.ingress
-            .bind_handle(&scope, &command.identity.command_id)
-            .map_err(|_| SessionError)?;
+        let adapter =
+            self.launch_adapter(prepared, &effective, plan, keys.as_ref(), &served, tools)?;
+        if let Some(keys) = keys.as_ref().filter(|_| serves) {
+            self.ingress
+                .register(
+                    scope.clone(),
+                    Self::endpoint(plan).parse().map_err(|_| SessionError)?,
+                    served,
+                    keys.gate,
+                    keys.inference,
+                )
+                .map_err(|_| SessionError)?;
+            // D9: load samples name the launch the controller holds as owned handle.
+            self.ingress
+                .bind_handle(&scope, &command.identity.command_id)
+                .map_err(|_| SessionError)?;
+        }
         let observation = adapter
             .execute_persisted(&initialize_command(command, plan, &effective))
             .await
@@ -1124,6 +1278,11 @@ impl NativeHostExecution {
                     _ => None,
                 },
             })?;
+        if !serves {
+            // ADR 0028 §9: a worker's readiness is the head's; its spawned
+            // and recorded processes are its whole answer.
+            return Ok(());
+        }
         let id = &command.identity;
         self.journal
             .record_launch_ready(session, &id.command_id, &observation)
@@ -1134,7 +1293,11 @@ impl NativeHostExecution {
     /// Register a retained launch's exact scope with its protected credentials.
     /// A restarted host has no in-memory gate; the entry is created closed.
     fn register_retained(&self, owned: &MemberCommand) -> Result<IngressScope, SessionError> {
-        let MemberAction::LaunchSingle(plan) = &owned.action else {
+        let Some(plan) = owned
+            .action
+            .launch_plan()
+            .filter(|plan| plan.service_port != 0)
+        else {
             return Err(SessionError);
         };
         let scope = self.scope(owned).map_err(|_| SessionError)?;
@@ -1226,13 +1389,16 @@ impl NativeHostExecution {
 
     /// SPEC §13 / §13.3: the terminal refusal of a command, and for a launch
     /// the deletion of the credentials its provisioning stored: a launch refused
-    /// before any effect keeps no keys behind (T37).
+    /// before any effect keeps no keys behind (T37). `reason` is a closed code
+    /// already known (a group Launch's host checks, ADR 0028 §8); without one
+    /// the refusal's policy category is recomputed.
     async fn refused_launch(
         &self,
         command: &MemberCommand,
+        reason: Option<String>,
     ) -> Result<pb::MemberExecutionResult, SessionError> {
-        let result = self.refused(command).await?;
-        if matches!(command.action, MemberAction::LaunchSingle(_)) {
+        let result = self.refused(command, reason).await?;
+        if command.action.launch_plan().is_some() {
             if let Ok(scope) = self.scope(command) {
                 let _ = self
                     .identities
@@ -1265,9 +1431,26 @@ impl NativeHostExecution {
         let fresh = tokio::task::spawn_blocking(move || journal.precheck(session, &checked))
             .await
             .map_err(|_| SessionError)?;
+        // ADR 0028 §8 (R7, R33): a fresh group Launch runs its Prepare checks
+        // again now, before its admission, against the digest its host's
+        // DigestCheckpoint measured. One that fails them is refused with the
+        // closed code: nothing is journaled or spawned. A replay is never
+        // checked again: its own engine holds these ports.
+        if matches!(command.action, MemberAction::Launch { .. }) && matches!(fresh, Ok(true)) {
+            let host = self.clone();
+            let checked = command.clone();
+            if let Err(code) =
+                tokio::task::spawn_blocking(move || host.check_group_launch(&checked))
+                    .await
+                    .map_err(|_| SessionError)?
+            {
+                return self.refused_launch(&command, Some(code)).await;
+            }
+        }
         if matches!(
             command.action,
             MemberAction::LaunchSingle(_)
+                | MemberAction::Launch { .. }
                 | MemberAction::Park { .. }
                 | MemberAction::Restore { .. }
         ) && matches!(fresh, Ok(true))
@@ -1285,7 +1468,7 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)?
             {
                 Ok(()) => {}
-                Err(LaunchVerdict::Refused(_)) => return self.refused_launch(&command).await,
+                Err(LaunchVerdict::Refused(_)) => return self.refused_launch(&command, None).await,
                 Err(LaunchVerdict::Uncertain) => return Err(SessionError),
             }
         }
@@ -1344,13 +1527,13 @@ impl NativeHostExecution {
             Ok(acceptance) => acceptance,
             // SPEC §13: local policy refused before anything was journaled.
             // That is terminal evidence, not a reason to end the session.
-            Err(JournalError::Unauthorized) => return self.refused_launch(&command).await,
+            Err(JournalError::Unauthorized) => return self.refused_launch(&command, None).await,
             Err(_) => return Err(SessionError),
         };
         match acceptance {
             Acceptance::Replay(_) => {}
             Acceptance::Fresh(ticket) => match &command.action {
-                MemberAction::LaunchSingle(plan) => {
+                MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
                     // SPEC §§6.1, 13.2: a launch that fails (an engine that
                     // exits before readiness, an unanswered model probe) is
                     // evidence for the controller, not a lost session. Ending
@@ -1419,7 +1602,7 @@ impl NativeHostExecution {
             result.model_usable = false;
             result.observed_at_unix_ms = now;
         }
-        if matches!(command.action, MemberAction::LaunchSingle(_))
+        if command.action.launch_plan().is_some()
             && result.state == "launched"
             && !result.model_usable
             && !result.processes.is_empty()
@@ -1503,6 +1686,60 @@ impl From<SessionError> for LaunchError {
     fn from(_: SessionError) -> Self {
         Self { engine: None }
     }
+}
+
+/// ADR 0028 §8: a group Launch's plan and this command's member of it.
+fn group_member(command: &MemberCommand) -> Option<(&GroupPlan, &MemberPlan)> {
+    let plan = command.action.group_launch()?;
+    let member = plan
+        .members()
+        .iter()
+        .find(|member| member.member == command.identity.member)?;
+    Some((plan, member))
+}
+
+/// SPEC §3.1, ADR 0028 §5: the loopback port a launch leases: a single
+/// launch's or a group head's service port, a SGLang worker's loopback port,
+/// none for any other group worker (it serves nothing).
+fn leased_port(command: &MemberCommand) -> Option<u16> {
+    match &command.action {
+        MemberAction::LaunchSingle(plan) => Some(plan.service_port),
+        MemberAction::Launch { member, .. } if member.service_port != 0 => {
+            Some(member.service_port)
+        }
+        MemberAction::Launch { .. } => group_member(command).and_then(|(_, m)| m.worker_port),
+        _ => None,
+    }
+}
+
+/// ADR 0028 §12 (R12): whether a group worker of `effective` enrolls a saver
+/// observation, so needs its own observation credential: a SGLang launch with
+/// the memory saver on (a deep one).
+fn worker_observes(effective: &EffectiveDeployment) -> bool {
+    matches!(
+        &effective.engine_config,
+        capyctl_domain::launch::LaunchSettings::Sglang(settings) if settings.memory_saver
+    )
+}
+
+/// R33 (ADR 0028 §5, §13): whether a SGLang deployment document turns DP
+/// attention on, read from its own `engine_config`: the setting itself, or
+/// the flag among its extra arguments. `enable_dp_attention` is a reserved
+/// SGLang field today, so such a document is refused at resolution; this
+/// keeps the head's port checks right if it is ever admitted.
+fn dp_attention(deployment_config: &str) -> bool {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return false;
+    };
+    let config = &document["engine_config"];
+    config["enable_dp_attention"].as_bool() == Some(true)
+        || config["extra_args"].as_array().is_some_and(|args| {
+            args.iter().any(|arg| {
+                arg.as_str().is_some_and(|arg| {
+                    arg == "--enable-dp-attention" || arg.starts_with("--enable-dp-attention=")
+                })
+            })
+        })
 }
 
 /// SPEC §§6.4, 13.2: the bounded summary of a launch whose recorded processes
@@ -1610,7 +1847,13 @@ impl LocalExecutionPolicy for NativeHostExecution {
             return Err(JournalError::Unauthorized);
         }
         match &command.action {
-            MemberAction::LaunchSingle(plan) if command.identity.expected_state == "reserved" => {
+            // ADR 0028 §8: a group member's launch is admitted exactly as a
+            // single launch is, on its own member launch (its host checks ran
+            // again just before acceptance, `check_group_launch`). Like a
+            // single launch it is sent to a reserved member.
+            MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. }
+                if command.identity.expected_state == "reserved" =>
+            {
                 // ADR 0014 §7, SPEC §13: checkpoint, pool shape and memory, the
                 // same admission provisioning runs and reports when refused.
                 // This runs under the journal's locks, so the GPU is read from
@@ -1676,7 +1919,7 @@ impl LocalExecutionPolicy for NativeHostExecution {
             // sleep and collective controls, and the launch must have been
             // started with sleep mode behind the guard.
             Engine::Vllm => {
-                let launch = self.vllm_plan(&effective, plan)?;
+                let launch = self.vllm_plan(&effective, plan, None)?;
                 if capyctl_adapters::vllm::park_policy(&effective)
                     != capyctl_adapters::ParkPolicy::Enabled
                     || launch.sleep_flags.is_empty()
@@ -1702,8 +1945,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
         // SPEC §§3.1, 7.3 (per-launch claims): this host keeps one claim per
         // launch and admits a new one beside the others from its own policy.
         match &command.action {
-            MemberAction::LaunchSingle(plan) => {
-                Ok(self.admit_beside_claims(command, plan, claimed)?)
+            MemberAction::LaunchSingle(_) | MemberAction::Launch { .. } => {
+                Ok(self.admit_beside_claims(command, claimed)?)
             }
             _ if claimed.is_empty() => Ok(()),
             _ => Err(JournalError::Uncertain),
@@ -1741,7 +1984,15 @@ impl SessionExecution for NativeHostExecution {
             {
                 return Err(SessionError);
             }
-            let MemberAction::LaunchSingle(plan) = command.action.clone() else {
+            // ADR 0028 §9: a group head is provisioned like a single launch
+            // (its keys scoped by its own binding and incarnation); a worker
+            // serves nothing and is never provisioned.
+            let Some(plan) = command
+                .action
+                .launch_plan()
+                .filter(|plan| plan.service_port != 0)
+                .cloned()
+            else {
                 return Err(SessionError);
             };
             // ADR 0014 §7: admission measures the checkpoint, which on a first
@@ -3049,7 +3300,7 @@ mod tests {
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
         let (launch, plan) = tensorfold_launch(&deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
-        let (input, built) = executor.tensorfold_plan(&effective, &plan).unwrap();
+        let (input, built) = executor.tensorfold_plan(&effective, &plan, None).unwrap();
         assert!(!built);
         assert!(input
             .extensions_dir
@@ -3057,7 +3308,7 @@ mod tests {
             .ends_with("engines/tensorfold/0.6.0/torch_extensions"));
         assert_eq!(input.context_length, 8192);
         assert!(matches!(
-            executor.prepare(&effective, &plan, "toy"),
+            executor.prepare(&effective, &plan, "toy", None),
             Ok(PreparedLaunch::Tensorfold(..))
         ));
     }
@@ -3072,13 +3323,13 @@ mod tests {
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
         let (launch, plan) = tensorfold_launch(&deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
-        let (input, _) = executor.tensorfold_plan(&effective, &plan).unwrap();
+        let (input, _) = executor.tensorfold_plan(&effective, &plan, None).unwrap();
         let extension =
             std::path::Path::new(&input.extensions_dir.unwrap()).join("tensorfold_qmm_v5");
         std::fs::create_dir(&extension).unwrap();
         std::fs::write(extension.join("lock"), "").unwrap();
         assert!(matches!(
-            executor.prepare(&effective, &plan, "toy"),
+            executor.prepare(&effective, &plan, "toy", None),
             Ok(PreparedLaunch::Tensorfold(..))
         ));
         assert!(!extension.join("lock").exists());

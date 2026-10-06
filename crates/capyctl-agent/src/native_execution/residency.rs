@@ -788,15 +788,18 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)?;
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         Ok(match effective.profile.engine {
-            Engine::Vllm => Driver::Vllm(Box::new(
-                self.vllm_adapter(&effective, plan, &keys, &served)?,
-            )),
+            Engine::Vllm => Driver::Vllm(Box::new(self.vllm_adapter(
+                &effective,
+                plan,
+                Some(&keys),
+                &served,
+            )?)),
             Engine::Sglang => {
                 let journal = self.journal.clone();
                 let handle = owner.identity.command_id.clone();
                 let ingress = self.ingress.clone();
                 let gate = scope.clone();
-                let frozen = self.sglang_frozen(&effective, plan, &served)?;
+                let frozen = self.sglang_frozen(&effective, plan, &served, None)?;
                 let endpoint = frozen.metadata().endpoint.clone();
                 let inference = hex::encode(keys.inference);
                 let metrics_key = inference.clone();

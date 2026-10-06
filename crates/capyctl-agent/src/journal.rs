@@ -471,6 +471,10 @@ impl HostJournal {
             "CREATE TABLE IF NOT EXISTS park_digests(owner TEXT PRIMARY KEY,digest TEXT NOT NULL);",
         )?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS member_exits(command_id TEXT NOT NULL REFERENCES commands(command_id),role TEXT NOT NULL,pid INTEGER NOT NULL,boot TEXT NOT NULL,ticks INTEGER NOT NULL,code INTEGER,signal INTEGER,observed_at INTEGER NOT NULL,PRIMARY KEY(command_id,pid,boot,ticks));")?;
+        // ADR 0028 §11: the Terminates whose recorded group outlived SIGTERM
+        // and its bounded wait and was ended with SIGKILL. Evidence only, same
+        // schema version like member_exits.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS terminate_escalations(command_id TEXT PRIMARY KEY REFERENCES commands(command_id));")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -598,7 +602,7 @@ impl HostJournal {
         policy.authorize(command)?;
         if !matches!(
             command.action,
-            MemberAction::Launch(_)
+            MemberAction::Launch { .. }
                 | MemberAction::LaunchSingle(_)
                 | MemberAction::Inspect
                 | MemberAction::Terminate { .. }
@@ -640,7 +644,7 @@ impl HostJournal {
         }
         let claim = matches!(
             command.action,
-            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+            MemberAction::Launch { .. } | MemberAction::LaunchSingle(_)
         );
         if claim {
             // SPEC §§3.1, 7.3: one claim per instance incarnation; a second
@@ -851,7 +855,7 @@ impl HostJournal {
             )),
         })));
         match &command.action {
-            MemberAction::Launch(_) | MemberAction::LaunchSingle(_) => {
+            MemberAction::Launch { .. } | MemberAction::LaunchSingle(_) => {
                 let rendered = policy.render_launch(&command)?;
                 before_deadline(clock.as_ref(), command.identity.deadline_ms)?;
                 self.check_session(ticket.session)?;
@@ -905,11 +909,15 @@ impl HostJournal {
                 };
                 before_deadline(clock.as_ref(), command.identity.deadline_ms)?;
                 self.check_session(ticket.session)?;
-                if !identities.is_empty() {
+                // ADR 0028 §11: SIGTERM, a bounded wait, then SIGKILL; whether
+                // SIGKILL was needed is journaled with this Terminate.
+                let escalated = if identities.is_empty() {
+                    false
+                } else {
                     tools
-                        .terminate_owned(&identities, Duration::from_secs(2))
-                        .map_err(|_| JournalError::Uncertain)?;
-                }
+                        .terminate_escalating(&identities, Duration::from_secs(2))
+                        .map_err(|_| JournalError::Uncertain)?
+                };
                 let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
                 let tx = db.transaction()?;
                 // A compacted tombstone keeps its tombstone state; its claim was
@@ -920,6 +928,12 @@ impl HostJournal {
                 )?;
                 // A launch proven gone has no residency left to track (W4).
                 tx.execute("DELETE FROM residency WHERE owner=?1", [owned_handle])?;
+                if escalated {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO terminate_escalations(command_id) VALUES(?1)",
+                        [&ticket.command_id],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE commands SET state=3 WHERE command_id=?1",
                     [&ticket.command_id],
@@ -980,7 +994,7 @@ impl HostJournal {
                 if !same_owner(&owner, command)
                     || !matches!(
                         owner.action,
-                        MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+                        MemberAction::Launch { .. } | MemberAction::LaunchSingle(_)
                     )
                 {
                     return Err(JournalError::Unauthorized);
@@ -1036,7 +1050,7 @@ impl HostJournal {
         policy.authorize(&command)?;
         if matches!(
             command.action,
-            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+            MemberAction::Launch { .. } | MemberAction::LaunchSingle(_)
         ) {
             // Defense in depth: the launch still fits beside every other
             // claim this host retains, just before its durable attempt.
@@ -1074,13 +1088,13 @@ impl HostJournal {
         let command = self.begin_attempt(&ticket, clock.as_ref(), policy.as_ref())?;
         if !matches!(
             command.action,
-            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+            MemberAction::Launch { .. } | MemberAction::LaunchSingle(_)
         ) {
             return Err(JournalError::Unauthorized);
         }
-        let incarnation = match &command.action {
-            MemberAction::LaunchSingle(plan) => plan.incarnation.clone(),
-            _ => ticket.command_id.clone(),
+        let incarnation = match command.action.launch_plan() {
+            Some(plan) => plan.incarnation.clone(),
+            None => ticket.command_id.clone(),
         };
         let tools = DurableProcessLaunch::new(Arc::new(JournalAssociation {
             journal: Arc::downgrade(self),
@@ -1175,7 +1189,7 @@ impl HostJournal {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             load_command(&db, command_id)?
         };
-        let MemberAction::LaunchSingle(plan) = &command.action else {
+        let Some(plan) = command.action.launch_plan() else {
             return Err(JournalError::Unauthorized);
         };
         let identity = &command.identity;
@@ -1230,6 +1244,32 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         db.execute("INSERT INTO native_results(command_id,result) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET result=excluded.result", params![command_id, result.encode_to_vec()])?;
         Ok(())
+    }
+
+    /// ADR 0028 §8 (R23): the group Launch this host journaled for
+    /// `member_id` of `deployment`'s instance `instance` at `generation`, if
+    /// any: the member launch's key. Evidence only, never authority.
+    pub fn group_launch(
+        &self,
+        deployment: &str,
+        instance: u32,
+        generation: i64,
+        member_id: &str,
+    ) -> Result<Option<String>, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let ids = db
+            .prepare("SELECT command_id FROM commands WHERE deployment=?1 AND instance=?2 AND generation=?3 AND member=?4 AND body IS NOT NULL ORDER BY sequence")?
+            .query_map(params![deployment, instance, generation, member_id], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in ids {
+            if matches!(load_command(&db, &id)?.action, MemberAction::Launch { .. }) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// SPEC §§6.1, 13.2 (G2): the group a fresh probe of `owned_handle` must find.
@@ -1617,7 +1657,7 @@ impl HostJournal {
             | MemberAction::Probe { owned_handle }
             | MemberAction::Park { owned_handle }
             | MemberAction::Restore { owned_handle, .. } => owned_handle.clone(),
-            MemberAction::Launch(_) | MemberAction::LaunchSingle(_) => command_id.into(),
+            MemberAction::Launch { .. } | MemberAction::LaunchSingle(_) => command_id.into(),
             _ => String::new(),
         };
         let unknown_probe_target = matches!(command.action, MemberAction::Probe { .. }) && {
@@ -1662,9 +1702,17 @@ impl HostJournal {
             let retained = crate::journal::record(&db, &handle)?.claim_retained;
             (observations, retained)
         };
-        let bound = |action: &MemberAction| match action {
-            MemberAction::LaunchSingle(plan) => (plan.binding_id.clone(), plan.incarnation.clone()),
-            _ => (String::new(), String::new()),
+        // ADR 0028 §4, §8: the launch these processes belong to, for the
+        // roles a group worker reports them under.
+        let owner = if handle.is_empty() || handle == command_id {
+            Some(command.clone())
+        } else {
+            let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+            load_command(&db, &handle).ok()
+        };
+        let bound = |action: &MemberAction| match action.launch_plan() {
+            Some(plan) => (plan.binding_id.clone(), plan.incarnation.clone()),
+            None => (String::new(), String::new()),
         };
         let (binding_id, incarnation) = match &command.action {
             // A probe, park or restore reports on the binding of the launch it
@@ -1693,7 +1741,7 @@ impl HostJournal {
             processes: processes
                 .into_iter()
                 .map(|(p, presence)| pb::OwnedProcessObservation {
-                    role: p.role,
+                    role: reported_role(owner.as_ref(), p.role),
                     pid: p.pid,
                     boot_id: p.boot_id,
                     start_ticks: p.start_ticks,
@@ -1727,6 +1775,15 @@ impl HostJournal {
             // ADR 0008: MaterializeSource is never journaled either.
             source: None,
             kernel_builds: Vec::new(),
+            // ADR 0028 §11: whether this Terminate needed SIGKILL.
+            escalated: matches!(command.action, MemberAction::Terminate { .. }) && {
+                let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+                db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM terminate_escalations WHERE command_id=?1)",
+                    [command_id],
+                    |r| r.get::<_, bool>(0),
+                )?
+            },
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -1903,6 +1960,28 @@ fn alive_identities(result: &pb::MemberExecutionResult) -> Vec<ProcessIdentity> 
             start_ticks: p.start_ticks,
         })
         .collect()
+}
+
+/// ADR 0028 §4, §8: the role one process of a launch is reported under. A
+/// group worker reports its member id (`worker-<r>`) for the process it
+/// spawned (recorded as the launch's `api` leader) and prefixes every other
+/// role with it, so its whole tree is named for the member. A single launch
+/// and a group head report the roles as recorded.
+fn reported_role(owner: Option<&MemberCommand>, role: String) -> String {
+    let Some(owner) = owner else {
+        return role;
+    };
+    match &owner.action {
+        MemberAction::Launch { member, .. } if member.service_port == 0 => {
+            let id = &owner.identity.member.member_id;
+            if role == "api" {
+                id.clone()
+            } else {
+                format!("{id}/{role}")
+            }
+        }
+        _ => role,
+    }
 }
 /// ADR 0016: whether `handle` names only the fence a Terminate wrote for a
 /// launch this host never accepted (no body, operation `fenced:<command>`),

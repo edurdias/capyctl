@@ -160,6 +160,25 @@ impl IngressIdentities {
     ) -> Result<NativeCredentials, IngressIdentityError> {
         load(&self.storage, scope, command_digest)
     }
+    /// ADR 0028 §12 (R12), ADR 0012: the credentials of a group worker, which
+    /// the server never provisions. Its gate opens no ingress (a worker has
+    /// none); its admin key is the worker's saver observation credential.
+    /// Minted once per launch, kept like every launch's (so a restarted host
+    /// still observes the worker) and retired with it; never logged.
+    pub fn provision_worker(
+        &self,
+        scope: &IngressScope,
+        command_digest: [u8; 32],
+    ) -> Result<NativeCredentials, IngressIdentityError> {
+        if let Some(bytes) = self
+            .storage
+            .read_bundle(&name(scope)?)
+            .map_err(|_| IngressIdentityError)?
+        {
+            return decode(&bytes, scope, command_digest);
+        }
+        provision(&self.storage, scope, command_digest, key()?)
+    }
     /// SPEC §13.3 / T37: delete the credentials of exactly this launch (scope
     /// and command digest) once it is settled: proven gone, or refused before
     /// any effect. A bundle naming another launch is left alone.

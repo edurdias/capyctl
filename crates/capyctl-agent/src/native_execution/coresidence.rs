@@ -182,7 +182,6 @@ impl NativeHostExecution {
     pub(super) fn admit_beside_claims(
         &self,
         command: &MemberCommand,
-        plan: &SingleLaunchPlan,
         claimed: &[ClaimedLaunch],
     ) -> Result<(), LaunchVerdict> {
         let refused = LaunchVerdict::Refused;
@@ -197,7 +196,7 @@ impl NativeHostExecution {
                     &effective.resources,
                     ClaimPhase::Starting,
                     domain,
-                    Some(plan.service_port),
+                    super::leased_port(command),
                 )
             },
             |domain, limit| self.claim_charges(claimed, domain, limit),
@@ -240,12 +239,12 @@ impl NativeHostExecution {
         claimed
             .iter()
             .map(|claim| {
-                let port = match &claim.command.action {
-                    MemberAction::LaunchSingle(plan) => Some(plan.service_port),
-                    _ => None,
-                };
+                // ADR 0028 §5: a group member is charged on its own host like
+                // a single launch, with the port it leases (none on a worker
+                // that serves nothing).
+                let port = super::leased_port(&claim.command);
                 match &claim.command.action {
-                    MemberAction::LaunchSingle(_) => self
+                    MemberAction::LaunchSingle(_) | MemberAction::Launch { .. } => self
                         .resolve_retained(&claim.command)
                         .ok()
                         .map(|retained| charge(&retained.resources, claim.phase, domain, port)),
@@ -275,7 +274,7 @@ impl NativeHostExecution {
             .journal
             .claimed_launches(&command.identity.command_id)
             .map_err(|_| LaunchVerdict::Uncertain)?;
-        self.admit_beside_claims(command, plan, &claimed)
+        self.admit_beside_claims(command, &claimed)
     }
 }
 

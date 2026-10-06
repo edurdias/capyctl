@@ -45,6 +45,11 @@ pub struct HostFacts {
 /// `proc` and `dev` files are read under it. The memlock limit and the local
 /// addresses are the process's own and the kernel's, whatever `root` is.
 pub fn read_host_facts(root: &Path) -> HostFacts {
+    read_host_facts_with(root, &interfaces())
+}
+
+/// [`read_host_facts`] with the local addresses taken from `interfaces`.
+fn read_host_facts_with(root: &Path, interfaces: &[(String, IpAddr)]) -> HostFacts {
     // ADR 0028 §7 (owner decision 10): read, never change.
     let compaction_proactiveness =
         std::fs::read_to_string(root.join("proc/sys/vm/compaction_proactiveness"))
@@ -54,10 +59,7 @@ pub fn read_host_facts(root: &Path) -> HostFacts {
         compaction_proactiveness,
         memlock_soft: memlock_soft(),
         infiniband: infiniband_access(&root.join("dev/infiniband")),
-        local_addresses: interfaces()
-            .into_iter()
-            .map(|(_, address)| address)
-            .collect(),
+        local_addresses: interfaces.iter().map(|(_, address)| *address).collect(),
     }
 }
 
@@ -140,11 +142,105 @@ fn interfaces() -> Vec<(String, IpAddr)> {
 /// name a group launch's socket interface is resolved from. `None` when no
 /// local interface holds it.
 pub fn interface_for(address: IpAddr) -> Option<String> {
+    interface_in(&interfaces(), address)
+}
+
+fn interface_in(interfaces: &[(String, IpAddr)], address: IpAddr) -> Option<String> {
     let address = address.to_canonical();
-    interfaces()
-        .into_iter()
+    interfaces
+        .iter()
         .find(|(_, local)| local.to_canonical() == address)
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.clone())
+}
+
+type InterfaceSource = dyn Fn() -> Vec<(String, IpAddr)> + Send + Sync;
+type PortProbe = dyn Fn(IpAddr, u16) -> bool + Send + Sync;
+
+/// ADR 0028 §7, §10 (R11): where a host's group checks read its interfaces
+/// and probe its ports: `getifaddrs` and [`port_free`] on a real host. A test
+/// host substitutes both, so a launch can be checked against documentation
+/// addresses no machine holds.
+#[derive(Clone)]
+pub struct HostProbes {
+    interfaces: std::sync::Arc<InterfaceSource>,
+    port_free: std::sync::Arc<PortProbe>,
+}
+
+impl Default for HostProbes {
+    fn default() -> Self {
+        Self {
+            interfaces: std::sync::Arc::new(interfaces),
+            port_free: std::sync::Arc::new(port_free),
+        }
+    }
+}
+
+impl HostProbes {
+    /// Probes reading `interfaces` and asking `port_free`. Tests only.
+    #[doc(hidden)]
+    pub fn with(
+        interfaces: impl Fn() -> Vec<(String, IpAddr)> + Send + Sync + 'static,
+        port_free: impl Fn(IpAddr, u16) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            interfaces: std::sync::Arc::new(interfaces),
+            port_free: std::sync::Arc::new(port_free),
+        }
+    }
+    /// This host's facts, its local addresses from these probes.
+    pub fn facts(&self, root: &Path) -> HostFacts {
+        read_host_facts_with(root, &(self.interfaces)())
+    }
+    /// R11: the interface holding `address`, if any.
+    pub fn interface_for(&self, address: IpAddr) -> Option<String> {
+        interface_in(&(self.interfaces)(), address)
+    }
+    /// Whether `port` is free for a listener on `address` ([`port_free`]).
+    pub fn port_free(&self, address: IpAddr, port: u16) -> bool {
+        (self.port_free)(address, port)
+    }
+}
+
+/// R33 (ADR 0028 §5, §13): the ports SGLang 0.5.21 derives from its
+/// rendezvous port `port` on the head when DP attention is on: six from
+/// `port + 1`, or from `port - 7` when `port + 7` would pass 65535. `None`
+/// when no such run of ports exists (no `u16` wrap).
+pub fn dp_attention_ports(port: u16) -> Option<std::ops::RangeInclusive<u16>> {
+    let base = if port.checked_add(7).is_none() {
+        port.checked_sub(7)?
+    } else {
+        port.checked_add(1)?
+    };
+    Some(base..=base.checked_add(5)?)
+}
+
+/// R33: on a SGLang head with DP attention, the first derived port held
+/// outside CapyCTL, as `rendezvous_port_in_use:<port>`. Nothing for any other
+/// member, engine or a group without DP attention.
+pub fn derived_ports_held(
+    plan: &GroupPlan,
+    host_id: &str,
+    dp_attention: bool,
+    port_free: impl Fn(IpAddr, u16) -> bool,
+) -> Result<(), String> {
+    let Some(member) = plan.members().iter().find(|m| m.member.host_id == host_id) else {
+        return Ok(());
+    };
+    if !dp_attention
+        || member.role != MemberRole::Head
+        || plan.engine() != capyctl_domain::group::GroupEngine::Sglang
+    {
+        return Ok(());
+    }
+    let ports = dp_attention_ports(plan.rendezvous_port())
+        .ok_or_else(|| format!("rendezvous_port_in_use:{}", plan.rendezvous_port()))?;
+    match ports
+        .into_iter()
+        .find(|port| !port_free(member.peer_address, *port))
+    {
+        Some(port) => Err(format!("rendezvous_port_in_use:{port}")),
+        None => Ok(()),
+    }
 }
 
 /// ADR 0028 §7: the outcome of the host checks. `warnings` never stop a
@@ -673,5 +769,88 @@ mod tests {
         assert!(port_free(loopback, port));
         // Bind and drop: the probe left nothing bound.
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    /// `plan` on rendezvous port `port`.
+    fn on_port(plan: &GroupPlan, port: u16) -> GroupPlan {
+        GroupPlan::new(
+            plan.engine(),
+            plan.members().to_vec(),
+            plan.topology(),
+            port,
+            plan.generation(),
+        )
+        .unwrap()
+    }
+
+    // R33 (ADR 0028 §5, §13), Review Focus 2: with DP attention a SGLang head
+    // also needs the six ports SGLang 0.5.21 derives from the rendezvous port:
+    // from P+1, or from P-7 when P+7 passes 65535. The first one held refuses,
+    // named; nothing is probed on a worker, on another engine, or without DP
+    // attention.
+    #[test]
+    fn dp_attention_probes_the_derived_head_ports() {
+        assert_eq!(dp_attention_ports(25000), Some(25001..=25006));
+        assert_eq!(dp_attention_ports(65528), Some(65529..=65534));
+        assert_eq!(dp_attention_ports(65529), Some(65522..=65527));
+        assert_eq!(dp_attention_ports(65535), Some(65528..=65533));
+        assert_eq!(dp_attention_ports(3), Some(4..=9));
+        let sglang = sample_plan(GroupEngine::Sglang);
+        let probed = std::cell::RefCell::new(Vec::new());
+        let held = |held: u16| {
+            let probed = &probed;
+            move |address: IpAddr, port: u16| {
+                assert_eq!(address, "192.0.2.10".parse::<IpAddr>().unwrap());
+                probed.borrow_mut().push(port);
+                port != held
+            }
+        };
+        assert_eq!(
+            derived_ports_held(&sglang, "host-a", true, held(25003)),
+            Err("rendezvous_port_in_use:25003".into())
+        );
+        assert_eq!(*probed.borrow(), [25001, 25002, 25003]);
+        probed.borrow_mut().clear();
+        assert_eq!(
+            derived_ports_held(&on_port(&sglang, 65530), "host-a", true, held(65525)),
+            Err("rendezvous_port_in_use:65525".into())
+        );
+        assert_eq!(*probed.borrow(), [65523, 65524, 65525]);
+        probed.borrow_mut().clear();
+        assert_eq!(
+            derived_ports_held(&on_port(&sglang, 65530), "host-a", true, held(1)),
+            Ok(())
+        );
+        assert_eq!(*probed.borrow(), (65523..=65528).collect::<Vec<_>>());
+        probed.borrow_mut().clear();
+        for (plan, host, dp) in [
+            (&sglang, "host-a", false),
+            (&sglang, "host-b", true),
+            (&sample_plan(GroupEngine::Vllm), "host-a", true),
+        ] {
+            assert_eq!(derived_ports_held(plan, host, dp, held(25001)), Ok(()));
+        }
+        assert!(probed.borrow().is_empty(), "nothing extra is probed");
+    }
+
+    // R11, R33: substituted probes answer the checks instead of the host.
+    #[test]
+    fn substituted_probes_answer_for_the_host() {
+        let probes = HostProbes::with(
+            || vec![("eth9".into(), "192.0.2.11".parse().unwrap())],
+            |_, port| port != 8101,
+        );
+        assert_eq!(
+            probes
+                .interface_for("192.0.2.11".parse().unwrap())
+                .as_deref(),
+            Some("eth9")
+        );
+        assert_eq!(probes.interface_for("192.0.2.12".parse().unwrap()), None);
+        assert!(!probes.port_free("127.0.0.1".parse().unwrap(), 8101));
+        assert_eq!(
+            probes.facts(Path::new("/")).local_addresses,
+            vec!["192.0.2.11".parse::<IpAddr>().unwrap()]
+        );
     }
 }
