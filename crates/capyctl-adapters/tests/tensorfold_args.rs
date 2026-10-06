@@ -4,7 +4,9 @@ use capyctl_adapters::tensorfold::{
     engine_environment, plan_from_effective, render_command, PlanInputTensorfold,
     TensorfoldArgsError, TensorfoldPlanError,
 };
+use capyctl_adapters::traits::RenderedCommand;
 use capyctl_config::effective::{derived_initialize_ms, resolve_effective};
+use capyctl_domain::group::GroupMemberArgs;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -458,4 +460,255 @@ fn a_rendered_parallel_beside_a_passed_one_is_refused() {
         );
         input.engine_args.clear();
     }
+}
+
+// ADR 0028 §10: TensorFold two-rank groups. CPU tests of the rendered command
+// only; the live rows MN1–MN9 are the qualification.
+
+fn has_pair(argv: &[String], flag: &str, value: &str) -> bool {
+    argv.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
+
+fn member(rank: u32) -> GroupMemberArgs {
+    GroupMemberArgs {
+        tensor_parallel: 2,
+        pipeline_parallel: 1,
+        nnodes: 2,
+        node_rank: rank,
+        head_address: "192.0.2.10".parse().unwrap(),
+        rendezvous_port: 25000,
+        own_address: format!("192.0.2.{}", 10 + rank).parse().unwrap(),
+        worker_port: None,
+        own_interface: None,
+    }
+}
+
+fn tf_group(rank: u32) -> PlanInputTensorfold {
+    PlanInputTensorfold {
+        engine_bin: "/opt/tf/bin/tensorfold".into(),
+        engine_path_extra: Some("/opt/tf/bin".into()),
+        model_path: "/models/m".into(),
+        served_model_name: "m".into(),
+        port: 8100,
+        context_length: 32768,
+        parallel: Some(4),
+        kv_dtype: Some("fp8".into()),
+        memory_limit_bytes: Some(58 << 30),
+        engine_log: Some("/var/lib/capyctl/logs/i.log".into()),
+        group: Some(member(rank)),
+        ..PlanInputTensorfold::default()
+    }
+}
+
+fn tf_group_with_drafter(rank: u32) -> PlanInputTensorfold {
+    let mut input = tf_group(rank);
+    input.engine_args = vec!["--drafter".into(), "/srv/drafters/d".into()];
+    input
+}
+
+// T14: both ranks render the two-rank flags right after the model path; only
+// rank 0 serves.
+#[test]
+fn two_rank_flags() {
+    let head = render_command(&tf_group(0)).unwrap();
+    let follower = render_command(&tf_group(1)).unwrap();
+    for (cmd, rank) in [(&head, "0"), (&follower, "1")] {
+        assert_eq!(
+            cmd.argv[..11],
+            [
+                "/opt/tf/bin/tensorfold",
+                "serve",
+                "/models/m",
+                "--tp",
+                "2",
+                "--rank",
+                rank,
+                "--master",
+                "192.0.2.10",
+                "--master-port",
+                "25000",
+            ]
+        );
+    }
+    for (f, v) in [("--name", "m"), ("--host", "127.0.0.1"), ("--port", "8100")] {
+        assert!(has_pair(&head.argv, f, v), "{f} {v}");
+    }
+    for absent in ["--host", "--port", "--name"] {
+        assert!(!follower.argv.iter().any(|a| a == absent), "{absent}");
+    }
+    assert_eq!(
+        follower.argv[11..],
+        [
+            "--no-update-check",
+            "--backend",
+            "cuda",
+            "--snapshot-dir",
+            "none",
+            "--context",
+            "32768",
+            "--parallel",
+            "4",
+            "--kv-dtype",
+            "fp8",
+            "--drafter",
+            "none",
+        ]
+    );
+}
+
+// T14: both ranks carry equal context, `--parallel`, KV dtype, drafter and
+// pass-through arguments (TensorFold requires agreement), and the same memory cap
+// (ADR 0025, per rank on its own host).
+#[test]
+fn ranks_agree_on_context_parallel_drafter_and_cap() {
+    let tail = |c: &RenderedCommand| {
+        c.argv
+            .iter()
+            .skip_while(|a| *a != "--context")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for build in [tf_group, tf_group_with_drafter] {
+        let head = render_command(&build(0)).unwrap();
+        let follower = render_command(&build(1)).unwrap();
+        assert_eq!(tail(&head), tail(&follower));
+        assert_eq!(head.env, follower.env);
+    }
+    let drafted = render_command(&tf_group_with_drafter(1)).unwrap();
+    assert!(has_pair(&drafted.argv, "--drafter", "/srv/drafters/d"));
+    assert_eq!(drafted.env["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58");
+}
+
+// T03: any shape other than TP 2, PP 1 on two members is refused; the user
+// still cannot pass `--tp`, `--rank`, `--master` or `--master-port`.
+#[test]
+fn other_shapes_and_user_flags_are_refused() {
+    let shapes: [fn(&mut GroupMemberArgs); 7] = [
+        |g| g.pipeline_parallel = 2,
+        |g| g.tensor_parallel = 4,
+        |g| g.tensor_parallel = 1,
+        |g| g.nnodes = 3,
+        |g| g.node_rank = 2,
+        |g| g.rendezvous_port = 0,
+        |g| g.worker_port = Some(8101),
+    ];
+    for (i, change) in shapes.iter().enumerate() {
+        for rank in [0, 1] {
+            let mut input = tf_group(rank);
+            change(input.group.as_mut().unwrap());
+            assert!(
+                matches!(render_command(&input), Err(TensorfoldArgsError::GroupShape)),
+                "shape {i} rank {rank}"
+            );
+        }
+    }
+    let mut head = tf_group(0);
+    head.group.as_mut().unwrap().own_address = "192.0.2.11".parse().unwrap();
+    assert!(matches!(
+        render_command(&head),
+        Err(TensorfoldArgsError::GroupShape)
+    ));
+    for flag in ["--tp", "--rank", "--master", "--master-port"] {
+        for mut input in [tf_group(0), tf_group(1), plan()] {
+            input.extra_args = vec![flag.into(), "1".into()];
+            assert!(
+                matches!(
+                    render_command(&input),
+                    Err(TensorfoldArgsError::Reserved(_))
+                ),
+                "{flag}"
+            );
+            input.extra_args.clear();
+            input.engine_args = vec![flag.into(), "1".into()];
+            assert!(
+                matches!(
+                    render_command(&input),
+                    Err(TensorfoldArgsError::Reserved(_))
+                ),
+                "{flag}"
+            );
+        }
+    }
+}
+
+// T21 T37: no transport, rendezvous or TF_COMM variable is rendered or inherited,
+// even with an interface known (R11 applies to the torch-gloo engines only); the
+// follower's final spawned environment holds no key material and equals the head's.
+#[test]
+fn no_transport_variables_and_no_credentials() {
+    let inherited = |name: &str| match name {
+        "HOME" => Some("/home/svc".to_string()),
+        "CUDA_VISIBLE_DEVICES" => Some("0".to_string()),
+        "NCCL_SOCKET_IFNAME"
+        | "NCCL_IB_HCA"
+        | "GLOO_SOCKET_IFNAME"
+        | "MASTER_ADDR"
+        | "MASTER_PORT"
+        | "TF_COMM_BACKEND"
+        | "TF_NCCL_LIB"
+        | "VLLM_API_KEY"
+        | "CAPYCTL_VLLM_ADMIN_KEY"
+        | "VLLM_HOST_IP" => Some("bad".to_string()),
+        _ => None,
+    };
+    let owned = |k: &String| {
+        ["NCCL_", "GLOO_", "MASTER_", "TF_COMM", "TF_NCCL"]
+            .iter()
+            .any(|p| k.starts_with(p))
+    };
+    let mut spawned = Vec::new();
+    for rank in [0, 1] {
+        let mut input = tf_group(rank);
+        input.group.as_mut().unwrap().own_interface = Some("enp1s0f0".into());
+        let cmd = render_command(&input).unwrap();
+        assert!(!cmd.env.keys().any(owned), "{:?}", cmd.env);
+        let env = engine_environment(&cmd.env, &input, &inherited, &BTreeMap::new());
+        assert!(!env.keys().any(owned), "{env:?}");
+        for absent in ["VLLM_API_KEY", "CAPYCTL_VLLM_ADMIN_KEY", "VLLM_HOST_IP"] {
+            assert!(!env.contains_key(absent), "{absent}");
+        }
+        assert!(!env.values().any(|v| v == "bad"), "{env:?}");
+        assert!(!cmd
+            .argv
+            .iter()
+            .any(|a| a.contains("key") || a.contains("enp1s0f0")));
+        spawned.push(env);
+    }
+    assert_eq!(spawned[0], spawned[1]);
+}
+
+// T39: a single-rank launch renders exactly today's command; no two-rank flag.
+#[test]
+fn single_rank_argv_is_unchanged() {
+    let mut input = plan();
+    input.parallel = Some(4);
+    input.kv_dtype = Some("fp8".into());
+    assert_eq!(input.group, None);
+    assert_eq!(
+        render_command(&input).unwrap().argv,
+        [
+            "/opt/tf/bin/tensorfold",
+            "serve",
+            "/srv/models/nemotron",
+            "--name",
+            "nemotron",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8101",
+            "--no-update-check",
+            "--backend",
+            "cuda",
+            "--snapshot-dir",
+            "none",
+            "--context",
+            "32768",
+            "--parallel",
+            "4",
+            "--kv-dtype",
+            "fp8",
+            "--drafter",
+            "none",
+        ]
+    );
 }

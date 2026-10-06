@@ -189,7 +189,8 @@ const SGLANG_RESERVED_ALIASES: &[&str] = &[
 /// ADR 0023 §3: TensorFold 0.6.0 to 0.6.5 `serve` options capyctl renders or forbids
 /// (`tensorfold/cli_args.py`). `--drafter` is not here: like other engines'
 /// draft model options it is an approved path option. `--tp`, `--rank`,
-/// `--master` and `--master-port` belong to multi-rank, which is out of scope.
+/// `--master` and `--master-port` are rendered by capyctl for a two-rank group
+/// member (ADR 0028 §10) and never stated by the user.
 /// `--api-key`, `--api-key-file` and `--metrics-open` (0.6.5) are reserved as
 /// vLLM's `--api-key` is: capyctl owns authentication, and an engine key would
 /// lock capyctl out of the engine's routes and `/metrics`.
