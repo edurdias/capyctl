@@ -637,7 +637,7 @@ fn other_shapes_and_user_flags_are_refused() {
 #[test]
 fn no_transport_variables_and_no_credentials() {
     let inherited = |name: &str| match name {
-        "HOME" => Some("/home/svc".to_string()),
+        "HOME" => Some("/var/lib/capyctl-test".to_string()),
         "CUDA_VISIBLE_DEVICES" => Some("0".to_string()),
         "NCCL_SOCKET_IFNAME"
         | "NCCL_IB_HCA"
@@ -668,6 +668,9 @@ fn no_transport_variables_and_no_credentials() {
             assert!(!env.contains_key(absent), "{absent}");
         }
         assert!(!env.values().any(|v| v == "bad"), "{env:?}");
+        // The ordinary pass-throughs still reach every rank.
+        assert_eq!(env["HOME"], "/var/lib/capyctl-test");
+        assert_eq!(env["CUDA_VISIBLE_DEVICES"], "0");
         assert!(!cmd
             .argv
             .iter()
