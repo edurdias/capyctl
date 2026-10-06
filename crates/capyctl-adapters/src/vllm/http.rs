@@ -160,6 +160,29 @@ impl EngineHttp {
         self.get_ok("/health").await.map(|()| true)
     }
 
+    /// ADR 0028 §9 (decided 2026-10-06): the completion probe in vLLM's form,
+    /// `POST /v1/completions` with `return_token_ids`, on this engine's
+    /// loopback endpoint with its inference key (the guard admits it on
+    /// `/v1`). Answers `choices[0].token_ids`.
+    pub async fn complete_token_ids(
+        &self,
+        served: &str,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> Result<Vec<u32>, crate::traits::AdapterError> {
+        use crate::completion_probe as probe;
+        let key = self.api_key.as_deref().and_then(probe::bearer);
+        let answer = probe::post(
+            &self.client,
+            self.url(probe::OPENAI_PATH),
+            key.as_ref(),
+            &probe::openai_request(served, max_tokens),
+            bound,
+        )
+        .await?;
+        probe::openai_token_ids(&answer)
+    }
+
     /// Served model ids from `/v1/models`. Presence of the deployment's
     /// model id is the readiness signal.
     pub async fn list_models(&self) -> Result<Vec<String>, HttpError> {

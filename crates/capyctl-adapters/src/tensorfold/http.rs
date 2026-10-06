@@ -110,4 +110,30 @@ impl Http {
             ),
         })
     }
+
+    /// ADR 0028 §9 (decided 2026-10-06): the completion probe in TensorFold's
+    /// OpenAI form, `POST /v1/completions` with `return_token_ids`, on its
+    /// loopback endpoint (TensorFold takes no key, ADR 0023 §3). Bounded by
+    /// `bound`, not the short read bound. Answers `choices[0].token_ids`.
+    pub(crate) async fn complete_token_ids(
+        &self,
+        served: &str,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> Result<Vec<u32>, AdapterError> {
+        use crate::completion_probe as probe;
+        let url = self
+            .base
+            .join(probe::OPENAI_PATH)
+            .map_err(|_| AdapterError::Uncertain("bad engine URL".into()))?;
+        let answer = probe::post(
+            &self.client,
+            url,
+            None,
+            &probe::openai_request(served, max_tokens),
+            bound,
+        )
+        .await?;
+        probe::openai_token_ids(&answer)
+    }
 }

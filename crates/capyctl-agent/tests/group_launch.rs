@@ -103,13 +103,25 @@ if os.path.exists(os.path.join(here, "late-children")):
         os.replace(os.path.join(here, label + ".tmp"), os.path.join(here, label))
     threading.Thread(target=late, args=(0.4, "late-1"), daemon=True).start()
     threading.Thread(target=late, args=(3.0, "late-2"), daemon=True).start()
-if worker or engine != "sglang":
+if worker or engine == "tensorfold":
     while True:
         time.sleep(0.5)
-port = int(settings["endpoint"].rsplit(":", 1)[1])
-served = settings["served_name"]
-fd = int(args[args.index("--inference-credential-fd") + 1])
-key = os.pread(fd, 4096, 0).decode().strip()
+if engine == "sglang":
+    port = int(settings["endpoint"].rsplit(":", 1)[1])
+    served = settings["served_name"]
+    fd = int(args[args.index("--inference-credential-fd") + 1])
+    key = os.pread(fd, 4096, 0).decode().strip()
+else:
+    port = int(args[args.index("--port") + 1])
+    served = args[args.index("--served-model-name") + 1]
+    key = os.environ.get("VLLM_API_KEY", "")
+# ADR 0028 §9: the completion probe's answer, when the test installs one.
+def completion():
+    try:
+        with open(os.path.join(here, "completion")) as f:
+            return json.load(f)
+    except OSError:
+        return None
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
@@ -131,8 +143,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
     def do_POST(self):
+        keyed = bool(key) and self.headers.get("Authorization") == "Bearer " + key
+        if self.path in ("/v1/completions", "/generate"):
+            with open(os.path.join(here, "last-request.tmp"), "w") as f:
+                json.dump({"path": self.path, "client": self.client_address[0], "keyed": keyed}, f)
+            os.replace(os.path.join(here, "last-request.tmp"), os.path.join(here, "last-request.json"))
         if not self.keyed(): return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        ids = completion()
+        if ids is not None and engine == "vllm" and self.path == "/v1/completions" and body.get("model") == served:
+            self.send_body(json.dumps({"choices": [{"index": 0, "text": "ok", "token_ids": ids[:body["max_tokens"]]}]}).encode()); return
+        if ids is not None and engine == "sglang" and self.path == "/generate":
+            self.send_body(json.dumps({"text": "ok", "output_ids": ids[:body["sampling_params"]["max_new_tokens"]]}).encode()); return
         if self.path != "/v1/chat/completions" or body.get("model") != served:
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
         if body.get("stream"):
@@ -229,6 +251,8 @@ struct FakeHost {
     holds_peer: bool,
     /// Peer ports held outside CapyCTL.
     held: Vec<u16>,
+    /// ADR 0028 §9: the token ids the engine answers a completion probe with.
+    completion: Option<Vec<u32>>,
     built: OnceLock<Built>,
 }
 
@@ -281,6 +305,22 @@ struct Launched {
     ingress: Option<capyctl_agent::ingress::IngressScope>,
 }
 
+/// ADR 0028 §9, ADR 0012: how a completion probe reached the head's engine.
+struct EngineRequest {
+    client: String,
+    keyed: bool,
+}
+impl EngineRequest {
+    /// From loopback, never ingress or the router, with the launch's own key.
+    fn is_loopback_with_launch_key(&self) -> bool {
+        self.keyed
+            && self
+                .client
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    }
+}
+
 /// What a member's Terminate answered.
 struct Gone {
     result: pb::MemberExecutionResult,
@@ -306,6 +346,7 @@ impl FakeHost {
             deep: false,
             holds_peer: true,
             held: Vec::new(),
+            completion: None,
             built: OnceLock::new(),
         }
     }
@@ -346,6 +387,11 @@ impl FakeHost {
     /// `port` is held on the peer address by something outside CapyCTL.
     fn with_held_peer_port(mut self, port: u16) -> Self {
         self.held.push(port);
+        self
+    }
+    /// ADR 0028 §9: the head's engine answers a completion probe with `ids`.
+    fn with_fake_completion(mut self, ids: Vec<u32>) -> Self {
+        self.completion = Some(ids);
         self
     }
 
@@ -397,6 +443,11 @@ impl FakeHost {
                 for dir in [&bin, &runtime] {
                     std::fs::write(dir.join(marker), "").unwrap();
                 }
+            }
+        }
+        if let Some(ids) = &self.completion {
+            for dir in [&bin, &runtime] {
+                std::fs::write(dir.join("completion"), json!(ids).to_string()).unwrap();
             }
         }
         let models = private(&path.join("models"));
@@ -559,6 +610,23 @@ impl FakeHost {
             .sum()
     }
 
+    /// ADR 0028 §9: what the engine last saw of a completion probe request.
+    fn last_engine_request(&self) -> EngineRequest {
+        let path = self.host().root.path();
+        let file = [
+            path.join("venv/bin/last-request.json"),
+            path.join("runtime/last-request.json"),
+        ]
+        .into_iter()
+        .find(|file| file.exists())
+        .expect("the engine saw a completion probe");
+        let seen: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        EngineRequest {
+            client: seen["client"].as_str().unwrap().into(),
+            keyed: seen["keyed"] == true,
+        }
+    }
+
     /// The checkpoint digest this host measures, as the server records it.
     fn digest(&self) -> String {
         let built = self.host();
@@ -630,10 +698,48 @@ impl FakeHost {
     /// Send `action` (a group Launch) to this host: a head is provisioned
     /// with its gate key first, as the server does. A refusal is the `Err`.
     async fn execute(&self, action: MemberAction) -> Result<Launched, String> {
-        let MemberAction::Launch { plan, .. } = action else {
-            panic!("only a group Launch is sent here")
-        };
-        self.send(&self.launch_command("launch", &plan)).await
+        match action {
+            MemberAction::Launch { plan, .. } => {
+                self.send(&self.launch_command("launch", &plan)).await
+            }
+            // ADR 0028 §9: the completion probe the server sends the head,
+            // naming its retained launch.
+            MemberAction::Probe {
+                owned_handle,
+                max_tokens,
+            } => {
+                let built = self.host();
+                let owner = built.journal.retained_command(&owned_handle).unwrap();
+                let mut command = MemberCommand {
+                    identity: identity(
+                        &format!("probe-{}", max_tokens.unwrap_or(0)),
+                        owner.identity.member.clone(),
+                        "ready",
+                        owner.identity.generation,
+                        &owner.identity.profile_fingerprint,
+                    ),
+                    action: MemberAction::Probe {
+                        owned_handle,
+                        max_tokens,
+                    },
+                };
+                command.identity.payload_digest = command.canonical_digest();
+                let result = built
+                    .executor
+                    .execute(built.session, command.clone())
+                    .await
+                    .map_err(|_| "session".to_owned())?;
+                capyctl_protocol::execution::validate_result(&command, &result)
+                    .expect("the result is a valid answer to its Probe");
+                Ok(Launched {
+                    owned_handle: result.owned_handle.clone(),
+                    processes: result.processes.clone(),
+                    ingress: None,
+                    result,
+                })
+            }
+            _ => panic!("only a group Launch or a Probe is sent here"),
+        }
     }
 
     async fn send(&self, command: &MemberCommand) -> Result<Launched, String> {
@@ -1223,6 +1329,82 @@ async fn a_launch_sent_again_replays_its_recorded_identities() {
     assert_eq!(again.owned_handle, first.owned_handle);
     let gone = host
         .terminate(&first.owned_handle, &first.processes)
+        .await
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+// T30 (decided 2026-10-06): the head's agent answers a completion probe with the generated token ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_answers_a_completion_probe_with_token_ids() {
+    // Each engine's own request form (vLLM `/v1/completions`, SGLang
+    // `/generate`); TensorFold's is pinned by the adapter test.
+    for engine in ["vllm", "sglang"] {
+        let host = FakeHost::new("host-a")
+            .with_groups_policy(HEAD_PEER)
+            .with_engine(engine)
+            .with_fake_completion(vec![7, 8]);
+        let plan = two_member_plan(&host);
+        let out = host.execute(launch(plan)).await.unwrap();
+        assert!(out.result.model_usable, "{engine}: {:?}", out.result);
+        let reply = host
+            .execute(MemberAction::Probe {
+                owned_handle: out.owned_handle.clone(),
+                max_tokens: Some(2),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.result.probe_tokens, vec![7, 8], "{engine}");
+        assert!(
+            host.last_engine_request().is_loopback_with_launch_key(),
+            "{engine}"
+        );
+        // The bound is honoured: one token asked, one answered.
+        let one = host
+            .execute(MemberAction::Probe {
+                owned_handle: out.owned_handle.clone(),
+                max_tokens: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(one.result.probe_tokens, vec![7], "{engine}");
+        // A readiness probe carries no tokens.
+        let ready = host
+            .execute(MemberAction::Probe {
+                owned_handle: out.owned_handle.clone(),
+                max_tokens: None,
+            })
+            .await
+            .unwrap();
+        assert!(ready.result.probe_tokens.is_empty(), "{engine}");
+        let gone = host
+            .terminate(&out.owned_handle, &out.processes)
+            .await
+            .unwrap();
+        assert!(gone.all_gone(), "{engine}: {:?}", gone.result);
+    }
+}
+
+// T30 (decided 2026-10-06): a worker is never probed: a completion probe of a
+// worker's launch answers no tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_answers_no_completion_probe() {
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_engine("sglang")
+        .with_fake_completion(vec![7, 8]);
+    let plan = two_member_plan(&host);
+    let out = host.execute(launch(plan)).await.unwrap();
+    let reply = host
+        .execute(MemberAction::Probe {
+            owned_handle: out.owned_handle.clone(),
+            max_tokens: Some(2),
+        })
+        .await
+        .unwrap();
+    assert!(reply.result.probe_tokens.is_empty());
+    let gone = host
+        .terminate(&out.owned_handle, &out.processes)
         .await
         .unwrap();
     assert!(gone.all_gone(), "{:?}", gone.result);

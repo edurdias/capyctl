@@ -874,6 +874,7 @@ impl Fixture {
             identity: identity(id, "ready", &launch.identity.profile_fingerprint),
             action: MemberAction::Probe {
                 owned_handle: "launch".into(),
+                max_tokens: None,
             },
         })
     }
@@ -973,6 +974,7 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
     let mut unknown = fixture.probe(&launch, "probe-unknown");
     unknown.action = MemberAction::Probe {
         owned_handle: "never-launched".into(),
+        max_tokens: None,
     };
     let unknown = sign(unknown);
     let nothing = host

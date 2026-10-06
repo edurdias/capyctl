@@ -8,7 +8,7 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
-use crate::traits::{RuntimeAction, RuntimeError};
+use crate::traits::{AdapterError, RuntimeAction, RuntimeError};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// How long one readiness model list may take. The readiness loop caps each
@@ -186,6 +186,31 @@ impl ControlHttp {
     pub(super) fn with_resident_weights(mut self, resident: bool) -> Self {
         self.resident_weights = resident;
         self
+    }
+
+    /// ADR 0028 §9 (decided 2026-10-06): the completion probe in SGLang's
+    /// form, its native `POST /generate`, on this engine's loopback endpoint
+    /// with its inference key (an inference route, not an admin one).
+    /// Answers `output_ids`.
+    pub(super) async fn complete_token_ids(
+        &self,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> Result<Vec<u32>, AdapterError> {
+        use crate::completion_probe as probe;
+        let url = self
+            .base
+            .join(probe::SGLANG_PATH)
+            .map_err(|_| AdapterError::Uncertain("completion probe: no endpoint".into()))?;
+        let answer = probe::post(
+            &self.client,
+            url,
+            Some(&self.inference),
+            &probe::sglang_request(max_tokens),
+            bound,
+        )
+        .await?;
+        probe::sglang_token_ids(&answer)
     }
 
     /// Served model ids from `/v1/models`, guarded by the inference key the

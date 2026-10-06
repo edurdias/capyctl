@@ -221,6 +221,7 @@ fn every_post_baseline_field_names_its_capability() {
             wire(
                 MemberAction::Probe {
                     owned_handle: handle(),
+                    max_tokens: None,
                 },
                 0,
             ),
@@ -367,6 +368,7 @@ fn the_gate_refuses_typed_before_anything_is_sent() {
     let probe = wire(
         MemberAction::Probe {
             owned_handle: "h".into(),
+            max_tokens: None,
         },
         0,
     );

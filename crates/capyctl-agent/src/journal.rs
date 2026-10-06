@@ -1283,7 +1283,7 @@ impl HostJournal {
         probe: &MemberCommand,
     ) -> Result<Vec<ProcessIdentity>, JournalError> {
         self.validate()?;
-        let MemberAction::Probe { owned_handle } = &probe.action else {
+        let MemberAction::Probe { owned_handle, .. } = &probe.action else {
             return Err(JournalError::Unauthorized);
         };
         let owned_handle = owned_handle.as_str();
@@ -1308,8 +1308,23 @@ impl HostJournal {
                 saved,
             )
         };
+        // ADR 0028 §9 (decided 2026-10-06): a completion probe also reaches a
+        // group's head, the only member that serves; a readiness probe still
+        // re-proves a single launch only.
+        let completion = matches!(
+            probe.action,
+            MemberAction::Probe {
+                max_tokens: Some(_),
+                ..
+            }
+        );
+        let target = match &owner.action {
+            MemberAction::LaunchSingle(_) => true,
+            MemberAction::Launch { member, .. } => completion && member.service_port != 0,
+            _ => false,
+        };
         if !same_owner(&owner, probe)
-            || !matches!(owner.action, MemberAction::LaunchSingle(_))
+            || !target
             || !record.claim_retained
             || record.state != CommandState::Launched
         {
@@ -1654,7 +1669,7 @@ impl HostJournal {
         };
         let handle = match &command.action {
             MemberAction::Terminate { owned_handle, .. }
-            | MemberAction::Probe { owned_handle }
+            | MemberAction::Probe { owned_handle, .. }
             | MemberAction::Park { owned_handle }
             | MemberAction::Restore { owned_handle, .. } => owned_handle.clone(),
             MemberAction::Launch { .. } | MemberAction::LaunchSingle(_) => command_id.into(),
@@ -1717,7 +1732,7 @@ impl HostJournal {
         let (binding_id, incarnation) = match &command.action {
             // A probe, park or restore reports on the binding of the launch it
             // names.
-            MemberAction::Probe { owned_handle }
+            MemberAction::Probe { owned_handle, .. }
             | MemberAction::Park { owned_handle }
             | MemberAction::Restore { owned_handle, .. } => {
                 let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -1784,6 +1799,9 @@ impl HostJournal {
                     |r| r.get::<_, bool>(0),
                 )?
             },
+            // ADR 0028 §9: the executor adds a fresh completion probe's
+            // token ids; nothing journaled carries any.
+            probe_tokens: Vec::new(),
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -2073,7 +2091,7 @@ fn fence_instance(db: &Connection, command: &MemberCommand) -> Result<u32, Journ
     let declared = command.identity.instance_index;
     let named = match &command.action {
         MemberAction::Terminate { owned_handle, .. }
-        | MemberAction::Probe { owned_handle }
+        | MemberAction::Probe { owned_handle, .. }
         | MemberAction::Park { owned_handle }
         | MemberAction::Restore { owned_handle, .. } => owned_handle,
         _ => return Ok(declared),

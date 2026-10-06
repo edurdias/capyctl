@@ -398,6 +398,7 @@ fn probe(launch: &MemberCommand, id: &str) -> MemberCommand {
         "ready",
         MemberAction::Probe {
             owned_handle: launch.identity.command_id.clone(),
+            max_tokens: None,
         },
     )
 }

@@ -290,8 +290,15 @@ pub enum MemberAction {
     /// SPEC §§6.1, 13.2: re-prove model readiness of one retained launch with a
     /// fresh native probe, after a session loss cleared its readiness authority.
     /// It names the launch by its owned handle and can never launch or release.
+    ///
+    /// ADR 0028 §9 (decided 2026-10-06): with `max_tokens`, the completion
+    /// probe instead: one completion at temperature 0 of at most that many
+    /// tokens against the retained launch, on loopback with its own key, whose
+    /// generated token ids the result carries (`probe_tokens`). `None` is the
+    /// readiness probe and encodes and digests exactly as before.
     Probe {
         owned_handle: String,
+        max_tokens: Option<u32>,
     },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
@@ -517,6 +524,16 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         if member_launch.is_some() != matches!(command.action, Some(Action::Launch(_))) {
             return Err(GroupIdentityError);
         }
+        // ADR 0028 §9 (decided 2026-10-06): a completion probe's token bound
+        // rides a probe only, and is bounded; zero is the readiness probe.
+        let mut probe_max_tokens =
+            (command.probe_max_tokens != 0).then_some(command.probe_max_tokens);
+        if probe_max_tokens.is_some_and(|tokens| tokens > MAX_PROBE_TOKENS)
+            || (probe_max_tokens.is_some()
+                && !matches!(command.action, Some(Action::ProbeOwnedHandle(_))))
+        {
+            return Err(GroupIdentityError);
+        }
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
             Action::Launch(plan) => MemberAction::Launch {
@@ -536,7 +553,10 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             }
             Action::CloseIngress(true) => MemberAction::CloseIngress,
             Action::ProbeOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
-                MemberAction::Probe { owned_handle }
+                MemberAction::Probe {
+                    owned_handle,
+                    max_tokens: probe_max_tokens.take(),
+                }
             }
             Action::ParkOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
                 MemberAction::Park { owned_handle }
@@ -609,7 +629,7 @@ impl MemberCommand {
                     Action::TerminateOwnedHandle(owned_handle.clone())
                 }
                 MemberAction::CloseIngress => Action::CloseIngress(true),
-                MemberAction::Probe { owned_handle } => {
+                MemberAction::Probe { owned_handle, .. } => {
                     Action::ProbeOwnedHandle(owned_handle.clone())
                 }
                 MemberAction::Park { owned_handle } => {
@@ -642,6 +662,11 @@ impl MemberCommand {
             group_member_launch: match &self.action {
                 MemberAction::Launch { member, .. } => Some(member.to_wire()),
                 _ => None,
+            },
+            // ADR 0028 §9: zero (the readiness probe) is not encoded.
+            probe_max_tokens: match &self.action {
+                MemberAction::Probe { max_tokens, .. } => max_tokens.unwrap_or(0),
+                _ => 0,
             },
         }
     }
@@ -711,6 +736,11 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
 /// ADR 0014 amendment A12: the most kernel build spans one launch reports.
 pub const MAX_KERNEL_BUILDS: usize = 64;
 
+/// ADR 0028 §9 (decided 2026-10-06): the most tokens a completion probe may
+/// ask for. Readiness asks for 1 and the wake canary for 8; the probe stays a
+/// short, bounded request either way.
+pub const MAX_PROBE_TOKENS: u32 = 64;
+
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
 pub fn validate_result(
@@ -761,9 +791,23 @@ pub fn validate_result(
     {
         return Err(GroupIdentityError);
     }
+    // ADR 0028 §9: generated token ids answer a completed completion probe
+    // only, never more than it asked for.
+    if !result.probe_tokens.is_empty() {
+        let asked = match &command.action {
+            MemberAction::Probe {
+                max_tokens: Some(max_tokens),
+                ..
+            } if result.state == "completed" => *max_tokens as usize,
+            _ => 0,
+        };
+        if result.probe_tokens.len() > asked {
+            return Err(GroupIdentityError);
+        }
+    }
     // A probe, park or restore reports on exactly the launch it names, whatever
     // the outcome.
-    if let MemberAction::Probe { owned_handle }
+    if let MemberAction::Probe { owned_handle, .. }
     | MemberAction::Park { owned_handle }
     | MemberAction::Restore { owned_handle, .. } = &command.action
     {

@@ -480,6 +480,13 @@ message ExecuteMember {
   // port or zero on a worker (which serves nothing). Absent otherwise, which
   // encodes exactly as before.
   SingleLaunchPlan group_member_launch = 15;
+  // ADR 0028 §9 (decided 2026-10-06, additive): with `probe_owned_handle`
+  // only, the completion probe's token bound. The host runs one completion at
+  // temperature 0 of at most this many tokens against the retained launch, on
+  // loopback with the launch's own key, and answers the generated token ids
+  // in `MemberExecutionResult.probe_tokens`. Zero is the readiness probe,
+  // which encodes exactly as before.
+  uint32 probe_max_tokens = 16;
 }
 // ADR 0016: one process identity as the server recorded it.
 message RecordedProcess {
@@ -562,6 +569,12 @@ message MemberExecutionResult {
   // Expected for a SGLang group worker, which ignores SIGTERM. False otherwise,
   // which encodes exactly as before.
   bool escalated = 16;
+  // ADR 0028 §9 (decided 2026-10-06, additive): a completed completion probe
+  // only (`probe_max_tokens` nonzero), the token ids the head's engine
+  // generated, at most `probe_max_tokens` of them. Empty otherwise, which
+  // encodes exactly as before; an empty answer to a completion probe is a
+  // failed probe.
+  repeated uint32 probe_tokens = 17;
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;

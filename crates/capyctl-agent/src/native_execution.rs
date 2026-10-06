@@ -1387,6 +1387,59 @@ impl NativeHostExecution {
         self.publish_ready(session, owned_handle, &command.identity.command_id, &scope)
     }
 
+    /// ADR 0028 §9 (decided 2026-10-06): the completion probe. The retained
+    /// launch it names (a single launch or a group's head, the only member
+    /// that serves) must still be the live, ready group its readiness
+    /// recorded; the engine is then asked for one completion at temperature 0
+    /// of at most `max_tokens` tokens, on its loopback endpoint with the
+    /// launch's own inference key (ADR 0012), never through ingress or the
+    /// router. The answer is the generated token ids; nothing is recorded and
+    /// no gate moves. Any failure, or an answer with no token ids or more than
+    /// were asked for, is an error, which the result reports as no tokens.
+    async fn complete(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+        max_tokens: u32,
+    ) -> Result<Vec<u32>, SessionError> {
+        let owned = self
+            .journal
+            .retained_command(owned_handle)
+            .map_err(|_| SessionError)?;
+        let plan = owned.action.launch_plan().ok_or(SessionError)?;
+        let journal = self.journal.clone();
+        let probe = command.clone();
+        tokio::task::spawn_blocking(move || journal.probe_target(&probe))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
+        let effective = self.resolve_retained(&owned).map_err(|_| SessionError)?;
+        let scope = self.scope(&owned).map_err(|_| SessionError)?;
+        let keys = self
+            .identities
+            .load(&scope, owned.identity.payload_digest)
+            .map_err(|_| SessionError)?;
+        let served = effective.routes.first().cloned().ok_or(SessionError)?;
+        let adapter = self.probe_adapter(&effective, plan, &keys, &served)?;
+        let bound = Duration::from_millis(
+            u64::try_from(
+                command.identity.deadline_ms - PROBE_MARGIN_MS - capyctl_protocol::now_unix_ms(),
+            )
+            .unwrap_or(0),
+        );
+        let tokens = tokio::time::timeout(
+            bound,
+            adapter.complete_token_ids(&served, max_tokens, bound),
+        )
+        .await
+        .map_err(|_| SessionError)?
+        .map_err(|_| SessionError)?;
+        if tokens.is_empty() || tokens.len() > max_tokens as usize {
+            return Err(SessionError);
+        }
+        Ok(tokens)
+    }
+
     /// SPEC §13 / §13.3: the terminal refusal of a command, and for a launch
     /// the deletion of the credentials its provisioning stored: a launch refused
     /// before any effect keeps no keys behind (T37). `reason` is a closed code
@@ -1513,6 +1566,8 @@ impl NativeHostExecution {
         // SPEC §§6.4, 13.2: the engine's own account of a launch that exited
         // before readiness; only its bounded summary leaves the host.
         let mut launch_failed: Option<String> = None;
+        // ADR 0028 §9 (decided 2026-10-06): what a completion probe generated.
+        let mut probe_tokens: Vec<u32> = Vec::new();
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -1570,7 +1625,10 @@ impl NativeHostExecution {
                     .map_err(|_| SessionError)?
                     .map_err(|_| SessionError)?;
                 }
-                MemberAction::Probe { owned_handle } => {
+                MemberAction::Probe {
+                    owned_handle,
+                    max_tokens,
+                } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
                     tokio::task::spawn_blocking(move || {
@@ -1579,9 +1637,24 @@ impl NativeHostExecution {
                     .await
                     .map_err(|_| SessionError)?
                     .map_err(|_| SessionError)?;
-                    // An engine that does not answer is ordinary evidence: the
-                    // result below reports it unusable with ownership retained.
-                    let _ = self.reprobe(session, &command, owned_handle).await;
+                    match max_tokens {
+                        // ADR 0028 §9: a completion that fails or answers no
+                        // token ids is ordinary evidence too: the result
+                        // carries none, which the controller reads as a
+                        // failed probe. Readiness and the gate are untouched.
+                        Some(max_tokens) => {
+                            probe_tokens = self
+                                .complete(&command, owned_handle, *max_tokens)
+                                .await
+                                .unwrap_or_default();
+                        }
+                        // An engine that does not answer is ordinary evidence:
+                        // the result below reports it unusable with ownership
+                        // retained.
+                        None => {
+                            let _ = self.reprobe(session, &command, owned_handle).await;
+                        }
+                    }
                 }
                 // SPEC §§9.1, 10 (W4): the outcome, including a refusal or an
                 // uncertain engine effect, is persisted evidence in the result.
@@ -1601,6 +1674,9 @@ impl NativeHostExecution {
             // launch. Keep reporting current physical ownership, never Ready.
             result.model_usable = false;
             result.observed_at_unix_ms = now;
+        }
+        if result.state == "completed" {
+            result.probe_tokens = probe_tokens;
         }
         if command.action.launch_plan().is_some()
             && result.state == "launched"
@@ -1662,7 +1738,7 @@ impl NativeHostExecution {
             // Exact, still-fresh replay may recover a lost acknowledgement. An
             // in-memory gate lost on host restart is rebuilt only for this scope.
             let owned = match &command.action {
-                MemberAction::Probe { owned_handle }
+                MemberAction::Probe { owned_handle, .. }
                 | MemberAction::Restore { owned_handle, .. } => self
                     .journal
                     .retained_command(owned_handle)

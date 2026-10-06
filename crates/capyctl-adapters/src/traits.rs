@@ -513,4 +513,18 @@ pub trait ChatForward: Send + Sync {
         let _ = body;
         Err(AdapterError::UnsupportedCapability)
     }
+    /// ADR 0028 §9 (decided 2026-10-06): the completion probe. One
+    /// non-streaming completion of a fixed prompt at temperature 0 of at most
+    /// `max_tokens` tokens, through this engine's own loopback endpoint and
+    /// launch key, in the engine's own request form, answering the generated
+    /// token ids. Bounded by `bound`. A reply without token ids is an error.
+    /// The host agent calls it for a retained launch only, never the router.
+    async fn complete_token_ids(
+        &self,
+        _served: &str,
+        _max_tokens: u32,
+        _bound: std::time::Duration,
+    ) -> Result<Vec<u32>, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
 }
