@@ -5,6 +5,8 @@
 #[cfg(test)]
 extern crate self as capyctl_controller;
 
+// SPEC §§6.2, 9.1: the embedded host's residency capability refusals.
+pub mod capability_gate;
 // ADR 0014 §7 (WE3): checkpoint digests measured and recorded.
 pub mod checkpoint_digests;
 pub mod coordinator;

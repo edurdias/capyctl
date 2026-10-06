@@ -110,6 +110,9 @@ pub(super) fn factory(
         }
         let tools = tools_factory(Arc::new(NoLaunch));
         let engine = bindings.adapter(declared, spec, tools.clone())?;
+        // SPEC §§6.2, 9.1: an adopted launch (one started before the rule
+        // reached this host) is refused its Park and Restore as a fresh one is.
+        let engine = crate::capability_gate::CapabilityGate::wrap(engine, work.effective());
         Ok(Arc::new(Driver {
             engine,
             cleanup: terminate_then_prove_gone(

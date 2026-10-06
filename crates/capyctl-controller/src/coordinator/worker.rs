@@ -1446,6 +1446,10 @@ impl OwnedCoordinator {
                     ) as Arc<dyn EngineAdapter>,
                     None => engine,
                 };
+                // SPEC §§6.2, 9.1 / ADR 0008: a residency the engine cannot
+                // honor is refused here, by the decision a host agent makes,
+                // after the drift check and before the checkpoint is measured.
+                let engine = crate::capability_gate::CapabilityGate::wrap(engine, work.effective());
                 // ADR 0008: outermost, so a drifted installation under
                 // `installation_drift: refuse` is refused before anything else.
                 let engine = match bindings.installation(work) {

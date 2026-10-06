@@ -1,5 +1,34 @@
 # Current implementation and launch status
 
+## Standalone refuses a modelopt SGLang park it cannot wake — 2026-10-06 (branch `fix/standalone-deep-wake-refusal`)
+
+Found live on host A (CapyCTL a6b2560, SGLang 0.5.21, GB10, standalone): a `deep` SGLang
+deployment with `quantization: modelopt` started and parked; the wake's
+`update_weights_from_disk` raised `AttributeError: 'Parameter' object has no attribute
+'weight_loader'` and the instance was retained `uncertain`. A host agent refuses that launch
+`capability_missing:deep_park` (SPEC §§6.2, 9.1, ADR 0010), but the rule lived in the agent's
+`launch_capability`/`park_capability` only, and standalone's embedded host never called it.
+
+The rule is now one decision, `EffectiveDeployment::deep_wake_refusal` (capyctl-config). The
+agent calls it as before; standalone's embedded launches and adopted launches pass a
+`CapabilityGate` that refuses Initialize, Park and Restore with the same reason before the
+engine is asked. The refused start gives up at once (one attempt) and spawns nothing.
+Tests: `a_standalone_sglang_modelopt_deep_launch_is_refused_before_any_effect` (spawn_resolved
+with the production bindings; before the fix it spawned the engine) and
+`a_modelopt_sglang_launch_is_refused_its_launch_park_and_restore`, both T22 T21.
+
+The other refusals in `native_execution/refusal.rs` were checked against standalone. Drift
+(`InstallationGate`) and checkpoint mismatch (`CheckpointGate`) already have embedded gates;
+runtime integrity is checked when the role resolves its installation, and the SGLang renderer
+revalidates the protected entry on every launch;
+memory (the coordinator's admission), the engine port (the lease binds it before handing it
+out), the residency tier (the store's `parks`) and a wake beside other claims (the residency
+admission) are decided where both paths pass. The probe refusals (`capability_missing:core`,
+`:deep_park`, `:observation`) stay agent-only by ADR 0008: standalone runs the deep-park probe
+at `engine add`, where a missing capability records `deep_park` disabled unless the operator
+enables it, and the protected entries probe again at startup. Not run live after the fix; CPU
+tests are not qualification.
+
 ## Hybrid SGLang runs 8 requests by default — 2026-10-05 (branch `fix/sglang-hybrid-default-8`)
 
 Owner decision 2026-10-05, the note on ADR 0014 amendment A16. A gated-delta-net hybrid
