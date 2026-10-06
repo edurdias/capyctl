@@ -208,6 +208,11 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     if !command.terminate_recorded_processes.is_empty() {
         needs.push(TERMINATE_RECORDED_PROCESSES);
     }
+    // ADR 0028 §9, §14 (decided 2026-10-06): an older host would drop the
+    // completion probe's token bound and answer a readiness probe instead.
+    if command.probe_max_tokens != 0 {
+        needs.push(ENGINE_GROUPS);
+    }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
     needs
 }

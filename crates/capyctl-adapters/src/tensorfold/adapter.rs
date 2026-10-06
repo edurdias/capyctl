@@ -232,4 +232,15 @@ impl ChatForward for TensorfoldAdapter {
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.forward_chat_stream(body, on_chunk).await
     }
+
+    async fn complete_token_ids(
+        &self,
+        served: &str,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<Vec<u32>, AdapterError> {
+        self.http
+            .complete_token_ids(served, max_tokens, bound)
+            .await
+    }
 }

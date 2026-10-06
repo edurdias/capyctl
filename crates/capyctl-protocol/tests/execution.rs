@@ -24,6 +24,7 @@ fn command() -> pb::ServerToAgent {
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
             group_member_launch: None,
+            probe_max_tokens: 0,
         })),
     }
 }
@@ -259,6 +260,7 @@ fn probe(handle: &str) -> MemberCommand {
     command.identity.expected_state = "ready".into();
     command.action = MemberAction::Probe {
         owned_handle: handle.into(),
+        max_tokens: None,
     };
     command.identity.payload_digest = command.canonical_digest();
     command
@@ -289,6 +291,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         source: None,
         kernel_builds: Vec::new(),
         escalated: false,
+        probe_tokens: Vec::new(),
     }
 }
 
@@ -310,6 +313,7 @@ fn probe_names_one_retained_launch_and_is_digest_bound() {
     let mut moved = command.clone();
     moved.action = MemberAction::Probe {
         owned_handle: "other-launch".into(),
+        max_tokens: None,
     };
     assert_ne!(moved.canonical_digest(), command.canonical_digest());
     assert!(moved.verify_digest().is_err());
@@ -317,6 +321,7 @@ fn probe_names_one_retained_launch_and_is_digest_bound() {
         let mut bad = command.clone();
         bad.action = MemberAction::Probe {
             owned_handle: handle.to_string(),
+            max_tokens: None,
         };
         bad.identity.payload_digest = bad.canonical_digest();
         assert!(bad.verify_digest().is_err(), "{handle:?}");

@@ -32,6 +32,7 @@ fn base() -> MemberCommand {
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
             group_member_launch: None,
+            probe_max_tokens: 0,
         })),
     })
     .unwrap()
@@ -103,6 +104,7 @@ fn park_and_restore_roundtrip_and_are_digest_bound() {
         restore("launch").canonical_digest(),
         with_action(MemberAction::Probe {
             owned_handle: "launch".into(),
+            max_tokens: None,
         })
         .canonical_digest(),
         with_action(MemberAction::Terminate {
@@ -222,6 +224,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         source: None,
         kernel_builds: Vec::new(),
         escalated: false,
+        probe_tokens: Vec::new(),
     }
 }
 
@@ -333,6 +336,7 @@ fn residency_evidence_is_refused_on_other_actions() {
     for action in [
         MemberAction::Probe {
             owned_handle: "launch".into(),
+            max_tokens: None,
         },
         MemberAction::Terminate {
             owned_handle: "launch".into(),
@@ -553,6 +557,7 @@ fn a_policy_refused_park_is_unchanged_with_a_closed_reason() {
     }
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
+        max_tokens: None,
     });
     let mut result = parked_result(&probe);
     result.residency = None;
@@ -690,4 +695,92 @@ fn terminate_recorded_identities_are_additive_and_bound() {
         pb::execute_member::Action::ProbeOwnedHandle("launch".into())
     )
     .is_err());
+}
+
+/// Today's encoding of `Probe { owned_handle: "launch" }` on [`base`], captured
+/// before the completion probe was added (T39).
+const PLAIN_PROBE_BYTES: &[u8] = &[
+    10, 110, 10, 10, 99, 111, 110, 116, 114, 111, 108, 108, 101, 114, 18, 4, 104, 111, 115, 116,
+    26, 6, 114, 97, 110, 107, 45, 48, 34, 5, 109, 111, 100, 101, 108, 42, 2, 111, 112, 50, 7, 99,
+    111, 109, 109, 97, 110, 100, 58, 4, 112, 97, 114, 107, 64, 3, 72, 1, 80, 100, 90, 32, 156, 132,
+    70, 204, 102, 97, 150, 212, 159, 125, 183, 30, 69, 30, 82, 136, 50, 80, 160, 209, 32, 230, 131,
+    25, 149, 164, 44, 121, 231, 5, 107, 77, 98, 5, 114, 101, 97, 100, 121, 106, 6, 112, 105, 110,
+    110, 101, 100, 114, 1, 49, 66, 6, 108, 97, 117, 110, 99, 104,
+];
+
+fn decode(bytes: &[u8]) -> Result<MemberCommand, capyctl_domain::group::GroupIdentityError> {
+    MemberCommand::try_from(pb::ServerToAgent {
+        msg: Some(pb::server_to_agent::Msg::ExecuteMember(
+            pb::ExecuteMember::decode(bytes).unwrap(),
+        )),
+    })
+}
+
+// T39 (decided 2026-10-06): the completion probe is additive; a plain probe encodes and digests as before.
+#[test]
+fn completion_probe_is_additive() {
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+    });
+    assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
+    let probe = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: Some(8),
+    });
+    assert_ne!(probe.canonical_digest(), plain.canonical_digest());
+    assert_eq!(
+        decode(&probe.to_wire().encode_to_vec()).unwrap().action,
+        probe.action
+    );
+    probe.verify_digest().unwrap();
+    // ADR 0028 §9: the token bound is the next free ExecuteMember field (16),
+    // set only with a probe; zero is today's readiness probe.
+    let mut wire = probe.to_wire();
+    assert_eq!(wire.probe_max_tokens, 8);
+    wire.probe_max_tokens = 0;
+    assert_eq!(decode(&wire.encode_to_vec()).unwrap().action, plain.action);
+    let mut inspect = with_action(MemberAction::Inspect).to_wire();
+    inspect.probe_max_tokens = 1;
+    assert!(decode(&inspect.encode_to_vec()).is_err());
+    let mut greedy = probe.to_wire();
+    greedy.probe_max_tokens = capyctl_protocol::execution::MAX_PROBE_TOKENS + 1;
+    assert!(decode(&greedy.encode_to_vec()).is_err());
+    // T34: an older host would answer a readiness probe instead; only a host
+    // with `engine_groups` is sent a completion probe.
+    use capyctl_protocol::capabilities::{required, ENGINE_GROUPS};
+    assert_eq!(required(&probe.to_wire()), vec![ENGINE_GROUPS]);
+    assert!(required(&plain.to_wire()).is_empty());
+}
+
+// T30, T34 (decided 2026-10-06): generated token ids answer a completion probe
+// only, never more than it asked for.
+#[test]
+fn probe_tokens_answer_a_completion_probe_only() {
+    let answer = |command: &MemberCommand, tokens: Vec<u32>| pb::MemberExecutionResult {
+        identity: command.to_wire().identity,
+        state: "completed".into(),
+        owned_handle: "launch".into(),
+        observed_at_unix_ms: 1,
+        claim_retained: true,
+        binding_id: "binding".into(),
+        incarnation: "incarnation".into(),
+        probe_tokens: tokens,
+        ..Default::default()
+    };
+    let probe = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: Some(2),
+    });
+    validate_result(&probe, &answer(&probe, vec![7, 8])).unwrap();
+    validate_result(&probe, &answer(&probe, Vec::new())).unwrap();
+    assert!(validate_result(&probe, &answer(&probe, vec![7, 8, 9])).is_err());
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+    });
+    validate_result(&plain, &answer(&plain, Vec::new())).unwrap();
+    assert!(validate_result(&plain, &answer(&plain, vec![7])).is_err());
+    let parked = park("launch");
+    assert!(validate_result(&parked, &answer(&parked, vec![7])).is_err());
 }

@@ -30,6 +30,7 @@ fn wire(instance_index: u32) -> pb::ExecuteMember {
         restore_checkpoint_digest: String::new(),
         terminate_recorded_processes: Vec::new(),
         group_member_launch: None,
+        probe_max_tokens: 0,
     }
 }
 

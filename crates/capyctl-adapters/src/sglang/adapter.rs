@@ -139,7 +139,7 @@ pub(super) type LaunchParts = (
 /// After uncertainty, reconciliation must establish a new adapter binding.
 pub struct SglangAdapter {
     pub(super) forward: crate::forward::ChatHttp,
-    http: Option<ControlHttp>,
+    pub(super) http: Option<ControlHttp>,
     base: reqwest::Url,
     checkpoint: String,
     binding_id: String,

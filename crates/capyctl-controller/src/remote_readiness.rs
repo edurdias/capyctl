@@ -354,6 +354,7 @@ impl RemoteReadiness {
             },
             action: MemberAction::Probe {
                 owned_handle: launch.step_id.clone(),
+                max_tokens: None,
             },
         };
         command.identity.payload_digest = command.canonical_digest();

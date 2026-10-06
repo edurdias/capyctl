@@ -32,4 +32,18 @@ impl ChatForward for SglangAdapter {
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.stream(body, on_chunk).await
     }
+    /// ADR 0028 §9: through the keyed control client; an adapter built
+    /// without the launch's credentials cannot probe.
+    async fn complete_token_ids(
+        &self,
+        _served: &str,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<Vec<u32>, AdapterError> {
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        http.complete_token_ids(max_tokens, bound).await
+    }
 }
