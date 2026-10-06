@@ -1437,6 +1437,12 @@ const TRANSIENT_REFUSALS: &[&str] = &[
     "model_source_pending",
     "checkpoint_unverified",
     "unauthorized",
+    // ADR 0028 §16: a group's rendezvous or service port taken outside
+    // CapyCTL (excluded, then redrawn), or a head range with every port held
+    // until another group settles. Every other group code is for good.
+    "rendezvous_port_in_use:",
+    "service_port_in_use:",
+    "rendezvous_ports_exhausted",
 ];
 
 /// Found live 2026-10-04: whether `reason` is a host refusal before any
@@ -1450,5 +1456,45 @@ fn refused_for_good(reason: &str) -> bool {
             .iter()
             .any(|transient| category.starts_with(transient)),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::refused_for_good;
+    use capyctl_adapters::traits::RuntimeError;
+
+    fn refused(code: &str) -> String {
+        RuntimeError::Refused(code.into()).to_string()
+    }
+
+    // T30 (ADR 0028 §16): a port a Prepare found taken, or a head range with
+    // no free port, clears on its own and keeps the retry budget; every other
+    // group refusal a retry of the same configuration cannot change.
+    #[test]
+    fn group_refusals_are_classified() {
+        for transient in [
+            "rendezvous_port_in_use:25000",
+            "service_port_in_use:8100",
+            "rendezvous_ports_exhausted",
+        ] {
+            assert!(!refused_for_good(&refused(transient)), "{transient}");
+        }
+        for permanent in [
+            "host_tuning_missing:memlock",
+            "peer_address_not_local",
+            "group_checkpoint_mismatch",
+            "group_profile_mismatch",
+            "group_model_path_mismatch",
+            "group_topology_invalid",
+            "group_shape_unsupported:tensorfold",
+            "host_capability_missing:engine_groups",
+            "group_drift:tensor_parallel",
+        ] {
+            assert!(refused_for_good(&refused(permanent)), "{permanent}");
+        }
+        // T39: the single-host classification is unchanged.
+        assert!(!refused_for_good(&refused("port_conflict")));
+        assert!(refused_for_good(&refused("capability_missing:deep_park")));
     }
 }

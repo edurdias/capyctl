@@ -212,3 +212,42 @@ fn zero_dimension_with_repeated_host_is_topology_invalid() {
     .unwrap_err();
     assert!(err.to_string().contains("group_topology_invalid"), "{err}");
 }
+
+// T03 (R20, ADR 0028 §2): a group states one device per host and a named id
+// applies to every host, so the one-host rule for named devices never refuses it.
+#[test]
+fn a_group_naming_a_device_is_not_refused() {
+    let spec = parse_instance_spec(&doc(json!({
+        "topology": {"tensor_parallel": 2},
+        "placement": {"hosts": ["host-a", "host-b"]},
+        "devices": [{"id": "gpu0", "sharing": "shared"}]
+    })))
+    .unwrap();
+    assert_eq!(spec.group.unwrap().hosts, ["host-a", "host-b"]);
+    let (mut deployment, host) = group_fixture("vllm");
+    deployment["devices"] = json!([{"id": "gpu0"}]);
+    capyctl_config::effective::resolve_effective(&deployment, &host).unwrap();
+    // The single-host rule is unchanged (T39).
+    let err = parse_instance_spec(&doc(json!({
+        "placement": {"hosts": ["host-a", "host-b"]},
+        "devices": [{"id": "gpu0"}]
+    })))
+    .unwrap_err();
+    assert!(err.to_string().contains("exactly one host"), "{err}");
+}
+
+// T14: the deploy-time group refusals a store or server raises carry their codes.
+#[test]
+fn deploy_time_group_refusals_carry_codes() {
+    use capyctl_config::topology::GroupRefusal;
+    for (refusal, code) in [
+        (GroupRefusal::ProfileMismatch, "group_profile_mismatch"),
+        (GroupRefusal::PeerAddressMissing, "peer_address_missing"),
+    ] {
+        assert_eq!(refusal.code(), code);
+        let error = refusal.at("placement.hosts", "host `host-b`");
+        assert!(error
+            .to_string()
+            .contains(&format!("{code}: host `host-b`")));
+    }
+}

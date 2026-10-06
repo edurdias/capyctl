@@ -129,5 +129,12 @@ pub fn compose_current_resource_controls(
             composed["resource_policy"]["devices"][id]["physical_gpu_uuid"] = json!(uuid);
         }
     }
+    // ADR 0028 §3: the groups block (peer address, rendezvous range) is host
+    // context, not a resource control, so a group deploy reads it from the
+    // trusted document it resolves against. It never enters the normalized
+    // policy, so the policy digest and every resolution are unchanged.
+    if let Some(groups) = trusted_host["resource_policy"].get("groups") {
+        composed["resource_policy"]["groups"] = groups.clone();
+    }
     Ok(composed)
 }
