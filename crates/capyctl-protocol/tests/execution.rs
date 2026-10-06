@@ -740,6 +740,8 @@ mod groups {
         };
         assert!(validate_result(&command, &result("")).is_ok());
         for code in [
+            // R35 (ADR 0028 §2): more than one rank per member.
+            "group_topology_invalid",
             "group_profile_mismatch",
             "group_checkpoint_mismatch",
             "peer_address_not_local",
@@ -874,6 +876,7 @@ mod groups {
             ..Default::default()
         };
         for code in [
+            "group_topology_invalid",
             "peer_address_not_local",
             "rendezvous_port_in_use:25001",
             "group_checkpoint_mismatch",

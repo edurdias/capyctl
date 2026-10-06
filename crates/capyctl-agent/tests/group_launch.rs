@@ -89,6 +89,20 @@ def orphaned():
         time.sleep(0.5)
     os.killpg(0, signal.SIGKILL)
 threading.Thread(target=orphaned, daemon=True).start()
+if os.path.exists(os.path.join(here, "late-children")):
+    # A child started just after the spawn, and one long after the tree settled.
+    def late(delay, label):
+        time.sleep(delay)
+        pid = os.fork()
+        if pid == 0:
+            while os.path.isdir(here):
+                time.sleep(0.5)
+            os._exit(0)
+        with open(os.path.join(here, label + ".tmp"), "w") as f:
+            f.write(str(pid))
+        os.replace(os.path.join(here, label + ".tmp"), os.path.join(here, label))
+    threading.Thread(target=late, args=(0.4, "late-1"), daemon=True).start()
+    threading.Thread(target=late, args=(3.0, "late-2"), daemon=True).start()
 if worker or engine != "sglang":
     while True:
         time.sleep(0.5)
@@ -209,6 +223,7 @@ struct FakeHost {
     peer: Option<String>,
     engine: GroupEngine,
     ignore_sigterm: bool,
+    late_children: bool,
     deep: bool,
     /// Whether the substituted host holds its own peer address.
     holds_peer: bool,
@@ -287,6 +302,7 @@ impl FakeHost {
             peer: None,
             engine: GroupEngine::Vllm,
             ignore_sigterm: false,
+            late_children: false,
             deep: false,
             holds_peer: true,
             held: Vec::new(),
@@ -305,6 +321,11 @@ impl FakeHost {
             "tensorfold" => GroupEngine::Tensorfold,
             other => panic!("unknown engine {other}"),
         };
+        self
+    }
+    /// The worker forks a child 0.4 s after it starts and another after 3 s.
+    fn with_late_children(mut self) -> Self {
+        self.late_children = true;
         self
     }
     /// The engine's whole tree ignores SIGTERM (SGLang rank > 0 does).
@@ -368,9 +389,14 @@ impl FakeHost {
             &runtime.join("engine_capabilities.py"),
             "# stand-in probes\n",
         );
-        if self.ignore_sigterm {
-            for dir in [&bin, &runtime] {
-                std::fs::write(dir.join("ignore-sigterm"), "").unwrap();
+        for (marker, on) in [
+            ("ignore-sigterm", self.ignore_sigterm),
+            ("late-children", self.late_children),
+        ] {
+            if on {
+                for dir in [&bin, &runtime] {
+                    std::fs::write(dir.join(marker), "").unwrap();
+                }
             }
         }
         let models = private(&path.join("models"));
@@ -953,6 +979,33 @@ async fn plan_without_this_host_is_refused() {
     );
     assert!(host.journal().history(0, 100).unwrap().is_empty());
     assert_eq!(host.spawns(), 0);
+
+    // T03, R35 (ADR 0028 §2): a plan giving a member more than one rank is
+    // refused typed, before anything is journaled or spawned.
+    let host = FakeHost::new("host-b").with_groups_policy(WORKER_PEER);
+    let one = two_member_plan(&host);
+    let mut members = one.members().to_vec();
+    for member in &mut members {
+        member.devices.push("gpu1".into());
+    }
+    let two = GroupPlan::new(
+        one.engine(),
+        members,
+        GroupTopology {
+            tensor_parallel: 4,
+            pipeline_parallel: 1,
+            local_ranks: 2,
+        },
+        one.rendezvous_port(),
+        one.generation(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.execute(launch(two)).await.err().as_deref(),
+        Some("group_topology_invalid")
+    );
+    assert!(host.journal().history(0, 100).unwrap().is_empty());
+    assert_eq!(host.spawns(), 0);
 }
 
 // Review Focus 6, T31: a SGLang worker that ignores SIGTERM is killed and settles, escalation recorded.
@@ -973,6 +1026,81 @@ async fn sglang_worker_ignoring_sigterm_is_escalated() {
     assert!(gone.escalated);
     // Bounded: the grace, then SIGKILL and its proof, never an endless wait.
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+/// The pid a late child of the fake engine recorded under `label`.
+fn late_pid(host: &FakeHost, label: &str) -> u32 {
+    let path = host.host().root.path();
+    let files = [
+        path.join("venv/bin").join(label),
+        path.join("runtime").join(label),
+    ];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(file) = files.iter().find(|file| file.exists()) {
+            return std::fs::read_to_string(file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+        }
+        assert!(std::time::Instant::now() < deadline, "{label} was started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Whether `pid` has ended (gone, or a zombie nobody reaped yet).
+fn ended(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+// T31, T33 (ADR 0028 §8, §11): a child the worker starts just after its spawn
+// is in the Launch reply and the journal; one started after the tree settled
+// is still ended by Terminate, even when the leader has already died.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_worker_children_are_recorded_and_terminated() {
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_late_children();
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    let early = late_pid(&host, "late-1");
+    assert!(
+        out.processes
+            .iter()
+            .any(|p| p.pid == early && p.role.starts_with("worker-1/")),
+        "{:?}",
+        out.processes
+    );
+    assert!(host
+        .journal()
+        .inspect_owned(&out.owned_handle)
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.pid == early));
+    let later = late_pid(&host, "late-2");
+    assert!(!out.processes.iter().any(|p| p.pid == later));
+    // Fault injection on the recorded leader: it dies and leaves its tree.
+    let leader = out.processes.iter().find(|p| p.role == "worker-1").unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the recorded leader.
+    assert_eq!(unsafe { libc::kill(leader.pid as i32, libc::SIGKILL) }, 0);
+    let gone = host
+        .terminate(&out.owned_handle, &out.processes)
+        .await
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(ended(early) && ended(later)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a late child survived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 // T31, T33: a worker terminates its own recorded tree only.

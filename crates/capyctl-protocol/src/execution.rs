@@ -960,9 +960,12 @@ pub fn is_policy_refusal(reason: &str) -> bool {
     POLICY_REFUSALS.contains(&reason)
 }
 
-/// ADR 0028 §7, §16: the closed codes a host refuses a group Prepare with.
-/// The port codes name one nonzero port.
+/// ADR 0028 §7, §16: the closed codes a host refuses a group Prepare (and a
+/// group Launch's re-run of its checks) with. The port codes name one nonzero
+/// port. `group_topology_invalid`: the plan gives a member more than one rank
+/// (ADR 0028 §2: one rank per member in this version).
 pub const PREPARE_REFUSALS: &[&str] = &[
+    "group_topology_invalid",
     "group_profile_mismatch",
     "group_checkpoint_mismatch",
     "peer_address_not_local",
