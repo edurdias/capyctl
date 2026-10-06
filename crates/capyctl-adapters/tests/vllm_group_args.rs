@@ -1,10 +1,11 @@
 //! ADR 0028 §10: vLLM multi-node rendering for group members. CPU tests of the
 //! rendered command only; the live rows MN1–MN9 are the qualification.
 
-use capyctl_adapters::group::{member_args, GroupMemberArgs};
+use capyctl_adapters::group::member_args;
 use capyctl_adapters::vllm::args::{render_command, ArgsError, PlanInputVllm};
 use capyctl_domain::group::{
-    member_id, GroupEngine, GroupPlan, GroupTopology, MemberKey, MemberPlan, MemberRole,
+    member_id, GroupEngine, GroupMemberArgs, GroupPlan, GroupTopology, MemberKey, MemberPlan,
+    MemberRole,
 };
 
 fn base_input() -> PlanInputVllm {

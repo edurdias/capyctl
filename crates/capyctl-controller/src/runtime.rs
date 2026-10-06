@@ -251,7 +251,9 @@ impl<'a> NativeLaunchHandoff<'a> {
         let descriptors =
             capyctl_launchers::ProtectedLaunchDescriptors::new(&private, &inference, &admin)
                 .map_err(|_| native_error("descriptor creation failed"))?;
-        let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
+        let [launch_fd, inference_fd, admin_fd] = descriptors.numbers()[..] else {
+            return Err(native_error("descriptor creation failed"));
+        };
         let command = launch.render_for_launcher(
             ProtectedDescriptorFds::for_launcher(
                 launch_fd.into(),

@@ -322,6 +322,7 @@ pub struct NativeLaunch {
     settings: SglangLaunchSettings,
     cuda_home: Option<String>,
     build_env: std::collections::BTreeMap<String, String>,
+    group: Option<crate::group::GroupMemberArgs>,
 }
 impl NativeLaunch {
     /// Internal cross-crate bridge. Call only with a validated persisted store read;
@@ -344,6 +345,7 @@ impl NativeLaunch {
             settings,
             cuda_home: None,
             build_env: std::collections::BTreeMap::new(),
+            group: None,
         }
     }
     /// SPEC §13.3 amendment (owner decision 2026-09-25): the profile's
@@ -359,6 +361,18 @@ impl NativeLaunch {
         self.cuda_home = cuda_home;
         self.build_env = build_env;
         self
+    }
+    /// ADR 0028 §10: this member's multi-node arguments. A launch without one
+    /// is a single-rank launch and renders exactly as before (T39). HOLD #10:
+    /// `checkpoint_root` stays this member's own model path.
+    #[doc(hidden)]
+    pub fn with_group(mut self, group: crate::group::GroupMemberArgs) -> Self {
+        self.group = Some(group);
+        self
+    }
+    #[doc(hidden)]
+    pub fn group(&self) -> Option<&crate::group::GroupMemberArgs> {
+        self.group.as_ref()
     }
     #[doc(hidden)]
     pub fn cuda_home(&self) -> Option<&str> {

@@ -23,6 +23,7 @@ qualify memory release. The controller retains those obligations.
 """
 
 import hmac
+import ipaddress
 import json
 import os
 import stat
@@ -77,7 +78,10 @@ _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io"
                     "sensitive_option_refused", "invalid_extra_approvals",
                     # SPEC §8.2 / T21: the single-rank rendezvous stays off the
                     # network (loopback_rendezvous.py).
-                    "loopback_rendezvous_failed"})
+                    "loopback_rendezvous_failed",
+                    # ADR 0028 §10: a group field SGLang's resolution changed.
+                    "group_drift:tp_size", "group_drift:pp_size", "group_drift:nnodes",
+                    "group_drift:node_rank", "group_drift:dist_init_addr"})
 # ADR 0014 §2: the typed settings a deployment may state. None means the
 # engine's own default applies; capyctl validates type and range only (ADR 0011).
 _SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
@@ -90,7 +94,20 @@ _SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
 _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 # ADR 0014 amendment A14: the recurrent-state slots capyctl sized for a hybrid
 # model. Present only when sized, so every other launch descriptor is unchanged.
-_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size",)
+# ADR 0028 §10: `group` is present only on a multi-node group member (T39).
+_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group")
+# ADR 0028 §10: a member's group object (crates/capyctl-adapters/src/sglang/
+# args.rs `public_group`); `gloo_socket_ifname` only when the host resolved one.
+_GROUP_KEYS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr", "host_ip")
+GROUP_IFNAME_KEY = "gloo_socket_ifname"
+# The protected entry's group switch, rendered beside the descriptor's group.
+GROUP_MODE = "CAPYCTL_GROUP_MODE"
+# ADR 0028 §10: the member's own peer address, the one address SGLang reads.
+GROUP_ADDRESS = "SGLANG_HOST_IP"
+# CapyCTL-owned single-rank rendezvous and address inputs a group member never
+# runs with: the file store (and its host directory) and the NIC lookup.
+_GROUP_STRIPPED = ("SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE", "CAPYCTL_RENDEZVOUS_DIR",
+                   "SGLANG_LOCAL_IP_NIC")
 
 
 class LaunchError(Exception):
@@ -201,6 +218,8 @@ def _validate_settings(settings):
                                               if name in settings))
     if "max_mamba_cache_size" in settings:
         _integer(settings["max_mamba_cache_size"], 1, _I32)
+    if "group" in settings:
+        _validate_group(settings["group"])
     for name in _PARSER_SETTINGS:
         if name in settings:
             value = settings[name]
@@ -265,6 +284,45 @@ def _validate_settings(settings):
         _reject()
     for token in extra:
         _text(token, 4096)
+
+
+def _address(value):
+    """One literal IP address, as Python's own parser reads it; never a name."""
+    try:
+        return ipaddress.ip_address(_text(value, 64))
+    except ValueError:
+        _reject()
+
+
+def _validate_group(group):
+    """ADR 0028 §10: one member's closed group object.
+
+    Shape only: the agent checked the plan, and construct_server_args rechecks
+    SGLang's resolution of the five reserved fields against it (group_drift).
+    """
+    optional = (GROUP_IFNAME_KEY,) if type(group) is dict and GROUP_IFNAME_KEY in group else ()
+    _exact_object(group, _GROUP_KEYS + optional)
+    for name in ("tp_size", "pp_size"):
+        _integer(group[name], 1, 1024)
+    _integer(group["nnodes"], 2, 1024)
+    _integer(group["node_rank"], 0, group["nnodes"] - 1)
+    # ADR 0028 §2: the members split the ranks evenly.
+    if group["tp_size"] * group["pp_size"] % group["nnodes"]:
+        _reject()
+    # The head's rendezvous address, `<ip>:<port>` (an IPv6 head bracketed).
+    host, _, port = _text(group["dist_init_addr"], 64).rpartition(":")
+    bracketed = host.startswith("[") and host.endswith("]")
+    if _address(host[1:-1] if bracketed else host).version != (6 if bracketed else 4):
+        _reject()
+    if (not port.isascii() or not port.isdigit() or str(int(port)) != port
+            or not 1 <= int(port) <= 65535):
+        _reject()
+    _address(group["host_ip"])
+    if optional:
+        # R11: a kernel interface name (IFNAMSIZ less its terminator).
+        name = _text(group[GROUP_IFNAME_KEY], 15)
+        if not name.isascii() or any(not (char.isalnum() or char in "_-.") for char in name):
+            _reject()
 
 
 def _validate_public(value):
@@ -368,8 +426,12 @@ def build_launch(argv, descriptor_reader):
     try:
         names = ("--public-settings-json", "--launch-descriptor-fd",
                  "--inference-credential-fd", "--admin-credential-fd")
-        if type(argv) not in (list, tuple) or len(argv) != 8:
+        # ADR 0028 §10, ADR 0012: a group worker (node_rank > 0) serves no API
+        # and is handed the private launch descriptor alone; every other
+        # launch carries both credential descriptors, exactly as before.
+        if type(argv) not in (list, tuple) or len(argv) not in (4, 8):
             _reject()
+        names = names[:len(argv) // 2]
         options = {}
         for name, value in zip(argv[::2], argv[1::2]):
             if type(name) is not str or name not in names or name in options:
@@ -386,6 +448,9 @@ def build_launch(argv, descriptor_reader):
             fds.append(fd)
         public = _strict_json(options[names[0]])
         _validate_public(public)
+        worker = public["settings"].get("group", {}).get("node_rank", 0) > 0
+        if worker != (len(fds) == 1):
+            _reject()
         private = _strict_json(descriptor_reader(fds[0]))
         version = private.get("schema_version")
         _integer(version, 1, 2)
@@ -417,6 +482,9 @@ def build_launch(argv, descriptor_reader):
         root = _text(private["checkpoint_root"], 4096)
         if not root.startswith("/") or any(part in ("", ".", "..") for part in root[1:].split("/")):
             _reject()
+        if worker:
+            return LaunchSpec(json.dumps(public, sort_keys=True, separators=(",", ":")),
+                              root, None, None, launch_scope, digest)
         inference = _credential(descriptor_reader(fds[1]))
         admin = _credential(descriptor_reader(fds[2]))
         if hmac.compare_digest(inference, admin):
@@ -562,12 +630,22 @@ def _import_and_launch(spec, contract, approvals=None):
     main's closed categories.
     """
     from runtime import loopback_rendezvous, sglang_server_args
-    # SPEC §8.2 / T21: pinned before any engine import, so no engine module
-    # reads a TCP rendezvous (torch's TCPStore binds every interface).
-    try:
-        rendezvous = loopback_rendezvous.pin("sglang")
-    except loopback_rendezvous.RendezvousError:
-        raise LaunchError("loopback_rendezvous_failed") from None
+    # ADR 0028 §10: group mode is the descriptor's group and the rendered
+    # switch together; either alone is a launch this boundary does not know.
+    group = json.loads(spec._public_json)["settings"].get("group")
+    if (os.environ.get(GROUP_MODE) == "1") != (group is not None):
+        raise LaunchError("invalid_descriptor")
+    if group is None:
+        # SPEC §8.2 / T21: pinned before any engine import, so no engine
+        # module reads a TCP rendezvous (torch's TCPStore binds every interface).
+        try:
+            rendezvous = loopback_rendezvous.pin("sglang")
+        except loopback_rendezvous.RendezvousError:
+            raise LaunchError("loopback_rendezvous_failed") from None
+    else:
+        # ADR 0028 §10: a member rendezvouses over TCP at the head's peer
+        # address (`dist_init_addr`); no file store, no inherited transport.
+        prepare_group_environment(os.environ, group.get(GROUP_IFNAME_KEY))
     arguments, launch = _guarded_engine_import()
     _require_capabilities(spec, arguments, launch)
     try:
@@ -579,16 +657,54 @@ def _import_and_launch(spec, contract, approvals=None):
     if json.loads(spec._public_json)["settings"]["memory_saver"] is True:
         # Only a memory-saver launch is ever woken by a disk reload.
         _keep_served_name_on_reload()
+    # ADR 0028 §12 (R12): every rank, head and worker alike, enrolls its own
+    # saver observation when the residency is deep.
     target = _observation_target(spec, launch)
-    try:
-        # Rechecked last: the scheduler inherits exactly what was verified.
-        loopback_rendezvous.verify(rendezvous)
-    except loopback_rendezvous.RendezvousError:
-        raise LaunchError("loopback_rendezvous_failed") from None
+    if group is None:
+        try:
+            # Rechecked last: the scheduler inherits exactly what was verified.
+            loopback_rendezvous.verify(rendezvous)
+        except loopback_rendezvous.RendezvousError:
+            raise LaunchError("loopback_rendezvous_failed") from None
+    else:
+        verify_group_environment(os.environ, group)
+    # ADR 0028 §9: readiness is the head's. A rank > 0 runs SGLang's health
+    # server on its loopback worker port and nothing probes it: its health
+    # always passes.
     if target is None:
         launch.launch_server(checked._native)
     else:
         launch.launch_server(checked._native, run_scheduler_process_func=target)
+
+
+def prepare_group_environment(environ, expected_ifname=None):
+    """ADR 0028 §10 (R11): strip a group member's inherited transport inputs.
+
+    Every `NCCL_*`, `MASTER_*` and `GLOO_*` name goes, except the resolved
+    `GLOO_SOCKET_IFNAME` (`expected_ifname`), as do `HOST_IP` and the
+    single-rank file rendezvous (`SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`,
+    its host directory) and `SGLANG_LOCAL_IP_NIC`. `SGLANG_HOST_IP` stays as
+    rendered; `verify_group_environment` checks it.
+    """
+    from runtime import loopback_rendezvous
+    try:
+        loopback_rendezvous.pin_group(environ, GROUP_ADDRESS, expected_ifname)
+    except loopback_rendezvous.RendezvousError:
+        raise LaunchError("loopback_rendezvous_failed") from None
+    for name in _GROUP_STRIPPED:
+        environ.pop(name, None)
+
+
+def verify_group_environment(environ, group):
+    """Recheck, right before the engine starts, the member's environment."""
+    from runtime import loopback_rendezvous
+    try:
+        loopback_rendezvous.verify_group(environ, GROUP_ADDRESS, group["host_ip"],
+                                         group.get(GROUP_IFNAME_KEY))
+    except loopback_rendezvous.RendezvousError:
+        raise LaunchError("loopback_rendezvous_failed") from None
+    if any(name in environ for name in _GROUP_STRIPPED):
+        raise LaunchError("loopback_rendezvous_failed")
 
 
 def _keep_served_name_on_reload():

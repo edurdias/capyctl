@@ -13,8 +13,10 @@ class LaunchSpec:
 
     _public_json: str = field(repr=False)
     _checkpoint_root: str = field(repr=False)
-    _inference_key: str = field(repr=False)
-    _admin_key: str = field(repr=False)
+    # ADR 0028 §10, ADR 0012: None on a group worker (node_rank > 0), which
+    # serves no API and is handed no credential.
+    _inference_key: str | None = field(repr=False)
+    _admin_key: str | None = field(repr=False)
     # Version 1 has no scope and must never be promoted implicitly. Version 2
     # carries immutable private metadata, not enrollment or execution authority,
     # plus the optional service-authorized device inventory digest the host

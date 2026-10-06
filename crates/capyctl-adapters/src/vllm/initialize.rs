@@ -324,8 +324,8 @@ fn now_ms() -> Result<i64, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::engine_environment;
-    use crate::group::GroupMemberArgs;
     use crate::vllm::args::{render_command, PlanInputVllm};
+    use capyctl_domain::group::GroupMemberArgs;
     use std::collections::BTreeMap;
 
     fn input(group: Option<(u32, Option<&str>)>) -> PlanInputVllm {

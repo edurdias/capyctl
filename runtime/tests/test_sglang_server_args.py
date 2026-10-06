@@ -11,7 +11,7 @@ from unittest import mock
 
 from runtime import sglang_entry as entry
 from runtime import sglang_server_args as mapping
-from test_sglang_entry import LaunchFixture
+from test_sglang_entry import LaunchFixture, group_public
 
 GIB = 1 << 30
 # A 128 GiB unified-memory baseline: the fixture's 8 GiB static share is 0.0625.
@@ -535,6 +535,81 @@ class DiscreteBaselineTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(mapping.ServerArgsError):
                     mapping.available_bytes_for({"device_total_bytes": bad})
+
+
+class GroupModeTests(LaunchFixture, unittest.TestCase):
+    placement = MappingTests.placement
+
+    def kwargs(self, public, constructor=synthetic_constructor):
+        captured = {}
+
+        def recording(**kwargs):
+            captured.update(kwargs)
+            return constructor(**kwargs)
+        recording.add_cli_args = SyntheticArgs.add_cli_args
+        recording.__struct_fields__ = SyntheticArgs.__struct_fields__
+        self.public = public
+        construct(self.build_member(public), self.placement(), recording).revalidate()
+        return captured
+
+    # T22: group mode takes the five reserved fields from the descriptor; drift is refused.
+    def test_group_fields_come_from_descriptor(self):
+        args = self.kwargs(group_public(1, "eth9"))
+        self.assertEqual((args["tp_size"], args["pp_size"], args["nnodes"], args["node_rank"],
+                          args["dist_init_addr"]), (2, 1, 2, 1, "192.0.2.10:25000"))
+        # ADR 0012: the worker's health server stays on its loopback port and
+        # holds no key; ADR 0028 §12 (R12): the saver is on for every rank.
+        self.assertEqual((args["host"], args["port"]), ("127.0.0.1", 8101))
+        self.assertIsNone(args["api_key"])
+        self.assertIsNone(args["admin_api_key"])
+        self.assertIs(args["enable_memory_saver"], True)
+        head = self.kwargs(group_public(0))
+        self.assertEqual((head["tp_size"], head["nnodes"], head["node_rank"]), (2, 2, 0))
+        self.assertEqual(head["api_key"], self.inference.decode())
+        self.assertEqual(head["admin_api_key"], self.admin.decode())
+        self.assertIs(head["enable_memory_saver"], True)
+        for field, replacement in (("node_rank", 0), ("tp_size", 1), ("pp_size", 2),
+                                   ("nnodes", 1), ("dist_init_addr", None),
+                                   ("node_rank", True)):
+            def drifted(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, field, replacement)
+                return effective
+            drifted.add_cli_args = SyntheticArgs.add_cli_args
+            with self.subTest(field=field, replacement=replacement), \
+                    self.assertRaises(mapping.ServerArgsError) as ctx:
+                self.kwargs(group_public(1), drifted)
+            self.assertEqual(ctx.exception.code, "group_drift:" + field)
+
+    # T22: a group field missing from the resolved record is drift, never silent.
+    def test_missing_group_field_is_drift(self):
+        native = []
+
+        def constructor(**kwargs):
+            result = synthetic_constructor(**kwargs)
+            native.append(result)
+            return result
+        self.public = group_public(1)
+        checked = construct(self.build_member(self.public), self.placement(), constructor)
+        del native[0].dist_init_addr
+        with self.assertRaises(mapping.ServerArgsError) as ctx:
+            checked.revalidate()
+        self.assertEqual(ctx.exception.code, "group_drift:dist_init_addr")
+
+    # T39: without a group the single-rank constants hold.
+    def test_single_rank_constants_hold(self):
+        captured = {}
+
+        def recording(**kwargs):
+            captured.update(kwargs)
+            return synthetic_constructor(**kwargs)
+        recording.add_cli_args = SyntheticArgs.add_cli_args
+        construct(self.build(), self.placement(), recording).revalidate()
+        self.assertEqual((captured["tp_size"], captured["nnodes"], captured["node_rank"],
+                          captured["pp_size"], captured["dist_init_addr"]), (1, 1, 0, 1, None))
+        self.assertEqual(captured["api_key"], self.inference.decode())
 
 
 if __name__ == "__main__":

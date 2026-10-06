@@ -16,7 +16,9 @@ pub enum ProtectedDescriptorError {
 /// Launcher-owned private files. No formatting or serialization surface exposes
 /// their contents; the descriptors close when this non-cloneable value is dropped.
 pub struct ProtectedLaunchDescriptors {
-    files: [std::fs::File; 3],
+    /// The private launch descriptor, then the inference and admin credentials
+    /// unless the launch carries none (`launch_only`).
+    files: Vec<std::fs::File>,
 }
 
 impl ProtectedLaunchDescriptors {
@@ -28,15 +30,22 @@ impl ProtectedLaunchDescriptors {
         let credential = |bytes: &[u8]| {
             !bytes.is_empty() && bytes.len() <= 4096 && bytes.iter().all(|b| (33..=126).contains(b))
         };
-        if launch.is_empty()
-            || launch.len() > 65536
-            || !credential(inference)
-            || !credential(admin)
-            || inference == admin
-        {
-            return Err(ProtectedDescriptorError::Create(
-                "invalid protected descriptors".into(),
-            ));
+        if !credential(inference) || !credential(admin) || inference == admin {
+            return Err(invalid());
+        }
+        Self::files(&[launch, inference, admin])
+    }
+
+    /// ADR 0028 §10, ADR 0012: the private launch descriptor alone, for a
+    /// group worker that serves no API and is handed no credential.
+    pub fn launch_only(launch: &[u8]) -> Result<Self, ProtectedDescriptorError> {
+        Self::files(&[launch])
+    }
+
+    fn files(contents: &[&[u8]]) -> Result<Self, ProtectedDescriptorError> {
+        let launch = contents[0];
+        if launch.is_empty() || launch.len() > 65536 {
+            return Err(invalid());
         }
         fn file(bytes: &[u8]) -> std::io::Result<std::fs::File> {
             use nix::fcntl::{fcntl, FcntlArg, SealFlag};
@@ -66,19 +75,20 @@ impl ProtectedLaunchDescriptors {
             )?;
             Ok(file)
         }
-        let files = [launch, inference, admin].map(file);
-        let [launch, inference, admin] = files;
         let sanitized = |e: std::io::Error| ProtectedDescriptorError::Create(e.to_string());
-        Ok(Self {
-            files: [
-                launch.map_err(sanitized)?,
-                inference.map_err(sanitized)?,
-                admin.map_err(sanitized)?,
-            ],
-        })
+        let files = contents
+            .iter()
+            .map(|bytes| file(bytes).map_err(sanitized))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { files })
     }
 
-    pub fn numbers(&self) -> [i32; 3] {
-        self.files.each_ref().map(AsRawFd::as_raw_fd)
+    /// The inherited descriptor numbers, in the order the entry names them.
+    pub fn numbers(&self) -> Vec<i32> {
+        self.files.iter().map(AsRawFd::as_raw_fd).collect()
     }
+}
+
+fn invalid() -> ProtectedDescriptorError {
+    ProtectedDescriptorError::Create("invalid protected descriptors".into())
 }

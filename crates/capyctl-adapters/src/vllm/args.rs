@@ -110,7 +110,7 @@ pub struct PlanInputVllm {
     pub cuda_namespace: Option<capyctl_config::effective::CudaNamespace>,
     /// ADR 0028 §10: this member's multi-node arguments; `None` is a
     /// single-rank launch, rendered exactly as before (T39).
-    pub group: Option<crate::group::GroupMemberArgs>,
+    pub group: Option<capyctl_domain::group::GroupMemberArgs>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -411,7 +411,7 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
 /// variable is rendered; `GLOO_SOCKET_IFNAME` only when the agent resolved
 /// the interface holding the member's own address (R11).
 fn render_group(
-    group: &crate::group::GroupMemberArgs,
+    group: &capyctl_domain::group::GroupMemberArgs,
     argv: &mut Vec<String>,
     env: &mut std::collections::BTreeMap<String, String>,
 ) {
