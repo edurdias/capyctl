@@ -1,5 +1,40 @@
 # Current implementation and launch status
 
+## An unusable checkpoint names its reason — 2026-10-06 (branch `fix/checkpoint-unusable-reason`)
+
+Reported live on the 16 GB discrete-GPU laptop host (0.1.1 standalone, vLLM 0.29, an 8B FP8
+checkpoint of 10,605,572,552 bytes, a device domain managing 15,797,762,136 bytes,
+`memory.request` 12 GiB and 13 GiB): once measured, every start answered
+`checkpoint_mismatch`, including after configuration changes and on a fresh deployment.
+The stored row was `unusable` with the generic "does not resolve ... replace the
+configuration" text, and `host_effective_revisions` still read `resolved`. Three defects
+(ADR 0014 §7): the re-resolution kept its error only for the closed refusals
+(`insufficient_device_memory:`, `host_backed_unavailable:`); `admit_start` turned every other
+unusable row into `LifecycleError::CheckpointMismatch`; and the failure path wrote no host or
+GPU row. Now the resolution's own text (code, field, detail; bounded at 512 characters) is
+stored; a start on such a revision is refused `checkpoint_unusable` with it (409, CLI class
+`invalid_config`, exit 2), closed refusals keep their codes and exits, and
+`checkpoint_mismatch` is only a digest disagreement. In the same transaction each host whose
+row does not resolve with the measured weights is refused `does_not_resolve` and its GPU rows
+dropped; nothing is reserved, so nothing is released. `status deployment` prints
+`Checkpoint  unusable: ... (<reason>)`. The 0.1.1 cause was most likely the 8 GiB family
+margin on a declared device request (KV = request − weights − 8 GiB ≤ 0; inferred from the
+arithmetic, the real text was not stored); since `c5ebc1a` (0.1.2) the margin is weights × 0.10, and the store
+test shows the reported 12 GiB request resolving with those weights while 10 GiB is refused
+with "the derived KV cache (request minus weights minus margin) is not positive". A row made
+unusable before this fix keeps its generic text (now refused `checkpoint_unusable`, not
+`checkpoint_mismatch`) and its host row; a new revision re-resolves. The per-revision row and
+the fast re-measure on a fresh deployment (the agent's stat-identity digest cache, ADR 0028
+§7) are by design and unchanged.
+
+Tests (T14 T26): `weights_that_do_not_fit_a_declared_request_make_the_revision_unusable`
+(previously pinned `CheckpointMismatch`), `a_declared_request_the_measured_weights_do_not_resolve_names_its_reason`,
+`an_unusable_checkpoint_is_refused_with_its_reason` (management),
+`an_unusable_checkpoint_exits_as_a_configuration_refusal` and
+`status_explains_an_unusable_checkpoint` (CLI); the closed-refusal test
+`a_derived_request_larger_than_the_card_refuses_the_start_with_its_code` is unchanged and
+passes. CPU tests only; they are not qualification, and no live run was made after the fix.
+
 ## Standalone parked limit is settable — 2026-10-06 (branch `feat/parked-limit-setting`)
 
 Owner decision 2026-10-06, the follow-up on ADR 0014 amendment A17 and the amendment of

@@ -747,6 +747,9 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         "unsupported_capability" | "group_shape_unsupported" => "unsupported",
         "not_found" => "not_found",
         "invalid_config" | "invalid_request" | "body_too_large" => "invalid_config",
+        // ADR 0014 §7: the measured checkpoint does not resolve the revision's
+        // memory; the configuration needs correcting (exit 2).
+        "checkpoint_unusable" => "invalid_config",
         // A command whose response deadline passed may still complete; the
         // retry with the same request identity decides (SPEC §6.4).
         "deadline_exceeded" => "management_unavailable",
@@ -1645,6 +1648,37 @@ mod tests {
         // A 5xx without a recognised code is a server fault, not bad input.
         let bare = refusal(StatusCode::BAD_GATEWAY, &json!({}));
         assert_eq!(bare.exit_code(), ExitCode::INTERNAL);
+    }
+
+    /// ADR 0014 §7 (found live on a 16 GB card): a start refused because the
+    /// revision's memory does not resolve with the measured weights exits as
+    /// an invalid configuration (2) and names the reason; a closed device
+    /// refusal keeps its own exit (4).
+    // T14 T26
+    #[test]
+    fn an_unusable_checkpoint_exits_as_a_configuration_refusal() {
+        use crate::output::ExitCode;
+        use reqwest::StatusCode;
+        let reason = "unsupported combination at `engine_config.memory.kv_cache`: the derived KV \
+                      cache (request minus weights minus margin) is not positive";
+        let message = format!(
+            "The checkpoint measured to its digest, but this revision's memory does not resolve with the measured weights: {reason}. Deploy a corrected configuration (a new revision); `capyctl status deployment <name>` shows the reason"
+        );
+        let refused = refusal(
+            StatusCode::CONFLICT,
+            &json!({"error": {"code": "checkpoint_unusable", "message": message}}),
+        );
+        assert_eq!(refused.exit_code(), ExitCode::INVALID_CONFIG);
+        assert_eq!(
+            refused.to_string(),
+            format!("error [invalid_config]: checkpoint_unusable: {message}")
+        );
+        let device = refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": {"code": "capacity_blocked",
+                "message": "insufficient_device_memory: the deployment needs 21 bytes"}}),
+        );
+        assert_eq!(device.exit_code(), ExitCode::INSUFFICIENT_RESOURCES);
     }
 
     /// SPEC §13: the override is part of a recovered command's intent.

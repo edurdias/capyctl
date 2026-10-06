@@ -392,11 +392,18 @@ fn status(value: &Value, names: &HostNames) -> String {
             notes.push(format!("Waiting     {}: {}", operation(op), clean(reason)));
         }
     }
+    // ADR 0014 §7 (found live on a 16 GB card): a checkpoint that measured
+    // to its digest but whose weights do not resolve the revision says why,
+    // not that it could not be measured.
     if let Some(diagnostic) = d["checkpoint_digest"]["diagnostic"].as_str() {
-        notes.push(format!(
-            "Checkpoint  could not be measured ({})",
-            clean(diagnostic)
-        ));
+        notes.push(if d["checkpoint_digest"]["state"] == "unusable" {
+            format!(
+                "Checkpoint  unusable: the memory does not resolve with the measured weights ({}); deploy a corrected configuration",
+                clean(diagnostic)
+            )
+        } else {
+            format!("Checkpoint  could not be measured ({})", clean(diagnostic))
+        });
     }
     // Found live 2026-10-04: a declared fingerprint that is a weight file's
     // hash, not CapyCTL's checkpoint digest, says which value is expected.
@@ -1002,6 +1009,33 @@ mod tests {
         assert!(out.contains(&format!("declared {declared}")), "{out}");
         assert!(out.contains(&format!("measured {measured}")), "{out}");
         assert!(out.contains("not a file hash"), "{out}");
+    }
+
+    // T14 T26 (found live on a 16 GB card): an unusable checkpoint shows the
+    // reason its weights do not resolve the revision, not "could not be
+    // measured" and not a mismatch.
+    #[test]
+    fn status_explains_an_unusable_checkpoint() {
+        let reason = "unsupported combination at `engine_config.memory.kv_cache`: the derived \
+                      KV cache (request minus weights minus margin) is not positive";
+        let out = render(
+            View::Status,
+            &json!({"name": "fv", "kind": "model", "desired_state": "running",
+                "observed_state": "stopped", "ready_instances": 0, "desired_instances": 1,
+                "revision": "1",
+                "checkpoint_digest": {"state": "unusable", "provisional": true,
+                    "digest": format!("sha256:{}", "b".repeat(64)), "diagnostic": reason},
+                "instances": []}),
+            &names(),
+        );
+        assert!(
+            out.contains(&format!(
+                "Checkpoint  unusable: the memory does not resolve with the measured weights ({reason})"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("could not be measured"), "{out}");
+        assert!(!out.contains("mismatch"), "{out}");
     }
 
     // T16: an instance whose launch failed shows the failure's code and
