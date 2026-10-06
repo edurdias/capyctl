@@ -204,29 +204,71 @@ fn sglang_single_rank_descriptor_unchanged() {
     assert_eq!(single.public_metadata(), &single_reference_descriptor());
 }
 
-// T21, T37 (ADR 0012): a worker's command names no credential descriptor;
-// the head and a single rank keep all three.
+// T21, T37 (ADR 0012): a worker's command names no API credential
+// descriptor; a deep worker names its observation credential (ADR 0028 §12,
+// R12); the head and a single rank keep the two API credentials.
 #[test]
 fn only_the_worker_command_carries_no_credentials() {
     let worker = SglangLaunch::from_frozen(&frozen_sglang_group(1)).unwrap();
     let command = worker
-        .render_for_launcher(ProtectedDescriptorFds::launch_only(3).unwrap(), wrapper())
-        .unwrap();
-    assert_eq!(&command.argv[5..], ["--launch-descriptor-fd", "3"]);
-    assert!(command.argv.iter().all(|a| !a.contains("credential")));
-    // A worker is never handed credential descriptors, and a credentialed
-    // launch is never rendered without them.
-    assert!(worker
         .render_for_launcher(
-            ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
+            ProtectedDescriptorFds::for_worker(3, Some(4)).unwrap(),
+            wrapper(),
+        )
+        .unwrap();
+    assert_eq!(
+        &command.argv[5..],
+        [
+            "--launch-descriptor-fd",
+            "3",
+            "--observation-credential-fd",
+            "4"
+        ]
+    );
+    // A worker is never handed API credential descriptors, and a deep one is
+    // never rendered without its observation credential.
+    for fds in [
+        ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
+        ProtectedDescriptorFds::for_worker(3, None).unwrap(),
+    ] {
+        assert!(worker.render_for_launcher(fds, wrapper()).is_err());
+    }
+    // A worker that is not deep is handed no observation credential.
+    let mut settings = capyctl_testkit::sglang_launch_settings();
+    settings.memory_saver = false;
+    let shallow = NativeLaunch::from_frozen_store(
+        frozen_sglang_single().metadata().clone(),
+        "/private/checkpoints/qwen".into(),
+        "/opt/sglang/bin/python3".into(),
+        "private://inference-reference".into(),
+        "private://admin-reference".into(),
+        settings,
+    )
+    .with_group(member(1, None));
+    let shallow = SglangLaunch::from_frozen(&shallow).unwrap();
+    assert!(shallow
+        .render_for_launcher(
+            ProtectedDescriptorFds::for_worker(3, Some(4)).unwrap(),
             wrapper()
         )
         .is_err());
+    let command = shallow
+        .render_for_launcher(
+            ProtectedDescriptorFds::for_worker(3, None).unwrap(),
+            wrapper(),
+        )
+        .unwrap();
+    assert_eq!(&command.argv[5..], ["--launch-descriptor-fd", "3"]);
     for launch in [frozen_sglang_single(), frozen_sglang_group(0)] {
         let rendered = SglangLaunch::from_frozen(&launch).unwrap();
-        assert!(rendered
-            .render_for_launcher(ProtectedDescriptorFds::launch_only(3).unwrap(), wrapper())
-            .is_err());
+        for fds in [None, Some(4)] {
+            assert!(rendered
+                .render_for_launcher(
+                    ProtectedDescriptorFds::for_worker(3, fds).unwrap(),
+                    wrapper()
+                )
+                .is_err());
+        }
         let command = rendered
             .render_for_launcher(
                 ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
@@ -245,5 +287,6 @@ fn only_the_worker_command_carries_no_credentials() {
             ]
         );
     }
-    assert!(ProtectedDescriptorFds::launch_only(2).is_err());
+    assert!(ProtectedDescriptorFds::for_worker(2, None).is_err());
+    assert!(ProtectedDescriptorFds::for_worker(3, Some(3)).is_err());
 }

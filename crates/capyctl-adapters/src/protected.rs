@@ -21,25 +21,35 @@ pub struct ProtectedLaunchDescriptors {
     files: Vec<std::fs::File>,
 }
 
+/// A credential's shape: 1 to 4096 printable, non-space ASCII bytes.
+fn credential(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.len() <= 4096 && bytes.iter().all(|b| (33..=126).contains(b))
+}
+
 impl ProtectedLaunchDescriptors {
     pub fn new(
         launch: &[u8],
         inference: &[u8],
         admin: &[u8],
     ) -> Result<Self, ProtectedDescriptorError> {
-        let credential = |bytes: &[u8]| {
-            !bytes.is_empty() && bytes.len() <= 4096 && bytes.iter().all(|b| (33..=126).contains(b))
-        };
         if !credential(inference) || !credential(admin) || inference == admin {
             return Err(invalid());
         }
         Self::files(&[launch, inference, admin])
     }
 
-    /// ADR 0028 §10, ADR 0012: the private launch descriptor alone, for a
-    /// group worker that serves no API and is handed no credential.
-    pub fn launch_only(launch: &[u8]) -> Result<Self, ProtectedDescriptorError> {
-        Self::files(&[launch])
+    /// ADR 0028 §10, ADR 0012: a group worker serves no API and is handed no
+    /// API credential: the private launch descriptor, then, when its
+    /// residency is deep, its own observation credential (ADR 0028 §12).
+    pub fn for_worker(
+        launch: &[u8],
+        observation: Option<&[u8]>,
+    ) -> Result<Self, ProtectedDescriptorError> {
+        match observation {
+            Some(observation) if credential(observation) => Self::files(&[launch, observation]),
+            Some(_) => Err(invalid()),
+            None => Self::files(&[launch]),
+        }
     }
 
     fn files(contents: &[&[u8]]) -> Result<Self, ProtectedDescriptorError> {

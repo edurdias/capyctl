@@ -143,11 +143,17 @@ def _validated_public(spec):
                               "public_settings": public}).encode()
         argv = ["--public-settings-json", spec._public_json, "--launch-descriptor-fd", "3"]
         payloads = {3: private}
-        # ADR 0028 §10: a group worker's launch carries no credential.
+        # ADR 0028 §10: a group worker's launch carries no API credential, and
+        # a deep one its observation credential instead (ADR 0028 §12).
         if spec._inference_key is not None or spec._admin_key is not None:
+            if spec._observation_secret is not None:
+                raise ValueError()
             argv += ["--inference-credential-fd", "4", "--admin-credential-fd", "5"]
             payloads.update({4: spec._inference_key.encode("ascii"),
                              5: spec._admin_key.encode("ascii")})
+        elif spec._observation_secret is not None:
+            argv += ["--observation-credential-fd", "4"]
+            payloads[4] = spec._observation_secret.encode("ascii")
         # Reuse the entire strict boundary: LaunchSpec's Python constructor is
         # not itself a validation capability. No descriptor I/O occurs here.
         sglang_entry.build_launch(argv, payloads.__getitem__)

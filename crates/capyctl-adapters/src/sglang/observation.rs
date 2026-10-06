@@ -47,6 +47,9 @@ fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// The per-launch observation key, from the launch's admin credential (hex).
+/// ADR 0028 §12 (R12): a group worker holds no admin credential (ADR 0012);
+/// its key comes from its own observation credential
+/// (`SglangAdapter::with_observation_credential`), passed here in its place.
 pub fn observation_key(admin_key: &str, binding_id: &str, incarnation: &str) -> [u8; 32] {
     hmac_sha256(
         admin_key.as_bytes(),

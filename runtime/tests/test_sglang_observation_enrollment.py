@@ -50,7 +50,7 @@ class EnrollmentTests(unittest.TestCase):
     def scope(self):
         self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION))
 
-    def ask(self, proof=None, request_id="read-1", version=2):
+    def ask(self, proof=None, request_id="read-1", version=2, secret="a" * 64):
         """One request from a client thread while this thread, the one that
         enrolled (the scheduler thread), ticks the safe point."""
         answers = []
@@ -59,7 +59,7 @@ class EnrollmentTests(unittest.TestCase):
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.settimeout(3)
             connection.connect(os.path.join(self.directory.name, BINDING + ".sock"))
-            key = observation_key("a" * 64, BINDING, INCARNATION)
+            key = observation_key(secret, BINDING, INCARNATION)
             body = dict(version=version, request_id=request_id, timeout_ms=1000,
                         proof=proof or request_proof(key, BINDING, INCARNATION, request_id))
             raw = json.dumps(body).encode()
@@ -225,6 +225,8 @@ class EnrollmentTests(unittest.TestCase):
 
     def test_entry_hands_launch_server_the_target_only_for_an_enrollable_launch(self):
         class Spec:
+            _observation_secret = None
+
             def __init__(self, saver, restore="disk_reload"):
                 self._public_json = json.dumps(dict(binding_id=BINDING, incarnation=INCARNATION,
                                                     settings=dict(memory_saver=saver,
@@ -253,6 +255,91 @@ class EnrollmentTests(unittest.TestCase):
             self.assertNotIn(enrollment.ENV_SCOPE, os.environ)
             self.assertNotIn(enrollment.ENV_DIR, os.environ)
             self.assertNotIn(enrollment.ENV_RESTORE, os.environ)
+
+    # ---------------------------------------- ADR 0028 §12 (R12): group ranks
+
+    WORKER_SECRET = "w" * 64
+
+    def group_scope(self, group=(2, 1, 2)):
+        self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION,
+                                                     group=group))
+        self.assertEqual(os.environ[enrollment.ENV_GROUP], ":".join(map(str, group)))
+
+    # T22: a TP 2 head (admin credential) and worker (observation credential,
+    # no API or admin key) each enroll, write their record and serve
+    # observations keyed by their own credential only.
+    def test_head_and_worker_group_ranks_enroll(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.addCleanup(enrollment._SECRET.clear)
+        for rank, secret in ((0, "a" * 64), (1, self.WORKER_SECRET)):
+            with self.subTest(rank=rank):
+                self.close_all()
+                for name in os.listdir(self.directory.name):
+                    if name.startswith(BINDING):
+                        os.unlink(os.path.join(self.directory.name, name))
+                enrollment._SECRET.clear()
+                if rank:
+                    enrollment._SECRET.append(enrollment.ObservationSecret(secret))
+                # Each rank is its own scheduler process.
+                self.fakes = Fakes(self)
+                self.fakes.impl._binary_wrapper.cdll._name = self.library
+                mock.patch.object(residency, "CudaDriver",
+                                  return_value=self.fakes.driver).start()
+                self.fakes.scheduler.server_args = ServerArgs(
+                    tp_size=2, admin_api_key=None if rank else "a" * 64)
+                self.group_scope()
+                self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+                record = json.loads((Path(self.directory.name) / (BINDING + ".json")).read_text())
+                self.assertEqual(record["binding_id"], BINDING)
+                self.assertEqual(self.ask(secret=secret)["status"], "observed")
+                if rank:
+                    self.assertIsNone(self.ask(request_id="read-2", secret="a" * 64))
+
+    # T22: without its observation credential a keyless worker enrolls nothing.
+    def test_a_keyless_worker_without_its_credential_enrolls_nothing(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.fakes.scheduler.server_args = ServerArgs(tp_size=2, admin_api_key=None)
+        self.group_scope()
+        self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        self.assertEqual(os.listdir(self.directory.name), [Path(self.library).name])
+
+    # T22: a scheduler whose topology differs from the descriptor's group, or a
+    # host running more than one rank of it, is refused at install.
+    def test_a_topology_other_than_the_group_is_refused(self):
+        from test_sglang_saver_residency import ServerArgs
+        for args, group in ((dict(tp_size=2), (1, 2, 2)), (dict(tp_size=1), (2, 1, 2)),
+                            (dict(tp_size=2, pp_size=2), (2, 2, 2)),
+                            (dict(tp_size=2, dp_size=2), (2, 1, 2))):
+            with self.subTest(args=args, group=group):
+                self.fakes.scheduler.server_args = ServerArgs(**args)
+                self.group_scope(group)
+                self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        self.assertFalse(enrollment.entry_environment(self.directory.name, BINDING,
+                                                      INCARNATION, group=(2, 1, 1)))
+
+    # T39: a single-rank scope publishes no group and keeps the 1/1 pin.
+    def test_single_rank_keeps_its_topology_pin(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.scope()
+        self.assertNotIn(enrollment.ENV_GROUP, os.environ)
+        self.fakes.scheduler.server_args = ServerArgs(tp_size=2)
+        self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+
+    # T22: the worker's scheduler target keeps its credential in its own
+    # process and never hands it to SGLang.
+    def test_the_worker_target_keeps_its_credential_from_sglang(self):
+        self.addCleanup(enrollment._SECRET.clear)
+        calls = []
+        loaded = types.ModuleType("sglang.srt.managers.scheduler")
+        loaded.Scheduler = type("Scheduler", (), {"run_event_loop": lambda self: None})
+        loaded.run_scheduler_process = lambda *args, **kwargs: calls.append((args, kwargs))
+        mock.patch.dict(sys.modules, {loaded.__name__: loaded,
+                                      "sglang.srt.managers": types.ModuleType("m")}).start()
+        sys.modules["sglang.srt.managers"].scheduler = loaded
+        enrollment.scheduler_target(self.WORKER_SECRET)(1, 2, writer=3)
+        self.assertEqual(calls, [((1, 2), {"writer": 3})])
+        self.assertEqual(enrollment._SECRET[0]._value, self.WORKER_SECRET)
+        self.assertIs(enrollment.scheduler_target(), enrollment.run_enrolled_scheduler)
 
 
 if __name__ == "__main__":

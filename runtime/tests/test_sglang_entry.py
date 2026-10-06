@@ -103,6 +103,7 @@ class LaunchFixture:
         self.root = "/private/checkpoints/qwen"
         self.inference = b"inference-private-" + b"a" * 32
         self.admin = b"admin-private-" + b"b" * 32
+        self.observation = b"observation-private-" + b"c" * 32
 
     def argv(self, public=None):
         return ["--public-settings-json", json.dumps(public or self.public),
@@ -140,15 +141,22 @@ class LaunchFixture:
         return entry.build_launch(self.argv() if argv is None else argv, data.__getitem__)
 
     # ADR 0012: a worker (node_rank > 0) is handed the private launch
-    # descriptor alone; the head keeps both credential descriptors.
+    # descriptor and, when deep, its observation credential (ADR 0028 §12);
+    # the head keeps both credential descriptors.
     def member_argv(self, public):
         argv = self.argv(public)
-        return argv[:4] if public["settings"]["group"]["node_rank"] else argv
+        if not public["settings"]["group"]["node_rank"]:
+            return argv
+        if public["settings"]["memory_saver"]:
+            return argv[:4] + ["--observation-credential-fd", "4"]
+        return argv[:4]
 
     def member_payloads(self, public):
         data = self.payloads(public)
         if public["settings"]["group"]["node_rank"]:
             del data[4], data[5]
+            if public["settings"]["memory_saver"]:
+                data[4] = self.observation
         return data
 
     def build_member(self, public):
@@ -1187,18 +1195,49 @@ class EntryGroupStartupTests(LaunchFixture, unittest.TestCase):
         self.assertEqual((result, error), (0, ""))
         self.assertIs(launch.launch_server.call_args.kwargs["run_scheduler_process_func"], target)
 
-    # T22, R12: the observation enrollment itself is rank-blind.
-    def test_observation_target_enrolls_a_worker(self):
+    # T22, R12 (ADR 0028 §12): every rank's scope carries the group topology;
+    # a worker's target carries its observation credential, picklable for
+    # SGLang's spawned scheduler and never formatted; the head's is unchanged.
+    def test_observation_target_enrolls_every_rank(self):
+        import pickle
         from runtime import engine_capabilities, sglang_observation_enrollment as enrollment
-        os.environ[enrollment.ENV_DIR] = "/state/observations"
-        spec = self.build_member(group_public(1))
-        with mock.patch.object(engine_capabilities, "accepts_scheduler_target",
-                               return_value=True), \
-                mock.patch.object(enrollment, "entry_environment", return_value=True) as enrol:
-            target = entry._observation_target(spec, mock.Mock())
-        self.assertIs(target, enrollment.run_enrolled_scheduler)
-        enrol.assert_called_once_with("/state/observations", "01K00000000000000000000001",
-                                      "01K00000000000000000000099", "disk_reload")
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                os.environ[enrollment.ENV_DIR] = "/state/observations"
+                spec = self.build_member(group_public(rank))
+                with mock.patch.object(engine_capabilities, "accepts_scheduler_target",
+                                       return_value=True), \
+                        mock.patch.object(enrollment, "entry_environment",
+                                          return_value=True) as enrol:
+                    target = entry._observation_target(spec, mock.Mock())
+                enrol.assert_called_once_with(
+                    "/state/observations", "01K00000000000000000000001",
+                    "01K00000000000000000000099", "disk_reload", group=(2, 1, 2))
+                if rank == 0:
+                    self.assertIs(target, enrollment.run_enrolled_scheduler)
+                    continue
+                self.assertIs(target.func, enrollment.run_enrolled_scheduler)
+                secret = target.keywords["observation_secret"]
+                self.assertNotIn(self.observation.decode(), repr(target))
+                self.assertEqual(pickle.loads(pickle.dumps(secret))._value,
+                                 self.observation.decode())
+
+    # T22, T37: a deep worker must carry its observation credential, and a
+    # worker that is not deep must not.
+    def test_a_worker_observation_credential_follows_its_residency(self):
+        public = group_public(1)
+        self.assertEqual(self.build_member(public)._observation_secret,
+                         self.observation.decode())
+        self.rejects(self.member_argv(public)[:4], {3: self.member_payloads(public)[3]})
+        public["settings"]["memory_saver"] = False
+        self.assertIsNone(self.build_member(public)._observation_secret)
+        data = self.member_payloads(public)
+        data[4] = self.observation
+        self.rejects(self.member_argv(public) + ["--observation-credential-fd", "4"], data)
+        # The head and a single rank never take one.
+        public = group_public(0)
+        self.rejects(self.argv(public)[:4] + ["--observation-credential-fd", "4"],
+                     {3: self.payloads(public)[3], 4: self.observation})
 
 
 if __name__ == "__main__":

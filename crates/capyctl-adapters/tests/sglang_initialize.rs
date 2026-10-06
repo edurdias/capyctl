@@ -1115,6 +1115,8 @@ async fn a_profile_cuda_home_and_build_limit_reach_the_sglang_engine() {
 // ---------------------------------------------------------- group members
 
 const WORKER_PORT: u16 = 8101;
+/// ADR 0028 §12 (R12): a deep worker's per-launch observation credential.
+const OBSERVATION: &str = "observation-secret";
 
 fn member(rank: u32, interface: Option<&str>) -> capyctl_domain::group::GroupMemberArgs {
     capyctl_domain::group::GroupMemberArgs {
@@ -1142,7 +1144,9 @@ async fn spawn_member(
     let (stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
     let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
     let launch = frozen_launch(port).with_group(member(rank, interface));
-    let adapter = configure(equipped(launch, tool.clone(), &log));
+    let adapter = configure(
+        equipped(launch, tool.clone(), &log).with_observation_credential(OBSERVATION.into()),
+    );
     let observation = adapter
         .execute_persisted(&initialize_command(30_000))
         .await
@@ -1192,9 +1196,10 @@ async fn sglang_group_env() {
     }
 }
 
-// T21, T37 (ADR 0012): the key-guarded API is the head's. A worker is handed
-// the private launch descriptor alone, even by an adapter holding the keys;
-// the head keeps all three descriptors.
+// T21, T37 (ADR 0012): the key-guarded API is the head's. A deep worker is
+// handed the private launch descriptor and its observation credential (ADR
+// 0028 §12), never the API keys, even by an adapter holding them; the head
+// keeps its three descriptors and no observation credential.
 #[tokio::test]
 async fn credentials_reach_the_head_only() {
     let (head, descriptors) = spawn_member(0, Some("eth9"), |adapter| adapter).await;
@@ -1202,23 +1207,75 @@ async fn credentials_reach_the_head_only() {
     assert_eq!(descriptors[1], INFERENCE.as_bytes());
     assert_eq!(descriptors[2], ADMIN.as_bytes());
     assert!(head.argv.iter().any(|a| a == "--inference-credential-fd"));
+    assert!(!head.argv.iter().any(|a| a == "--observation-credential-fd"));
 
     let (worker, descriptors) = spawn_member(1, Some("eth9"), |adapter| adapter).await;
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(&worker.argv[5..6], ["--launch-descriptor-fd"]);
-    assert_eq!(worker.argv.len(), 7);
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[1], OBSERVATION.as_bytes());
+    assert_eq!(
+        [&worker.argv[5], &worker.argv[7]],
+        ["--launch-descriptor-fd", "--observation-credential-fd"]
+    );
+    assert_eq!(worker.argv.len(), 9);
     let private: Value = serde_json::from_slice(&descriptors[0]).unwrap();
     assert_eq!(
         private["public_settings"]["endpoint"],
         "http://127.0.0.1:8101"
     );
-    let everything = format!("{:?} {:?} {}", worker.argv, worker.env, private);
+    let everything = format!(
+        "{:?} {:?} {} {:?}",
+        worker.argv, worker.env, private, descriptors[1]
+    );
     for secret in [INFERENCE, ADMIN] {
         assert!(
             !everything.contains(secret),
             "a credential reached the worker"
         );
     }
+    assert!(!format!("{:?} {:?}", worker.argv, worker.env).contains(OBSERVATION));
+}
+
+/// A group worker launch with the memory saver on or off.
+fn worker_launch(port: u16, deep: bool) -> NativeLaunch {
+    let mut config = settings();
+    config.memory_saver = deep;
+    let frozen = frozen_launch(port);
+    NativeLaunch::from_frozen_store(
+        frozen.metadata().clone(),
+        CHECKPOINT.into(),
+        "/opt/sglang/bin/python3".into(),
+        format!("sglang-inference-{BINDING}"),
+        format!("sglang-admin-{BINDING}"),
+        config,
+    )
+    .with_group(member(1, None))
+}
+
+// T22, R12 (ADR 0028 §12): a worker that is not deep is handed no
+// observation credential; a deep worker without one spawns nothing.
+#[tokio::test]
+async fn the_observation_credential_follows_the_worker_residency() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    equipped(worker_launch(1, false), tool.clone(), &log)
+        .with_observation_credential(OBSERVATION.into())
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(tool.descriptors.lock().unwrap()[0].len(), 1);
+    assert_eq!(tool.spawned.lock().unwrap()[0].argv.len(), 7);
+
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let refused = equipped(worker_launch(1, true), tool.clone(), &log)
+        .execute_persisted(&initialize_command(30_000))
+        .await;
+    assert!(
+        matches!(refused, Err(RuntimeError::Unsupported)),
+        "{refused:?}"
+    );
+    assert!(tool.spawned.lock().unwrap().is_empty());
+    std::fs::remove_file(&log).ok();
 }
 
 // T22, R12 (ADR 0028 §12): a deep worker enrolls its saver observation in its

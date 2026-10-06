@@ -117,12 +117,20 @@ pub struct SglangLaunchHandle {
     pub(super) rendered: SglangLaunch,
 }
 
-/// An owned launch's parts: the launch, the process tools, and the inference
-/// and admin credentials (`None` for a group worker, ADR 0012).
+/// The protected credentials one owned launch is handed.
+pub(super) enum LaunchCredentials {
+    /// A single rank or a group head: the inference and admin credentials.
+    Api { inference: String, admin: String },
+    /// ADR 0028 §10, ADR 0012: a group worker is handed no API credential;
+    /// a deep one gets its own observation credential (ADR 0028 §12).
+    Worker { observation: Option<String> },
+}
+
+/// An owned launch's parts: the launch, the process tools and its credentials.
 pub(super) type LaunchParts = (
     SglangLaunchHandle,
     Arc<dyn OwnedProcessLaunch>,
-    Option<(String, String)>,
+    LaunchCredentials,
 );
 
 /// One immutable runtime binding. No Debug implementation exposes credentials or
@@ -161,6 +169,12 @@ pub struct SglangAdapter {
     /// descriptors and appear in no argv, env, log or receipt (SPEC §13.3).
     inference_key: Option<String>,
     admin_key: Option<String>,
+    /// ADR 0028 §12 (R12): a deep group worker's per-launch observation
+    /// credential. It reaches the entry through its own protected descriptor
+    /// and keys the worker's saver observation (`observation::observation_key`)
+    /// exactly as the admin credential keys the head's, so the host's observer
+    /// verifies the worker with it.
+    observation_credential: Option<String>,
     /// The installation interpreter the frozen launch names (its prefix bounds
     /// where the saver library an observation reports may live).
     executable: String,
@@ -226,6 +240,7 @@ impl SglangAdapter {
             session: None,
             inference_key: None,
             admin_key: None,
+            observation_credential: None,
             executable: frozen.executable().into(),
             observation_dir: None,
             rendezvous_dir: None,
@@ -315,6 +330,17 @@ impl SglangAdapter {
         );
         self.inference_key = Some(inference);
         self.admin_key = Some(admin);
+        self
+    }
+
+    /// ADR 0028 §12 (R12): a deep group worker's per-launch observation
+    /// credential, handed to its entry on its own protected descriptor. The
+    /// worker's scheduler keys its saver observation with it (it holds no
+    /// admin credential, ADR 0012), and the host's observer derives the same
+    /// key from it (`observation::observation_key`). Ignored for every other
+    /// launch.
+    pub fn with_observation_credential(mut self, credential: String) -> Self {
+        self.observation_credential = Some(credential);
         self
     }
 
@@ -415,18 +441,29 @@ impl SglangAdapter {
 
     /// The four things an owned launch needs. Any one missing makes the step
     /// unsupported rather than partly performed. ADR 0028 §10, ADR 0012: a
-    /// group worker serves no API and is handed no credential, so its parts
-    /// carry none even when this adapter holds a pair.
+    /// group worker serves no API and is handed no API credential, so its
+    /// parts carry none even when this adapter holds a pair; a deep worker
+    /// needs its observation credential instead (ADR 0028 §12), and a worker
+    /// that is not deep is handed none.
     pub(super) fn launch_parts(&self) -> Result<LaunchParts, RuntimeError> {
         let (Some(launch), Some(tools)) = (&self.launch, &self.tools) else {
             return Err(RuntimeError::Unsupported);
         };
         let rendered = SglangLaunch::from_frozen(launch)?;
         let credentials = if rendered.is_group_worker() {
-            None
+            LaunchCredentials::Worker {
+                observation: match (rendered.worker_observes(), &self.observation_credential) {
+                    (false, _) => None,
+                    (true, Some(observation)) => Some(observation.clone()),
+                    (true, None) => return Err(RuntimeError::Unsupported),
+                },
+            }
         } else {
             match (&self.inference_key, &self.admin_key) {
-                (Some(inference), Some(admin)) => Some((inference.clone(), admin.clone())),
+                (Some(inference), Some(admin)) => LaunchCredentials::Api {
+                    inference: inference.clone(),
+                    admin: admin.clone(),
+                },
                 _ => return Err(RuntimeError::Unsupported),
             }
         };
