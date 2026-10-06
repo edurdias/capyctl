@@ -688,7 +688,9 @@ impl crate::Store {
     /// ADR 0028 §8, §11: durably fence one member as dispatched, before its
     /// Launch is sent.
     ///
-    /// Contract for the controller (Task 17): call this for a member, and see
+    /// Contract for the controller (Task 16, group activation, which sends
+    /// every Launch; Task 17 relies on it when settling): call this for a
+    /// member, and see
     /// it return `Ok`, before sending that member's Launch, and on every
     /// retry of it. A Launch whose reply is lost may have spawned the member,
     /// so from here on it never settles on empty gone evidence, in any later
