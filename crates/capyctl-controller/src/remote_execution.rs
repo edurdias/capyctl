@@ -1018,6 +1018,157 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             self.readiness.clone(),
         ))
     }
+    fn groups(&self) -> Option<Arc<dyn crate::group_activation::GroupHosts>> {
+        Some(Arc::new(AgentGroupHosts::new(
+            self.owner.clone(),
+            self.sessions.clone(),
+            self.controller_id.clone(),
+            self.readiness.clone(),
+        )))
+    }
+}
+
+/// ADR 0028 §8: the member hosts of a group through their authenticated
+/// sessions, with the head's readiness in the same ledger every remote launch
+/// shares (SPEC §13.2, G2).
+pub struct AgentGroupHosts {
+    owner: SharedCoordinatorState,
+    sessions: Arc<AgentSessions>,
+    controller_id: String,
+    readiness: ReadinessLedger,
+}
+
+impl AgentGroupHosts {
+    pub fn new(
+        owner: SharedCoordinatorState,
+        sessions: Arc<AgentSessions>,
+        controller_id: String,
+        readiness: ReadinessLedger,
+    ) -> Self {
+        Self {
+            owner,
+            sessions,
+            controller_id,
+            readiness,
+        }
+    }
+}
+
+impl crate::group_activation::GroupHosts for AgentGroupHosts {
+    fn controller_id(&self) -> String {
+        self.controller_id.clone()
+    }
+
+    fn host(&self, host_id: &str) -> Result<crate::group_activation::MemberHost, String> {
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| "ownership unavailable".to_owned())?;
+        let publication = owner
+            .store()
+            .host_publication(host_id)
+            .map_err(|e| e.to_string())?
+            .filter(|p| p.host_id == host_id)
+            .ok_or_else(|| format!("host {host_id} has no current publication"))?;
+        let config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
+            .map_err(|e| e.to_string())?;
+        // ADR 0028 §3: read from the publication, never from the normalized
+        // policy (its digest leaves the groups block out).
+        let groups = capyctl_config::groups_policy::host_groups_policy(&config.document)
+            .map_err(|e| e.to_string())?;
+        Ok(crate::group_activation::MemberHost {
+            policy_fingerprint: publication.fingerprint,
+            groups,
+        })
+    }
+
+    fn preflight(&self, host_id: &str, needs: &[&str]) -> Result<(), String> {
+        self.sessions.preflight(host_id, needs, true)
+    }
+
+    fn supports(&self, host_id: &str, capability: &str) -> bool {
+        self.sessions.supports(host_id, capability)
+    }
+
+    fn execute(
+        &self,
+        command: MemberCommand,
+    ) -> crate::group_activation::HostFuture<'_, Result<pb::MemberExecutionResult, String>> {
+        Box::pin(async move {
+            self.sessions
+                .execute(command)
+                .await
+                .map_err(|status| status.message().to_owned())
+        })
+    }
+
+    fn provision_head<'a>(
+        &'a self,
+        command: &'a MemberCommand,
+    ) -> crate::group_activation::HostFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let MemberAction::Launch { member, .. } = &command.action else {
+                return Err("not a group launch".into());
+            };
+            let host = &command.identity.member.host_id;
+            let key = {
+                let owner = self
+                    .owner
+                    .lock()
+                    .map_err(|_| "ownership unavailable".to_owned())?;
+                let publication = owner
+                    .store()
+                    .host_publication(host)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("host {host} has no current publication"))?;
+                let config =
+                    capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
+                        .map_err(|e| e.to_string())?;
+                let ingress = config
+                    .ingress
+                    .as_ref()
+                    .ok_or_else(|| format!("host {host} publishes no ingress"))?;
+                // ADR 0012: the head's launch has its own inference key,
+                // sealed beside the binding before the host is provisioned.
+                let role = capyctl_store::secrets::SecretRole::Inference;
+                let key = match owner
+                    .store()
+                    .engine_key(&member.binding_id, &member.incarnation, role)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(key) => key,
+                    None => {
+                        let key = capyctl_store::secrets::new_engine_key();
+                        owner
+                            .store()
+                            .store_engine_key(&member.binding_id, &member.incarnation, &key, role)
+                            .map_err(|e| e.to_string())?;
+                        key
+                    }
+                };
+                // SPEC §§6, 15: the group's only replica is the head's ingress.
+                owner
+                    .store()
+                    .bind_remote_ingress(&member.binding_id, host, &ingress.address)
+                    .map_err(|e| e.to_string())?;
+                key
+            };
+            match self.sessions.provision_ingress(command, key).await {
+                Ok(ProvisionOutcome::Provisioned) => Ok(()),
+                Ok(ProvisionOutcome::Refused(reason)) => Err(reason),
+                Err(status) => Err(status.message().to_owned()),
+            }
+        })
+    }
+
+    fn head_ready(&self, binding_id: &str, host_id: &str) {
+        if let (Ok(mut readiness), Some(session)) = (
+            self.readiness.lock(),
+            self.sessions.current_session(host_id),
+        ) {
+            readiness.insert(binding_id.to_owned(), session);
+        }
+    }
 }
 
 #[cfg(test)]

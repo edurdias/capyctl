@@ -293,10 +293,51 @@ pub async fn ensure_materialized(
     host_policy_fingerprint: &str,
     deadline_ms: i64,
 ) -> Result<(), RuntimeError> {
+    ensure_materialized_with(
+        owner,
+        sessions.supports_model_sources(host),
+        |command| async move { sessions.execute(command).await.map_err(drop) },
+        controller_id,
+        host,
+        member_id,
+        deployment_id,
+        revision,
+        generation,
+        profile_fingerprint,
+        deployment_config,
+        host_policy_fingerprint,
+        deadline_ms,
+    )
+    .await
+}
+
+/// [`ensure_materialized`] over any transport to the host: `supported` is
+/// whether its session declares model sources, `send` delivers one command
+/// and answers its terminal result (ADR 0028 §8: a group member's host).
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_materialized_with<F, Fut, E>(
+    owner: &SharedCoordinatorState,
+    supported: bool,
+    send: F,
+    controller_id: &str,
+    host: &str,
+    member_id: &str,
+    deployment_id: &str,
+    revision: i64,
+    generation: i64,
+    profile_fingerprint: &str,
+    deployment_config: &str,
+    host_policy_fingerprint: &str,
+    deadline_ms: i64,
+) -> Result<(), RuntimeError>
+where
+    F: Fn(MemberCommand) -> Fut,
+    Fut: Future<Output = Result<pb::MemberExecutionResult, E>>,
+{
     let Some(plan) = MaterializeSourcePlan::new(deployment_config, host_policy_fingerprint) else {
         return Ok(());
     };
-    if !sessions.supports_model_sources(host) {
+    if !supported {
         // ADR 0017: the typed refusal for a host without the feature.
         return Err(RuntimeError::Refused(
             capyctl_protocol::capabilities::missing(capyctl_protocol::capabilities::MODEL_SOURCES),
@@ -315,7 +356,7 @@ pub async fn ensure_materialized(
             plan.clone(),
             (now + REQUEST_DEADLINE.as_millis() as i64).min(deadline_ms),
         );
-        let report = match sessions.execute(command).await {
+        let report = match send(command).await {
             Ok(result) => report_from(&result).ok(),
             Err(_) => None,
         };

@@ -265,6 +265,9 @@ struct Shared {
     /// When cancelling leases were last checked against engine quiescence.
     cancel_checked_ms: std::sync::atomic::AtomicI64,
     options: CoordinatorOptions,
+    /// ADR 0028 §8: the transport a group activation reaches its member
+    /// hosts through; `None` where no host is enrolled (standalone).
+    groups: Option<Arc<dyn crate::group_activation::GroupHosts>>,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
 }
@@ -1050,6 +1053,12 @@ pub struct SettlementContext {
 pub type SettlementExecutor = Arc<dyn Fn(SettlementContext) -> CleanupFuture + Send + Sync>;
 pub trait ExecutionBindings: Send + Sync {
     fn resolve(&self, work: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError>;
+    /// ADR 0028 §8: the member hosts of a group, through their sessions. A
+    /// resolver without enrolled hosts has none, and a group start is then
+    /// refused before anything is reserved.
+    fn groups(&self) -> Option<Arc<dyn crate::group_activation::GroupHosts>> {
+        None
+    }
 }
 impl<F> ExecutionBindings for F
 where
@@ -1252,6 +1261,7 @@ impl OwnedCoordinator {
         options: CoordinatorOptions,
         bindings: Arc<dyn ExecutionBindings>,
     ) -> Result<Self, CoordinatorError> {
+        let groups = bindings.groups();
         Self::spawn_with(
             owner,
             observations,
@@ -1268,6 +1278,7 @@ impl OwnedCoordinator {
             }),
             true,
             None,
+            groups,
         )
     }
 
@@ -1475,6 +1486,7 @@ impl OwnedCoordinator {
             }),
             false,
             Some(adoption),
+            None,
         )
     }
 
@@ -1487,7 +1499,16 @@ impl OwnedCoordinator {
         options: CoordinatorOptions,
         factory: DriverFactory,
     ) -> Result<Self, CoordinatorError> {
-        Self::spawn_with(owner, observations, clock, options, factory, false, None)
+        Self::spawn_with(
+            owner,
+            observations,
+            clock,
+            options,
+            factory,
+            false,
+            None,
+            None,
+        )
     }
 
     /// `adopt_remote` lets this worker adopt retired sessions' remote launches
@@ -1495,6 +1516,7 @@ impl OwnedCoordinator {
     /// the Ready embedded launches its retired session left running (SPEC §4.3,
     /// P3); their dispatch stays closed until the local readiness supervisor
     /// collects fresh local proof.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with(
         owner: SharedCoordinatorState,
         observations: Arc<dyn ServiceObservation>,
@@ -1503,6 +1525,7 @@ impl OwnedCoordinator {
         factory: DriverFactory,
         adopt_remote: bool,
         local_adoption: Option<DriverFactory>,
+        groups: Option<Arc<dyn crate::group_activation::GroupHosts>>,
     ) -> Result<Self, CoordinatorError> {
         if options.poll_interval.is_zero()
             || options.poll_interval > Duration::from_secs(1)
@@ -1570,6 +1593,7 @@ impl OwnedCoordinator {
             idle_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             cancel_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             options,
+            groups,
         });
         let (stop, stop_rx) = watch::channel(false);
         let (status_tx, status) = watch::channel(WorkerStatus::Running);
@@ -2357,6 +2381,70 @@ async fn drive(
             .await;
     }
     Ok(())
+}
+
+/// ADR 0028 §5–§9: drive one planned group Initialize through its activation.
+/// A failure before any member is dispatched leaves the step planned (a
+/// closed refusal is classified like a host's refusal); once armed, a launch
+/// that does not reach READY is a failure of the armed step, whose members
+/// stay charged until their own hosts prove them gone (Task 17's group stop).
+async fn drive_group(
+    shared: &Arc<Shared>,
+    work: &InitializeWork,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), CoordinatorError> {
+    use crate::group_activation::{
+        activate_group, GroupActivation, GroupActivationError, GroupCtx,
+    };
+    let shape = work
+        .group()
+        .cloned()
+        .ok_or_else(|| CoordinatorError::Service("not a group start".into()))?;
+    // ADR 0028 §8: a group needs enrolled member hosts.
+    let hosts = shared.groups.clone().ok_or_else(|| {
+        CoordinatorError::Service(
+            RuntimeError::Refused(capyctl_protocol::capabilities::missing(
+                capyctl_protocol::capabilities::ENGINE_GROUPS,
+            ))
+            .to_string(),
+        )
+    })?;
+    if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Stopped("shutdown before arm".into()));
+    }
+    let ctx = GroupCtx {
+        owner: shared.owner.clone(),
+        hosts: hosts.clone(),
+        observations: shared.observations.clone(),
+        clock: shared.clock.clone(),
+    };
+    // No child task: shutdown drops the activation; a dispatched member keeps
+    // its charge and the armed step is recorded uncertain.
+    let outcome = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during group activation".into())),
+        outcome = activate_group(&ctx, work, &shape) => outcome,
+    };
+    match outcome {
+        Ok(outcome) => {
+            hosts.concluded(&work.fence().deployment_id, &outcome);
+            match outcome {
+                GroupActivation::Ready { .. } => Ok(()),
+                GroupActivation::Failed {
+                    failed_rank,
+                    reason,
+                    ..
+                } => Err(CoordinatorError::Service(format!(
+                    "group_member_failed: rank {failed_rank}: {reason}"
+                ))),
+            }
+        }
+        // SPEC §13.2: a closed refusal before any effect is a host refusal.
+        Err(GroupActivationError::Refused { code, detail }) => Err(CoordinatorError::Service(
+            RuntimeError::Refused(format!("{code}: {detail}")).to_string(),
+        )),
+        Err(error) => Err(CoordinatorError::Service(error.to_string())),
+    }
 }
 
 /// SPEC §§6.3, 9.1, 10, 13 (W5): arm and send one planned park or restore.

@@ -911,11 +911,16 @@ impl AgentSessions {
         gate_key: [u8; 32],
     ) -> Result<ProvisionOutcome, Box<Status>> {
         command.verify_digest().map_err(|_| denied())?;
-        if !matches!(
-            command.action,
-            capyctl_protocol::execution::MemberAction::LaunchSingle(_)
-        ) || gate_key == [0; 32]
-        {
+        // ADR 0028 §8: a group's head serves the API and is provisioned like a
+        // single launch; a worker (no service port) never is.
+        let provisioned = match &command.action {
+            capyctl_protocol::execution::MemberAction::LaunchSingle(_) => true,
+            capyctl_protocol::execution::MemberAction::Launch { member, .. } => {
+                member.service_port != 0
+            }
+            _ => false,
+        };
+        if !provisioned || gate_key == [0; 32] {
             return Err(denied().into());
         }
         let wire = command.to_wire();

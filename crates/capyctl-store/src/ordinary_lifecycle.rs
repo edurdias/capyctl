@@ -108,6 +108,12 @@ struct Execution {
     grant_id: String,
     expected_epoch: u64,
     policy_revision: i64,
+    /// ADR 0028 §5: a group activation's arm. Its members were charged by
+    /// `crate::groups` (`reserve_group`), each to its own member owner, so
+    /// this arm takes no grant and the instance owner holds nothing. Absent
+    /// for every single-host arm, so its encoding is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    group: bool,
 }
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -569,6 +575,32 @@ fn validate_local(
             {
                 return Err(LifecycleError::CorruptStoredData);
             }
+            if execution.group {
+                // ADR 0028 §5, §11: a group arm takes no grant; its members
+                // are charged to their own owners by the group plan of this
+                // generation, and the instance owner never holds anything.
+                let planned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3)
+                       AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?4)
+                       AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?5 AND grant_id=?6)",
+                    params![
+                        p.deployment_id,
+                        p.instance_index,
+                        p.generation,
+                        p.operation_id,
+                        p.step_id,
+                        execution.grant_id
+                    ],
+                    |r| r.get(0),
+                )?;
+                if !planned
+                    || ledger.epoch <= execution.expected_epoch
+                    || ledger.owners.contains_key(&p.owner())
+                {
+                    return Err(LifecycleError::Conflict);
+                }
+                return Ok(());
+            }
             let frozen = resource_ledger::encode(&startup::cold(p, e)).map_err(resource)?;
             let identity = encode(&(
                 &p.deployment_id,
@@ -1009,6 +1041,7 @@ pub(crate) fn arm_with_context(
         grant_id: ulid::Ulid::new().to_string(),
         expected_epoch: ledger.epoch,
         policy_revision: policy.revision,
+        group: false,
     };
     reserve_increase_in_transaction(
         tx,
@@ -1039,6 +1072,62 @@ pub(crate) fn arm_with_context(
     one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2,grant_id=?3 WHERE id=?1 AND session_id=?4 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,p.execution.as_ref().unwrap().grant_id,s.id()])?)?;
     event(tx, s, &p, Transition::Armed, None)?;
     Ok((ArmResult::New { step_id: id.into() }, Some(p.context(&e)?)))
+}
+
+/// ADR 0028 §5, §8: arm a planned Initialize whose group plan already
+/// reserved every member at this generation.
+///
+/// The lifecycle moves exactly as an ordinary arm moves it (binding
+/// uncertain, run and operation running, the step armed with a fresh grant
+/// id), but nothing is charged here: each member holds its own reservation
+/// (`reserve_group`), and the instance owner holds nothing for the whole life
+/// of the group. The ledger epoch advances once, as an ordinary arm's grant
+/// advances it, so every epoch fence downstream reads the same. Refused
+/// (`Conflict`) unless the plan is active and no member was dispatched yet.
+pub(crate) fn arm_group(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+    now_ms: i64,
+) -> Result<StepExecutionContext, LifecycleError> {
+    let (mut p, e, state) = load(tx, id)?;
+    current(tx, s, &p, false)?;
+    if state != "planned" || now_ms < p.accepted_at_ms || now_ms >= p.deadline_ms {
+        return Err(LifecycleError::Conflict);
+    }
+    let reserved: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state='active')
+           AND NOT EXISTS(SELECT 1 FROM group_members WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND (state!='reserved' OR dispatched=1))",
+        params![p.deployment_id, p.instance_index, p.generation],
+        |r| r.get(0),
+    )?;
+    if !reserved {
+        return Err(LifecycleError::Conflict);
+    }
+    let policy = policy(tx, &e)?;
+    let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+    let execution = Execution {
+        issued_at_ms: now_ms,
+        grant_id: ulid::Ulid::new().to_string(),
+        expected_epoch: ledger.epoch,
+        policy_revision: policy.revision,
+        group: true,
+    };
+    resource_ledger::advance_completion_epoch(tx)?;
+    one(tx.execute(
+        "UPDATE runtime_bindings SET state='uncertain' WHERE id=?1 AND state='reserved'",
+        [&p.binding_id],
+    )?)?;
+    one(tx.execute(
+        "UPDATE operations SET state='running' WHERE id=?1 AND state='pending'",
+        [&p.operation_id],
+    )?)?;
+    one(tx.execute("UPDATE lifecycle_runs SET state='running' WHERE operation_id=?1 AND session_id=?2 AND state='queued'",params![p.operation_id,s.id()])?)?;
+    let grant = execution.grant_id.clone();
+    p.execution = Some(execution);
+    one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2,grant_id=?3 WHERE id=?1 AND session_id=?4 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,grant,s.id()])?)?;
+    event(tx, s, &p, Transition::Armed, None)?;
+    p.context(&e)
 }
 
 fn association(tx: &Transaction<'_>, p: &Plan) -> Result<Option<Association>, LifecycleError> {
@@ -1200,14 +1289,18 @@ pub(crate) fn complete(
     )
     .map_err(resource)?;
     let epoch = resource_ledger::advance_completion_epoch(tx)?;
-    one(tx.execute(
-        "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
-        params![
-            p.owner(),
-            resource_ledger::encode(&phase(&e.resources.ready, ResourcePhase::Ready))
-                .map_err(resource)?
-        ],
-    )?)?;
+    if p.execution.as_ref().is_some_and(|x| x.group) {
+        complete_group_members(tx, &p)?;
+    } else {
+        one(tx.execute(
+            "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
+            params![
+                p.owner(),
+                resource_ledger::encode(&phase(&e.resources.ready, ResourcePhase::Ready))
+                    .map_err(resource)?
+            ],
+        )?)?;
+    }
     one(tx.execute(
         "UPDATE runtime_bindings SET state='live' WHERE id=?1 AND state='uncertain'",
         [&p.binding_id],
@@ -1234,6 +1327,44 @@ pub(crate) fn complete(
         [&p.operation_id],
     )?)?;
     event(tx, s, &p, Transition::Ready, Some(epoch))
+}
+
+/// ADR 0028 §5, §9: a group reaches Ready only once every member launched
+/// under its active plan; each member owner then holds its own host's Ready
+/// footprint, as an ordinary instance owner moves from cold to Ready.
+fn complete_group_members(tx: &Transaction<'_>, p: &Plan) -> Result<(), LifecycleError> {
+    let active: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state='active')",
+        params![p.deployment_id, p.instance_index, p.generation],
+        |r| r.get(0),
+    )?;
+    let members: Vec<(String, String, String)> = tx
+        .prepare(
+            "SELECT owner_id,host_id,state FROM group_members
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
+        )?
+        .query_map(
+            params![p.deployment_id, p.instance_index, p.generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    if !active || members.len() < 2 || members.iter().any(|(.., state)| state != "launched") {
+        return Err(LifecycleError::Conflict);
+    }
+    for (owner, host, _) in members {
+        let (raw, _) = frozen_on_host(tx, &p.deployment_id, p.revision, Some(&host))?;
+        let effective =
+            decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+        one(tx.execute(
+            "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
+            params![
+                owner,
+                resource_ledger::encode(&phase(&effective.resources.ready, ResourcePhase::Ready))
+                    .map_err(resource)?
+            ],
+        )?)?;
+    }
+    Ok(())
 }
 
 use crate::events::LifecycleTransition as Transition;

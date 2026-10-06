@@ -686,7 +686,12 @@ async fn a_digest_incapable_group_host_is_sent_no_source_request() {
     .is_some());
     let driver = RemoteGroupSources {
         owner: h.state.clone(),
-        sessions: h.sessions.clone(),
+        hosts: std::sync::Arc::new(remote_execution::AgentGroupHosts::new(
+            h.state.clone(),
+            h.sessions.clone(),
+            h.authority.controller_id(),
+            ReadinessLedger::default(),
+        )),
         controller_id: h.authority.controller_id(),
         deployment_id: "deployment".into(),
         revision: 1,
