@@ -1024,16 +1024,24 @@ async fn initialize_task(
 ) -> Outcome {
     // Catch both service and adapter panics. If an arm exists, the fenced
     // annotation below preserves it; otherwise no effect has been allowed.
-    let result = AssertUnwindSafe(drive(
-        &shared,
-        &work,
-        &*observations,
-        &factory,
-        &mut stop,
-        &contended,
-    ))
-    .catch_unwind()
-    .await;
+    // ADR 0028 §5: a start whose revision runs as a group activates its
+    // members instead of one engine.
+    let result = if work.group().is_some() {
+        AssertUnwindSafe(super::drive_group(&shared, &work, &mut stop))
+            .catch_unwind()
+            .await
+    } else {
+        AssertUnwindSafe(drive(
+            &shared,
+            &work,
+            &*observations,
+            &factory,
+            &mut stop,
+            &contended,
+        ))
+        .catch_unwind()
+        .await
+    };
     match AssertUnwindSafe(conclude_initialize(&shared, &work, result, &stop))
         .catch_unwind()
         .await

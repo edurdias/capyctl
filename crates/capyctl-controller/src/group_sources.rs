@@ -11,8 +11,8 @@
 //!
 //! Nothing here reserves, launches or releases anything.
 use crate::{
-    agent_sessions::AgentSessions,
     checkpoint_digests::{self, MeasureError},
+    group_activation::GroupHosts,
     model_sources,
     ownership::SharedCoordinatorState,
 };
@@ -32,6 +32,10 @@ pub struct Materialized {
     pub path: String,
     /// The checkpoint digest this host measured for its copy.
     pub digest: String,
+    /// ADR 0014 §7: the weights it measured beside the digest.
+    pub weights_bytes: i64,
+    /// ADR 0014 amendment A16: the hybrid state slot read beside them.
+    pub state_slot_bytes: Option<i64>,
 }
 
 /// Why one host has no verified copy.
@@ -181,7 +185,8 @@ pub struct MemberSource {
 /// group's declaration, the same in every member's document.
 pub struct RemoteGroupSources {
     pub owner: SharedCoordinatorState,
-    pub sessions: Arc<AgentSessions>,
+    /// ADR 0028 §8: the member hosts' sessions.
+    pub hosts: Arc<dyn GroupHosts>,
     pub controller_id: String,
     pub deployment_id: String,
     pub revision: i64,
@@ -204,16 +209,14 @@ impl SourceDriver for RemoteGroupSources {
         // ADR 0017: a host without the digest action is refused before it is
         // asked anything, so no download starts for a member that could
         // never be measured (the single-host launch's preflight order).
-        self.sessions
-            .preflight(
-                host,
-                &[capyctl_protocol::capabilities::CHECKPOINT_DIGEST],
-                true,
-            )
+        self.hosts
+            .preflight(host, &[capyctl_protocol::capabilities::CHECKPOINT_DIGEST])
             .map_err(SourceFailure::Failed)?;
-        model_sources::ensure_materialized(
+        model_sources::ensure_materialized_with(
             &self.owner,
-            &self.sessions,
+            self.hosts
+                .supports(host, capyctl_protocol::capabilities::MODEL_SOURCES),
+            |command| self.hosts.execute(command),
             &self.controller_id,
             host,
             &member.member_id,
@@ -243,7 +246,7 @@ impl SourceDriver for RemoteGroupSources {
         );
         let unavailable = || SourceFailure::Failed(UNAVAILABLE.into());
         let result = self
-            .sessions
+            .hosts
             .execute(command)
             .await
             .map_err(|_| unavailable())?;
@@ -261,6 +264,8 @@ impl SourceDriver for RemoteGroupSources {
         Ok(Materialized {
             path: member.model_path.clone(),
             digest: measured.digest,
+            weights_bytes: measured.weights_bytes,
+            state_slot_bytes: measured.state_slot_bytes,
         })
     }
 }
@@ -320,6 +325,8 @@ mod tests {
         Materialized {
             path: path.into(),
             digest: digest.into(),
+            weights_bytes: 1,
+            state_slot_bytes: None,
         }
     }
 

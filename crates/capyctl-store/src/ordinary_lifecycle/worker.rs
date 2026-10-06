@@ -227,13 +227,58 @@ pub(super) fn prepare_work(
     let policy = policy(tx, &effective)?;
     let binding = decode(&plan.binding_json)?;
     let fence = plan.fence();
+    let group = group_shape(tx, &plan.deployment_id, plan.revision)?;
     Ok(InitializeWork {
         plan,
         effective,
         policy,
         binding,
         fence,
+        group,
     })
+}
+
+/// ADR 0028 §2: the group a revision runs as, read from its accepted source
+/// (`InstanceSpec.group`), with each named host as the host id it resolved
+/// on, in rank order (the head first). `None` for a single-host revision.
+pub(crate) fn group_shape(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+) -> Result<Option<capyctl_config::topology::GroupShape>, LifecycleError> {
+    let source: Option<String> = tx
+        .query_row(
+            "SELECT config_json FROM managed_configuration_sources WHERE deployment_id=?1 AND revision=?2",
+            params![deployment_id, revision],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let source: serde_json::Value =
+        serde_json::from_str(&source).map_err(|_| LifecycleError::CorruptStoredData)?;
+    let Some(mut shape) = capyctl_config::instances::parse_instance_spec(&source)
+        .map_err(|_| LifecycleError::CorruptStoredData)?
+        .group
+    else {
+        return Ok(None);
+    };
+    for host in &mut shape.hosts {
+        // ADR 0013 §2: a named host is its id or its enrolled name.
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT h.host_id FROM host_effective_revisions h
+                  WHERE h.deployment_id=?1 AND h.revision=?2 AND h.outcome='resolved'
+                    AND (h.host_id=?3 OR EXISTS(SELECT 1 FROM enrolled_hosts e WHERE e.host_id=h.host_id AND e.host_name=?3))
+                  ORDER BY h.host_id!=?3 LIMIT 1",
+                params![deployment_id, revision, host.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        *host = id.ok_or(LifecycleError::CorruptStoredData)?;
+    }
+    Ok(Some(shape))
 }
 
 /// Frozen, validated input for driver construction; never permission to execute.
@@ -244,6 +289,22 @@ pub struct InitializeWork {
     policy: ResourcePolicySnapshot,
     binding: BindingDto,
     fence: DeploymentFence,
+    group: Option<capyctl_config::topology::GroupShape>,
+}
+
+/// ADR 0028 §5: one member of a group revision as its own host resolved it.
+#[derive(Debug, Clone)]
+pub struct GroupMemberResolution {
+    pub rank: u32,
+    pub host_id: String,
+    /// The revision as resolved on this host (its scoped ledger keys, its
+    /// model path, its profile build, its port range).
+    pub effective: EffectiveDeployment,
+    /// The deployment document scoped to this host, which its launch is
+    /// rendered from.
+    pub source: serde_json::Value,
+    /// What the member is charged on its own host until the group is Ready.
+    pub cold: PhaseFootprint,
 }
 
 impl InitializeWork {
@@ -283,6 +344,85 @@ impl InitializeWork {
     }
     pub fn credential_ref(&self) -> &str {
         &self.binding.credential_ref
+    }
+    /// ADR 0028 §2: the group this start activates, with its hosts as host
+    /// ids in rank order; `None` for a single-host start.
+    pub fn group(&self) -> Option<&capyctl_config::topology::GroupShape> {
+        self.group.as_ref()
+    }
+}
+
+impl crate::Store {
+    /// ADR 0028 §5: every member of a group revision as its own host resolved
+    /// it, in rank order (`shape.hosts`, the head first).
+    pub fn group_member_resolutions(
+        &self,
+        deployment_id: &str,
+        revision: i64,
+        hosts: &[String],
+    ) -> Result<Vec<GroupMemberResolution>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let mut members = Vec::with_capacity(hosts.len());
+        for (rank, host) in hosts.iter().enumerate() {
+            let (raw, _) = frozen_on_host(&tx, deployment_id, revision, Some(host))?;
+            let effective =
+                decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+            if effective.host.name != *host {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            let source: Option<String> = tx
+                .query_row(
+                    "SELECT source_json FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND outcome='resolved'",
+                    params![deployment_id, revision, host],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let source = source.ok_or(LifecycleError::CorruptStoredData)?;
+            let source =
+                serde_json::from_str(&source).map_err(|_| LifecycleError::CorruptStoredData)?;
+            members.push(GroupMemberResolution {
+                rank: rank as u32,
+                host_id: host.clone(),
+                cold: phase(&effective.resources.cold, ResourcePhase::Cold),
+                effective,
+                source,
+            });
+        }
+        tx.commit()?;
+        Ok(members)
+    }
+
+    /// ADR 0028 §5, §8: arm a planned group Initialize whose members are all
+    /// reserved under an active plan of its generation and none dispatched.
+    /// Returns the frozen context the activation sends under.
+    pub fn arm_group_initialize(
+        &self,
+        session: &CoordinatorSession,
+        step_id: &str,
+        now_ms: i64,
+    ) -> Result<StepExecutionContext, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, session)?;
+        let context = super::arm_group(&tx, session, step_id, now_ms)?;
+        tx.commit()?;
+        Ok(context)
+    }
+
+    /// SPEC §17, ADR 0028 §16: the closed reason one instance's activation
+    /// failed with, shown in its status until its next start is accepted.
+    pub fn record_instance_error(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        reason: &str,
+    ) -> Result<(), LifecycleError> {
+        self.conn.execute(
+            "UPDATE deployment_instances SET last_error=?4 WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![deployment_id, instance_index, generation, reason],
+        )?;
+        Ok(())
     }
 }
 
