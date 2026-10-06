@@ -1935,7 +1935,12 @@ fn group_inventory(document: &serde_json::Value) -> Option<pb::GroupInventory> {
     let policy = capyctl_config::groups_policy::host_groups_policy(&host).ok()?;
     let peer = policy.peer_address?;
     let facts = crate::host_checks::read_host_facts(std::path::Path::new("/"));
+    // ADR 0028 §7: every tuning finding, not only the first refusal, so status
+    // shows each gap at once.
     let mut findings = crate::host_checks::tuning_findings(&facts, &policy);
+    // SPEC §3 (ADR 0028 §3): the agent verifies its peer address is on a local
+    // interface and reports it in its inventory; a mismatch is a finding here
+    // and refuses group work at Prepare.
     if !crate::host_checks::peer_address_local(&facts, &policy) {
         findings.push("peer_address_not_local".into());
     }

@@ -463,25 +463,35 @@ impl CheckpointVerifier {
         })
     }
 
-    /// SPEC §13.3 / T37: the cache directory, only when it is private: a real
-    /// directory (never a symlink) owned by this user with no group or other
-    /// access. A missing one is created 0700 (its parent must exist); an owned
-    /// one with wider access is narrowed. Anything else is not used at all.
+    /// SPEC §13.3 / T37: the cache directory for writing, only when it is
+    /// private: a missing one is created 0700 (its parent must exist), then it
+    /// must pass [`Self::existing_private_cache_dir`].
     fn private_cache_dir(&self) -> Option<&Path> {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::os::unix::fs::DirBuilderExt;
         let dir = self.cache_dir.as_deref()?;
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return None,
         }
+        self.existing_private_cache_dir()
+    }
+
+    /// SPEC §13.3 / T37: the cache directory for reading, only when it already
+    /// exists and is private: a real directory (never a symlink) owned by this
+    /// user with no group or other access. Anything else is not used at all.
+    /// It creates nothing, so a read (ADR 0028 §7: a group Prepare) leaves the
+    /// host as it was.
+    fn existing_private_cache_dir(&self) -> Option<&Path> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = self.cache_dir.as_deref()?;
         let metadata = std::fs::symlink_metadata(dir).ok()?;
         if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
             return None;
         }
         if metadata.mode() & 0o077 != 0 {
             // Another account may already have written here: nothing in it is
-            // trusted, even once narrowed.
+            // trusted.
             return None;
         }
         Some(dir)
@@ -493,7 +503,8 @@ impl CheckpointVerifier {
         if let Some(record) = self.memory.lock().ok()?.get(key) {
             return Some(record.clone());
         }
-        self.private_cache_dir()?;
+        // Reading creates nothing; `remember` creates the directory on write.
+        self.existing_private_cache_dir()?;
         // Never through a symlink, and only a private regular file of ours.
         let mut file = std::fs::OpenOptions::new()
             .read(true)
