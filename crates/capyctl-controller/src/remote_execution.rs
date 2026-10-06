@@ -166,6 +166,7 @@ impl RemoteEngine {
         let command = crate::checkpoint_digests::digest_command(
             &b.controller_id,
             &b.host_id,
+            "head",
             &c.token.deployment_id,
             c.token.revision,
             c.token.generation,
@@ -205,6 +206,7 @@ impl RemoteEngine {
         let command = crate::checkpoint_digests::digest_command(
             &b.controller_id,
             &b.host_id,
+            "head",
             &c.token.deployment_id,
             c.token.revision,
             c.token.generation,
@@ -477,6 +479,7 @@ impl EngineAdapter for RemoteEngine {
             &self.sessions,
             &b.controller_id,
             &b.host_id,
+            "head",
             &c.token.deployment_id,
             c.token.revision,
             c.token.generation,

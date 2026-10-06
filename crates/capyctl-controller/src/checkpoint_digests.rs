@@ -216,11 +216,14 @@ where
     }
 }
 
-/// The `DigestCheckpoint` command for one deployment revision on one host.
+/// The `DigestCheckpoint` command for one deployment revision on one host,
+/// addressed to `member_id` there (ADR 0028 §6: `head` for a single-host
+/// deployment, the host's own member for a group).
 #[allow(clippy::too_many_arguments)]
 pub fn digest_command(
     controller_id: &str,
     host_id: &str,
+    member_id: &str,
     deployment_id: &str,
     revision: i64,
     generation: i64,
@@ -232,6 +235,7 @@ pub fn digest_command(
     checkpoint_command(
         controller_id,
         host_id,
+        member_id,
         deployment_id,
         revision,
         generation,
@@ -248,6 +252,7 @@ pub fn digest_command(
 fn checkpoint_command(
     controller_id: &str,
     host_id: &str,
+    member_id: &str,
     deployment_id: &str,
     revision: i64,
     generation: i64,
@@ -263,7 +268,7 @@ fn checkpoint_command(
             controller_id: controller_id.into(),
             member: MemberKey {
                 host_id: host_id.into(),
-                member_id: "head".into(),
+                member_id: member_id.into(),
             },
             deployment_id: deployment_id.into(),
             operation_id: id.clone(),
@@ -337,6 +342,7 @@ impl RemoteDigests {
         Ok(checkpoint_command(
             &self.controller_id,
             &pending.host_id,
+            "head",
             &pending.deployment_id,
             pending.revision,
             pending.generation,
