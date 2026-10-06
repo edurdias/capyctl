@@ -143,8 +143,9 @@ pub fn plan_from_effective(
         model_path,
         port,
         served_model_name,
-        // Reserved: tensor and pipeline parallelism come from placement, and
-        // multi-rank groups are parked (TP2 deferred), so a vLLM launch is one rank.
+        // Reserved: tensor and pipeline parallelism come from placement. A
+        // single-rank launch is one rank; a group member takes both from the
+        // group plan through `with_group` (ADR 0028 §10).
         tensor_parallel_size: 1,
         pipeline_parallel_size: 1,
         // ADR 0014 §2: typed fields render in vLLM's own spelling; an omitted
@@ -208,5 +209,17 @@ pub fn plan_from_effective(
         cuda_namespace: effective
             .cuda_namespace()
             .map_err(|_| VllmPlanError::UnpinnableDevice)?,
+        // ADR 0028 §10: single-rank unless `with_group` sets it.
+        group: None,
     })
+}
+
+/// ADR 0028 §10: a group member's launch plan. Tensor and pipeline
+/// parallelism come from the group plan instead of the single-rank `1` pin;
+/// everything else stays as `plan_from_effective` froze it.
+pub fn with_group(mut plan: PlanInputVllm, group: crate::group::GroupMemberArgs) -> PlanInputVllm {
+    plan.tensor_parallel_size = group.tensor_parallel;
+    plan.pipeline_parallel_size = group.pipeline_parallel;
+    plan.group = Some(group);
+    plan
 }

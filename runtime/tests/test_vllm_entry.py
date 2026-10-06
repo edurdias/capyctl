@@ -479,3 +479,70 @@ class MainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GROUP_WORKER = ["serve", "/models/qwen", "--tensor-parallel-size", "2",
+                "--pipeline-parallel-size", "1", "--distributed-executor-backend", "mp",
+                "--nnodes", "2", "--node-rank", "1", "--master-addr", "192.0.2.10",
+                "--master-port", "25000", "--headless", entry.MARKER]
+
+
+class GroupModeTests(unittest.TestCase):
+    EXPECTED = {"nnodes": 2, "node_rank": 1, "master_addr": "192.0.2.10",
+                "master_port": 25000, "headless": True,
+                "distributed_executor_backend": "mp",
+                "tensor_parallel_size": 2, "pipeline_parallel_size": 1}
+
+    def setUp(self):
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+
+    # T14, T21: every rendered multi-node destination must match the parse.
+    def test_group_drift_is_refused(self):
+        entry.check_group(self.EXPECTED, argparse.Namespace(**self.EXPECTED))
+        for dest, bad in [("node_rank", 0), ("master_port", 25001), ("headless", False),
+                          ("tensor_parallel_size", 1)]:
+            drifted = argparse.Namespace(**{**self.EXPECTED, dest: bad})
+            with self.assertRaises(entry.LaunchError) as ctx:
+                entry.check_group(self.EXPECTED, drifted)
+            self.assertEqual(ctx.exception.code, "group_drift:" + dest)
+        missing = {k: v for k, v in self.EXPECTED.items() if k != "nnodes"}
+        with self.assertRaises(entry.LaunchError) as ctx:
+            entry.check_group(missing, argparse.Namespace(**self.EXPECTED))
+        self.assertEqual(ctx.exception.code, "group_drift:nnodes")
+
+    # T21, R11: a headless worker serves with its own address and rendered gloo
+    # interface, and no inherited transport input.
+    def test_worker_serves_with_group_environment(self):
+        os.environ.update({"CAPYCTL_GROUP_MODE": "1", "VLLM_HOST_IP": "192.0.2.11",
+                           "GLOO_SOCKET_IFNAME": "eth9", "NCCL_SOCKET_IFNAME": "eth0",
+                           "MASTER_ADDR": "198.51.100.1",
+                           "CAPYCTL_GROUP_EXPECTED": json.dumps(
+                               {**self.EXPECTED, "gloo_socket_ifname": "eth9"})})
+        runtime = FakeRuntime()
+        seen = {}
+        run = runtime.run
+
+        def recording_run(args):
+            seen.update({name: os.environ.get(name) for name in (
+                "VLLM_HOST_IP", "GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME", "MASTER_ADDR")})
+            return run(args)
+
+        runtime.run = recording_run
+        error = io.StringIO()
+        self.assertEqual(entry.main(GROUP_WORKER, runtime, error), 0, error.getvalue())
+        self.assertEqual(seen, {"VLLM_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9",
+                                "NCCL_SOCKET_IFNAME": None, "MASTER_ADDR": None})
+        self.assertNotIn("CAPYCTL_GROUP_EXPECTED", os.environ)
+
+    # T14: a rendered vector that disagrees with the expected payload refuses.
+    def test_worker_drift_refuses_before_serving(self):
+        os.environ.update({"CAPYCTL_GROUP_MODE": "1", "VLLM_HOST_IP": "192.0.2.11",
+                           "CAPYCTL_GROUP_EXPECTED": json.dumps(
+                               {**self.EXPECTED, "node_rank": 0})})
+        runtime = FakeRuntime()
+        error = io.StringIO()
+        self.assertEqual(entry.main(GROUP_WORKER, runtime, error), 1)
+        self.assertEqual(error.getvalue(), "vllm_startup_failed: group_drift:node_rank\n")
+        self.assertNotIn("run", runtime.events)

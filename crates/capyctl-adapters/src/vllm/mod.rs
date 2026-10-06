@@ -8,7 +8,8 @@ mod initialize;
 mod residency;
 
 pub use frozen::{
-    park_policy, plan_from_effective, sleep_flags, VllmPlanError, GPU_UTILIZATION_GATE_PCT,
+    park_policy, plan_from_effective, sleep_flags, with_group, VllmPlanError,
+    GPU_UTILIZATION_GATE_PCT,
 };
 
 pub use adapter::VllmAdapter;

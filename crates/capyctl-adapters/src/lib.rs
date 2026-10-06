@@ -1,5 +1,7 @@
 pub mod engine_env;
 pub mod forward;
+// ADR 0028 §10: the engine-neutral arguments of a multi-node group member.
+pub mod group;
 pub mod kernel_builds;
 // SPEC §§6.4, 13.2: the bounded summary of an engine that exited before readiness.
 pub mod launch_failure;

@@ -110,3 +110,52 @@ class VerifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GroupPinTests(unittest.TestCase):
+    # T21, R11 (ADR 0028 §10): group mode pins no loopback interface, strips every
+    # inherited NCCL/MASTER/GLOO input except the rendered gloo interface, and
+    # keeps the member's own address.
+    def test_pin_group_strips_transport_and_keeps_host_ip(self):
+        env = {"NCCL_IB_HCA": "x", "GLOO_SOCKET_IFNAME": "lo", "GLOO_DEVICE_TRANSPORT": "x",
+               "MASTER_PORT": "1", "VLLM_HOST_IP": "192.0.2.11"}
+        rendezvous.pin_group(env, "VLLM_HOST_IP")
+        # No rendered interface: the inherited one is stripped too.
+        self.assertEqual(env, {"VLLM_HOST_IP": "192.0.2.11"})
+        rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11")
+        env["GLOO_SOCKET_IFNAME"] = "lo"
+        with self.assertRaises(rendezvous.RendezvousError):
+            rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11")
+        del env["GLOO_SOCKET_IFNAME"]
+        # A rendered interface survives the strip.
+        env.update({"GLOO_SOCKET_IFNAME": "eth9", "NCCL_DEBUG": "INFO"})
+        rendezvous.pin_group(env, "VLLM_HOST_IP", "eth9")
+        self.assertEqual(env, {"VLLM_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9"})
+        del env["GLOO_SOCKET_IFNAME"]
+        env["NCCL_SOCKET_IFNAME"] = "eth0"
+        with self.assertRaises(rendezvous.RendezvousError):
+            rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11")
+
+    # T21, R11: the gloo interface must be exactly the one rendered.
+    def test_verify_group_checks_the_gloo_interface(self):
+        env = {"VLLM_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9"}
+        rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11", "eth9")
+        env["GLOO_SOCKET_IFNAME"] = "lo"
+        with self.assertRaises(rendezvous.RendezvousError):
+            rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11", "eth9")
+        del env["GLOO_SOCKET_IFNAME"]
+        with self.assertRaises(rendezvous.RendezvousError):
+            rendezvous.verify_group(env, "VLLM_HOST_IP", "192.0.2.11", "eth9")
+        for name, value in (("VLLM_HOST_IP", "192.0.2.12"), ("MASTER_ADDR", "192.0.2.10"),
+                            ("GLOO_DEVICE_TRANSPORT", "tcp")):
+            drifted = {"VLLM_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9", name: value}
+            with self.assertRaises(rendezvous.RendezvousError):
+                rendezvous.verify_group(drifted, "VLLM_HOST_IP", "192.0.2.11", "eth9")
+
+    # T39: the single-rank loopback pin is unchanged.
+    def test_single_rank_keeps_loopback_pin(self):
+        env = {}
+        rendezvous.pin("vllm", env)
+        self.assertEqual(env["NCCL_SOCKET_IFNAME"], "lo")
+        self.assertEqual(env["GLOO_SOCKET_IFNAME"], "lo")
+        self.assertEqual(env["VLLM_HOST_IP"], "127.0.0.1")
