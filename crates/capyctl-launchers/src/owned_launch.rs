@@ -216,9 +216,6 @@ impl DurableProcessLaunch {
             // validates its protocol timeout against.
             signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
             signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
-            // ADR 0028 §8, §11: a member the group gained after its last
-            // recorded scan is reached through the group scan too.
-            self.signal_later_members(api, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
                 return Ok(true);
             }
@@ -229,19 +226,17 @@ impl DurableProcessLaunch {
             // one by one kills exactly the launch's own processes and nothing
             // else. Refusing here instead would pause an operator over a state
             // capyctl can prove and end.
+            //
+            // ADR 0028 §8, §11: only recorded identities are signalled here. A
+            // leaderless group scan can name an unrelated group once the
+            // leader's pid is reused, so it never authorizes a signal: an
+            // unrecorded process still in the group is settlement evidence
+            // only, and the stop below reports it uncertain (claim retained).
             signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
-            // ADR 0028 §8, §11: a child the leader started after the tree was
-            // last recorded is still in the leader's process group, on this
-            // boot and started after the leader (`observe_group` proves both,
-            // the same proof the final settlement check reads). It is
-            // signalled by identity like the recorded ones, so it never
-            // outlives the stop unreached.
-            self.signal_later_members(api, nix::sys::signal::Signal::SIGTERM)?;
             if self.settled(identities, api, Instant::now() + grace, 200)? {
                 return Ok(false);
             }
             signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
-            self.signal_later_members(api, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
                 return Ok(true);
             }
@@ -262,21 +257,6 @@ impl DurableProcessLaunch {
 }
 
 impl DurableProcessLaunch {
-    /// ADR 0028 §8, §11: signal every live member of the leader `api`'s process
-    /// group as `observe_group` proves it (same boot, started after the
-    /// leader), each by identity. A group that cannot be observed now is left
-    /// to the settlement check, which then refuses to report it gone.
-    fn signal_later_members(
-        &self,
-        api: &ProcessIdentity,
-        signal: nix::sys::signal::Signal,
-    ) -> Result<(), RuntimeError> {
-        match self.observe_group(api) {
-            Ok(members) => signal_recorded(&members, signal),
-            Err(_) => Ok(()),
-        }
-    }
-
     /// Poll until every recorded process is proven gone and the group itself is
     /// empty, or the deadline passes. Both halves are required: a recorded process
     /// may exit while a worker it started keeps running in the same group.
