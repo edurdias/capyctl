@@ -20,9 +20,9 @@
 - CapyCTL-owned environment names, never settable by profile or deployment, by YAML or by flag: prefixes `NCCL_`, `GLOO_`, `MASTER_`, `CAPYCTL_`, `LD_`; names `VLLM_HOST_IP`, `SGLANG_HOST_IP`, `HOST_IP`, `SGLANG_LOCAL_IP_NIC`, `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`, `TF_COMM_BACKEND`, `TF_NCCL_LIB`, `PATH`, `PYTHONPATH`, `CUDA_HOME`, `CUDA_VISIBLE_DEVICES`.
 - A group launch renders no `NCCL_*` or `GLOO_*` variable and inherits none. It renders the head's peer address as the engine's rendezvous address and the member's own peer address as `VLLM_HOST_IP` (vLLM) or `SGLANG_HOST_IP` (SGLang). The API server and every control endpoint stay on loopback with the per-launch keys and the key guard (ADR 0012).
 - CapyCTL never changes sysctls, limits, device permissions or firewalls; it reads them.
-- Every new setting comes three ways with one precedence, flag > env > YAML > default: `--peer-address`/`CAPYCTL_PEER_ADDRESS`/`resource_policy.groups.peer_address`; `--rendezvous-ports`/`CAPYCTL_RENDEZVOUS_PORTS`/`resource_policy.groups.rendezvous_port_range` (default `25000-25099` inclusive); `--require-rdma`/`CAPYCTL_REQUIRE_RDMA`/`resource_policy.groups.require_rdma` (default `false`).
-- Closed codes (spec §16), with exits: 2 for `group_placement_required`, `group_topology_invalid`, `group_profile_mismatch`, `group_checkpoint_mismatch`, `group_model_path_mismatch`, `peer_address_missing`, `peer_address_not_local`, `engine_env_reserved:<name>`, `engine_env_not_approved:<name>`, `engine_env_conflict:<name>`; 4 for `rendezvous_ports_exhausted`, `rendezvous_port_in_use:<port>`, `service_port_in_use:<port>`, `host_tuning_missing:<item>`; 5 for `group_shape_unsupported`, `group_shape_unsupported:<engine>`, `group_instances_unsupported`, `group_drift:<field>`, `host_capability_missing:engine_groups`; no exit for `host_tuning_warning:<item>`, `group_member_failed`, `group_member_uncertain`, `group_wake_mismatch`. Items: `compaction`, `memlock`, `infiniband`. No new exit number.
-- Engine group support (spec §2): vLLM and SGLang any N dividing TP × PP, deep park; TensorFold TP 2, PP 1, exactly 2 hosts, restart-only.
+- Every new setting comes three ways with one precedence, flag > env > YAML > default: `--peer-address`/`CAPYCTL_PEER_ADDRESS`/`resource_policy.groups.peer_address`; `--rendezvous-ports`/`CAPYCTL_RENDEZVOUS_PORTS`/`resource_policy.groups.rendezvous_port_range` (default `25000-25099` inclusive); `--require-rdma`/`CAPYCTL_REQUIRE_RDMA`/`resource_policy.groups.require_rdma` (default `false`); on the server, `--group-stall-timeout`/`CAPYCTL_GROUP_STALL_TIMEOUT`/`groups.stall_timeout` (default `120s`; Task 19b).
+- Closed codes (spec §16), with exits: 2 for `group_placement_required`, `group_topology_invalid`, `group_profile_mismatch`, `group_checkpoint_mismatch`, `group_model_path_mismatch`, `peer_address_missing`, `peer_address_not_local`, `engine_env_reserved:<name>`, `engine_env_not_approved:<name>`, `engine_env_conflict:<name>`; 4 for `rendezvous_ports_exhausted`, `rendezvous_port_in_use:<port>`, `service_port_in_use:<port>`, `host_tuning_missing:<item>`; 5 for `group_shape_unsupported`, `group_shape_unsupported:<engine>`, `group_instances_unsupported`, `group_drift:<field>`, `host_capability_missing:engine_groups`; no exit for `host_tuning_warning:<item>`, `group_member_failed`, `group_member_uncertain`, `group_wake_mismatch`, `group_stalled`. Items: `compaction`, `memlock`, `infiniband`. No new exit number.
+- Engine group support (spec §2): vLLM and SGLang any N dividing TP × PP, deep park; TensorFold TP 2, PP 1, exactly 2 hosts, restart-only. No gate and no warning for more than two hosts or PP > 1 (decided 2026-10-06).
 - In tracked files, commits and the PR: no machine names, addresses or home paths. The hosts are "host A" (head) and "host B" (worker); the link is "the direct link". Example and test addresses use `192.0.2.0/24` and `198.51.100.0/24`. Live addresses come only from the untracked `scripts/live/matrix/hosts.local.env`.
 - CPU and Fake-engine tests are not qualification; the live rows MN1–MN9 are. Say so in every status claim.
 - Verification before every commit: `scripts/ci-local.sh`; before merge, `scripts/ci-local.sh --deep` with its result in the PR body.
@@ -57,11 +57,13 @@
 | `crates/capyctl-agent/src/native_execution.rs`, `journal.rs` | member launch and terminate for three engines | 13 |
 | `crates/capyctl-testkit/src/fake_group.rs` (new), `crates/capyctl-controller/src/coordinator/tests_groups.rs` (new, `GroupWorld`) | fake multi-host harness | 14 |
 | `crates/capyctl-controller/src/group_sources.rs` (new), `model_sources.rs`, `checkpoint_digests.rs` | parallel weights, digest agreement | 15 |
-| `crates/capyctl-controller/src/group_activation.rs` (new), `remote_execution.rs`, `remote_readiness.rs`, `crates/capyctl-management/src/configuration.rs`, `crates/capyctl-router/src/balance.rs` | reserve, prepare, fan-out, head readiness, route | 16 |
+| `crates/capyctl-controller/src/group_activation.rs` (new), `remote_execution.rs`, `remote_readiness.rs`, `crates/capyctl-management/src/configuration.rs`, `crates/capyctl-router/src/balance.rs`, the completion probe in `crates/capyctl-protocol` (`execution.rs`, `management.proto`), `crates/capyctl-agent/src/native_execution.rs` and the three adapters | reserve, prepare, fan-out, head readiness and readiness probe (`probe_head`), SGLang path check, route | 16 |
 | `crates/capyctl-controller/src/group_settlement.rs` (new) | stop, failure, settlement, uncertainty, recovery | 17 |
 | `crates/capyctl-scheduler/src/placement.rs`, `crates/capyctl-store/src/ordinary_lifecycle/switching.rs` | group eviction across named hosts | 18 |
 | `crates/capyctl-controller/src/group_residency.rs` (new), agent residency per member | park/wake, per-rank evidence, canary, restart-only | 19 |
+| `crates/capyctl-controller/src/group_stall.rs` (new), `crates/capyctl-controller/src/port.rs`, `coordinator_port.rs`, `crates/capyctl-router/src/stream.rs`, `chat.rs`, `crates/capyctl-config/src/schema.rs`, `crates/capyctl-cli/src/grammar.rs`, `docs/operations/configuration.md` | request-stall check, `LifecyclePort::report_group_stall`, `groups.stall_timeout` three ways | 19b |
 | `crates/capyctl-management/src/status.rs`, `crates/capyctl-cli/src/output.rs`, docs | status, codes, exits, user docs | 20 |
+| `crates/capyctl-cli/src/validate.rs`, `grammar.rs`, `crates/capyctl-cli/tests/validate_config.rs` | `validate config --host` repeated, one per named host | 20b |
 | `scripts/live/matrix/rows/MN*.sh`, `scripts/live/matrix/rdma_counters.py` (new), status runbook | live rows | 21, 22 |
 
 ---
@@ -1539,12 +1541,15 @@ git commit -m "feat(adapters): TensorFold two-rank rendering"
 ### Task 13: Agent member launch and member terminate
 
 **Files:**
-- Modify: `crates/capyctl-agent/src/native_execution.rs` (`authorize` admits `Launch(GroupPlan)`; `render_launch` dispatches per engine through `member_args`; the "exactly one device" rule becomes "exactly `local_ranks` devices"), `crates/capyctl-agent/src/journal.rs` (journal a member launch keyed by deployment, instance, generation, rank), `crates/capyctl-agent/src/rendezvous.rs` (no file rendezvous root for a group member)
-- Test: `crates/capyctl-agent/tests/group_launch.rs`
+- Modify: `crates/capyctl-agent/src/native_execution.rs` (`authorize` admits `Launch { plan, member }`; `render_launch` dispatches per engine through `member_args`; the "exactly one device" rule becomes "exactly `local_ranks` devices"), `crates/capyctl-agent/src/journal.rs` (journal a member launch keyed by deployment, instance, generation, rank), `crates/capyctl-agent/src/rendezvous.rs` (no file rendezvous root for a group member), `crates/capyctl-agent/src/host_checks.rs` (the SGLang DP-attention ports)
+- Modify (protocol, R29; Task 7 stays as committed): `crates/capyctl-protocol/proto/capyctl/management/v1/management.proto` (`ExecuteMember.group_member_launch`, a `SingleLaunchPlan`, field 15, the next free number), `crates/capyctl-protocol/src/execution.rs` (`MemberAction::Launch { plan, member }`, decode, encode, digest, the cross-check), and every existing `MemberAction::Launch(..)` site: the decode, encode and identity check in `execution.rs`, the group tests in `crates/capyctl-protocol/tests/execution.rs`, the `Launch(_)` matches in `crates/capyctl-agent/src/journal.rs` (they become `Launch { .. }`), and `crates/capyctl-agent/tests/journal.rs`
+- Test: `crates/capyctl-agent/tests/group_launch.rs`, `crates/capyctl-protocol/tests/execution.rs`
 
 **Interfaces:**
 - Consumes: `GroupPlan`, `member_id` (Task 6); `member_args` (Task 10); the three renderers (Tasks 10–12); `prepare_member` (Task 9).
 - Produces: `fn member_of<'a>(plan: &'a GroupPlan, host_id: &str) -> Option<&'a MemberPlan>`; a worker launch reports `ProcessIdentity` roles `worker-<r>` and children and no ingress; `Terminate` on a member handle is the journal-owned SIGTERM, bounded wait, SIGKILL path, and the gone report carries `escalated: bool`.
+- Produces: `fn sglang_dp_attention_ports(rendezvous_port: u16) -> Option<RangeInclusive<u16>>` — mirrors SGLang 0.5.21's derivation with checked arithmetic: `port_base` is `P + 1`, or `P - 7` when `P + 1 + 6 > 65535`; the six ports are `port_base..=port_base + 5`. `None` only if the arithmetic cannot be done, which the head refuses as `rendezvous_port_in_use:<P>`. Re-check the derivation on every SGLang upgrade.
+- Produces (protocol, R29): `MemberAction::Launch { plan: GroupPlan, member: SingleLaunchPlan }`. The group plan alone lacks the deployment document, binding, host policy fingerprint and KV sizing, so a group Launch also carries this host's own `SingleLaunchPlan` as `ExecuteMember.group_member_launch` (additive, field 15). It is required with a group Launch and refused with any other action; the canonical digest binds it. Decode cross-checks it against this host's `MemberPlan` (the member named by the identity): equal `profile_name` and `checkpoint_fingerprint`, and `service_port` equal to the member's service port on the head and 0 on a worker; any mismatch is refused like any other malformed command. The head's ingress is provisioned as for a single-rank launch; a worker's never is. Which binding fields a worker's `SingleLaunchPlan` carries is defined here and documented beside the type.
 
 - [ ] **Step 1: Write the failing tests** (Fake launcher, no real engine)
 
@@ -1599,20 +1604,98 @@ async fn worker_member_terminates_its_recorded_tree() {
     assert!(gone.all_gone());
     assert!(!gone.escalated);
 }
+
+// T21, Review Focus 2 (decided 2026-10-06): the six DP-attention ports follow SGLang 0.5.21, both branches.
+#[test]
+fn dp_attention_ports_follow_sglang() {
+    assert_eq!(sglang_dp_attention_ports(25000), Some(25001..=25006));
+    assert_eq!(sglang_dp_attention_ports(65528), Some(65529..=65534));
+    assert_eq!(sglang_dp_attention_ports(65529), Some(65522..=65527));
+    assert_eq!(sglang_dp_attention_ports(65535), Some(65528..=65533));
+}
+
+// T21, Review Focus 2: a SGLang head whose deployment enables DP attention refuses a held derived port;
+// without DP attention the same held port is not checked.
+#[tokio::test]
+async fn sglang_head_with_dp_attention_probes_the_derived_ports() {
+    for (dp_attention, refused) in [(true, true), (false, false)] {
+        let host = FakeHost::new("host-a").with_groups_policy("192.0.2.10").with_engine("sglang").holding_port(25003);
+        let launch = two_member_launch(GroupEngine::Sglang).with_engine_config("enable_dp_attention", dp_attention);
+        let out = host.execute(launch).await;
+        if refused {
+            assert_eq!(out.unwrap_err().refused(), "rendezvous_port_in_use:25003");
+            assert!(host.journal().is_empty());
+        } else {
+            assert!(out.is_ok());
+        }
+    }
+}
 ```
 
-`FakeHost` extends the agent's existing Fake-launcher fixture (search `struct Fake` in `crates/capyctl-agent/tests/`) with `with_groups_policy`, `with_engine`, `with_fake_ignoring_sigterm` (the fake child traps SIGTERM) and `last_argv`.
+```rust
+// T34 (R29): a group Launch carries this host's SingleLaunchPlan; it round-trips and the digest binds it.
+// crates/capyctl-protocol/tests/execution.rs
+#[test]
+fn group_launch_carries_the_member_launch() {
+    for engine in [GroupEngine::Vllm, GroupEngine::Sglang, GroupEngine::Tensorfold] {
+        for rank in [0, 1] {
+            let command = command_with(group_launch(engine, rank));
+            let wire = command.to_wire();
+            assert!(wire.group_member_launch.is_some());
+            assert_eq!(MemberCommand::try_from(wire).unwrap(), command);
+            let mut moved = command.clone();
+            if let MemberAction::Launch { member, .. } = &mut moved.action {
+                member.binding_id = "other".into();
+            }
+            assert_ne!(moved.canonical_digest(), command.canonical_digest());
+        }
+    }
+}
 
-- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-agent --test group_launch` — expected: the native path returns `Unauthorized`.
+// T34 (R29): group_member_launch is required with a group Launch and refused with any other action.
+#[test]
+fn group_member_launch_only_with_a_group_launch() {
+    let mut missing = command_with(group_launch(GroupEngine::Vllm, 0)).to_wire();
+    missing.group_member_launch = None;
+    assert!(!decodes(missing));
+    let mut stray = command_with(MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm))).to_wire();
+    stray.group_member_launch = Some(sample_single_launch().to_wire());
+    assert!(!decodes(stray));
+}
 
-- [ ] **Step 3: Implement.** `render_launch` accepts `Launch(GroupPlan)`: re-run `prepare_member` (a Launch without passing checks never spawns), take `member_of`, build the engine's input from the member (its `model_path`, devices → `CUDA_VISIBLE_DEVICES` as today, `group: member_args(plan, host_id)`), then the existing durable-spawn path. Workers skip ingress and the readiness wait; they return once identities are recorded. The terminate path records whether SIGKILL was needed. Comments cite `// ADR 0028 §8, §11`.
+// T34 (R29): the member launch must agree with this host's MemberPlan.
+#[test]
+fn member_launch_must_match_the_member_plan() {
+    let edits: &[fn(&mut SingleLaunchPlan)] = &[
+        |m| m.profile_name = "other".into(),
+        |m| m.checkpoint_fingerprint = "sha256:other".into(),
+        |m| m.service_port += 1,
+    ];
+    for edit in edits {
+        let mut head = command_with(group_launch(GroupEngine::Sglang, 0));
+        if let MemberAction::Launch { member, .. } = &mut head.action { edit(member) }
+        assert!(!decodes(head.to_wire()));
+    }
+    let mut worker = command_with(group_launch(GroupEngine::Sglang, 1));
+    if let MemberAction::Launch { member, .. } = &mut worker.action { member.service_port = 8100 }
+    assert!(!decodes(worker.to_wire()));
+}
+```
 
-- [ ] **Step 4: Run the tests.** Run: `cargo test -p capyctl-agent` — expected: PASS; every single-rank launch test unchanged.
+`group_launch(engine, rank)` builds `MemberAction::Launch { plan, member }` for that rank's member with an identity naming it (head: the plan's service port; worker: 0); `sample_single_launch` is the file's existing single-launch sample. A test that edits a decoded command re-signs it with `canonical_digest` before `to_wire`, as the file's other tests do.
+
+`FakeHost` extends the agent's existing Fake-launcher fixture (search `struct Fake` in `crates/capyctl-agent/tests/`) with `with_groups_policy`, `with_engine`, `with_fake_ignoring_sigterm` (the fake child traps SIGTERM), `holding_port` and `last_argv`. The agent tests write `MemberAction::Launch(plan)` for short; it means `MemberAction::Launch { plan, member }` with this host's own `SingleLaunchPlan`, which `two_member_launch` builds.
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-protocol --test execution && cargo test -p capyctl-agent --test group_launch` — expected: the protocol tests do not compile, and the native path returns `Unauthorized`.
+
+- [ ] **Step 3: Implement.** `render_launch` accepts a group Launch: re-run `prepare_member` (a Launch without passing checks never spawns), take `member_of`, build the engine's input from the member (its `model_path`, devices → `CUDA_VISIBLE_DEVICES` as today, `group: member_args(plan, host_id)`), then the existing durable-spawn path. Workers skip ingress and the readiness wait; they return once identities are recorded. The terminate path records whether SIGKILL was needed. DP attention is decided from the deployment document in this host's `SingleLaunchPlan` carried by the Launch (SGLang's `enable_dp_attention`; it is a reserved field today, so the branch is reached only once a later change admits it, but the check reads the document, not a constant). Only the Launch carries that document, so the check runs in the Launch's re-run of the Prepare checks: when the head member of a SGLang group enables DP attention, it also probes `sglang_dp_attention_ports(P)` free and refuses `rendezvous_port_in_use:<port>` naming the first one held, before anything is journaled; without DP attention nothing extra (no store change). Comments cite `// ADR 0028 §7, §8, §11`.
+
+- [ ] **Step 4: Run the tests.** Run: `cargo test -p capyctl-protocol && cargo test -p capyctl-agent` — expected: PASS; every single-rank launch test unchanged, and every existing command encoding unchanged (T39).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/capyctl-agent
+git add crates/capyctl-agent crates/capyctl-protocol
 git commit -m "feat(agent): launch and terminate group members for vLLM, SGLang and TensorFold"
 ```
 
@@ -1759,15 +1842,19 @@ git commit -m "feat(controller): group weights on every host in parallel and cro
 
 **Files:**
 - Create: `crates/capyctl-controller/src/group_activation.rs`
-- Modify: `crates/capyctl-controller/src/coordinator/worker.rs` and `scheduler.rs` (a deployment with `InstanceSpec.group` goes to group activation), `remote_execution.rs` and `remote_readiness.rs` (member id from the plan), `crates/capyctl-management/src/configuration.rs` (resolve on every named host; `group_profile_mismatch`, `peer_address_missing`, `engine_env_not_approved` on any host, `host_capability_missing:engine_groups`), `crates/capyctl-router/src/balance.rs` (a group is one replica at the head's ingress)
-- Test: `crates/capyctl-controller/src/coordinator/tests_groups.rs`
+- Modify: `crates/capyctl-controller/src/coordinator/worker.rs` and `scheduler.rs` (a deployment with `InstanceSpec.group` goes to group activation), `remote_execution.rs` and `remote_readiness.rs` (member id from the plan; the completion probe sent to the head), `crates/capyctl-management/src/configuration.rs` (resolve on every named host; `group_profile_mismatch`, `peer_address_missing`, `engine_env_not_approved` on any host, `host_capability_missing:engine_groups`), `crates/capyctl-router/src/balance.rs` (a group is one replica at the head's ingress), `crates/capyctl-protocol/proto/capyctl/management/v1/management.proto` and `crates/capyctl-protocol/src/execution.rs` (the additive completion probe), `crates/capyctl-agent/src/native_execution.rs` (the head's agent runs it), `crates/capyctl-adapters/src/vllm/residency.rs`, `sglang/http.rs`, `tensorfold/http.rs` (a bounded completion that returns the generated token ids)
+- Modify (R30 migration): every existing `MemberAction::Probe` construction gains `max_tokens: None`, and every exact destructure `Probe { owned_handle }` becomes `Probe { owned_handle, .. }` (or binds `max_tokens` where the agent runs the completion); `Probe { .. }` patterns compile unchanged. Sites: `crates/capyctl-protocol/src/execution.rs` (the enum, decode, encode, the owned-handle binding check), `crates/capyctl-agent/src/journal.rs` (four exact destructures: the probe-target binding, the owned-handle extraction, the retained-launch lookup and the instance fence), `crates/capyctl-agent/src/native_execution.rs` (the probe dispatch and the retained-command lookup), `crates/capyctl-controller/src/remote_readiness.rs` (the readiness probe it builds); tests `crates/capyctl-protocol/tests/execution.rs`, `protocol_v2.rs` and `version_skew.rs`, `crates/capyctl-agent/tests/coresidence.rs` and `native_vllm.rs`, `crates/capyctl-controller/src/coordinator/tests_remote.rs`, `crates/capyctl-controller/tests/version_skew.rs`.
+- Test: `crates/capyctl-controller/src/coordinator/tests_groups.rs`, `crates/capyctl-protocol/tests/protocol_v2.rs`, `crates/capyctl-agent/tests/group_launch.rs`, the adapters' probe tests
 
 **Interfaces:**
-- Consumes: `reserve_group` (Task 8), `group_refusal` (Task 7), `materialize_on_all`, `agree_digests` (Task 15), `GroupWorld` (Task 14), `check_engine_shape` (Task 4).
+- Consumes: `reserve_group` (Task 8), `group_refusal` (Task 7), `materialize_on_all`, `agree_digests` (Task 15), `GroupWorld` (Task 14), `check_engine_shape`, `group_support` (Task 4).
 - Produces:
   - `pub async fn activate_group(ctx: &CoordinatorCtx, deployment: &DeploymentRecord, shape: &GroupShape) -> Result<GroupActivation, GroupActivationError>`.
   - `pub enum GroupActivation { Ready { plan: GroupPlan }, Failed { plan: GroupPlan, failed_rank: u32, reason: String } }`; `Failed` hands off to Task 17's `stop_group`.
-  - Order: sources → build one `AdmissionContext` per member host → `reserve_group` → `Prepare` to all concurrently → on any refusal release all reservations → for each member, `mark_member_dispatching` must commit before its `Launch` is sent (and before every retry) → `Launch` to all concurrently → `mark_member_launched` with the identities from each Launch reply → head readiness while watching every member's exit reports → open the route on `Ready`.
+  - `pub async fn probe_head(ctx: &CoordinatorCtx, plan: &GroupPlan, max_tokens: u32, deadline: Duration) -> Result<Vec<u32>, ProbeError>` — sends one completion probe to the head's agent and waits at most `deadline`. The head's agent runs one completion (`temperature: 0`, `max_tokens`) against its retained launch on loopback with the per-launch key (ADR 0012), never through ingress or the router, and returns the generated token ids. Worker hosts are never sent one. The one probe function for readiness (1 token, here), the wake canary (8 tokens, Task 19) and the request-stall check (Task 19b). `ProbeError` covers a timeout and a failed request, with the reason.
+  - The completion probe is an additive extension of the existing cross-host probe: `MemberAction::Probe { owned_handle, max_tokens: Option<u32> }`. `None` is today's readiness probe and encodes and digests exactly as before (T39). On the wire, `ExecuteMember` gains `probe_max_tokens` (`uint32`, field 16, the next free number after Task 13's `group_member_launch`; set only with `probe_owned_handle`; 0 means today's probe) and `MemberExecutionResult` gains `probe_tokens` (`repeated uint32`, field 16, the next free number). The digest binds `max_tokens` when it is set. Temperature is always 0 and is not on the wire. Each adapter (vLLM, SGLang, TensorFold) asks its engine for the generated token ids in its own request form, pinned by an adapter test; a reply without them is a probe failure.
+  - `fn check_member_paths(engine: GroupEngine, residency: Residency, head: &str, paths: &BTreeMap<String, PathBuf>) -> Result<(), GroupActivationError>` — a SGLang group with deep park whose members' model paths differ is refused `group_model_path_mismatch`, naming the head's path and the member's path (ADR 0028 §6, decided 2026-10-06). Restart-only SGLang groups, vLLM and TensorFold pass.
+  - Order: sources → `check_member_paths` → build one `AdmissionContext` per member host → `reserve_group` → `Prepare` to all concurrently → on any refusal release all reservations → for each member, `mark_member_dispatching` must commit before its `Launch` is sent (and before every retry) → `Launch` to all concurrently → `mark_member_launched` with the identities from each Launch reply → head readiness while watching every member's exit reports → `probe_head(.., 1, ..)` → open the route on `Ready`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1839,20 +1926,89 @@ async fn profile_mismatch_and_missing_peer_address_refuse_deploy() {
     let world = GroupWorld::hosts(&["host-a", "host-b"]).without_peer_address("host-b");
     assert_eq!(world.try_deploy_group("g", &["host-a", "host-b"]).await.unwrap_err().code(), "peer_address_missing");
 }
+
+// T30 (decided 2026-10-06): a readiness probe that fails is a launch failure; the route never opens.
+// Stopping and settling the members after it is Task 17's (`readiness_probe_failure_stops_the_group`).
+#[tokio::test]
+async fn failing_readiness_probe_fails_the_activation() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).probe_fails();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    assert!(matches!(world.wait_activation(&id).await, GroupActivation::Failed { failed_rank: 0, .. }));
+    assert!(!world.route_open("g"));
+    assert_eq!(world.group.probe_calls(), 1);
+}
+
+// T30 (decided 2026-10-06): a passing 1-token probe through the head opens the route; workers are never probed.
+#[tokio::test]
+async fn readiness_probe_goes_through_the_head_only() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]);
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    assert_eq!(world.group.probe_calls(), 1);
+    assert_eq!(world.group.last_probe_max_tokens(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
+}
+
+// T14 (decided 2026-10-06): a deep SGLang group whose member paths differ is refused before
+// the reservation, naming both paths; a restart-only SGLang group with the same differing paths activates.
+#[tokio::test]
+async fn sglang_deep_group_with_differing_paths_is_refused() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).with_engine("sglang")
+        .model_path("host-a", "/models/a").model_path("host-b", "/models/b");
+    let err = world.try_deploy_group_with_residency("g", &["host-a", "host-b"], "deep").await.unwrap_err();
+    assert_eq!(err.code(), "group_model_path_mismatch");
+    assert!(err.to_string().contains("/models/a") && err.to_string().contains("/models/b"));
+    assert!(world.group_plan("g").is_none());
+    assert_eq!(world.owner_bytes_on("host-b", &member_owner_id("g", 0, 1)), 0);
+    assert_eq!(world.launches(), 0);
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).with_engine("sglang")
+        .model_path("host-a", "/models/a").model_path("host-b", "/models/b");
+    let id = world.deploy_group_with_residency("g", &["host-a", "host-b"], "restart_only").await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+}
 ```
 
-Remove the `#[ignore]` from Task 14's four-host smoke test.
+```rust
+// T39 (decided 2026-10-06): the completion probe is additive; a plain probe encodes and digests as before.
+// crates/capyctl-protocol/tests/protocol_v2.rs
+#[test]
+fn completion_probe_is_additive() {
+    let plain = with_action(MemberAction::Probe { owned_handle: "launch".into(), max_tokens: None });
+    assert_eq!(plain.encode_to_vec(), PLAIN_PROBE_BYTES);
+    let probe = with_action(MemberAction::Probe { owned_handle: "launch".into(), max_tokens: Some(8) });
+    assert_ne!(probe.canonical_digest(), plain.canonical_digest());
+    assert_eq!(decode(&probe.encode_to_vec()).unwrap().action, probe.action);
+}
+```
 
-- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-controller tests_groups` — expected: fail.
+```rust
+// T30 (decided 2026-10-06): the head's agent answers a completion probe with the generated token ids.
+// crates/capyctl-agent/tests/group_launch.rs
+#[tokio::test]
+async fn head_answers_a_completion_probe_with_token_ids() {
+    let host = FakeHost::new("host-a").with_groups_policy("192.0.2.10").with_engine("vllm").with_fake_completion(vec![7, 8]);
+    let out = host.execute(two_member_launch(GroupEngine::Vllm)).await.unwrap();
+    let reply = host.execute(MemberAction::Probe { owned_handle: out.owned_handle.clone(), max_tokens: Some(2) }).await.unwrap();
+    assert_eq!(reply.probe_tokens, vec![7, 8]);
+    assert!(host.last_engine_request().is_loopback_with_launch_key());
+}
+```
 
-- [ ] **Step 3: Implement `activate_group`** in the order above. `Prepare` and `Launch` fan-out use `join_all` over per-host sends, each command carrying the plan's generation and `CommandIdentity { member: MemberKey { host_id, member_id: member_id(rank) }, instance_index: 0, .. }`. Readiness uses the engine's existing native readiness check against the head only (`// ADR 0028 §9, owner decision 5`), bounded by `timeouts.initialize`, returning `Failed` on any member exit. The lifecycle claim spans the whole activation. The router registers the head's ingress as the only replica.
+`PLAIN_PROBE_BYTES` is today's encoding of that probe, captured before the change. Remove the `#[ignore]` from Task 14's four-host smoke test.
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-controller tests_groups && cargo test -p capyctl-protocol --test protocol_v2 && cargo test -p capyctl-agent --test group_launch` — expected: fail.
+
+- [ ] **Step 3: Implement `activate_group`** in the order above. `Prepare` and `Launch` fan-out use `join_all` over per-host sends, each command carrying the plan's generation and `CommandIdentity { member: MemberKey { host_id, member_id: member_id(rank) }, instance_index: 0, .. }`; each `Launch` also carries that host's own `SingleLaunchPlan` (`MemberAction::Launch { plan, member }`, Task 13), built from that host's resolution as a single-rank launch is. Readiness uses the engine's existing native readiness check against the head only (`// ADR 0028 §9, owner decision 5`), bounded by `timeouts.initialize`, returning `Failed` on any member exit; then one `probe_head` with `max_tokens: 1`, bounded by a named const, whose failure is `Failed` like a launch failure (`// ADR 0028 §9, decided 2026-10-06`). `check_member_paths` runs on the paths from `materialize_on_all`, before `reserve_group`, so a refusal reserves and releases nothing (`// ADR 0028 §6`). The lifecycle claim spans the whole activation. The router registers the head's ingress as the only replica.
 
 - [ ] **Step 4: Run the tests.** Run: `scripts/ci-local.sh --deep --only core` (or the core suite command from `AGENTS.md`) — expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/capyctl-controller crates/capyctl-management crates/capyctl-router
+git add crates/capyctl-controller crates/capyctl-management crates/capyctl-router crates/capyctl-protocol crates/capyctl-agent crates/capyctl-adapters
 git commit -m "feat(controller): group activation: reserve all, prepare, concurrent launch, head readiness"
 ```
 
@@ -1940,6 +2096,19 @@ async fn launch_failure_is_compensated() {
     assert!(!world.route_open("g"));
     assert_eq!(world.status_of(&id).await.last_error(), "group_member_failed");
 }
+
+// T30, T31 (decided 2026-10-06): a failed readiness probe stops every member; each host releases on its own evidence.
+#[tokio::test]
+async fn readiness_probe_failure_stops_the_group() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).probe_fails();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_settled_generation("g", 1).await;
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(world.owner_bytes_on("host-a", &member_owner_id("g", 0, 0)), 0);
+    assert_eq!(world.owner_bytes_on("host-b", &member_owner_id("g", 0, 1)), 0);
+    assert_eq!(world.status_of(&id).await.last_error(), "group_member_failed");
+}
 ```
 
 - [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-controller tests_groups` — expected: new tests fail.
@@ -2024,11 +2193,12 @@ git commit -m "feat(switching): all-or-nothing group eviction across named hosts
 - Test: `crates/capyctl-controller/src/coordinator/tests_groups.rs`
 
 **Interfaces:**
-- Consumes: `FakeGroup` faults (Task 14), `stop_group` (Task 17), `group_support` (Task 4).
+- Consumes: `FakeGroup` faults (Task 14), `stop_group` (Task 17), `activate_group`, `probe_head` (Task 16), the deployment's effective residency (Task 4, `group_support`).
 - Produces:
-  - `pub async fn park_group(ctx: &CoordinatorCtx, plan: &GroupPlan) -> Result<(), GroupResidencyError>` — deep: head collective once, then every member's residency at or below its parked budget within the park deadline; restart-only engines: `stop_group`.
-  - `pub async fn wake_group(ctx: &CoordinatorCtx, plan: &GroupPlan) -> Result<(), GroupResidencyError>` — deep: head collective once, every member resident, head readiness, canary; restart-only: a new activation.
-  - `pub struct CanaryReference { pub prompt: String, pub tokens: Vec<u32> }` recorded at first readiness (`temperature: 0`, `max_tokens: 8`).
+  - `pub async fn park_group(ctx: &CoordinatorCtx, plan: &GroupPlan) -> Result<(), GroupResidencyError>` — dispatches on the deployment's effective residency, never on the engine. `deep`: head collective once, then every member's residency at or below its parked budget within the park deadline. `restart_only` (any engine): `stop_group`.
+  - `pub async fn wake_group(ctx: &CoordinatorCtx, plan: &GroupPlan) -> Result<(), GroupResidencyError>` — `deep`: head collective once, every member resident, head readiness, canary. `restart_only`: a new activation.
+  - `pub struct CanaryReference { pub prompt: String, pub tokens: Vec<u32> }` recorded at first readiness through `probe_head(ctx, plan, CANARY_TOKENS, ..)` (Task 16; `temperature: 0`), with `pub const CANARY_TOKENS: u32 = 8`.
+  - `pub fn canary_matches(reference: &CanaryReference, observed: &[u32]) -> bool` — the one comparison: exact token equality today, the rule documented beside a named const so a tolerance rule later is a one-function change; revisited at MN4 with live evidence (ADR 0028 §12, decided 2026-10-06).
   - `GroupResidencyError::{MemberSilent { rank }, MemberResident { rank }, CanaryMismatch}` → codes `group_member_uncertain`, `group_member_failed`, `group_wake_mismatch`; each triggers `stop_group`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2088,7 +2258,7 @@ async fn repeated_cycles_are_clean() {
     assert_eq!(world.group.sleep_calls(), 5);
 }
 
-// T22: a TensorFold group parks by stopping both ranks and wakes by relaunching.
+// T22, R34: TensorFold supports only restart_only, so its effective residency defaults there: it parks by stopping both ranks and wakes by relaunching.
 #[tokio::test]
 async fn tensorfold_group_is_restart_only() {
     let world = GroupWorld::ready_group_with("g", &["host-a", "host-b"], "tensorfold").await;
@@ -2099,11 +2269,33 @@ async fn tensorfold_group_is_restart_only() {
     world.wake("g").await.unwrap();
     assert!(world.generation_started("g", 2));
 }
+
+// T20, R34: park and wake follow the effective residency, not the engine: a restart_only vLLM or SGLang group parks by stopping.
+#[tokio::test]
+async fn restart_only_residency_parks_by_stopping_on_any_engine() {
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::ready_group_with_residency("g", &["host-a", "host-b"], engine, "restart_only").await;
+        world.park("g").await.unwrap();
+        assert_eq!(world.group.sleep_calls(), 0, "{engine}");
+        assert!(!world.group.alive(0) && !world.group.alive(1));
+        world.wake("g").await.unwrap();
+        assert!(world.generation_started("g", 2));
+    }
+}
+
+// T20 (decided 2026-10-06): the canary is compared by one function, exact tokens only.
+#[test]
+fn canary_matches_exact_tokens_only() {
+    let reference = CanaryReference { prompt: "canary".into(), tokens: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+    assert!(canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 8]));
+    assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 9]));
+    assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7]));
+}
 ```
 
 - [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-controller tests_groups` — expected: unresolved.
 
-- [ ] **Step 3: Implement.** Only the head's agent receives `Park`/`Restore` (existing actions, member id `head`); worker agents report `process_residency` for their member handle, now keyed by member. A member's charge moves to its parked budget only on its own report. `max_parked` counts the group once on each host. Restart-only groups (TensorFold; SGLang if the owner chooses the fallback) take the stop and activation paths. Comments cite `// ADR 0028 §12, SPEC §11: the lead agent invokes each collective once`.
+- [ ] **Step 3: Implement.** Only the head's agent receives `Park`/`Restore` (existing actions, member id `head`); worker agents report `process_residency` for their member handle, now keyed by member. A member's charge moves to its parked budget only on its own report. `max_parked` counts the group once on each host. `park_group` and `wake_group` dispatch on the deployment's effective residency (R34): every `restart_only` group, on any engine, takes the stop and activation paths; every `deep` group takes `Park`/`Restore`. TensorFold supports only `restart_only` (its `group_support` data), so that is its default. There is no restart-only fallback for SGLang (decided 2026-10-06). The canary goes through `probe_head` with `CANARY_TOKENS` and is judged only by `canary_matches`. At the SGLang wake call, a comment notes that the wake posts the head's model path to every rank, which is why Task 16 refuses differing paths for a deep SGLang group (`// ADR 0028 §12`). Comments cite `// ADR 0028 §12, SPEC §11: the lead agent invokes each collective once`.
 
 - [ ] **Step 4: Run the tests.** Run the core suite — expected: PASS.
 
@@ -2116,10 +2308,127 @@ git commit -m "feat(controller): group park and wake with per-rank evidence and 
 
 ---
 
+### Task 19b: Request-stall check
+
+**Files:**
+- Create: `crates/capyctl-controller/src/group_stall.rs`
+- Modify: `crates/capyctl-controller/src/port.rs` (`LifecyclePort::report_group_stall`, and its `Controller` impl), `crates/capyctl-controller/src/coordinator_port.rs` (the `CoordinatorLifecycle` impl dispatches to `on_request_stalled`), `crates/capyctl-router/src/stream.rs` and `chat.rs` (a first-token watch on requests forwarded to a group's head; the call site), `crates/capyctl-controller/src/lib.rs`, `crates/capyctl-controller/src/group_settlement.rs` (`StopReason::Stalled`), `crates/capyctl-config/src/schema.rs` (server `groups.stall_timeout`), `crates/capyctl-cli/src/grammar.rs` (`--group-stall-timeout` on `capyctl start server`), the server settings resolution (`CAPYCTL_GROUP_STALL_TIMEOUT`), `docs/operations/configuration.md` (one row)
+- Test: `crates/capyctl-controller/src/coordinator/tests_groups.rs`, `crates/capyctl-router/tests/router_core.rs` (its `StubAuthority` records stall reports), the config settings tests
+
+**Interfaces:**
+- Consumes: `probe_head` (Task 16), `stop_group`, `StopReason` (Task 17), `GroupWorld` (Task 14).
+- Produces:
+  - The setting, three ways (flag > env > YAML > default): `groups.stall_timeout` in the server document (shown as `server.groups.stall_timeout` by `capyctl config show`), `--group-stall-timeout <duration>` on `capyctl start server`, `CAPYCTL_GROUP_STALL_TIMEOUT`; default `120s`.
+  - `async fn report_group_stall(&self, deployment_id: &str, instance: u32, generation: i64)` on `LifecyclePort`: the boundary between the router and the controller. The router calls it once per request when a request forwarded to a group's head has produced no first token within `stall_timeout`; it never calls it for a single-host instance, and nothing is sent when no request is in flight. The controller looks up that generation's group plan and dispatches to `on_request_stalled`; a report for a generation that is no longer current is ignored.
+  - `pub async fn on_request_stalled(ctx: &CoordinatorCtx, plan: &GroupPlan) -> StallOutcome` — one `probe_head(ctx, plan, 1, STALL_PROBE_DEADLINE)` with `const STALL_PROBE_DEADLINE: Duration = Duration::from_secs(60)`; stalls reported for one generation while its probe runs share that probe. `StallOutcome::Healthy` when the probe passes: nothing is stopped. `StallOutcome::Stopped` when it fails: `stop_group(.., StopReason::Stalled)`, status `group_stalled` (no exit number).
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// T31 (decided 2026-10-06): a stalled request and a failing probe stop the group on every host;
+// each member is released only on its own host's evidence.
+#[tokio::test]
+async fn stalled_request_with_failing_probe_stops_the_group() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.group.hang_collectives();
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_stalled");
+    assert_eq!(world.terminates_sent_to("host-a"), 1);
+    assert_eq!(world.terminates_sent_to("host-b"), 1);
+    assert_eq!(world.owner_bytes_on("host-a", &member_owner_id("g", 0, 0)), 0);
+    assert_eq!(world.owner_bytes_on("host-b", &member_owner_id("g", 0, 1)), 0);
+}
+
+// T32 (decided 2026-10-06): if host B is unreachable when the stalled group stops, its share stays charged and uncertain.
+#[tokio::test]
+async fn stalled_group_keeps_an_unreachable_member_charged() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.group.hang_collectives();
+    world.group.disconnect_host("host-b");
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    world.settle_for(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(world.owner_bytes_on("host-b", &member_owner_id("g", 0, 1)), 0);
+    assert_eq!(world.owner_bytes_on("host-a", &member_owner_id("g", 0, 0)), 0);
+}
+
+// T31 (decided 2026-10-06): a slow request whose probe passes stops nothing.
+#[tokio::test]
+async fn stalled_request_with_passing_probe_stops_nothing() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let probes = world.group.probe_calls();
+    world.group.delay_first_token(std::time::Duration::from_secs(150));
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    world.settle_for(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.group.probe_calls(), probes + 1);
+    assert_eq!(world.state("g").await, "ready");
+    assert_eq!(world.terminates_sent_to("host-a") + world.terminates_sent_to("host-b"), 0);
+}
+
+// T31 (decided 2026-10-06): an idle group is never probed.
+#[tokio::test]
+async fn idle_group_is_never_probed() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let probes = world.group.probe_calls();
+    world.advance(std::time::Duration::from_secs(3600)).await;
+    assert_eq!(world.group.probe_calls(), probes);
+}
+```
+
+```rust
+// T14 (decided 2026-10-06): the stall timeout comes three ways, flag > env > YAML > default.
+#[test]
+fn stall_timeout_three_ways() {
+    assert_eq!(server_settings(&[], &[], "").groups.stall_timeout, Duration::from_secs(120));
+    assert_eq!(server_settings(&[], &[], "groups: {stall_timeout: 90s}").groups.stall_timeout, Duration::from_secs(90));
+    assert_eq!(server_settings(&[], &[("CAPYCTL_GROUP_STALL_TIMEOUT", "60s")], "groups: {stall_timeout: 90s}").groups.stall_timeout, Duration::from_secs(60));
+    assert_eq!(server_settings(&["--group-stall-timeout", "30s"], &[("CAPYCTL_GROUP_STALL_TIMEOUT", "60s")], "groups: {stall_timeout: 90s}").groups.stall_timeout, Duration::from_secs(30));
+}
+```
+
+```rust
+// T31 (decided 2026-10-06): a first-token timeout in the router reaches the controller once, naming the generation.
+// crates/capyctl-router/tests/router_core.rs
+#[tokio::test]
+async fn first_token_timeout_reports_a_group_stall() {
+    let authority = StubAuthority::with_group("g", 0, 1).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&authority).with_upstream_silent();
+    let _pending = router.send_chat("g");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(authority.stall_reports(), vec![("g".to_string(), 0, 1)]);
+    let single = StubAuthority::with_single("s").stall_timeout(Duration::from_millis(50));
+    let router = router_with(&single).with_upstream_silent();
+    let _pending = router.send_chat("s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(single.stall_reports().is_empty());
+}
+```
+
+`server_settings(flags, env, yaml)` stands for the existing server settings resolution used by the other server settings tests (search `drain_timeout` in `crates/capyctl-config/src/setting_overrides/tests.rs`). Add only the `GroupWorld`, `FakeGroup` and `StubAuthority` helpers these tests use (`hang_collectives`, `delay_first_token`, `send_request`, `advance`, `terminates_sent_to`, `probe_calls`, `with_group`, `with_single`, `stall_timeout`, `stall_reports`, `with_upstream_silent`).
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-controller tests_groups && cargo test -p capyctl-router --test router_core && cargo test -p capyctl-config` — expected: unresolved.
+
+- [ ] **Step 3: Implement.** The router's watch starts when a request is forwarded to a group's head and ends at its first generated token; on expiry it calls `LifecyclePort::report_group_stall` once for that request. The controller's implementation dispatches to `on_request_stalled`, whose probe is `probe_head` (the head's agent, on loopback with the per-launch key, never through the router). A failed probe stops the group through `stop_group`, which releases each member only on its own host's gone-evidence and keeps an unreachable member charged and `uncertain`. Nothing polls an idle group. A server document without `groups` keeps its current form and digest. Comments cite `// ADR 0028 §11, decided 2026-10-06`.
+
+- [ ] **Step 4: Run the tests.** Run: `cargo test -p capyctl-controller -p capyctl-router -p capyctl-config -p capyctl-cli` — expected: PASS; single-host forwarding unchanged.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/capyctl-controller crates/capyctl-router crates/capyctl-config crates/capyctl-cli docs/operations/configuration.md
+git commit -m "feat(controller): group request-stall check through a head probe"
+```
+
+---
+
 ### Task 20: Status, codes, exits and user docs
 
 **Files:**
-- Modify: `crates/capyctl-management/src/status.rs` (group rows), `crates/capyctl-cli/src/output.rs` (text view, codes → exits), `docs/guide/several-machines.md` ("One model across machines"), `docs/operations/configuration.md` (three group settings, engine environment settings), `docs/operations/network-access.md` (risk), `docs/guide/engines.md` (`--env`, `--approve-env`, group support table), `docs/examples/deployment-multinode.yaml` (real two-host TP 2 group) and `docs/examples/deployment-spread.yaml` (the current spread example, moved)
+- Modify: `crates/capyctl-management/src/status.rs` (group rows), `crates/capyctl-cli/src/output.rs` (text view, codes → exits), `docs/guide/several-machines.md` ("One model across machines"), `docs/operations/configuration.md` (three group settings, engine environment settings), `docs/operations/network-access.md` (risk), `docs/guide/engines.md` (`--env`, `--approve-env`, group support table), `docs/examples/deployment-multinode.yaml` (real two-host TP 2 group) and `docs/examples/deployment-spread.yaml` (the current spread example, moved), the release notes of the release that ships groups (`docs/operations/release-notes-<version>.md`)
 - Test: `crates/capyctl-cli` output tests, `crates/capyctl-management` status tests, the example-validation test (search `deployment-multinode.yaml` in tests)
 
 **Interfaces:**
@@ -2139,6 +2448,7 @@ fn group_codes_map_to_exits() {
         ("host_capability_missing:engine_groups", 5),
         ("rendezvous_ports_exhausted", 4), ("rendezvous_port_in_use:25000", 4),
         ("host_tuning_missing:memlock", 4),
+        ("group_model_path_mismatch", 2),
     ] {
         assert_eq!(exit_for_code(code).0, exit, "{code}");
     }
@@ -2167,7 +2477,7 @@ Use the real function names in `output.rs` for `exit_for_code`, `render_status_j
 
 - [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-cli && cargo test -p capyctl-management` — expected: fail.
 
-- [ ] **Step 3: Implement** the mappings (prefix match for `group_shape_unsupported:`, `group_drift:`, `host_tuning_*:`, `rendezvous_port_in_use:`, `service_port_in_use:`), the status rows, the docs (short, matching real output exactly; the guide section shows the deployment, the status view and the risk in plain words), and the examples.
+- [ ] **Step 3: Implement** the mappings (prefix match for `group_shape_unsupported:`, `group_drift:`, `host_tuning_*:`, `rendezvous_port_in_use:`, `service_port_in_use:`), the status rows, the docs (short, matching real output exactly; the guide section shows the deployment, the status view and the risk in plain words), and the examples. The no-exit codes (`host_tuning_warning:<item>`, `group_member_failed`, `group_member_uncertain`, `group_wake_mismatch`, `group_stalled`) appear only in status and `last_error`. The guide and the release notes list exactly which catalog models run as groups on which engines at release (from the spec §17.2 catalog table, marked pending live qualification until the MN rows pass) and name the next milestones: container launchers and a live row of three or more hosts on rented machines (decided 2026-10-06). The engines guide states each engine's shapes per spec §2, with no gate or warning beyond two hosts or for PP > 1.
 
 - [ ] **Step 4: Run the tests.** Run: `scripts/ci-local.sh` — expected: PASS.
 
@@ -2176,6 +2486,91 @@ Use the real function names in `output.rs` for `exit_for_code`, `render_status_j
 ```bash
 git add crates/capyctl-cli crates/capyctl-management docs
 git commit -m "feat(cli): group status, codes and exits; docs for one model across machines"
+```
+
+---
+
+### Task 20b: `validate config --host` multi-host resolution
+
+**Files:**
+- Modify: `crates/capyctl-cli/src/grammar.rs` (`--host` on `validate config` becomes repeatable), `crates/capyctl-cli/src/validate.rs` (one resolution per named host), the user docs that describe `validate config --host` (search them)
+- Test: `crates/capyctl-cli/tests/validate_config.rs`
+
+**Interfaces:**
+- Consumes: the per-host checks deploy runs (`host_groups_policy` (Task 5), `resolve_engine_env` (Task 2), `check_engine_shape`, `group_support` (Task 4), the per-host profile resolution of Task 16) and Task 20's example-validation helper. No second implementation of any check.
+- Produces: `pub fn validate_config(file: &Path, hosts: &[PathBuf]) -> Result<Value, StructuredError>`. A group deployment needs one `--host <host document>` per name in `placement.hosts`, matched by the host document's `name`; a named host without a document, or a document for a host not named, is refused with a message naming the host. A deployment without a group takes at most one `--host`, with today's output unchanged. `--host` is a command option, not a setting, so it has no variable or YAML form (`docs/operations/configuration.md`, "Command options that are not settings").
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// T03 (decided 2026-10-06): a group deployment validates against two host documents.
+#[test]
+fn a_group_validates_against_every_named_host() {
+    let (code, value, raw) = validate(&["--file", "docs/examples/deployment-multinode.yaml",
+        "--host", "docs/examples/host.yaml", "--host", "docs/examples/host-b.yaml"]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["hosts"].as_array().unwrap().len(), 2, "{raw}");
+}
+
+// T14: a named host without a peer address is refused.
+#[test]
+fn a_named_host_without_a_peer_address_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_b = write(dir.path(), "host-b.yaml", &group_host_document(dir.path(), "host-b", None).to_string());
+    let (code, value, raw) = validate(&["--file", "docs/examples/deployment-multinode.yaml",
+        "--host", "docs/examples/host.yaml", "--host", host_b.to_str().unwrap()]);
+    assert_ne!(code, 0, "{raw}");
+    assert_eq!(value["code"], "peer_address_missing", "{raw}");
+    assert!(value["message"].as_str().unwrap().contains("host-b"), "{raw}");
+}
+
+// T14: a profile whose build differs on one named host is refused.
+#[test]
+fn a_profile_mismatch_on_one_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_b = write(dir.path(), "host-b.yaml", &group_host_document_other_build(dir.path(), "host-b", "192.0.2.11").to_string());
+    let (code, value, raw) = validate(&["--file", "docs/examples/deployment-multinode.yaml",
+        "--host", "docs/examples/host.yaml", "--host", host_b.to_str().unwrap()]);
+    assert_ne!(code, 0, "{raw}");
+    assert_eq!(value["code"], "group_profile_mismatch", "{raw}");
+}
+
+// T14, T37: an engine environment name approved on host A but not on host B is refused.
+#[test]
+fn an_env_name_not_approved_on_one_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let deployment = write(dir.path(), "deployment.yaml", &group_deployment_with_env("SGLANG_ENABLE_X", "1").to_string());
+    let host_a = write(dir.path(), "host-a.yaml", &group_host_document_approving(dir.path(), "host-a", "192.0.2.10", &["SGLANG_ENABLE_*"]).to_string());
+    let host_b = write(dir.path(), "host-b.yaml", &group_host_document_approving(dir.path(), "host-b", "192.0.2.11", &[]).to_string());
+    let (code, value, raw) = validate(&["--file", deployment.to_str().unwrap(),
+        "--host", host_a.to_str().unwrap(), "--host", host_b.to_str().unwrap()]);
+    assert_ne!(code, 0, "{raw}");
+    assert_eq!(value["code"], "engine_env_not_approved:SGLANG_ENABLE_X", "{raw}");
+}
+
+// T03: `--host` is repeatable; a named host without a document is refused, naming it.
+#[test]
+fn every_named_host_needs_its_document() {
+    let (code, value, raw) = validate(&["--file", "docs/examples/deployment-multinode.yaml",
+        "--host", "docs/examples/host.yaml"]);
+    assert_ne!(code, 0, "{raw}");
+    assert!(value["message"].as_str().unwrap().contains("host-b"), "{raw}");
+}
+```
+
+`group_host_document`, `group_host_document_other_build`, `group_host_document_approving` and `group_deployment_with_env` are small builders beside the file's existing `host_document` and `deployment_document`; the other-build builder changes whatever the real host document carries for a profile's build fingerprint (see Task 16's `group_profile_mismatch` test). Exit numbers follow the file's existing validate tests.
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p capyctl-cli --test validate_config` — expected: fail (`--host` takes one value).
+
+- [ ] **Step 3: Implement.** Parse every `--host`, match each to a name in `placement.hosts`, resolve the deployment against each document with the same functions deploy uses, and report the first refusal with deploy's code; on success report each host's resolution under `hosts`. Every existing `validate_config` test passes unchanged. Comment `// ADR 0028, design §15, decided 2026-10-06`.
+
+- [ ] **Step 4: Run the tests.** Run: `cargo test -p capyctl-cli` — expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/capyctl-cli docs
+git commit -m "feat(cli): validate config resolves a group against every named host"
 ```
 
 ---
@@ -2217,7 +2612,7 @@ Run: `python3 -m unittest discover -s scripts/live/matrix/tests` — expected: F
 
 - [ ] **Step 3: Write MN4–MN8** per spec §17.2: MN4 five park/wake cycles (vLLM, SGLang) with per-host residency and the canary; MN5 `signal_owned.py` kills host B's engine (each engine); MN6 kills host A's engine (each engine); MN7 stops host B's agent service through the CLI (no firewall change), checks `uncertain` and the charge, restarts it, checks settlement; MN8 alternates the group with a single-rank deployment on host A. Every row cleans up on failure (`rowlib.sh` trap) and prints evidence lines only.
 
-- [ ] **Step 4: Run MN1–MN8 on host A and host B.** Run: `scripts/live/matrix/run_row.sh MN1` … `MN8`. Expected: pass. On a failure, debug before continuing; record the fix in its commit. If MN4 fails for SGLang after debugging, stop and take spec open question 2 to the owner.
+- [ ] **Step 4: Run MN1–MN8 on host A and host B.** Run: `scripts/live/matrix/run_row.sh MN1` … `MN8`. Expected: pass. On a failure, debug before continuing; record the fix in its commit. SGLang groups have no restart-only fallback (decided 2026-10-06): if MN4 still fails for SGLang after debugging, stop and report to the owner. MN4's evidence on the canary rule (exact tokens) goes to the owner either way.
 
 - [ ] **Step 5: Record and commit.** One status runbook section: commit range, each row's result per engine, the transport observed, and "CPU and Fake-engine tests are not qualification; these rows are."
 
@@ -2236,9 +2631,9 @@ git commit -m "test(live): multi-node group rows MN1-MN8 on two hosts for three 
 
 Prerequisites: Qwen3.8-Flash-Next downloaded through CapyCTL on both hosts (RadixArk NVFP4 for SGLang and vLLM; the MLX 4-bit export for TensorFold two-rank), with equal digests; recipe-only environment variables declared through `engine add --env`/`--approve-env` or `engine_config.env` (Tasks 2, 3); owner approval of downloads per spec open question 3.
 
-- [ ] **Step 1: Write MN9.** Per engine: deploy with the reference recipe's non-transport flags as `engine_config`/approved extra args and `timeouts.initialize: 1800s`; run `bench.py` through the router at concurrency 1, 2, 4, 8, 16, 32, 64, three runs each; report average and peak tok/s, TTFT and the RDMA counters. A build that cannot load the model is recorded as such (vLLM stock 0.30.0 may not), not patched in this task.
+- [ ] **Step 1: Write MN9.** Per engine: deploy with the reference recipe's non-transport flags as `engine_config`/approved extra args and `timeouts.initialize: 1800s`; run `bench.py` through the router at concurrency 1, 2, 4, 8, 16, 32, 64, three runs each; report average and peak tok/s, TTFT and the RDMA counters. For vLLM, also run the same-build baseline: stock vLLM 0.30.0 launched directly on host A and host B (not through CapyCTL) with the same arguments and the environment CapyCTL renders for the group, measured with the same `bench.py` sweep against its API. A build that cannot load the model is recorded as such (vLLM stock 0.30.0 may not), not patched in this task.
 
-- [ ] **Step 2: Run MN9.** Pass per engine: averages within about 10% of that engine's reference (vLLM published two-Spark recipe about 95 tok/s at 1 and 735 at 64; SGLang cookbook two-Spark TP 2 cells; TensorFold two-rank Flash Next recipe numbers). A miss is recorded with the transport evidence, not tuned with NCCL variables (decision 4); it goes to the owner (spec open question 1).
+- [ ] **Step 2: Run MN9.** Pass per engine: averages within about 10% of that engine's reference. vLLM: the same-build baseline of Step 1 (decided 2026-10-06); the published two-Spark recipe (about 95 tok/s at 1 and 735 at 64, a patched build with NCCL settings) is reported beside it for reference only. SGLang: the cookbook two-Spark TP 2 cells. TensorFold: the two-rank Flash Next recipe numbers. A miss is recorded with the transport evidence, not tuned with NCCL variables (decision 4); it goes to the owner (spec open question 1).
 
 - [ ] **Step 3: One deep park and wake** of the SGLang or vLLM Flash-Next group with per-rank evidence and the canary, then one concurrency-1 run to check no loss after wake.
 
@@ -2255,7 +2650,8 @@ git commit -m "test(live): two-host Flash-Next benchmark through the router on t
 
 ## Self-review notes
 
-- Spec coverage: §2 configuration → Tasks 4 (topology, shape support, standalone refusal); §2.1 engine environment → 2, 3; §3 host policy three ways → 5; §4 plan → 6; §5 reservations, memory per rank, ports, eviction → 8, 18; §6 weights → 8 (per-host digests), 15; §7 prepare and host checks → 9; §8 fan-out → 13, 16; §9 readiness and router → 16; §10 adapters → 10, 11, 12; §11 stop and failure → 13 (escalation), 17; §12 park and wake → 19; §13 exposure → 1, 10, 11, 12, 20; §14 protocol → 7; §15 status → 20; §16 codes → 4, 8, 9, 15, 16, 19, 20; §17 testing → every task, 14 (harness), 21, 22; §18 docs → 20; §19 ADR and amendments → 1.
-- Type names across tasks: `GroupShape`/`Topology` (config, Task 4) are distinct from `GroupTopology` (domain, Task 6); Task 16 converts one to the other. `GroupEngine` (6) is used by 7, 9, 13. `GroupMemberArgs` and `member_args` (10) are used by 11, 12, 13. `member_owner_id`, `GroupReservation`, `GroupSettlement`, `MemberGone` (8) are used by 16, 17, 19. `resolve_engine_env`, `ApprovedEnv`, `EnvRefusal` (2) are used by 3 and 16. `group_support`, `check_engine_shape` (4) are used by 16 and 19.
+- Spec coverage: §2 configuration → Tasks 4 (topology, shape support, standalone refusal); §2.1 engine environment → 2, 3; §3 host policy three ways → 5; §4 plan → 6; §5 reservations, memory per rank, ports, eviction → 8, 18; §6 weights → 8 (per-host digests), 15, 16 (SGLang path refusal); §7 prepare and host checks → 9, 13 (DP-attention ports); §8 fan-out → 13, 16; §9 readiness, readiness probe and router → 16; §10 adapters → 10, 11, 12; §11 stop and failure → 13 (escalation), 17, 19b (request stall); §12 park and wake → 19; §13 exposure → 1, 10, 11, 12, 20; §14 protocol → 7; §15 status → 20, `validate config --host` → 20b; §16 codes → 4, 8, 9, 15, 16, 19, 19b, 20; §17 testing → every task, 14 (harness), 21, 22; §18 docs → 20; §19 ADR and amendments → 1.
+- Owner decisions of 2026-10-06 (ADR 0028): readiness probe and SGLang path refusal → 16; canary → 19; request stall → 19b; catalog at release and `group_stalled` → 20; `validate config --host` → 20b; MN9 vLLM baseline → 22; shapes without a gate → 4, 16.
+- Type names across tasks: `GroupShape`/`Topology` (config, Task 4) are distinct from `GroupTopology` (domain, Task 6); Task 16 converts one to the other. `GroupEngine` (6) is used by 7, 9, 13. `GroupMemberArgs` and `member_args` (10) are used by 11, 12, 13. `member_owner_id`, `GroupReservation`, `GroupSettlement`, `MemberGone` (8) are used by 16, 17, 19. `resolve_engine_env`, `ApprovedEnv`, `EnvRefusal` (2) are used by 3, 16 and 20b. `group_support`, `check_engine_shape` (4) are used by 16, 19 and 20b. `probe_head` and `MemberAction::Probe { max_tokens }` (16) are used by 19 and 19b; `StopReason` (17) gains `Stalled` in 19b; `LifecyclePort::report_group_stall` (19b) is called by the router and implemented by the controller. `sglang_dp_attention_ports` (13) is the only place SGLang's derived head ports are computed.
 - Review Focus pins: 1 → Tasks 2, 16; 2 → 9; 3 → 17; 4 → 19; 5 → 8; 6 → 13.
 - CPU and Fake-engine tests are not qualification; MN1–MN9 are.
