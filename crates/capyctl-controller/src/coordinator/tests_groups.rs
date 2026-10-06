@@ -47,6 +47,8 @@ const GROUP_MODEL_PATH: &str = "/srv/models/toy";
 /// The golden host's runtime profile and its recorded build.
 const GROUP_PROFILE: &str = "local";
 const GROUP_PROFILE_BUILD: &str = "vllm-build-1";
+/// The controller every scripted agent is enrolled with.
+const GROUP_CONTROLLER: &str = "controller";
 
 /// Host `index`'s peer address: documentation addresses only (RFC 5737).
 fn peer_address(index: usize) -> IpAddr {
@@ -62,9 +64,9 @@ pub(super) enum HostError {
     CapabilityMissing(String),
     /// The command does not decode, or names another host.
     Malformed,
-    /// The agent's authorization refused it (a wrong expected state, another
-    /// owner, or a group Park, Restore or Probe, which the agent admits for
-    /// single-rank launches only).
+    /// The agent's authorization refused it (another controller, a wrong
+    /// expected state, another owner, or a group Park, Restore or Probe,
+    /// which the agent admits for single-rank launches only).
     Unauthorized,
     /// ADR 0028 §8 (R23): another command already claims this member's launch.
     Uncertain,
@@ -253,6 +255,10 @@ impl GroupHost {
         .map_err(|_| HostError::Malformed)?;
         if decoded.verify_digest().is_err() || decoded.identity.member.host_id != self.name {
             return Err(HostError::Malformed);
+        }
+        // SPEC §13.1: the agent takes commands from its own controller only.
+        if decoded.identity.controller_id != GROUP_CONTROLLER {
+            return Err(HostError::Unauthorized);
         }
         let result = match &decoded.action {
             MemberAction::Prepare(plan) => self.prepare(&decoded, plan),
@@ -464,6 +470,10 @@ impl GroupHost {
         recorded: &[ProcessIdentity],
     ) -> Result<pb::MemberExecutionResult, HostError> {
         let id = &command.identity;
+        // ADR 0028 §11: a Terminate is authorized against a retained launch only.
+        if id.expected_state != "retained" {
+            return Err(HostError::Unauthorized);
+        }
         let mut state = self.state();
         let Some(launch) = state.journal.get(owned_handle) else {
             // A lost journal signals nothing: it reports what it observes of
@@ -708,7 +718,7 @@ fn identity(
     generation: i64,
 ) -> CommandIdentity {
     CommandIdentity {
-        controller_id: "controller".into(),
+        controller_id: GROUP_CONTROLLER.into(),
         member: MemberKey {
             host_id: host.into(),
             member_id: member_id(rank),
@@ -1086,6 +1096,41 @@ async fn a_host_without_engine_groups_takes_no_group_command() {
         ))
     );
     assert_eq!(group.launches(), 0);
+}
+
+// T34: an agent takes commands from its own controller only.
+#[tokio::test]
+async fn a_command_from_another_controller_is_unauthorized() {
+    let (group, hosts) = scripted(&["host-a", "host-b"]);
+    let p = plan(&["host-a", "host-b"], 25000, 1);
+    let mut foreign = launch("host-b", 1, &p, "launch-b");
+    foreign.identity.controller_id = "another-controller".into();
+    let foreign = sealed(foreign.identity, foreign.action);
+    assert_eq!(
+        hosts[1].execute(foreign).await,
+        Err(HostError::Unauthorized)
+    );
+    assert_eq!(group.launches(), 0);
+    assert!(hosts[1].recorded("launch-b").is_none());
+}
+
+// T31: a Terminate is authorized against a retained launch only; a wrong
+// expected state ends nothing.
+#[tokio::test]
+async fn a_terminate_outside_the_retained_state_is_unauthorized() {
+    let (group, hosts) = scripted(&["host-a", "host-b"]);
+    let p = plan(&["host-a", "host-b"], 25000, 1);
+    let launched = hosts[1]
+        .execute(launch("host-b", 1, &p, "launch-b"))
+        .await
+        .unwrap();
+    let stop = terminate("host-b", 1, "launch-b", identities(&launched));
+    let mut wrong = stop.identity.clone();
+    wrong.expected_state = "reserved".into();
+    let wrong = sealed(wrong, stop.action.clone());
+    assert_eq!(hosts[1].execute(wrong).await, Err(HostError::Unauthorized));
+    assert!(group.alive(1));
+    assert!(all_gone(&hosts[1].execute(stop).await.unwrap()));
 }
 
 // ---- the world ---------------------------------------------------------------
