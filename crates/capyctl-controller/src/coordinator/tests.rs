@@ -3765,6 +3765,185 @@ mod native {
         w.shutdown().await.unwrap();
     }
 
+    /// SPEC §§6.2, 9.1 / ADR 0010: the embedded host refuses what a host agent
+    /// refuses. Found live 2026-10-06: standalone launched a `deep` SGLang
+    /// deployment declaring modelopt quantization, parked it, and its wake
+    /// (a disk reload SGLang cannot do for modelopt weights) failed and was
+    /// retained uncertain. Through the production bindings the launch is now
+    /// refused `capability_missing:deep_park` before any effect, as the agent
+    /// path refuses it (`sglang_modelopt_quantization_refuses_deep_but_not_
+    /// restart_only_or_vllm`): nothing is spawned, the start gives up at once
+    /// and is never retried, so there is no launch to park. A stub tool proves
+    /// nothing about a native engine recipe.
+    // T22 T21
+    #[tokio::test]
+    async fn a_standalone_sglang_modelopt_deep_launch_is_refused_before_any_effect() {
+        use crate::engine_bindings::ProfileBindings;
+        use capyctl_config::effective::resolve_effective;
+        use serde_json::{json, Value};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn realtime_ms() -> i64 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        }
+        let source: Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/effective-sglang-golden.json"
+        ))
+        .unwrap();
+        let mut host = source["input"]["host"].clone();
+        let mut deployment = source["input"]["deployment"].clone();
+        assert_eq!(deployment["residency"], json!("deep"));
+        deployment["engine_config"]["quantization"] = json!("modelopt_fp4");
+        let models = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(models.path().join("toy")).unwrap();
+        std::fs::write(models.path().join("toy/config.json"), "{}").unwrap();
+        host["model_store"]["path"] = json!(models.path());
+        deployment["model"]["path"] = json!(models.path().join("toy"));
+        let ports = capyctl_testkit::ports::free_ports(100, true);
+        host["resource_policy"]["endpoint_port_range"] =
+            json!({"start": ports[0], "end": ports[99]});
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = Arc::new(Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        let (fence, observations) = {
+            let now = realtime_ms();
+            let o = owner.lock().unwrap();
+            let session = o.session().clone();
+            let store = o.store();
+            let policy = resolve_effective(&deployment, &host)
+                .expect("fixture resolves")
+                .host;
+            let observations: Vec<_> = policy
+                .domains
+                .keys()
+                .map(|domain| MemoryObservation {
+                    domain: domain.clone(),
+                    capacity_bytes: 1_i64 << 50,
+                    available_bytes: 1_i64 << 50,
+                    sampled_at_ms: now,
+                })
+                .collect();
+            store
+                .import_resource_policy(&session, &policy, &observations, now)
+                .unwrap();
+            let receipt = store
+                .create_stopped_managed_configuration(
+                    &session,
+                    "owner",
+                    "toy",
+                    &json!({ "config": deployment }).to_string(),
+                    &host,
+                    now,
+                )
+                .unwrap();
+            let fence = DeploymentFence {
+                deployment_id: receipt.deployment_id,
+                revision: receipt.revision,
+                generation: receipt.generation,
+            };
+            (fence, observations)
+        };
+        // The protected entry the renderer revalidates, so that only the
+        // refusal can keep the builder from spawning.
+        let runtime_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let wrapper = runtime_dir.path().join("sglang_entry.py");
+        std::fs::write(&wrapper, b"# never executed\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        /// Counts every spawn the builder asks for, protected or not, and
+        /// starts nothing.
+        #[derive(Default)]
+        struct Spawns(std::sync::atomic::AtomicUsize);
+        impl OwnedProcessLaunch for Spawns {
+            fn spawn_durable(
+                &self,
+                _: &str,
+                _: &RenderedCommand,
+            ) -> Result<capyctl_domain::completion::ProcessIdentity, RuntimeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::Unsupported)
+            }
+            fn spawn_durable_protected(
+                &self,
+                incarnation: &str,
+                cmd: &RenderedCommand,
+                _: &capyctl_adapters::protected::ProtectedLaunchDescriptors,
+            ) -> Result<capyctl_domain::completion::ProcessIdentity, RuntimeError> {
+                self.spawn_durable(incarnation, cmd)
+            }
+            fn present(
+                &self,
+                _: &capyctl_domain::completion::ProcessIdentity,
+            ) -> capyctl_domain::completion::Presence {
+                capyctl_domain::completion::Presence::Gone
+            }
+            fn observe_group(
+                &self,
+                _: &capyctl_domain::completion::ProcessIdentity,
+            ) -> Result<Vec<capyctl_domain::completion::ProcessIdentity>, RuntimeError>
+            {
+                Ok(Vec::new())
+            }
+            fn terminate_owned(
+                &self,
+                _: &[capyctl_domain::completion::ProcessIdentity],
+                _: Duration,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+        }
+        let tool = Arc::new(Spawns::default());
+        let factory_tool = tool.clone();
+        let w = OwnedCoordinator::spawn_resolved(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(realtime_ms())),
+            CoordinatorOptions {
+                retry_cooldown: Duration::from_millis(20),
+                ..Default::default()
+            },
+            Arc::new(ProfileBindings::new(
+                log_dir.path().to_path_buf(),
+                runtime_dir.path().to_path_buf(),
+            )),
+            Arc::new(move |_| factory_tool.clone() as Arc<dyn OwnedProcessLaunch>),
+        )
+        .unwrap();
+
+        let start = w.start(&fence, realtime_ms() + 240_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Closed,
+            "the refused start gives up at once"
+        );
+        assert_eq!(tool.0.load(Ordering::SeqCst), 0, "nothing was spawned");
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        assert_eq!(
+            steps(&sql, &fence.deployment_id),
+            (1, false),
+            "one attempt, never retried"
+        );
+        {
+            let o = owner.lock().unwrap();
+            let evidence = o.store().journal_evidence(start.operation_id()).unwrap();
+            assert!(
+                evidence
+                    .iter()
+                    .any(|entry| entry.contains("capability_missing:deep_park")),
+                "{evidence:?}"
+            );
+        }
+        w.shutdown().await.unwrap();
+    }
+
     /// Spec §3: the router must reach the engine the coordinator launched. The
     /// engine answers to the `--served-model-name` the plan rendered, and the
     /// forwarder rewrites every request's model to whatever `runtime_endpoint`

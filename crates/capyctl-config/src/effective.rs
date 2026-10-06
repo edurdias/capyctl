@@ -578,6 +578,43 @@ impl EffectiveDeployment {
         }
     }
 
+    /// SPEC §§6.2, 9.1 / ADR 0010: a residency tier the engine cannot honor
+    /// fails closed. Every SGLang deep wake reloads weights from disk, and
+    /// SGLang 0.5.20 and 0.5.21 cannot reload modelopt-quantized (NVFP4)
+    /// weights: the reload raises `AttributeError: 'Parameter' object has no
+    /// attribute 'weight_loader'` (live, host A, 2026-09-24 and 2026-10-06).
+    /// The launch-time probe inspects installation shapes only and cannot see
+    /// this, so it is a rule on the declared quantization method, not a probe
+    /// result. Lift it once a probe or a live run proves a disk reload of
+    /// modelopt weights works on the installed SGLang. vLLM is not affected.
+    ///
+    /// It is kept for both parking tiers: a `host_backed` wake of a modelopt
+    /// checkpoint from the CPU backup is unproven, so it fails closed too.
+    /// ADR 0014 amendment A17: a launch whose park keeps the weights resident
+    /// reloads nothing from disk, so the rule does not apply to it.
+    ///
+    /// One decision for every host that runs the launch: a host agent and
+    /// standalone's embedded host both refuse its launch, Park and Restore
+    /// with this closed reason (ADR 0008), before any effect.
+    pub fn deep_wake_refusal(&self) -> Option<&'static str> {
+        let resident = matches!(
+            &self.engine_config,
+            capyctl_domain::launch::LaunchSettings::Sglang(settings)
+                if settings.weight_restore == "resident"
+        );
+        let cannot_reload = self.residency.parks()
+            && self.profile.engine == Engine::Sglang
+            && !resident
+            && self
+                .engine_config
+                .common()
+                .quantization
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|method| method.starts_with("modelopt") || method == "nvfp4");
+        cannot_reload.then_some("capability_missing:deep_park")
+    }
+
     /// Discrete GPU design §7 (review decision): the namespace a launch's
     /// engine child is narrowed to. Where there is a choice of GPU (several
     /// devices) or the GPU is a discrete device domain, the selected GPU is

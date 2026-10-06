@@ -42,3 +42,14 @@ Unreleased.
   is above a standalone's parked limit (a quarter of the memory), so once
   that is measured on its first park, later parks are refused and it stays
   loaded.
+
+## Standalone
+
+- **Standalone no longer parks an SGLang ModelOpt model it cannot wake.** A
+  `deep` or `host_backed` SGLang deployment with ModelOpt (NVFP4)
+  quantization started in standalone, parked, and then failed to wake, since
+  SGLang cannot reload those weights; the instance stayed `uncertain` until a
+  stop. Standalone now refuses its start with `capability_missing:deep_park`,
+  as a host agent already did, so nothing is parked. Deploy such a model
+  `restart_only`. A model with speculative decoding, whose park keeps its
+  weights, still parks.

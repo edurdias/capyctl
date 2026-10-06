@@ -45,35 +45,6 @@ fn checkpoint_refusal(error: CheckpointError) -> &'static str {
     }
 }
 
-/// SPEC §§6.2, 9.1 / ADR 0010: a residency tier the engine cannot honor fails
-/// closed. Every SGLang deep wake reloads weights from disk, and SGLang 0.5.20
-/// cannot reload modelopt-quantized (NVFP4) weights: `qwen3_5.load_weights`
-/// raises `AttributeError: 'Parameter' object has no attribute
-/// 'weight_loader'` (live, host-a, 2026-09-24). The launch-time probe
-/// inspects installation shapes only and cannot see this, so it is a rule on
-/// the declared quantization method, not a probe result. Lift it once a probe
-/// or a live run proves a disk reload of modelopt weights works on the
-/// installed SGLang. vLLM is not affected by this rule.
-///
-/// ADR 0014 amendment A17: a launch whose park keeps the weights resident
-/// reloads nothing from disk, so the rule does not apply to it.
-fn deep_wake_cannot_reload(effective: &capyctl_config::effective::EffectiveDeployment) -> bool {
-    let resident = matches!(
-        &effective.engine_config,
-        capyctl_domain::launch::LaunchSettings::Sglang(settings)
-            if settings.weight_restore == "resident"
-    );
-    effective.profile.engine == capyctl_config::engine_policy::Engine::Sglang
-        && !resident
-        && effective
-            .engine_config
-            .common()
-            .quantization
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|method| method.starts_with("modelopt") || method == "nvfp4")
-}
-
 /// SPEC §7.2, discrete GPU design §4: the memory half of launch admission,
 /// from one host memory sample and one GPU sample. Every allocation of the
 /// cold footprint is checked against its own declared domain, read from that
@@ -200,11 +171,9 @@ impl NativeHostExecution {
         if !effective.residency.parks() {
             return Ok(());
         }
-        // Kept for both tiers, as `park_capability` refuses the Park of
-        // either: a `host_backed` wake of a modelopt checkpoint from the CPU
-        // backup is unproven, so it fails closed at launch too.
-        if deep_wake_cannot_reload(effective) {
-            return Err("capability_missing:deep_park");
+        // SPEC §§6.2, 9.1: the decision standalone's embedded host makes too.
+        if let Some(reason) = effective.deep_wake_refusal() {
+            return Err(reason);
         }
         let Some(report) = installations.capabilities(
             profile,
@@ -232,8 +201,8 @@ impl NativeHostExecution {
         effective: &capyctl_config::effective::EffectiveDeployment,
         profile: &str,
     ) -> Option<&'static str> {
-        if deep_wake_cannot_reload(effective) {
-            return Some("capability_missing:deep_park");
+        if let Some(reason) = effective.deep_wake_refusal() {
+            return Some(reason);
         }
         let executable = std::path::Path::new(&effective.profile.executable);
         // ADR 0018 §4: a running engine's profile never changes (removal waits
@@ -541,13 +510,16 @@ mod tests {
     fn a_resident_weights_park_is_not_refused_for_a_disk_reload() {
         let deep = sglang_modelopt(false);
         assert_eq!(deep.residency, capyctl_config::effective::Residency::Deep);
-        assert!(deep_wake_cannot_reload(&deep));
+        assert_eq!(
+            deep.deep_wake_refusal(),
+            Some("capability_missing:deep_park")
+        );
         let resident = sglang_modelopt(true);
         assert_eq!(
             resident.residency,
             capyctl_config::effective::Residency::Deep
         );
-        assert!(!deep_wake_cannot_reload(&resident));
+        assert_eq!(resident.deep_wake_refusal(), None);
     }
 
     fn domain(
