@@ -507,3 +507,42 @@ fn a_remote_discrete_host_is_credited_per_domain() {
         }
     }
 }
+
+// T27, ADR 0028 §5, SPEC §3: a host's group rendezvous range may overlap its
+// endpoint range. An ordinary start on that host leases past a port an
+// unsettled group plan holds there as its rendezvous port, instead of taking it
+// or failing; the torch store binds that port on every interface.
+#[test]
+fn an_ordinary_start_leases_past_a_held_rendezvous_port() {
+    let t = remote();
+    let id = t.deploy();
+    t.sql
+        .execute(
+            "INSERT INTO group_plans VALUES(?1,9,1,'{}',?2,8100,'active')",
+            params![id, HOST.0],
+        )
+        .unwrap();
+    t.store
+        .accept_scoped_start_command(
+            &t.session,
+            "owner",
+            &id,
+            StartScope::All,
+            t.store.current_revision(&id).unwrap().unwrap(),
+            "start",
+            NOW,
+            DEADLINE,
+            None,
+        )
+        .unwrap();
+    assert_eq!(t.planned(&id).len(), 2);
+    let ports: Vec<u16> = t
+        .sql
+        .prepare("SELECT port FROM endpoint_leases WHERE host_id=?1 ORDER BY port")
+        .unwrap()
+        .query_map([HOST.0], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ports, vec![8101, 8102]);
+}

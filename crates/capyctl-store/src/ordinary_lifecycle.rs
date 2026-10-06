@@ -811,7 +811,9 @@ impl crate::Store {
         let payload = identity.payload()?;
         let mut reserved = None;
         // SPEC §3 (v21): a host's port range is its own. Only leases on this
-        // instance's host take a port out of it.
+        // instance's host take a port out of it, and (ADR 0028 §13) a port an
+        // unsettled group plan holds there as its rendezvous port: the
+        // rendezvous range may overlap the endpoint range.
         let host_key = crate::lifecycle::endpoint_host_key(tx, f)?;
         for port in e.host.endpoint_port_range.start..=e.host.endpoint_port_range.end {
             let leased: bool = tx.query_row(
@@ -819,7 +821,7 @@ impl crate::Store {
                 params![port, host_key],
                 |r| r.get(0),
             )?;
-            if leased {
+            if leased || crate::groups::rendezvous_port_held(tx, &host_key, port)? {
                 continue;
             }
             let request = ReserveBinding {

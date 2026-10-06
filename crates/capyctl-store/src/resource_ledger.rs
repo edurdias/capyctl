@@ -192,7 +192,7 @@ pub(crate) fn read_snapshot(conn: &Connection) -> Result<LedgerSnapshot, Resourc
 
 /// The host a registered ledger key belongs to, or `None` when the key is not in
 /// the host-scoped registry.
-fn registered_host(
+pub(crate) fn registered_host(
     transaction: &Transaction<'_>,
     kind: &str,
     ledger_key: &str,

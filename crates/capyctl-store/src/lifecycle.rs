@@ -538,10 +538,15 @@ pub(crate) fn insert_prepared_binding(
     })?;
     // ADR 0013 §5: the binding belongs to the instance whose current fence it is.
     let instance = fence_instance(tx, &prepared.fence)?;
-    tx.execute("INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state,instance_index) VALUES(?1,?2,?3,?4,?5,?6,'[]','reserved',?7)",
-        params![prepared.id, prepared.fence.deployment_id, prepared.fence.revision, prepared.incarnation, prepared.ownership, prepared.json, instance])?;
     // SPEC §3 (v21): a port lease belongs to the host the instance is placed on.
     let host_id = endpoint_host_key(tx, &prepared.fence)?;
+    // ADR 0028 §13: never a port an unsettled group plan holds on that host as
+    // its rendezvous port; the torch store binds it on every interface.
+    if crate::groups::rendezvous_port_held(tx, &host_id, prepared.port)? {
+        return Err(LifecycleError::Conflict);
+    }
+    tx.execute("INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state,instance_index) VALUES(?1,?2,?3,?4,?5,?6,'[]','reserved',?7)",
+        params![prepared.id, prepared.fence.deployment_id, prepared.fence.revision, prepared.incarnation, prepared.ownership, prepared.json, instance])?;
     tx.execute(
         "INSERT INTO endpoint_leases(host_id,host,port,binding_id) VALUES(?1,?2,?3,?4)",
         params![host_id, prepared.host, prepared.port, prepared.id],
@@ -1868,6 +1873,51 @@ mod tests {
             .unwrap();
         assert_eq!(lease_host, "spark-remote");
         drop(busy);
+    }
+
+    // T27, ADR 0028 §5, SPEC §3: an endpoint lease never takes a port an
+    // unsettled group plan holds as its rendezvous port on the same host; the
+    // torch store binds that port on every interface, loopback included.
+    #[test]
+    fn an_endpoint_lease_refuses_a_held_rendezvous_port() {
+        let store = Store::open_in_memory().unwrap();
+        let remote = accepted(&store, "remote-endpoint");
+        let group = accepted(&store, "group");
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO enrolled_hosts VALUES('spark-remote','spark','key',0);
+                 INSERT OR IGNORE INTO deployment_instances(deployment_id,instance_index) VALUES('{remote}',0);
+                 UPDATE deployment_instances SET host_id='spark-remote',generation=1 WHERE deployment_id='{remote}';
+                 INSERT INTO group_plans VALUES('{group}',0,1,'{{}}','spark-remote',25000,'active');
+                 INSERT INTO group_plans VALUES('{group}',1,1,'{{}}','other-host',25001,'active');"
+            ))
+            .unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let reserve = |port| ReserveBinding {
+            id: format!("binding-{port}"),
+            fence: DeploymentFence {
+                deployment_id: remote.clone(),
+                revision: 1,
+                generation: 1,
+            },
+            incarnation: format!("incarnation-{port}"),
+            identity_id: "qualified".into(),
+            ownership: "managed".into(),
+            endpoint_host: "127.0.0.1".into(),
+            endpoint_port: port,
+            credential_ref: format!("credential-{port}"),
+            binding_payload: "recipe-reference".into(),
+        };
+        assert!(matches!(
+            store.reserve_runtime_binding(&session, &reserve(25000)),
+            Err(LifecycleError::Conflict)
+        ));
+        assert!(store.runtime_binding(&remote).unwrap().is_none());
+        // Another head's rendezvous port is not this host's.
+        store
+            .reserve_runtime_binding(&session, &reserve(25001))
+            .unwrap();
     }
 
     #[test]

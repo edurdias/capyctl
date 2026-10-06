@@ -21,6 +21,7 @@ use capyctl_store::groups::{
 use capyctl_store::instances::instance_owner_id;
 use capyctl_store::resource_ledger::{GrantRequest, ResourceStoreError};
 use capyctl_store::{AcceptDeployment, Store};
+use rusqlite::{params, Connection};
 
 // ---- fixtures -------------------------------------------------------------
 
@@ -44,6 +45,11 @@ fn domain(host: &str) -> String {
     format!("{host}/system")
 }
 
+/// The GPU of one host in the shared ledger.
+fn device(host: &str) -> String {
+    format!("{host}/gpu0")
+}
+
 /// A file-backed store shared across threads: every call opens its own
 /// connection, as the coordinator's concurrent workers do. Tests address
 /// deployments by name; the fixture maps each to its accepted id.
@@ -55,10 +61,18 @@ struct Fixture {
     hosts: Arc<Vec<(String, i64)>>,
 }
 
-/// Fresh observations of every named host, gathered by the caller at `NOW_MS`.
-struct Fresh;
+/// Fresh observations of every member host, gathered by the caller at
+/// `NOW_MS`, with each host's `max_parked`. `swapped` hands the first two
+/// members each other's context.
+struct Fresh {
+    max_parked: usize,
+    swapped: bool,
+}
 fn ctx() -> Fresh {
-    Fresh
+    Fresh {
+        max_parked: 4,
+        swapped: false,
+    }
 }
 
 fn store_with(hosts: &[(&str, i64)]) -> Fixture {
@@ -81,6 +95,32 @@ fn store_with(hosts: &[(&str, i64)]) -> Fixture {
             })
             .unwrap();
         ids.insert((*name).to_owned(), id.to_string());
+    }
+    // The host-scoped key registry the publication path fills (SPEC §7): host-a
+    // is the embedded host, named by its configured name while its namespace
+    // id is opaque; the others are enrolled hosts named by their ids.
+    let sql = Connection::open(&path).unwrap();
+    for (host, _) in hosts {
+        let (namespace, kind) = if *host == "host-a" {
+            ("ns-embedded", "embedded")
+        } else {
+            (*host, "remote")
+        };
+        sql.execute(
+            "INSERT INTO host_resource_namespaces(host_id,policy_key,kind) VALUES(?1,?2,?3)",
+            params![namespace, host, kind],
+        )
+        .unwrap();
+        for (kind, local, key) in [
+            ("domain", "system", domain(host)),
+            ("device", "gpu0", device(host)),
+        ] {
+            sql.execute(
+                "INSERT INTO host_resource_keys(host_id,kind,local_id,ledger_key) VALUES(?1,?2,?3,?4)",
+                params![namespace, kind, local, key],
+            )
+            .unwrap();
+        }
     }
     Fixture {
         _dir: Arc::new(dir),
@@ -110,12 +150,28 @@ impl Fixture {
         let (name, instance, rank) = parse_member_owner_id(owner).expect("member owner");
         member_owner_id(&self.id(&name), instance, rank)
     }
+    /// A parked owner of instance `instance` of `d`, charged 1 GiB on `host`.
+    fn park_owner(&self, host: &str, instance: u32) {
+        let id = self.id("d");
+        let footprint = format!(
+            r#"{{"version":1,"phase":"parked","allocations":[["{}",{},0]],"devices":[]}}"#,
+            domain(host),
+            gib(1)
+        );
+        Connection::open(&self.path)
+            .unwrap()
+            .execute(
+                "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index) VALUES(?1,?2,?3,?4)",
+                params![instance_owner_id(&id, instance), footprint, id, instance],
+            )
+            .unwrap();
+    }
 
     fn reserve_group(
         &self,
         r: &GroupReservation,
         plan: PlanFor,
-        _fresh: Fresh,
+        fresh: Fresh,
     ) -> Result<GroupPlan, GroupStoreError> {
         let store = self.open();
         let id = self.id(&r.deployment_id);
@@ -145,34 +201,58 @@ impl Fixture {
             members,
             ..r.clone()
         };
-        let observations: Vec<MemoryObservation> = self
-            .hosts
+        // One context per member host, from that host's own observation,
+        // limit and `max_parked` (ADR 0028 §12).
+        let per_host: Vec<(String, [MemoryObservation; 1], [MemoryLimit; 1])> = r
+            .members
             .iter()
-            .map(|(host, bytes)| MemoryObservation {
-                domain: domain(host),
-                capacity_bytes: *bytes,
-                available_bytes: *bytes,
-                sampled_at_ms: NOW_MS,
+            .map(|(host, _)| {
+                let bytes = self
+                    .hosts
+                    .iter()
+                    .find(|(known, _)| known == host)
+                    .map_or(0, |(_, bytes)| *bytes);
+                (
+                    host.clone(),
+                    [MemoryObservation {
+                        domain: domain(host),
+                        capacity_bytes: bytes,
+                        available_bytes: bytes,
+                        sampled_at_ms: NOW_MS,
+                    }],
+                    [MemoryLimit {
+                        domain: domain(host),
+                        managed_bytes: bytes,
+                        free_reserve_bytes: 0,
+                        reserve_absorbs_unmanaged: false,
+                        host_kv_bytes: None,
+                        parked_bytes: None,
+                    }],
+                )
             })
             .collect();
-        let limits: Vec<MemoryLimit> = self
-            .hosts
+        let mut contexts: BTreeMap<String, AdmissionContext<'_>> = per_host
             .iter()
-            .map(|(host, bytes)| MemoryLimit {
-                domain: domain(host),
-                managed_bytes: *bytes,
-                free_reserve_bytes: 0,
-                reserve_absorbs_unmanaged: false,
-                host_kv_bytes: None,
-                parked_bytes: None,
+            .map(|(host, observed, limit)| {
+                (
+                    host.clone(),
+                    AdmissionContext::new(observed, limit, NOW_MS, 60_000, fresh.max_parked),
+                )
             })
             .collect();
-        let context = AdmissionContext::new(&observations, &limits, NOW_MS, 60_000, 4);
+        if fresh.swapped {
+            // The first two members' contexts exchanged: each names the other
+            // host's domain.
+            let (a, b) = (&r.members[0].0, &r.members[1].0);
+            let (first, second) = (contexts[a], contexts[b]);
+            contexts.insert(a.clone(), second);
+            contexts.insert(b.clone(), first);
+        }
         let hosts: Vec<String> = r.members.iter().map(|(host, _)| host.clone()).collect();
         let plan_for = move |port: u16, workers: &BTreeMap<String, u16>| {
             build_plan(plan.0, &hosts, port, workers)
         };
-        store.reserve_group(&real, plan_for, context)
+        store.reserve_group(&real, plan_for, &contexts)
     }
     fn settle_member(
         &self,
@@ -194,6 +274,10 @@ impl Fixture {
     ) -> Result<(), GroupStoreError> {
         self.open()
             .mark_member_uncertain(&self.id(name), instance, generation, rank)
+    }
+    fn mark_member_dispatching(&self, name: &str, rank: u32) -> Result<(), GroupStoreError> {
+        self.open()
+            .mark_member_dispatching(&self.id(name), 0, 1, rank)
     }
     fn mark_member_launched(
         &self,
@@ -573,6 +657,8 @@ fn settlement_needs_the_members_own_evidence() {
         store.settle_member("g", 0, 1, 1, gone("host-a", 1)),
         Err(GroupStoreError::Conflict)
     ));
+    // ADR 0028 §8: the Launch is fenced as dispatched before it is sent.
+    store.mark_member_dispatching("g", 1).unwrap();
     store
         .mark_member_launched(
             "g",
@@ -686,4 +772,217 @@ fn digests_are_per_host() {
     assert_eq!(all["host-b"], d);
     assert!(store.record_digest("g", 1, "host-a", "sha256:c").is_err());
     assert!(store.digests_for("g", 2).unwrap().is_empty());
+}
+
+// T27 T30, ADR 0028 §5, §11: every key a member's footprint charges belongs to
+// that member's own host. A footprint charged on another host, or on a key the
+// host-scoped registry does not know, is refused before anything is held, so no
+// member can later be released on one host's evidence while its bytes sit on
+// another.
+#[test]
+fn a_members_footprint_is_charged_on_its_own_host_only() {
+    let store = two_host_store(gib(400), gib(400));
+    let refused = |r: &GroupReservation| {
+        assert!(
+            matches!(
+                store.reserve_group(r, plan_for("g"), ctx()),
+                Err(GroupStoreError::Plan)
+            ),
+            "{r:?}"
+        );
+        assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 0)), 0);
+        assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), 0);
+        assert!(store.group_plan("g", 0).unwrap().is_none());
+    };
+    // The head on host-a with its memory charged on host-b's domain.
+    let mut elsewhere = reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]);
+    elsewhere.members[0].1.next.allocations[0].domain = domain("host-b");
+    refused(&elsewhere);
+    // A key no host registered.
+    let mut unknown = reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]);
+    unknown.members[1].1.next.allocations[0].domain = "nowhere/system".into();
+    refused(&unknown);
+    // The worker on host-b claiming host-a's GPU.
+    let mut device_elsewhere = reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]);
+    device_elsewhere.members[1].1.next.devices = vec![DeviceClaim {
+        device: device("host-a"),
+        sharing: Sharing::Shared,
+    }];
+    refused(&device_elsewhere);
+    // Each member judged against the other host's context.
+    assert!(matches!(
+        store.reserve_group(
+            &reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]),
+            plan_for("g"),
+            Fresh {
+                max_parked: 4,
+                swapped: true
+            },
+        ),
+        Err(GroupStoreError::Plan)
+    ));
+    assert!(store.group_plan("g", 0).unwrap().is_none());
+    // Each member on its own host's domain and GPU is reserved.
+    let mut own = reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]);
+    for (host, grant) in &mut own.members {
+        grant.next.devices = vec![DeviceClaim {
+            device: device(host),
+            sharing: Sharing::Shared,
+        }];
+    }
+    store.reserve_group(&own, plan_for("g"), ctx()).unwrap();
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(10));
+}
+
+// T27, ADR 0028 §12: `max_parked` counts the parked owners of each member's own
+// host. One parked owner on each of two hosts allowing one each does not refuse
+// a cold group that fits both; a host already at its limit still does.
+#[test]
+fn max_parked_is_judged_on_each_member_host() {
+    let store = shared_store_three_hosts(gib(100), gib(100), gib(100));
+    store.park_owner("host-a", 0);
+    store.park_owner("host-b", 1);
+    let one_each = || Fresh {
+        max_parked: 1,
+        swapped: false,
+    };
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(10)), ("host-b", gib(10))]),
+            plan_for("g"),
+            one_each(),
+        )
+        .unwrap();
+    // A second parked owner on host-c puts that host over its own limit.
+    store.park_owner("host-c", 2);
+    store.park_owner("host-c", 3);
+    assert!(matches!(
+        store.reserve_group(
+            &reservation("g1", &[("host-b", gib(10)), ("host-c", gib(10))]),
+            plan_for("g1"),
+            one_each(),
+        ),
+        Err(GroupStoreError::Admission(ResourceStoreError::Admission(
+            ResourceError::CategoryLimit
+        )))
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g1", 0, 0)), 0);
+}
+
+// T27 T22, ADR 0028 §5, SPEC §3: a host's rendezvous range may overlap its
+// endpoint range. A rendezvous draw skips a port an endpoint lease holds on the
+// head, and an endpoint lease skips a port an unsettled plan holds there as its
+// rendezvous port, so the two never double-allocate one host port.
+#[test]
+fn rendezvous_ports_and_endpoint_leases_never_share_a_host_port() {
+    let store = shared_store_three_hosts(gib(400), gib(400), gib(400));
+    // g1's SGLang worker on host-a leases host-a's 25000.
+    let mut one = reservation("g1", &[("host-b", gib(10)), ("host-a", gib(10))]);
+    one.worker_ports = BTreeMap::from([("host-a".into(), 25000..=25000)]);
+    store
+        .reserve_group(&one, sglang_plan_for("g1"), ctx())
+        .unwrap();
+    assert!(store.endpoint_leased("host-a", 25000));
+    // g2, headed by host-a, draws past that lease.
+    let mut two = reservation("g2", &[("host-a", gib(10)), ("host-c", gib(10))]);
+    two.port_range = 25000..=25001;
+    assert_eq!(
+        store
+            .reserve_group(&two, plan_for("g2"), ctx())
+            .unwrap()
+            .rendezvous_port(),
+        25001
+    );
+    // g3's SGLang worker on host-a leases past g2's rendezvous port.
+    let mut three = reservation("g3", &[("host-c", gib(10)), ("host-a", gib(10))]);
+    three.worker_ports = BTreeMap::from([("host-a".into(), 25001..=25002)]);
+    let plan = store
+        .reserve_group(&three, sglang_plan_for("g3"), ctx())
+        .unwrap();
+    assert_eq!(plan.members()[1].worker_port, Some(25002));
+    assert!(!store.endpoint_leased("host-a", 25001));
+}
+
+// T30 T32 T33, ADR 0028 §8, §11: a Launch whose reply is lost leaves no
+// identities recorded, but the member was durably fenced as dispatched before
+// the Launch was sent. Empty gone evidence then proves nothing: the member may
+// be running. It keeps its charge, through `uncertain` too, until the host's
+// own record of its identities is recorded and those are proven gone. A member
+// never dispatched still settles on empty evidence, and identities are never
+// recorded for a member that was not fenced first.
+#[test]
+fn a_dispatched_member_never_settles_on_empty_evidence() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    let launched = [process(41)];
+    // Identities belong only to a Launch fenced as dispatched first.
+    assert!(matches!(
+        store.mark_member_launched("g", 1, &launched),
+        Err(GroupStoreError::Conflict)
+    ));
+    store.mark_member_dispatching("g", 1).unwrap();
+    // A retried fence is idempotent.
+    store.mark_member_dispatching("g", 1).unwrap();
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(
+        (rows[0].state, rows[0].dispatched),
+        (MemberState::Reserved, false)
+    );
+    assert_eq!(
+        (rows[1].state, rows[1].dispatched),
+        (MemberState::Dispatching, true)
+    );
+    // Launch sent, member spawned, reply lost: empty evidence is refused.
+    assert!(matches!(
+        store.settle_member("g", 0, 1, 1, gone("host-b", 1)),
+        Err(GroupStoreError::Conflict)
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+    // The host becomes unreachable: still dispatched, still refused.
+    store.mark_member_uncertain("g", 0, 1, 1).unwrap();
+    assert!(matches!(
+        store.settle_member("g", 0, 1, 1, gone("host-b", 1)),
+        Err(GroupStoreError::Conflict)
+    ));
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(
+        (rows[1].state, rows[1].dispatched),
+        (MemberState::Uncertain, true)
+    );
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+    // A settled or uncertain member is never fenced for a new Launch.
+    store.mark_member_uncertain("g", 0, 1, 0).unwrap();
+    assert!(matches!(
+        store.mark_member_dispatching("g", 0),
+        Err(GroupStoreError::Conflict)
+    ));
+    // The never-dispatched head settles on its host's empty evidence.
+    assert!(matches!(
+        store
+            .settle_member("g", 0, 1, 0, gone("host-a", 0))
+            .unwrap(),
+        GroupSettlement::Partial { unsettled } if unsettled == vec![1]
+    ));
+    // The host reconnects and reconciles its journal: the identities it
+    // recorded at spawn are recorded here, then proven gone.
+    store.mark_member_launched("g", 1, &launched).unwrap();
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(rows[1].state, MemberState::Launched);
+    assert!(matches!(
+        store.settle_member("g", 0, 1, 1, gone("host-b", 1)),
+        Err(GroupStoreError::Conflict)
+    ));
+    let mut exact = gone("host-b", 1);
+    exact.identities = launched.to_vec();
+    assert!(matches!(
+        store.settle_member("g", 0, 1, 1, exact).unwrap(),
+        GroupSettlement::Complete
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), 0);
 }
