@@ -39,21 +39,66 @@ ENV_SCOPE = "CAPYCTL_OBSERVATION_SCOPE"
 # whether a speculative scheduler is admitted (`resident`, ADR 0014 A17).
 ENV_RESTORE = "CAPYCTL_OBSERVATION_WEIGHT_RESTORE"
 WEIGHT_RESTORES = ("disk_reload", "cpu_backup", "resident")
+# ADR 0028 §12 (R12): a group member's topology, `<tp>:<pp>:<nnodes>`, which
+# the saver topology check admits in place of the single-rank pin.
+ENV_GROUP = "CAPYCTL_OBSERVATION_GROUP"
 
 # The live listener, retained for the scheduler process lifetime.
 _ENROLLED = []
+# ADR 0028 §12 (R12): the observation credential a group worker's scheduler
+# derives its key from, set by `run_enrolled_scheduler` in that process only.
+_SECRET = []
+
+
+class ObservationSecret:
+    """A group worker's per-launch observation credential (ADR 0028 §12).
+
+    The worker is handed no admin credential (ADR 0012), so its scheduler's
+    observation key comes from this one instead. It reaches the spawned
+    scheduler inside its pickled process target, never env or argv, and is
+    never formatted.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value):
+        self._value = value
+
+    def __repr__(self):
+        return "ObservationSecret(<private>)"
+
+    def __reduce__(self):
+        return (ObservationSecret, (self._value,))
+
+
+def _group(value):
+    """(tp, pp, nnodes) from `ENV_GROUP`, or raise ValueError."""
+    parts = value.split(":")
+    if len(parts) != 3 or any(not part.isascii() or not part.isdigit() or part != str(int(part))
+                              for part in parts):
+        raise ValueError()
+    tp, pp, nnodes = (int(part) for part in parts)
+    if not (tp >= 1 and pp >= 1 and nnodes >= 2):
+        raise ValueError()
+    return tp, pp, nnodes
 
 
 def _scope():
-    """(dir, binding, incarnation, weight restore) from the entry's environment, or None."""
+    """(dir, binding, incarnation, weight restore, group) from the entry's
+    environment, or None. `group` is None for a single-rank launch."""
     directory = os.environ.get(ENV_DIR)
     scope = os.environ.get(ENV_SCOPE)
     restore = os.environ.get(ENV_RESTORE)
     if (not directory or not scope or scope.count(":") != 1
             or restore not in WEIGHT_RESTORES):
         return None
+    group = os.environ.get(ENV_GROUP)
+    try:
+        group = None if group is None else _group(group)
+    except ValueError:
+        return None
     binding, incarnation = scope.split(":")
-    return directory, binding, incarnation, restore
+    return directory, binding, incarnation, restore, group
 
 
 def _preload_library():
@@ -138,7 +183,7 @@ def enroll(scheduler):
         scope = _scope()
         if scope is None:
             return False
-        directory, binding, incarnation, restore = scope
+        directory, binding, incarnation, restore, group = scope
         from . import sglang_saver_binding as saver
         from . import sglang_saver_residency as residency
         from .sglang_observation_server import SchedulerObservationServer
@@ -148,8 +193,12 @@ def enroll(scheduler):
         args = saver._fields(scheduler).get("server_args")
         if residency.server_arg(args, "enable_memory_saver") is not True:
             return False
-        admin = residency.server_arg(args, "admin_api_key")
-        key = observation_key(admin, binding, incarnation)
+        # The key comes from the launch's admin credential; a group worker,
+        # which holds none (ADR 0012), uses its own observation credential
+        # (ADR 0028 §12).
+        secret = (_SECRET[0]._value if _SECRET
+                  else residency.server_arg(args, "admin_api_key"))
+        key = observation_key(secret, binding, incarnation)
         stage = "library"
         path = _preload_library()
         build = saver.TrustedSaverBuild(path, _digest(path), "preload")
@@ -159,7 +208,10 @@ def enroll(scheduler):
             scheduler, binding_id=binding, incarnation_id=incarnation, expected_owner=owner,
             build=build,
             observe=functools.partial(residency.observe_scheduler_saver, weight_restore=restore),
-            topology=functools.partial(residency.topology, weight_restore=restore))
+            topology=(functools.partial(residency.topology, weight_restore=restore)
+                      if group is None else
+                      functools.partial(residency.topology, weight_restore=restore,
+                                        group=group)))
         stage = "listen"
         server = SchedulerObservationServer.start(
             path=os.path.join(directory, binding + ".sock"), bridge=bridge, binding_id=binding,
@@ -192,14 +244,18 @@ def _enrolling_event_loop(original):
     return run_event_loop
 
 
-def run_enrolled_scheduler(*args, **kwargs):
+def run_enrolled_scheduler(*args, observation_secret=None, **kwargs):
     """SGLang's scheduler process target with observation enrollment.
 
     Runs in the dedicated spawned scheduler process only: the Scheduler class of
     this process gains an enrolling `run_event_loop` (built, then enrolled, then
-    served), and SGLang's own `run_scheduler_process` runs unchanged.
+    served), and SGLang's own `run_scheduler_process` runs unchanged. A group
+    worker's target carries its `ObservationSecret` (ADR 0028 §12), kept in
+    this process for `enroll` and never passed to SGLang.
     """
     from sglang.srt.managers import scheduler as module
+    if type(observation_secret) is ObservationSecret:
+        _SECRET[:] = [observation_secret]
     if _scope() is not None:
         cls = module.Scheduler
         original = cls.__dict__.get("run_event_loop")
@@ -208,13 +264,25 @@ def run_enrolled_scheduler(*args, **kwargs):
     return module.run_scheduler_process(*args, **kwargs)
 
 
-def entry_environment(directory, binding, incarnation, weight_restore="disk_reload"):
+def scheduler_target(secret=None):
+    """The scheduler target the protected entry hands `launch_server`: the
+    enrolling target itself, or, for a group worker, the same target bound to
+    its observation credential (picklable for SGLang's spawned process)."""
+    if secret is None:
+        return run_enrolled_scheduler
+    return functools.partial(run_enrolled_scheduler,
+                             observation_secret=ObservationSecret(secret))
+
+
+def entry_environment(directory, binding, incarnation, weight_restore="disk_reload",
+                      group=None):
     """Validate the host's observation directory and publish the child scope.
 
     Called by the protected entry before `launch_server`; the directory must be
     an absolute, canonical, private (0700, service-owned) directory, and
-    `weight_restore` the launch's declared restore. Returns False (no
-    enrollment) otherwise.
+    `weight_restore` the launch's declared restore. ADR 0028 §12: `group` is a
+    group member's (tp, pp, nnodes), published for the topology check; None
+    for a single rank. Returns False (no enrollment) otherwise.
     """
     try:
         if (weight_restore not in WEIGHT_RESTORES
@@ -222,6 +290,9 @@ def entry_environment(directory, binding, incarnation, weight_restore="disk_relo
                 or os.path.realpath(directory) != directory
                 or len(os.fsencode(os.path.join(directory, binding + ".sock"))) > 107):
             return False
+        if group is not None:
+            group = ":".join(str(value) for value in group)
+            _group(group)
         info = os.stat(directory, follow_symlinks=False)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o700):
@@ -229,6 +300,8 @@ def entry_environment(directory, binding, incarnation, weight_restore="disk_relo
         os.environ[ENV_DIR] = directory
         os.environ[ENV_SCOPE] = binding + ":" + incarnation
         os.environ[ENV_RESTORE] = weight_restore
+        if group is not None:
+            os.environ[ENV_GROUP] = group
         return True
     except Exception:
         return False
@@ -238,3 +311,4 @@ def clear_environment():
     os.environ.pop(ENV_DIR, None)
     os.environ.pop(ENV_SCOPE, None)
     os.environ.pop(ENV_RESTORE, None)
+    os.environ.pop(ENV_GROUP, None)

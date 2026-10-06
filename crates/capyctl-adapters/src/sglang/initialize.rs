@@ -21,7 +21,7 @@ use crate::protected::ProtectedLaunchDescriptors;
 use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
-use super::adapter::SglangAdapter;
+use super::adapter::{LaunchCredentials, SglangAdapter};
 use super::args::ProtectedDescriptorFds;
 
 /// How often the builder asks the engine whether it is serving the model.
@@ -109,7 +109,7 @@ pub(super) async fn initialize(
     // SPEC §13.3: the private descriptor and the two credentials ride protected
     // descriptors the launcher hands the child; nothing enters argv or env.
     // ADR 0028 §10, ADR 0012: a group worker is handed the private descriptor
-    // alone.
+    // and, when deep, its observation credential (ADR 0028 §12) instead.
     let private = private_descriptor(
         session,
         context,
@@ -118,19 +118,33 @@ pub(super) async fn initialize(
         launch.frozen.metadata().placement_digest.as_deref(),
     )?;
     let descriptors = match &credentials {
-        Some((inference, admin)) => {
+        LaunchCredentials::Api { inference, admin } => {
             ProtectedLaunchDescriptors::new(&private, inference.as_bytes(), admin.as_bytes())
         }
-        None => ProtectedLaunchDescriptors::launch_only(&private),
+        LaunchCredentials::Worker { observation } => ProtectedLaunchDescriptors::for_worker(
+            &private,
+            observation.as_deref().map(str::as_bytes),
+        ),
     }
     .map_err(|e| RuntimeError::Uncertain(redact_text(&format!("protected descriptors: {e}"))))?;
-    let fds = match descriptors.numbers()[..] {
-        [launch_fd, inference_fd, admin_fd] => ProtectedDescriptorFds::for_launcher(
-            i64::from(launch_fd),
-            i64::from(inference_fd),
-            i64::from(admin_fd),
-        )?,
-        [launch_fd] => ProtectedDescriptorFds::launch_only(i64::from(launch_fd))?,
+    let numbers = descriptors.numbers();
+    let fds = match (&credentials, numbers.as_slice()) {
+        (LaunchCredentials::Api { .. }, &[launch_fd, inference_fd, admin_fd]) => {
+            ProtectedDescriptorFds::for_launcher(
+                i64::from(launch_fd),
+                i64::from(inference_fd),
+                i64::from(admin_fd),
+            )?
+        }
+        (LaunchCredentials::Worker { .. }, &[launch_fd]) => {
+            ProtectedDescriptorFds::for_worker(i64::from(launch_fd), None)?
+        }
+        (LaunchCredentials::Worker { .. }, &[launch_fd, observation_fd]) => {
+            ProtectedDescriptorFds::for_worker(
+                i64::from(launch_fd),
+                Some(i64::from(observation_fd)),
+            )?
+        }
         _ => return Err(RuntimeError::Unsupported),
     };
     let mut cmd = launch.rendered.render_for_launcher(fds, &wrapper)?;

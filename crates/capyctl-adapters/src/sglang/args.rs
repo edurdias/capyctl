@@ -24,8 +24,11 @@ use std::{fmt, net::SocketAddr, path::Path};
 pub struct ProtectedDescriptorFds {
     launch: i32,
     /// The inference and admin credential descriptors; `None` for a group
-    /// worker, which is handed no credential (ADR 0012, ADR 0028 §10).
+    /// worker, which is handed no API credential (ADR 0012, ADR 0028 §10).
     credentials: Option<(i32, i32)>,
+    /// A deep group worker's observation credential descriptor (ADR 0028
+    /// §12); `None` for every other launch.
+    observation: Option<i32>,
 }
 
 fn descriptor_number(value: i64) -> Result<i32, RuntimeError> {
@@ -48,15 +51,23 @@ impl ProtectedDescriptorFds {
         Ok(Self {
             launch,
             credentials: Some((inference, admin)),
+            observation: None,
         })
     }
 
-    /// ADR 0028 §10, ADR 0012: the private launch descriptor alone, for a
-    /// group worker (node_rank > 0).
-    pub fn launch_only(launch: i64) -> Result<Self, RuntimeError> {
+    /// ADR 0028 §10, ADR 0012: a group worker (node_rank > 0): the private
+    /// launch descriptor and, when its residency is deep, its observation
+    /// credential descriptor (ADR 0028 §12).
+    pub fn for_worker(launch: i64, observation: Option<i64>) -> Result<Self, RuntimeError> {
+        let launch = descriptor_number(launch)?;
+        let observation = observation.map(descriptor_number).transpose()?;
+        if observation == Some(launch) {
+            return Err(RuntimeError::Unsupported);
+        }
         Ok(Self {
-            launch: descriptor_number(launch)?,
+            launch,
             credentials: None,
+            observation,
         })
     }
 }
@@ -82,6 +93,9 @@ pub struct SglangLaunch {
     /// ADR 0028 §10: a group worker (node_rank > 0), rendered without
     /// credential descriptors (ADR 0012: the key-guarded API is the head's).
     worker: bool,
+    /// ADR 0028 §12 (R12): a deep group worker, whose saver observation is
+    /// keyed by its own observation credential descriptor.
+    worker_observes: bool,
 }
 
 impl SglangLaunch {
@@ -145,10 +159,12 @@ impl SglangLaunch {
             "device": m.device,
             "settings": settings,
         });
+        let worker = frozen.group().is_some_and(|group| !group.is_head());
         Ok(Self {
             executable: frozen.executable().into(),
             public,
-            worker: frozen.group().is_some_and(|group| !group.is_head()),
+            worker,
+            worker_observes: worker && s.memory_saver,
         })
     }
 
@@ -159,17 +175,21 @@ impl SglangLaunch {
     }
 
     /// The final launcher substitutes three distinct protected descriptor numbers
-    /// (the private launch descriptor alone for a group worker) only after
-    /// resolving the private frozen inputs outside this renderer.
+    /// (for a group worker, the private launch descriptor and, when deep, its
+    /// observation credential) only after resolving the private frozen inputs
+    /// outside this renderer.
     pub fn render_for_launcher(
         &self,
         fds: ProtectedDescriptorFds,
         wrapper: &Path,
     ) -> Result<RenderedCommand, RuntimeError> {
         Self::validate_wrapper_path(wrapper)?;
-        // ADR 0012, ADR 0028 §10: credentials go to every launch that serves
-        // the API and to no worker.
-        if self.worker != fds.credentials.is_none() {
+        // ADR 0012, ADR 0028 §10, §12: credentials go to every launch that
+        // serves the API and to no worker; an observation credential to a deep
+        // worker only.
+        if self.worker != fds.credentials.is_none()
+            || self.worker_observes != fds.observation.is_some()
+        {
             return Err(RuntimeError::Unsupported);
         }
         let public = serde_json::to_string(&self.public).map_err(|_| RuntimeError::Unsupported)?;
@@ -195,6 +215,12 @@ impl SglangLaunch {
                 admin.to_string(),
             ]);
         }
+        if let Some(observation) = fds.observation {
+            argv.extend([
+                "--observation-credential-fd".into(),
+                observation.to_string(),
+            ]);
+        }
         Ok(RenderedCommand {
             argv,
             env: Default::default(),
@@ -202,9 +228,15 @@ impl SglangLaunch {
     }
 
     /// ADR 0028 §10: whether this launch is a group worker (node_rank > 0),
-    /// which is handed no credential and serves no API.
+    /// which is handed no API credential and serves no API.
     pub fn is_group_worker(&self) -> bool {
         self.worker
+    }
+
+    /// ADR 0028 §12 (R12): whether this launch is a deep group worker, handed
+    /// its own observation credential.
+    pub fn worker_observes(&self) -> bool {
+        self.worker_observes
     }
 
     /// Service configuration supplies this path, never a candidate or HTTP request.

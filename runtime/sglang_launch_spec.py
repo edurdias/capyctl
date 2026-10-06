@@ -23,6 +23,11 @@ class LaunchSpec:
     # policy published; the entry never invents either.
     _launch_scope_json: str | None = field(default=None, repr=False)
     _placement_digest: str | None = field(default=None, repr=False)
+    # ADR 0028 §12 (R12): a deep group worker's per-launch observation
+    # credential, from its own protected descriptor. Its scheduler derives the
+    # saver observation key from it, as the head's derives it from the admin
+    # credential. None for every other launch.
+    _observation_secret: str | None = field(default=None, repr=False)
 
     def __repr__(self):
         return "LaunchSpec(<private>)"

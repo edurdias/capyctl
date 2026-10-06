@@ -427,11 +427,15 @@ def build_launch(argv, descriptor_reader):
         names = ("--public-settings-json", "--launch-descriptor-fd",
                  "--inference-credential-fd", "--admin-credential-fd")
         # ADR 0028 §10, ADR 0012: a group worker (node_rank > 0) serves no API
-        # and is handed the private launch descriptor alone; every other
-        # launch carries both credential descriptors, exactly as before.
-        if type(argv) not in (list, tuple) or len(argv) not in (4, 8):
+        # and is handed no API credential: the private launch descriptor, and,
+        # when its residency is deep, its own observation credential (ADR 0028
+        # §12). Every other launch carries both credential descriptors, exactly
+        # as before.
+        worker_names = ("--public-settings-json", "--launch-descriptor-fd",
+                        "--observation-credential-fd")
+        if type(argv) not in (list, tuple) or len(argv) not in (4, 6, 8):
             _reject()
-        names = names[:len(argv) // 2]
+        names = names if len(argv) == 8 else worker_names[:len(argv) // 2]
         options = {}
         for name, value in zip(argv[::2], argv[1::2]):
             if type(name) is not str or name not in names or name in options:
@@ -449,7 +453,8 @@ def build_launch(argv, descriptor_reader):
         public = _strict_json(options[names[0]])
         _validate_public(public)
         worker = public["settings"].get("group", {}).get("node_rank", 0) > 0
-        if worker != (len(fds) == 1):
+        if (worker != (len(argv) != 8)
+                or (worker and (len(fds) == 2) != (public["settings"]["memory_saver"] is True))):
             _reject()
         private = _strict_json(descriptor_reader(fds[0]))
         version = private.get("schema_version")
@@ -483,8 +488,9 @@ def build_launch(argv, descriptor_reader):
         if not root.startswith("/") or any(part in ("", ".", "..") for part in root[1:].split("/")):
             _reject()
         if worker:
+            observation = _credential(descriptor_reader(fds[1])) if len(fds) == 2 else None
             return LaunchSpec(json.dumps(public, sort_keys=True, separators=(",", ":")),
-                              root, None, None, launch_scope, digest)
+                              root, None, None, launch_scope, digest, observation)
         inference = _credential(descriptor_reader(fds[1]))
         admin = _credential(descriptor_reader(fds[2]))
         if hmac.compare_digest(inference, admin):
@@ -750,19 +756,26 @@ def _observation_target(spec, launch):
     the installation's `launch_server` takes a scheduler target (the
     `observation` capability, engine_capabilities.py). Anything else serves
     without an observation, and the host refuses Park unchanged (fail closed).
+
+    ADR 0028 §12 (R12): every group rank enrolls alike. Its scope carries the
+    group's topology, and a worker's target carries its observation
+    credential (it holds no admin credential to derive the key from).
     """
     from runtime import engine_capabilities, sglang_observation_enrollment as enrollment
     # Children see only a scope this entry validated, never the raw input.
     directory = os.environ.get(enrollment.ENV_DIR)
     enrollment.clear_environment()
     public = json.loads(spec._public_json)
-    if (directory is None or public["settings"]["memory_saver"] is not True
+    settings = public["settings"]
+    scope = (directory, public["binding_id"], public["incarnation"], settings["weight_restore"])
+    group = settings.get("group")
+    if (directory is None or settings["memory_saver"] is not True
             or not engine_capabilities.accepts_scheduler_target(launch)
-            or not enrollment.entry_environment(directory, public["binding_id"],
-                                                public["incarnation"],
-                                                public["settings"]["weight_restore"])):
+            or not (enrollment.entry_environment(*scope) if group is None else
+                    enrollment.entry_environment(*scope, group=(
+                        group["tp_size"], group["pp_size"], group["nnodes"])))):
         return None
-    return enrollment.run_enrolled_scheduler
+    return enrollment.scheduler_target(spec._observation_secret)
 
 
 def main(argv=None, descriptor_reader=None, stderr=None):
