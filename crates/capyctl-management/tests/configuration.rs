@@ -1529,36 +1529,202 @@ async fn a_host_lacking_the_profile_is_refused_while_another_has_it() {
     );
 }
 
-/// ADR 0028 §5 interim (Task 4 fix, R19): a server deploy of a multi-node group
-/// is refused until group activation lands; nothing is published.
-// T03
-#[tokio::test]
-async fn a_registry_group_deploy_is_refused_until_activation_lands() {
-    let (_directory, state, mut config, _host) = fixture();
+/// Two enrolled hosts for a group: each publishes its peer address and
+/// declares `engine_groups` unless the test says otherwise. Returns the
+/// registry router and the hosts' ids.
+fn group_hosts(
+    state: &Arc<Mutex<OwnedCoordinatorState>>,
+    peers: [Option<&str>; 2],
+    capable: [bool; 2],
+) -> (axum::Router, Vec<String>) {
+    let mut ids = Vec::new();
+    for (index, (name, digest)) in [("host-a", 'e'), ("host-b", 'f')].into_iter().enumerate() {
+        let id = publish_host(state, name, digest, json!({}));
+        let owner = state.lock().unwrap();
+        if let Some(peer) = peers[index] {
+            let mut document: Value = serde_json::from_str(
+                &owner
+                    .store()
+                    .host_publication(&id)
+                    .unwrap()
+                    .unwrap()
+                    .config_json,
+            )
+            .unwrap();
+            document["resource_policy"]["groups"] = json!({ "peer_address": peer });
+            owner
+                .store()
+                .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                    host_id: id.clone(),
+                    config_json: document.to_string(),
+                    boot_id: format!("boot-{name}"),
+                    fingerprint: capyctl_config::remote_resources::policy_fingerprint(&document),
+                    received_at_ms: 2000,
+                })
+                .unwrap();
+        }
+        let mut capabilities = vec!["heartbeats".to_owned()];
+        if capable[index] {
+            capabilities.push("engine_groups".into());
+        }
+        owner
+            .store()
+            .record_host_version(
+                &id,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.2.0".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities,
+                    recorded_at_ms: 2000,
+                },
+            )
+            .unwrap();
+        ids.push(id);
+    }
     let router = configuration_router(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
         Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
     );
+    (router, ids)
+}
+
+/// The golden deployment as a TP 2 group headed by host B. It keeps the
+/// golden `devices: [{id: gpu0}]`: one device per host (R20).
+fn group_config(mut config: Value) -> Value {
     config.as_object_mut().unwrap().remove("host");
-    config.as_object_mut().unwrap().remove("devices");
     config["topology"] = json!({"tensor_parallel": 2});
-    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    config["placement"] = json!({"hosts": ["host-b", "host-a"]});
+    config
+}
+
+async fn deploy(router: &axum::Router, key: &str, config: &Value) -> (u16, Value) {
     let response = router
+        .clone()
         .oneshot(request(
             "POST",
             "/management/v1/deployments",
-            "group",
+            key,
             json!({"config":config,"activate":false}),
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), 501);
-    let body = json_response(response).await;
-    assert_eq!(body["error"]["code"], "group_shape_unsupported", "{body}");
-    assert_eq!(
-        body["error"]["message"],
-        "multi-node group activation is not available yet"
+    let status = response.status().as_u16();
+    (status, json_response(response).await)
+}
+
+/// ADR 0028 §2, §5 (R19 removed): a valid group deploy is accepted and stored,
+/// resolved on every named host with the head's resolution canonical.
+// T03 T14
+#[tokio::test]
+async fn a_registry_group_deploy_is_accepted_and_stored() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, ids) = group_hosts(&state, [Some("192.0.2.10"), Some("192.0.2.11")], [true; 2]);
+    let config = group_config(config);
+    let (status, body) = deploy(&router, "group", &config).await;
+    assert_eq!(status, 202, "{body}");
+    let id = body["deployment_id"].as_str().unwrap().to_owned();
+    {
+        let owner = state.lock().unwrap();
+        let snapshot = owner.store().snapshot().unwrap();
+        let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+        let mut hosts: Vec<_> = deployment
+            .hosts
+            .iter()
+            .map(|h| (h.host_id.clone(), h.outcome.clone()))
+            .collect();
+        hosts.sort();
+        let mut expected: Vec<_> = ids
+            .iter()
+            .map(|id| (id.clone(), "resolved".into()))
+            .collect();
+        expected.sort();
+        assert_eq!(hosts, expected);
+        let effective = owner.store().effective_configuration(&id).unwrap().unwrap();
+        assert_eq!(
+            effective.effective["host"]["name"], ids[1],
+            "the head is canonical"
+        );
+    }
+    // An exact retry is answered from its receipt.
+    let (status, retried) = deploy(&router, "group", &config).await;
+    assert_eq!(status, 202, "{retried}");
+    assert_eq!(retried["deployment_id"], body["deployment_id"]);
+}
+
+/// ADR 0028 §2, spec §16 (T34): a named host that does not declare
+/// `engine_groups` refuses the group at deploy; nothing is stored.
+// T14 T34
+#[tokio::test]
+async fn a_group_naming_a_host_without_engine_groups_is_refused() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, _) = group_hosts(
+        &state,
+        [Some("192.0.2.10"), Some("192.0.2.11")],
+        [true, false],
     );
+    let (status, body) = deploy(&router, "group", &group_config(config)).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("host_capability_missing:engine_groups"),
+        "{message}"
+    );
+    assert!(message.contains("host-b"), "{message}");
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 0);
+}
+
+/// ADR 0028 §3: a named host without a peer address cannot be in a group.
+// T14
+#[tokio::test]
+async fn a_group_naming_a_host_without_a_peer_address_is_refused() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, _) = group_hosts(&state, [Some("192.0.2.10"), None], [true; 2]);
+    let (status, body) = deploy(&router, "group", &group_config(config)).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("peer_address_missing"), "{message}");
+    assert!(message.contains("host-b"), "{message}");
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 0);
+}
+
+/// ADR 0028 §2: the profile must resolve on every named host; one host
+/// lacking it refuses the group (`group_profile_mismatch`) instead of being
+/// recorded refused beside the others.
+// T14
+#[tokio::test]
+async fn a_group_whose_profile_one_named_host_lacks_is_refused() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, ids) = group_hosts(&state, [Some("192.0.2.10"), Some("192.0.2.11")], [true; 2]);
+    {
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&ids[0])
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        let profile = document["runtime_profiles"]["local"].take();
+        document["runtime_profiles"] = json!({ "sglang": profile });
+        owner
+            .store()
+            .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                host_id: ids[0].clone(),
+                config_json: document.to_string(),
+                boot_id: "boot-again".into(),
+                fingerprint: capyctl_config::remote_resources::policy_fingerprint(&document),
+                received_at_ms: 3000,
+            })
+            .unwrap();
+    }
+    let (status, body) = deploy(&router, "group", &group_config(config)).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("group_profile_mismatch"), "{message}");
+    assert!(message.contains("host-a"), "{message}");
     assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 0);
 }
 

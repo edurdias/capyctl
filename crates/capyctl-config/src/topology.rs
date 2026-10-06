@@ -29,12 +29,17 @@ impl GroupShape {
     }
 }
 
+/// ADR 0028 §16: the closed deploy-time refusals of a group deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupRefusal {
     PlacementRequired,
     TopologyInvalid,
     ShapeUnsupported,
     InstancesUnsupported,
+    /// The profile does not resolve on a named host, or its build differs.
+    ProfileMismatch,
+    /// A named host declares no peer address (ADR 0028 §3).
+    PeerAddressMissing,
 }
 
 impl GroupRefusal {
@@ -44,10 +49,14 @@ impl GroupRefusal {
             Self::TopologyInvalid => "group_topology_invalid",
             Self::ShapeUnsupported => "group_shape_unsupported",
             Self::InstancesUnsupported => "group_instances_unsupported",
+            Self::ProfileMismatch => "group_profile_mismatch",
+            Self::PeerAddressMissing => "peer_address_missing",
         }
     }
 
-    pub(crate) fn at(self, path: &str, detail: &str) -> ConfigError {
+    /// The refusal as a configuration error at `path`, its detail led by the
+    /// closed code.
+    pub fn at(self, path: &str, detail: &str) -> ConfigError {
         ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
             path,

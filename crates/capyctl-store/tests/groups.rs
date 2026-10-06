@@ -184,7 +184,9 @@ impl Fixture {
                 (
                     host.clone(),
                     GrantRequest {
-                        id: format!("grant-{id}-{rank}"),
+                        // One grant per reservation attempt: a retry in the
+                        // same generation is a new grant at a later epoch.
+                        id: format!("grant-{id}-{rank}-{epoch}"),
                         owner_id: member_owner_id(&id, r.instance_index, rank as u32),
                         deployment_id: id.clone(),
                         operation_id: format!("op-{}", r.deployment_id),
@@ -985,4 +987,140 @@ fn a_dispatched_member_never_settles_on_empty_evidence() {
         GroupSettlement::Complete
     ));
     assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), 0);
+}
+
+// T15, T27 (R15): a retry in the same generation after a Prepare refusal
+// redraws its rendezvous port; the fully settled plan it replaces is gone.
+#[test]
+fn a_settled_plan_of_the_same_generation_is_replaced() {
+    let store = two_host_store(gib(100), gib(100));
+    let r = reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]);
+    let first = store.reserve_group(&r, plan_for("g"), ctx()).unwrap();
+    assert_eq!(first.rendezvous_port(), 25000);
+    // The head's Prepare found the port held outside CapyCTL; nothing was
+    // dispatched, so every member settles on empty evidence.
+    store.exclude_rendezvous_port("host-a", 25000, now_ms() + 600_000);
+    store
+        .settle_member("g", 0, 1, 0, gone("host-a", 0))
+        .unwrap();
+    assert!(matches!(
+        store
+            .settle_member("g", 0, 1, 1, gone("host-b", 1))
+            .unwrap(),
+        GroupSettlement::Complete
+    ));
+    let second = store.reserve_group(&r, plan_for("g"), ctx()).unwrap();
+    assert_eq!(second.rendezvous_port(), 25001);
+    let (stored, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(stored, second);
+    assert!(rows
+        .iter()
+        .all(|row| row.state == MemberState::Reserved && !row.dispatched));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 0)), gib(50));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+}
+
+// T30, T33 (ADR 0028 §8, §11): a plan an interrupted activation left with no
+// member dispatched is released on empty evidence before the next one
+// reserves, its worker lease with it.
+#[test]
+fn a_never_dispatched_leftover_is_released_before_reserving() {
+    let store = two_host_store(gib(100), gib(100));
+    let mut r = reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]);
+    r.worker_ports = BTreeMap::from([("host-b".into(), 8100..=8100)]);
+    store
+        .reserve_group(&r, sglang_plan_for("g"), ctx())
+        .unwrap();
+    store.mark_member_uncertain("g", 0, 1, 1).unwrap();
+    // The leftover still holds the instance.
+    assert!(matches!(
+        store.reserve_group(&r, sglang_plan_for("g"), ctx()),
+        Err(GroupStoreError::Conflict)
+    ));
+    assert!(matches!(
+        store.release_undispatched_group("g", 0, 1).unwrap(),
+        GroupSettlement::Complete
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 0)), 0);
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), 0);
+    assert!(!store.endpoint_leased("host-b", 8100));
+    // A repeated release reports the settled plan again.
+    assert!(matches!(
+        store.release_undispatched_group("g", 0, 1).unwrap(),
+        GroupSettlement::Complete
+    ));
+    let plan = store
+        .reserve_group(&r, sglang_plan_for("g"), ctx())
+        .unwrap();
+    assert_eq!(plan.members()[1].worker_port, Some(8100));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+}
+
+// T33 (R23): a plan with a dispatched member is never released on empty
+// evidence; every member keeps its charge.
+#[test]
+fn a_dispatched_leftover_is_never_released_on_empty_evidence() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    store.mark_member_dispatching("g", 1).unwrap();
+    assert!(matches!(
+        store.release_undispatched_group("g", 0, 1),
+        Err(GroupStoreError::Conflict)
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 0)), gib(50));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(rows[0].state, MemberState::Reserved);
+    assert_eq!(rows[1].state, MemberState::Dispatching);
+    // No plan at that generation: nothing to release.
+    assert!(matches!(
+        store.release_undispatched_group("g", 0, 2),
+        Err(GroupStoreError::Conflict)
+    ));
+}
+
+impl Fixture {
+    fn release_undispatched_group(
+        &self,
+        name: &str,
+        instance: u32,
+        generation: i64,
+    ) -> Result<GroupSettlement, GroupStoreError> {
+        self.open()
+            .release_undispatched_group(&self.id(name), instance, generation)
+    }
+}
+
+// T33 (Task 8 concern, owner-id audit): a group instance's members are not its
+// instance owner. Status lists each member owner, which parses as the member it
+// is, and never labels the instance with one of them.
+#[test]
+fn a_group_instance_is_not_labelled_with_a_member_owner() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    let id = store.id("g");
+    let snapshot = store.open().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    assert!(!deployment.instances.is_empty());
+    for instance in &deployment.instances {
+        assert_eq!(instance.reservation_owner, None, "{instance:?}");
+    }
+    let members: Vec<(String, u32, u32)> = snapshot
+        .reservations
+        .iter()
+        .filter_map(|r| parse_member_owner_id(&r.owner_id))
+        .collect();
+    assert_eq!(members, [(id.clone(), 0, 0), (id, 0, 1)]);
 }

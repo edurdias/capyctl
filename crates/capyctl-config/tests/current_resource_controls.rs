@@ -118,3 +118,28 @@ fn current_controls_preserve_physical_device_identity() {
     );
     assert_eq!(ResourceControls::from_host(&effective.host), controls);
 }
+
+// T14, T39: the groups block is host context a group deploy reads (ADR 0028
+// §3); composing the current controls keeps it, and it changes no resolution.
+#[test]
+fn current_controls_preserve_the_groups_block() {
+    let (deployment, mut host, context, controls) = fixture();
+    let plain = compose_current_resource_controls(&host, &context, &controls).unwrap();
+    assert!(plain["resource_policy"].get("groups").is_none());
+    host["resource_policy"]["groups"] = json!({"peer_address": "192.0.2.10"});
+    let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
+    assert_eq!(
+        composed["resource_policy"]["groups"],
+        json!({"peer_address": "192.0.2.10"})
+    );
+    assert_eq!(
+        capyctl_config::groups_policy::host_groups_policy(&composed)
+            .unwrap()
+            .peer_address,
+        Some("192.0.2.10".parse().unwrap())
+    );
+    assert_eq!(
+        resolve_effective(&deployment, &composed).unwrap(),
+        resolve_effective(&deployment, &plain).unwrap()
+    );
+}

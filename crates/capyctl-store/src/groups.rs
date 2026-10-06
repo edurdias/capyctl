@@ -466,6 +466,44 @@ pub(crate) fn migrate_v41(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// ADR 0028 §11: once no member of the plan at `generation` is reserved,
+/// dispatching, launched or uncertain, the plan settles and frees its
+/// rendezvous port, and its worker leases go with it.
+fn finish_if_settled(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+) -> Result<GroupSettlement, GroupStoreError> {
+    let unsettled: Vec<u32> = tx
+        .prepare(
+            "SELECT rank FROM group_members
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state!='settled'
+              ORDER BY rank",
+        )?
+        .query_map(params![deployment_id, instance_index, generation], |r| {
+            r.get(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if !unsettled.is_empty() {
+        return Ok(GroupSettlement::Partial { unsettled });
+    }
+    // ADR 0028 §11: the rendezvous port is released only after every member
+    // settles; the worker leases with it.
+    tx.execute(
+        "UPDATE group_plans SET state='settled'
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+        params![deployment_id, instance_index, generation],
+    )?;
+    tx.execute(
+        "DELETE FROM endpoint_leases WHERE group_owner IN
+           (SELECT owner_id FROM group_members
+             WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3)",
+        params![deployment_id, instance_index, generation],
+    )?;
+    Ok(GroupSettlement::Complete)
+}
+
 impl crate::Store {
     /// ADR 0028 §5: reserve every member of a group instance, or none.
     ///
@@ -486,6 +524,12 @@ impl crate::Store {
     /// match); charge every member to its own owner, judged on its own host;
     /// write the plan and its members. Any error returns before commit, so the
     /// transaction rolls back and nothing is held anywhere.
+    ///
+    /// An unsettled plan of the instance is a `Conflict`; one an interrupted
+    /// activation left with no member dispatched is released first with
+    /// [`Self::release_undispatched_group`]. A fully settled plan of the same
+    /// generation (a retry that redraws its rendezvous port) is replaced.
+    /// Every grant must be new (a fresh grant id per attempt), else `Plan`.
     pub fn reserve_group(
         &self,
         r: &GroupReservation,
@@ -644,7 +688,7 @@ impl crate::Store {
             let context = *contexts.get(host).ok_or(GroupStoreError::Plan)?;
             let mut grant = grant.clone();
             grant.expected_epoch = first.expected_epoch + rank as u64;
-            crate::resource_ledger::reserve_member_increase_in_transaction(
+            let receipt = crate::resource_ledger::reserve_member_increase_in_transaction(
                 &tx,
                 &grant,
                 rank as u32,
@@ -654,7 +698,24 @@ impl crate::Store {
                 ResourceStoreError::Conflict => GroupStoreError::Conflict,
                 other => GroupStoreError::Admission(other),
             })?;
+            // Every reservation attempt is new grants: one already recorded
+            // would leave this member written without a charge.
+            if !matches!(receipt, crate::resource_ledger::GrantReceipt::New { .. }) {
+                return Err(GroupStoreError::Plan);
+            }
         }
+        // ADR 0028 §5 (R15): a retry in the same generation (a rendezvous
+        // port a `Prepare` found held, redrawn) replaces that generation's
+        // plan. The busy check above proved it fully settled, so nothing it
+        // charged or leased is still held.
+        tx.execute(
+            "DELETE FROM group_members WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![r.deployment_id, r.instance_index, first.generation],
+        )?;
+        tx.execute(
+            "DELETE FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state='settled'",
+            params![r.deployment_id, r.instance_index, first.generation],
+        )?;
         tx.execute(
             "INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state)
              VALUES(?1,?2,?3,?4,?5,?6,'active')",
@@ -842,34 +903,67 @@ impl crate::Store {
                 params![deployment_id, instance_index, generation, rank],
             )?;
         }
-        let unsettled: Vec<u32> = tx
+        let outcome = finish_if_settled(&tx, deployment_id, instance_index, generation)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// ADR 0028 §8, §11: release a plan whose activation was interrupted, or
+    /// whose `Prepare` was refused, before any member was dispatched.
+    ///
+    /// Contract for the controller (Task 16, group activation): empty
+    /// evidence proves only a member never dispatched gone, so this settles
+    /// every member of the plan at `generation` only when none was fenced by
+    /// [`Self::mark_member_dispatching`]; it releases their charges, their
+    /// worker leases and the rendezvous port in one transaction. A plan with
+    /// any dispatched member, or no plan at that generation, is a `Conflict`
+    /// and changes nothing: such a member settles only on its own host's
+    /// evidence ([`Self::settle_member`]). Only the instance's single
+    /// activation calls it, for a plan no live activation is using. A plan
+    /// already settled reports `Complete` again.
+    pub fn release_undispatched_group(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<GroupSettlement, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String, bool)> = tx
             .prepare(
-                "SELECT rank FROM group_members
-                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state!='settled'
-                  ORDER BY rank",
+                "SELECT owner_id,state,dispatched FROM group_members
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
             )?
             .query_map(params![deployment_id, instance_index, generation], |r| {
-                r.get(0)
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let outcome = if unsettled.is_empty() {
-            // ADR 0028 §11: the rendezvous port is released only after every
-            // member settles; the worker leases with it.
-            tx.execute(
-                "UPDATE group_plans SET state='settled'
-                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
-                params![deployment_id, instance_index, generation],
-            )?;
-            tx.execute(
-                "DELETE FROM endpoint_leases WHERE group_owner IN
-                   (SELECT owner_id FROM group_members
-                     WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3)",
-                params![deployment_id, instance_index, generation],
-            )?;
-            GroupSettlement::Complete
-        } else {
-            GroupSettlement::Partial { unsettled }
-        };
+        if rows.is_empty() {
+            return Err(GroupStoreError::Conflict);
+        }
+        let mut unsettled = Vec::new();
+        for (owner, state, dispatched) in rows {
+            if MemberState::parse(&state)? == MemberState::Settled {
+                continue;
+            }
+            // R23: a dispatched member may be running; nothing is released.
+            if dispatched {
+                return Err(GroupStoreError::Conflict);
+            }
+            unsettled.push(owner);
+        }
+        for owner in &unsettled {
+            let released = tx.execute("DELETE FROM resource_owners WHERE owner_id=?1", [owner])?;
+            if released != 1 {
+                return Err(corrupt());
+            }
+            crate::resource_ledger::advance_completion_epoch(&tx).map_err(|_| corrupt())?;
+        }
+        tx.execute(
+            "UPDATE group_members SET state='settled'
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![deployment_id, instance_index, generation],
+        )?;
+        let outcome = finish_if_settled(&tx, deployment_id, instance_index, generation)?;
         tx.commit()?;
         Ok(outcome)
     }

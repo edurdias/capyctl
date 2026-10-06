@@ -44,8 +44,6 @@ pub enum ConfigurationFailure {
     QueueFull,
     DeadlineExceeded,
     Unsupported,
-    /// ADR 0028 §5: a multi-node group deployment before group activation exists.
-    GroupUnsupported,
     NotFound,
     RevisionConflict,
     IdempotencyConflict,
@@ -219,12 +217,6 @@ impl ConfigurationFailure {
                 "deadline_exceeded",
                 "Command response deadline exceeded; retry with the same idempotency key",
                 true,
-            ),
-            GroupUnsupported => (
-                StatusCode::NOT_IMPLEMENTED,
-                "group_shape_unsupported",
-                "multi-node group activation is not available yet",
-                false,
             ),
             Unsupported => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -691,7 +683,9 @@ impl ConfigurationSource for SharedConfigurationSource {
 /// (not enrolled or published, no runtime profile, no current resource
 /// policy, a label mismatch) is returned as a refusal with its closed reason,
 /// so the deploy records it and status shows it. A single named host that
-/// refuses keeps the answer a single-host deploy always gave.
+/// refuses keeps the answer a single-host deploy always gave. A group (ADR
+/// 0028 §2) is refused as a whole by the first named host that refuses, and
+/// by any named host that cannot run group members ([`check_group_targets`]).
 fn registry_targets(
     store: &capyctl_store::Store,
     config_json: &str,
@@ -699,11 +693,7 @@ fn registry_targets(
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, config_json)?;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
-    // TODO(ADR 0028 §5, Task 16): remove when group activation lands. Until then
-    // the placement reads only `placement_json` and would launch one host.
-    if spec.group.is_some() {
-        return Err(ConfigurationFailure::GroupUnsupported);
-    }
+    let group = spec.group.as_ref();
     let allowed: Vec<String> = match &spec.placement.hosts {
         Some(hosts) => hosts.clone(),
         None => store
@@ -742,6 +732,11 @@ fn registry_targets(
     let mut refusals = Vec::new();
     let mut single = None;
     for selector in &allowed {
+        // ADR 0028 §2: every named host of a group must resolve, so the
+        // first that cannot refuses the whole deploy with its own answer.
+        if group.is_some() && !refusals.is_empty() {
+            break;
+        }
         let refuse =
             |failure: ConfigurationFailure, reason: &str, refusals: &mut Vec<HostRefusal>| {
                 refusals.push(HostRefusal {
@@ -844,6 +839,9 @@ fn registry_targets(
             scoped: true,
         });
     }
+    if group.is_some() {
+        check_group_targets(store, &targets, &refusals, single.take())?;
+    }
     if targets.is_empty() {
         return Err(match (allowed.len(), single) {
             (1, Some(failure)) => failure,
@@ -852,6 +850,55 @@ fn registry_targets(
         });
     }
     Ok((targets, refusals))
+}
+
+/// ADR 0028 §2, spec §16: a group deploy is refused as a whole when a named
+/// host cannot resolve it: the profile not published there is
+/// `group_profile_mismatch` (the store compares builds and checks every
+/// host's peer address); any other refusal is that host's own answer, as a
+/// single named host gives it. A named host whose latest session did not
+/// declare `engine_groups` is `host_capability_missing:engine_groups` and is
+/// sent nothing (Task 7's `group_refusal`).
+fn check_group_targets(
+    store: &capyctl_store::Store,
+    targets: &[HostTarget],
+    refusals: &[HostRefusal],
+    failure: Option<ConfigurationFailure>,
+) -> Result<(), ConfigurationFailure> {
+    if let Some(refusal) = refusals.first() {
+        return Err(if refusal.diagnostic == "profile_not_published" {
+            capyctl_config::topology::GroupRefusal::ProfileMismatch
+                .at(
+                    "runtime_profile",
+                    &format!(
+                        "the runtime profile is not published by host `{}`",
+                        refusal.host_id
+                    ),
+                )
+                .into()
+        } else {
+            failure.unwrap_or(ConfigurationFailure::HostPolicyDenied)
+        });
+    }
+    for target in targets {
+        let declared: std::collections::BTreeSet<String> = store
+            .host_version(&target.host_id)
+            .map_err(|_| ConfigurationFailure::Internal)?
+            .map(|version| version.capabilities.into_iter().collect())
+            .unwrap_or_default();
+        if let Some(code) = capyctl_protocol::capabilities::group_refusal(&declared) {
+            return Err(capyctl_config::ConfigError::new(
+                capyctl_config::ConfigErrorCode::UnsupportedCombination,
+                "placement.hosts",
+                format!(
+                    "{code}: host `{}` cannot run group members; upgrade its agent",
+                    target.host_name
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// ADR 0018 §7: the runtime profile the deployment names, when some host in

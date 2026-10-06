@@ -141,6 +141,104 @@ fn refusal_diagnostic(error: &ManagedConfigurationError) -> &'static str {
     }
 }
 
+/// ADR 0028 §2, §3: a group's named hosts in rank order, the head first, each
+/// one an allowed target the server could resolve against and each declaring
+/// the peer address its peers reach it on (read from the trusted host
+/// document's groups block, never from the normalized policy). A named host
+/// without a target cannot resolve, so the group is refused.
+fn group_members<'t>(
+    shape: &capyctl_config::topology::GroupShape,
+    targets: &'t [HostTarget],
+) -> Result<Vec<&'t HostTarget>> {
+    use capyctl_config::topology::GroupRefusal;
+    let mut members: Vec<&HostTarget> = Vec::with_capacity(shape.hosts.len());
+    for name in &shape.hosts {
+        let target = targets
+            .iter()
+            .find(|t| t.host_id == *name || t.host_name == *name)
+            .ok_or(ManagedConfigurationError::Invalid)?;
+        if members.iter().any(|m| m.host_id == target.host_id) {
+            return Err(ManagedConfigurationError::Invalid);
+        }
+        let policy = capyctl_config::groups_policy::host_groups_policy(&target.trusted_host)
+            .map_err(ManagedConfigurationError::Rejected)?;
+        if policy.peer_address.is_none() {
+            return Err(ManagedConfigurationError::Rejected(
+                GroupRefusal::PeerAddressMissing.at(
+                    "placement.hosts",
+                    &format!("host `{name}` declares no resource_policy.groups.peer_address"),
+                ),
+            ));
+        }
+        members.push(target);
+    }
+    Ok(members)
+}
+
+/// ADR 0028 §2, spec §16: why one named host of a group did not resolve. A
+/// profile that does not resolve there is `group_profile_mismatch`; any other
+/// configuration reason (an engine env name not approved on that host,
+/// `engine_env_not_approved:<name>`) is named as it is.
+fn group_member_error(host: &str, error: ManagedConfigurationError) -> ManagedConfigurationError {
+    match error {
+        ManagedConfigurationError::Rejected(error)
+            if matches!(
+                error.path.as_str(),
+                "runtime_profile" | "runtime_profile_revision"
+            ) =>
+        {
+            ManagedConfigurationError::Rejected(
+                capyctl_config::topology::GroupRefusal::ProfileMismatch.at(
+                    &error.path,
+                    &format!("the runtime profile does not resolve on host `{host}`"),
+                ),
+            )
+        }
+        other => other,
+    }
+}
+
+/// ADR 0028 §2: the members of one group run one build (else
+/// `group_profile_mismatch`), and the decision every host makes before a
+/// launch, Park or Restore (`EffectiveDeployment::deep_wake_refusal`, the
+/// capability gate) admits every member's resolution: one member refused
+/// refuses the group before anything is stored or reserved. `resolved` is in
+/// rank order, the head first.
+fn check_group_members(resolved: &[Resolved]) -> Result<()> {
+    let Some(head) = resolved.first() else {
+        return Err(ManagedConfigurationError::Invalid);
+    };
+    for member in resolved {
+        if member.effective.profile.engine != head.effective.profile.engine
+            || member.effective.profile.build_fingerprint
+                != head.effective.profile.build_fingerprint
+        {
+            return Err(ManagedConfigurationError::Rejected(
+                capyctl_config::topology::GroupRefusal::ProfileMismatch.at(
+                    "runtime_profile",
+                    &format!(
+                        "the runtime profile's build on host `{}` differs from the head's on `{}`",
+                        member.host_id, head.host_id
+                    ),
+                ),
+            ));
+        }
+        if let Some(reason) = member.effective.deep_wake_refusal() {
+            return Err(ManagedConfigurationError::Rejected(
+                capyctl_config::ConfigError::new(
+                    capyctl_config::ConfigErrorCode::UnsupportedCombination,
+                    "residency",
+                    format!(
+                        "{reason}: host `{}` cannot park and wake this group member",
+                        member.host_id
+                    ),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl crate::Store {
     /// Service-only trusted host configuration must contain the current persisted
     /// resource controls, not stale startup values. This never imports policy,
@@ -337,14 +435,21 @@ impl crate::Store {
         // canonical (first resolving) host is deterministic.
         // A host outside the allowed set is not a candidate at all (ADR 0013
         // §2: `placement.hosts` or the `host` shorthand, by id or by name).
-        let mut ordered: Vec<&HostTarget> = targets
-            .iter()
-            .filter(|t| {
-                instance_spec.placement.allows(&t.host_id)
-                    || instance_spec.placement.allows(&t.host_name)
-            })
-            .collect();
-        ordered.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+        let group = instance_spec.group.as_ref();
+        let ordered: Vec<&HostTarget> = match group {
+            None => {
+                let mut ordered: Vec<&HostTarget> = targets
+                    .iter()
+                    .filter(|t| {
+                        instance_spec.placement.allows(&t.host_id)
+                            || instance_spec.placement.allows(&t.host_name)
+                    })
+                    .collect();
+                ordered.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+                ordered
+            }
+            Some(shape) => group_members(shape, targets)?,
+        };
         let mut refusals = refused.to_vec();
         let mut resolved: Vec<Resolved> = Vec::new();
         let mut single_error = None;
@@ -372,6 +477,13 @@ impl crate::Store {
                             .map_err(ManagedConfigurationError::Rejected)?;
                     if let Some(object) = source.as_object_mut() {
                         for field in ["instances", "placement", "host"] {
+                            // ADR 0028 §2: a group member's recipe keeps
+                            // its rank-ordered host list, so it resolves as
+                            // the group it is; placement is outside the
+                            // recipe fingerprint either way.
+                            if field == "placement" && group.is_some() {
+                                continue;
+                            }
                             object.remove(field);
                         }
                     }
@@ -453,6 +565,11 @@ impl crate::Store {
                 Err(ManagedConfigurationError::Sql(error)) => {
                     return Err(ManagedConfigurationError::Sql(error))
                 }
+                // ADR 0028 §2: every named host of a group must resolve; one
+                // that does not refuses the whole deploy with its reason.
+                Err(error) if group.is_some() => {
+                    return Err(group_member_error(&host.host_id, error))
+                }
                 Err(error) => {
                     refusals.push(HostRefusal {
                         host_id: host.host_id.clone(),
@@ -461,6 +578,9 @@ impl crate::Store {
                     single_error.get_or_insert(error);
                 }
             }
+        }
+        if group.is_some() {
+            check_group_members(&resolved)?;
         }
         let Some(canonical) = resolved.first() else {
             // A single allowed host keeps the answer it always gave; with
