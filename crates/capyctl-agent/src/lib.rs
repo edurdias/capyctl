@@ -16,6 +16,8 @@ pub mod enrollment;
 pub mod gpu_memory;
 // ADR 0019: the domains a host reports and its start-time device check.
 pub mod device_domains;
+// ADR 0028 §7: the read-only host checks and peer address of a group member.
+pub mod host_checks;
 // ADR 0018 §3: the owner-only local control socket for engine add, remove
 // and list.
 pub mod control_socket;

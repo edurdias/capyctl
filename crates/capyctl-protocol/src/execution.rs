@@ -869,10 +869,34 @@ pub fn is_policy_refusal(reason: &str) -> bool {
     POLICY_REFUSALS.contains(&reason)
 }
 
+/// ADR 0028 §7, §16: the closed codes a host refuses a group Prepare with.
+/// The port codes name one nonzero port.
+pub const PREPARE_REFUSALS: &[&str] = &[
+    "group_profile_mismatch",
+    "group_checkpoint_mismatch",
+    "peer_address_not_local",
+    "host_tuning_missing:memlock",
+    "host_tuning_missing:infiniband",
+];
+
+/// Whether `reason` is a closed Prepare refusal: one of [`PREPARE_REFUSALS`],
+/// or `rendezvous_port_in_use:<port>` / `service_port_in_use:<port>`.
+pub fn is_prepare_refusal(reason: &str) -> bool {
+    PREPARE_REFUSALS.contains(&reason)
+        || ["rendezvous_port_in_use:", "service_port_in_use:"]
+            .iter()
+            .filter_map(|prefix| reason.strip_prefix(prefix))
+            .any(|port| {
+                port.bytes().all(|b| b.is_ascii_digit())
+                    && port.parse::<u16>().is_ok_and(|port| port != 0)
+            })
+}
+
 /// SPEC §13: a policy refusal is terminal evidence that nothing happened. A
 /// refused launch completed with no claim, no process and no usable model; a
-/// refused Park or Restore left the launch `unchanged`. No other action carries
-/// a refusal.
+/// refused Park or Restore left the launch `unchanged`. ADR 0028 §7: a refused
+/// Prepare carries one closed group code and claims nothing. No other action
+/// carries a refusal.
 fn validate_refusal(
     command: &MemberCommand,
     result: &pb::MemberExecutionResult,
@@ -884,20 +908,28 @@ fn validate_refusal(
         .residency
         .as_ref()
         .is_some_and(|r| r.state == "unchanged");
-    let shape = match &command.action {
-        MemberAction::LaunchSingle(_) => {
+    let (shape, closed) = match &command.action {
+        MemberAction::LaunchSingle(_) => (
             !result.claim_retained
                 && result.processes.is_empty()
-                && result.owned_handle == command.identity.command_id
+                && result.owned_handle == command.identity.command_id,
+            is_policy_refusal(&result.refused),
+        ),
+        MemberAction::Park { .. } | MemberAction::Restore { .. } => {
+            (unchanged, is_policy_refusal(&result.refused))
         }
-        MemberAction::Park { .. } | MemberAction::Restore { .. } => unchanged,
-        _ => false,
+        // ADR 0028 §7: Prepare has no process effect and claims nothing.
+        MemberAction::Prepare(_) => (
+            !result.claim_retained
+                && result.processes.is_empty()
+                && result.owned_handle.is_empty()
+                && result.binding_id.is_empty()
+                && result.incarnation.is_empty(),
+            is_prepare_refusal(&result.refused),
+        ),
+        _ => (false, false),
     };
-    if !shape
-        || !is_policy_refusal(&result.refused)
-        || result.state != "completed"
-        || result.model_usable
-    {
+    if !shape || !closed || result.state != "completed" || result.model_usable {
         return Err(GroupIdentityError);
     }
     Ok(())

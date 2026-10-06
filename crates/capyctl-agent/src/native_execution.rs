@@ -24,6 +24,7 @@ use capyctl_config::{
     effective::EffectiveDeployment, engine_policy::Engine, remote_roles::HostConfig,
 };
 use capyctl_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
+use capyctl_domain::group::GroupPlan;
 use capyctl_protocol::{
     execution::{DigestCheckpointPlan, MemberAction, MemberCommand, SingleLaunchPlan},
     pb,
@@ -786,6 +787,91 @@ impl NativeHostExecution {
         })
     }
 
+    /// ADR 0028 §7 (owner decision 10): read, never change. A group Prepare
+    /// answers whether this host's member of `plan` could launch now. It
+    /// journals nothing, spawns nothing and holds no port: every check reads a
+    /// file, a syscall or the checkpoint cache, and a port probe binds and
+    /// drops. A redelivery checks again. A failed check is a closed refusal in
+    /// a completed result, never a session failure.
+    async fn prepare_group(
+        &self,
+        command: &MemberCommand,
+        plan: &GroupPlan,
+    ) -> Result<pb::MemberExecutionResult, SessionError> {
+        if self.authorize(command).is_err()
+            || command.identity.deadline_ms <= capyctl_protocol::now_unix_ms()
+        {
+            return Err(SessionError);
+        }
+        let host = self.clone();
+        let checked = plan.clone();
+        let verdict = tokio::task::spawn_blocking(move || host.check_group(&checked))
+            .await
+            .map_err(|_| SessionError)?;
+        Ok(pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
+            refused: verdict.err().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    /// ADR 0028 §7: this host's checks of its member of `plan`, against its
+    /// own accepted document: the groups policy (peer address, `require_rdma`),
+    /// the profile table's build fingerprint, and the digest the checkpoint
+    /// cache already proves for the member's model path (never a full hash: an
+    /// unmeasured path is `group_checkpoint_mismatch`). Ports are probed on
+    /// the peer address, loopback and both wildcards (R15). Blocking; the `Err`
+    /// is one closed code.
+    pub(crate) fn check_group(
+        &self,
+        plan: &GroupPlan,
+    ) -> Result<crate::host_checks::CheckVerdict, String> {
+        let set = self.profiles.accepted();
+        let host = capyctl_config::remote_resources::local_host_document(&set.config.document).ok();
+        // ADR 0028 §3: the host's own resolved settings (flag > env > YAML >
+        // default), as written into its document at start.
+        let policy = host
+            .as_ref()
+            .and_then(|host| capyctl_config::groups_policy::host_groups_policy(host).ok())
+            .unwrap_or_default();
+        // The roots a checkpoint is measured under (ADR 0008): the sources
+        // store for a materialized source, the model store otherwise.
+        let roots = host
+            .as_ref()
+            .and_then(|host| capyctl_config::effective::normalize_host_policy(host).ok())
+            .map(|policy| {
+                (
+                    policy.model_sources.root(&policy.model_store).to_path_buf(),
+                    policy.model_store,
+                )
+            });
+        let facts = crate::host_checks::read_host_facts(std::path::Path::new("/"));
+        crate::host_checks::prepare_member(
+            plan,
+            &self.host_id,
+            &facts,
+            &policy,
+            crate::host_checks::port_free,
+            |path| {
+                let (sources, store) = roots.as_ref()?;
+                let path = std::path::Path::new(path);
+                let root = if path.starts_with(sources) {
+                    sources
+                } else {
+                    store
+                };
+                self.checkpoints.known_digest(root, path)
+            },
+            |name| {
+                set.config.profiles.get(name)?["build_fingerprint"]
+                    .as_str()
+                    .map(str::to_owned)
+            },
+        )
+    }
+
     /// Where a digest request's checkpoint lives on this host, from this host's
     /// approved document only.
     fn locate(
@@ -1167,6 +1253,10 @@ impl NativeHostExecution {
         if let MemberAction::MaterializeSource(plan) = &command.action {
             return self.materialize_source(&command, plan);
         }
+        // ADR 0028 §7: a group Prepare is checked here and never journaled.
+        if let MemberAction::Prepare(plan) = &command.action {
+            return self.prepare_group(&command, plan).await;
+        }
         // SPEC §13.2: fence and duplicate checks first (cheap), then the slow
         // half of admission outside the journal's locks. A replay or a fenced
         // command never measures anything; a refusal is the terminal answer.
@@ -1534,6 +1624,10 @@ impl LocalExecutionPolicy for NativeHostExecution {
             // owns; the journal binds it to that exact retained launch.
             MemberAction::Probe { .. } if command.identity.expected_state == "ready" => Ok(()),
             MemberAction::Inspect => Ok(()),
+            // ADR 0028 §7: a group Prepare (it always carries a group plan) has
+            // no process effect; this host's own checks decide its answer, and
+            // it is never journaled.
+            MemberAction::Prepare(_) => Ok(()),
             // SPEC §§9.1, 10: Park only a ready launch, Restore only a parked
             // one. The journal binds the named launch and asks
             // `authorize_residency` about its tier before anything is recorded.
@@ -1824,8 +1918,31 @@ impl SessionExecution for NativeHostExecution {
                 domain.residents.clear();
             }
         }
+        // ADR 0028 §3, §14: the host's peer address and check findings,
+        // read fresh for this report.
+        inventory.group = group_inventory(&set.config.document);
         Some(inventory)
     }
+}
+
+/// ADR 0028 §3, §14: what a host with a peer address publishes about group
+/// work: the address, every host tuning finding (warnings, and refusals under
+/// `require_rdma`) and `peer_address_not_local` when no local interface holds
+/// it. A host that declares no peer address publishes none, exactly as before
+/// groups existed. ADR 0028 §7 (owner decision 10): read, never change.
+fn group_inventory(document: &serde_json::Value) -> Option<pb::GroupInventory> {
+    let host = capyctl_config::remote_resources::local_host_document(document).ok()?;
+    let policy = capyctl_config::groups_policy::host_groups_policy(&host).ok()?;
+    let peer = policy.peer_address?;
+    let facts = crate::host_checks::read_host_facts(std::path::Path::new("/"));
+    let mut findings = crate::host_checks::tuning_findings(&facts, &policy);
+    if !crate::host_checks::peer_address_local(&facts, &policy) {
+        findings.push("peer_address_not_local".into());
+    }
+    Some(pb::GroupInventory {
+        peer_address: peer.to_string(),
+        findings,
+    })
 }
 
 /// The device domains of an approved host document, each with the nvidia-smi
@@ -3631,5 +3748,145 @@ mod tests {
             launch_failure(&result, None),
             "the engine exited before readiness"
         );
+    }
+
+    /// ADR 0028 §7 (owner decision 10): a group Prepare answers from this
+    /// host's own groups policy, profile table and checkpoint cache. A failed
+    /// check is a closed refusal in a valid completed result, a port held
+    /// outside CapyCTL is named, and nothing is journaled or claimed.
+    // T30 T29, Review Focus 2
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_prepare_refuses_with_closed_codes_and_journals_nothing() {
+        use capyctl_domain::group::{
+            member_id, GroupEngine, GroupTopology, MemberKey, MemberPlan, MemberRole,
+        };
+        use std::net::IpAddr;
+        // A non-loopback IPv4 address this machine holds stands for host A's
+        // peer address; without one only the address refusal is exercised.
+        let local = crate::host_checks::read_host_facts(std::path::Path::new("/"))
+            .local_addresses
+            .into_iter()
+            .find(|a| a.is_ipv4() && !a.is_loopback() && !a.is_unspecified());
+        let peer = local.unwrap_or_else(|| "192.0.2.10".parse().unwrap());
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, _, _) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                document["resource_policy"]["groups"] =
+                    serde_json::json!({"peer_address": peer.to_string()});
+            });
+        let models = root.path().join("models");
+        let digest = executor
+            .checkpoints
+            .measure(&models, &models.join("toy"))
+            .unwrap()
+            .manifest
+            .digest;
+        let model_path = models.join("toy").to_string_lossy().into_owned();
+        let plan = |peer: IpAddr, digest: &str, rendezvous: u16| {
+            let member = |rank: u32, host: &str, address: IpAddr| MemberPlan {
+                member: MemberKey {
+                    host_id: host.into(),
+                    member_id: member_id(rank),
+                },
+                rank,
+                role: if rank == 0 {
+                    MemberRole::Head
+                } else {
+                    MemberRole::Worker
+                },
+                profile_name: "local".into(),
+                profile_fingerprint: "vllm-build-1".into(),
+                checkpoint_fingerprint: digest.into(),
+                model_path: model_path.clone(),
+                devices: vec!["gpu0".into()],
+                peer_address: address,
+                service_port: (rank == 0).then(closed_port),
+                worker_port: None,
+            };
+            GroupPlan::new(
+                GroupEngine::Vllm,
+                vec![
+                    member(0, "host", peer),
+                    member(1, "host-b", "198.51.100.11".parse().unwrap()),
+                ],
+                GroupTopology {
+                    tensor_parallel: 2,
+                    pipeline_parallel: 1,
+                    local_ranks: 1,
+                },
+                rendezvous,
+                1,
+            )
+            .unwrap()
+        };
+        let run = |plan: GroupPlan| {
+            let executor = executor.clone();
+            async move {
+                let mut command = MemberCommand {
+                    identity: checkpoint_identity("prepare", "reserved"),
+                    action: MemberAction::Prepare(plan),
+                };
+                command.identity.payload_digest = command.canonical_digest();
+                let result = executor.execute(1, command.clone()).await.unwrap();
+                capyctl_protocol::execution::validate_result(&command, &result).unwrap();
+                result.refused
+            }
+        };
+        let free = closed_port();
+        assert_eq!(
+            run(plan("192.0.2.200".parse().unwrap(), &digest, free)).await,
+            "peer_address_not_local"
+        );
+        if local.is_some() {
+            let other = format!("sha256:{}", "0".repeat(64));
+            assert_eq!(
+                run(plan(peer, &other, free)).await,
+                "group_checkpoint_mismatch"
+            );
+            // Review Focus 2: held on the wildcard by something else.
+            let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let held = holder.local_addr().unwrap().port();
+            assert_eq!(
+                run(plan(peer, &digest, held)).await,
+                format!("rendezvous_port_in_use:{held}")
+            );
+            drop(holder);
+            // Without require_rdma the tuning only warns: the member passes.
+            assert_eq!(run(plan(peer, &digest, held)).await, "");
+        }
+        assert!(executor.journal.claimed_launches("").unwrap().is_empty());
+        // Another controller's Prepare is not answered at all.
+        let mut foreign = MemberCommand {
+            identity: checkpoint_identity("prepare", "reserved"),
+            action: MemberAction::Prepare(plan(peer, &digest, free)),
+        };
+        foreign.identity.controller_id = "other".into();
+        foreign.identity.payload_digest = foreign.canonical_digest();
+        assert!(executor.execute(1, foreign).await.is_err());
+    }
+
+    /// ADR 0028 §3, §14: only a host with a peer address publishes group
+    /// inventory; an address no local interface holds is a finding.
+    // T39 T29
+    #[test]
+    fn group_inventory_is_published_only_with_a_peer_address() {
+        let root = directory();
+        let mut document: serde_json::Value =
+            serde_json::from_str(&HostConfig::template(root.path())).unwrap();
+        assert_eq!(group_inventory(&document), None);
+        document["resource_policy"]["groups"] = serde_json::json!({"require_rdma": true});
+        assert_eq!(group_inventory(&document), None);
+        document["resource_policy"]["groups"]["peer_address"] = "192.0.2.10".into();
+        let group = group_inventory(&document).unwrap();
+        assert_eq!(group.peer_address, "192.0.2.10");
+        assert!(group
+            .findings
+            .contains(&"peer_address_not_local".to_string()));
+        assert!(group.findings.iter().all(|finding| {
+            finding == "peer_address_not_local"
+                || finding == "host_tuning_warning:compaction"
+                || finding.starts_with("host_tuning_missing:")
+        }));
     }
 }

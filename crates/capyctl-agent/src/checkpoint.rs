@@ -430,6 +430,30 @@ impl CheckpointVerifier {
         })
     }
 
+    /// ADR 0028 §7: the digest the cache already proves for this checkpoint,
+    /// checked exactly as `measure` reuses it (every stat identity unchanged,
+    /// every small file rehashed), and `None` whenever `measure` would have to
+    /// hash in full or cannot open it. It never hashes a large file, so a group
+    /// Prepare stays cheap; the full measurement is DigestCheckpoint's.
+    pub fn known_digest(&self, model_store: &Path, checkpoint: &Path) -> Option<String> {
+        let opened = open_checkpoint(model_store, checkpoint, Confinement::OwnRootOutside).ok()?;
+        let key = opened.checkpoint.to_string_lossy().into_owned();
+        let lock = self
+            .locks
+            .lock()
+            .ok()?
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _serialized = lock.lock().ok()?;
+        let cached = self.cached(&key)?;
+        let walked = walk(&opened).ok()?;
+        reuse(&opened, &walked, &cached)
+            .ok()
+            .flatten()
+            .map(|manifest| manifest.digest)
+    }
+
     fn cache_file(&self, key: &str) -> Option<PathBuf> {
         self.cache_dir.as_ref().map(|dir| {
             dir.join(format!(
