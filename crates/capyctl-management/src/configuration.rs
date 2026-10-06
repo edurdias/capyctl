@@ -87,6 +87,10 @@ pub enum ConfigurationFailure {
     CheckpointDigestPending,
     /// ADR 0014 §7: the checkpoint is not the declared or recorded one.
     CheckpointMismatch,
+    /// ADR 0014 §7: the checkpoint measured to its digest, but the revision's
+    /// memory does not resolve with the measured weights; the reason is the
+    /// resolution's own (`checkpoint_unusable`). A new revision is needed.
+    CheckpointUnusable(String),
     /// ADR 0008: activation waits for the declared remote model source.
     ModelSourcePending,
     /// ADR 0008: the declared remote model source failed terminally.
@@ -127,6 +131,18 @@ impl ConfigurationFailure {
                 };
                 return detailed(StatusCode::SERVICE_UNAVAILABLE, "host_ineligible", message);
             }
+            CheckpointUnusable(reason) => {
+                let message = format!(
+                    "The checkpoint measured to its digest, but this revision's memory does not resolve with the measured weights: {reason}. Deploy a corrected configuration (a new revision); `capyctl status deployment <name>` shows the reason"
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"api_version":"1","error":{
+                        "code":"checkpoint_unusable","message":message,"retryable":false,
+                        "operation_id":null,"details":{}}})),
+                )
+                    .into_response();
+            }
             ProfileNotPublished { profile, hosts } => {
                 // ADR 0018 §7: name the profile, each allowed host with what it
                 // publishes, and the fix. Deployments are never re-resolved
@@ -164,6 +180,7 @@ impl ConfigurationFailure {
             InvalidConfigReason { .. }
             | CapacityBlockedBecause(_)
             | HostIneligible(_)
+            | CheckpointUnusable(_)
             | ProfileNotPublished { .. } => {
                 unreachable!("answered above")
             }

@@ -77,6 +77,16 @@ weight file. `capyctl status deployment <name>` shows the declared and measured
 digests; set the field to the measured one, or leave it out and CapyCTL
 measures it. If the files changed on the host, restore them or deploy again.
 
+**A start refused `checkpoint_unusable` (exit 2).** The checkpoint measured to
+its digest, but the deployment's memory does not resolve with the weights it
+measured, for example a `memory.request` too small to leave a KV cache once
+the weights are counted. The message, and `Checkpoint  unusable` under
+`capyctl status deployment <name>`, give the reason. Deploy a corrected
+configuration (a larger `memory.request`, a smaller `kv_cache` or
+`context_length`, or no `memory.request` so CapyCTL sizes it). A card too
+small for the weights is refused `insufficient_device_memory` (exit 4)
+instead.
+
 **A launch refused `port_conflict`.** Another program listens on the engine port
 CapyCTL leased. Start again (the next start takes a free port), or give CapyCTL
 another range with `--engine-ports`.

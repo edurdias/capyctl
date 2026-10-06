@@ -170,8 +170,10 @@ pub(crate) fn migrate_v40(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 }
 
 /// SPEC §6, ADR 0014 §7: activation of a revision waits while its frozen
-/// resources depend on a digest still pending, and is refused while its
-/// checkpoint is known not to be the declared or recorded one.
+/// resources depend on a digest still pending, is refused while its
+/// checkpoint is known not to be the declared or recorded one, and is refused
+/// with the stored reason while its memory does not resolve with the measured
+/// weights.
 pub(crate) fn admit_start(
     tx: &Transaction<'_>,
     deployment: &str,
@@ -192,10 +194,18 @@ pub(crate) fn admit_start(
             "pending" => Err(LifecycleError::CheckpointDigestPending),
             // Discrete GPU design §11: a closed refusal the measured weights
             // met is the start's refusal (exit 4 for insufficient_device_memory).
-            "unusable" => match diagnostic.filter(|d| closed_refusal(d)) {
-                Some(reason) => Err(LifecycleError::CheckpointUnusable(reason)),
-                None => Err(LifecycleError::CheckpointMismatch),
-            },
+            // ADR 0014 §7: any other reason is a configuration the measured
+            // weights do not resolve; the digest matched, so never a mismatch.
+            "unusable" => {
+                let reason = diagnostic.unwrap_or_else(|| {
+                    "the memory request does not resolve with the measured weights".to_owned()
+                });
+                Err(if closed_refusal(&reason) {
+                    LifecycleError::CheckpointUnusable(reason)
+                } else {
+                    LifecycleError::CheckpointUnusableConfig(reason)
+                })
+            }
             "mismatch" => Err(LifecycleError::CheckpointMismatch),
             _ => Err(LifecycleError::CorruptStoredData),
         },
@@ -626,7 +636,8 @@ impl crate::Store {
             // fit is dropped as a placement option for this revision, never
             // the whole record. A host whose GPUs all drop, or whose own row
             // no longer resolves, is refused for the revision with a
-            // diagnostic; the revision is unusable only when no host resolves.
+            // diagnostic, whether or not another host resolves; the revision
+            // is unusable only when no host resolves.
             let devices: Vec<(String, String, String, String)> = tx
                 .prepare("SELECT host_id,device,effective_json,source_json FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,device")?
                 .query_map(params![deployment, revision], |r| {
@@ -638,7 +649,7 @@ impl crate::Store {
                 Vec<(EffectiveDeployment, String)>,
             > = Default::default();
             let mut multi_gpu = std::collections::BTreeSet::new();
-            // Written only once the revision is known to resolve somewhere.
+            // Written once it is known whether the revision resolves anywhere.
             type DeviceWrite = (String, String, Option<(String, String)>);
             let mut device_writes: Vec<DeviceWrite> = Vec::new();
             type HostWrite = (String, Option<(String, String, Option<String>)>);
@@ -718,35 +729,38 @@ impl crate::Store {
                     ))
                 }),
             };
+            // Each host and GPU row is written in this transaction either way:
+            // re-resolved where the weights resolve, refused where they do not.
+            // Nothing is reserved yet, so nothing is released.
+            for (host, device, write) in &device_writes {
+                match write {
+                    Some((json, fingerprint)) => tx.execute(
+                        "UPDATE host_device_effective_revisions SET effective_json=?5,fingerprint=?6 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                        params![deployment, revision, host, device, json, fingerprint],
+                    )?,
+                    None => tx.execute(
+                        "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                        params![deployment, revision, host, device],
+                    )?,
+                };
+            }
+            for (host, write) in &host_writes {
+                match write {
+                    Some((json, fingerprint, source)) => tx.execute(
+                        "UPDATE host_effective_revisions SET effective_json=?4,fingerprint=?5,source_json=COALESCE(?6,source_json) WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                        params![deployment, revision, host, json, fingerprint, source],
+                    )?,
+                    None => tx.execute(
+                        "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                        params![deployment, revision, host],
+                    )? + tx.execute(
+                        "UPDATE host_effective_revisions SET outcome='refused',effective_json=NULL,fingerprint=NULL,diagnostic='does_not_resolve' WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                        params![deployment, revision, host],
+                    )?,
+                };
+            }
             match canonical {
                 Ok(resolved) => {
-                    for (host, device, write) in &device_writes {
-                        match write {
-                            Some((json, fingerprint)) => tx.execute(
-                                "UPDATE host_device_effective_revisions SET effective_json=?5,fingerprint=?6 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
-                                params![deployment, revision, host, device, json, fingerprint],
-                            )?,
-                            None => tx.execute(
-                                "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
-                                params![deployment, revision, host, device],
-                            )?,
-                        };
-                    }
-                    for (host, write) in &host_writes {
-                        match write {
-                            Some((json, fingerprint, source)) => tx.execute(
-                                "UPDATE host_effective_revisions SET effective_json=?4,fingerprint=?5,source_json=COALESCE(?6,source_json) WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
-                                params![deployment, revision, host, json, fingerprint, source],
-                            )?,
-                            None => tx.execute(
-                                "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
-                                params![deployment, revision, host],
-                            )? + tx.execute(
-                                "UPDATE host_effective_revisions SET outcome='refused',effective_json=NULL,fingerprint=NULL,diagnostic='does_not_resolve' WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
-                                params![deployment, revision, host],
-                            )?,
-                        };
-                    }
                     let json = serde_json::to_string(&resolved)
                         .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
                     tx.execute(
@@ -760,14 +774,15 @@ impl crate::Store {
                 }
                 Err(error) => {
                     // Discrete GPU design §11: a closed refusal keeps its code
-                    // and numbers (bounded) so a start can be refused with it.
-                    let diagnostic = Some(error.detail.chars().take(512).collect::<String>())
-                        .filter(|detail| closed_refusal(detail))
-                        .unwrap_or_else(|| {
-                            "the derived memory request does not resolve with the measured \
-                             weights; replace the configuration"
-                                .to_owned()
-                        });
+                    // and numbers so a start is refused with it. ADR 0014 §7:
+                    // any other reason is kept as the resolution's own text
+                    // (its code, field and detail) so the operator learns why.
+                    let reason = if closed_refusal(&error.detail) {
+                        error.detail.clone()
+                    } else {
+                        error.to_string()
+                    };
+                    let diagnostic = reason.chars().take(512).collect::<String>();
                     tx.execute(
                         "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5 WHERE deployment_id=?1 AND revision=?2",
                         params![deployment, revision, digest, host_id, now_ms, diagnostic],

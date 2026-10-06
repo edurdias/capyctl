@@ -52,6 +52,22 @@ Unreleased.
   stored policy unchanged. See
   [configuration](configuration.md#standalone-parked-limit).
 
+## Checkpoints
+
+- **A checkpoint whose memory does not resolve says why.** When a model's
+  memory is sized from its weights and the measured weights do not fit the
+  configuration (for example a `memory.request` that leaves no KV cache),
+  every start answered `checkpoint_mismatch`, which is about a digest that
+  does not match, with no word of the real reason. The start is now refused
+  `checkpoint_unusable` with the reason (exit 2), for example
+  `the derived KV cache (request minus weights minus margin) is not positive`,
+  and `capyctl status deployment <name>` shows it under `Checkpoint`. A card
+  too small keeps `insufficient_device_memory` (exit 4). The host is also
+  shown as refused for that revision instead of resolved. Deploy a corrected
+  configuration; `checkpoint_mismatch` now means only that the digest differs.
+  A revision that became unusable before this release still reads the old
+  generic reason; deploy it again to see the real one.
+
 ## Standalone
 
 - **Standalone no longer parks an SGLang ModelOpt model it cannot wake.** A

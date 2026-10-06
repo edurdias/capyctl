@@ -367,7 +367,7 @@ pub enum LifecycleError {
     #[error("checkpoint digest pending")]
     CheckpointDigestPending,
     /// ADR 0014 §7: the checkpoint measured to a digest other than the declared
-    /// or recorded one, or its weights do not resolve the revision.
+    /// or recorded one. Only a digest disagreement is this refusal.
     #[error("checkpoint does not match its recorded digest")]
     CheckpointMismatch,
     /// Discrete GPU design §11 (found live on a 16 GB card): the measured
@@ -376,6 +376,12 @@ pub enum LifecycleError {
     /// is needed.
     #[error("{0}")]
     CheckpointUnusable(String),
+    /// ADR 0014 §7 (found live on a 16 GB card): the checkpoint measured to
+    /// its digest, but the revision's memory does not resolve with the
+    /// measured weights for a configuration reason, kept as the resolution's
+    /// own text; a corrected configuration (a new revision) is needed.
+    #[error("the measured checkpoint does not resolve this revision: {0}")]
+    CheckpointUnusableConfig(String),
     /// ADR 0008: the revision's declared remote model source is not yet
     /// materialized on any host; activation waits for it.
     #[error("model source pending")]

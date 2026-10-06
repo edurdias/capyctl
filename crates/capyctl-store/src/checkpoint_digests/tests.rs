@@ -289,8 +289,22 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
         .unwrap();
 }
 
+/// Each host row of one revision: host, outcome, diagnostic.
+fn host_rows(store: &Store, id: &str) -> Vec<(String, String, Option<String>)> {
+    store
+        .conn
+        .prepare("SELECT host_id,outcome,diagnostic FROM host_effective_revisions WHERE deployment_id=?1 AND revision=1 ORDER BY host_id")
+        .unwrap()
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 // T14 (P2): measured weights that leave no KV cache in a declared request make the
-// revision unusable; it never starts.
+// revision unusable; it never starts. The digest matched, so the start is
+// refused with the resolution's own reason, never `checkpoint_mismatch`, and
+// the host the revision resolved on is refused for it too.
 #[test]
 fn weights_that_do_not_fit_a_declared_request_make_the_revision_unusable() {
     let (store, session, mut config, host) = setup();
@@ -298,6 +312,7 @@ fn weights_that_do_not_fit_a_declared_request_make_the_revision_unusable() {
     config["engine_config"] = json!({"memory": {"request": "10GiB"}});
     let receipt = deploy(&store, &session, "tight", &config, &host);
     let id = &receipt.deployment_id;
+    assert_eq!(host_rows(&store, id)[0].1, "resolved");
     assert_eq!(
         store
             .record_checkpoint_digest(&session, id, 1, "lab", DIGEST, 4 << 30, 2)
@@ -306,11 +321,156 @@ fn weights_that_do_not_fit_a_declared_request_make_the_revision_unusable() {
     );
     let record = store.checkpoint_digest(id, 1).unwrap().unwrap();
     assert_eq!(record.state, DigestState::Unusable);
-    assert!(record.diagnostic.is_some());
+    let diagnostic = record.diagnostic.unwrap();
+    assert!(diagnostic.contains("engine_config.memory"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("replace the configuration"),
+        "{diagnostic}"
+    );
+    match store.accept_start(&session, &fence(&receipt), 100, 100_100) {
+        Err(LifecycleError::CheckpointUnusableConfig(reason)) => assert_eq!(reason, diagnostic),
+        other => panic!("expected the configuration reason, got {other:?}"),
+    }
+    assert_eq!(
+        host_rows(&store, id),
+        vec![(
+            "lab".to_owned(),
+            "refused".to_owned(),
+            Some("does_not_resolve".to_owned())
+        )]
+    );
+}
+
+fn device_rows(store: &Store, id: &str) -> i64 {
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM host_device_effective_revisions WHERE deployment_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+// T14 T26 (found live on the 16 GB discrete-GPU laptop host with 0.1.1, vLLM
+// 0.29, an 8B FP8 checkpoint of 10,605,572,552 bytes, a device domain
+// managing 15,797,762,136 bytes, a declared `memory.request`): once
+// measured, the revision was unusable with a generic diagnostic, every start
+// answered `checkpoint_mismatch` for a digest that matched, and the host row
+// still read `resolved`. (0.1.1 sized a declared device request with the
+// 8 GiB family margin; since 0.1.2 its margin is the weights x 0.10, so 12 GiB
+// resolves and 10 GiB does not.) The start is refused with the reason the
+// re-resolution met, and the host and each of its GPUs are refused for the
+// revision in the same transaction.
+#[test]
+fn a_declared_request_the_measured_weights_do_not_resolve_names_its_reason() {
+    const WEIGHTS: i64 = 10_605_572_552;
+    let value: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
+    let (mut config, mut host) = (value["deployment"].clone(), value["host"].clone());
+    let gpu = json!({"memory": "device", "managed_limit": "15797762136B",
+                     "free_reserve": "1GiB", "parked_limit": "2GiB"});
+    let (mut gpu0, mut gpu1) = (gpu.clone(), gpu);
+    gpu0["device"] = json!("gpu0");
+    gpu1["device"] = json!("gpu1");
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
+        "gpu0": gpu0, "gpu1": gpu1
+    });
+    host["resource_policy"]["devices"] = json!({
+        "gpu0": {"domain": "gpu0", "sharing": "shared"},
+        "gpu1": {"domain": "gpu1", "sharing": "shared"}
+    });
+    host["runtime_profiles"]["local"]["args"] = json!([]);
+    for field in ["resources", "devices"] {
+        config.as_object_mut().unwrap().remove(field);
+    }
+    config["residency"] = json!("deep");
+    let store = Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let mut sized = config.clone();
+    sized["engine_config"] = json!({"memory": {"request": "10GiB", "kv_cache": "2GiB"}});
+    let effective = capyctl_config::effective::resolve_effective(&sized, &host).unwrap();
+    // Each card's 16,376 MiB.
+    let observation = |domain: &str, bytes: i64| capyctl_domain::resources::MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: bytes,
+        available_bytes: bytes,
+        sampled_at_ms: 1,
+    };
+    store
+        .import_resource_policy(
+            &session,
+            &effective.host,
+            &[
+                observation("gpu0", 16_376 << 20),
+                observation("gpu1", 16_376 << 20),
+                observation("system", 64 << 30),
+            ],
+            1,
+        )
+        .unwrap();
+    let deploy_with = |name: &str, request: &str| {
+        let mut config = config.clone();
+        config["name"] = json!(name);
+        config["routes"] = json!([name]);
+        config["engine_config"] = json!({"memory": {"request": request}, "context_length": 16384});
+        let receipt = deploy(&store, &session, name, &config, &host);
+        let record = store
+            .checkpoint_digest(&receipt.deployment_id, 1)
+            .unwrap()
+            .unwrap();
+        assert!(record.provisional);
+        assert_eq!(device_rows(&store, &receipt.deployment_id), 2);
+        receipt
+    };
+    let fits = deploy_with("fits", "12GiB");
     assert!(matches!(
-        store.accept_start(&session, &fence(&receipt), 100, 100_100),
-        Err(LifecycleError::CheckpointMismatch)
+        store
+            .record_checkpoint_digest(&session, &fits.deployment_id, 1, "lab", DIGEST, WEIGHTS, 2)
+            .unwrap(),
+        RecordOutcome::Recorded { .. }
     ));
+    let short = deploy_with("short", "10GiB");
+    let id = &short.deployment_id;
+    assert_eq!(
+        store
+            .record_checkpoint_digest(&session, id, 1, "lab", DIGEST, WEIGHTS, 2)
+            .unwrap(),
+        RecordOutcome::Unusable
+    );
+    let record = store.checkpoint_digest(id, 1).unwrap().unwrap();
+    assert_eq!(record.state, DigestState::Unusable);
+    let diagnostic = record.diagnostic.unwrap();
+    assert_eq!(
+        diagnostic,
+        "unsupported combination at `engine_config.memory.kv_cache`: the derived KV cache \
+         (request minus weights minus margin) is not positive"
+    );
+    assert!(diagnostic.chars().count() <= 512, "{diagnostic}");
+    match store.accept_start(&session, &fence(&short), 100, 100_100) {
+        Err(LifecycleError::CheckpointUnusableConfig(reason)) => assert_eq!(reason, diagnostic),
+        other => panic!("expected the configuration reason, got {other:?}"),
+    }
+    assert_eq!(
+        host_rows(&store, id),
+        vec![(
+            "lab".to_owned(),
+            "refused".to_owned(),
+            Some("does_not_resolve".to_owned())
+        )]
+    );
+    assert_eq!(device_rows(&store, id), 0);
+    // A later report from the measuring host changes nothing.
+    assert_eq!(
+        store
+            .record_checkpoint_digest(&session, id, 1, "lab", DIGEST, WEIGHTS, 3)
+            .unwrap(),
+        RecordOutcome::Unusable
+    );
 }
 
 // T26 (discrete GPU design §11): found live on the 16 GB discrete-GPU laptop

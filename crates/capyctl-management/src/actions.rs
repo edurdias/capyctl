@@ -856,6 +856,9 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // Discrete GPU design §11: `insufficient_device_memory: ...`
             // travels in the message, which the CLI maps to its exit.
             LifecycleError::CheckpointUnusable(reason) => F::CapacityBlockedBecause(reason),
+            // ADR 0014 §7: the digest matched; the configuration does not
+            // resolve with the measured weights. Never `checkpoint_mismatch`.
+            LifecycleError::CheckpointUnusableConfig(reason) => F::CheckpointUnusable(reason),
             // ADR 0008.
             LifecycleError::ModelSourcePending => F::ModelSourcePending,
             LifecycleError::ModelSourceFailed => F::ModelSourceFailed,
@@ -1232,6 +1235,46 @@ mod tests {
         )))
         .await;
         assert_eq!(error["code"], "reconciliation_required", "{error}");
+    }
+
+    /// ADR 0014 §7 (found live on a 16 GB card): a revision whose memory does
+    /// not resolve with the measured weights is refused with the reason, as
+    /// `checkpoint_unusable` (a configuration refusal), never
+    /// `checkpoint_mismatch`; a closed refusal keeps its code in the message,
+    /// and a digest disagreement stays `checkpoint_mismatch`.
+    // T14 T26
+    #[tokio::test]
+    async fn an_unusable_checkpoint_is_refused_with_its_reason() {
+        let body = |error: LifecycleError| async move {
+            let response = command_failure(CoordinatorCommandError::Lifecycle(error)).response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, value["error"].clone())
+        };
+        let reason = "unsupported combination at `engine_config.memory.kv_cache`: the derived KV \
+                      cache (request minus weights minus margin) is not positive";
+        let (status, error) = body(LifecycleError::CheckpointUnusableConfig(reason.into())).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(error["code"], "checkpoint_unusable", "{error}");
+        assert_eq!(error["retryable"], false, "{error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(reason), "{message}");
+        assert!(!message.contains("does not match"), "{message}");
+        let (status, error) = body(LifecycleError::CheckpointUnusable(
+            "insufficient_device_memory: the deployment needs 21 bytes".into(),
+        ))
+        .await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["code"], "capacity_blocked", "{error}");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("insufficient_device_memory:"));
+        let (_, error) = body(LifecycleError::CheckpointMismatch).await;
+        assert_eq!(error["code"], "checkpoint_mismatch", "{error}");
     }
 
     /// SPEC §6.3: after an accepted wake, only "every instance already holds a
