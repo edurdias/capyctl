@@ -42,8 +42,9 @@ From 2026-09-25, still valid:
 1. **Engines.** Engine virtual environments are registered with `capyctl engine add
    --name`, the same name on every host. Bring-up first uses a model the stock
    engine loads.
-2. **Residency.** Deep park is supported from day one: group-wide sleep and wake with
-   evidence from every rank.
+2. **Residency, amended 2026-10-06.** vLLM and SGLang groups deep-park from day one:
+   group-wide sleep and wake with evidence from every rank. TensorFold groups are
+   restart-only (no sleep or wake), as the engine's group-support data says.
 3. **Peer exposure.** Trust the network. CapyCTL does no firewall check. Rendezvous
    and NCCL ports are open on all interfaces during a run. CapyCTL binds to the
    direct link where the engine allows it. Recorded as a known risk.
@@ -68,7 +69,8 @@ From 2026-09-25, still valid:
     TensorFold 0.6.5. Ideally every catalog model runs on every engine that can
     serve it.
 13. **Success bar.** Through the router, within about 10% of the reference recipe's
-    averages. Peaks are reported, not required.
+    averages. Peaks are reported, not required. For vLLM the reference is a
+    same-build baseline (decided 2026-10-06; §17.2).
 
 Engine environment (2026-09-25): settings an engine reads only from the
 environment are declared in YAML (the profile's `env`, the deployment's
@@ -148,13 +150,16 @@ Rules, checked at deploy time (codes in §16):
 - The engine must support the shape (`group_shape_unsupported:<engine>`, table
   below). A standalone role refuses a topology (`group_placement_required`: one
   host).
+- Shapes beyond two hosts and PP > 1 are allowed, with no gate and no warning,
+  wherever the engine's support data admits them (decided 2026-10-06). Live
+  qualification covers two hosts.
 
 | Shape and feature | vLLM 0.30.0 | SGLang 0.5.21 | TensorFold 0.6.5 |
 |---|---|---|---|
 | TP across hosts | yes | yes | `tp` 2 only |
 | PP across hosts | yes | yes | no |
 | Hosts | any N dividing TP × PP | any N dividing TP × PP | exactly 2 |
-| Deep park | yes (sleep mode on every rank) | yes (memory saver on every rank), gated by live proof | no (restart-only engine) |
+| Deep park | yes (sleep mode on every rank) | yes (memory saver on every rank) | no (restart-only engine) |
 | Worker listens on | nothing (headless) | a loopback dummy health port | nothing |
 
 The effective revision of a group records the per-host resolutions it was built
@@ -271,9 +276,12 @@ written durably with the reservation (§5) before any host is contacted.
    on a mismatch.
 3. The store's checkpoint digest record is keyed by deployment and revision with one
    host today; it becomes one row per host.
-4. Each member's own `model_path` goes into the plan. If live bring-up shows an
-   engine needs the same path on every node, preparation refuses differing paths
-   (`group_model_path_mismatch`). That is a live finding, not an assumption.
+4. Each member's own `model_path` goes into the plan. Before the reservation, a
+   SGLang group with deep park whose members' paths differ is refused
+   (`group_model_path_mismatch`, naming the head's path and the member's path):
+   CapyCTL's SGLang wake posts the head's path to every rank (§12). Nothing is
+   reserved, so nothing is released. Restart-only SGLang groups, vLLM and TensorFold
+   keep differing paths (decided 2026-10-06).
 
 ### 7. Prepare and host checks
 
@@ -281,7 +289,12 @@ After the reservation commits, `Prepare(GroupPlan)` goes to every member. It has
 process effect. Each host checks: the profile resolves with the recorded
 fingerprint; the model path holds the recorded digest; the peer address is local; on
 the head, the rendezvous port is free on the peer address and the service port on
-loopback; on a SGLang worker, its loopback port is free; and the host tuning:
+loopback; on the head of a SGLang group whose deployment enables DP attention, also
+the six ports SGLang derives from the rendezvous port `P` and binds there (`P+1` to
+`P+6`, or `P-7` to `P-2` when `P+7` exceeds 65535, as SGLang 0.5.21 computes them;
+checked when the `Launch` re-runs these checks, because only the `Launch` carries the
+deployment document); on a SGLang worker, its loopback port is free; and the host
+tuning:
 
 | Check | How | Default | `require_rdma: true` |
 |---|---|---|---|
@@ -310,12 +323,18 @@ to launch, or exiting before readiness, stops the group (§11).
 ### 9. Readiness and the router
 
 The group is READY when the head passes the existing native readiness check for its
-engine (model readiness, not HTTP liveness). A TP or PP forward cannot complete
-without every rank, so a passing head check implies the collective works. Worker
-hosts never probe readiness; SGLang's nonzero-rank health server always answers 200
-and is never read. The router routes only to the head's ingress, opens the route
-only on READY (T30), and treats a group as one replica in balancing and failover.
-The initialization timeout is the deployment's `timeouts.initialize`.
+engine (model readiness, not HTTP liveness) and then one bounded 1-token completion
+through the head (decided 2026-10-06). A TP or PP forward cannot complete without
+every rank, so the completion proves the collective works. A failed or timed-out
+probe is a launch failure and stops the group (§11). The controller sends the probe
+to the head's agent as an additive extension of the existing member probe; the agent
+runs it on loopback with the per-launch key and returns the generated token ids. It
+never goes through ingress or the router, and worker hosts never receive one. One probe
+function serves readiness, the request-stall check (§11) and the wake canary (§12).
+Worker hosts never probe readiness; SGLang's nonzero-rank health server always
+answers 200 and is never read. The router routes only to the head's ingress, opens
+the route only on READY (T30), and treats a group as one replica in balancing and
+failover. The initialization timeout is the deployment's `timeouts.initialize`.
 
 ### 10. Engine adapters: one mechanism, three renderings
 
@@ -388,9 +407,19 @@ Per-engine notes:
   journaled process tree with the existing SIGTERM, bounded wait, SIGKILL escalation,
   and reports gone-evidence. An escalation on a SGLang worker is expected and
   recorded, not an error.
-- **Rank failure.** Any member's exit, launch failure or failed readiness marks the
-  group failed (`group_member_failed`, with host and node rank) and stops every other
-  member. No rank replacement: an NCCL group cannot re-admit a rank.
+- **Rank failure.** Any member's exit, launch failure or failed readiness (the
+  readiness probe included) marks the group failed (`group_member_failed`, with host
+  and node rank) and stops every other member. No rank replacement: an NCCL group
+  cannot re-admit a rank.
+- **Request stall** (decided 2026-10-06). Most group faults leave every process
+  alive (a dropped link, a GPU fault, a rank stuck in NCCL). When a group request gets
+  no first token within the stall timeout, the controller runs one probe through the
+  head (§9), bounded at 60 s. If the probe fails too, the group is failed
+  (`group_stalled`) and stopped on every host; if it passes, nothing is stopped. An
+  idle group is never probed: there is no periodic polling. The timeout is a server
+  setting, three ways: `groups.stall_timeout` in the server document,
+  `--group-stall-timeout` on `capyctl start server`, `CAPYCTL_GROUP_STALL_TIMEOUT`;
+  default 120 s.
 - **Settlement.** Each member's reservation is released only on its own host's
   gone-evidence. The instance leaves its lifecycle step only when every member has
   settled.
@@ -419,12 +448,21 @@ loopback control endpoint. Workers never receive a sleep call.
   fails the park. Either stops the group. The collective is never repeated.
 - **Wake.** The head calls `/wake_up` or `/resume_memory_occupation`; every host
   reports its member resident again; the head readiness check passes; and the canary
-  matches: a short deterministic completion (`temperature: 0`, 8 tokens) whose tokens
-  equal the reference recorded at first readiness. A mismatch is `group_wake_mismatch`
-  and stops the group, which relaunches under recovery.
-- **TensorFold, and SGLang if the live proof fails.** `restart_only`: park is a group
-  stop, wake a group relaunch; `residency: deep` is refused
-  `capability_missing:deep_park` at deploy.
+  matches: a short deterministic completion through the head probe (§9,
+  `temperature: 0`, 8 tokens) whose tokens equal exactly the reference recorded at
+  first readiness, compared by one function. A mismatch is `group_wake_mismatch` and
+  stops the group, which relaunches under recovery. The exact-token rule is revisited
+  at MN4 with live evidence (decided 2026-10-06).
+- **SGLang wake path.** CapyCTL's SGLang wake posts the head's model path, and every
+  rank loads it from its own disk, which is why differing paths are refused for a
+  deep SGLang group (§6).
+- **Restart-only groups.** Park and wake follow the deployment's effective residency,
+  not the engine. A group whose effective residency is `restart_only`, on any engine,
+  parks by a group stop and wakes by a group relaunch. TensorFold supports only
+  `restart_only`, so that is its default; `residency: deep` on a TensorFold group is
+  refused `capability_missing:deep_park` at deploy. A `deep` group uses the collective
+  park and wake above. SGLang groups have no restart-only fallback (decided
+  2026-10-06): MN4's evidence revisits only the canary rule.
 - Parked members stay charged at their parked budget on their own hosts; `max_parked`
   counts a group once on each host it occupies.
 
@@ -437,7 +475,8 @@ loopback control endpoint. Workers never receive a sleep call.
 - Engines also open listeners CapyCTL does not choose: the torch TCP store on the
   rendezvous port binds every interface; vLLM's broadcast queue binds an ephemeral
   port on `VLLM_HOST_IP`; TensorFold Flash Next under `--parallel` opens one extra
-  ephemeral port on rank 0; NCCL uses dynamic ports. None is authenticated.
+  ephemeral port on rank 0; SGLang with DP attention binds six ports derived from the
+  rendezvous port on the head (§7); NCCL uses dynamic ports. None is authenticated.
 - CapyCTL narrows what it can: it renders the direct-link addresses where the engine
   takes them (head address, `VLLM_HOST_IP`, `SGLANG_HOST_IP`), keeps every API and
   control endpoint on loopback, and exposes nothing through ingress or the router.
@@ -484,8 +523,11 @@ flash-next   ready   sglang 0.5.21   TP 2 x PP 1 on 2 hosts
 ```
 
 A failed member shows `failed` with its last error; an unreachable host's member
-shows `uncertain` and keeps its charge. `capyctl validate config` resolves a group
-deployment against every named host document given with `--host`.
+shows `uncertain` and keeps its charge. `capyctl validate config --host <host
+document>`, with `--host` repeated once per named host, resolves a group deployment
+against every named host's document: peer address, profile resolution and build
+fingerprint, and engine environment approvals, with the deploy-time codes of §16
+(decided 2026-10-06).
 
 ### 16. Error codes
 
@@ -498,7 +540,7 @@ deployment against every named host document given with `--host`.
 | `group_instances_unsupported` | deploy | 5 | `instances` > 1 with a topology |
 | `group_profile_mismatch` | deploy, prepare | 2 | the profile does not resolve on a named host, or its build differs |
 | `group_checkpoint_mismatch` | weights, prepare | 2 | checkpoint digests differ between hosts |
-| `group_model_path_mismatch` | prepare | 2 | only if live bring-up shows an engine needs equal paths |
+| `group_model_path_mismatch` | weights, before reservation | 2 | a SGLang group with deep park whose members' model paths differ; names the head's path and the member's path |
 | `peer_address_missing` | deploy | 2 | a named host declares no peer address |
 | `peer_address_not_local` | host start, prepare | 2 | the declared address is not on a local interface |
 | `rendezvous_ports_exhausted` | reservation | 4 | every port in the head's range is held |
@@ -513,6 +555,7 @@ deployment against every named host document given with `--host`.
 | `group_member_failed` | status | none | a member exited or failed; carries host and node rank |
 | `group_member_uncertain` | status | none | a member's host is unreachable; its share stays charged |
 | `group_wake_mismatch` | wake | none | the post-wake canary differed |
+| `group_stalled` | serving | none | a group request got no first token within the stall timeout and the head probe failed too; the group is stopped |
 | `host_capability_missing:engine_groups` | placement | 5 | a named host cannot run group members |
 
 Existing codes keep their meaning (`insufficient_space`, the insufficient-resources
@@ -564,14 +607,16 @@ on both hosts under one name with equal build fingerprints.
 | MN6 | each engine | kill the head's engine | same as MN5 |
 | MN7 | one engine | stop host B's agent service while READY | host B's share stays charged and uncertain; settles after the agent returns |
 | MN8 | one engine | the group and a single-rank deployment on host A alternate | eviction covers both hosts whole; correct release evidence |
-| MN9 | each engine that loads it | Qwen3.8-Flash-Next at TP 2, concurrency sweep 1–64 through the router | averages within about 10% of that engine's reference recipe; peaks reported |
+| MN9 | each engine that loads it | Qwen3.8-Flash-Next at TP 2, concurrency sweep 1–64 through the router | averages within about 10% of that engine's reference; peaks reported |
 
 Bring-up models (smallest that each engine loads at two ranks): Qwen3-30B-A3B for
 vLLM and SGLang (already mirrored on both hosts); Nemotron 3.5 Lightning 30B-A3B
 MLX 4-bit for TensorFold (one or two ranks in the 0.6.5 family table). MN9
-references: the published two-Spark vLLM recipe (about 95 tok/s at 1 stream, 735 at
-64), the SGLang cookbook's two-Spark TP 2 cells, and TensorFold's two-rank Flash Next
-numbers from its recipe page.
+references (decided 2026-10-06 for vLLM): for vLLM, a same-build baseline, stock
+vLLM 0.30.0 launched directly on the same two hosts with the environment CapyCTL
+renders; the published two-Spark vLLM recipe (about 95 tok/s at 1 stream, 735 at 64)
+is shown for reference only. For SGLang, the cookbook's two-Spark TP 2 cells; for
+TensorFold, its two-rank Flash Next numbers from its recipe page.
 
 **Catalog models on two or more machines, by engine** (from the model pins and the
 installed builds' source; "class present" means the engine has the architecture,
@@ -605,8 +650,10 @@ environments only. Rows for 3+ hosts (14, 15, 16) need rented machines.
   table.
 - `docs/examples/deployment-multinode.yaml` becomes a real two-host TP 2 group
   example; the current spread example moves to `deployment-spread.yaml`.
-- Release notes of the release that ships it; the status runbook records each
-  live row.
+- Release notes of the release that ships it, listing exactly which catalog models
+  run as groups on which engines and naming the next milestones: container launchers
+  and a live row of three or more hosts on rented machines (decided 2026-10-06). The
+  status runbook records each live row.
 
 ### 19. ADR and amendments
 
@@ -632,9 +679,9 @@ environments only. Rows for 3+ hosts (14, 15, 16) need rented machines.
    after the evidence, not now.
 2. **SGLang group deep park.** Decision 2 says deep park from day one, but SGLang's
    cross-node release and resume is inferred from source, not run.
-   *Recommendation:* build it; if MN4 fails for SGLang, ship SGLang groups as
-   `restart_only` (`capability_missing:deep_park`) rather than hold the release. vLLM
-   deep; TensorFold is restart-only in any case.
+   *Recommendation:* build it. vLLM deep; TensorFold is restart-only in any case.
+   Decided 2026-10-06 (ADR 0028): SGLang groups deep-park with no restart-only
+   fallback; MN4's evidence revisits only the canary rule.
 3. **Bring-up and benchmark models.** *Recommendation:* Qwen3-30B-A3B for vLLM and
    SGLang bring-up (already on both hosts); Nemotron 3.5 Lightning 30B-A3B MLX 4-bit
    for TensorFold; Qwen3.8-Flash-Next for MN9 on all three, which needs two
@@ -651,8 +698,8 @@ environments only. Rows for 3+ hosts (14, 15, 16) need rented machines.
 
 ### From 2026-10-04 review
 
-Findings from the document review of 2026-10-04, deferred for the owner. None of them is
-applied above.
+Findings from the document review of 2026-10-04. The adopted ones are recorded in
+ADR 0028; the ones the owner decided on 2026-10-06 are also applied above.
 
 - **Group plan cannot precede host materialization** — §4 Group plan / §6 Weights (P1, whole-document (independent pass), coherence, confidence 100)
 
@@ -672,7 +719,10 @@ applied above.
   authoritative; explicitly limiting the binding decision to engines with collective
   sleep support makes TensorFold's documented restart behavior implementable.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028): decision 2 now names vLLM and SGLang groups as
+  deep-parking from day one, with no restart-only fallback for SGLang, and TensorFold
+  groups are restart-only from the engine's group-support data. Park and wake follow
+  the deployment's effective residency (§12).
 
 - **World-size-one topology has conflicting placement semantics** — §2 Deployment configuration (P1, whole-document (independent pass), confidence 100)
 
@@ -693,7 +743,8 @@ applied above.
   to PP staging or three-plus-host failure fan-out. Gating supported shapes to
   live-qualified rows keeps the exposed capability aligned with available evidence.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028 §2): shapes beyond two hosts and PP > 1 stay allowed
+  with no gate and no warning; support stays data-driven per engine.
 
 - **Engine environment lacks required environment-variable inputs** — §2.1 Engine environment / §18 Documentation (P1, whole-document (independent pass), confidence 100)
 
@@ -728,7 +779,9 @@ applied above.
   produces one. MN4 runs only 5 cycles, which is too few to measure that
   false-positive rate.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028 §12): the exact-token canary stays (`temperature: 0`,
+  8 tokens, reference at first readiness), compared by one function so the rule can
+  change in one place; it is revisited at MN4 with live evidence.
 
 - **Stated problem (catalog models 8-16) is mostly unsolved by this milestone** — Problem; §17.2 catalog table (P1, adversarial, adversarial (independent pass), scope-guardian, confidence 75)
 
@@ -740,7 +793,9 @@ applied above.
   downstream integration would then see the 'multi-machine serving' gap as closed
   when it is not.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028): the release docs and release notes list exactly
+  which catalog models run as groups on which engines, and name container launchers
+  and a live row of three or more hosts on rented machines as the next milestones.
 
 - **Unset GLOO interface binds loopback on default Ubuntu hosts** — §10 Engine adapters (common rules); Open question 1 (P1, feasibility, confidence 75)
 
@@ -777,7 +832,9 @@ applied above.
   feasibility would make the refusal unconditional for SGLang groups with deep
   residency; scope-guardian would remove the code until a live row needs it.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028 §6): refuse. A SGLang group with deep park whose
+  members' model paths differ is refused `group_model_path_mismatch` (exit 2) before
+  the reservation, naming both paths; restart-only SGLang groups are not refused.
 
 - **No detection for a hung rank or failed interconnect after READY** — §9 Readiness and the router; §11 Stop, failure and settlement (P1, adversarial, confidence 75)
 
@@ -789,7 +846,10 @@ applied above.
   this case ('a rank exit leaves the others alive but not serving (as NCCL hangs)'),
   but nothing in the lifecycle acts on it.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028 §11): a group request with no first token within the
+  stall timeout triggers one bounded probe through the head; if it fails too, the
+  group fails with `group_stalled` and is stopped on every host. No periodic idle
+  polling.
 
 - **Per-member park evidence skips SGLang's saver-map contract** — §12 Park and wake (P1, feasibility, confidence 75)
 
@@ -851,7 +911,9 @@ applied above.
   completes an actual distributed forward pass. Requiring a bounded inference probe
   before READY directly tests the property on which routing depends.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028 §9): before READY the controller runs one bounded
+  1-token completion through the head; a failure is a launch failure and stops the
+  group.
 
 - **Port held by another process is drawn again on every retry** — §5 Rendezvous port; §7 Prepare (P1, feasibility, adversarial, adversarial (independent pass) (+1 anchor), confidence 100)
 
@@ -876,7 +938,10 @@ applied above.
   and the row cannot tell which, so the pass/fail result would not support the
   release decision.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028): the vLLM bar is a same-build baseline, stock vLLM
+  0.30.0 launched directly on the same two hosts with the environment CapyCTL
+  renders, and CapyCTL must be within about 10% of it; the published recipe is shown
+  for reference only.
 
 - **require_rdma summary says host checks refuse; compaction never does** — Owner decisions (carried forward) vs §7 table (P2, coherence, confidence 75)
 
@@ -895,7 +960,8 @@ applied above.
   fix, no adjacent features' rule. It adds multi-document loading, per-host profile
   resolution and its own error surface to build and test.
 
-  Held for the owner.
+  Decided 2026-10-06 (ADR 0028): build it as §15 describes; `--host` is repeated once
+  per named host.
 
 ## Known risks
 
