@@ -108,6 +108,9 @@ pub struct PlanInputVllm {
     /// by its index in PCI bus order). `None` keeps the agent's own
     /// pass-through (a one-device unified host).
     pub cuda_namespace: Option<capyctl_config::effective::CudaNamespace>,
+    /// ADR 0028 §10: this member's multi-node arguments; `None` is a
+    /// single-rank launch, rendered exactly as before (T39).
+    pub group: Option<crate::group::GroupMemberArgs>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -147,6 +150,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
             .field("cuda_namespace", &self.cuda_namespace)
+            .field("group", &self.group)
             .finish()
     }
 }
@@ -287,14 +291,19 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         argv.push(flag.to_string());
         argv.push(value);
     }
+    // ADR 0028 §10: a group worker is headless — no listener, served name, key
+    // or middleware. Everything else keeps the single-rank rendering.
+    let headless = input.group.as_ref().is_some_and(|group| !group.is_head());
     // Spec §3: capyctl owns the listener address and the served name; a
     // profile's engine_args cannot set them (they are reserved flags).
-    push(&mut argv, "--host", "127.0.0.1".into());
-    push(
-        &mut argv,
-        "--served-model-name",
-        input.served_model_name.clone(),
-    );
+    if !headless {
+        push(&mut argv, "--host", "127.0.0.1".into());
+        push(
+            &mut argv,
+            "--served-model-name",
+            input.served_model_name.clone(),
+        );
+    }
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.
     push(
@@ -314,7 +323,9 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             (input.cpu_offload_bytes / (1024 * 1024 * 1024)).to_string(),
         );
     }
-    push(&mut argv, "--port", input.port.to_string());
+    if !headless {
+        push(&mut argv, "--port", input.port.to_string());
+    }
     if let Some(pct) = input.granted.gpu_utilization_pct {
         push(
             &mut argv,
@@ -346,7 +357,7 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     )]
     .into_iter()
     .collect();
-    if dev_mode {
+    if dev_mode && !headless {
         push(
             &mut argv,
             "--middleware",
@@ -355,6 +366,9 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         // SPEC §9.1 / T21: the verified runtime directory alone; nothing of
         // the agent's own PYTHONPATH reaches the engine's import path.
         env.insert("PYTHONPATH".into(), runtime_dir);
+    }
+    if let Some(group) = &input.group {
+        render_group(group, &mut argv, &mut env);
     }
     // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
     // refuses it if any reserved field above resolves differently.
@@ -388,6 +402,51 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     // allocator flag. Explicitly disable them for stock profiles too, so
     // an inherited development environment cannot bypass the host opt-in.
     Ok(RenderedCommand { argv, env })
+}
+
+/// ADR 0028 §10: the multi-node flags of one group member (rendered in the
+/// reserved block, so the entry also compares them against the full parse),
+/// its own peer address as `VLLM_HOST_IP`, and the expected destinations the
+/// entry checks in group mode. No `NCCL_*`, `MASTER_*` or other `GLOO_*`
+/// variable is rendered; `GLOO_SOCKET_IFNAME` only when the agent resolved
+/// the interface holding the member's own address (R11).
+fn render_group(
+    group: &crate::group::GroupMemberArgs,
+    argv: &mut Vec<String>,
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    let headless = !group.is_head();
+    for (flag, value) in [
+        ("--distributed-executor-backend", "mp".to_string()),
+        ("--nnodes", group.nnodes.to_string()),
+        ("--node-rank", group.node_rank.to_string()),
+        ("--master-addr", group.head_address.to_string()),
+        ("--master-port", group.rendezvous_port.to_string()),
+    ] {
+        argv.push(flag.into());
+        argv.push(value);
+    }
+    if headless {
+        argv.push("--headless".into());
+    }
+    env.insert("VLLM_HOST_IP".into(), group.own_address.to_string());
+    if let Some(interface) = &group.own_interface {
+        env.insert(crate::group::GLOO_SOCKET_IFNAME.into(), interface.clone());
+    }
+    env.insert(crate::group::GROUP_MODE_ENV.into(), "1".into());
+    env.insert(
+        crate::group::GROUP_EXPECTED_ENV.into(),
+        group.expected_json(serde_json::json!({
+            "nnodes": group.nnodes,
+            "node_rank": group.node_rank,
+            "master_addr": group.head_address.to_string(),
+            "master_port": group.rendezvous_port,
+            "headless": headless,
+            "distributed_executor_backend": "mp",
+            "tensor_parallel_size": group.tensor_parallel,
+            "pipeline_parallel_size": group.pipeline_parallel,
+        })),
+    );
 }
 
 /// ADR 0014 §2: typed deployment fields in vLLM 0.29.0 spellings (verified in

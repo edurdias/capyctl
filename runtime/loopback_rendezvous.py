@@ -118,3 +118,52 @@ def verify(expected, environ=None):
             raise ValueError()
     except Exception:
         raise RendezvousError() from None
+
+
+# ADR 0028 §10 (R11): a multi-node group member. CapyCTL renders the member's own
+# peer address (VLLM_HOST_IP or SGLANG_HOST_IP) and, when it resolved one, the
+# interface holding that address as GLOO_SOCKET_IFNAME. Nothing else of the
+# transport families is rendered or inherited: no NCCL_*, no MASTER_*, no other
+# GLOO_*. The loopback pin above is never applied in group mode.
+GROUP_IFNAME = "GLOO_SOCKET_IFNAME"
+_GROUP_STRIPPED_PREFIXES = ("NCCL_", "MASTER_", "GLOO_")
+
+
+def pin_group(environ, address_var, expected_ifname=None):
+    """Strip inherited transport inputs for a group member.
+
+    Every `NCCL_*`, `MASTER_*` and `GLOO_*` name is removed, except
+    `GLOO_SOCKET_IFNAME` when CapyCTL rendered one (`expected_ifname`). The
+    member's own address variable is left as rendered; `verify_group` checks it.
+    """
+    if type(address_var) is not str or not address_var:
+        raise RendezvousError()
+    for name in list(environ):
+        if not name.startswith(_GROUP_STRIPPED_PREFIXES):
+            continue
+        if name == GROUP_IFNAME and expected_ifname is not None:
+            continue
+        environ.pop(name, None)
+    # The generic host address input is never rendered for a group member.
+    if address_var != "HOST_IP":
+        environ.pop("HOST_IP", None)
+
+
+def verify_group(environ, address_var, expected_address, expected_ifname=None):
+    """Recheck, right before the engine starts, the group member's environment."""
+    try:
+        if type(expected_address) is not str or not expected_address:
+            raise ValueError()
+        if environ.get(address_var) != expected_address:
+            raise ValueError()
+        for name in environ:
+            if name.startswith(("NCCL_", "MASTER_")):
+                raise ValueError()
+            if name.startswith("GLOO_") and name != GROUP_IFNAME:
+                raise ValueError()
+        if environ.get(GROUP_IFNAME) != expected_ifname:
+            raise ValueError()
+        if address_var != "HOST_IP" and "HOST_IP" in environ:
+            raise ValueError()
+    except Exception:
+        raise RendezvousError() from None

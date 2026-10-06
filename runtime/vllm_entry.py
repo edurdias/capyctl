@@ -25,6 +25,7 @@ body therefore has no effects. Passing tests here are CPU fakes, never evidence
 that a vLLM build serves a model.
 """
 
+import json
 import os
 import sys
 
@@ -80,11 +81,21 @@ _CODES = frozenset({"invalid_launch_arguments", "config_file_refused",
                     "plugin_refused"})
 
 
+# ADR 0028 §10: the multi-node destinations a group member's rendered vector
+# must resolve to, exactly as CapyCTL rendered them (`CAPYCTL_GROUP_EXPECTED`).
+GROUP_MODE = "CAPYCTL_GROUP_MODE"
+GROUP_EXPECTED = "CAPYCTL_GROUP_EXPECTED"
+GROUP_DESTS = ("nnodes", "node_rank", "master_addr", "master_port", "headless",
+               "distributed_executor_backend", "tensor_parallel_size",
+               "pipeline_parallel_size")
+_GROUP_CODES = frozenset("group_drift:" + dest for dest in GROUP_DESTS)
+
+
 class LaunchError(Exception):
     """Closed, public failure category; never retains argument values."""
 
     def __init__(self, code):
-        self.code = code if code in _CODES else "startup_error"
+        self.code = code if code in _CODES or code in _GROUP_CODES else "startup_error"
         super().__init__(self.code)
 
 
@@ -220,6 +231,36 @@ def resolve(argv, parser, approvals=None):
     return actual
 
 
+def check_group(expected, namespace):
+    """ADR 0028 §10: every multi-node destination keeps the rendered value.
+
+    `expected` is the decoded `CAPYCTL_GROUP_EXPECTED` object; a destination it
+    lacks, or one the parse resolved differently (value or type), is
+    `group_drift:<dest>`.
+    """
+    missing = object()
+    for dest in GROUP_DESTS:
+        want = expected.get(dest, missing) if type(expected) is dict else missing
+        have = getattr(namespace, dest, missing)
+        if want is missing or have is missing or type(want) is not type(have) or want != have:
+            raise LaunchError("group_drift:" + dest)
+
+
+def _group_expected():
+    """The rendered group payload, removed so no engine child inherits it."""
+    raw = os.environ.pop(GROUP_EXPECTED, None)
+    try:
+        expected = json.loads(raw) if type(raw) is str else None
+    except ValueError:
+        expected = None
+    if type(expected) is not dict:
+        raise LaunchError("invalid_launch_arguments")
+    ifname = expected.get("gloo_socket_ifname")
+    if ifname is not None and (type(ifname) is not str or not ifname):
+        raise LaunchError("invalid_launch_arguments")
+    return expected
+
+
 def check_plugins(entry_points=None):
     """ADR 0012 / T21: refuse any installed vLLM plugin that is not vLLM's own.
 
@@ -351,13 +392,26 @@ def main(argv=None, runtime=None, stderr=None):
         os.environ["VLLM_PLUGINS"] = ""
         if runtime is None:
             check_plugins()
-        # SPEC §8.2 / T21: vLLM already rendezvouses through a file store on
-        # CUDA; its TCP fallback address and group transports are pinned to
-        # loopback before any engine import reads them.
-        try:
-            pinned = rendezvous.pin("vllm")
-        except rendezvous.RendezvousError:
-            raise LaunchError("loopback_rendezvous_failed") from None
+        # ADR 0028 §10: a group member keeps its rendered own address and gloo
+        # interface; every other inherited transport input is stripped. The
+        # loopback pin below is single-rank only (T39).
+        group = os.environ.get(GROUP_MODE) == "1"
+        if group:
+            expected_group = _group_expected()
+            group_ifname = expected_group.get("gloo_socket_ifname")
+            group_address = os.environ.get("VLLM_HOST_IP")
+            try:
+                rendezvous.pin_group(os.environ, "VLLM_HOST_IP", group_ifname)
+            except rendezvous.RendezvousError:
+                raise LaunchError("loopback_rendezvous_failed") from None
+        else:
+            # SPEC §8.2 / T21: vLLM already rendezvouses through a file store on
+            # CUDA; its TCP fallback address and group transports are pinned to
+            # loopback before any engine import reads them.
+            try:
+                pinned = rendezvous.pin("vllm")
+            except rendezvous.RendezvousError:
+                raise LaunchError("loopback_rendezvous_failed") from None
         runtime = InstalledVllm() if runtime is None else runtime
         runtime.env_setup()
         parser = runtime.parser()
@@ -367,8 +421,14 @@ def main(argv=None, runtime=None, stderr=None):
         except Exception:
             raise LaunchError("invalid_arguments") from None
         check_deep_park(args, parser, runtime)
+        if group:
+            check_group(expected_group, args)
         try:
-            rendezvous.verify(pinned)
+            if group:
+                rendezvous.verify_group(os.environ, "VLLM_HOST_IP", group_address,
+                                        group_ifname)
+            else:
+                rendezvous.verify(pinned)
         except rendezvous.RendezvousError:
             raise LaunchError("loopback_rendezvous_failed") from None
     except LaunchError as error:
