@@ -1060,10 +1060,12 @@ fn ended(pid: u32) -> bool {
 }
 
 // T31, T33 (ADR 0028 §8, §11): a child the worker starts just after its spawn
-// is in the Launch reply and the journal; one started after the tree settled
-// is still ended by Terminate, even when the leader has already died.
+// is in the Launch reply and the journal. With the leader dead and reaped,
+// Terminate signals recorded identities only: the recorded child ends, and a
+// child started after the tree settled (never recorded) is never signalled;
+// it keeps the stop uncertain, with the claim retained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_worker_children_are_recorded_and_terminated() {
+async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncertain() {
     let host = FakeHost::new("host-b")
         .with_groups_policy(WORKER_PEER)
         .with_late_children();
@@ -1086,21 +1088,49 @@ async fn late_worker_children_are_recorded_and_terminated() {
     assert!(!out.processes.iter().any(|p| p.pid == later));
     // Fault injection on the recorded leader: it dies and leaves its tree.
     let leader = out.processes.iter().find(|p| p.role == "worker-1").unwrap();
+    let leader = capyctl_domain::completion::ProcessIdentity {
+        role: "api".into(),
+        pid: leader.pid,
+        boot_id: leader.boot_id.clone(),
+        start_ticks: leader.start_ticks,
+    };
     // SAFETY: kill has no memory preconditions; the pid is the recorded leader.
     assert_eq!(unsafe { libc::kill(leader.pid as i32, libc::SIGKILL) }, 0);
-    let gone = host
-        .terminate(&out.owned_handle, &out.processes)
-        .await
-        .unwrap();
-    assert!(gone.all_gone(), "{:?}", gone.result);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !(ended(early) && ended(later)) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while capyctl_launchers::process_absence::presence(&leader)
+        != capyctl_domain::completion::Presence::Gone
+    {
         assert!(
             std::time::Instant::now() < deadline,
-            "a late child survived"
+            "the leader was never reaped"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // (b) The unrecorded survivor makes the stop uncertain: no gone report.
+    assert!(host
+        .terminate(&out.owned_handle, &out.processes)
+        .await
+        .is_err());
+    // (a) The recorded child was signalled and ended.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ended(early) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a recorded child survived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // A leaderless group scan never authorizes a signal: it is still running.
+    assert!(!ended(later), "an unrecorded process was signalled");
+    assert!(host
+        .journal()
+        .claimed_launches("")
+        .unwrap()
+        .iter()
+        .any(|claim| claim.command.identity.command_id == out.owned_handle));
+    // The test ends the process it injected the fault into.
+    // SAFETY: kill has no memory preconditions; the pid is the fake's child.
+    unsafe { libc::kill(later as i32, libc::SIGKILL) };
 }
 
 // T31, T33: a worker terminates its own recorded tree only.
