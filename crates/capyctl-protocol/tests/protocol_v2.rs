@@ -31,6 +31,7 @@ fn base() -> MemberCommand {
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
+            group_member_launch: None,
         })),
     })
     .unwrap()
@@ -220,6 +221,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         launch_failure: String::new(),
         source: None,
         kernel_builds: Vec::new(),
+        escalated: false,
     }
 }
 

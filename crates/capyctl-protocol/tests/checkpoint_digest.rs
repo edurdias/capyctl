@@ -46,6 +46,7 @@ fn decode(action: pb::execute_member::Action) -> Result<MemberCommand, ()> {
             action: Some(action),
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
+            group_member_launch: None,
         })),
     })
     .map_err(|_| ())

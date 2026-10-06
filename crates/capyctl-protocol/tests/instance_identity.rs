@@ -29,6 +29,7 @@ fn wire(instance_index: u32) -> pb::ExecuteMember {
         action: Some(pb::execute_member::Action::Inspect(true)),
         restore_checkpoint_digest: String::new(),
         terminate_recorded_processes: Vec::new(),
+        group_member_launch: None,
     }
 }
 

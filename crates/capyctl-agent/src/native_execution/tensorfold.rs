@@ -22,10 +22,13 @@ const IDLE_MARGIN_MS: i64 = 1_000 + HEALTH_READ_TIMEOUT.as_millis() as i64;
 
 impl NativeHostExecution {
     /// The plan, and whether this version's extensions are already built.
+    /// ADR 0028 §10: a group member's plan carries its group arguments
+    /// (TensorFold renders `--tp 2 --rank r --master ...` from them).
     pub(super) fn tensorfold_plan(
         &self,
         effective: &EffectiveDeployment,
         plan: &SingleLaunchPlan,
+        group: Option<capyctl_domain::group::GroupMemberArgs>,
     ) -> Result<(PlanInputTensorfold, bool), JournalError> {
         // ADR 0023 §3, SPEC §13.3: the build directory is private state; a
         // host without a private root never launches TensorFold.
@@ -37,7 +40,7 @@ impl NativeHostExecution {
             .torch_extensions(&effective.profile.build_fingerprint)
             .map_err(|_| JournalError::Unauthorized)?;
         let built = crate::engine_cache::has_build(&dir);
-        let input = plan_from_effective(
+        let mut input = plan_from_effective(
             effective,
             plan.service_port,
             self.log_dir
@@ -47,6 +50,7 @@ impl NativeHostExecution {
             Some(dir.to_string_lossy().into_owned()),
         )
         .map_err(|_| JournalError::Unauthorized)?;
+        input.group = group;
         Ok((input, built))
     }
 

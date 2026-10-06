@@ -392,6 +392,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
+            group_member_launch: None,
         })),
     })
     .unwrap();

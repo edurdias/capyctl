@@ -59,6 +59,7 @@ fn decode(config: String) -> Result<MemberCommand, ()> {
             )),
             restore_checkpoint_digest: String::new(),
             terminate_recorded_processes: Vec::new(),
+            group_member_launch: None,
         })),
     })
     .map_err(|_| ())

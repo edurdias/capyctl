@@ -186,6 +186,30 @@ pub(super) async fn initialize(
     // ADR 0014 amendment A12: note any kernel build until the step ends.
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
+    // ADR 0028 §9, §10: a headless worker serves nothing; readiness is the
+    // head's. Its step ends once its process is recorded and present.
+    if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
+        let log = plan.engine_log.clone();
+        return crate::group::worker_spawned(
+            context,
+            tools,
+            api,
+            builds,
+            || {
+                let tail = crate::launch_failure::log_tail(log.as_deref());
+                RuntimeError::LaunchFailed(format!(
+                    "{}; log tail:\n{tail}",
+                    crate::launch_failure::summary(&tail, None)
+                ))
+            },
+            format!(
+                "vllm {} group worker spawned; readiness is the head's",
+                adapter.fingerprint()
+            ),
+        )
+        .await;
+    }
+
     // Spec §4: the builder ends before the coordinator's bound so its own error wins.
     let stop_at = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
     let member = MemberRef {

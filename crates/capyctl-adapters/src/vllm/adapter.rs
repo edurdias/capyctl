@@ -238,7 +238,9 @@ impl VllmAdapter {
     }
 
     /// The three things an owned launch needs. Any one missing makes the step
-    /// unsupported rather than partly performed.
+    /// unsupported rather than partly performed. ADR 0028 §10 / ADR 0012: a
+    /// headless group worker serves nothing and is handed no key, so it
+    /// needs none (the key is then empty and never rendered).
     pub(super) fn launch_parts(
         &self,
     ) -> Result<
@@ -249,9 +251,15 @@ impl VllmAdapter {
         ),
         RuntimeError,
     > {
+        let worker = |launch: &crate::vllm::args::PlanInputVllm| {
+            launch.group.as_ref().is_some_and(|group| !group.is_head())
+        };
         match (&self.launch, &self.tools, &self.engine_key) {
             (Some(launch), Some(tools), Some(key)) => {
                 Ok((launch.clone(), tools.clone(), key.clone()))
+            }
+            (Some(launch), Some(tools), None) if worker(launch) => {
+                Ok((launch.clone(), tools.clone(), String::new()))
             }
             _ => Err(RuntimeError::Unsupported),
         }

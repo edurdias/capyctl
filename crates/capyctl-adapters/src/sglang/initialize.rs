@@ -273,7 +273,19 @@ pub(super) async fn initialize(
     // passes and is never probed; its step ends once its process is recorded
     // and present.
     if launch.rendered.is_group_worker() {
-        return worker_spawned(adapter, context, tools, api, builds, debug_logs).await;
+        let receipt = format!(
+            "sglang {} group worker spawned; readiness is the head's",
+            adapter.fingerprint()?
+        );
+        return crate::group::worker_spawned(
+            context,
+            tools,
+            api,
+            builds,
+            || launch_failed(adapter, debug_logs),
+            receipt,
+        )
+        .await;
     }
 
     // Spec §4: the builder ends before the coordinator's bound so its own error wins.
@@ -396,58 +408,6 @@ pub(super) async fn initialize(
             Milestone::CacheValid,
             Milestone::ModelUsable,
         ],
-        kernel_builds: builds.finish(),
-    })
-}
-
-/// ADR 0028 §9, §10: a group worker's Initialize. Readiness is the head's, so
-/// nothing here talks to the worker's health server; the step reports the
-/// recorded process tree once the spawned process is present. No milestone is
-/// claimed: a worker alone serves nothing.
-async fn worker_spawned(
-    adapter: &SglangAdapter,
-    context: &StepExecutionContext,
-    tools: std::sync::Arc<dyn crate::traits::OwnedProcessLaunch>,
-    api: ProcessIdentity,
-    builds: crate::kernel_builds::BuildWatch,
-    debug_logs: bool,
-) -> Result<EffectObservation, RuntimeError> {
-    let presence_tools = tools.clone();
-    let watched = api.clone();
-    match tokio::task::spawn_blocking(move || presence_tools.present(&watched))
-        .await
-        .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))?
-    {
-        Presence::Alive => {}
-        Presence::Gone => return Err(launch_failed(adapter, debug_logs)),
-        Presence::Unknown => {
-            return Err(RuntimeError::Uncertain(
-                "group worker presence could not be established".into(),
-            ))
-        }
-    }
-    let led_by = api.clone();
-    let identities = tokio::task::spawn_blocking(move || tools.observe_group(&led_by))
-        .await
-        .map_err(|_| RuntimeError::Uncertain("group task failed".into()))??;
-    // The recorded tree must lead with the process this step spawned.
-    if identities.first() != Some(&api) {
-        return Err(RuntimeError::Uncertain(format!(
-            "group worker tree does not lead with its spawned process: {}",
-            roles(&identities)
-        )));
-    }
-    Ok(EffectObservation {
-        token: context.token.clone(),
-        binding_id: context.binding_id.clone(),
-        incarnation: context.incarnation.clone(),
-        identities,
-        observed_at_ms: now_ms()?,
-        receipt: format!(
-            "sglang {} group worker spawned; readiness is the head's",
-            adapter.fingerprint()?
-        ),
-        facts: Vec::new(),
         kernel_builds: builds.finish(),
     })
 }

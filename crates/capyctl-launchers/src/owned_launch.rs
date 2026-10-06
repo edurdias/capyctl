@@ -160,6 +160,21 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         identities: &[ProcessIdentity],
         grace: Duration,
     ) -> Result<(), RuntimeError> {
+        self.terminate_escalating(identities, grace).map(drop)
+    }
+}
+
+impl DurableProcessLaunch {
+    /// SPEC §13.2: terminate the recorded group with SIGTERM, a bounded wait
+    /// of `grace`, then SIGKILL, and prove it gone. ADR 0028 §11: the answer
+    /// says whether SIGKILL was needed (`true`), which a group member's gone
+    /// report carries as `escalated`; a SGLang worker ignores SIGTERM, so its
+    /// stop normally escalates. Never waits past grace plus the proof window.
+    pub fn terminate_escalating(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+    ) -> Result<bool, RuntimeError> {
         // Presence that cannot be established is retention, never absence, so it is
         // settled before anything is signalled or released.
         for identity in identities {
@@ -174,7 +189,7 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             // With no leader recorded there is no group to signal; only proof that
             // the recorded set is already gone can end this without one.
             return match verify_gone(identities) {
-                GoneProof::AllGone => Ok(()),
+                GoneProof::AllGone => Ok(false),
                 _ => Err(uncertain(
                     "no API identity recorded and the set is not proven gone",
                 )),
@@ -186,7 +201,7 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         if presence(api) == Presence::Alive {
             signal_group(api.pid, nix::sys::signal::Signal::SIGTERM)?;
             if self.settled(identities, api, Instant::now() + grace, 200)? {
-                return Ok(());
+                return Ok(false);
             }
             if presence(api) == Presence::Alive {
                 signal_group(api.pid, nix::sys::signal::Signal::SIGKILL)?;
@@ -202,7 +217,7 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
             signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
-                return Ok(());
+                return Ok(true);
             }
         } else {
             // The head crashed and left its workers behind. There is no leader to
@@ -213,15 +228,15 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             // capyctl can prove and end.
             signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
             if self.settled(identities, api, Instant::now() + grace, 200)? {
-                return Ok(());
+                return Ok(false);
             }
             signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
-                return Ok(());
+                return Ok(true);
             }
         }
         match (verify_gone(identities), self.observe_group(api)?.is_empty()) {
-            (GoneProof::AllGone, true) => Ok(()),
+            (GoneProof::AllGone, true) => Ok(true),
             (GoneProof::AllGone, false) => Err(uncertain(
                 "recorded processes gone but the group still has members",
             )),

@@ -471,6 +471,15 @@ message ExecuteMember {
   // and reports each one's presence, so gone evidence can still be given by
   // identity. Empty otherwise, which encodes exactly as before.
   repeated RecordedProcess terminate_recorded_processes = 13;
+  // ADR 0028 §8 (ruling R29, additive): with `launch` only, and required there,
+  // this host's own launch of its member of the group plan: the deployment
+  // document, profile, approved host policy, binding, incarnation and grant,
+  // and the checkpoint facts, exactly as a single-rank launch carries them.
+  // Its profile name equals the member's, its checkpoint digest is the
+  // member's recorded checkpoint, and its service port is the head's service
+  // port or zero on a worker (which serves nothing). Absent otherwise, which
+  // encodes exactly as before.
+  SingleLaunchPlan group_member_launch = 15;
 }
 // ADR 0016: one process identity as the server recorded it.
 message RecordedProcess {
@@ -548,6 +557,11 @@ message MemberExecutionResult {
   // was seen. An older host sends none, and the startup peak then counts
   // every sample as before.
   repeated KernelBuildSpan kernel_builds = 15;
+  // ADR 0028 §11 (additive): a completed Terminate only. The recorded process
+  // tree outlived SIGTERM and its bounded wait, so it was ended with SIGKILL.
+  // Expected for a SGLang group worker, which ignores SIGTERM. False otherwise,
+  // which encodes exactly as before.
+  bool escalated = 16;
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;
