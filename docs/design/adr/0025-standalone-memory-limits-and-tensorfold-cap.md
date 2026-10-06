@@ -85,3 +85,19 @@ past what CapyCTL reserved.
   same window; raise it rather than drop the cap.
 - CapyCTL still does not measure a running engine's use against its charge; that
   remains observation, not enforcement (SPEC §7).
+
+## Amendment (owner decision 2026-10-06): the parked limit is settable
+
+Found with ADR 0014 amendment A17: a parked Qwen3.8-27B with a DFlash2 drafter measured
+33.4 GiB, above the derived quarter of a 128 GB GB10, so after its first measured park
+later parks were refused `park_parked_capacity` and it stayed loaded.
+
+`host.resource_policy.memory.system.parked_limit` joins the limits of §1, set the same
+three ways with the same precedence and forms: `auto` (the default, unchanged: 25 %), a
+size or a whole percentage of the observed memory. It is a sub-limit of the managed
+limit (SPEC §7.1), so a stated parked limit above the managed limit refuses the start
+with both numbers rather than being lowered; a derived one is still lowered as in §1.
+`0B` parks nothing. A document that states none, or `auto`, publishes the policy it
+published before, byte for byte. The embedded host's published document carries the
+stated limits too, so a discrete template sizes its `host_backed` default on the same
+parked room admission uses. An enrolled host already states `parked_limit` per domain.

@@ -270,8 +270,10 @@ fn check_state_dir(
 /// The memory limits a standalone document may state under
 /// `host.resource_policy.memory.system` (owner decision 2026-10-03: standalone
 /// is a server and one host, every setting three ways). `auto` keeps the
-/// derived default.
-pub const STATED_MEMORY_LIMITS: &[&str] = &["managed_limit", "free_reserve"];
+/// derived default. Owner decision 2026-10-06 (ADR 0014 amendment A17): the
+/// parked limit is one of them, so a parked footprint above the derived
+/// quarter of memory can be admitted.
+pub const STATED_MEMORY_LIMITS: &[&str] = &["managed_limit", "free_reserve", "parked_limit"];
 
 /// A stated standalone memory limit: a size, or a whole percentage of the
 /// memory the host observes at start.
@@ -316,8 +318,9 @@ impl MemoryShare {
 }
 
 /// One stated memory limit's form and range: the managed limit is above zero
-/// and the free reserve below the whole memory. Whether the two fit the
-/// observed memory together is checked at start, when it is known.
+/// and the free reserve below the whole memory; a parked limit of zero parks
+/// nothing. Whether the limits fit the observed memory together, and the
+/// parked limit the managed one, is checked at start, when it is known.
 fn check_memory_limit(field: &str, value: &Value, path: &str) -> Result<(), ConfigError> {
     let Some(text) = value.as_str() else {
         return Err(refuse(
@@ -823,6 +826,52 @@ mod tests {
         );
         assert_eq!(MemoryShare::Percent(75).of(200 << 30), 150 << 30);
         assert_eq!(MemoryShare::Bytes(90 << 30).of(200 << 30), 90 << 30);
+    }
+
+    // T03 (owner decision 2026-10-06, ADR 0014 amendment A17): the parked
+    // limit is set three ways with one precedence, `--set` over
+    // `CAPYCTL_SET__…` over the YAML, and takes `auto`, a size or a share.
+    #[test]
+    fn the_parked_limit_is_set_three_ways() {
+        use crate::setting_overrides::SettingOverrides;
+        const FLAG: &str = "host.resource_policy.memory.system.parked_limit=50GiB";
+        const ENV: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT";
+        let mut yaml = generated("/s");
+        yaml["host"]["resource_policy"]["memory"]["system"]["parked_limit"] = json!("40GiB");
+        let parked = |flags: &[&str], env: &[(&str, &str)]| {
+            let overrides = SettingOverrides::parse(
+                crate::ConfigKind::Standalone,
+                &flags.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                &env.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let applied = overrides.apply_and_validate(yaml.clone()).unwrap();
+            check(&applied).unwrap();
+            applied["host"]["resource_policy"]["memory"]["system"]["parked_limit"].clone()
+        };
+        assert_eq!(parked(&[FLAG], &[(ENV, "45GiB")]), "50GiB", "the flag wins");
+        assert_eq!(
+            parked(&[], &[(ENV, "45GiB")]),
+            "45GiB",
+            "the environment over YAML"
+        );
+        assert_eq!(parked(&[], &[]), "40GiB", "the YAML");
+        for good in ["auto", "0B", "0%", "40GiB", "35%", "100%"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"]["parked_limit"] = json!(good);
+            check(&doc).unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in ["101%", "-1GiB", "7.5%", "lots", "1 GiB"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"]["parked_limit"] = json!(bad);
+            let error = check(&doc).expect_err(bad);
+            assert_eq!(
+                error.path, "host.resource_policy.memory.system.parked_limit",
+                "{bad}"
+            );
+        }
     }
 
     // T03 (owner rule 2026-09-25: standalone is a server and one host, every

@@ -1183,6 +1183,42 @@ fn a_switch_park_that_host_memory_cannot_take_is_refused() {
     ));
 }
 
+// T16 (owner decision 2026-10-06, ADR 0014 amendment A17): a parked
+// footprint above the host's parked limit is refused `parked_capacity` and
+// the launch stays Ready, as the measured 33.4 GiB Qwen3.8-27B with a
+// DFlash2 drafter was under the derived quarter of memory. The same park is
+// admitted once the host states a parked limit that holds it (standalone:
+// `host.resource_policy.memory.system.parked_limit`).
+#[test]
+fn a_park_refused_at_the_default_parked_limit_is_admitted_when_it_is_raised() {
+    let park_with = |parked_limit: &str| {
+        let lab = Lab::new(|host| {
+            host["resource_policy"]["domains"]["unified"]["parked_limit"] = json!(parked_limit);
+        });
+        let a = lab.deploy("a", |config| {
+            config["resources"]["parked"]["allocations"][0]["bytes"] = json!("6GiB");
+        });
+        lab.ready(&a, 1_000, 10);
+        let park = lab.park(&a, "park-a", 1_100);
+        let armed = lab.arm(&park.step_id, 1_200);
+        (lab, a, armed)
+    };
+    // A parked limit of 4 GiB (the derived default, scaled to the fixture)
+    // cannot hold the 6 GiB footprint.
+    let (lab, a, armed) = park_with("4GiB");
+    assert!(
+        matches!(armed, ResidencyArm::Refused("parked_capacity")),
+        "{armed:?}"
+    );
+    assert!(lab.instance(&a.deployment_id).1, "the launch serves again");
+    assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Ready);
+    // Raised to the fixture's 8 GiB, the same park arms and completes.
+    let (lab, a, armed) = park_with("8GiB");
+    let context = new_context(armed);
+    lab.complete(&context, ResidencyKind::Park, 10, 1_300);
+    assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Parked);
+}
+
 // T26 T27, ADR 0007: found live 2026-09-23 (matrix M33, host-a), a wake
 // beside a Ready engine was refused `insufficient resources` although both
 // fit the managed limit: the host's availability already excluded what the

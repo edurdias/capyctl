@@ -323,9 +323,11 @@ pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
 /// A size is taken as stated; a percentage is of `capacity_bytes`, the memory
 /// observed at this start. The managed limit and the free reserve are
 /// simultaneous constraints on one memory (SPEC §16), so together they must
-/// fit `capacity_bytes`, as the derived pair does; the parked and host-KV
-/// sub-limits are lowered to a managed limit below them. Forms and ranges were
-/// checked when the document was read
+/// fit `capacity_bytes`, as the derived pair does. A stated parked limit is a
+/// category sub-limit of the managed ceiling (SPEC §7.1, §6.5 bounded parked
+/// sets), so one above the managed limit is refused; the derived
+/// parked and host-KV sub-limits are lowered to a managed limit below them.
+/// Forms and ranges were checked when the document was read
 /// ([`capyctl_config::standalone::check_honoured`]).
 pub fn apply_stated_memory(
     host: &mut Value,
@@ -376,6 +378,17 @@ pub fn apply_stated_memory(
             reserve as f64 / GIB,
             capacity_bytes as f64 / GIB,
         ));
+    }
+    if let Some((_, parked)) = shares.iter().find(|(field, _)| *field == "parked_limit") {
+        if *parked > managed {
+            return Err(format!(
+                "host.resource_policy.memory.system.parked_limit: the parked limit ({:.1} GiB) \
+                 is above the managed limit ({:.1} GiB); raise the managed limit or lower the \
+                 parked limit",
+                *parked as f64 / GIB,
+                managed as f64 / GIB,
+            ));
+        }
     }
     for sub_limit in ["parked_limit", "host_kv_limit"] {
         if domain.get(sub_limit).is_some() && bytes(domain, sub_limit) > managed {
@@ -651,10 +664,11 @@ pub fn default_residency(deep_park: bool, discrete: Option<(i64, i64)>) -> &'sta
 
 /// Design §3: the template memory of a discrete host, sized on its largest GPU
 /// (the one most likely to hold the deployment; the picker still chooses) and
-/// the system domain's parked room. `None` when there is no GPU.
+/// the parked room of the system domain `host` publishes. `None` when there
+/// is no GPU.
 pub fn discrete_template_memory(
     gpus: &[capyctl_agent::gpu_memory::GpuDevice],
-    capacity_bytes: i64,
+    host: &Value,
     weights_bytes: Option<i64>,
     kv_cache_bytes: Option<i64>,
 ) -> Option<TemplateMemory> {
@@ -663,17 +677,41 @@ pub fn discrete_template_memory(
         .filter_map(|gpu| gpu.memory.as_ref())
         .max_by_key(|memory| memory.total_bytes)?;
     let limits = device_limits(largest, MAX_PARKED);
-    // The same shares `host_policy` publishes for the system domain; the
-    // parked copy is held to the smaller of its parked and managed limits.
-    let system_parked_limit =
-        (capacity_bytes / 100 * PARKED_FRACTION).min(capacity_bytes / 100 * MANAGED_FRACTION);
     Some(TemplateMemory::Device {
         managed_limit: limits.managed_limit,
         device_total: largest.total_bytes,
         weights_bytes,
-        system_parked_limit,
+        system_parked_limit: system_parked_limit(host),
         kv_cache_bytes,
     })
+}
+
+/// What the published system domain holds parked: the smaller of its parked
+/// and managed limits, so a parked limit the operator stated
+/// ([`apply_stated_memory`]) sizes the template's residency as it sizes
+/// admission. Zero when `host` publishes no system domain.
+fn system_parked_limit(host: &Value) -> i64 {
+    let bytes = |domain: &Value, field: &str| {
+        domain[field]
+            .as_str()
+            .and_then(|text| capyctl_config::effective::parse_bytes(text).ok())
+    };
+    host["resource_policy"]["domains"]
+        .as_object()
+        .and_then(|domains| {
+            domains
+                .values()
+                .find(|domain| domain["memory"] == "distinct")
+        })
+        .and_then(|system| {
+            let managed = bytes(system, "managed_limit")?;
+            Some(
+                bytes(system, "parked_limit")
+                    .unwrap_or(managed)
+                    .min(managed),
+            )
+        })
+        .unwrap_or(0)
 }
 
 struct DiscreteTemplate {

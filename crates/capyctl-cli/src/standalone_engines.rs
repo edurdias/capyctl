@@ -53,6 +53,10 @@ pub struct EmbeddedHost {
     engine_ports: (u16, u16),
     /// ADR 0028 §3: the role's group policy, published in every document.
     groups: capyctl_config::groups_policy::StatedGroups,
+    /// The standalone document's `host:` block (after `--set` and
+    /// `CAPYCTL_SET__…`), whose memory limits every published document
+    /// carries ([`crate::standalone_config::apply_stated_memory`]).
+    stated_host: Value,
 }
 
 impl EmbeddedHost {
@@ -68,6 +72,7 @@ impl EmbeddedHost {
         models: ModelSettings,
         engine_ports: (u16, u16),
         groups: capyctl_config::groups_policy::StatedGroups,
+        stated_host: Value,
     ) -> Arc<Self> {
         let named = with_models(named, &models);
         let mut document = crate::standalone_config::host_policy(
@@ -82,6 +87,8 @@ impl EmbeddedHost {
         groups
             .write_into(&mut document)
             .expect("a generated host document is a mapping");
+        crate::standalone_config::apply_stated_memory(&mut document, &stated_host, capacity_bytes)
+            .expect("the stated memory limits were checked when the declared host was built");
         let installations = EmbeddedInstallations::new();
         for n in &named {
             installations.register(
@@ -101,6 +108,7 @@ impl EmbeddedHost {
             models,
             engine_ports,
             groups,
+            stated_host,
         })
     }
 
@@ -148,6 +156,12 @@ impl EmbeddedHost {
         self.groups
             .write_into(&mut document)
             .expect("a generated host document is a mapping");
+        crate::standalone_config::apply_stated_memory(
+            &mut document,
+            &self.stated_host,
+            self.capacity_bytes,
+        )
+        .expect("the stated memory limits were checked when the declared host was built");
         document
     }
 
