@@ -40,13 +40,29 @@ pub fn member_args(plan: &GroupPlan, host_id: &str) -> Option<GroupMemberArgs> {
     })
 }
 
+/// ADR 0028 §8, §11: how often a group worker's process tree is scanned while
+/// it settles after the spawn.
+const WORKER_TREE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// ADR 0028 §8, §11: how long the tree must stay unchanged before it is
+/// reported: an engine forks its helpers right after it starts, and a child
+/// missing from the reply would be missing from the server's record too.
+const WORKER_TREE_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// ADR 0028 §8: the longest the settling waits. A tree still changing then is
+/// reported as last scanned; every scan is journaled, and the journal-owned
+/// Terminate also signals the recorded group's later members.
+const WORKER_TREE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// The settling ends this far ahead of the step's deadline.
+const WORKER_TREE_MARGIN_MS: i64 = 2_000;
+
 /// ADR 0028 §9, §10: the end of a group worker's Initialize, shared by every
 /// engine. Readiness is the head's, so nothing here talks to the worker (a
 /// vLLM headless worker and a TensorFold follower serve nothing; SGLang's
 /// rank > 0 health server always passes). The step reports the recorded
-/// process tree once the spawned process `api` is present, and claims no
-/// milestone: a worker alone serves nothing. `failed` is the engine's own
-/// launch failure for a process that already left.
+/// process tree once the spawned process `api` is present and its tree has
+/// stayed unchanged for [`WORKER_TREE_SETTLE`] (bounded by
+/// [`WORKER_TREE_BOUND`] and the deadline), and claims no milestone: a worker
+/// alone serves nothing. `failed` is the engine's own launch failure for a
+/// process that already left.
 pub(crate) async fn worker_spawned(
     context: &StepExecutionContext,
     tools: Arc<dyn OwnedProcessLaunch>,
@@ -55,24 +71,63 @@ pub(crate) async fn worker_spawned(
     failed: impl FnOnce() -> RuntimeError,
     receipt: String,
 ) -> Result<EffectObservation, RuntimeError> {
-    let presence_tools = tools.clone();
-    let watched = api.clone();
-    match tokio::task::spawn_blocking(move || presence_tools.present(&watched))
-        .await
-        .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))?
-    {
+    let now_ms = || -> Result<i64, RuntimeError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| RuntimeError::Uncertain("system clock is before the epoch".into()))?
+            .as_millis() as i64)
+    };
+    let present = |tools: Arc<dyn OwnedProcessLaunch>, api: ProcessIdentity| async move {
+        tokio::task::spawn_blocking(move || tools.present(&api))
+            .await
+            .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))
+    };
+    let scan = |tools: Arc<dyn OwnedProcessLaunch>, api: ProcessIdentity| async move {
+        tokio::task::spawn_blocking(move || tools.observe_group(&api))
+            .await
+            .map_err(|_| RuntimeError::Uncertain("group task failed".into()))?
+    };
+    let mut failed = Some(failed);
+    let mut gone = || {
+        failed
+            .take()
+            .map_or(RuntimeError::Unsupported, |failed| failed())
+    };
+    match present(tools.clone(), api.clone()).await? {
         Presence::Alive => {}
-        Presence::Gone => return Err(failed()),
+        Presence::Gone => return Err(gone()),
         Presence::Unknown => {
             return Err(RuntimeError::Uncertain(
                 "group worker presence could not be established".into(),
             ))
         }
     }
-    let led_by = api.clone();
-    let identities = tokio::task::spawn_blocking(move || tools.observe_group(&led_by))
-        .await
-        .map_err(|_| RuntimeError::Uncertain("group task failed".into()))??;
+    // Every scan is journaled by the tools; the reply carries the last one,
+    // taken once the tree stopped changing.
+    let started = std::time::Instant::now();
+    let stop_at = context.deadline_ms.saturating_sub(WORKER_TREE_MARGIN_MS);
+    let mut identities = scan(tools.clone(), api.clone()).await?;
+    let mut unchanged_since = std::time::Instant::now();
+    while unchanged_since.elapsed() < WORKER_TREE_SETTLE
+        && started.elapsed() < WORKER_TREE_BOUND
+        && now_ms()? < stop_at
+    {
+        tokio::time::sleep(WORKER_TREE_POLL).await;
+        match present(tools.clone(), api.clone()).await? {
+            Presence::Alive => {}
+            Presence::Gone => return Err(gone()),
+            Presence::Unknown => {
+                return Err(RuntimeError::Uncertain(
+                    "group worker presence could not be established".into(),
+                ))
+            }
+        }
+        let current = scan(tools.clone(), api.clone()).await?;
+        if current != identities {
+            identities = current;
+            unchanged_since = std::time::Instant::now();
+        }
+    }
     // The recorded tree must lead with the process this step spawned.
     if identities.first() != Some(&api) {
         return Err(RuntimeError::Uncertain(format!(
@@ -89,10 +144,7 @@ pub(crate) async fn worker_spawned(
         binding_id: context.binding_id.clone(),
         incarnation: context.incarnation.clone(),
         identities,
-        observed_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| RuntimeError::Uncertain("system clock is before the epoch".into()))?
-            .as_millis() as i64,
+        observed_at_ms: now_ms()?,
         receipt,
         facts: Vec::new(),
         kernel_builds: builds.finish(),

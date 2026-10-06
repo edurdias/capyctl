@@ -310,7 +310,8 @@ pub fn peer_address_local(facts: &HostFacts, policy: &GroupsPolicy) -> bool {
 }
 
 /// ADR 0028 §7: the checks one member runs on its host before it may launch.
-/// In order: the plan names this host (else `group_profile_mismatch`); the
+/// In order: one rank per member (else `group_topology_invalid`, ADR 0028 §2);
+/// the plan names this host (else `group_profile_mismatch`); the
 /// member's peer address is the host's own declared one and is local
 /// (`peer_address_not_local`); its profile resolves with the recorded build
 /// (`group_profile_mismatch`); its model path measures to the recorded digest
@@ -327,6 +328,12 @@ pub fn prepare_member(
     digest_of: impl Fn(&str) -> Option<String>,
     profile_fingerprint: impl Fn(&str) -> Option<String>,
 ) -> Result<CheckVerdict, String> {
+    // ADR 0028 §2 (R35): in this version every member contributes exactly one
+    // rank (W/N = 1); configuration refuses anything else, and a plan that
+    // still names more is refused here, typed, before any other check.
+    if plan.topology().local_ranks != 1 {
+        return Err("group_topology_invalid".into());
+    }
     let Some(member) = plan.members().iter().find(|m| m.member.host_id == host_id) else {
         return Err("group_profile_mismatch".into());
     };
@@ -831,6 +838,43 @@ mod tests {
             assert_eq!(derived_ports_held(plan, host, dp, held(25001)), Ok(()));
         }
         assert!(probed.borrow().is_empty(), "nothing extra is probed");
+    }
+
+    // T03, R35 (ADR 0028 §2): a plan giving a member more than one rank is
+    // refused typed, before any other check, on every member.
+    #[test]
+    fn more_than_one_rank_per_member_is_refused() {
+        let one = sample_plan(GroupEngine::Vllm);
+        let mut members = one.members().to_vec();
+        for member in &mut members {
+            member.devices = vec!["gpu0".into(), "gpu1".into()];
+        }
+        let two = GroupPlan::new(
+            GroupEngine::Vllm,
+            members,
+            GroupTopology {
+                tensor_parallel: 4,
+                pipeline_parallel: 1,
+                local_ranks: 2,
+            },
+            one.rendezvous_port(),
+            one.generation(),
+        )
+        .unwrap();
+        for (host, address) in [("host-a", "192.0.2.10"), ("host-b", "192.0.2.11")] {
+            assert_eq!(
+                prepare_member(
+                    &two,
+                    host,
+                    &facts_for(address),
+                    &policy_with(address),
+                    |_, _| true,
+                    |_| Some("sha256:c".into()),
+                    |_| Some("pinned".into()),
+                ),
+                Err("group_topology_invalid".into())
+            );
+        }
     }
 
     // R11, R33: substituted probes answer the checks instead of the host.
