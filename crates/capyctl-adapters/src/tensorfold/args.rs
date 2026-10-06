@@ -8,6 +8,8 @@ use capyctl_config::engine_policy::{
     Engine, ProfileArgError, TENSORFOLD_DRAFTS_CONFLICT, TENSORFOLD_PARALLEL,
 };
 
+use capyctl_domain::group::GroupMemberArgs;
+
 use crate::traits::RenderedCommand;
 
 /// Every variable a TensorFold engine may start with (SPEC §13.3 / T21).
@@ -59,6 +61,9 @@ pub struct PlanInputTensorfold {
     /// allocation on the GPU's memory, which caps TensorFold's CUDA budget
     /// (`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`). `None` renders no cap.
     pub memory_limit_bytes: Option<i64>,
+    /// ADR 0028 §10: this launch's member of a two-rank group; `None` for a
+    /// single-rank launch, which renders exactly as before.
+    pub group: Option<GroupMemberArgs>,
 }
 
 /// ADR 0028 §2.1: `build_env` values may hold tokens, so Debug prints its names only.
@@ -84,6 +89,7 @@ impl std::fmt::Debug for PlanInputTensorfold {
             .field("cuda_namespace", &self.cuda_namespace)
             .field("warm_startup_ms", &self.warm_startup_ms)
             .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .field("group", &self.group)
             .finish()
     }
 }
@@ -100,6 +106,26 @@ pub enum TensorfoldArgsError {
     NoContext,
     #[error("{}", TENSORFOLD_DRAFTS_CONFLICT)]
     DraftsConflict,
+    #[error("TensorFold runs a group only as TP 2, PP 1 on exactly two hosts")]
+    GroupShape,
+}
+
+/// ADR 0028 §2, §10: TensorFold 0.6.5 serves a group only as two ranks, one GPU
+/// each (`--tp 2`, no pipeline). The member must be one of those two ranks;
+/// a follower has no listener, and the head's own address is the rendezvous.
+fn check_group(group: &GroupMemberArgs) -> Result<(), TensorfoldArgsError> {
+    let shape = group.tensor_parallel == 2
+        && group.pipeline_parallel == 1
+        && group.nnodes == 2
+        && group.node_rank < 2
+        && group.rendezvous_port != 0
+        && group.worker_port.is_none()
+        && (!group.is_head() || group.own_address == group.head_address);
+    if shape {
+        Ok(())
+    } else {
+        Err(TensorfoldArgsError::GroupShape)
+    }
 }
 
 /// The typed flags, in TensorFold's own spelling (`tensorfold/cli_args.py`).
@@ -156,6 +182,9 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
     if input.context_length == 0 {
         return Err(TensorfoldArgsError::NoContext);
     }
+    if let Some(group) = &input.group {
+        check_group(group)?;
+    }
     // ADR 0023 §3: no protected entry, so the shared policy's
     // prefix rule is the second check of the complete pass-through vector.
     let pass_through: Vec<String> = input
@@ -190,20 +219,46 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
         input.engine_bin.clone(),
         "serve".into(),
         input.model_path.clone(),
-        // ADR 0023 §3: capyctl owns the served name and the loopback listener.
-        "--name".into(),
-        input.served_model_name.clone(),
-        "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        input.port.to_string(),
+    ];
+    // ADR 0028 §10: both ranks name the two-rank world and the head's peer
+    // address as TensorFold's TCP store; `--tp`, `--rank`, `--master` and
+    // `--master-port` stay reserved for the user (ADR 0023 §3).
+    if let Some(group) = &input.group {
+        argv.extend([
+            "--tp".to_owned(),
+            group.tensor_parallel.to_string(),
+            "--rank".to_owned(),
+            group.node_rank.to_string(),
+            "--master".to_owned(),
+            group.head_address.to_string(),
+            "--master-port".to_owned(),
+            group.rendezvous_port.to_string(),
+        ]);
+    }
+    // ADR 0028 §10: rank 0 serves HTTP, rank 1 follows it and serves nothing,
+    // so the follower renders no served name and no listener.
+    if input.group.as_ref().is_none_or(GroupMemberArgs::is_head) {
+        argv.extend([
+            // ADR 0023 §3: capyctl owns the served name and the loopback listener.
+            "--name".into(),
+            input.served_model_name.clone(),
+            "--host".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            input.port.to_string(),
+        ]);
+    }
+    argv.extend([
         "--no-update-check".into(),
         // ADR 0023 §3: NVIDIA only; prefix snapshots stay in memory.
         "--backend".into(),
         "cuda".into(),
         "--snapshot-dir".into(),
         "none".into(),
-    ];
+    ]);
+    // ADR 0028 §10: the typed arguments, the drafter choice and the
+    // pass-through arguments come from the same input on both ranks, so
+    // context, `--parallel`, KV dtype and drafting agree, as TensorFold requires.
     argv.extend(typed);
     // ADR 0023 §3, §5: TensorFold's default `--drafter auto` would read the
     // Hugging Face cache; without an approved `--drafter` or `--no-drafts` it
@@ -218,6 +273,9 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
         argv.extend(["--drafter".to_owned(), "none".to_owned()]);
     }
     argv.extend(pass_through);
+    // ADR 0028 §10: TensorFold has no own-address variable and its NCCL is
+    // built in, so a group member renders exactly the single-rank variables:
+    // nothing `NCCL_*`, `GLOO_*`, `MASTER_*` or `TF_COMM*` (decision 4).
     let mut env = BTreeMap::new();
     env.insert("TENSORFOLD_NO_UPDATE_CHECK".into(), "1".into());
     // ADR 0023 §3: the engine fetches nothing; capyctl's model store does.

@@ -110,6 +110,8 @@ pub fn plan_from_effective(
             .map_err(|_| TensorfoldPlanError::UnpinnableDevice)?,
         warm_startup_ms,
         memory_limit_bytes: gpu_allocation(effective),
+        // ADR 0028 §10: a group member's launch sets this from its member args.
+        group: None,
     })
 }
 
