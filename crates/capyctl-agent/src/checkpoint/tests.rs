@@ -161,6 +161,38 @@ fn a_changed_file_forces_a_full_rehash_and_the_stale_digest_is_refused() {
     assert!(rehashed.full_rehash);
 }
 
+// T30 (ADR 0028 §7): Prepare reads the digest the cache already proves and
+// never hashes a checkpoint in full: nothing measured, or a changed file,
+// has no known digest; measuring again makes it known.
+#[test]
+fn a_known_digest_comes_from_the_cache_only() {
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    let verifier = CheckpointVerifier::in_memory();
+    assert_eq!(verifier.known_digest(&store.root, &checkpoint), None);
+    let recorded = verifier
+        .measure(&store.root, &checkpoint)
+        .unwrap()
+        .manifest
+        .digest;
+    assert_eq!(
+        verifier.known_digest(&store.root, &checkpoint),
+        Some(recorded.clone())
+    );
+    let shard = checkpoint.join("model-00001-of-00002.safetensors");
+    let before = std::fs::metadata(&shard).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&shard, b"WEIGHTS-ONE").unwrap();
+    restore_mtime(&shard, &before);
+    assert_eq!(verifier.known_digest(&store.root, &checkpoint), None);
+    let measured = verifier.measure(&store.root, &checkpoint).unwrap();
+    assert_ne!(measured.manifest.digest, recorded);
+    assert_eq!(
+        verifier.known_digest(&store.root, &checkpoint),
+        Some(measured.manifest.digest)
+    );
+}
+
 // T34: added or removed files change the manifest and force a full rehash.
 #[test]
 fn an_added_or_removed_file_changes_the_digest() {

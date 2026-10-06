@@ -677,4 +677,53 @@ mod groups {
         let back = pb::ReportInventory::decode(inventory.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back, inventory);
     }
+
+    // T30, Review Focus 2: a Prepare refusal is one closed group code on a
+    // completed result that claims nothing; a policy code, a malformed port
+    // or a result claiming anything is not.
+    #[test]
+    fn prepare_refusal_carries_a_closed_group_code() {
+        use capyctl_protocol::execution::{is_prepare_refusal, validate_result};
+        let command = command_with(MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)));
+        let result = |refused: &str| pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            refused: refused.into(),
+            ..Default::default()
+        };
+        assert!(validate_result(&command, &result("")).is_ok());
+        for code in [
+            "group_profile_mismatch",
+            "group_checkpoint_mismatch",
+            "peer_address_not_local",
+            "rendezvous_port_in_use:25000",
+            "service_port_in_use:8101",
+            "host_tuning_missing:memlock",
+            "host_tuning_missing:infiniband",
+        ] {
+            assert!(is_prepare_refusal(code), "{code}");
+            assert!(validate_result(&command, &result(code)).is_ok(), "{code}");
+        }
+        for code in [
+            "unauthorized",
+            "rendezvous_port_in_use:0",
+            "rendezvous_port_in_use:65536",
+            "service_port_in_use:",
+            "service_port_in_use:+80",
+            "host_tuning_missing:compaction",
+            "host_tuning_warning:memlock",
+        ] {
+            assert!(!is_prepare_refusal(code), "{code}");
+            assert!(validate_result(&command, &result(code)).is_err(), "{code}");
+        }
+        let mut attempted = result("group_profile_mismatch");
+        attempted.state = "attempted".into();
+        assert!(validate_result(&command, &attempted).is_err());
+        let mut claimed = result("group_profile_mismatch");
+        claimed.claim_retained = true;
+        assert!(validate_result(&command, &claimed).is_err());
+        let mut handled = result("group_profile_mismatch");
+        handled.owned_handle = "command".into();
+        assert!(validate_result(&command, &handled).is_err());
+    }
 }
