@@ -1,18 +1,20 @@
 //! ADR 0028 §4, §5, §11: multi-node group plans in the durable store.
 //!
 //! A group instance is charged as one resource owner per member,
-//! `deployment:<id>/instance:<k>/member:<r>`, each on its own host's domains.
-//! Every member is reserved in one store transaction together with the group
-//! plan, the rendezvous port drawn from the head's range and any SGLang worker
-//! loopback port leased on its own host. A failure anywhere rolls the whole
-//! transaction back, so no host's share is held for a group that did not fit
-//! elsewhere. This is atomic accounting in the server's store, not an atomic
-//! launch across hosts.
+//! `deployment:<id>/instance:<k>/member:<r>`, each on its own host's domains
+//! and judged against its own host's admission context. Every member is
+//! reserved in one store transaction together with the group plan, the
+//! rendezvous port drawn from the head's range and any SGLang worker loopback
+//! port leased on its own host. A failure anywhere rolls the whole transaction
+//! back, so no host's share is held for a group that did not fit elsewhere.
+//! This is atomic accounting in the server's store, not an atomic launch
+//! across hosts.
 //!
-//! Each member settles only on gone evidence from its own host. A member whose
-//! host cannot be reached is marked uncertain and keeps its charge. The
-//! rendezvous port and worker leases are freed only when every member has
-//! settled.
+//! Each member settles only on gone evidence from its own host. A member is
+//! fenced as dispatched before its Launch is sent; from then on it settles only
+//! on recorded identities, never on empty evidence. A member whose host cannot
+//! be reached is marked uncertain and keeps its charge. The rendezvous port and
+//! worker leases are freed only when every member has settled.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -27,7 +29,7 @@ use capyctl_scheduler::residency::AdmissionContext;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::resource_ledger::{GrantRequest, ResourceStoreError};
+use crate::resource_ledger::{registered_host, GrantRequest, ResourceStoreError};
 
 /// ADR 0028 §5: the resource owner of one member of a group instance. It never
 /// equals an instance owner ([`crate::instances::instance_owner_id`]), so a
@@ -57,8 +59,9 @@ pub fn parse_member_owner_id(owner_id: &str) -> Option<(String, u32, u32)> {
 
 /// ADR 0028 §5: what a group reservation charges and draws. `members` is in
 /// rank order, head first, each with its host and the grant charged there.
-/// Every grant names the same revision and generation, and the ledger epoch
-/// the caller observed before reserving; the store chains the epoch across
+/// Every key a grant charges must be registered to its member's host. Every
+/// grant names the same revision and generation, and the ledger epoch the
+/// caller observed before reserving; the store chains the epoch across
 /// members inside the one transaction. `worker_ports` maps each SGLang worker
 /// host to its `endpoint_port_range` and is empty for other engines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,15 +102,21 @@ fn corrupt() -> GroupStoreError {
 /// What settling one member left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupSettlement {
-    /// These ranks are still reserved, launched or uncertain.
+    /// These ranks are still reserved, dispatching, launched or uncertain.
     Partial { unsettled: Vec<u32> },
     /// Every member settled; the rendezvous port and worker leases are free.
     Complete,
 }
 
+/// ADR 0028 §8, §11: where a member is between reservation and settlement.
+/// `Reserved` was never dispatched; `Dispatching` was fenced as dispatched
+/// before its Launch was sent and has no identities recorded yet; `Launched`
+/// has its identities recorded; `Uncertain` lost its host and keeps its
+/// charge, whether it was dispatched or not ([`MemberRow::dispatched`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberState {
     Reserved,
+    Dispatching,
     Launched,
     Settled,
     Uncertain,
@@ -117,6 +126,7 @@ impl MemberState {
     fn parse(value: &str) -> Result<Self, GroupStoreError> {
         Ok(match value {
             "reserved" => Self::Reserved,
+            "dispatching" => Self::Dispatching,
             "launched" => Self::Launched,
             "settled" => Self::Settled,
             "uncertain" => Self::Uncertain,
@@ -125,19 +135,22 @@ impl MemberState {
     }
 }
 
-/// One stored member of a group plan.
+/// One stored member of a group plan. `dispatched` records durably that its
+/// Launch may have been sent; it survives `Uncertain` and is never cleared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberRow {
     pub rank: u32,
     pub host_id: String,
     pub owner_id: String,
     pub state: MemberState,
+    pub dispatched: bool,
 }
 
 /// SPEC §11, ADR 0028 §11: gone evidence for one member, reported by that
 /// member's own host. `identities` are the processes it proved gone; a member
-/// recorded as launched settles only when they are exactly its recorded
-/// identities, and a member that never launched only with none.
+/// with identities recorded settles only when they are exactly those, a
+/// member never dispatched only with none, and a member dispatched without
+/// identities recorded not at all until they are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberGone {
     pub member: MemberKey,
@@ -273,18 +286,38 @@ fn now_ms() -> i64 {
 /// The loopback host every endpoint lease names (SPEC §3).
 const LOOPBACK: &str = "127.0.0.1";
 
+/// ADR 0028 §13: whether an unsettled group plan holds `port` on `host` as its
+/// rendezvous port. The torch store binds it on every interface, so no endpoint
+/// lease on that host may take it, loopback included.
+pub(crate) fn rendezvous_port_held(
+    tx: &Transaction<'_>,
+    host: &str,
+    port: u16,
+) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_plans WHERE rendezvous_host=?1 AND rendezvous_port=?2 AND state!='settled')",
+        params![host, port],
+        |r| r.get(0),
+    )
+}
+
+/// ADR 0028 §5 (R15), SPEC §3: a rendezvous port is free on `head` when no
+/// unsettled plan holds it, no unexpired exclusion names it, and no endpoint
+/// lease on that host holds it under any address (a host's rendezvous range may
+/// overlap its endpoint range).
 fn rendezvous_port_free(
     tx: &Transaction<'_>,
     head: &str,
     port: u16,
     now: i64,
 ) -> Result<bool, GroupStoreError> {
-    Ok(tx.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM group_plans WHERE rendezvous_host=?1 AND rendezvous_port=?2 AND state!='settled')
-            AND NOT EXISTS(SELECT 1 FROM group_port_exclusions WHERE host_id=?1 AND port=?2 AND until_ms>?3)",
-        params![head, port, now],
-        |r| r.get(0),
-    )?)
+    Ok(!rendezvous_port_held(tx, head, port)?
+        && tx.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM group_port_exclusions WHERE host_id=?1 AND port=?2 AND until_ms>?3)
+                AND NOT EXISTS(SELECT 1 FROM endpoint_leases WHERE host_id=?1 AND port=?2)",
+            params![head, port, now],
+            |r| r.get(0),
+        )?)
 }
 
 fn endpoint_port_free(
@@ -297,6 +330,19 @@ fn endpoint_port_free(
         params![host, LOOPBACK, port],
         |r| r.get(0),
     )?)
+}
+
+/// SPEC §7: the namespace of the host a member names, by its id or, for the
+/// embedded host, by its configured name. None, or more than one, fails closed.
+fn member_namespace(tx: &Transaction<'_>, host: &str) -> Result<String, GroupStoreError> {
+    let found: Vec<String> = tx
+        .prepare("SELECT host_id FROM host_resource_namespaces WHERE host_id=?1 OR policy_key=?1")?
+        .query_map([host], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match found.as_slice() {
+        [namespace] => Ok(namespace.clone()),
+        _ => Err(GroupStoreError::Plan),
+    }
 }
 
 fn has_column(tx: &Transaction<'_>, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -389,8 +435,14 @@ pub(crate) fn migrate_v41(tx: &Transaction<'_>) -> rusqlite::Result<()> {
            host_id TEXT NOT NULL CHECK(length(host_id)>0),
            owner_id TEXT NOT NULL
              CHECK(owner_id='deployment:'||deployment_id||'/instance:'||instance_index||'/member:'||rank),
-           state TEXT NOT NULL CHECK(state IN ('reserved','launched','settled','uncertain')),
+           state TEXT NOT NULL
+             CHECK(state IN ('reserved','dispatching','launched','settled','uncertain')),
+           dispatched INTEGER NOT NULL DEFAULT 0 CHECK(dispatched IN (0,1)),
            identities_json TEXT,
+           CHECK(state!='reserved' OR (dispatched=0 AND identities_json IS NULL)),
+           CHECK(state!='dispatching' OR (dispatched=1 AND identities_json IS NULL)),
+           CHECK(state!='launched' OR (dispatched=1 AND identities_json IS NOT NULL)),
+           CHECK(identities_json IS NULL OR dispatched=1),
            PRIMARY KEY(deployment_id,instance_index,generation,rank),
            UNIQUE(deployment_id,instance_index,generation,host_id),
            FOREIGN KEY(deployment_id,instance_index,generation)
@@ -409,7 +461,7 @@ pub(crate) fn migrate_v41(tx: &Transaction<'_>) -> rusqlite::Result<()> {
            PRIMARY KEY(deployment_id,revision,host_id));
          INSERT OR IGNORE INTO checkpoint_host_digests(deployment_id,revision,host_id,digest,recorded_at_ms)
            SELECT deployment_id,revision,host_id,digest,updated_at_ms FROM checkpoint_digests
-            WHERE digest IS NOT NULL AND host_id!='' AND state IN ('recorded','mismatch');",
+            WHERE digest IS NOT NULL AND host_id!='';",
     )?;
     Ok(())
 }
@@ -417,19 +469,28 @@ pub(crate) fn migrate_v41(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 impl crate::Store {
     /// ADR 0028 §5: reserve every member of a group instance, or none.
     ///
+    /// `contexts` holds one admission context per member host, keyed by the
+    /// host id the member names, built from that host's own limits,
+    /// observations, resident floors and `max_parked` (ADR 0028 §12: a host's
+    /// parked limit counts the owners on that host only).
+    ///
     /// In one immediate transaction: refuse a reservation naming one host
-    /// twice (`Plan`); draw the lowest rendezvous port in `port_range` that no
-    /// unsettled plan holds on the head and no unexpired exclusion names
+    /// twice, or whose contexts are not exactly one per member host (`Plan`);
+    /// refuse a member whose context or footprint names any key the host-scoped
+    /// registry does not assign to that member's host (`Plan`); draw the lowest
+    /// rendezvous port in `port_range` that no unsettled plan holds on the
+    /// head, no unexpired exclusion names and no endpoint lease holds there
     /// (`PortsExhausted`); lease each SGLang worker's loopback port on its own
-    /// host (`PortsExhausted`); build the plan with `plan_for(port, workers)`
-    /// (`Plan` when it fails or does not match); charge every member to its own
-    /// owner; write the plan and its members. Any error returns before commit,
-    /// so the transaction rolls back and nothing is held anywhere.
+    /// host, past any rendezvous port held there (`PortsExhausted`); build the
+    /// plan with `plan_for(port, workers)` (`Plan` when it fails or does not
+    /// match); charge every member to its own owner, judged on its own host;
+    /// write the plan and its members. Any error returns before commit, so the
+    /// transaction rolls back and nothing is held anywhere.
     pub fn reserve_group(
         &self,
         r: &GroupReservation,
         plan_for: impl FnOnce(u16, &BTreeMap<String, u16>) -> Result<GroupPlan, GroupIdentityError>,
-        ctx: AdmissionContext<'_>,
+        contexts: &BTreeMap<String, AdmissionContext<'_>>,
     ) -> Result<GroupPlan, GroupStoreError> {
         // ADR 0028 §4: distinct hosts, the head first, one fence for all.
         let mut hosts = BTreeSet::new();
@@ -443,6 +504,8 @@ impl crate::Store {
                 .iter()
                 .any(|(host, _)| host.trim().is_empty() || !hosts.insert(host.as_str()))
             || &r.head_host != head
+            || contexts.len() != r.members.len()
+            || contexts.keys().any(|host| !hosts.contains(host.as_str()))
             || *r.port_range.start() == 0
             || r.worker_ports.iter().any(|(host, range)| {
                 host == head || !hosts.contains(host.as_str()) || *range.start() == 0
@@ -473,8 +536,42 @@ impl crate::Store {
         if busy {
             return Err(GroupStoreError::Conflict);
         }
-        // ADR 0028 §5 (R15): skip ports held by unsettled plans on this head
-        // and ports a Prepare recently found held outside CapyCTL.
+        // ADR 0028 §5, §11, SPEC §7: each member is judged on its own host and
+        // charged there only. Its context names that host's domains, and every
+        // key its footprint charges is registered to that host. An unknown key,
+        // or one of another host's, fails closed, so no member can later be
+        // released on one host's evidence while its bytes sit on another.
+        for (host, grant) in &r.members {
+            let namespace = member_namespace(&tx, host)?;
+            let context = contexts.get(host).ok_or(GroupStoreError::Plan)?;
+            let keys = context
+                .limits
+                .iter()
+                .map(|limit| ("domain", limit.domain.as_str()))
+                .chain(
+                    grant
+                        .next
+                        .allocations
+                        .iter()
+                        .map(|a| ("domain", a.domain.as_str())),
+                )
+                .chain(
+                    grant
+                        .next
+                        .devices
+                        .iter()
+                        .map(|d| ("device", d.device.as_str())),
+                );
+            for (kind, key) in keys {
+                let owner = registered_host(&tx, kind, key).map_err(GroupStoreError::Admission)?;
+                if owner.as_deref() != Some(namespace.as_str()) {
+                    return Err(GroupStoreError::Plan);
+                }
+            }
+        }
+        // ADR 0028 §5 (R15), SPEC §3: skip ports held by unsettled plans on
+        // this head, ports a Prepare recently found held outside CapyCTL, and
+        // ports an endpoint lease holds on the head.
         let now = now_ms();
         let mut rendezvous = None;
         for port in r.port_range.clone() {
@@ -485,7 +582,8 @@ impl crate::Store {
         }
         let rendezvous = rendezvous.ok_or(GroupStoreError::PortsExhausted)?;
         // ADR 0028 §5, SPEC §3: SGLang worker loopback ports come from each
-        // worker host's endpoint range through the endpoint lease table.
+        // worker host's endpoint range through the endpoint lease table, past
+        // any port an unsettled plan holds there as its rendezvous port.
         let mut workers = BTreeMap::new();
         for (rank, (host, _)) in r.members.iter().enumerate() {
             let Some(range) = r.worker_ports.get(host) else {
@@ -493,7 +591,7 @@ impl crate::Store {
             };
             let mut chosen = None;
             for port in range.clone() {
-                if endpoint_port_free(&tx, host, port)? {
+                if endpoint_port_free(&tx, host, port)? && !rendezvous_port_held(&tx, host, port)? {
                     chosen = Some(port);
                     break;
                 }
@@ -539,14 +637,18 @@ impl crate::Store {
         if u64::try_from(epoch).ok() != Some(first.expected_epoch) {
             return Err(GroupStoreError::Conflict);
         }
-        for (rank, (_, grant)) in r.members.iter().enumerate() {
+        // ADR 0028 §12, SPEC §7: each grant is admitted against its own host's
+        // context, so the ledger it sees and the parked owners it counts are
+        // that host's only; the epoch chain stays the whole ledger's.
+        for (rank, (host, grant)) in r.members.iter().enumerate() {
+            let context = *contexts.get(host).ok_or(GroupStoreError::Plan)?;
             let mut grant = grant.clone();
             grant.expected_epoch = first.expected_epoch + rank as u64;
             crate::resource_ledger::reserve_member_increase_in_transaction(
                 &tx,
                 &grant,
                 rank as u32,
-                ctx,
+                context,
             )
             .map_err(|error| match error {
                 ResourceStoreError::Conflict => GroupStoreError::Conflict,
@@ -583,8 +685,65 @@ impl crate::Store {
         Ok(plan)
     }
 
-    /// ADR 0028 §11: record the processes a member launched, so it later
-    /// settles only on gone evidence for exactly these identities.
+    /// ADR 0028 §8, §11: durably fence one member as dispatched, before its
+    /// Launch is sent.
+    ///
+    /// Contract for the controller (Task 17): call this for a member, and see
+    /// it return `Ok`, before sending that member's Launch, and on every
+    /// retry of it. A Launch whose reply is lost may have spawned the member,
+    /// so from here on it never settles on empty gone evidence, in any later
+    /// state, `uncertain` included. It settles only after
+    /// [`Self::mark_member_launched`] records its identities (from the Launch
+    /// reply, a replay of it, or the host's journal when the host reconnects
+    /// or recovers under ADR 0016), on gone evidence for exactly those. There
+    /// is no release on revocation alone: a member whose host never reports
+    /// its identities keeps its charge, and status must show it as retained.
+    ///
+    /// A repeated fence is accepted. Fencing a member that is settled, or
+    /// uncertain without having been dispatched, is a `Conflict`: nothing is
+    /// launched for it.
+    pub fn mark_member_dispatching(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+    ) -> Result<(), GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let row: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT state,dispatched FROM group_members
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
+                params![deployment_id, instance_index, generation, rank],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, dispatched)) = row else {
+            return Err(GroupStoreError::Conflict);
+        };
+        match (MemberState::parse(&state)?, dispatched) {
+            (MemberState::Reserved, false) => {
+                tx.execute(
+                    "UPDATE group_members SET state='dispatching',dispatched=1
+                      WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
+                    params![deployment_id, instance_index, generation, rank],
+                )?;
+            }
+            // A retry of the fence, or of a Launch already fenced.
+            (MemberState::Settled, _) => return Err(GroupStoreError::Conflict),
+            (_, true) => {}
+            _ => return Err(GroupStoreError::Conflict),
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// ADR 0028 §8, §11: record the processes a dispatched member launched,
+    /// so it later settles only on gone evidence for exactly these identities.
+    /// Accepted from `dispatching`, and from `uncertain` once dispatched (the
+    /// host reconciled its journal), moving the member to `launched`; a retry
+    /// with the same identities changes nothing. A member never fenced by
+    /// [`Self::mark_member_dispatching`] is a `Conflict`.
     pub fn mark_member_launched(
         &self,
         deployment_id: &str,
@@ -596,16 +755,19 @@ impl crate::Store {
         validate_local_processes(identities).map_err(|_| GroupStoreError::Plan)?;
         let recorded = canonical_identities(identities);
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>)> = tx
+        let row: Option<(String, bool, Option<String>)> = tx
             .query_row(
-                "SELECT state,identities_json FROM group_members
+                "SELECT state,dispatched,identities_json FROM group_members
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
                 params![deployment_id, instance_index, generation, rank],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        match row {
-            Some((state, None)) if state == "reserved" => {
+        let Some((state, dispatched, existing)) = row else {
+            return Err(GroupStoreError::Conflict);
+        };
+        match (MemberState::parse(&state)?, dispatched, existing) {
+            (MemberState::Dispatching | MemberState::Uncertain, true, None) => {
                 tx.execute(
                     "UPDATE group_members SET state='launched',identities_json=?5
                       WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
@@ -613,7 +775,8 @@ impl crate::Store {
                 )?;
             }
             // A retry with the same identities.
-            Some((state, Some(existing))) if state == "launched" && existing == recorded => {}
+            (MemberState::Launched | MemberState::Uncertain, true, Some(existing))
+                if existing == recorded => {}
             _ => return Err(GroupStoreError::Conflict),
         }
         tx.commit()?;
@@ -621,9 +784,12 @@ impl crate::Store {
     }
 
     /// ADR 0028 §11, SPEC §11: release one member's reservation on gone
-    /// evidence from its own host. The rendezvous port and worker leases are
-    /// freed only once no member is reserved, launched or uncertain. A retry
-    /// for a member already settled reports the group's state again.
+    /// evidence from its own host: exactly its recorded identities, or none
+    /// for a member never dispatched. A member dispatched without identities
+    /// recorded is refused (`Conflict`) and keeps its charge. The rendezvous
+    /// port and worker leases are freed only once no member is reserved,
+    /// dispatching, launched or uncertain. A retry for a member already
+    /// settled reports the group's state again.
     pub fn settle_member(
         &self,
         deployment_id: &str,
@@ -633,20 +799,24 @@ impl crate::Store {
         evidence: MemberGone,
     ) -> Result<GroupSettlement, GroupStoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let row: Option<(String, String, String, Option<String>)> = tx
+        let row: Option<(String, String, String, bool, Option<String>)> = tx
             .query_row(
-                "SELECT host_id,owner_id,state,identities_json FROM group_members
+                "SELECT host_id,owner_id,state,dispatched,identities_json FROM group_members
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
                 params![deployment_id, instance_index, generation, rank],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((host, owner, state, recorded)) = row else {
+        let Some((host, owner, state, dispatched, recorded)) = row else {
             return Err(GroupStoreError::Conflict);
         };
         // ADR 0028 §11: each member settles on its own host's evidence only.
         let proven = match &recorded {
-            None => evidence.identities.is_empty(),
+            // ADR 0028 §8, §11: empty evidence proves only a member that was
+            // never dispatched gone. A Launch whose reply was lost may have
+            // spawned it, and an empty journal settles only on recorded
+            // identities.
+            None => !dispatched && evidence.identities.is_empty(),
             Some(recorded) => {
                 validate_local_processes(&evidence.identities).is_ok()
                     && &canonical_identities(&evidence.identities) == recorded
@@ -703,7 +873,8 @@ impl crate::Store {
     }
 
     /// ADR 0028 §11: a member whose host cannot be reached keeps its charge.
-    /// Nothing is released here, and lease expiry never frees it.
+    /// Nothing is released here, and lease expiry never frees it. Whether it
+    /// was dispatched, and any identities recorded, are kept.
     pub fn mark_member_uncertain(
         &self,
         deployment_id: &str,
@@ -715,7 +886,7 @@ impl crate::Store {
         let changed = tx.execute(
             "UPDATE group_members SET state='uncertain'
               WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4
-                AND state IN ('reserved','launched','uncertain')",
+                AND state IN ('reserved','dispatching','launched','uncertain')",
             params![deployment_id, instance_index, generation, rank],
         )?;
         if changed != 1 {
@@ -745,23 +916,24 @@ impl crate::Store {
             return Ok(None);
         };
         let plan = decode_plan(&json)?;
-        let rows: Vec<(u32, String, String, String)> = tx
+        let rows: Vec<(u32, String, String, String, bool)> = tx
             .prepare(
-                "SELECT rank,host_id,owner_id,state FROM group_members
+                "SELECT rank,host_id,owner_id,state,dispatched FROM group_members
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
             )?
             .query_map(params![deployment_id, instance_index, generation], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let members = rows
             .into_iter()
-            .map(|(rank, host_id, owner_id, state)| {
+            .map(|(rank, host_id, owner_id, state, dispatched)| {
                 Ok(MemberRow {
                     rank,
                     host_id,
                     owner_id,
                     state: MemberState::parse(&state)?,
+                    dispatched,
                 })
             })
             .collect::<Result<Vec<_>, GroupStoreError>>()?;

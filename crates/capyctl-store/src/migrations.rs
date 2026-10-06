@@ -368,6 +368,26 @@ mod tests {
         .unwrap();
         assert!(conn.execute("INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state) VALUES('a',2,1,0,'host-a','deployment:a/instance:2/member:0','gone')", []).is_err());
         conn.execute("INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state) VALUES('a',2,1,0,'host-a','deployment:a/instance:2/member:0','reserved')", []).unwrap();
+        // ADR 0028 §8, §11: a dispatched member is marked so durably; a
+        // reserved one was never dispatched, and identities are recorded only
+        // for a dispatched member.
+        for (state, dispatched, identities) in [
+            ("reserved", 1, None),
+            ("dispatching", 0, None),
+            ("dispatching", 1, Some("[]")),
+            ("launched", 1, None),
+            ("uncertain", 0, Some("[]")),
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state,dispatched,identities_json) VALUES('a',2,1,1,'host-b','deployment:a/instance:2/member:1',?1,?2,?3)",
+                    rusqlite::params![state, dispatched, identities],
+                )
+                .is_err(),
+                "{state} {dispatched} {identities:?}"
+            );
+        }
+        conn.execute("INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state,dispatched) VALUES('a',2,1,1,'host-b','deployment:a/instance:2/member:1','uncertain',1)", []).unwrap();
         // One unsettled plan holds a rendezvous port on its head.
         assert!(conn
             .execute(
@@ -375,6 +395,51 @@ mod tests {
                 []
             )
             .is_err());
+    }
+
+    /// ADR 0028 §6 (v41): every measured digest is carried into the per-host
+    /// table, `unusable` included (the measurement path writes its digest,
+    /// host and time when the derived memory request cannot be resolved);
+    /// only a `pending` row, which has measured nothing, is not.
+    // T14
+    #[test]
+    fn v41_carries_every_measured_digest_including_unusable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 40).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,3);
+            INSERT INTO effective_revisions VALUES('a',1,'{"host":{"name":"host-a"}}','fa'),('a',2,'{"host":{"name":"host-b"}}','fb'),('a',3,'{"host":{"name":"host-c"}}','fc');"#,
+        )
+        .unwrap();
+        let measured = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        for (revision, state, host, digest, weights, at) in [
+            (1, "unusable", "host-a", Some(measured('a')), None, 7),
+            (2, "mismatch", "host-b", Some(measured('b')), Some(10), 8),
+            (3, "pending", "host-c", None, None, 9),
+        ] {
+            conn.execute(
+                "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',?1,?2,?3,NULL,?4,?5,0,NULL,?6)",
+                rusqlite::params![revision, state, host, digest, weights, at],
+            )
+            .unwrap();
+        }
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let rows: Vec<(i64, String, String, i64)> = conn
+            .prepare("SELECT revision,host_id,digest,recorded_at_ms FROM checkpoint_host_digests WHERE deployment_id='a' ORDER BY revision")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "host-a".into(), measured('a'), 7),
+                (2, "host-b".into(), measured('b'), 8),
+            ]
+        );
     }
 
     #[test]
