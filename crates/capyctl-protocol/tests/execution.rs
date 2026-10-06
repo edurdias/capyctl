@@ -716,14 +716,36 @@ mod groups {
             assert!(!is_prepare_refusal(code), "{code}");
             assert!(validate_result(&command, &result(code)).is_err(), "{code}");
         }
-        let mut attempted = result("group_profile_mismatch");
-        attempted.state = "attempted".into();
-        assert!(validate_result(&command, &attempted).is_err());
-        let mut claimed = result("group_profile_mismatch");
-        claimed.claim_retained = true;
-        assert!(validate_result(&command, &claimed).is_err());
-        let mut handled = result("group_profile_mismatch");
-        handled.owned_handle = "command".into();
-        assert!(validate_result(&command, &handled).is_err());
+        // T30 (ADR 0028 §7): every Prepare result, passed or refused, is
+        // completed and effect-free; any state or field claiming more is not.
+        type Mutation = fn(&mut pb::MemberExecutionResult);
+        let mutations: [(&str, Mutation); 8] = [
+            ("accepted", |r| r.state = "accepted".into()),
+            ("attempted", |r| r.state = "attempted".into()),
+            ("launched", |r| r.state = "launched".into()),
+            ("claim_retained", |r| r.claim_retained = true),
+            ("processes", |r| {
+                r.processes.push(pb::OwnedProcessObservation {
+                    pid: 7,
+                    start_ticks: 1,
+                    role: "api".into(),
+                    boot_id: "boot".into(),
+                    presence: "alive".into(),
+                })
+            }),
+            ("owned_handle", |r| r.owned_handle = "command".into()),
+            ("binding_id", |r| r.binding_id = "binding".into()),
+            ("incarnation", |r| r.incarnation = "incarnation".into()),
+        ];
+        for refused in ["", "group_profile_mismatch"] {
+            for (name, mutate) in mutations {
+                let mut mutated = result(refused);
+                mutate(&mut mutated);
+                assert!(
+                    validate_result(&command, &mutated).is_err(),
+                    "{name} with refused {refused:?}"
+                );
+            }
+        }
     }
 }

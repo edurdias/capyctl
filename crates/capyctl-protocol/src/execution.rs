@@ -742,6 +742,7 @@ pub fn validate_result(
         (_, Some(_)) => return Err(GroupIdentityError),
         (_, None) => {}
     }
+    validate_prepare(command, result)?;
     validate_refusal(command, result)?;
     validate_launch_failure(command, result)?;
     let named_binding = !result.binding_id.is_empty()
@@ -895,8 +896,9 @@ pub fn is_prepare_refusal(reason: &str) -> bool {
 /// SPEC §13: a policy refusal is terminal evidence that nothing happened. A
 /// refused launch completed with no claim, no process and no usable model; a
 /// refused Park or Restore left the launch `unchanged`. ADR 0028 §7: a refused
-/// Prepare carries one closed group code and claims nothing. No other action
-/// carries a refusal.
+/// Prepare carries one closed group code (its effect-free shape is checked for
+/// every Prepare result by [`validate_prepare`]). No other action carries a
+/// refusal.
 fn validate_refusal(
     command: &MemberCommand,
     result: &pb::MemberExecutionResult,
@@ -918,18 +920,30 @@ fn validate_refusal(
         MemberAction::Park { .. } | MemberAction::Restore { .. } => {
             (unchanged, is_policy_refusal(&result.refused))
         }
-        // ADR 0028 §7: Prepare has no process effect and claims nothing.
-        MemberAction::Prepare(_) => (
-            !result.claim_retained
-                && result.processes.is_empty()
-                && result.owned_handle.is_empty()
-                && result.binding_id.is_empty()
-                && result.incarnation.is_empty(),
-            is_prepare_refusal(&result.refused),
-        ),
+        MemberAction::Prepare(_) => (true, is_prepare_refusal(&result.refused)),
         _ => (false, false),
     };
     if !shape || !closed || result.state != "completed" || result.model_usable {
+        return Err(GroupIdentityError);
+    }
+    Ok(())
+}
+
+/// ADR 0028 §7: a Prepare has no process effect. Every Prepare result, passed
+/// or refused, is completed and claims nothing: no claim, no process, no owned
+/// handle, binding or incarnation.
+fn validate_prepare(
+    command: &MemberCommand,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), GroupIdentityError> {
+    if matches!(command.action, MemberAction::Prepare(_))
+        && (result.state != "completed"
+            || result.claim_retained
+            || !result.processes.is_empty()
+            || !result.owned_handle.is_empty()
+            || !result.binding_id.is_empty()
+            || !result.incarnation.is_empty())
+    {
         return Err(GroupIdentityError);
     }
     Ok(())

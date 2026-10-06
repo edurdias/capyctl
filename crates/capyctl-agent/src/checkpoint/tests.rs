@@ -193,6 +193,34 @@ fn a_known_digest_comes_from_the_cache_only() {
     );
 }
 
+// T30 (ADR 0028 §7, owner decision 10): reading a known digest changes nothing
+// on the host: an absent cache directory stays absent; measuring creates it,
+// and a fresh verifier then reads the persisted record without writing.
+#[test]
+fn a_known_digest_never_creates_the_cache_directory() {
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    let state = tempfile::tempdir().unwrap();
+    let cache = state.path().join("checkpoint-cache");
+    let verifier = CheckpointVerifier::with_cache_dir(cache.clone());
+    assert_eq!(verifier.known_digest(&store.root, &checkpoint), None);
+    assert!(!cache.exists());
+    let recorded = verifier
+        .measure(&store.root, &checkpoint)
+        .unwrap()
+        .manifest
+        .digest;
+    assert!(cache.is_dir());
+    let restarted = CheckpointVerifier::with_cache_dir(cache.clone());
+    let entries = || std::fs::read_dir(&cache).unwrap().count();
+    let before = entries();
+    assert_eq!(
+        restarted.known_digest(&store.root, &checkpoint),
+        Some(recorded)
+    );
+    assert_eq!(entries(), before);
+}
+
 // T34: added or removed files change the manifest and force a full rehash.
 #[test]
 fn an_added_or_removed_file_changes_the_digest() {
