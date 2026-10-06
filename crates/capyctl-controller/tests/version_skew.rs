@@ -651,6 +651,76 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
     h.server.abort();
 }
 
+// T34: ADR 0028 §6 with ADR 0017: a group host that cannot measure a
+// checkpoint digest is refused, typed, before it is asked to download
+// anything: it is sent no MaterializeSource.
+#[tokio::test]
+async fn a_digest_incapable_group_host_is_sent_no_source_request() {
+    use capyctl_controller::group_sources::{
+        MemberSource, RemoteGroupSources, SourceDriver, SourceFailure,
+    };
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::CHECKPOINT_DIGEST);
+    let (_send, mut stream) = h.reconciled(BINARY_VERSION, declared).await;
+    assert!(h.sessions.supports_model_sources(&h.host));
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
+    let mut deployment = fixture["deployment"].clone();
+    let model = deployment["model"].as_object_mut().unwrap();
+    model.remove("path");
+    model.insert(
+        "source".into(),
+        json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": "0123456789abcdef0123456789abcdef01234567"}}),
+    );
+    let deployment_config = deployment.to_string();
+    let host_policy_fingerprint = "a".repeat(64);
+    // Without the check first, this source would be requested from the host.
+    assert!(capyctl_protocol::execution::MaterializeSourcePlan::new(
+        &deployment_config,
+        &host_policy_fingerprint
+    )
+    .is_some());
+    let driver = RemoteGroupSources {
+        owner: h.state.clone(),
+        sessions: h.sessions.clone(),
+        controller_id: h.authority.controller_id(),
+        deployment_id: "deployment".into(),
+        revision: 1,
+        generation: 1,
+        deadline_ms: capyctl_protocol::now_unix_ms() + 3_000,
+        members: [(
+            h.host.clone(),
+            MemberSource {
+                member_id: "worker-1".into(),
+                deployment_config,
+                host_policy_fingerprint,
+                profile_fingerprint: "sglang-0.5.20".into(),
+                model_path: "/srv/models/toy".into(),
+            },
+        )]
+        .into(),
+    };
+    let source = capyctl_config::model_source::ModelSource::HuggingFace {
+        repo: "Qwen/Qwen3-4B".into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        files: Vec::new(),
+        token_ref: None,
+    };
+    let (outcome, sent) = tokio::join!(
+        driver.materialize(&h.host, &source),
+        next_command(&mut stream, Duration::from_millis(500))
+    );
+    assert_eq!(
+        outcome.unwrap_err(),
+        SourceFailure::Failed("host_capability_missing:checkpoint_digest".into())
+    );
+    assert!(sent.is_none(), "the host was sent {sent:?}");
+    h.server.abort();
+}
+
 // T06 T33: one minor release behind is supported with an upgrade recommended:
 // it is eligible and takes launches; status shows its version and the advice.
 #[tokio::test]

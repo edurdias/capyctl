@@ -201,6 +201,16 @@ impl SourceDriver for RemoteGroupSources {
             .members
             .get(host)
             .ok_or_else(|| SourceFailure::Failed("unauthorized".into()))?;
+        // ADR 0017: a host without the digest action is refused before it is
+        // asked anything, so no download starts for a member that could
+        // never be measured (the single-host launch's preflight order).
+        self.sessions
+            .preflight(
+                host,
+                &[capyctl_protocol::capabilities::CHECKPOINT_DIGEST],
+                true,
+            )
+            .map_err(SourceFailure::Failed)?;
         model_sources::ensure_materialized(
             &self.owner,
             &self.sessions,
@@ -217,14 +227,6 @@ impl SourceDriver for RemoteGroupSources {
         )
         .await
         .map_err(failure_from)?;
-        // ADR 0017: a host without the digest action is never asked.
-        self.sessions
-            .preflight(
-                host,
-                &[capyctl_protocol::capabilities::CHECKPOINT_DIGEST],
-                true,
-            )
-            .map_err(SourceFailure::Failed)?;
         let command = checkpoint_digests::digest_command(
             &self.controller_id,
             host,
