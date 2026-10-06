@@ -12,9 +12,10 @@
 use crate::sglang::pinned::NATIVE_SGLANG_CONTRACT;
 use crate::traits::{RenderedCommand, RuntimeError};
 use capyctl_config::engine_policy::{validate_rendered_args, Engine};
+use capyctl_domain::group::GroupMemberArgs;
 use capyctl_domain::launch::{NativeLaunch, SglangLaunchSettings};
 use serde_json::{json, Value};
-use std::{fmt, path::Path};
+use std::{fmt, net::SocketAddr, path::Path};
 
 /// Inherited descriptor numbers selected by the final launcher. This validates
 /// numeric shape only; protection, inheritance, ownership, and contents remain
@@ -22,26 +23,40 @@ use std::{fmt, path::Path};
 #[derive(Debug)]
 pub struct ProtectedDescriptorFds {
     launch: i32,
-    inference: i32,
-    admin: i32,
+    /// The inference and admin credential descriptors; `None` for a group
+    /// worker, which is handed no credential (ADR 0012, ADR 0028 §10).
+    credentials: Option<(i32, i32)>,
+}
+
+fn descriptor_number(value: i64) -> Result<i32, RuntimeError> {
+    i32::try_from(value)
+        .ok()
+        .filter(|value| *value >= 3)
+        .ok_or(RuntimeError::Unsupported)
 }
 
 impl ProtectedDescriptorFds {
     pub fn for_launcher(launch: i64, inference: i64, admin: i64) -> Result<Self, RuntimeError> {
-        let convert = |value| {
-            i32::try_from(value)
-                .ok()
-                .filter(|value| *value >= 3)
-                .ok_or(RuntimeError::Unsupported)
-        };
-        let (launch, inference, admin) = (convert(launch)?, convert(inference)?, convert(admin)?);
+        let (launch, inference, admin) = (
+            descriptor_number(launch)?,
+            descriptor_number(inference)?,
+            descriptor_number(admin)?,
+        );
         if launch == inference || launch == admin || inference == admin {
             return Err(RuntimeError::Unsupported);
         }
         Ok(Self {
             launch,
-            inference,
-            admin,
+            credentials: Some((inference, admin)),
+        })
+    }
+
+    /// ADR 0028 §10, ADR 0012: the private launch descriptor alone, for a
+    /// group worker (node_rank > 0).
+    pub fn launch_only(launch: i64) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            launch: descriptor_number(launch)?,
+            credentials: None,
         })
     }
 }
@@ -64,6 +79,9 @@ impl ProtectedDescriptorFds {
 pub struct SglangLaunch {
     executable: String,
     public: Value,
+    /// ADR 0028 §10: a group worker (node_rank > 0), rendered without
+    /// credential descriptors (ADR 0012: the key-guarded API is the head's).
+    worker: bool,
 }
 
 impl SglangLaunch {
@@ -103,7 +121,16 @@ impl SglangLaunch {
         {
             return Err(RuntimeError::Unsupported);
         }
-        let settings = public_settings(s)?;
+        let mut settings = public_settings(s)?;
+        // ADR 0028 §10: a group member's descriptor carries its group, and a
+        // worker answers on its loopback worker port, never a peer address.
+        let mut endpoint = m.endpoint.clone();
+        if let Some(group) = frozen.group() {
+            settings["group"] = public_group(group)?;
+            if let Some(port) = group.worker_port.filter(|_| !group.is_head()) {
+                endpoint = format!("http://127.0.0.1:{port}");
+            }
+        }
         // The checkpoint revision stays out of the public descriptor: the
         // entry no longer pins a checkpoint (ADR 0014 §9; WE3 verifies a digest).
         let public = json!({
@@ -112,7 +139,7 @@ impl SglangLaunch {
             "engine": m.engine,
             "binding_id": m.binding_id,
             "incarnation": m.incarnation,
-            "endpoint": m.endpoint,
+            "endpoint": endpoint,
             "served_name": m.served_name,
             "rendered_settings_digest": m.rendered_settings_digest,
             "device": m.device,
@@ -121,6 +148,7 @@ impl SglangLaunch {
         Ok(Self {
             executable: frozen.executable().into(),
             public,
+            worker: frozen.group().is_some_and(|group| !group.is_head()),
         })
     }
 
@@ -131,35 +159,52 @@ impl SglangLaunch {
     }
 
     /// The final launcher substitutes three distinct protected descriptor numbers
-    /// only after resolving the private frozen inputs outside this renderer.
+    /// (the private launch descriptor alone for a group worker) only after
+    /// resolving the private frozen inputs outside this renderer.
     pub fn render_for_launcher(
         &self,
         fds: ProtectedDescriptorFds,
         wrapper: &Path,
     ) -> Result<RenderedCommand, RuntimeError> {
         Self::validate_wrapper_path(wrapper)?;
+        // ADR 0012, ADR 0028 §10: credentials go to every launch that serves
+        // the API and to no worker.
+        if self.worker != fds.credentials.is_none() {
+            return Err(RuntimeError::Unsupported);
+        }
         let public = serde_json::to_string(&self.public).map_err(|_| RuntimeError::Unsupported)?;
-        Ok(RenderedCommand {
-            argv: vec![
-                self.executable.clone(),
-                // Installed .pth/sitecustomize hooks otherwise run before our
-                // protected entry, even in isolated mode. Trusted package paths
-                // must be composed explicitly without invoking site processing.
-                // SPEC §9.1 / T21: -B, so no bytecode is written beside the
-                // checked source for a later import to prefer.
-                "-BIS".into(),
-                wrapper.to_str().ok_or(RuntimeError::Unsupported)?.into(),
-                "--public-settings-json".into(),
-                public,
-                "--launch-descriptor-fd".into(),
-                fds.launch.to_string(),
+        let mut argv = vec![
+            self.executable.clone(),
+            // Installed .pth/sitecustomize hooks otherwise run before our
+            // protected entry, even in isolated mode. Trusted package paths
+            // must be composed explicitly without invoking site processing.
+            // SPEC §9.1 / T21: -B, so no bytecode is written beside the
+            // checked source for a later import to prefer.
+            "-BIS".into(),
+            wrapper.to_str().ok_or(RuntimeError::Unsupported)?.into(),
+            "--public-settings-json".into(),
+            public,
+            "--launch-descriptor-fd".into(),
+            fds.launch.to_string(),
+        ];
+        if let Some((inference, admin)) = fds.credentials {
+            argv.extend([
                 "--inference-credential-fd".into(),
-                fds.inference.to_string(),
+                inference.to_string(),
                 "--admin-credential-fd".into(),
-                fds.admin.to_string(),
-            ],
+                admin.to_string(),
+            ]);
+        }
+        Ok(RenderedCommand {
+            argv,
             env: Default::default(),
         })
+    }
+
+    /// ADR 0028 §10: whether this launch is a group worker (node_rank > 0),
+    /// which is handed no credential and serves no API.
+    pub fn is_group_worker(&self) -> bool {
+        self.worker
     }
 
     /// Service configuration supplies this path, never a candidate or HTTP request.
@@ -368,6 +413,62 @@ fn public_memory(
         }
     }
     rendered
+}
+
+/// ADR 0028 §10: one member's closed group object, which the entry maps onto
+/// the five reserved ServerArgs fields it takes from the group (`tp_size`,
+/// `pp_size`, `nnodes`, `node_rank`, `dist_init_addr`) and checks again after
+/// SGLang's resolution (`group_drift:<field>`). `host_ip` is the member's own
+/// peer address (`SGLANG_HOST_IP`), and `gloo_socket_ifname` is present only
+/// when the host resolved the interface holding it (R11). The same shape is
+/// validated by `runtime/sglang_entry.py::_validate_group`.
+fn public_group(group: &GroupMemberArgs) -> Result<Value, RuntimeError> {
+    let ranks = group.tensor_parallel.checked_mul(group.pipeline_parallel);
+    // The head is its own rendezvous address and has no worker port; a
+    // worker answers on its loopback worker port.
+    let ports = if group.is_head() {
+        group.worker_port.is_none() && group.own_address == group.head_address
+    } else {
+        group.worker_port.is_some_and(|port| port != 0)
+    };
+    if !(1..=1024).contains(&group.tensor_parallel)
+        || !(1..=1024).contains(&group.pipeline_parallel)
+        || !(2..=1024).contains(&group.nnodes)
+        || group.node_rank >= group.nnodes
+        // ADR 0028 §2: the members split the ranks evenly.
+        || ranks.is_none_or(|ranks| ranks % group.nnodes != 0)
+        || group.rendezvous_port == 0
+        || !ports
+        || group
+            .own_interface
+            .as_deref()
+            .is_some_and(|name| !interface_name(name))
+    {
+        return Err(RuntimeError::Unsupported);
+    }
+    let mut rendered = json!({
+        "tp_size": group.tensor_parallel,
+        "pp_size": group.pipeline_parallel,
+        "nnodes": group.nnodes,
+        "node_rank": group.node_rank,
+        // An IPv6 head address is bracketed: `[addr]:port`.
+        "dist_init_addr": SocketAddr::new(group.head_address, group.rendezvous_port).to_string(),
+        "host_ip": group.own_address.to_string(),
+    });
+    if let Some(name) = &group.own_interface {
+        rendered["gloo_socket_ifname"] = json!(name);
+    }
+    Ok(rendered)
+}
+
+/// A kernel interface name: at most 15 bytes (IFNAMSIZ less its terminator)
+/// of the characters interface names use, never a path or an address.
+fn interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 15
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 fn selector(value: &str) -> bool {

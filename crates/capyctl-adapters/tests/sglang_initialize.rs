@@ -180,7 +180,7 @@ struct ScriptedTool {
     present: Mutex<Presence>,
     group: Vec<ProcessIdentity>,
     spawned: Mutex<Vec<RenderedCommand>>,
-    descriptors: Mutex<Vec<[Vec<u8>; 3]>>,
+    descriptors: Mutex<Vec<Vec<Vec<u8>>>>,
     gone_on_spawn: bool,
     present_calls: Arc<AtomicUsize>,
     /// ADR 0014 amendment A12: whether a compiler runs in the group.
@@ -189,15 +189,19 @@ struct ScriptedTool {
 
 /// Read each protected descriptor through a duplicated descriptor, then rewind
 /// so the original stays positioned at zero for a real child to read.
-fn descriptor_contents(descriptors: &ProtectedLaunchDescriptors) -> [Vec<u8>; 3] {
-    descriptors.numbers().map(|fd: RawFd| {
-        let dup = nix::unistd::dup(fd).unwrap();
-        let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        file.rewind().unwrap();
-        bytes
-    })
+fn descriptor_contents(descriptors: &ProtectedLaunchDescriptors) -> Vec<Vec<u8>> {
+    descriptors
+        .numbers()
+        .into_iter()
+        .map(|fd: RawFd| {
+            let dup = nix::unistd::dup(fd).unwrap();
+            let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            file.rewind().unwrap();
+            bytes
+        })
+        .collect()
 }
 
 impl ScriptedTool {
@@ -561,7 +565,9 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     // The launcher was handed exactly the private inputs the renderer pinned.
     let captured = tool.descriptors.lock().unwrap();
     assert_eq!(captured.len(), 1);
-    let [private, inference, admin] = &captured[0];
+    let [private, inference, admin] = captured[0].as_slice() else {
+        panic!("three protected descriptors")
+    };
     let private: Value = serde_json::from_slice(private).unwrap();
     assert_eq!(private["schema_version"], 2);
     assert_eq!(private["kind"], "sglang_private_launch");
@@ -1104,4 +1110,151 @@ async fn a_profile_cuda_home_and_build_limit_reach_the_sglang_engine() {
     );
     assert_eq!(spawned[0].env["CUDA_HOME"], "/usr/local/cuda-13.0");
     assert_eq!(spawned[0].env["FLASHINFER_NVCC_THREADS"], "2");
+}
+
+// ---------------------------------------------------------- group members
+
+const WORKER_PORT: u16 = 8101;
+
+fn member(rank: u32, interface: Option<&str>) -> capyctl_domain::group::GroupMemberArgs {
+    capyctl_domain::group::GroupMemberArgs {
+        tensor_parallel: 2,
+        pipeline_parallel: 1,
+        nnodes: 2,
+        node_rank: rank,
+        head_address: "192.0.2.10".parse().unwrap(),
+        rendezvous_port: 25000,
+        own_address: format!("192.0.2.{}", 10 + rank).parse().unwrap(),
+        worker_port: (rank > 0).then_some(WORKER_PORT),
+        own_interface: interface.map(str::to_owned),
+    }
+}
+
+/// Run one group member's Initialize and return what the launcher was
+/// handed: the final spawned command and the protected descriptor contents.
+async fn spawn_member(
+    rank: u32,
+    interface: Option<&str>,
+    configure: impl FnOnce(SglangAdapter) -> SglangAdapter,
+) -> (RenderedCommand, Vec<Vec<u8>>) {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port).with_group(member(rank, interface));
+    let adapter = configure(equipped(launch, tool.clone(), &log));
+    let observation = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    if rank > 0 {
+        // ADR 0028 §9: readiness is the head's; nothing probes a worker, and
+        // a worker alone claims no milestone.
+        assert!(stub.requests.lock().unwrap().is_empty());
+        assert!(observation.facts.is_empty());
+        assert_eq!(observation.identities[0], api_identity());
+    }
+    let command = tool.spawned.lock().unwrap().remove(0);
+    let descriptors = tool.descriptors.lock().unwrap().remove(0);
+    std::fs::remove_file(&log).ok();
+    (command, descriptors)
+}
+
+// T21, T37, R11 (ADR 0028 §10): the final spawned environment of each member
+// carries its own SGLANG_HOST_IP and the group switch, no NCCL_* or MASTER_*,
+// GLOO_SOCKET_IFNAME only as resolved, and no file rendezvous.
+#[tokio::test]
+async fn sglang_group_env() {
+    for rank in [0, 1] {
+        for interface in [Some("eth9"), None] {
+            let (command, _) = spawn_member(rank, interface, |adapter| {
+                adapter.with_rendezvous_dir("/state/rendezvous/01K00000000000000000000002".into())
+            })
+            .await;
+            let env = &command.env;
+            assert_eq!(env["SGLANG_HOST_IP"], format!("192.0.2.{}", 10 + rank));
+            assert_eq!(env["CAPYCTL_GROUP_MODE"], "1");
+            assert!(!env
+                .keys()
+                .any(|k| k.starts_with("NCCL_") || k.starts_with("MASTER_")));
+            let gloo: Vec<_> = env.keys().filter(|k| k.starts_with("GLOO_")).collect();
+            match interface {
+                Some(name) => {
+                    assert_eq!(gloo, ["GLOO_SOCKET_IFNAME"]);
+                    assert_eq!(env["GLOO_SOCKET_IFNAME"], name);
+                }
+                None => assert!(gloo.is_empty(), "{gloo:?}"),
+            }
+            assert!(!env.contains_key("SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE"));
+            assert!(!env.contains_key("CAPYCTL_RENDEZVOUS_DIR"));
+            assert!(!env.contains_key("HOST_IP"));
+        }
+    }
+}
+
+// T21, T37 (ADR 0012): the key-guarded API is the head's. A worker is handed
+// the private launch descriptor alone, even by an adapter holding the keys;
+// the head keeps all three descriptors.
+#[tokio::test]
+async fn credentials_reach_the_head_only() {
+    let (head, descriptors) = spawn_member(0, Some("eth9"), |adapter| adapter).await;
+    assert_eq!(descriptors.len(), 3);
+    assert_eq!(descriptors[1], INFERENCE.as_bytes());
+    assert_eq!(descriptors[2], ADMIN.as_bytes());
+    assert!(head.argv.iter().any(|a| a == "--inference-credential-fd"));
+
+    let (worker, descriptors) = spawn_member(1, Some("eth9"), |adapter| adapter).await;
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(&worker.argv[5..6], ["--launch-descriptor-fd"]);
+    assert_eq!(worker.argv.len(), 7);
+    let private: Value = serde_json::from_slice(&descriptors[0]).unwrap();
+    assert_eq!(
+        private["public_settings"]["endpoint"],
+        "http://127.0.0.1:8101"
+    );
+    let everything = format!("{:?} {:?} {}", worker.argv, worker.env, private);
+    for secret in [INFERENCE, ADMIN] {
+        assert!(
+            !everything.contains(secret),
+            "a credential reached the worker"
+        );
+    }
+}
+
+// T22, R12 (ADR 0028 §12): a deep worker enrolls its saver observation in its
+// own host's directory, exactly as the head and a single rank do.
+#[tokio::test]
+async fn a_deep_worker_launch_carries_the_observation_target() {
+    for rank in [0, 1] {
+        let (command, _) = spawn_member(rank, None, |adapter| {
+            adapter.with_observation_dir("/state/observations".into())
+        })
+        .await;
+        assert_eq!(
+            command.env["CAPYCTL_OBSERVATION_DIR"],
+            "/state/observations"
+        );
+        let public: Value = serde_json::from_str(&command.argv[4]).unwrap();
+        assert_eq!(public["settings"]["memory_saver"], true);
+    }
+}
+
+// T39: a single-rank spawn has none of the group names and keeps its file rendezvous.
+#[tokio::test]
+async fn single_rank_spawn_has_no_group_names() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    equipped(frozen_launch(port), tool.clone(), &log)
+        .with_rendezvous_dir("/state/rendezvous/01K00000000000000000000002".into())
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let env = &tool.spawned.lock().unwrap()[0].env;
+    for name in ["SGLANG_HOST_IP", "CAPYCTL_GROUP_MODE", "GLOO_SOCKET_IFNAME"] {
+        assert!(!env.contains_key(name), "{name}");
+    }
+    assert!(env.contains_key("CAPYCTL_RENDEZVOUS_DIR"));
+    std::fs::remove_file(&log).ok();
 }

@@ -11,14 +11,18 @@ fn protected_descriptors_are_private_sealed_bounded_and_close_on_drop() {
     let descriptors =
         ProtectedLaunchDescriptors::new(b"{}", b"inference-secret", b"admin-secret").unwrap();
     let numbers = descriptors.numbers();
-    let inodes = numbers.map(|fd| {
-        std::fs::metadata(format!("/proc/self/fd/{fd}"))
-            .unwrap()
-            .ino()
-    });
-    for (fd, expected) in
+    assert_eq!(numbers.len(), 3);
+    let inodes: Vec<_> = numbers
+        .iter()
+        .map(|fd| {
+            std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .unwrap()
+                .ino()
+        })
+        .collect();
+    for (&fd, expected) in
         numbers
-            .into_iter()
+            .iter()
             .zip([b"{}".as_slice(), b"inference-secret", b"admin-secret"])
     {
         assert!(fd > 9, "must not collide with initialization gate");
@@ -65,7 +69,9 @@ fn protected_descriptors_reach_only_gated_child_and_association_failure_keeps_ga
         let marker = dir.path().join("descriptor-content");
         let descriptors =
             ProtectedLaunchDescriptors::new(b"{}", b"inference-secret", b"admin-secret").unwrap();
-        let [_, inference, _] = descriptors.numbers();
+        let [_, inference, _] = descriptors.numbers()[..] else {
+            panic!("three protected descriptors")
+        };
         let command = RenderedCommand {
             argv: vec![
                 "sh".into(),
@@ -134,7 +140,9 @@ fn owned_process_launch_spawns_with_protected_descriptors() {
         b"admin-secret",
     )
     .unwrap();
-    let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
+    let [launch_fd, inference_fd, admin_fd] = descriptors.numbers()[..] else {
+        panic!("three protected descriptors")
+    };
     let command = RenderedCommand {
         argv: vec![
             "sh".into(),

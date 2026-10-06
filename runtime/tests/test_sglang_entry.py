@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from runtime import sglang_entry as entry
+from runtime import loopback_rendezvous as rendezvous
 from runtime import sglang_native_composition as composition
 from runtime import sglang_device as device
 from runtime import sglang_server_args as server_args
@@ -61,6 +62,24 @@ def public_settings():
                    "device_id": "gpu0", "memory_domain": "uma"},
         "settings": settings(),
     }
+
+
+def group(rank, ifname=None):
+    """ADR 0028 §10: one member's `group` object, as the adapter renders it."""
+    value = {"tp_size": 2, "pp_size": 1, "nnodes": 2, "node_rank": rank,
+             "dist_init_addr": "192.0.2.10:25000", "host_ip": "192.0.2.%d" % (10 + rank)}
+    if ifname is not None:
+        value["gloo_socket_ifname"] = ifname
+    return value
+
+
+def group_public(rank, ifname=None):
+    """A member's public settings; a worker answers on its loopback worker port."""
+    public = public_settings()
+    public["settings"]["group"] = group(rank, ifname)
+    if rank:
+        public["endpoint"] = "http://127.0.0.1:8101"
+    return public
 
 
 class ScriptIdentityTests(unittest.TestCase):
@@ -119,6 +138,21 @@ class LaunchFixture:
     def build(self, argv=None, payloads=None):
         data = self.payloads() if payloads is None else payloads
         return entry.build_launch(self.argv() if argv is None else argv, data.__getitem__)
+
+    # ADR 0012: a worker (node_rank > 0) is handed the private launch
+    # descriptor alone; the head keeps both credential descriptors.
+    def member_argv(self, public):
+        argv = self.argv(public)
+        return argv[:4] if public["settings"]["group"]["node_rank"] else argv
+
+    def member_payloads(self, public):
+        data = self.payloads(public)
+        if public["settings"]["group"]["node_rank"]:
+            del data[4], data[5]
+        return data
+
+    def build_member(self, public):
+        return self.build(self.member_argv(public), self.member_payloads(public))
 
     def rejects(self, argv=None, payloads=None):
         with self.assertRaises(entry.LaunchError) as caught:
@@ -995,6 +1029,176 @@ class HealthTests(unittest.TestCase):
         calls, messages = finish_without_io(exercise("/health_generate", "GET", [auth, auth]))
         self.assertEqual(calls, [])
         self.assertEqual(messages[0]["status"], 401)
+
+
+class EntryGroupDescriptorTests(LaunchFixture, unittest.TestCase):
+    # T22, T37 (ADR 0012): a worker's launch carries no credential; the head's
+    # and a single rank's carry both, exactly as before.
+    def test_only_a_worker_launches_without_credentials(self):
+        worker = self.build_member(group_public(1, "eth9"))
+        self.assertIsNone(worker._inference_key)
+        self.assertIsNone(worker._admin_key)
+        head = self.build_member(group_public(0))
+        self.assertEqual(head._inference_key, self.inference.decode())
+        # A worker handed credentials, or a head or single rank without
+        # them, is a launch this boundary does not know.
+        public = group_public(1)
+        self.rejects(self.argv(public), self.payloads(public))
+        for public in (group_public(0), public_settings()):
+            data = self.payloads(public)
+            del data[4], data[5]
+            self.rejects(self.argv(public)[:4], data)
+
+    # T22: the group object is closed and its shape checked.
+    def test_group_shapes_are_checked(self):
+        mutations = [("tp_size", 0), ("tp_size", 3), ("pp_size", 0), ("nnodes", 1),
+                     ("nnodes", True), ("node_rank", 2), ("node_rank", -1),
+                     ("dist_init_addr", "192.0.2.10"), ("dist_init_addr", "192.0.2.10:0"),
+                     ("dist_init_addr", "host-a:25000"), ("dist_init_addr", "192.0.2.10:x"),
+                     ("host_ip", "not-an-address"), ("host_ip", 1),
+                     ("gloo_socket_ifname", ""), ("gloo_socket_ifname", "eth0/1"),
+                     ("gloo_socket_ifname", "a" * 16), ("unexpected", 1)]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                public = group_public(1)
+                public["settings"]["group"][key] = value
+                self.rejects(self.member_argv(public), self.member_payloads(public))
+        public = group_public(1)
+        public["settings"]["group"]["dist_init_addr"] = "[2001:db8::10]:25000"
+        self.build_member(public)
+
+
+class EntryGroupModeTests(unittest.TestCase):
+    # T21: group mode uses no file rendezvous and keeps only SGLANG_HOST_IP.
+    def test_entry_group_mode_env(self):
+        env = {"SGLANG_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "lo"}
+        entry.prepare_group_environment(env)
+        self.assertEqual(env, {"SGLANG_HOST_IP": "192.0.2.11"})
+
+    # T21, R11: the resolved interface is kept and verified; every other
+    # transport input and the file rendezvous are stripped.
+    def test_the_resolved_interface_is_kept_and_verified(self):
+        env = {"SGLANG_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9",
+               "GLOO_DEVICE_TRANSPORT": "x", "NCCL_SOCKET_IFNAME": "lo",
+               "MASTER_ADDR": "0.0.0.0", "HOST_IP": "0.0.0.0", "SGLANG_LOCAL_IP_NIC": "lo",
+               "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE": "file:///tmp/store",
+               "CAPYCTL_RENDEZVOUS_DIR": "/state/rendezvous/x", "CAPYCTL_GROUP_MODE": "1",
+               "HOME": "/nonexistent"}
+        entry.prepare_group_environment(env, "eth9")
+        self.assertEqual(env, {"SGLANG_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9",
+                               "CAPYCTL_GROUP_MODE": "1", "HOME": "/nonexistent"})
+        entry.verify_group_environment(env, group(1, "eth9"))
+
+    # T21: anything that reappears before launch is refused.
+    def test_verify_refuses_drift(self):
+        clean = {"SGLANG_HOST_IP": "192.0.2.11", "GLOO_SOCKET_IFNAME": "eth9"}
+        for name, value in (("SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE", "tcp://0.0.0.0:1"),
+                            ("CAPYCTL_RENDEZVOUS_DIR", "/x"), ("SGLANG_LOCAL_IP_NIC", "lo"),
+                            ("NCCL_SOCKET_IFNAME", "lo"), ("MASTER_PORT", "1"),
+                            ("GLOO_SOCKET_IFNAME", "lo"), ("SGLANG_HOST_IP", "192.0.2.12")):
+            with self.subTest(name=name):
+                env = dict(clean, **{name: value})
+                with self.assertRaises(entry.LaunchError) as caught:
+                    entry.verify_group_environment(env, group(1, "eth9"))
+                self.assertEqual(caught.exception.code, "loopback_rendezvous_failed")
+        with self.assertRaises(entry.LaunchError):
+            entry.verify_group_environment(clean, group(1))
+
+
+class EntryGroupStartupTests(LaunchFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+
+    def _launch(self, public, drift=None, target=None):
+        seen = {}
+        launch = mock.Mock()
+        launch.launch_server.side_effect = lambda *args, **kwargs: seen.update(os.environ)
+
+        def construct(spec, placement, constructor, **_):
+            if drift:
+                drift()
+            return mock.Mock()
+
+        error = io.StringIO()
+        with mock.patch.object(entry, "_verified_native_contract", return_value=mock.Mock()), \
+                mock.patch.object(entry, "_guarded_engine_import",
+                                  side_effect=lambda: (mock.Mock(), launch)), \
+                mock.patch.object(entry, "_require_capabilities"), \
+                mock.patch.object(entry, "_observation_target", return_value=target), \
+                mock.patch.object(server_args, "construct_server_args", side_effect=construct), \
+                mock.patch.object(rendezvous, "pin",
+                                  side_effect=AssertionError("file rendezvous")):
+            result = entry.main(self.member_argv(public), self.member_payloads(public).__getitem__,
+                                error)
+        return result, error.getvalue(), seen, launch
+
+    # T21, R11: a group member starts with its own address and resolved
+    # interface, no file rendezvous and no inherited transport input.
+    def test_a_worker_starts_without_a_file_rendezvous(self):
+        os.environ.update({"CAPYCTL_GROUP_MODE": "1", "SGLANG_HOST_IP": "192.0.2.11",
+                           "GLOO_SOCKET_IFNAME": "eth9", "NCCL_IB_DISABLE": "1",
+                           "MASTER_ADDR": "0.0.0.0",
+                           "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE": "tcp://0.0.0.0:1",
+                           "CAPYCTL_RENDEZVOUS_DIR": "/state/rendezvous/x"})
+        result, error, seen, _ = self._launch(group_public(1, "eth9"))
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(seen["SGLANG_HOST_IP"], "192.0.2.11")
+        self.assertEqual(seen["GLOO_SOCKET_IFNAME"], "eth9")
+        for name in ("NCCL_IB_DISABLE", "MASTER_ADDR", "CAPYCTL_RENDEZVOUS_DIR",
+                     "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE", "NCCL_SOCKET_IFNAME"):
+            self.assertNotIn(name, seen)
+
+    # T21: a file rendezvous reappearing before launch is refused.
+    def test_group_rendezvous_drift_is_refused(self):
+        os.environ.update({"CAPYCTL_GROUP_MODE": "1", "SGLANG_HOST_IP": "192.0.2.10"})
+
+        def drift():
+            os.environ["SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE"] = "tcp://0.0.0.0:1"
+
+        result, error, seen, _ = self._launch(group_public(0), drift)
+        self.assertEqual(result, 1)
+        self.assertEqual(error, "sglang_startup_failed: loopback_rendezvous_failed\n")
+        self.assertEqual(seen, {})
+
+    # T22: the group switch and the descriptor's group must agree.
+    def test_group_mode_and_descriptor_must_agree(self):
+        os.environ.update({"SGLANG_HOST_IP": "192.0.2.10"})
+        result, error, _, _ = self._launch(group_public(0))
+        self.assertEqual((result, error), (1, "sglang_startup_failed: invalid_descriptor\n"))
+        os.environ["CAPYCTL_GROUP_MODE"] = "1"
+        public = public_settings()
+        with mock.patch.object(entry, "_verified_native_contract", return_value=mock.Mock()), \
+                mock.patch.object(entry, "_guarded_engine_import",
+                                  side_effect=AssertionError("imported")):
+            error = io.StringIO()
+            result = entry.main(self.argv(public), self.payloads(public).__getitem__, error)
+        self.assertEqual((result, error.getvalue()),
+                         (1, "sglang_startup_failed: invalid_descriptor\n"))
+
+    # T22, R12 (ADR 0028 §12): a deep worker enrolls its saver observation
+    # through the same scheduler target as the head and a single rank.
+    def test_a_deep_worker_launches_with_the_observation_target(self):
+        os.environ.update({"CAPYCTL_GROUP_MODE": "1", "SGLANG_HOST_IP": "192.0.2.11"})
+        target = object()
+        result, error, _, launch = self._launch(group_public(1), target=target)
+        self.assertEqual((result, error), (0, ""))
+        self.assertIs(launch.launch_server.call_args.kwargs["run_scheduler_process_func"], target)
+
+    # T22, R12: the observation enrollment itself is rank-blind.
+    def test_observation_target_enrolls_a_worker(self):
+        from runtime import engine_capabilities, sglang_observation_enrollment as enrollment
+        os.environ[enrollment.ENV_DIR] = "/state/observations"
+        spec = self.build_member(group_public(1))
+        with mock.patch.object(engine_capabilities, "accepts_scheduler_target",
+                               return_value=True), \
+                mock.patch.object(enrollment, "entry_environment", return_value=True) as enrol:
+            target = entry._observation_target(spec, mock.Mock())
+        self.assertIs(target, enrollment.run_enrolled_scheduler)
+        enrol.assert_called_once_with("/state/observations", "01K00000000000000000000001",
+                                      "01K00000000000000000000099", "disk_reload")
 
 
 if __name__ == "__main__":

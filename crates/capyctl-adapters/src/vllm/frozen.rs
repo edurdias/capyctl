@@ -217,7 +217,10 @@ pub fn plan_from_effective(
 /// ADR 0028 §10: a group member's launch plan. Tensor and pipeline
 /// parallelism come from the group plan instead of the single-rank `1` pin;
 /// everything else stays as `plan_from_effective` froze it.
-pub fn with_group(mut plan: PlanInputVllm, group: crate::group::GroupMemberArgs) -> PlanInputVllm {
+pub fn with_group(
+    mut plan: PlanInputVllm,
+    group: capyctl_domain::group::GroupMemberArgs,
+) -> PlanInputVllm {
     plan.tensor_parallel_size = group.tensor_parallel;
     plan.pipeline_parallel_size = group.pipeline_parallel;
     plan.group = Some(group);

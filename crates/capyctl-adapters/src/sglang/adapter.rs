@@ -117,6 +117,14 @@ pub struct SglangLaunchHandle {
     pub(super) rendered: SglangLaunch,
 }
 
+/// An owned launch's parts: the launch, the process tools, and the inference
+/// and admin credentials (`None` for a group worker, ADR 0012).
+pub(super) type LaunchParts = (
+    SglangLaunchHandle,
+    Arc<dyn OwnedProcessLaunch>,
+    Option<(String, String)>,
+);
+
 /// One immutable runtime binding. No Debug implementation exposes credentials or
 /// the checkpoint root. The local attempt fence survives cancellation, but is
 /// supplementary: persisted coordinator fencing remains mandatory across restart.
@@ -406,38 +414,30 @@ impl SglangAdapter {
     }
 
     /// The four things an owned launch needs. Any one missing makes the step
-    /// unsupported rather than partly performed.
-    pub(super) fn launch_parts(
-        &self,
-    ) -> Result<
-        (
-            SglangLaunchHandle,
-            Arc<dyn OwnedProcessLaunch>,
-            String,
-            String,
-        ),
-        RuntimeError,
-    > {
-        match (
-            &self.launch,
-            &self.tools,
-            &self.inference_key,
-            &self.admin_key,
-        ) {
-            (Some(launch), Some(tools), Some(inference), Some(admin)) => {
-                let rendered = SglangLaunch::from_frozen(launch)?;
-                Ok((
-                    SglangLaunchHandle {
-                        frozen: launch.clone(),
-                        rendered,
-                    },
-                    tools.clone(),
-                    inference.clone(),
-                    admin.clone(),
-                ))
+    /// unsupported rather than partly performed. ADR 0028 §10, ADR 0012: a
+    /// group worker serves no API and is handed no credential, so its parts
+    /// carry none even when this adapter holds a pair.
+    pub(super) fn launch_parts(&self) -> Result<LaunchParts, RuntimeError> {
+        let (Some(launch), Some(tools)) = (&self.launch, &self.tools) else {
+            return Err(RuntimeError::Unsupported);
+        };
+        let rendered = SglangLaunch::from_frozen(launch)?;
+        let credentials = if rendered.is_group_worker() {
+            None
+        } else {
+            match (&self.inference_key, &self.admin_key) {
+                (Some(inference), Some(admin)) => Some((inference.clone(), admin.clone())),
+                _ => return Err(RuntimeError::Unsupported),
             }
-            _ => Err(RuntimeError::Unsupported),
-        }
+        };
+        Ok((
+            SglangLaunchHandle {
+                frozen: launch.clone(),
+                rendered,
+            },
+            tools.clone(),
+            credentials,
+        ))
     }
 
     /// Claim this adapter's one launch. A second claim is refused: the adapter

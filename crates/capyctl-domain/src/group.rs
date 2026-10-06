@@ -150,6 +150,50 @@ pub struct MemberPlan {
     pub worker_port: Option<u16>,
 }
 
+/// ADR 0028 §10: the engine-neutral arguments of one multi-node group member,
+/// taken from the group plan (`capyctl_adapters::group::member_args`). Each
+/// engine adapter renders them in its own spelling; the protected entry
+/// compares the parse against them before serving. It lives here so a frozen
+/// launch (`crate::launch::NativeLaunch`) can carry it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMemberArgs {
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+    pub nnodes: u32,
+    pub node_rank: u32,
+    /// The head's peer address: the engine's rendezvous address.
+    pub head_address: std::net::IpAddr,
+    pub rendezvous_port: u16,
+    /// This member's own peer address.
+    pub own_address: std::net::IpAddr,
+    /// A SGLang worker's loopback port; `None` for every other member.
+    pub worker_port: Option<u16>,
+    /// ADR 0028 §10 (R11): the interface holding `own_address`, rendered as
+    /// `GLOO_SOCKET_IFNAME`. The plan cannot know it; the agent fills it at
+    /// launch and refuses the launch if it cannot.
+    pub own_interface: Option<String>,
+}
+
+impl GroupMemberArgs {
+    /// Rank 0 is the head: the only member that serves the API.
+    pub fn is_head(&self) -> bool {
+        self.node_rank == 0
+    }
+
+    /// The `CAPYCTL_GROUP_EXPECTED` payload: the engine's own destination
+    /// `fields` (a JSON object), plus `gloo_socket_ifname` when rendered.
+    pub fn expected_json(&self, fields: serde_json::Value) -> String {
+        let mut object = match fields {
+            serde_json::Value::Object(object) => object,
+            _ => serde_json::Map::new(),
+        };
+        if let Some(interface) = &self.own_interface {
+            object.insert("gloo_socket_ifname".into(), interface.clone().into());
+        }
+        serde_json::Value::Object(object).to_string()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupPlan {
     engine: GroupEngine,

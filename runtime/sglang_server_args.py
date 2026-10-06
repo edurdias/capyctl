@@ -29,6 +29,11 @@ from . import extra_args_policy
 from . import sglang_entry
 
 
+# ADR 0028 §10: the reserved fields a multi-node group member takes from its
+# descriptor's `group` object instead of the single-rank constants below.
+GROUP_FIELDS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr")
+
+
 class ServerArgsError(Exception):
     """Sanitized boundary error; never render native arguments or exceptions."""
 
@@ -36,7 +41,8 @@ class ServerArgsError(Exception):
         if code not in ("invalid_launch_inputs", "placement_mismatch",
                         "server_args_construction_failed", "effective_args_mismatch",
                         "invalid_extra_args", "memory_grant_unavailable",
-                        "sensitive_option_refused"):
+                        "sensitive_option_refused",
+                        *("group_drift:" + name for name in GROUP_FIELDS)):
             code = "effective_args_mismatch"
         super().__init__(code)
         self.code = code
@@ -135,14 +141,16 @@ def _validated_public(spec):
                               "kind": "sglang_private_launch",
                               "checkpoint_root": spec._checkpoint_root,
                               "public_settings": public}).encode()
-        payloads = {3: private, 4: spec._inference_key.encode("ascii"),
-                    5: spec._admin_key.encode("ascii")}
+        argv = ["--public-settings-json", spec._public_json, "--launch-descriptor-fd", "3"]
+        payloads = {3: private}
+        # ADR 0028 §10: a group worker's launch carries no credential.
+        if spec._inference_key is not None or spec._admin_key is not None:
+            argv += ["--inference-credential-fd", "4", "--admin-credential-fd", "5"]
+            payloads.update({4: spec._inference_key.encode("ascii"),
+                             5: spec._admin_key.encode("ascii")})
         # Reuse the entire strict boundary: LaunchSpec's Python constructor is
         # not itself a validation capability. No descriptor I/O occurs here.
-        sglang_entry.build_launch(
-            ["--public-settings-json", spec._public_json,
-             "--launch-descriptor-fd", "3", "--inference-credential-fd", "4",
-             "--admin-credential-fd", "5"], payloads.__getitem__)
+        sglang_entry.build_launch(argv, payloads.__getitem__)
         return public
     except Exception:
         raise ServerArgsError("invalid_launch_inputs") from None
@@ -343,15 +351,28 @@ class CheckedServerArgs:
     _native: object = field(repr=False)
     _expected: tuple = field(repr=False)
     _graphs_disabled: bool = field(default=False, repr=False)
+    # ADR 0028 §10: the group fields of a multi-node member, whose change is
+    # named `group_drift:<field>`; empty for a single rank.
+    _group_fields: tuple = field(default=(), repr=False)
 
     def __repr__(self):
         return "CheckedServerArgs(<private; not launch authority>)"
 
     def revalidate(self):
         try:
+            resolved = self._native.resolved_dict()
+        except Exception:
+            raise ServerArgsError("effective_args_mismatch") from None
+        wanted = dict(self._expected)
+        # ADR 0028 §10: a group field SGLang's resolution changed or dropped
+        # is refused by name, before anything else is compared.
+        for key in self._group_fields:
+            value = resolved.get(key, _MISSING) if type(resolved) is dict else _MISSING
+            if type(value) is not type(wanted[key]) or value != wanted[key]:
+                raise ServerArgsError("group_drift:" + key)
+        try:
             # SPEC §8.1 / T22: 0.5.20 preserves raw fields; validate the resolved
             # projection consumed by the engine, not constructor declarations.
-            resolved = self._native.resolved_dict()
             for key, expected in self._expected:
                 value = resolved[key]
                 if type(value) is not type(expected) or value != expected:
@@ -363,6 +384,9 @@ class CheckedServerArgs:
                         raise ValueError()
         except Exception:
             raise ServerArgsError("effective_args_mismatch") from None
+
+
+_MISSING = object()
 
 
 def _log_refusal(error):
@@ -425,8 +449,16 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
                     host="127.0.0.1", port=int(public["endpoint"].rsplit(":", 1)[1]),
                     base_gpu_id=placement.cuda_index, mem_fraction_static=fraction,
                     # ADR 0010: residency decides the park strategy at launch.
+                    # ADR 0028 §12 (R12): on every rank of a group alike.
                     enable_memory_saver=settings["memory_saver"],
                     enable_weights_cpu_backup=settings["cpu_weight_backup"])
+    # ADR 0028 §10: a group member's parallelism and rendezvous come from its
+    # descriptor's group, never the single-rank constants. On a worker the key
+    # fields stay None (it is handed no credential, ADR 0012) and its health
+    # server binds the loopback worker port the descriptor's endpoint names.
+    group = settings.get("group")
+    if group is not None:
+        reserved.update({name: group[name] for name in GROUP_FIELDS})
     keywords = dict(_SAFE_DEFAULTS)
     keywords.update(typed_keywords(settings))
     keywords.update(extra)
@@ -441,6 +473,7 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         _log_refusal(error)
         raise ServerArgsError("server_args_construction_failed") from None
     checked = CheckedServerArgs(native, tuple(expected.items()),
-                                settings["cuda_graphs"] is False)
+                                settings["cuda_graphs"] is False,
+                                GROUP_FIELDS if group is not None else ())
     checked.revalidate()
     return checked

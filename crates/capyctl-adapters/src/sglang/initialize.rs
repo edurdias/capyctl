@@ -93,8 +93,8 @@ pub(super) async fn initialize(
     let context = &command.context;
     // Unsupported when any part is missing: a builder without its launch, its
     // tools or its credentials cannot launch anything, and must not half-run
-    // the step.
-    let (launch, tools, inference, admin) = adapter.launch_parts()?;
+    // the step. A group worker has no credentials to miss (ADR 0012).
+    let (launch, tools, credentials) = adapter.launch_parts()?;
     if !matches!(context.launch_settings, Some(LaunchSettings::Sglang(_)))
         || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
@@ -108,6 +108,8 @@ pub(super) async fn initialize(
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
     // descriptors the launcher hands the child; nothing enters argv or env.
+    // ADR 0028 §10, ADR 0012: a group worker is handed the private descriptor
+    // alone.
     let private = private_descriptor(
         session,
         context,
@@ -115,16 +117,22 @@ pub(super) async fn initialize(
         launch.rendered.public_metadata(),
         launch.frozen.metadata().placement_digest.as_deref(),
     )?;
-    let descriptors =
-        ProtectedLaunchDescriptors::new(&private, inference.as_bytes(), admin.as_bytes()).map_err(
-            |e| RuntimeError::Uncertain(redact_text(&format!("protected descriptors: {e}"))),
-        )?;
-    let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
-    let fds = ProtectedDescriptorFds::for_launcher(
-        i64::from(launch_fd),
-        i64::from(inference_fd),
-        i64::from(admin_fd),
-    )?;
+    let descriptors = match &credentials {
+        Some((inference, admin)) => {
+            ProtectedLaunchDescriptors::new(&private, inference.as_bytes(), admin.as_bytes())
+        }
+        None => ProtectedLaunchDescriptors::launch_only(&private),
+    }
+    .map_err(|e| RuntimeError::Uncertain(redact_text(&format!("protected descriptors: {e}"))))?;
+    let fds = match descriptors.numbers()[..] {
+        [launch_fd, inference_fd, admin_fd] => ProtectedDescriptorFds::for_launcher(
+            i64::from(launch_fd),
+            i64::from(inference_fd),
+            i64::from(admin_fd),
+        )?,
+        [launch_fd] => ProtectedDescriptorFds::launch_only(i64::from(launch_fd))?,
+        _ => return Err(RuntimeError::Unsupported),
+    };
     let mut cmd = launch.rendered.render_for_launcher(fds, &wrapper)?;
     // SPEC §13.3: tools come from the selected installation and fixed system
     // directories, never the caller's shell PATH. FlashInfer needs venv ninja.
@@ -187,7 +195,8 @@ pub(super) async fn initialize(
     }
     // SPEC §8.2 / T21: a host-named rendezvous directory, removed by the host
     // on gone evidence; without one the entry makes its own temporary one.
-    if let Some(dir) = adapter.rendezvous_dir() {
+    // ADR 0028 §10: a group member has no file rendezvous.
+    if let (None, Some(dir)) = (launch.frozen.group(), adapter.rendezvous_dir()) {
         let dir = dir.to_str().ok_or(RuntimeError::Unsupported)?;
         cmd.env.insert("CAPYCTL_RENDEZVOUS_DIR".into(), dir.into());
     }
@@ -212,6 +221,27 @@ pub(super) async fn initialize(
             cmd.env.insert(name.into(), value);
         }
     }
+    // ADR 0028 §10 (R11): a group member renders its own peer address, the
+    // interface holding it when the host resolved one, and the entry's group
+    // switch, last so they win; no other NCCL_*, GLOO_* or MASTER_* name
+    // reaches the engine.
+    if let Some(group) = launch.frozen.group() {
+        cmd.env.retain(|name, _| {
+            !["NCCL_", "GLOO_", "MASTER_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        });
+        cmd.env.insert(
+            crate::group::SGLANG_HOST_IP.into(),
+            group.own_address.to_string(),
+        );
+        if let Some(interface) = &group.own_interface {
+            cmd.env
+                .insert(crate::group::GLOO_SOCKET_IFNAME.into(), interface.clone());
+        }
+        cmd.env
+            .insert(crate::group::GROUP_MODE_ENV.into(), "1".into());
+    }
 
     // The tool is synchronous on purpose (capyctl-launchers has no runtime), so every
     // call into it leaves the async threads free.
@@ -224,6 +254,13 @@ pub(super) async fn initialize(
     .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
     // ADR 0014 amendment A12: note any kernel build until the step ends.
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
+
+    // ADR 0028 §9: readiness is the head's. A worker's health server always
+    // passes and is never probed; its step ends once its process is recorded
+    // and present.
+    if launch.rendered.is_group_worker() {
+        return worker_spawned(adapter, context, tools, api, builds, debug_logs).await;
+    }
 
     // Spec §4: the builder ends before the coordinator's bound so its own error wins.
     let stop_at = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
@@ -267,20 +304,7 @@ pub(super) async fn initialize(
             Presence::Alive => {}
             // SPEC §§6.4, 13.2: an engine that left before readiness is a
             // launch failure with its own reason, not ownership uncertainty.
-            // The summary names refused options only, never values, so it is
-            // read from the tail even when the full log is retained privately.
-            Presence::Gone => {
-                let tail = log_tail(adapter.engine_log(), LOG_TAIL_LINES);
-                let summary = crate::launch_failure::summary(&tail, None);
-                return Err(RuntimeError::LaunchFailed(format!(
-                    "{summary}; log tail:\n{}",
-                    if debug_logs {
-                        "full native log retained privately; omitted from public diagnostics".into()
-                    } else {
-                        tail
-                    }
-                )));
-            }
+            Presence::Gone => return Err(launch_failed(adapter, debug_logs)),
             // Unknown is retained, never absent: the step fails but says why.
             Presence::Unknown => {
                 return Err(RuntimeError::Uncertain(
@@ -360,6 +384,75 @@ pub(super) async fn initialize(
         ],
         kernel_builds: builds.finish(),
     })
+}
+
+/// ADR 0028 §9, §10: a group worker's Initialize. Readiness is the head's, so
+/// nothing here talks to the worker's health server; the step reports the
+/// recorded process tree once the spawned process is present. No milestone is
+/// claimed: a worker alone serves nothing.
+async fn worker_spawned(
+    adapter: &SglangAdapter,
+    context: &StepExecutionContext,
+    tools: std::sync::Arc<dyn crate::traits::OwnedProcessLaunch>,
+    api: ProcessIdentity,
+    builds: crate::kernel_builds::BuildWatch,
+    debug_logs: bool,
+) -> Result<EffectObservation, RuntimeError> {
+    let presence_tools = tools.clone();
+    let watched = api.clone();
+    match tokio::task::spawn_blocking(move || presence_tools.present(&watched))
+        .await
+        .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))?
+    {
+        Presence::Alive => {}
+        Presence::Gone => return Err(launch_failed(adapter, debug_logs)),
+        Presence::Unknown => {
+            return Err(RuntimeError::Uncertain(
+                "group worker presence could not be established".into(),
+            ))
+        }
+    }
+    let led_by = api.clone();
+    let identities = tokio::task::spawn_blocking(move || tools.observe_group(&led_by))
+        .await
+        .map_err(|_| RuntimeError::Uncertain("group task failed".into()))??;
+    // The recorded tree must lead with the process this step spawned.
+    if identities.first() != Some(&api) {
+        return Err(RuntimeError::Uncertain(format!(
+            "group worker tree does not lead with its spawned process: {}",
+            roles(&identities)
+        )));
+    }
+    Ok(EffectObservation {
+        token: context.token.clone(),
+        binding_id: context.binding_id.clone(),
+        incarnation: context.incarnation.clone(),
+        identities,
+        observed_at_ms: now_ms()?,
+        receipt: format!(
+            "sglang {} group worker spawned; readiness is the head's",
+            adapter.fingerprint()?
+        ),
+        facts: Vec::new(),
+        kernel_builds: builds.finish(),
+    })
+}
+
+/// SPEC §§6.4, 13.2: an engine that left before readiness is a launch failure
+/// with its own reason, not ownership uncertainty. The summary names refused
+/// options only, never values, so it is read from the tail even when the full
+/// log is retained privately.
+fn launch_failed(adapter: &SglangAdapter, debug_logs: bool) -> RuntimeError {
+    let tail = log_tail(adapter.engine_log(), LOG_TAIL_LINES);
+    let summary = crate::launch_failure::summary(&tail, None);
+    RuntimeError::LaunchFailed(format!(
+        "{summary}; log tail:\n{}",
+        if debug_logs {
+            "full native log retained privately; omitted from public diagnostics".into()
+        } else {
+            tail
+        }
+    ))
 }
 
 fn roles(identities: &[ProcessIdentity]) -> String {

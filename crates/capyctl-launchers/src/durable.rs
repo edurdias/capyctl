@@ -196,8 +196,8 @@ impl DurableSpawn {
                     nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
                 )
                 .map_err(std::io::Error::other)?;
-                if let Some(numbers) = inherited {
-                    for fd in numbers {
+                if let Some(numbers) = &inherited {
+                    for &fd in numbers {
                         nix::fcntl::fcntl(
                             fd,
                             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
