@@ -26,6 +26,10 @@ mod startup;
 #[path = "tests_switching.rs"]
 mod switching_tests;
 
+// ADR 0028: multi-node engine groups (`cargo test tests_groups`).
+#[path = "tests_groups.rs"]
+mod tests_groups;
+
 use capyctl_testkit::{fixture, FakeEngine};
 
 struct Observations(Vec<MemoryObservation>);
