@@ -106,9 +106,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   and engine virtual environments only in the home directory. The lab-host rules
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
-- Do not change engine environments, drivers, or reboot hosts. The only owner
-  exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
-  vLLM 0.29 venv on host B; do not create or modify others.
+- Do not change engine environments, drivers, or reboot hosts. The engine virtual
+  environments in use, all owner-approved (list updated 2026-10-06):
+  - both hosts: SGLang 0.5.21, vLLM 0.30.0 and TensorFold 0.6.5 (host B's TensorFold
+    0.6.5 is a byte-identical copy of host A's, made with owner approval);
+  - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B.
+
+  Use these as they are. Do not create or modify any engine environment without the
+  owner's explicit approval, and add each approved one to this list.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
