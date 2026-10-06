@@ -74,11 +74,14 @@ pub fn report_from(result: &pb::MemberExecutionResult) -> Result<SourceReport, U
     })
 }
 
-/// The `MaterializeSource` command for one deployment revision on one host.
+/// The `MaterializeSource` command for one deployment revision on one host,
+/// addressed to `member_id` there (ADR 0028 §6: `head` for a single-host
+/// deployment, the host's own member for a group).
 #[allow(clippy::too_many_arguments)]
 pub fn source_command(
     controller_id: &str,
     host_id: &str,
+    member_id: &str,
     deployment_id: &str,
     revision: i64,
     generation: i64,
@@ -92,7 +95,7 @@ pub fn source_command(
             controller_id: controller_id.into(),
             member: MemberKey {
                 host_id: host_id.into(),
-                member_id: "head".into(),
+                member_id: member_id.into(),
             },
             deployment_id: deployment_id.into(),
             operation_id: id.clone(),
@@ -180,6 +183,7 @@ impl RemoteSources {
         Ok(source_command(
             &self.controller_id,
             &pending.host_id,
+            "head",
             &pending.deployment_id,
             pending.revision,
             pending.generation,
@@ -272,13 +276,15 @@ impl SourceHost for LocalSources {
 /// passes. Every answer is recorded. A failure or a timeout refuses the launch
 /// before anything was sent (`model_source:<reason>`, `model_source_pending`);
 /// a download still running keeps running on the host for the next attempt.
-/// A deployment with a local source returns at once.
+/// A deployment with a local source returns at once. The requests name
+/// `member_id` (ADR 0028 §6: `head` for a single-host deployment).
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_materialized(
     owner: &SharedCoordinatorState,
     sessions: &Arc<AgentSessions>,
     controller_id: &str,
     host: &str,
+    member_id: &str,
     deployment_id: &str,
     revision: i64,
     generation: i64,
@@ -301,6 +307,7 @@ pub async fn ensure_materialized(
         let command = source_command(
             controller_id,
             host,
+            member_id,
             deployment_id,
             revision,
             generation,
