@@ -2221,6 +2221,159 @@ fn stated_memory_limits_must_fit_the_observed_memory() {
     assert_eq!(domain_bytes(&host, DOMAIN, "host_kv_limit"), 8 << 30);
 }
 
+// T03 (owner decision 2026-10-06, ADR 0014 amendment A17: a parked
+// Qwen3.8-27B with a DFlash2 drafter measured 33.4 GiB, above the derived
+// quarter of a 128 GiB machine): a stated parked limit replaces the derived
+// one as a size or a share, up to and including the managed limit.
+#[test]
+fn a_stated_parked_limit_replaces_the_derived_one() {
+    const MEASURED_PARKED: i64 = 33_400 << 20;
+    let capacity = 128 * GIB;
+    let derived = || {
+        host_policy(
+            &installations(),
+            "env",
+            capacity,
+            None,
+            &HostShape::Unified,
+            PORTS,
+        )
+    };
+    assert!(domain_bytes(&derived(), DOMAIN, "parked_limit") < MEASURED_PARKED);
+    for (stated, expected) in [
+        ("40GiB", 40 * GIB),
+        ("35%", capacity / 100 * 35),
+        ("0B", 0),
+        // At the managed limit: the boundary is admitted.
+        ("50%", capacity / 100 * MANAGED_FRACTION),
+    ] {
+        let mut host = derived();
+        let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+            "parked_limit": stated}}}});
+        apply_stated_memory(&mut host, &doc, capacity).unwrap();
+        assert_eq!(
+            domain_bytes(&host, DOMAIN, "parked_limit"),
+            expected,
+            "{stated}"
+        );
+        let mut expected_host = derived();
+        expected_host["resource_policy"]["domains"][DOMAIN]["parked_limit"] =
+            serde_json::json!(format!("{expected}B"));
+        assert_eq!(host, expected_host, "{stated}: nothing else changes");
+        capyctl_config::effective::normalize_host_policy(&host).unwrap();
+    }
+    // With a raised managed limit the parked limit may follow it.
+    let mut host = derived();
+    let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "70%", "parked_limit": "60%"}}}});
+    apply_stated_memory(&mut host, &doc, capacity).unwrap();
+    assert_eq!(
+        domain_bytes(&host, DOMAIN, "parked_limit"),
+        capacity / 100 * 60
+    );
+}
+
+// T03 (owner decision 2026-10-06): a parked limit above the managed limit is
+// refused at start with both numbers, never silently lowered; one byte over
+// is the boundary.
+#[test]
+fn a_stated_parked_limit_above_the_managed_limit_is_refused() {
+    let managed = CAPACITY / 100 * MANAGED_FRACTION;
+    let one_over = format!("{}B", managed + 1);
+    for (stated_managed, stated_parked) in [
+        ("auto", "51%"),
+        ("auto", one_over.as_str()),
+        ("auto", "100%"),
+        ("40%", "45%"),
+    ] {
+        let mut host = derived_unified();
+        let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+            "managed_limit": stated_managed, "parked_limit": stated_parked}}}});
+        let error = apply_stated_memory(&mut host, &doc, CAPACITY).unwrap_err();
+        assert!(
+            error.contains("host.resource_policy.memory.system.parked_limit")
+                && error.contains("managed limit")
+                && error.contains("GiB"),
+            "{stated_managed}/{stated_parked}: {error}"
+        );
+    }
+    let mut host = derived_unified();
+    let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "parked_limit": format!("{managed}B")}}}});
+    apply_stated_memory(&mut host, &doc, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, DOMAIN, "parked_limit"), managed);
+}
+
+// T26 (owner decision 2026-10-06): a document that states no parked limit,
+// or states `auto` (the generated document), publishes the policy captured
+// from `main` before the setting existed, so its policy digest is unchanged.
+#[test]
+fn no_stated_parked_limit_keeps_the_policy_digest() {
+    use sha2::{Digest, Sha256};
+    let digest = |host: &Value| {
+        let policy = capyctl_config::effective::normalize_host_policy(host).unwrap();
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&policy).unwrap()))
+    };
+    let before: Value =
+        serde_json::from_str(include_str!("fixtures/unified_host_policy.json")).unwrap();
+    for stated in [
+        serde_json::json!({}),
+        serde_json::json!({"resource_policy": {"memory": {"system": {
+            "managed_limit": "auto", "free_reserve": "auto", "parked_limit": "auto"}}}}),
+    ] {
+        let mut host = host_policy(
+            &installations(),
+            "env",
+            128 * GIB,
+            None,
+            &HostShape::Unified,
+            PORTS,
+        );
+        apply_stated_memory(&mut host, &stated, 128 * GIB).unwrap();
+        assert_eq!(host, before, "{stated}");
+        assert_eq!(digest(&host), digest(&before), "{stated}");
+    }
+}
+
+// T26 (owner decision 2026-10-06, design §3): on a discrete host the
+// template's residency is sized on the parked room the published system
+// domain states, so a raised parked limit lets a larger copy park in host RAM.
+#[test]
+fn the_discrete_template_reads_the_published_parked_limit() {
+    let gpus = vec![rtx(0, 16376, 1536)];
+    let shape = HostShape::Discrete(gpus.clone());
+    let room = |stated: &Value| {
+        let mut host = host_policy(
+            &named(&installed(Engine::Vllm, "/bin/true")),
+            "env-1",
+            CAPACITY,
+            None,
+            &shape,
+            PORTS,
+        );
+        apply_stated_memory(&mut host, stated, CAPACITY).unwrap();
+        match discrete_template_memory(&gpus, &host, Some(6 * GIB), None).unwrap() {
+            TemplateMemory::Device {
+                system_parked_limit,
+                ..
+            } => system_parked_limit,
+            TemplateMemory::Unified { .. } => unreachable!("a discrete host"),
+        }
+    };
+    assert_eq!(
+        room(&serde_json::json!({})),
+        CAPACITY / 100 * PARKED_FRACTION,
+        "the derived quarter, as before"
+    );
+    assert_eq!(
+        room(
+            &serde_json::json!({"resource_policy": {"memory": {"system": {
+            "parked_limit": "45%"}}}})
+        ),
+        CAPACITY / 100 * 45
+    );
+}
+
 // T03 (ADR 0019): on a discrete host the stated limits are host RAM's, the
 // `system` domain; each card's own domain keeps its derived limits.
 #[test]

@@ -326,3 +326,81 @@ async fn standalone_memory_limits_follow_the_document_and_its_overrides() {
     assert_eq!(stored(&app), (CAPACITY / 100 * 50, CAPACITY / 100 * 20));
     let _ = app.shutdown().await;
 }
+
+// T03 T16 (owner decision 2026-10-06, ADR 0014 amendment A17: the derived
+// quarter of memory refused a 33.4 GiB parked footprint): the standalone
+// parked limit is set three ways, `--set` over `CAPYCTL_SET__…` over the
+// document over the derived 25 %, reaches the stored policy admission reads,
+// and one above the managed limit is refused at boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_parked_limit_follows_the_document_and_its_overrides() {
+    use capyctl_cli::roles::SettingOverrides;
+    use capyctl_config::ConfigKind;
+    const CAPACITY: i64 = support::TEST_CAPACITY_BYTES;
+    const ENV: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT";
+    let dir = support::safe_state_dir();
+    let config = dir.path().join("standalone.yaml");
+    let ports = support::engine_ports();
+    let parked = |app: &capyctl_cli::roles::App| {
+        app.store
+            .resource_policy("standalone")
+            .unwrap()
+            .expect("the embedded host published its policy")
+            .controls
+            .domains["unified"]
+            .parked_limit
+    };
+    let boot = |yaml: &'static str, flags: Vec<String>, env: Vec<(String, String)>| {
+        std::fs::write(&config, yaml).unwrap();
+        let overrides = SettingOverrides::parse(ConfigKind::Standalone, &flags, &env).unwrap();
+        let config = config.clone();
+        let dir = dir.path().to_path_buf();
+        async move { support::boot_with_overrides_on(&dir, Some(&config), &overrides, ports).await }
+    };
+    const NONE: &str = "schema_version: 1\nkind: standalone\nname: s\n";
+    const YAML: &str = "schema_version: 1\nkind: standalone\nname: s\nhost:\n  resource_policy:\n    memory:\n      system:\n        parked_limit: 30%\n";
+    let flag = || vec!["host.resource_policy.memory.system.parked_limit=40%".to_owned()];
+    let env = || vec![(ENV.to_owned(), "35%".to_owned())];
+    for (yaml, flags, env, expected, channel) in [
+        (
+            NONE,
+            vec![],
+            vec![],
+            CAPACITY / 100 * 25,
+            "the derived default",
+        ),
+        (YAML, vec![], vec![], CAPACITY / 100 * 30, "the document"),
+        (
+            YAML,
+            vec![],
+            env(),
+            CAPACITY / 100 * 35,
+            "the environment over the document",
+        ),
+        (
+            YAML,
+            flag(),
+            env(),
+            CAPACITY / 100 * 40,
+            "the flag over the environment",
+        ),
+    ] {
+        let app = boot(yaml, flags, env).await.expect(channel);
+        assert_eq!(parked(&app), Some(expected), "{channel}");
+        let _ = app.shutdown().await;
+    }
+    let error = match boot(
+        YAML,
+        vec!["host.resource_policy.memory.system.parked_limit=60%".to_owned()],
+        vec![],
+    )
+    .await
+    {
+        Ok(_) => panic!("a parked limit above the managed limit booted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("host.resource_policy.memory.system.parked_limit"),
+        "{error}"
+    );
+}

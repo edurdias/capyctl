@@ -595,7 +595,7 @@ impl App {
                 let weights = checkpoint_weights(&first.installation.models_root, &source)?;
                 crate::standalone_config::discrete_template_memory(
                     gpus,
-                    self.capacity_bytes,
+                    &host,
                     weights,
                     declared_kv_cache(&first.installation)?,
                 )
@@ -1872,6 +1872,7 @@ async fn start_standalone_in(
         );
         let engine_ports = role.engine_ports;
         let groups = role.groups.clone();
+        let stated = stated_host.clone();
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
                 named,
@@ -1882,6 +1883,7 @@ async fn start_standalone_in(
                 models,
                 engine_ports,
                 groups,
+                stated,
             )
         })
         .await

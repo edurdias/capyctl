@@ -144,7 +144,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("accounting", SCALAR),
                 (
                     "system",
-                    FieldSpec::Struct(&[("managed_limit", SCALAR), ("free_reserve", SCALAR)]),
+                    FieldSpec::Struct(&[
+                        ("managed_limit", SCALAR),
+                        ("free_reserve", SCALAR),
+                        ("parked_limit", SCALAR),
+                    ]),
                 ),
             ]),
         ),

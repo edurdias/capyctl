@@ -39,9 +39,18 @@ Unreleased.
   refused for it; a deployment that states `restart_only` keeps restarting.
   On a 128 GB GB10, Qwen3.8-27B NVFP4 with DFlash2 parks in about a second,
   holds 33.4 GiB parked and answers about 2 s after a request wakes it. That
-  is above a standalone's parked limit (a quarter of the memory), so once
-  that is measured on its first park, later parks are refused and it stays
-  loaded.
+  is above a standalone's default parked limit (a quarter of the memory), so
+  once that is measured on its first park, later parks are refused and it
+  stays loaded unless the parked limit is raised (next item).
+- **Standalone's parked limit is settable.** What parked models may hold
+  together was fixed at a quarter of the memory. Raise it with
+  `host.resource_policy.memory.system.parked_limit` in the document,
+  `--set host.resource_policy.memory.system.parked_limit=40GiB` or
+  `CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT=35%`, as
+  a size or a whole percentage, up to the managed limit; a higher value is
+  refused at start. `auto`, or leaving it out, keeps the quarter and the
+  stored policy unchanged. See
+  [configuration](configuration.md#standalone-parked-limit).
 
 ## Standalone
 

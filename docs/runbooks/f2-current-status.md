@@ -1,5 +1,23 @@
 # Current implementation and launch status
 
+## Standalone parked limit is settable — 2026-10-06 (branch `feat/parked-limit-setting`)
+
+Owner decision 2026-10-06, the follow-up on ADR 0014 amendment A17 and the amendment of
+ADR 0025. A standalone's parked limit was fixed at a quarter of the observed memory, below
+the 33.4 GiB a parked Qwen3.8-27B with DFlash2 measured on a 128 GB GB10, so its later parks
+were refused `park_parked_capacity`. `host.resource_policy.memory.system.parked_limit` now
+takes `auto` (the quarter), a size or a whole percentage, by YAML, `--set` and
+`CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT` (flag over environment over
+YAML), and shows in `capyctl config show`. A stated value above the managed limit refuses the
+start with both numbers. A document without it publishes the same policy, byte for byte. The
+embedded host's published document now carries the stated memory limits, so a discrete
+template's `host_backed` default is sized on the same parked room admission uses.
+
+CPU and Fake-engine tests only (precedence, form and boundary checks, unchanged digest, a
+park refused `parked_capacity` at a lower limit and admitted at a raised one, and a booted
+standalone storing each channel's value). They are not qualification; no live park has run
+with a raised limit.
+
 ## Standalone refuses a modelopt SGLang park it cannot wake — 2026-10-06 (branch `fix/standalone-deep-wake-refusal`)
 
 Found live on host A (CapyCTL a6b2560, SGLang 0.5.21, GB10, standalone): a `deep` SGLang

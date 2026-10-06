@@ -1173,3 +1173,12 @@ next park is refused `park_parked_capacity` and the deployment stays ready (foun
 run: two later parks of one deployment were refused that way, leaving it serving). Such a
 deployment therefore parks once per revision on that host until the parked limit is raised
 or made settable on a standalone.
+
+Follow-up (owner decision 2026-10-06): the standalone parked limit is now settable, as
+`host.resource_policy.memory.system.parked_limit` in the standalone document, `--set` on
+`capyctl start standalone` and `CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT`
+(flag over environment over YAML), as a size or a whole percentage of the observed memory, at
+most the managed limit (ADR 0025, amendment of 2026-10-06). `auto` keeps the quarter. With it
+raised above the measured 33.4 GiB (for example `40GiB`), a revision's later parks are admitted
+instead of refused `park_parked_capacity`. CPU and Fake tests cover the setting and the admission;
+no live park has run with a raised limit yet.

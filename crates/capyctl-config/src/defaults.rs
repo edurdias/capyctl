@@ -277,6 +277,7 @@ fn render_standalone(state_dir: &Path) -> String {
          \x20     system:\n\
          \x20       managed_limit: auto\n\
          \x20       free_reserve: auto\n\
+         \x20       parked_limit: auto\n\
          \x20 runtime_profiles: {{}}\n"
     )
 }

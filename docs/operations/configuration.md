@@ -201,7 +201,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
-| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit` and `free_reserve`, `endpoint_port_range`, and the `queue` bounds of a host) |
+| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 
@@ -300,6 +300,37 @@ How a value is read and checked:
   reloads its document, so a live reload compares the file plus the same
   overrides with what the host runs.
 
+### Standalone parked limit
+
+Parked models keep part of their memory: their parked footprint. Standalone
+lets parked models hold at most a quarter of the memory it observes (on a
+discrete-GPU machine, of host RAM). A park whose footprint would exceed it is
+refused (`parked_capacity`) and the model stays loaded; a parked
+Qwen3.8-27B with a DFlash2 drafter measured 33.4 GiB, above the quarter of a
+128 GB machine. Raise the parked limit with a size or a whole percentage:
+
+```bash
+capyctl start standalone --set host.resource_policy.memory.system.parked_limit=40GiB
+CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__PARKED_LIMIT=35%
+```
+
+```yaml
+host:
+  resource_policy:
+    memory:
+      system:
+        parked_limit: "40GiB"    # or "35%"; auto is 25 %
+```
+
+`--set` wins over the variable, and both over the document. The parked limit
+is part of the managed memory, so it may not exceed the managed limit: a start
+whose parked limit does is refused with both numbers (raise the managed limit
+too). `0B` parks nothing. A document that leaves it out or says `auto` keeps the
+derived quarter, and its stored policy is unchanged. A card's own parked limit
+(the CUDA contexts parked engines leave on it) stays derived. A host role states
+its limits literally, in `resource_policy.domains.<domain>.parked_limit`, and
+takes `--set` and `CAPYCTL_SET__…` the same way.
+
 ## Seeing the effective configuration
 
 `capyctl config show` prints the value each setting of a role will have, and
@@ -330,6 +361,7 @@ host.resource_policy.endpoint_port_range.start     8100                         
 host.resource_policy.memory.accounting             auto                                yaml
 host.resource_policy.memory.system.free_reserve    auto                                yaml
 host.resource_policy.memory.system.managed_limit   auto                                yaml
+host.resource_policy.memory.system.parked_limit    auto                                yaml
 host.state_dir                                     /home/me/.local/state/capyctl/host     yaml
 name                                               local                               yaml
 server.listeners.inference.authentication          api_key                             yaml
