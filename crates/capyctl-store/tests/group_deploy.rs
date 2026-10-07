@@ -297,3 +297,149 @@ fn a_named_host_without_a_target_refuses_the_group() {
     assert!(w.deploy_on("head-only", &head_only).is_err());
     assert_eq!(w.store.deployment_count().unwrap(), 0);
 }
+
+impl World {
+    /// Deployment `name` from `config`, accepted on every enrolled host.
+    fn create(&self, name: &str, config: &Value) -> ManagedConfigurationReceipt {
+        self.store
+            .create_managed_configuration_on_hosts(
+                &self.session,
+                "owner",
+                name,
+                &json!({ "config": config }).to_string(),
+                &self.targets(),
+                &[],
+                NOW,
+            )
+            .unwrap()
+    }
+
+    /// Group `g` (head host B, worker host A) as its activation leaves it at
+    /// generation 1: the head's member `head`, the worker's member `worker`.
+    fn group_with_members(&self, head: &str, worker: &str) -> String {
+        let id = self.deploy("g").unwrap().deployment_id;
+        self.sql
+            .execute(
+                "INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state)
+                 VALUES(?1,0,1,'{}','host-b',25000,?2)",
+                params![id, if head == "settled" && worker == "settled" { "settled" } else { "active" }],
+            )
+            .unwrap();
+        for (rank, host, state) in [(0, "host-b", head), (1, "host-a", worker)] {
+            let dispatched = state != "reserved";
+            let identities =
+                (state == "launched" || (state == "settled" && dispatched)).then_some("[]");
+            self.sql
+                .execute(
+                    "INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state,dispatched,identities_json)
+                     VALUES(?1,0,1,?2,?3,'deployment:'||?1||'/instance:0/member:'||?2,?4,?5,?6)",
+                    params![id, rank, host, state, dispatched, identities],
+                )
+                .unwrap();
+        }
+        id
+    }
+
+    /// A single-rank deployment `name` on host A (spark-a) alone.
+    fn single_on_host_a(&self, name: &str) -> String {
+        let mut config = self.config.clone();
+        config.as_object_mut().unwrap().remove("topology");
+        config["name"] = json!(name);
+        config["routes"] = json!([name]);
+        config["placement"] = json!({"hosts": ["spark-a"]});
+        self.create(name, &config).deployment_id
+    }
+
+    /// Another group `name` over host B (head) and host A.
+    fn another_group(&self, name: &str) -> String {
+        let mut config = self.config.clone();
+        config["name"] = json!(name);
+        config["routes"] = json!([name]);
+        self.create(name, &config).deployment_id
+    }
+
+    /// An on-demand start of `deployment`, placed without eviction.
+    fn start(&self, deployment: &str) -> Result<(), capyctl_store::lifecycle::LifecycleError> {
+        let revision: i64 = self
+            .sql
+            .query_row(
+                "SELECT revision FROM deployments WHERE id=?1",
+                [deployment],
+                |r| r.get(0),
+            )
+            .unwrap();
+        self.store
+            .accept_scoped_start_command(
+                &self.session,
+                "owner",
+                deployment,
+                capyctl_store::ordinary_lifecycle::placement::StartScope::OnDemand,
+                revision,
+                &format!("start-{deployment}"),
+                NOW,
+                NOW + 190_000,
+                None,
+            )
+            .map(drop)
+    }
+
+    /// Whether `deployment`'s start is refused because host A (`host-a`)
+    /// cannot take another launch.
+    fn refused_host_a_occupied(&self, deployment: &str) -> bool {
+        matches!(
+            self.start(deployment),
+            Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(Some(detail)))
+                if detail == "host host-a: host_occupied"
+        )
+    }
+}
+
+// T16, T30 (ADR 0028 §5, §11; SPEC §§3.1, 7.3): a single-claim host running
+// only a group's worker member cannot take another launch, whatever that
+// member's state short of settled: uncertainty keeps accounting, so an
+// uncertain or dispatching member occupies its host as a launched one does.
+// Neither a single-rank start nor another group is placed there.
+#[test]
+fn a_host_running_a_group_worker_member_is_occupied() {
+    for state in ["reserved", "dispatching", "launched", "uncertain"] {
+        let w = world();
+        w.group_with_members("settled", state);
+        let single = w.single_on_host_a("single");
+        assert!(w.refused_host_a_occupied(&single), "{state}");
+        let other = w.another_group("other");
+        assert!(w.refused_host_a_occupied(&other), "{state}");
+    }
+}
+
+// T16, T30, T39: a settled member frees its host, and a host fencing per
+// instance takes another launch beside a member, judged by memory alone.
+// Each start runs in its own world (a started single-rank occupies host A).
+#[test]
+fn a_settled_member_or_a_per_instance_host_takes_another_launch() {
+    let per_instance = |w: &World| {
+        for (host, ..) in HOSTS {
+            w.sql
+                .execute(
+                    "INSERT INTO host_launch_claims(host_id,mode,recorded_at_ms) VALUES(?1,'per_instance',1)",
+                    [host],
+                )
+                .unwrap();
+        }
+    };
+    for (members, fenced) in [("settled", false), ("launched", true), ("uncertain", true)] {
+        for group in [false, true] {
+            let w = world();
+            w.group_with_members("settled", members);
+            if fenced {
+                per_instance(&w);
+            }
+            let next = if group {
+                w.another_group("other")
+            } else {
+                w.single_on_host_a("single")
+            };
+            w.start(&next)
+                .unwrap_or_else(|e| panic!("{members} {fenced} {group}: {e:?}"));
+        }
+    }
+}

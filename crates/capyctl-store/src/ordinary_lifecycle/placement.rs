@@ -166,6 +166,12 @@ pub(super) fn candidates(
         // fences per instance (journal v5, ADR 0013 §4, owner decision P1)
         // co-hosts instances of one deployment too, judged by fit alone.
         // The embedded host can run several launches of any kind.
+        //
+        // ADR 0028 §5, §11: a group's binding names only its head's ingress,
+        // so every member host is read from the group's members: a member not
+        // yet settled on its own host's evidence (reserved, dispatching,
+        // launched or uncertain) holds that host as a retained launch does.
+        // Uncertainty keeps accounting: an uncertain member still occupies it.
         let occupied: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
                 AND (EXISTS(SELECT 1 FROM remote_binding_ingress r JOIN runtime_bindings b ON b.id=r.binding_id
@@ -176,7 +182,11 @@ pub(super) fn candidates(
                                ON b.deployment_id=i.deployment_id AND b.instance_index=i.instance_index
                             WHERE i.host_id=?1 AND b.state!='released'
                               AND NOT (i.deployment_id=?2 AND i.instance_index=?3)
-                              AND (?4=0 OR (?4=1 AND i.deployment_id=?2))))",
+                              AND (?4=0 OR (?4=1 AND i.deployment_id=?2)))
+                     OR EXISTS(SELECT 1 FROM group_members m
+                            WHERE m.host_id=?1 AND m.state!='settled'
+                              AND NOT (m.deployment_id=?2 AND m.instance_index=?3)
+                              AND (?4=0 OR (?4=1 AND m.deployment_id=?2))))",
             params![
                 host,
                 deployment_id,

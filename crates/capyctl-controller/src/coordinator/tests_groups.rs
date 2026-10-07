@@ -3154,14 +3154,20 @@ impl GroupWorld {
     /// the host's 32 GiB managed limit holds alone but not beside a group
     /// member (8 GiB Ready, 10 GiB cold).
     pub(super) fn with_single_rank(self, name: &str, host: &str) -> Self {
-        self.single_rank(name, host, false);
+        self.single_rank(name, host, 26, false);
+        self
+    }
+
+    /// As [`Self::with_single_rank`], charged `gib` GiB at every phase.
+    pub(super) fn with_single_rank_of(self, name: &str, host: &str, gib: u32) -> Self {
+        self.single_rank(name, host, gib, false);
         self
     }
 
     /// As [`Self::with_single_rank`], holding a warm-residency commitment
     /// (SPEC §6.5): it is never a switch victim.
     pub(super) fn with_warm_single_rank(self, name: &str, host: &str) -> Self {
-        self.single_rank(name, host, true);
+        self.single_rank(name, host, 26, true);
         self
     }
 
@@ -3179,7 +3185,7 @@ impl GroupWorld {
         self
     }
 
-    fn single_rank(&self, name: &str, host: &str, warm: bool) {
+    fn single_rank(&self, name: &str, host: &str, gib: u32, warm: bool) {
         let source: serde_json::Value = serde_json::from_str(include_str!(
             "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
         ))
@@ -3193,7 +3199,8 @@ impl GroupWorld {
         deployment["recovery"] = serde_json::json!(self.recovery);
         deployment["residency"] = serde_json::json!("restart_only");
         for phase in ["cold", "ready", "parking", "wake"] {
-            deployment["resources"][phase]["allocations"][0]["bytes"] = serde_json::json!("26GiB");
+            deployment["resources"][phase]["allocations"][0]["bytes"] =
+                serde_json::json!(format!("{gib}GiB"));
         }
         if warm {
             deployment["lifecycle"] = serde_json::json!({ "warm": true });
@@ -3419,4 +3426,69 @@ async fn an_evicting_start_of_a_group_releases_on_every_named_host() {
     assert_eq!(world.state("u").await, "stopped");
     world.request("g").await;
     assert_eq!(world.state("g").await, "ready");
+}
+
+impl GroupWorld {
+    /// An on-demand start of deployment `name`, placed without eviction
+    /// (owner decision Q5); the refusal when no allowed host takes it.
+    pub(super) fn start_without_eviction(&self, name: &str) -> Result<(), String> {
+        let fence = self.deployed.lock().unwrap()[name].clone();
+        self.worker
+            .commands()
+            .start_on_demand(
+                "owner",
+                &fence.deployment_id,
+                fence.revision,
+                &format!("start:{name}"),
+                capyctl_protocol::now_unix_ms() + 60_000,
+            )
+            .map(drop)
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+// T16, T30 (ADR 0028 §5, §11; SPEC §§3.1, 7.3): host B runs only g's worker
+// member. A single-claim agent there takes no other launch: s (10 GiB, which
+// host B's memory holds beside the member) is not placed there without
+// eviction, and a request for s evicts g whole, each member released on its
+// own host's evidence. An agent fencing per instance takes s beside the
+// member, by memory alone, and g keeps serving.
+#[tokio::test]
+async fn a_host_running_only_a_group_worker_member_is_occupied() {
+    for per_instance in [false, true] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"]);
+        let world = if per_instance {
+            world.with_per_instance_claims()
+        } else {
+            world
+        };
+        let world = world
+            .ready("g")
+            .await
+            .with_single_rank_of("s", "host-b", 10);
+        let g = world.id("g");
+        if per_instance {
+            world.start_without_eviction("s").unwrap();
+            world.request("s").await;
+            assert_eq!(world.state("s").await, "ready");
+            assert_eq!(world.state("g").await, "ready");
+            assert!(world.route_open("g"));
+            continue;
+        }
+        let refused = world.start_without_eviction("s").unwrap_err();
+        assert!(refused.contains("host host-b: host_occupied"), "{refused}");
+        world.request("s").await;
+        assert_eq!(world.state("s").await, "ready");
+        assert_eq!(world.state("g").await, "stopped");
+        world.wait_settled_generation("g", 1).await;
+        world.assert_release_evidence_per_member("g");
+        assert_eq!(
+            world.owner_bytes_on("host-a", &member_owner_id(&g, 0, 0)),
+            0
+        );
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+            0
+        );
+    }
 }
