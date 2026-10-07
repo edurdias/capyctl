@@ -443,3 +443,152 @@ fn a_settled_member_or_a_per_instance_host_takes_another_launch() {
         }
     }
 }
+
+impl World {
+    /// The worker member of group `id` (rank 1, on host A) settles on host
+    /// A's evidence, and with it the plan.
+    fn settle_worker(&self, id: &str) {
+        self.sql
+            .execute(
+                "UPDATE group_members SET state='settled' WHERE deployment_id=?1 AND rank=1",
+                [id],
+            )
+            .unwrap();
+        self.sql
+            .execute(
+                "UPDATE group_plans SET state='settled' WHERE deployment_id=?1",
+                [id],
+            )
+            .unwrap();
+    }
+}
+
+// T30, T31 (SPEC §4.3; ADR 0028 §5, §11): a drain of host A, which runs only
+// group g's worker member, names g whenever that member is not settled (an
+// uncertain one included), and names nothing once it settled. A drain of the
+// embedded host never names a group by a member.
+#[test]
+fn a_drain_names_a_group_by_its_unsettled_member() {
+    use capyctl_store::host_drain::{DrainCandidate, DrainHost};
+    for state in [
+        "reserved",
+        "dispatching",
+        "launched",
+        "uncertain",
+        "settled",
+    ] {
+        let w = world();
+        let g = w.group_with_members("settled", state);
+        let named = w
+            .store
+            .drain_candidates(DrainHost::Remote("host-a"))
+            .unwrap();
+        let expected = if state == "settled" {
+            vec![]
+        } else {
+            vec![DrainCandidate {
+                deployment_id: g,
+                revision: 1,
+                instance: 0,
+            }]
+        };
+        assert_eq!(named, expected, "{state}");
+        assert!(w
+            .store
+            .drain_candidates(DrainHost::Remote("host-b"))
+            .unwrap()
+            .is_empty());
+        assert!(w
+            .store
+            .drain_candidates(DrainHost::Embedded)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+// T30, T32 (ADR 0028 §11): a drain of host A stays pending while g's member
+// there is not settled, even once the group's Stop ended: uncertainty keeps
+// accounting. It clears when the member settles on host A's evidence.
+#[test]
+fn a_drain_holds_while_the_drained_member_is_unsettled() {
+    let w = world();
+    let g = w.group_with_members("settled", "uncertain");
+    w.sql
+        .execute(
+            "INSERT INTO operations(id,deployment_id,kind,state) VALUES('stop-g',?1,'ordinary_cleanup','failed')",
+            [&g],
+        )
+        .unwrap();
+    w.store
+        .record_host_drain("host-a", &["stop-g".to_string()], NOW)
+        .unwrap();
+    assert!(w.store.host_drain_pending("host-a").unwrap());
+    assert!(w
+        .store
+        .hosts_with_pending_drain()
+        .unwrap()
+        .contains("host-a"));
+    // A later drain of the host keeps the marker of the unsettled member.
+    w.sql
+        .execute(
+            "INSERT INTO operations(id,kind,state) VALUES('stop-other','ordinary_cleanup','succeeded')",
+            [],
+        )
+        .unwrap();
+    w.store
+        .record_host_drain("host-a", &["stop-other".to_string()], NOW + 1)
+        .unwrap();
+    assert!(w.store.host_drain_pending("host-a").unwrap());
+    assert!(!w.store.host_drain_pending("host-b").unwrap());
+    w.settle_worker(&g);
+    assert!(!w.store.host_drain_pending("host-a").unwrap());
+    assert!(w.store.hosts_with_pending_drain().unwrap().is_empty());
+}
+
+// T16, T30 (ADR 0018 §4; ADR 0028 §5, §11): retiring the profile on host A
+// counts g's member there as a user of it: refused without drain, waiting
+// with drain until the member settles, then confirmed.
+#[test]
+fn a_profile_retirement_counts_a_group_member_as_a_user() {
+    use capyctl_store::profile_retirement::{RetirementProgress, RetirementStart};
+    let w = world();
+    let g = w.group_with_members("settled", "uncertain");
+    let names = |start: RetirementStart| match start {
+        RetirementStart::InUse(named) | RetirementStart::Draining(named) => named
+            .into_iter()
+            .map(|c| (c.deployment_id, c.instance))
+            .collect::<Vec<_>>(),
+        RetirementStart::Clear => vec![],
+    };
+    let refused = w
+        .store
+        .begin_profile_retirement("host-a", "local", "retire", NOW, NOW + 60_000, false)
+        .unwrap();
+    assert!(matches!(refused, RetirementStart::InUse(_)), "{refused:?}");
+    assert_eq!(names(refused), [(g.clone(), 0)]);
+    let draining = w
+        .store
+        .begin_profile_retirement("host-a", "local", "retire", NOW, NOW + 60_000, true)
+        .unwrap();
+    assert!(matches!(draining, RetirementStart::Draining(_)));
+    assert!(matches!(
+        w.store
+            .profile_retirement_progress("host-a", "local", "retire", NOW + 1)
+            .unwrap(),
+        RetirementProgress::Waiting(named) if named.len() == 1
+    ));
+    w.settle_worker(&g);
+    assert_eq!(
+        w.store
+            .profile_retirement_progress("host-a", "local", "retire", NOW + 2)
+            .unwrap(),
+        RetirementProgress::Settled
+    );
+    // Host B's head member settled: the profile there is not in use.
+    assert_eq!(
+        w.store
+            .begin_profile_retirement("host-b", "local", "retire-b", NOW, NOW + 60_000, false)
+            .unwrap(),
+        RetirementStart::Clear
+    );
+}

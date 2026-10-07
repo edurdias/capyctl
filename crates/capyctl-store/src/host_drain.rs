@@ -43,6 +43,12 @@ impl Store {
     /// Every model deployment with a runtime binding on `host` that has not been
     /// released, whatever its state: an uncertain launch still occupies the host
     /// and is exactly what a drain must account for.
+    ///
+    /// ADR 0028 §5, §11: a group's binding names only its head's ingress, so a
+    /// group is also named on every host where one of its members is not yet
+    /// settled on that host's own evidence (an uncertain member included). Its
+    /// Stop is the ordinary one, which stops the group as a unit and releases
+    /// each member only on its own host's evidence.
     pub fn drain_candidates(&self, host: DrainHost<'_>) -> Result<Vec<DrainCandidate>, StoreError> {
         let remote = match host {
             DrainHost::Remote(id) => Some(id),
@@ -54,7 +60,11 @@ impl Store {
              WHERE b.state!='released' AND d.kind='model' AND (
                (?1 IS NULL AND NOT EXISTS(SELECT 1 FROM remote_binding_ingress r WHERE r.binding_id=b.id))
                OR EXISTS(SELECT 1 FROM remote_binding_ingress r WHERE r.binding_id=b.id AND r.host_id=?1))
-             ORDER BY d.id, b.instance_index LIMIT ?2",
+             UNION
+             SELECT d.id, d.revision, m.instance_index FROM group_members m
+             JOIN deployments d ON d.id=m.deployment_id
+             WHERE m.host_id=?1 AND m.state!='settled' AND d.kind='model'
+             ORDER BY 1, 3 LIMIT ?2",
         )?;
         let candidates = query
             .query_map(params![remote, (MAX_CANDIDATES + 1) as i64], |r| {
@@ -186,7 +196,9 @@ impl Store {
         tx.execute(
             &format!(
                 "DELETE FROM host_drains WHERE host_id=?1 AND operation_id IN
-                   (SELECT id FROM operations WHERE state IN ({TERMINAL}))"
+                   (SELECT o.id FROM operations o WHERE o.state IN ({TERMINAL})
+                      AND NOT EXISTS(SELECT 1 FROM group_members m WHERE m.deployment_id=o.deployment_id
+                                       AND m.host_id=?1 AND m.state!='settled'))"
             ),
             params![host],
         )?;
@@ -212,11 +224,15 @@ impl Store {
     /// settled, or (router review item 14) an intent not yet completed. A host
     /// with a pending drain is not a placement candidate (ADR 0013 §4 step 1,
     /// W12 eligibility), whether or not it is connected.
+    ///
+    /// ADR 0028 §11: a drained group's member on the host keeps the drain
+    /// pending until that member is settled on the host's own evidence, even
+    /// once the group's Stop ended (uncertainty keeps accounting).
     pub fn host_drain_pending(&self, host: &str) -> Result<bool, StoreError> {
         Ok(self.conn.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM host_drains h JOIN operations o ON o.id=h.operation_id
-                   WHERE h.host_id=?1 AND o.state NOT IN ({TERMINAL}))
+                   WHERE h.host_id=?1 AND (o.state NOT IN ({TERMINAL}) OR {DRAINED_MEMBER}))
                  OR EXISTS(SELECT 1 FROM host_drain_intents
                    WHERE host_id=?1 AND completed_at_ms IS NULL)"
             ),
@@ -249,7 +265,7 @@ impl Store {
               WHERE i.completed_at_ms IS NULL
                 AND COALESCE(d.deadline_ms, i.recorded_at_ms + {LEGACY_INTENT_WINDOW_MS}) <= ?1
                 AND NOT EXISTS(SELECT 1 FROM host_drains h JOIN operations o ON o.id=h.operation_id
-                   WHERE h.host_id=i.host_id AND o.state NOT IN ({TERMINAL}))
+                   WHERE h.host_id=i.host_id AND (o.state NOT IN ({TERMINAL}) OR {DRAINED_MEMBER}))
               ORDER BY i.host_id, i.drain_key LIMIT {MAX_CANDIDATES}"
         );
         let read = |conn: &rusqlite::Connection| -> Result<Vec<(String, String, i64)>, StoreError> {
@@ -296,7 +312,7 @@ impl Store {
     ) -> Result<std::collections::BTreeSet<String>, StoreError> {
         let mut query = self.conn.prepare(&format!(
             "SELECT h.host_id FROM host_drains h JOIN operations o ON o.id=h.operation_id
-               WHERE o.state NOT IN ({TERMINAL})
+               WHERE o.state NOT IN ({TERMINAL}) OR {DRAINED_MEMBER}
              UNION
              SELECT host_id FROM host_drain_intents WHERE completed_at_ms IS NULL"
         ))?;
@@ -313,3 +329,9 @@ pub const LEGACY_INTENT_WINDOW_MS: i64 = 900_000;
 
 /// The operation states in which a Stop has settled.
 const TERMINAL: &str = "'succeeded','failed','cancelled'";
+
+/// ADR 0028 §11: the drained Stop's group (operation `o`, recorded for host
+/// `h`) still has a member on that host that is not settled on its own
+/// evidence. Single-host deployments have no group members.
+const DRAINED_MEMBER: &str = "EXISTS(SELECT 1 FROM group_members m
+    WHERE m.deployment_id=o.deployment_id AND m.host_id=h.host_id AND m.state!='settled')";

@@ -3492,3 +3492,113 @@ async fn a_host_running_only_a_group_worker_member_is_occupied() {
         );
     }
 }
+
+impl GroupWorld {
+    /// SPEC §4.3: an operator's drain of `host`, as management runs it: the
+    /// intent and enumeration, an ordinary drain Stop of every instance
+    /// named, the marker, then the completed intent. The ids of the
+    /// deployments it named.
+    pub(super) fn drain(&self, host: &str) -> Vec<String> {
+        let commands = self.worker.commands();
+        let now = capyctl_protocol::now_unix_ms();
+        let named = {
+            let o = self.owner.lock().unwrap();
+            o.store()
+                .begin_host_drain_until(host, "drain", now, Some(now + 60_000))
+                .unwrap()
+        };
+        let mut issued = Vec::new();
+        for candidate in &named {
+            if let Some(receipt) = commands
+                .drain_stop_instance(
+                    "owner",
+                    &candidate.deployment_id,
+                    candidate.instance,
+                    candidate.revision,
+                    &format!("drain:drain:{}", candidate.deployment_id),
+                    now + 60_000,
+                )
+                .unwrap()
+            {
+                issued.push(receipt.operation_id().to_owned());
+            }
+        }
+        let o = self.owner.lock().unwrap();
+        if !issued.is_empty() {
+            o.store().record_host_drain(host, &issued, now).unwrap();
+        }
+        o.store().complete_host_drain(host, "drain", now).unwrap();
+        named.into_iter().map(|c| c.deployment_id).collect()
+    }
+
+    /// Whether a drain of `host` still holds it (SPEC §4.3).
+    pub(super) fn drain_pending(&self, host: &str) -> bool {
+        let o = self.owner.lock().unwrap();
+        o.store().host_drain_pending(host).unwrap()
+    }
+}
+
+// T30, T31 (SPEC §4.3; ADR 0028 §5, §11): a drain of host B, which runs only
+// g's worker member, names g and stops it as a unit: each host is sent one
+// Terminate for its own member, each member is released only on its own
+// host's evidence, and the drain stays pending until the member settled.
+#[tokio::test]
+async fn draining_a_worker_host_stops_the_group_whole() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let g = world.id("g");
+    assert_eq!(world.drain("host-b"), std::slice::from_ref(&g));
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&g, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        0
+    );
+    world
+        .until("the drain of host B done", || {
+            (!world.drain_pending("host-b")).then_some(())
+        })
+        .await;
+    assert!(!world.route_open("g"));
+}
+
+// T30, T32 (ADR 0028 §11): host B is away when it is drained. Its member is
+// left uncertain and charged and the drain is not complete; once host B
+// reconnects with its journal, the member settles and the drain completes.
+#[tokio::test]
+async fn draining_an_absent_worker_host_keeps_its_member_charged() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let g = world.id("g");
+    world.group.disconnect_host("host-b");
+    assert_eq!(world.drain("host-b"), std::slice::from_ref(&g));
+    world
+        .until("host B's member uncertain", || {
+            world
+                .read_status(&g)
+                .filter(|s| s.members.get(1).is_some_and(|m| m.state == "uncertain"))
+                .map(drop)
+        })
+        .await;
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        0
+    );
+    assert!(world.drain_pending("host-b"));
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        0
+    );
+    world
+        .until("the drain of host B done", || {
+            (!world.drain_pending("host-b")).then_some(())
+        })
+        .await;
+}
