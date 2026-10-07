@@ -2425,20 +2425,16 @@ async fn drive_group(
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during group activation".into())),
         outcome = activate_group(&ctx, work, &shape) => outcome,
     };
+    hosts.concluded(&work.fence().deployment_id, outcome.as_ref());
     match outcome {
-        Ok(outcome) => {
-            hosts.concluded(&work.fence().deployment_id, &outcome);
-            match outcome {
-                GroupActivation::Ready { .. } => Ok(()),
-                GroupActivation::Failed {
-                    failed_rank,
-                    reason,
-                    ..
-                } => Err(CoordinatorError::Service(format!(
-                    "group_member_failed: rank {failed_rank}: {reason}"
-                ))),
-            }
-        }
+        Ok(GroupActivation::Ready { .. }) => Ok(()),
+        Ok(GroupActivation::Failed {
+            failed_rank,
+            reason,
+            ..
+        }) => Err(CoordinatorError::Service(format!(
+            "group_member_failed: rank {failed_rank}: {reason}"
+        ))),
         // SPEC §13.2: a closed refusal before any effect is a host refusal.
         Err(GroupActivationError::Refused { code, detail }) => Err(CoordinatorError::Service(
             RuntimeError::Refused(format!("{code}: {detail}")).to_string(),

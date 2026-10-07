@@ -26,6 +26,7 @@
 //! qualifies an engine, a host or a group: CPU and Fake-engine tests are not
 //! qualification; the live rows MN1–MN9 are.
 use super::*;
+use crate::group_activation::{GroupActivation, GroupActivationError};
 use capyctl_agent::host_checks::{prepare_member, HostFacts, InfinibandAccess};
 use capyctl_config::groups_policy::GroupsPolicy;
 use capyctl_domain::completion::ProcessIdentity;
@@ -94,18 +95,32 @@ struct Spawned {
     identities: Vec<ProcessIdentity>,
 }
 
+/// Called with every Launch a host receives, before it does anything.
+type LaunchObserver = Arc<dyn Fn(&MemberCommand) + Send + Sync>;
+
 struct HostState {
     capabilities: BTreeSet<String>,
     /// Profile name to its recorded build.
     profiles: BTreeMap<String, String>,
     /// Model path to the digest this host measured.
     digests: BTreeMap<String, String>,
+    /// The path this host's copy of the group's weights resolves to.
+    model_path: String,
     /// Ports something outside CapyCTL holds on this host.
     held_ports: BTreeSet<u16>,
     journal: BTreeMap<String, Recorded>,
     spawned: Vec<Spawned>,
     received: Vec<MemberCommand>,
     next_pid: u32,
+    /// A closed code every Prepare is refused with, whatever the checks say.
+    prepare_refusal: Option<String>,
+    /// The head's completion probes generate no token.
+    probe_fails: bool,
+    /// Every Launch is carried out but its reply never reaches the server.
+    lose_launch_replies: bool,
+    launch_observer: Option<LaunchObserver>,
+    /// The engine environment the last Launch rendered here.
+    launch_env: Option<BTreeMap<String, String>>,
 }
 
 /// The scripted agent of one member host.
@@ -131,11 +146,17 @@ impl GroupHost {
                     GROUP_MODEL_PATH.into(),
                     GROUP_CHECKPOINT_DIGEST.into(),
                 )]),
+                model_path: GROUP_MODEL_PATH.into(),
                 held_ports: BTreeSet::new(),
                 journal: BTreeMap::new(),
                 spawned: Vec::new(),
                 received: Vec::new(),
                 next_pid: 4000,
+                prepare_refusal: None,
+                probe_fails: false,
+                lose_launch_replies: false,
+                launch_observer: None,
+                launch_env: None,
             }),
         }
     }
@@ -262,22 +283,38 @@ impl GroupHost {
         }
         let result = match &decoded.action {
             MemberAction::Prepare(plan) => self.prepare(&decoded, plan),
-            MemberAction::Launch { plan, member } => self.launch(&decoded, plan, member).await?,
+            MemberAction::Launch { plan, member } => {
+                let observer = self.state().launch_observer.clone();
+                if let Some(observer) = observer {
+                    observer(&decoded);
+                }
+                let result = self.launch(&decoded, plan, member).await?;
+                // The host carried the Launch out; its reply is lost.
+                if self.state().lose_launch_replies {
+                    return Err(HostError::Unreachable);
+                }
+                result
+            }
             MemberAction::Terminate {
                 owned_handle,
                 recorded,
             } => self.terminate(&decoded, owned_handle, recorded)?,
-            // ADR 0028 §9, §12: the agent admits Park, Restore and Probe for
-            // single-rank launches only, so far.
+            // ADR 0028 §9 (R30): the head answers a completion probe on its
+            // retained launch; a readiness probe of a group launch, and any
+            // probe of a worker, is refused as the agent refuses it.
+            MemberAction::Probe {
+                owned_handle,
+                max_tokens: Some(max_tokens),
+            } => self.probe(&decoded, owned_handle, *max_tokens)?,
+            // ADR 0028 §9, §12: the agent admits Park, Restore and a readiness
+            // Probe for single-rank launches only, so far.
             MemberAction::Park { .. }
             | MemberAction::Restore { .. }
             | MemberAction::Probe { .. } => return Err(HostError::Unauthorized),
+            MemberAction::DigestCheckpoint(_) => self.digest(&decoded),
             MemberAction::LaunchSingle(_) => return Err(HostError::NotScripted("LaunchSingle")),
             MemberAction::Inspect => return Err(HostError::NotScripted("Inspect")),
             MemberAction::CloseIngress => return Err(HostError::NotScripted("CloseIngress")),
-            MemberAction::DigestCheckpoint(_) => {
-                return Err(HostError::NotScripted("DigestCheckpoint"))
-            }
             MemberAction::MaterializeSource(_) => {
                 return Err(HostError::NotScripted("MaterializeSource"))
             }
@@ -298,10 +335,71 @@ impl GroupHost {
 
     /// ADR 0028 §7: a Prepare is effect-free; `refused` carries the closed code.
     fn prepare(&self, command: &MemberCommand, plan: &GroupPlan) -> pb::MemberExecutionResult {
+        let scripted = self.state().prepare_refusal.clone();
         pb::MemberExecutionResult {
-            refused: self.check(plan).err().unwrap_or_default(),
+            refused: scripted.unwrap_or_else(|| self.check(plan).err().unwrap_or_default()),
             ..Self::reply(command)
         }
+    }
+
+    /// ADR 0014 §7, ADR 0028 §6: this host measures its own copy.
+    fn digest(&self, command: &MemberCommand) -> pb::MemberExecutionResult {
+        let state = self.state();
+        let digest = state.digests.get(&state.model_path).cloned();
+        pb::MemberExecutionResult {
+            checkpoint: Some(match digest {
+                Some(digest) => pb::CheckpointDigestEvidence {
+                    state: "computed".into(),
+                    digest,
+                    weights_bytes: 1 << 30,
+                    total_bytes: 1 << 30,
+                    file_count: 1,
+                    ..Default::default()
+                },
+                None => pb::CheckpointDigestEvidence {
+                    state: "refused".into(),
+                    reason: "checkpoint_unreadable".into(),
+                    ..Default::default()
+                },
+            }),
+            ..Self::reply(command)
+        }
+    }
+
+    /// ADR 0028 §9 (R30): one completion through the head's retained launch,
+    /// at most `max_tokens` token ids, on loopback with the launch's key.
+    fn probe(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+        max_tokens: u32,
+    ) -> Result<pb::MemberExecutionResult, HostError> {
+        let state = self.state();
+        let Some(launch) = state.journal.get(owned_handle) else {
+            return Err(HostError::Unauthorized);
+        };
+        if launch.rank != 0
+            || command.identity.expected_state != "ready"
+            || launch.command.identity.deployment_id != command.identity.deployment_id
+        {
+            return Err(HostError::Unauthorized);
+        }
+        let tokens: Vec<u32> = if state.probe_fails {
+            Vec::new()
+        } else {
+            self.group
+                .complete("probe")
+                .into_iter()
+                .take(max_tokens as usize)
+                .collect()
+        };
+        Ok(pb::MemberExecutionResult {
+            owned_handle: owned_handle.into(),
+            processes: self.observed(&state, &launch.identities),
+            claim_retained: true,
+            probe_tokens: tokens,
+            ..Self::reply(command)
+        })
     }
 
     /// ADR 0028 §8 (R7, R23, R29): one member launch.
@@ -355,6 +453,28 @@ impl GroupHost {
                 });
             }
             self.spawn(command, plan);
+            // ADR 0028 §2.1, §10: the engine environment this member
+            // renders: the deployment's approved variables, the same on every
+            // host, and the member's own address under the engine's name.
+            let document: serde_json::Value = serde_json::from_str(&member.deployment_config)
+                .map_err(|_| HostError::Malformed)?;
+            let mut env: BTreeMap<String, String> = document["engine_config"]["env"]
+                .as_object()
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let address = match plan.engine() {
+                GroupEngine::Vllm => Some("VLLM_HOST_IP"),
+                GroupEngine::Sglang => Some("SGLANG_HOST_IP"),
+                GroupEngine::Tensorfold => None,
+            };
+            if let Some(name) = address {
+                env.insert(name.into(), self.peer.to_string());
+            }
+            self.state().launch_env = Some(env);
         }
         let rank = plan
             .members()
@@ -519,19 +639,197 @@ fn scripted(names: &[&str]) -> (FakeGroup, Vec<Arc<GroupHost>>) {
     (group, hosts)
 }
 
+/// ADR 0028 §8: the coordinator's transport to the world's scripted hosts:
+/// every command goes to [`GroupHost::execute`], whose errors become the
+/// transport's "no answer".
+struct WorldHosts {
+    hosts: Vec<Arc<GroupHost>>,
+    /// What each host publishes: its peer address (`None` without one) and
+    /// its policy fingerprint.
+    published: Mutex<BTreeMap<String, (Option<IpAddr>, String)>>,
+    concluded: Mutex<BTreeMap<String, Result<GroupActivation, GroupActivationError>>>,
+    ready: Mutex<Vec<(String, String)>>,
+}
+
+impl WorldHosts {
+    fn host(&self, name: &str) -> Option<&Arc<GroupHost>> {
+        self.hosts.iter().find(|h| h.name == name)
+    }
+}
+
+impl crate::group_activation::GroupHosts for WorldHosts {
+    fn controller_id(&self) -> String {
+        GROUP_CONTROLLER.into()
+    }
+
+    fn host(&self, host_id: &str) -> Result<crate::group_activation::MemberHost, String> {
+        let published = self.published.lock().unwrap();
+        let (peer, fingerprint) = published
+            .get(host_id)
+            .cloned()
+            .ok_or_else(|| format!("{host_id} publishes nothing"))?;
+        Ok(crate::group_activation::MemberHost {
+            policy_fingerprint: fingerprint,
+            groups: GroupsPolicy {
+                peer_address: peer,
+                ..GroupsPolicy::default()
+            },
+        })
+    }
+
+    fn preflight(&self, host_id: &str, needs: &[&str]) -> Result<(), String> {
+        let host = WorldHosts::host(self, host_id).ok_or("unauthorized")?;
+        let declared = host.state().capabilities.clone();
+        match needs.iter().find(|need| !declared.contains(**need)) {
+            Some(need) => Err(capabilities::missing(need)),
+            None => Ok(()),
+        }
+    }
+
+    fn supports(&self, host_id: &str, capability: &str) -> bool {
+        WorldHosts::host(self, host_id).is_some_and(|h| h.state().capabilities.contains(capability))
+    }
+
+    fn execute(
+        &self,
+        command: MemberCommand,
+    ) -> crate::group_activation::HostFuture<'_, Result<pb::MemberExecutionResult, String>> {
+        Box::pin(async move {
+            let host = WorldHosts::host(self, &command.identity.member.host_id)
+                .ok_or_else(|| "no such host".to_owned())?;
+            host.execute(command).await.map_err(|e| format!("{e:?}"))
+        })
+    }
+
+    fn provision_head<'a>(
+        &'a self,
+        _command: &'a MemberCommand,
+    ) -> crate::group_activation::HostFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn head_ready(&self, binding_id: &str, host_id: &str) {
+        self.ready
+            .lock()
+            .unwrap()
+            .push((binding_id.into(), host_id.into()));
+    }
+
+    fn concluded(
+        &self,
+        deployment_id: &str,
+        outcome: Result<&GroupActivation, &GroupActivationError>,
+    ) {
+        self.concluded
+            .lock()
+            .unwrap()
+            .insert(deployment_id.into(), outcome.cloned().map_err(Clone::clone));
+    }
+}
+
+/// The world's bindings: no single-host engine, the scripted group hosts.
+struct WorldBindings(Arc<WorldHosts>);
+
+impl ExecutionBindings for WorldBindings {
+    fn resolve(&self, _: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError> {
+        // ADR 0028 §5: a group never launches as a single-rank engine.
+        Err(CoordinatorError::Service(
+            "a group world has no single-host engine binding".into(),
+        ))
+    }
+    fn groups(&self) -> Option<Arc<dyn crate::group_activation::GroupHosts>> {
+        Some(self.0.clone())
+    }
+}
+
+/// Each host's own domains, observed fresh and empty; any other host (the
+/// fixture's embedded one) as the fixture observed it.
+struct WorldObservations {
+    domains: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+    fallback: Vec<MemoryObservation>,
+}
+
+impl ServiceObservation for WorldObservations {
+    fn observe(&self, host: String) -> ObservationFuture {
+        let now = capyctl_protocol::now_unix_ms();
+        let observed = match self.domains.lock().unwrap().get(&host) {
+            Some(domains) => domains
+                .iter()
+                .map(|domain| MemoryObservation {
+                    domain: domain.clone(),
+                    capacity_bytes: 1 << 50,
+                    available_bytes: 1 << 50,
+                    sampled_at_ms: now,
+                })
+                .collect(),
+            None => self
+                .fallback
+                .iter()
+                .cloned()
+                .map(|o| MemoryObservation {
+                    sampled_at_ms: now,
+                    ..o
+                })
+                .collect(),
+        };
+        Box::pin(async move { Ok(observed) })
+    }
+}
+
+/// Why a deploy (or its activation) was refused, led by its closed code.
+#[derive(Debug)]
+pub(super) struct DeployError(String);
+
+impl DeployError {
+    /// The closed code (spec §16) the refusal leads with.
+    pub(super) fn code(&self) -> &str {
+        let text = self.0.as_str();
+        let end = text.find(": ").unwrap_or(text.len());
+        &text[..end]
+    }
+}
+
+impl std::fmt::Display for DeployError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An instance's status as an operator reads it.
+pub(super) struct GroupStatus {
+    last_error: Option<String>,
+}
+
+impl GroupStatus {
+    pub(super) fn last_error(&self) -> &str {
+        self.last_error.as_deref().unwrap_or("")
+    }
+}
+
 /// The coordinator and its store, with a scripted agent per member host,
 /// every host running its rank of one [`FakeGroup`].
 pub(super) struct GroupWorld {
     pub(super) group: FakeGroup,
     hosts: Vec<Arc<GroupHost>>,
+    transport: Arc<WorldHosts>,
+    domains: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     owner: SharedCoordinatorState,
     worker: OwnedCoordinator,
+    /// Deployment ids by name.
+    deployed: Mutex<BTreeMap<String, DeploymentFence>>,
+    enrolled: Mutex<bool>,
+    engine: String,
+    approved: BTreeMap<String, Vec<String>>,
+    builds: BTreeMap<String, String>,
+    without_peer: BTreeSet<String>,
+    model_stores: BTreeMap<String, String>,
     _dir: tempfile::TempDir,
 }
 
 impl GroupWorld {
     /// A world of `names`, which are the group's hosts in rank order: the
-    /// first heads it. Each host has its own documentation peer address.
+    /// first heads it. Each host is enrolled under its own name and has its
+    /// own documentation peer address.
     pub(super) fn hosts(names: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let (group, hosts) = scripted(names);
@@ -544,33 +842,117 @@ impl GroupWorld {
             .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
             .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            let sql = rusqlite::Connection::open(&path).unwrap();
+            for name in names {
+                sql.execute(
+                    "INSERT INTO enrolled_hosts(host_id,host_name,key_digest,revoked) VALUES(?1,?1,'key',0)",
+                    [name],
+                )
+                .unwrap();
+            }
+        }
         let owner = Arc::new(Mutex::new(
             crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
         ));
+        let transport = Arc::new(WorldHosts {
+            hosts: hosts.clone(),
+            published: Mutex::new(BTreeMap::new()),
+            concluded: Mutex::new(BTreeMap::new()),
+            ready: Mutex::new(Vec::new()),
+        });
+        let domains = Arc::new(Mutex::new(BTreeMap::new()));
         let worker = OwnedCoordinator::spawn_with_execution_bindings(
             owner.clone(),
-            Arc::new(Observations(fixture.observations.clone())),
-            Arc::new(|| Ok(1900)),
+            Arc::new(WorldObservations {
+                domains: domains.clone(),
+                fallback: fixture.observations.clone(),
+            }),
+            Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
             CoordinatorOptions {
                 retry_cooldown: Duration::from_millis(50),
                 ..Default::default()
             },
-            // ADR 0028 §5: a group never launches as a single-rank engine, so
-            // this world resolves no single-host binding for it.
-            Arc::new(|_: &InitializeWork| {
-                Err(CoordinatorError::Service(
-                    "a group world has no single-host engine binding".into(),
-                ))
-            }),
+            Arc::new(WorldBindings(transport.clone())),
         )
         .unwrap();
         Self {
             group,
             hosts,
+            transport,
+            domains,
             owner,
             worker,
+            deployed: Mutex::new(BTreeMap::new()),
+            enrolled: Mutex::new(false),
+            engine: "vllm".into(),
+            approved: BTreeMap::new(),
+            builds: BTreeMap::new(),
+            without_peer: BTreeSet::new(),
+            model_stores: BTreeMap::new(),
             _dir: dir,
         }
+    }
+
+    /// Every host runs `engine` (`vllm`, `sglang` or `tensorfold`).
+    pub(super) fn with_engine(mut self, engine: &str) -> Self {
+        self.engine = engine.into();
+        self
+    }
+
+    /// `host` refuses every Prepare with `code`.
+    pub(super) fn prepare_refuses(self, host: &str, code: &str) -> Self {
+        self.host(host).state().prepare_refusal = Some(code.into());
+        self
+    }
+
+    /// `host`'s session does not declare `capability`.
+    pub(super) fn without_capability(self, host: &str, capability: &str) -> Self {
+        self.host(host).state().capabilities.remove(capability);
+        self
+    }
+
+    /// `host`'s profile approves engine environment names matching `globs`.
+    pub(super) fn approved_env(mut self, host: &str, globs: &[&str]) -> Self {
+        self.approved
+            .insert(host.into(), globs.iter().map(|g| (*g).to_owned()).collect());
+        self
+    }
+
+    /// `host` records another build of the profile.
+    pub(super) fn profile_fingerprint(mut self, host: &str, build: &str) -> Self {
+        self.builds.insert(host.into(), build.into());
+        self
+    }
+
+    /// `host` publishes no peer address.
+    pub(super) fn without_peer_address(mut self, host: &str) -> Self {
+        self.without_peer.insert(host.into());
+        self
+    }
+
+    /// `host`'s model store is `store`: the group's relative model path
+    /// resolves there.
+    pub(super) fn model_path(mut self, host: &str, store: &str) -> Self {
+        self.model_stores.insert(host.into(), store.into());
+        let path = format!("{store}/toy");
+        let mut state = self.host(host).state();
+        state.model_path = path.clone();
+        state.digests.insert(path, GROUP_CHECKPOINT_DIGEST.into());
+        drop(state);
+        self
+    }
+
+    /// The head's completion probes generate no token.
+    pub(super) fn probe_fails(self) -> Self {
+        self.hosts[0].state().probe_fails = true;
+        self
+    }
+
+    /// `host` carries every Launch out but its replies are lost.
+    pub(super) fn launch_replies_lost(self, host: &str) -> Self {
+        self.host(host).state().lose_launch_replies = true;
+        self
     }
 
     /// The scripted agent of `name`.
@@ -581,19 +963,62 @@ impl GroupWorld {
             .unwrap_or_else(|| panic!("{name} is not a host of this world"))
     }
 
+    fn names(&self) -> Vec<&str> {
+        self.hosts.iter().map(|h| h.name.as_str()).collect()
+    }
+
     /// Deploy a TP N group named `name` over `hosts` (every host of the world,
     /// in rank order) and start it. Returns the deployment id.
-    // The core helper the group activation tests deploy with; nothing in
-    // this module calls it yet.
-    #[allow(dead_code)]
     pub(super) async fn deploy_group(&self, name: &str, hosts: &[&str]) -> String {
-        let names: Vec<&str> = self.hosts.iter().map(|h| h.name.as_str()).collect();
-        assert_eq!(
-            hosts,
-            names.as_slice(),
-            "one group over the world's hosts in rank order"
-        );
-        self.deploy(name, hosts.len() as u32, 1)
+        self.try_deploy(name, hosts, &[], None, true).unwrap()
+    }
+
+    /// As [`Self::deploy_group`], refused deploys and activations returned.
+    pub(super) async fn try_deploy_group(
+        &self,
+        name: &str,
+        hosts: &[&str],
+    ) -> Result<String, DeployError> {
+        let id = self.try_deploy(name, hosts, &[], None, true)?;
+        self.activation_refusal(&id).await.map(|()| id)
+    }
+
+    /// As [`Self::deploy_group`], not started.
+    pub(super) async fn deploy_group_no_start(&self, name: &str, hosts: &[&str]) -> String {
+        self.try_deploy(name, hosts, &[], None, false).unwrap()
+    }
+
+    /// As [`Self::try_deploy_group`] with engine environment `env`.
+    pub(super) async fn try_deploy_group_with_env(
+        &self,
+        name: &str,
+        hosts: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<String, DeployError> {
+        let id = self.try_deploy(name, hosts, env, None, true)?;
+        self.activation_refusal(&id).await.map(|()| id)
+    }
+
+    /// As [`Self::deploy_group`] with `residency`.
+    pub(super) async fn deploy_group_with_residency(
+        &self,
+        name: &str,
+        hosts: &[&str],
+        residency: &str,
+    ) -> String {
+        self.try_deploy(name, hosts, &[], Some(residency), true)
+            .unwrap()
+    }
+
+    /// As [`Self::try_deploy_group`] with `residency`.
+    pub(super) async fn try_deploy_group_with_residency(
+        &self,
+        name: &str,
+        hosts: &[&str],
+        residency: &str,
+    ) -> Result<String, DeployError> {
+        let id = self.try_deploy(name, hosts, &[], Some(residency), true)?;
+        self.activation_refusal(&id).await.map(|()| id)
     }
 
     /// Deploy a TP `tp` × PP `pp` group named `name` over every host of the
@@ -604,28 +1029,165 @@ impl GroupWorld {
             self.hosts.len() as u32,
             "one rank per host (ADR 0028 §2)"
         );
-        self.deploy(name, tp, pp)
+        self.deploy(name, tp, pp, &[], None, true).unwrap()
+    }
+
+    fn try_deploy(
+        &self,
+        name: &str,
+        hosts: &[&str],
+        env: &[(&str, &str)],
+        residency: Option<&str>,
+        start: bool,
+    ) -> Result<String, DeployError> {
+        assert_eq!(
+            hosts,
+            self.names().as_slice(),
+            "one group over the world's hosts in rank order"
+        );
+        self.deploy(name, hosts.len() as u32, 1, env, residency, start)
+    }
+
+    /// `host`'s document as it publishes it (ADR 0028 §3): the golden host
+    /// with this world's engine, approvals, build, model store and peer
+    /// address.
+    fn host_document(&self, golden: &serde_json::Value, host: &GroupHost) -> serde_json::Value {
+        let mut document = golden.clone();
+        let profile = &mut document["runtime_profiles"][GROUP_PROFILE];
+        match self.engine.as_str() {
+            "sglang" => {
+                profile["engine"] = serde_json::json!("sglang");
+                profile["args"] = serde_json::json!([]);
+                profile["security"]["admin_credential_ref"] =
+                    serde_json::json!("secret://engine-admin");
+            }
+            "tensorfold" => {
+                profile["engine"] = serde_json::json!("tensorfold");
+                profile["executable"] = serde_json::json!("/opt/tf/bin/tensorfold");
+                profile["args"] = serde_json::json!([]);
+                profile["security"]["deep_park"] = serde_json::json!("disabled");
+            }
+            _ => {}
+        }
+        if let Some(globs) = self.approved.get(&host.name) {
+            profile["security"]["approved_env"] = serde_json::json!(globs);
+        }
+        if let Some(build) = self.builds.get(&host.name) {
+            profile["build_fingerprint"] = serde_json::json!(build);
+        }
+        if let Some(store) = self.model_stores.get(&host.name) {
+            document["model_store"]["path"] = serde_json::json!(store);
+        }
+        if !self.without_peer.contains(&host.name) {
+            document["resource_policy"]["groups"] =
+                serde_json::json!({ "peer_address": host.peer.to_string() });
+        }
+        document
+    }
+
+    /// ADR 0013 §3: each enrolled host's policy imported once (its ledger
+    /// keys registered to it), as the registry imports a published host.
+    fn enroll(&self, golden: &serde_json::Value) {
+        let mut enrolled = self.enrolled.lock().unwrap();
+        if *enrolled {
+            return;
+        }
+        let o = self.owner.lock().unwrap();
+        for host in &self.hosts {
+            let document = self.host_document(golden, host);
+            let policy = capyctl_config::effective::normalize_host_policy(&document).unwrap();
+            o.store()
+                .import_remote_resource_policy(
+                    o.session(),
+                    &host.name,
+                    &policy,
+                    &[MemoryObservation {
+                        domain: "unified".into(),
+                        capacity_bytes: 1 << 50,
+                        available_bytes: 1 << 50,
+                        sampled_at_ms: 1,
+                    }],
+                    1,
+                )
+                .unwrap();
+            let controls = o.store().resource_policy(&host.name).unwrap().unwrap();
+            self.domains.lock().unwrap().insert(
+                host.name.clone(),
+                controls.controls.domains.keys().cloned().collect(),
+            );
+            self.transport.published.lock().unwrap().insert(
+                host.name.clone(),
+                (
+                    (!self.without_peer.contains(&host.name)).then_some(host.peer),
+                    capyctl_config::remote_resources::policy_fingerprint(&document),
+                ),
+            );
+        }
+        *enrolled = true;
     }
 
     /// The group deployment `name`, accepted on every member host from that
-    /// host's own document, then started through the coordinator.
-    fn deploy(&self, name: &str, tp: u32, pp: u32) -> String {
+    /// host's own scoped document, then (with `start`) started through the
+    /// coordinator.
+    fn deploy(
+        &self,
+        name: &str,
+        tp: u32,
+        pp: u32,
+        env: &[(&str, &str)],
+        residency: Option<&str>,
+        start: bool,
+    ) -> Result<String, DeployError> {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let golden = &source["input"]["host"];
+        self.enroll(golden);
+        let names = self.names();
+        let mut deployment = group_document(&source["input"]["deployment"], name, &names, tp, pp);
+        deployment.as_object_mut().unwrap().remove("host");
+        if self.engine == "tensorfold" {
+            deployment["residency"] = serde_json::json!("restart_only");
+            deployment["engine_config"] = serde_json::json!({"context_length": 8192});
+        }
+        if let Some(residency) = residency {
+            deployment["residency"] = serde_json::json!(residency);
+        }
+        if !env.is_empty() {
+            deployment["engine_config"]["env"] = env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), serde_json::json!(v)))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+        }
+        if !self.model_stores.is_empty() {
+            // ADR 0013 §3: a relative path resolves in each host's own store.
+            deployment["model"]["path"] = serde_json::json!("toy");
+        }
         let fence = {
             let o = self.owner.lock().unwrap();
-            let source: serde_json::Value = serde_json::from_str(include_str!(
-                "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
-            ))
-            .unwrap();
-            let names: Vec<&str> = self.hosts.iter().map(|h| h.name.as_str()).collect();
-            let deployment = group_document(&source["input"]["deployment"], name, &names, tp, pp);
             let targets: Vec<_> = self
                 .hosts
                 .iter()
-                .map(|host| capyctl_store::managed_configuration::HostTarget {
-                    host_id: host.name.clone(),
-                    host_name: host.name.clone(),
-                    trusted_host: host_document(&source["input"]["host"], host),
-                    scoped: false,
+                .map(|host| {
+                    let document = self.host_document(golden, host);
+                    let trusted = capyctl_config::remote_resources::scope_host_document(
+                        &host.name, &document,
+                    )
+                    .unwrap();
+                    let policy = o.store().resource_policy(&host.name).unwrap().unwrap();
+                    capyctl_store::managed_configuration::HostTarget {
+                        host_id: host.name.clone(),
+                        host_name: host.name.clone(),
+                        trusted_host: capyctl_config::effective::compose_current_resource_controls(
+                            &trusted,
+                            &policy.context,
+                            &policy.controls,
+                        )
+                        .unwrap(),
+                        scoped: true,
+                    }
                 })
                 .collect();
             let receipt = o
@@ -637,36 +1199,259 @@ impl GroupWorld {
                     &serde_json::json!({ "config": deployment }).to_string(),
                     &targets,
                     &[],
-                    1700,
+                    capyctl_protocol::now_unix_ms(),
                 )
-                .unwrap();
+                .map_err(|e| match e {
+                    // The refusal's detail leads with its closed code.
+                    capyctl_store::managed_configuration::ManagedConfigurationError::Rejected(
+                        e,
+                    ) => DeployError(e.detail),
+                    e => DeployError(e.to_string()),
+                })?;
             DeploymentFence {
                 deployment_id: receipt.deployment_id,
                 revision: receipt.revision,
                 generation: receipt.generation,
             }
         };
-        // The start runs on in the coordinator; `wait_ready` observes it.
-        drop(self.worker.start(&fence, 60_000).unwrap());
-        fence.deployment_id
+        self.deployed
+            .lock()
+            .unwrap()
+            .insert(name.into(), fence.clone());
+        if start {
+            self.start_fence(&fence)?;
+        }
+        Ok(fence.deployment_id)
     }
 
-    /// Wait until deployment `id` is observed ready; panics after 30 s.
-    pub(super) async fn wait_ready(&self, id: &str) {
-        let ready = || {
-            let o = self.owner.lock().unwrap();
-            o.store()
-                .get_deployment(id)
-                .unwrap()
-                .is_some_and(|d| d.observed_state == capyctl_domain::LifecycleState::Ready)
-        };
+    fn start_fence(&self, fence: &DeploymentFence) -> Result<(), DeployError> {
+        // The start runs on in the coordinator; the world observes it.
+        drop(
+            self.worker
+                .start(fence, capyctl_protocol::now_unix_ms() + 60_000)
+                .map_err(|e| DeployError(e.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Start deployment `id` at the fence it was accepted with.
+    pub(super) async fn start(&self, id: &str) -> Result<(), DeployError> {
+        let fence = self
+            .deployed
+            .lock()
+            .unwrap()
+            .values()
+            .find(|f| f.deployment_id == id)
+            .cloned()
+            .expect("a deployment of this world");
+        self.start_fence(&fence)
+    }
+
+    fn id(&self, name: &str) -> String {
+        self.deployed.lock().unwrap()[name].deployment_id.clone()
+    }
+
+    async fn until<T>(&self, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !ready() {
+            loop {
+                if let Some(value) = ready() {
+                    return value;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("deployment {id} never became ready"));
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what} never happened; activations: {:?}; worker: {:?}",
+                self.transport.concluded.lock().unwrap(),
+                self.worker.status()
+            )
+        })
+    }
+
+    /// The first activation of `id` that concluded: `Err` with its closed code
+    /// when it was refused before any member was dispatched.
+    async fn activation_refusal(&self, id: &str) -> Result<(), DeployError> {
+        let outcome = self
+            .until("an activation", || {
+                self.transport.concluded.lock().unwrap().get(id).cloned()
+            })
+            .await;
+        outcome
+            .map(drop)
+            .map_err(|e| DeployError(format!("{}: {e}", e.code())))
+    }
+
+    /// How deployment `id`'s activation concluded.
+    pub(super) async fn wait_activation(&self, id: &str) -> GroupActivation {
+        self.until("an activation", || {
+            self.transport
+                .concluded
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .map(|o| o.expect("the activation reached its launches"))
+        })
+        .await
+    }
+
+    /// Wait until deployment `id` is observed ready; panics after 30 s.
+    pub(super) async fn wait_ready(&self, id: &str) {
+        self.until(&format!("deployment {id} ready"), || {
+            let o = self.owner.lock().unwrap();
+            o.store()
+                .get_deployment(id)
+                .unwrap()
+                .filter(|d| d.observed_state == capyctl_domain::LifecycleState::Ready)
+                .map(drop)
+        })
+        .await
+    }
+
+    /// Wait until deployment `id`'s start gave up with every reservation
+    /// released; its status.
+    pub(super) async fn wait_settled(&self, id: &str) -> GroupStatus {
+        self.until(&format!("deployment {id} settled"), || {
+            let o = self.owner.lock().unwrap();
+            let held = o
+                .store()
+                .group_plan(id, 0)
+                .unwrap()
+                .is_some_and(|(_, rows)| {
+                    rows.iter()
+                        .any(|r| r.state != capyctl_store::groups::MemberState::Settled)
+                });
+            let snapshot = o.store().snapshot().unwrap();
+            let instance = snapshot
+                .deployments
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| d.instances.first().cloned())?;
+            // Every reservation released, and the instance's status names why.
+            (!held && instance.last_error.is_some()).then_some(GroupStatus {
+                last_error: instance.last_error,
+            })
+        })
+        .await
+    }
+
+    /// Wait until every host received its Launch, while the head is still
+    /// waiting for the group to form.
+    pub(super) async fn agents_saw_launch_before_head_ready(&self, name: &str) {
+        let _ = self.id(name);
+        self.until("every Launch", || {
+            self.hosts
+                .iter()
+                .all(|h| {
+                    h.received()
+                        .iter()
+                        .any(|c| matches!(c.action, MemberAction::Launch { .. }))
+                })
+                .then_some(())
+        })
+        .await;
+        assert!(
+            !self.group.launch_completed(),
+            "every Launch went out before the engine initialized"
+        );
+    }
+
+    /// Whether deployment `name` has an instance open for dispatch, and that
+    /// it is the head's ingress (ADR 0028 §9: one replica, at the head).
+    pub(super) fn route_open(&self, name: &str) -> bool {
+        let id = self.id(name);
+        let o = self.owner.lock().unwrap();
+        let serving = o.store().serving_instances(&id).unwrap();
+        let open: Vec<_> = serving.iter().filter(|s| s.dispatch_open).collect();
+        assert!(open.len() <= 1, "a group is one replica");
+        open.first().is_some_and(|instance| {
+            assert_eq!(
+                instance.host_id.as_deref().unwrap_or(&self.hosts[0].name),
+                self.hosts[0].name,
+                "the group serves at the head"
+            );
+            true
+        })
+    }
+
+    /// The bytes `owner_id` holds on `host`'s own domains.
+    pub(super) fn owner_bytes_on(&self, host: &str, owner_id: &str) -> i64 {
+        let o = self.owner.lock().unwrap();
+        let ledger = o.store().resource_snapshot().unwrap();
+        let prefix = capyctl_config::remote_resources::ledger_key(host, "domain", "");
+        ledger.owners.get(owner_id).map_or(0, |footprint| {
+            footprint
+                .allocations
+                .iter()
+                .filter(|a| a.domain.starts_with(&prefix))
+                .map(|a| a.bytes)
+                .sum()
+        })
+    }
+
+    /// The bytes one Ready member is charged on its host: the golden
+    /// deployment's Ready footprint.
+    pub(super) fn member_request(&self) -> i64 {
+        8 << 30
+    }
+
+    /// How many commands `host` received.
+    pub(super) fn commands_sent_to(&self, host: &str) -> usize {
+        self.host(host).received().len()
+    }
+
+    fn probes(&self, host: &str) -> Vec<Option<u32>> {
+        self.host(host)
+            .received()
+            .into_iter()
+            .filter_map(|c| match c.action {
+                MemberAction::Probe { max_tokens, .. } => Some(max_tokens),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many probes `host` received.
+    pub(super) fn probes_sent_to(&self, host: &str) -> usize {
+        self.probes(host).len()
+    }
+
+    /// How many completion probes the group's head was sent.
+    pub(super) fn probe_calls(&self) -> usize {
+        self.probes(&self.hosts[0].name).len()
+    }
+
+    /// The token bound of the last probe the head was sent.
+    pub(super) fn last_probe_max_tokens(&self) -> u32 {
+        self.probes(&self.hosts[0].name)
+            .last()
+            .copied()
+            .flatten()
+            .expect("a completion probe")
+    }
+
+    /// The engine environment `host`'s Launch rendered, once it has one.
+    pub(super) async fn launch_env(&self, host: &str) -> BTreeMap<String, String> {
+        let host = self.host(host).clone();
+        self.until("a Launch", || host.state().launch_env.clone())
+            .await
+    }
+
+    /// The plan and members of deployment `name`'s instance, if any.
+    pub(super) fn group_plan(
+        &self,
+        name: &str,
+    ) -> Option<(GroupPlan, Vec<capyctl_store::groups::MemberRow>)> {
+        let id = self.id(name);
+        let o = self.owner.lock().unwrap();
+        o.store().group_plan(&id, 0).unwrap()
+    }
+
+    /// The coordinator's state, for scripted observers.
+    pub(super) fn owner(&self) -> SharedCoordinatorState {
+        self.owner.clone()
     }
 
     /// How many rank processes the hosts started (a replayed Launch starts
@@ -691,16 +1476,6 @@ fn group_document(
     deployment["topology"] = serde_json::json!({"tensor_parallel": tp, "pipeline_parallel": pp});
     deployment["placement"] = serde_json::json!({ "hosts": hosts });
     deployment
-}
-
-/// The golden host document as `host` publishes it: its name and its peer
-/// address (ADR 0028 §3).
-fn host_document(golden: &serde_json::Value, host: &GroupHost) -> serde_json::Value {
-    let mut document = golden.clone();
-    document["name"] = serde_json::json!(host.name);
-    document["resource_policy"]["groups"] =
-        serde_json::json!({ "peer_address": host.peer.to_string() });
-    document
 }
 
 // ---- commands as the server sends them --------------------------------------
@@ -1165,12 +1940,355 @@ async fn group_world_hosts_run_one_group_in_rank_order() {
 }
 
 // Harness smoke: a four-host world deploys a TP2 x PP2 group through the coordinator.
+// OD4: no shape gate for more than two hosts or PP > 1.
 #[tokio::test]
-#[ignore = "enabled by Task 16"]
 async fn group_world_four_hosts_smoke() {
     let world = GroupWorld::hosts(&["h0", "h1", "h2", "h3"]);
     let id = world.deploy_group_shape("g", 2, 2).await;
     world.group.launch_completes();
     world.wait_ready(&id).await;
     assert_eq!(world.launches(), 4);
+}
+
+// ---- Task 16: group activation ------------------------------------------------
+
+use capyctl_store::groups::{member_owner_id, MemberState};
+
+// T30: a clean activation reserves all, launches all concurrently, routes only after head readiness.
+#[tokio::test]
+async fn group_activates_and_routes_after_head_readiness() {
+    for engine in ["vllm", "sglang", "tensorfold"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"]).with_engine(engine);
+        let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+        world.agents_saw_launch_before_head_ready("g").await;
+        assert!(!world.route_open("g"));
+        world.group.launch_completes();
+        world.wait_ready(&id).await;
+        assert!(world.route_open("g"), "{engine}");
+        // ADR 0028 §10: each member renders its own peer address under the
+        // engine's name; TensorFold reads none.
+        let (a, b) = (
+            world.launch_env("host-a").await,
+            world.launch_env("host-b").await,
+        );
+        match engine {
+            "tensorfold" => assert!(a.is_empty() && b.is_empty()),
+            _ => {
+                let name = if engine == "vllm" {
+                    "VLLM_HOST_IP"
+                } else {
+                    "SGLANG_HOST_IP"
+                };
+                assert_eq!(a[name], peer_address(0).to_string());
+                assert_eq!(b[name], peer_address(1).to_string());
+            }
+        }
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+            world.member_request(),
+            "{engine}"
+        );
+        // ADR 0028 §5: the instance owner holds nothing; each member is
+        // charged on its own host only.
+        assert_eq!(
+            world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 1)),
+            0
+        );
+    }
+}
+
+// T30: a Prepare refusal on one host releases every member and launches nothing.
+#[tokio::test]
+async fn prepare_refusal_releases_everything() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .prepare_refuses("host-b", "host_tuning_missing:memlock");
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    let status = world.wait_settled(&id).await;
+    assert_eq!(status.last_error(), "host_tuning_missing:memlock");
+    assert_eq!(world.launches(), 0);
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+}
+
+// T15: concurrent activation requests produce one plan and one launch per member.
+#[tokio::test]
+async fn concurrent_activation_is_single() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]);
+    let id = world
+        .deploy_group_no_start("g", &["host-a", "host-b"])
+        .await;
+    let (a, b) = tokio::join!(world.start(&id), world.start(&id));
+    assert!(a.is_ok() && b.is_ok());
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    assert_eq!(world.launches(), 2);
+}
+
+// T34: a named host without engine_groups is refused typed and receives nothing.
+#[tokio::test]
+async fn host_without_capability_is_refused() {
+    for missing in ["host-a", "host-b"] {
+        let world =
+            GroupWorld::hosts(&["host-a", "host-b"]).without_capability(missing, "engine_groups");
+        let err = world
+            .try_deploy_group("g", &["host-a", "host-b"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "host_capability_missing:engine_groups");
+        assert_eq!(world.commands_sent_to(missing), 0);
+        assert!(world.group_plan("g").is_none(), "nothing is reserved");
+    }
+}
+
+// T14, T37, Review Focus 1: an env name unapproved on one host refuses the group;
+// members render equal environments apart from the address variable.
+#[tokio::test]
+async fn group_engine_env_is_approved_everywhere_and_equal() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("sglang")
+        .approved_env("host-a", &["SGLANG_ENABLE_*"]);
+    let err = world
+        .try_deploy_group_with_env("g", &["host-a", "host-b"], &[("SGLANG_ENABLE_X", "1")])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "engine_env_not_approved:SGLANG_ENABLE_X");
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("sglang")
+        .approved_env("host-a", &["SGLANG_ENABLE_*"])
+        .approved_env("host-b", &["SGLANG_ENABLE_*"]);
+    // A frozen revision that sets engine env cannot be started yet: its
+    // effective snapshot does not re-resolve with the env (pre-existing,
+    // reported for Task 17). What every member's Launch is rendered from is
+    // compared instead: its own host-local document.
+    let id = world
+        .try_deploy(
+            "e",
+            &["host-a", "host-b"],
+            &[("SGLANG_ENABLE_X", "1")],
+            None,
+            false,
+        )
+        .unwrap();
+    let documents: Vec<serde_json::Value> = {
+        let o = world.owner.lock().unwrap();
+        ["host-a", "host-b"]
+            .into_iter()
+            .map(|host| {
+                let source = o
+                    .store()
+                    .launch_configuration_source(&id, 1, host, None)
+                    .unwrap()
+                    .unwrap();
+                capyctl_config::remote_resources::local_deployment_document(host, &source).unwrap()
+            })
+            .collect()
+    };
+    let env = |d: &serde_json::Value| d["engine_config"]["env"].clone();
+    assert_eq!(
+        env(&documents[0])["SGLANG_ENABLE_X"],
+        "1",
+        "real values (R10)"
+    );
+    assert_eq!(env(&documents[0]), env(&documents[1]));
+}
+
+// T14: one mismatched build or a host without a peer address refuses the deploy.
+#[tokio::test]
+async fn profile_mismatch_and_missing_peer_address_refuse_deploy() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).profile_fingerprint("host-b", "other");
+    assert_eq!(
+        world
+            .try_deploy_group("g", &["host-a", "host-b"])
+            .await
+            .unwrap_err()
+            .code(),
+        "group_profile_mismatch"
+    );
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).without_peer_address("host-b");
+    assert_eq!(
+        world
+            .try_deploy_group("g", &["host-a", "host-b"])
+            .await
+            .unwrap_err()
+            .code(),
+        "peer_address_missing"
+    );
+}
+
+// T30 (decided 2026-10-06): a readiness probe that fails is a launch failure; the route never opens.
+// Stopping and settling the members after it is Task 17's (`readiness_probe_failure_stops_the_group`).
+#[tokio::test]
+async fn failing_readiness_probe_fails_the_activation() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).probe_fails();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    assert!(matches!(
+        world.wait_activation(&id).await,
+        GroupActivation::Failed { failed_rank: 0, .. }
+    ));
+    assert!(!world.route_open("g"));
+    assert_eq!(world.probe_calls(), 1);
+}
+
+// T30 (decided 2026-10-06): a passing 1-token probe through the head opens the route; workers are never probed.
+#[tokio::test]
+async fn readiness_probe_goes_through_the_head_only() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]);
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    assert_eq!(world.probe_calls(), 1);
+    assert_eq!(world.last_probe_max_tokens(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
+}
+
+// T14 (decided 2026-10-06): a deep SGLang group whose member paths differ is refused before
+// the reservation, naming both paths; a restart-only SGLang group with the same differing paths activates.
+#[tokio::test]
+async fn sglang_deep_group_with_differing_paths_is_refused() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("sglang")
+        .model_path("host-a", "/models/a")
+        .model_path("host-b", "/models/b");
+    let err = world
+        .try_deploy_group_with_residency("g", &["host-a", "host-b"], "deep")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "group_model_path_mismatch");
+    assert!(err.to_string().contains("/models/a") && err.to_string().contains("/models/b"));
+    assert!(world.group_plan("g").is_none());
+    let id = world.id("g");
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert_eq!(world.launches(), 0);
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("sglang")
+        .model_path("host-a", "/models/a")
+        .model_path("host-b", "/models/b");
+    let id = world
+        .deploy_group_with_residency("g", &["host-a", "host-b"], "restart_only")
+        .await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+}
+
+// T30, T33 (R23): every member is fenced dispatched, durably, before its host
+// receives its Launch; after the reply its identities are the reply's.
+#[tokio::test]
+async fn members_are_fenced_before_launch_and_record_the_reply_identities() {
+    let names = ["host-a", "host-b"];
+    let world = GroupWorld::hosts(&names);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    for (rank, name) in names.iter().enumerate() {
+        let (owner, seen) = (world.owner(), seen.clone());
+        world.host(name).state().launch_observer =
+            Some(Arc::new(move |command: &MemberCommand| {
+                let o = owner.lock().unwrap();
+                let (_, rows) = o
+                    .store()
+                    .group_plan(&command.identity.deployment_id, 0)
+                    .unwrap()
+                    .unwrap();
+                let row = &rows[rank];
+                seen.lock()
+                    .unwrap()
+                    .push((row.rank, row.state, row.dispatched));
+            }));
+    }
+    let id = world.deploy_group("g", &names).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_by_key(|(rank, ..)| *rank);
+    assert_eq!(
+        seen,
+        vec![
+            (0, MemberState::Dispatching, true),
+            (1, MemberState::Dispatching, true)
+        ]
+    );
+    let (plan, rows) = world.group_plan("g").unwrap();
+    assert!(rows
+        .iter()
+        .all(|r| r.state == MemberState::Launched && r.dispatched));
+    let o = world.owner();
+    for (rank, name) in names.iter().enumerate() {
+        let host = world.host(name);
+        let launch = host
+            .received()
+            .into_iter()
+            .find(|c| matches!(c.action, MemberAction::Launch { .. }))
+            .unwrap();
+        let reply = host.recorded(&launch.identity.command_id).unwrap();
+        let o = o.lock().unwrap();
+        // The same identities again are a retry; any others a conflict.
+        o.store()
+            .mark_member_launched(&id, 0, plan.generation(), rank as u32, &reply)
+            .unwrap();
+        let mut other = reply.clone();
+        other[0].pid += 1000;
+        assert!(o
+            .store()
+            .mark_member_launched(&id, 0, plan.generation(), rank as u32, &other)
+            .is_err());
+    }
+}
+
+// T30, T33 (R23): a Launch whose reply is lost is resent identically (the host
+// replays, never spawns twice) and its member stays dispatched and charged.
+#[tokio::test]
+async fn a_lost_launch_reply_keeps_the_member_charged() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_replies_lost("host-b");
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    assert!(matches!(
+        world.wait_activation(&id).await,
+        GroupActivation::Failed { failed_rank: 1, .. }
+    ));
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_ne!(rows[1].state, MemberState::Settled);
+    assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
+    let launches: Vec<_> = world
+        .host("host-b")
+        .received()
+        .into_iter()
+        .filter(|c| matches!(c.action, MemberAction::Launch { .. }))
+        .collect();
+    assert!(launches.len() > 1, "the Launch was resent");
+    assert!(launches.iter().all(|c| c == &launches[0]), "identically");
+    assert_eq!(world.launches(), 2, "a resend starts nothing");
+    assert!(!world.route_open("g"));
+}
+
+// T27, Review Focus 2 (R15): a head rendezvous port held outside CapyCTL is
+// excluded, every reservation released, and the retry draws another port.
+#[tokio::test]
+async fn a_rendezvous_port_held_outside_capyctl_is_redrawn() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]);
+    world.host("host-a").hold_port(25000);
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    let (plan, _) = world.group_plan("g").unwrap();
+    assert_ne!(plan.rendezvous_port(), 25000);
+    let prepared: Vec<u16> = world
+        .host("host-a")
+        .received()
+        .into_iter()
+        .filter_map(|c| match c.action {
+            MemberAction::Prepare(plan) => Some(plan.rendezvous_port()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prepared, vec![25000, plan.rendezvous_port()]);
+    assert_eq!(world.launches(), 2);
 }
