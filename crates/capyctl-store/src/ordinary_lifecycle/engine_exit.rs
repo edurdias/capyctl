@@ -35,6 +35,9 @@ pub struct ExitedLaunch {
     pub binding_id: String,
     /// True the first time this launch's exit was recorded.
     pub first: bool,
+    /// ADR 0028 §11: the rank of the group member that exited, when the
+    /// launch is a group's; `None` for a single-host launch.
+    pub group_rank: Option<u32>,
 }
 
 /// Which evidence source is reporting.
@@ -64,15 +67,37 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
+        // ADR 0028 §11: a group member's exit names its own Launch on its own
+        // host; the group's Ready step is the head's Initialize. Only a member
+        // whose identities were recorded can be matched.
+        let member: Option<(String, u32, String)> = match source {
+            ExitSource::Host(reporter) => tx
+                .query_row(
+                    "SELECT s.id,m.rank,m.identities_json FROM group_members m
+                       JOIN group_plans g ON g.deployment_id=m.deployment_id AND g.instance_index=m.instance_index AND g.generation=m.generation
+                       JOIN lifecycle_runs r ON r.deployment_id=m.deployment_id AND r.instance_index=m.instance_index AND r.generation=m.generation
+                       JOIN operations o ON o.id=r.operation_id AND o.kind='initialize'
+                       JOIN lifecycle_steps s ON s.operation_id=o.id AND s.state='completed'
+                      WHERE m.deployment_id=?1 AND m.generation=?2 AND m.host_id=?3 AND m.launch_handle=?4
+                        AND m.state='launched' AND g.state='active'",
+                    params![exit.deployment_id, exit.generation, reporter, exit.step_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?,
+            ExitSource::Embedded => None,
+        };
+        let step_id = member
+            .as_ref()
+            .map_or(exit.step_id.as_str(), |(step, ..)| step.as_str());
         let known: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='initialize')",
-            [&exit.step_id],
+            [step_id],
             |r| r.get(0),
         )?;
         if !known {
             return Ok(None);
         }
-        let (p, _, state) = load(&tx, &exit.step_id)?;
+        let (p, _, state) = load(&tx, step_id)?;
         if state != "completed"
             || p.deployment_id != exit.deployment_id
             || p.generation != exit.generation
@@ -97,6 +122,9 @@ impl crate::Store {
             )
             .optional()?;
         let served = match source {
+            // A group member reports from the host its plan placed it on,
+            // which the match above already required.
+            ExitSource::Host(_) if member.is_some() => host.is_some(),
             ExitSource::Host(reporter) => host.as_deref() == Some(reporter),
             ExitSource::Embedded => host.is_none(),
         };
@@ -106,9 +134,24 @@ impl crate::Store {
         let Some(association) = association(&tx, &p)? else {
             return Ok(None);
         };
+        let recorded = match &member {
+            Some((_, _, identities)) => {
+                let rows: Vec<(String, u32, String, u64)> = serde_json::from_str(identities)
+                    .map_err(|_| LifecycleError::CorruptStoredData)?;
+                rows.into_iter()
+                    .map(|(role, pid, boot_id, start_ticks)| ProcessIdentity {
+                        role,
+                        pid,
+                        boot_id,
+                        start_ticks,
+                    })
+                    .collect()
+            }
+            None => members(&association.identities)?,
+        };
         // ADR 0027: a helper's exit is not the engine's. Cleanup still proves
         // it gone with the rest of the recorded group.
-        if exit.process.is_helper() || !members(&association.identities)?.contains(&exit.process) {
+        if exit.process.is_helper() || !recorded.contains(&exit.process) {
             return Ok(None);
         }
         // SPEC §13.2: dispatch to this incarnation closes before anything else;
@@ -125,6 +168,18 @@ impl crate::Store {
             p.generation,
             crate::switch_state::ClosureReason::EngineExit,
         )?;
+        if let Some((_, rank, _)) = &member {
+            // ADR 0028 §11: any member's exit fails the whole group
+            // (`group_member_failed`); its stop terminates every member.
+            crate::groups::record_failure(
+                &tx,
+                &p.deployment_id,
+                p.instance_index,
+                p.generation,
+                *rank,
+            )
+            .map_err(|_| LifecycleError::CorruptStoredData)?;
+        }
         let first: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM journal_entries WHERE operation_id=?1 AND state='engine_exited')",
             [&p.operation_id],
@@ -158,6 +213,7 @@ impl crate::Store {
             operation_id: p.operation_id,
             binding_id: p.binding_id,
             first,
+            group_rank: member.map(|(_, rank, _)| rank),
         }))
     }
 }

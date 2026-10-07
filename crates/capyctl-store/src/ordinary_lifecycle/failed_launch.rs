@@ -211,10 +211,17 @@ fn release(
         "UPDATE operations SET state='failed',error_code='launch_failed' WHERE id=?1 AND state='running'",
         [&p.operation_id],
     )?)?;
-    one(tx.execute(
-        "DELETE FROM resource_owners WHERE owner_id=?1",
-        [&p.owner()],
-    )?)?;
+    // ADR 0028 §11, SPEC §11: a failed group launch is released only once
+    // every member settled on its own host's evidence; it holds no
+    // instance-owner charge of its own.
+    match crate::groups::plan_settled(tx, &p.deployment_id, p.instance_index, p.generation)? {
+        Some(true) => {}
+        Some(false) => return Err(LifecycleError::Conflict),
+        None => one(tx.execute(
+            "DELETE FROM resource_owners WHERE owner_id=?1",
+            [&p.owner()],
+        )?)?,
+    }
     one(tx.execute(
         "DELETE FROM endpoint_leases WHERE binding_id=?1",
         [&p.binding_id],

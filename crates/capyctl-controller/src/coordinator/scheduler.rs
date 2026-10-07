@@ -470,6 +470,18 @@ impl Scheduler {
             journal_reconciled(&shared, &done).await;
             shared.changed.notify_waiters();
         }
+        // ADR 0028 §11: under `recovery: reconcile` a group that failed after
+        // READY relaunches as a new generation and plan, accepted only in a
+        // transaction that reads every member of its old plan settled.
+        if starts && shared.groups.is_some() {
+            let relaunched = shared
+                .read(|owner, now| owner.store().relaunch_failed_groups(owner.session(), now))
+                .await
+                .map_err(failed)?;
+            if !relaunched.is_empty() {
+                shared.changed.notify_waiters();
+            }
+        }
         // Owner decision 2026-09-22: a drain Stop that expired, never armed,
         // while its host was offline is closed as expired and issued afresh
         // once the host is back. ADR 0015: that closes a planned cleanup, so it
@@ -983,6 +995,21 @@ async fn settlement_task(
             ))
             .catch_unwind() => settled.unwrap_or(Ok(InitializeStatus::Uncertain)),
         },
+        // ADR 0028 §11: a group's launch is retried by stopping its members
+        // again, each on its own host's evidence.
+        None if launch.group => tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => {
+                return Outcome::SettleLater(binding);
+            }
+            settled = AssertUnwindSafe(native_failure::settle_failed_group(
+                &shared,
+                &launch,
+                "settlement retried while paused",
+                false,
+            ))
+            .catch_unwind() => settled.unwrap_or(Ok(InitializeStatus::Uncertain)),
+        },
         None => Ok(InitializeStatus::Uncertain),
     };
     if !shared.accepting.load(Ordering::Acquire) {
@@ -1136,7 +1163,12 @@ async fn conclude_initialize(
             driver.tools.is_some()
                 || (driver.settle.is_some() && !shared.shutdown_requested.load(Ordering::Acquire))
         });
-    let is_native = native.is_some();
+    // ADR 0028 §11: a group launch settles by stopping every member on its
+    // own host, the way a remote launch settles through its host.
+    let group = work.group().is_some()
+        && shared.groups.is_some()
+        && !shared.shutdown_requested.load(Ordering::Acquire);
+    let is_native = native.is_some() || group;
     let pausing = shared.clone();
     let paused_binding = work.binding_id().to_owned();
     let paused_status = WorkerStatus::Uncertain {
@@ -1184,12 +1216,23 @@ async fn conclude_initialize(
         })
         .await;
     let mut settled_native = false;
-    let settles_remotely = native.as_ref().is_some_and(|d| d.settle.is_some());
+    let settles_remotely = group || native.as_ref().is_some_and(|d| d.settle.is_some());
     let status = match (status, native) {
         (Ok(InitializeStatus::Armed), Some(driver)) => {
             let settled = native_failure::settle_failed_launch(
                 shared,
                 &driver,
+                &native_failure::LaunchRef::of(work),
+                &recorded_reason,
+                true,
+            )
+            .await;
+            settled_native = matches!(settled, Ok(InitializeStatus::Closed));
+            settled
+        }
+        (Ok(InitializeStatus::Armed), None) if group => {
+            let settled = native_failure::settle_failed_group(
+                shared,
                 &native_failure::LaunchRef::of(work),
                 &recorded_reason,
                 true,

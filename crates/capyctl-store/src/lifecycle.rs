@@ -1895,8 +1895,8 @@ mod tests {
                 "INSERT INTO enrolled_hosts VALUES('spark-remote','spark','key',0);
                  INSERT OR IGNORE INTO deployment_instances(deployment_id,instance_index) VALUES('{remote}',0);
                  UPDATE deployment_instances SET host_id='spark-remote',generation=1 WHERE deployment_id='{remote}';
-                 INSERT INTO group_plans VALUES('{group}',0,1,'{{}}','spark-remote',25000,'active');
-                 INSERT INTO group_plans VALUES('{group}',1,1,'{{}}','other-host',25001,'active');"
+                 INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES('{group}',0,1,'{{}}','spark-remote',25000,'active');
+                 INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES('{group}',1,1,'{{}}','other-host',25001,'active');"
             ))
             .unwrap();
         let session = store.begin_coordinator_session().unwrap();

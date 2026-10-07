@@ -327,9 +327,8 @@ impl RemoteReadiness {
         }));
     }
 
-    /// Ask the host to re-prove this launch on `session`, and reopen dispatch
-    /// only on its authenticated, fresh, exactly matching evidence.
-    async fn probe(&self, launch: &RemoteReadyLaunch, session: &str) -> Result<(), String> {
+    /// The native readiness probe of a single remote launch (SPEC §13.2).
+    fn readiness_probe(&self, launch: &RemoteReadyLaunch) -> MemberCommand {
         let id = ulid::Ulid::new().to_string();
         let deadline = capyctl_protocol::now_unix_ms()
             .saturating_add(i64::try_from(PROBE_DEADLINE.as_millis()).unwrap_or(i64::MAX));
@@ -358,6 +357,40 @@ impl RemoteReadiness {
             },
         };
         command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+
+    /// Ask the host to re-prove this launch on `session`, and reopen dispatch
+    /// only on its authenticated, fresh, exactly matching evidence. A group
+    /// head is re-proven as its readiness was first proven (ADR 0028 §9,
+    /// decided 2026-10-06): a 1-token completion through the head, which the
+    /// head's agent runs on loopback against its retained launch; its agent
+    /// refuses a plain readiness probe of a group launch.
+    async fn probe(&self, launch: &RemoteReadyLaunch, session: &str) -> Result<(), String> {
+        use crate::group_activation::{probe_answer, probe_command, HeadLaunch};
+        let head = {
+            let owner = self
+                .owner
+                .lock()
+                .map_err(|_| "coordinator state unavailable".to_owned())?;
+            owner
+                .store()
+                .group_of_binding(&launch.binding_id)
+                .map_err(|error| error.to_string())?
+                .map(|bound| HeadLaunch {
+                    plan: bound.plan,
+                    deployment_id: launch.fence.deployment_id.clone(),
+                    revision: launch.fence.revision,
+                    operation_id: launch.operation_id.clone(),
+                    owned_handle: launch.step_id.clone(),
+                    profile_fingerprint: launch.profile_fingerprint.clone(),
+                })
+        };
+        let tokens = crate::group_activation::READINESS_PROBE_TOKENS;
+        let command = match &head {
+            Some(head) => probe_command(&self.controller_id, head, tokens, PROBE_DEADLINE),
+            None => self.readiness_probe(launch),
+        };
         let (answered_on, result) = self
             .hosts
             .probe(command)
@@ -366,7 +399,13 @@ impl RemoteReadiness {
         if answered_on != session {
             return Err("the probe was answered on a different host session".into());
         }
-        if !result.model_usable
+        // A group head proves itself by generating, a single launch by its
+        // engine's native readiness.
+        let proved = match &head {
+            Some(head) => probe_answer(&result, head, tokens).is_ok(),
+            None => result.model_usable,
+        };
+        if !proved
             || !result.claim_retained
             || result.binding_id != launch.binding_id
             || result.incarnation != launch.incarnation

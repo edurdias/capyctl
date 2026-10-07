@@ -37,6 +37,9 @@ pub struct ExitedLaunch {
 /// this boot (a parked one is reported only; nothing changes its residency),
 /// with that exit journaled. The API process is named first when it exited,
 /// because it is the one this host's launcher reaps and so knows the status of.
+/// ADR 0028 §11: a group worker's launch is watched from its Launch on, and
+/// its exit is reported under the member's own roles (`worker-<r>`), the ones
+/// its Launch reported and the controller recorded.
 pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<ExitedLaunch> {
     let Ok(ready) = journal.ready_launches() else {
         return Vec::new();
@@ -70,7 +73,7 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
                 deployment_id: command.identity.deployment_id.clone(),
                 generation: command.identity.generation,
                 owned_handle: handle,
-                process: process.clone(),
+                process: crate::journal::reported_identity(&command, process),
                 status,
                 observed_at_ms,
             },

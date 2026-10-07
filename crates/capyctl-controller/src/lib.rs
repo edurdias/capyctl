@@ -19,6 +19,8 @@ pub mod host_publication;
 pub mod profile_retirement;
 // ADR 0028 §5–§9: reserve, prepare, launch and prove a multi-node group.
 pub mod group_activation;
+// ADR 0028 §11: whole-group stop, per-host settlement, uncertain members.
+pub mod group_settlement;
 // ADR 0028 §6: a group's weights on every host and cross-host digest agreement.
 pub mod group_sources;
 // ADR 0008: the embedded host's installation fingerprint and drift.

@@ -940,6 +940,12 @@ pub const SCHEMA_V40: &str = "-- checkpoint_digests.state_slot_bytes (migrate_v4
 /// digests. The steps are in `groups::migrate_v41`, which is idempotent.
 pub const SCHEMA_V41: &str = "-- group plans (groups::migrate_v41)";
 
+/// v42 (ADR 0028 §8, §11): each group member's Launch handle, recorded with
+/// its dispatch fence so a stop reaches it from any later session, and the
+/// rank a failed group failed at. The columns are added by
+/// `groups::migrate_v42` only when missing.
+pub const SCHEMA_V42: &str = "-- group member launch handles (groups::migrate_v42)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

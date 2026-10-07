@@ -29,6 +29,9 @@ pub(super) struct LaunchRef {
     step_id: String,
     pub(super) binding_id: String,
     incarnation: String,
+    /// ADR 0028 §11: the launch is a group's, settled by stopping every
+    /// member ([`settle_failed_group`]) rather than through one driver.
+    pub(super) group: bool,
 }
 impl LaunchRef {
     pub(super) fn of(work: &InitializeWork) -> Self {
@@ -38,8 +41,89 @@ impl LaunchRef {
             step_id: work.step_id().to_owned(),
             binding_id: work.binding_id().to_owned(),
             incarnation: work.incarnation().to_owned(),
+            group: work.group().is_some(),
         }
     }
+}
+
+/// ADR 0028 §11, SPEC §11: settle a group launch that failed after its step
+/// armed. Every member is stopped and settled on its own host's evidence
+/// ([`crate::group_settlement::stop_group`]); only once every member has
+/// settled (`GroupSettlement::Complete`, the rendezvous port freed with the
+/// last) is the launch released, in the transaction that cancels its step,
+/// exactly as a single launch is. A member left uncertain keeps its charge
+/// and the step `Uncertain`; a paused retry asks its host again.
+pub(super) async fn settle_failed_group(
+    shared: &Arc<Shared>,
+    launch: &LaunchRef,
+    reason: &str,
+    report: bool,
+) -> Result<InitializeStatus, CoordinatorError> {
+    use crate::group_settlement::{recorded_reason, stop_group, GroupTarget};
+    let hosts = shared
+        .groups
+        .clone()
+        .ok_or_else(|| CoordinatorError::Service("no group transport".into()))?;
+    let binding = launch.binding_id.clone();
+    let bound = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .group_of_binding(&binding)
+                .map_err(|error| CoordinatorError::Service(error.to_string()))
+        })
+        .await?;
+    let settled = match bound {
+        // Armed but never reserved: nothing of the group exists to stop.
+        None => Err("the group's plan is not recorded".to_owned()),
+        Some(bound) => {
+            let ctx = crate::group_activation::GroupCtx {
+                owner: shared.owner.clone(),
+                hosts,
+                observations: shared.observations.clone(),
+                clock: shared.clock.clone(),
+            };
+            let reason = recorded_reason(
+                &ctx,
+                &bound.deployment_id,
+                bound.instance_index,
+                bound.plan.generation(),
+            );
+            let target = GroupTarget {
+                deployment_id: bound.deployment_id,
+                instance_index: bound.instance_index,
+                revision: launch.fence.revision,
+                operation_id: launch.operation_id.clone(),
+                plan: bound.plan,
+            };
+            match stop_group(&ctx, &target, reason).await {
+                capyctl_store::groups::GroupSettlement::Complete => Ok(()),
+                capyctl_store::groups::GroupSettlement::Partial { unsettled } => Err(format!(
+                    "group_member_uncertain: ranks {unsettled:?} are not proven gone"
+                )),
+            }
+        }
+    };
+    let proven = match settled {
+        // The head's binding records what its readiness recorded (nothing,
+        // for a group that never reached READY); every member, the head
+        // included, was proven gone by its own host.
+        Ok(()) => {
+            let binding = launch.binding_id.clone();
+            let identities = shared
+                .read(move |owner, _| owner.store().runtime_binding_identities(&binding))
+                .await?;
+            Ok(CleanupEvidence {
+                binding_id: launch.binding_id.clone(),
+                incarnation: launch.incarnation.clone(),
+                identities,
+                observed_at_ms: (shared.clock)()?,
+                receipt: "every group member settled on its own host's gone evidence".into(),
+            })
+        }
+        Err(error) => Err(error),
+    };
+    conclude(shared, launch, reason, report, proven).await
 }
 
 /// Terminate what the launch recorded, prove it gone, release against that proof
@@ -65,7 +149,6 @@ pub(super) async fn settle_failed_launch(
     let incarnation = launch.incarnation.clone();
     let step_id = launch.step_id.clone();
     let operation_id = launch.operation_id.clone();
-    let deployment_id = launch.fence.deployment_id.clone();
 
     // This read is outside the release transaction, so an association still
     // running on the launcher's blocking thread may write the api identity after
@@ -143,6 +226,21 @@ pub(super) async fn settle_failed_launch(
             Err(error) => Err(error.to_string()),
         }
     };
+    conclude(shared, launch, reason, report, proven).await
+}
+
+/// Release the failed launch against `proven`, or retain it `Uncertain`.
+async fn conclude(
+    shared: &Arc<Shared>,
+    launch: &LaunchRef,
+    reason: &str,
+    report: bool,
+    proven: Result<CleanupEvidence, String>,
+) -> Result<InitializeStatus, CoordinatorError> {
+    let binding_id = launch.binding_id.clone();
+    let step_id = launch.step_id.clone();
+    let operation_id = launch.operation_id.clone();
+    let deployment_id = launch.fence.deployment_id.clone();
     let evidence = match proven {
         Ok(evidence) => evidence,
         // Spec §6 step 4: nothing here is provable, so nothing is released.
@@ -173,7 +271,6 @@ pub(super) async fn settle_failed_launch(
             return Ok(InitializeStatus::Uncertain);
         }
     };
-
     // SPEC §17: failures are recorded. The evidence, the journal entry and the
     // closed admission commit together, so a released launch is never left without
     // the reason it was released or with its deployment still admitting.

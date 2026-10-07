@@ -1898,7 +1898,10 @@ impl HostJournal {
     /// SPEC §13.2 (W13): every launch this host claims that is Ready or parked
     /// now (its native readiness recorded, not changing residency), with the
     /// exact group that readiness named. The processes to watch for an exit;
-    /// for a parked launch the report is evidence only.
+    /// for a parked launch the report is evidence only. ADR 0028 §11: a group
+    /// worker never records readiness (its head proves the group's); it is
+    /// watched from its Launch on, by the tree its Launch journaled, so its
+    /// exit fails the group like the head's.
     pub fn ready_launches(
         &self,
     ) -> Result<Vec<(MemberCommand, Vec<ProcessIdentity>)>, JournalError> {
@@ -1906,13 +1909,23 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         let mut ready = Vec::new();
         for claimed in claimed_launches(&db, "")? {
+            let id = &claimed.command.identity.command_id;
+            if is_group_worker(&claimed.command) {
+                let launched = record(&db, id)?;
+                if claimed.phase == ClaimPhase::Starting
+                    && launched.state == CommandState::Launched
+                    && !launched.processes.is_empty()
+                {
+                    ready.push((claimed.command, launched.processes));
+                }
+                continue;
+            }
             // SPEC §13.2 (W13): a parked engine is watched too, report only, so
             // a group that lost a member while parked is never woken as the
             // one it was.
             if !matches!(claimed.phase, ClaimPhase::Ready | ClaimPhase::Parked) {
                 continue;
             }
-            let id = &claimed.command.identity.command_id;
             let saved: Vec<u8> = db.query_row(
                 "SELECT result FROM native_results WHERE command_id=?1",
                 [id],
@@ -1989,16 +2002,30 @@ fn reported_role(owner: Option<&MemberCommand>, role: String) -> String {
     let Some(owner) = owner else {
         return role;
     };
-    match &owner.action {
-        MemberAction::Launch { member, .. } if member.service_port == 0 => {
-            let id = &owner.identity.member.member_id;
-            if role == "api" {
-                id.clone()
-            } else {
-                format!("{id}/{role}")
-            }
-        }
-        _ => role,
+    if !is_group_worker(owner) {
+        return role;
+    }
+    let id = &owner.identity.member.member_id;
+    if role == "api" {
+        id.clone()
+    } else {
+        format!("{id}/{role}")
+    }
+}
+/// ADR 0028 §4, §8: a group worker's Launch (no service port), as opposed to
+/// a group head's or a single launch.
+fn is_group_worker(command: &MemberCommand) -> bool {
+    matches!(&command.action, MemberAction::Launch { member, .. } if member.service_port == 0)
+}
+/// ADR 0028 §4, §8, §11: `process` of the launch `owner`, named as the
+/// controller recorded it from that launch's reports.
+pub(crate) fn reported_identity(
+    owner: &MemberCommand,
+    process: &ProcessIdentity,
+) -> ProcessIdentity {
+    ProcessIdentity {
+        role: reported_role(Some(owner), process.role.clone()),
+        ..process.clone()
     }
 }
 /// ADR 0016: whether `handle` names only the fence a Terminate wrote for a

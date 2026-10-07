@@ -518,7 +518,7 @@ fn an_ordinary_start_leases_past_a_held_rendezvous_port() {
     let id = t.deploy();
     t.sql
         .execute(
-            "INSERT INTO group_plans VALUES(?1,9,1,'{}',?2,8100,'active')",
+            "INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES(?1,9,1,'{}',?2,8100,'active')",
             params![id, HOST.0],
         )
         .unwrap();

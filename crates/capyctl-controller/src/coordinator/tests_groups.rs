@@ -121,7 +121,11 @@ struct HostState {
     probe_fails: bool,
     /// Every Launch is carried out but its reply never reaches the server.
     lose_launch_replies: bool,
+    /// Every Launch starts its rank, which exits at once (a launch failure).
+    launch_fails: bool,
     launch_observer: Option<LaunchObserver>,
+    /// The world's own observer of every Launch, besides a test's.
+    witness: Option<LaunchObserver>,
     /// The engine environment the last Launch rendered here.
     launch_env: Option<BTreeMap<String, String>>,
 }
@@ -158,7 +162,9 @@ impl GroupHost {
                 prepare_refusal: None,
                 probe_fails: false,
                 lose_launch_replies: false,
+                launch_fails: false,
                 launch_observer: None,
+                witness: None,
                 launch_env: None,
             }),
         }
@@ -249,6 +255,55 @@ impl GroupHost {
             .collect()
     }
 
+    /// Review Focus 3: a restarted agent with an empty journal knows no
+    /// launch; the processes it started run on.
+    fn reconcile_journal(&self) {
+        if self.group.take_journal_loss(&self.name) {
+            self.state().journal.clear();
+        }
+    }
+
+    /// SPEC §13.2 (W13), ADR 0028 §11: the exits this host's agent reports,
+    /// as its exit watcher does: every launch it still claims whose rank's
+    /// process (of the newest tree) is gone, a head once it proved readiness,
+    /// a worker from its Launch on, named by the launch's own handle and its
+    /// leader's reported identity. A disconnected host reports nothing.
+    fn exits(&self) -> Vec<capyctl_protocol::reports::MemberExit> {
+        if !self.group.connected(&self.name) {
+            return Vec::new();
+        }
+        self.reconcile_journal();
+        let state = self.state();
+        let Some(newest) = state.spawned.last() else {
+            return Vec::new();
+        };
+        state
+            .journal
+            .values()
+            .filter(|r| {
+                r.claim_retained
+                    && !r.identities.is_empty()
+                    && r.identities == newest.identities
+                    && !self.group.alive(r.rank)
+                    && (r.rank != 0 || r.reply.as_ref().is_some_and(|reply| reply.model_usable))
+            })
+            .map(|r| capyctl_protocol::reports::MemberExit {
+                host_id: self.name.clone(),
+                deployment_id: r.command.identity.deployment_id.clone(),
+                generation: r.command.identity.generation,
+                owned_handle: r.command.identity.command_id.clone(),
+                process: r.identities[0].clone(),
+                status: match self.group.ended(r.rank) {
+                    Some(capyctl_testkit::RankEnd::Killed) => {
+                        capyctl_protocol::reports::ExitStatus::Signal(9)
+                    }
+                    _ => capyctl_protocol::reports::ExitStatus::Code(1),
+                },
+                observed_at_ms: capyctl_protocol::now_unix_ms(),
+            })
+            .collect()
+    }
+
     /// Answer one command as the member's agent does.
     pub(super) async fn execute(
         &self,
@@ -257,11 +312,7 @@ impl GroupHost {
         if !self.group.connected(&self.name) {
             return Err(HostError::Unreachable);
         }
-        // Review Focus 3: a restarted agent with an empty journal knows no
-        // launch; the processes it started run on.
-        if self.group.take_journal_loss(&self.name) {
-            self.state().journal.clear();
-        }
+        self.reconcile_journal();
         self.state().received.push(command.clone());
         // The agent receives the wire form: decode it, check its digest and
         // the capabilities it needs.
@@ -287,9 +338,12 @@ impl GroupHost {
         let result = match &decoded.action {
             MemberAction::Prepare(plan) => self.prepare(&decoded, plan),
             MemberAction::Launch { plan, member } => {
-                let observer = self.state().launch_observer.clone();
-                if let Some(observer) = observer {
-                    observer(&decoded);
+                let (observer, witness) = {
+                    let state = self.state();
+                    (state.launch_observer.clone(), state.witness.clone())
+                };
+                for observe in [observer, witness].into_iter().flatten() {
+                    observe(&decoded);
                 }
                 let result = self.launch(&decoded, plan, member).await?;
                 // The host carried the Launch out; its reply is lost.
@@ -396,11 +450,21 @@ impl GroupHost {
                 .take(max_tokens as usize)
                 .collect()
         };
+        // As the agent, the probe reports on the binding of the launch it
+        // names.
+        let (binding_id, incarnation) = match &launch.command.action {
+            MemberAction::Launch { member, .. } => {
+                (member.binding_id.clone(), member.incarnation.clone())
+            }
+            _ => Default::default(),
+        };
         Ok(pb::MemberExecutionResult {
             owned_handle: owned_handle.into(),
             processes: self.observed(&state, &launch.identities),
             claim_retained: true,
             probe_tokens: tokens,
+            binding_id,
+            incarnation,
             ..Self::reply(command)
         })
     }
@@ -456,6 +520,11 @@ impl GroupHost {
                 });
             }
             self.spawn(command, plan);
+            // The engine dies during its initialization (a bad flag, an OOM).
+            if self.state().launch_fails {
+                let rank = self.group.rank_of(&self.name).unwrap();
+                self.group.exit_rank(rank);
+            }
             // ADR 0028 §2.1, §10: the engine environment this member
             // renders: the deployment's approved variables, the same on every
             // host, and the member's own address under the engine's name.
@@ -817,11 +886,22 @@ impl std::fmt::Display for DeployError {
 /// An instance's status as an operator reads it.
 pub(super) struct GroupStatus {
     last_error: Option<String>,
+    members: Vec<MemberStatus>,
+}
+
+/// One member of a group instance as status reads it (ADR 0028 §15).
+pub(super) struct MemberStatus {
+    pub(super) state: String,
 }
 
 impl GroupStatus {
     pub(super) fn last_error(&self) -> &str {
         self.last_error.as_deref().unwrap_or("")
+    }
+
+    /// The member at `rank` of the instance's newest plan.
+    pub(super) fn member(&self, rank: u32) -> &MemberStatus {
+        &self.members[rank as usize]
     }
 }
 
@@ -842,6 +922,11 @@ pub(super) struct GroupWorld {
     builds: BTreeMap<String, String>,
     without_peer: BTreeSet<String>,
     model_stores: BTreeMap<String, String>,
+    /// `recovery` of every group this world deploys.
+    recovery: String,
+    /// Every group Launch the hosts received: its generation, and whether the
+    /// instance's previous plan had fully settled when it arrived.
+    witnessed: Arc<Mutex<Vec<(i64, bool)>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -896,6 +981,45 @@ impl GroupWorld {
             Arc::new(WorldBindings(transport.clone())),
         )
         .unwrap();
+        // SPEC §13.2 (W13): each host's exit watcher reports through the
+        // controller's own exit path, as an agent session's `MemberExit` does:
+        // the wire report is decoded and validated, then handled.
+        let exits = crate::engine_exit::EngineExits::new(worker.commands());
+        for host in &hosts {
+            let (host, exits) = (host.clone(), exits.clone());
+            tokio::spawn(async move {
+                let mut changes = host.group.subscribe();
+                loop {
+                    for exit in host.exits() {
+                        let report =
+                            capyctl_protocol::reports::MemberExit::try_from(exit.to_wire())
+                                .expect("a scripted exit report is valid on the wire");
+                        let (exits, name) = (exits.clone(), host.name.clone());
+                        let _ =
+                            tokio::task::spawn_blocking(move || exits.remote(&name, &report)).await;
+                    }
+                    tokio::select! {
+                        changed = changes.changed() => if changed.is_err() { return },
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    }
+                }
+            });
+        }
+        // ADR 0028 §11: what each Launch saw of the plan before it.
+        let witnessed = Arc::new(Mutex::new(Vec::new()));
+        for host in &hosts {
+            let (owner, witnessed) = (owner.clone(), witnessed.clone());
+            host.state().witness = Some(Arc::new(move |command: &MemberCommand| {
+                let id = &command.identity;
+                let o = owner.lock().unwrap();
+                let settled = o
+                    .store()
+                    .group_plan_at(&id.deployment_id, 0, id.generation - 1)
+                    .unwrap()
+                    .is_some_and(|(_, rows)| rows.iter().all(|r| r.state == MemberState::Settled));
+                witnessed.lock().unwrap().push((id.generation, settled));
+            }));
+        }
         Self {
             group,
             hosts,
@@ -910,6 +1034,9 @@ impl GroupWorld {
             builds: BTreeMap::new(),
             without_peer: BTreeSet::new(),
             model_stores: BTreeMap::new(),
+            // Nothing relaunches unless a test asks for `reconcile`.
+            recovery: "cold_restart".into(),
+            witnessed,
             _dir: dir,
         }
     }
@@ -981,6 +1108,33 @@ impl GroupWorld {
     /// `host` carries every Launch out but its replies are lost.
     pub(super) fn launch_replies_lost(self, host: &str) -> Self {
         self.host(host).state().lose_launch_replies = true;
+        self
+    }
+
+    /// `host` starts every Launch's rank, which exits during initialization.
+    pub(super) fn launch_fails(self, host: &str) -> Self {
+        self.host(host).state().launch_fails = true;
+        self
+    }
+
+    /// Every group this world deploys runs `recovery: reconcile`.
+    pub(super) fn recovery_reconcile(mut self) -> Self {
+        self.recovery = "reconcile".into();
+        self
+    }
+
+    /// A world of `hosts` whose group `name` over all of them is Ready.
+    pub(super) async fn ready_group(name: &str, hosts: &[&str]) -> Self {
+        Self::hosts(hosts).ready(name).await
+    }
+
+    /// Deploy group `name` over every host of this world and wait for READY.
+    pub(super) async fn ready(self, name: &str) -> Self {
+        let names: Vec<String> = self.names().iter().map(|n| (*n).to_owned()).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let id = self.deploy_group(name, &names).await;
+        self.group.launch_completes();
+        self.wait_ready(&id).await;
         self
     }
 
@@ -1186,6 +1340,7 @@ impl GroupWorld {
         let names = self.names();
         let mut deployment = group_document(&source["input"]["deployment"], name, &names, tp, pp);
         deployment.as_object_mut().unwrap().remove("host");
+        deployment["recovery"] = serde_json::json!(self.recovery);
         if self.engine == "tensorfold" {
             deployment["residency"] = serde_json::json!("restart_only");
             deployment["engine_config"] = serde_json::json!({"context_length": 8192});
@@ -1349,31 +1504,172 @@ impl GroupWorld {
         .await
     }
 
+    /// Deployment `id`'s instance as status reads it: its `last_error` and
+    /// the members of its newest plan.
+    fn read_status(&self, id: &str) -> Option<GroupStatus> {
+        let o = self.owner.lock().unwrap();
+        let members = o
+            .store()
+            .group_plan(id, 0)
+            .unwrap()
+            .map(|(_, rows)| {
+                rows.iter()
+                    .map(|r| MemberStatus {
+                        state: r.state.as_str().into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let snapshot = o.store().snapshot().unwrap();
+        let instance = snapshot
+            .deployments
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.instances.first().cloned())?;
+        Some(GroupStatus {
+            last_error: instance.last_error,
+            members,
+        })
+    }
+
+    /// Deployment `name`'s instance as status reads it now.
+    pub(super) async fn status(&self, name: &str) -> GroupStatus {
+        self.read_status(&self.id(name))
+            .expect("a deployed instance")
+    }
+
+    /// As [`Self::status`], for deployment `id`.
+    pub(super) async fn status_of(&self, id: &str) -> GroupStatus {
+        self.read_status(id).expect("a deployed instance")
+    }
+
     /// Wait until deployment `id`'s start gave up with every reservation
     /// released; its status.
     pub(super) async fn wait_settled(&self, id: &str) -> GroupStatus {
         self.until(&format!("deployment {id} settled"), || {
-            let o = self.owner.lock().unwrap();
-            let held = o
-                .store()
-                .group_plan(id, 0)
-                .unwrap()
-                .is_some_and(|(_, rows)| {
-                    rows.iter()
-                        .any(|r| r.state != capyctl_store::groups::MemberState::Settled)
-                });
-            let snapshot = o.store().snapshot().unwrap();
-            let instance = snapshot
-                .deployments
-                .iter()
-                .find(|d| d.id == id)
-                .and_then(|d| d.instances.first().cloned())?;
+            let status = self.read_status(id)?;
             // Every reservation released, and the instance's status names why.
-            (!held && instance.last_error.is_some()).then_some(GroupStatus {
-                last_error: instance.last_error,
-            })
+            (status.members.iter().all(|m| m.state == "settled") && status.last_error.is_some())
+                .then_some(status)
         })
         .await
+    }
+
+    /// Wait until the plan of deployment `name` at `generation` settled:
+    /// every member released on its own host's evidence and the rendezvous
+    /// port freed with the last; its instance's status.
+    pub(super) async fn wait_settled_generation(&self, name: &str, generation: i64) -> GroupStatus {
+        let id = self.id(name);
+        self.until(
+            &format!("generation {generation} of {name} settled"),
+            || {
+                let settled = {
+                    let o = self.owner.lock().unwrap();
+                    o.store()
+                        .group_plan_at(&id, 0, generation)
+                        .unwrap()
+                        .is_some_and(|(_, rows)| {
+                            rows.iter().all(|r| r.state == MemberState::Settled)
+                        })
+                };
+                settled.then(|| self.read_status(&id)).flatten()
+            },
+        )
+        .await
+    }
+
+    /// Whether no unsettled plan holds `port` on `host` as its rendezvous
+    /// port (ADR 0028 §11: released only once every member settled).
+    pub(super) fn port_free(&self, host: &str, port: u16) -> bool {
+        let o = self.owner.lock().unwrap();
+        !o.store().rendezvous_port_held_on(host, port).unwrap()
+    }
+
+    /// An operator's Stop of deployment `id`'s Ready group, waited on until
+    /// every member either settled or was left uncertain.
+    pub(super) async fn stop(&self, id: &str) {
+        let fence = self
+            .deployed
+            .lock()
+            .unwrap()
+            .values()
+            .find(|f| f.deployment_id == id)
+            .cloned()
+            .expect("a deployment of this world");
+        drop(
+            self.worker
+                .stop(
+                    "owner",
+                    &fence,
+                    "stop",
+                    capyctl_protocol::now_unix_ms() + 60_000,
+                )
+                .unwrap(),
+        );
+        self.until("every member settled or uncertain", || {
+            let status = self.read_status(id)?;
+            status
+                .members
+                .iter()
+                .all(|m| m.state == "settled" || m.state == "uncertain")
+                .then_some(())
+        })
+        .await
+    }
+
+    /// SPEC §11: time passes far beyond any lease: the store's time-driven
+    /// reconciliation runs a day from now, and the worker's own retries run
+    /// several times. Nothing of it may release an uncertain member.
+    pub(super) async fn advance_past_lease_expiry(&self) {
+        {
+            let o = self.owner.lock().unwrap();
+            o.store()
+                .reconcile_instances(
+                    o.session(),
+                    capyctl_protocol::now_unix_ms() + 24 * 3_600_000,
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// Let the world run for `duration`.
+    pub(super) async fn settle_for(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+
+    /// Whether a Launch of deployment `name`'s group at `generation` reached
+    /// its head.
+    pub(super) fn generation_started(&self, name: &str, generation: i64) -> bool {
+        let id = self.id(name);
+        self.hosts[0].received().iter().any(|c| {
+            matches!(c.action, MemberAction::Launch { .. })
+                && c.identity.deployment_id == id
+                && c.identity.generation == generation
+        })
+    }
+
+    /// Wait for `generation` of `name` to start; whether every Launch of it
+    /// arrived only after the previous plan had fully settled.
+    pub(super) async fn generation_started_after_settlement(
+        &self,
+        name: &str,
+        generation: i64,
+    ) -> bool {
+        self.until(
+            &format!("generation {generation} of {name} started"),
+            || self.generation_started(name, generation).then_some(()),
+        )
+        .await;
+        let witnessed = self.witnessed.lock().unwrap();
+        let launches: Vec<bool> = witnessed
+            .iter()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, settled)| *settled)
+            .collect();
+        !launches.is_empty() && launches.iter().all(|settled| *settled)
     }
 
     /// Wait until every host received its Launch, while the head is still
@@ -2297,20 +2593,27 @@ async fn members_are_fenced_before_launch_and_record_the_reply_identities() {
 }
 
 // T30, T33 (R23): a Launch whose reply is lost is resent identically (the host
-// replays, never spawns twice) and its member stays dispatched and charged.
+// replays, never spawns twice); its member stays dispatched, charged and
+// uncertain while its host is away. When the host comes back with its journal,
+// the stop records the identities that journal names, then settles on them.
 #[tokio::test]
 async fn a_lost_launch_reply_keeps_the_member_charged() {
     let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_replies_lost("host-b");
+    // Host B drops off after its second (resent) Launch.
+    let (group, seen) = (world.group.clone(), Arc::new(Mutex::new(0)));
+    world.host("host-b").state().launch_observer = Some(Arc::new(move |_: &MemberCommand| {
+        let mut seen = seen.lock().unwrap();
+        *seen += 1;
+        if *seen == 2 {
+            group.disconnect_host("host-b");
+        }
+    }));
     let id = world.deploy_group("g", &["host-a", "host-b"]).await;
     world.group.launch_completes();
     assert!(matches!(
         world.wait_activation(&id).await,
         GroupActivation::Failed { failed_rank: 1, .. }
     ));
-    let (_, rows) = world.group_plan("g").unwrap();
-    assert!(rows[1].dispatched);
-    assert_ne!(rows[1].state, MemberState::Settled);
-    assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
     let launches: Vec<_> = world
         .host("host-b")
         .received()
@@ -2321,6 +2624,39 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     assert!(launches.iter().all(|c| c == &launches[0]), "identically");
     assert_eq!(world.launches(), 2, "a resend starts nothing");
     assert!(!world.route_open("g"));
+    // The head settles on its own host's evidence; host B's member stays.
+    world
+        .until("the head settled", || {
+            let (_, rows) = world.group_plan("g").unwrap();
+            (rows[0].state == MemberState::Settled).then_some(())
+        })
+        .await;
+    world.settle_for(Duration::from_millis(300)).await;
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_eq!(rows[1].state, MemberState::Uncertain);
+    assert_eq!(rows[1].identities, None);
+    assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
+    assert!(!world.port_free("host-a", 25000));
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_member_failed");
+    let (_, rows) = world.group_plan("g").unwrap();
+    let journaled = world
+        .host("host-b")
+        .recorded(&launches[0].identity.command_id)
+        .unwrap();
+    let mut recorded = rows[1].identities.clone().unwrap();
+    let mut expected = journaled.clone();
+    recorded.sort_by_key(|p| p.pid);
+    expected.sort_by_key(|p| p.pid);
+    assert_eq!(recorded, expected, "the identities its host journaled");
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.group.alive(1));
 }
 
 // T27, Review Focus 2 (R15): a head rendezvous port held outside CapyCTL is
@@ -2345,4 +2681,207 @@ async fn a_rendezvous_port_held_outside_capyctl_is_redrawn() {
         .collect();
     assert_eq!(prepared, vec![25000, plan.rendezvous_port()]);
     assert_eq!(world.launches(), 2);
+}
+
+// ---- Task 17: stop, failure, settlement, uncertainty and recovery ---------
+
+// T31: a worker exit stops the head; each host releases on its own evidence; the port frees.
+// The exit reaches the controller as host B's agent reports it (`MemberExit`).
+#[tokio::test]
+async fn worker_exit_stops_the_group() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.exit_rank(1);
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_member_failed");
+    assert!(!world.group.alive(0));
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.route_open("g"));
+}
+
+// T31: a head exit terminates the worker before any relaunch; under
+// `recovery: reconcile` the group relaunches as a new generation only after
+// every member of the old plan settled.
+#[tokio::test]
+async fn head_exit_terminates_worker_before_any_relaunch() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    world.group.exit_rank(0);
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.generation_started_after_settlement("g", 2).await);
+    world.wait_ready(&world.id("g")).await;
+    assert!(world.route_open("g"));
+}
+
+// T32: an unreachable worker host keeps its share charged and uncertain; the port stays held.
+#[tokio::test]
+async fn unreachable_host_keeps_charge_and_port() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.disconnect_host("host-b");
+    world.stop(&id).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_eq!(
+        world.status("g").await.last_error(),
+        "group_member_uncertain"
+    );
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert!(!world.port_free("host-a", 25000));
+    world.advance_past_lease_expiry().await;
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.group.alive(1));
+}
+
+// Review Focus 3: a worker host back with an empty journal settles only on recorded identities.
+#[tokio::test]
+async fn empty_journal_reconnect_settles_on_recorded_identities_only() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    world.group.disconnect_host("host-b");
+    world.group.exit_rank(0);
+    world
+        .until("the head settled", || {
+            let (_, rows) = world.group_plan("g").unwrap();
+            (rows[0].state == MemberState::Settled).then_some(())
+        })
+        .await;
+    world.group.reconnect_host("host-b", JournalState::Empty);
+    world.settle_for(Duration::from_secs(5)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert!(world.group.alive(1), "an empty journal signals nothing");
+    assert!(!world.generation_started("g", 2));
+    world.group.kill_rank_process(1);
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.generation_started_after_settlement("g", 2).await);
+}
+
+// T30: a launch failure on one member after the other launched is compensated.
+#[tokio::test]
+async fn launch_failure_is_compensated() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_fails("host-b");
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.wait_settled_generation("g", 1).await;
+    assert!(!world.group.alive(0));
+    assert!(!world.route_open("g"));
+    assert_eq!(
+        world.status_of(&id).await.last_error(),
+        "group_member_failed"
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+}
+
+// T30, T31 (decided 2026-10-06): a failed readiness probe stops every member; each host releases on its own evidence.
+#[tokio::test]
+async fn readiness_probe_failure_stops_the_group() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).probe_fails();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_settled_generation("g", 1).await;
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert_eq!(
+        world.status_of(&id).await.last_error(),
+        "group_member_failed"
+    );
+}
+
+// T20, T30 (ADR 0028 §9): after the head's host session changes, the group head
+// is re-proven with the 1-token completion probe its agent answers (never the
+// plain readiness probe it refuses), and only then does dispatch reopen.
+#[tokio::test]
+async fn group_head_is_reproven_by_a_completion_probe_after_a_session_change() {
+    struct Sessions {
+        transport: Arc<WorldHosts>,
+        session: Mutex<String>,
+        changes: tokio::sync::watch::Sender<u64>,
+    }
+    impl crate::remote_readiness::ReadinessHosts for Sessions {
+        fn current_session(&self, _: &str) -> Option<String> {
+            Some(self.session.lock().unwrap().clone())
+        }
+        fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.changes.subscribe()
+        }
+        fn probe(&self, command: MemberCommand) -> crate::remote_readiness::ProbeFuture {
+            let transport = self.transport.clone();
+            let session = self.session.lock().unwrap().clone();
+            Box::pin(async move {
+                let host = WorldHosts::host(&transport, &command.identity.member.host_id)
+                    .cloned()
+                    .ok_or(())?;
+                host.execute(command)
+                    .await
+                    .map(|r| (session, r))
+                    .map_err(drop)
+            })
+        }
+    }
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    assert!(world.route_open("g"));
+    let (changes, _) = tokio::sync::watch::channel(0);
+    let hosts = Arc::new(Sessions {
+        transport: world.transport.clone(),
+        session: Mutex::new("session-2".into()),
+        changes,
+    });
+    // The readiness was proven on another session than the head's current one.
+    let ledger: crate::remote_execution::ReadinessLedger = Default::default();
+    let supervisor = crate::remote_readiness::RemoteReadiness::new(
+        world.owner(),
+        hosts,
+        GROUP_CONTROLLER.into(),
+        ledger.clone(),
+    );
+    let pass = supervisor.clone();
+    tokio::task::spawn_blocking(move || pass.pass())
+        .await
+        .unwrap();
+    world
+        .until("the head re-proven", || {
+            (ledger.lock().unwrap().values().any(|s| s == "session-2") && world.route_open("g"))
+                .then_some(())
+        })
+        .await;
+    assert_eq!(world.probe_calls(), 2);
+    assert_eq!(world.last_probe_max_tokens(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
 }

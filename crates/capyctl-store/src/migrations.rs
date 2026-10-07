@@ -9,8 +9,8 @@ use crate::schema::{
     SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
-    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -58,6 +58,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V40,
     // ADR 0028 §5, §6: multi-node group plans and per-host digests.
     SCHEMA_V41,
+    // ADR 0028 §8, §11: member Launch handles and the failed rank.
+    SCHEMA_V42,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -145,6 +147,10 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
         if version == 41 {
             // ADR 0028 §5, §6: group plans, member owners, per-host digests.
             crate::groups::migrate_v41(&tx)?;
+        }
+        if version == 42 {
+            // ADR 0028 §8, §11: member Launch handles and the failed rank.
+            crate::groups::migrate_v42(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -362,7 +368,7 @@ mod tests {
         assert!(conn.execute("INSERT INTO endpoint_leases(host_id,host,port,binding_id,group_owner) VALUES('host-b','127.0.0.1',8100,'binding-a',NULL)", []).is_err());
         // Group member states are closed.
         conn.execute(
-            "INSERT INTO group_plans VALUES('a',2,1,'{}','host-a',25000,'active')",
+            "INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES('a',2,1,'{}','host-a',25000,'active')",
             [],
         )
         .unwrap();
@@ -391,9 +397,39 @@ mod tests {
         // One unsettled plan holds a rendezvous port on its head.
         assert!(conn
             .execute(
-                "INSERT INTO group_plans VALUES('a',3,1,'{}','host-a',25000,'active')",
+                "INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES('a',3,1,'{}','host-a',25000,'active')",
                 []
             )
+            .is_err());
+    }
+
+    /// ADR 0028 §8, §11 (v42): a v41 store's members keep their rows and gain
+    /// an empty Launch handle; its plans gain no failed rank. Applying again
+    /// changes nothing.
+    // T31 T33
+    #[test]
+    fn v42_adds_member_launch_handles_and_the_failed_rank() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 41).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO group_plans VALUES('a',0,1,'{}','host-a',25000,'active');
+            INSERT INTO group_members(deployment_id,instance_index,generation,rank,host_id,owner_id,state,dispatched) VALUES('a',0,1,1,'host-b','deployment:a/instance:0/member:1','dispatching',1);"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let (handle, failed): (Option<String>, Option<u32>) = conn
+            .query_row(
+                "SELECT m.launch_handle,p.failed_rank FROM group_members m JOIN group_plans p USING(deployment_id,instance_index,generation)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((handle, failed), (None, None));
+        assert!(conn
+            .execute("UPDATE group_plans SET failed_rank=-1", [])
             .is_err());
     }
 

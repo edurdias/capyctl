@@ -279,7 +279,7 @@ impl Fixture {
     }
     fn mark_member_dispatching(&self, name: &str, rank: u32) -> Result<(), GroupStoreError> {
         self.open()
-            .mark_member_dispatching(&self.id(name), 0, 1, rank)
+            .mark_member_dispatching(&self.id(name), 0, 1, rank, &launch_handle(rank))
     }
     fn mark_member_launched(
         &self,
@@ -452,6 +452,11 @@ fn process(pid: u32) -> ProcessIdentity {
         boot_id: "boot-b".into(),
         start_ticks: 7,
     }
+}
+
+/// The command id a test Launch of member `rank` carries.
+fn launch_handle(rank: u32) -> String {
+    format!("01K{rank:023}")
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -1123,4 +1128,69 @@ fn a_group_instance_is_not_labelled_with_a_member_owner() {
         .filter_map(|r| parse_member_owner_id(&r.owner_id))
         .collect();
     assert_eq!(members, [(id.clone(), 0, 0), (id, 0, 1)]);
+}
+
+// T31, T33 (ADR 0028 §11): the dispatch fence records the member's Launch
+// handle, and the member reports it with its recorded identities; a fence for
+// another Launch of the same member is refused.
+#[test]
+fn a_member_fence_records_its_launch_handle() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(rows[1].launch_handle, None);
+    assert_eq!(rows[1].identities, None);
+    store.mark_member_dispatching("g", 1).unwrap();
+    // A resend of the same Launch is fenced again.
+    store.mark_member_dispatching("g", 1).unwrap();
+    assert!(matches!(
+        store
+            .open()
+            .mark_member_dispatching(&store.id("g"), 0, 1, 1, &launch_handle(9)),
+        Err(GroupStoreError::Conflict)
+    ));
+    store.mark_member_launched("g", 1, &[process(41)]).unwrap();
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(rows[1].launch_handle, Some(launch_handle(1)));
+    assert_eq!(rows[1].identities, Some(vec![process(41)]));
+    assert_eq!(rows[1].state.as_str(), "launched");
+    assert_eq!(
+        store.open().group_plan_at(&store.id("g"), 0, 1).unwrap(),
+        store.group_plan("g", 0).unwrap()
+    );
+    assert_eq!(
+        store.open().group_plan_at(&store.id("g"), 0, 2).unwrap(),
+        None
+    );
+}
+
+// T31 (ADR 0028 §11): a group keeps the first rank it failed at; a rank
+// outside the plan is refused.
+#[test]
+fn a_group_failure_keeps_its_first_rank() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    let (id, open) = (store.id("g"), store.open());
+    assert_eq!(open.group_failure(&id, 0, 1).unwrap(), None);
+    open.record_group_failure(&id, 0, 1, 1).unwrap();
+    open.record_group_failure(&id, 0, 1, 0).unwrap();
+    assert_eq!(open.group_failure(&id, 0, 1).unwrap(), Some(1));
+    assert!(matches!(
+        open.record_group_failure(&id, 0, 1, 2),
+        Err(GroupStoreError::Conflict)
+    ));
+    // Recording a failure releases nothing.
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
 }
