@@ -81,11 +81,11 @@ impl Default for SwitchOptions {
     }
 }
 
-/// A host's switch turn and the switch it belongs to. Held while the
-/// waiting instance activates, so the next group on the host plans against
-/// what this one left.
+/// A switch's host turns and the switch they belong to. Held while the
+/// waiting instance activates, so the next group on those hosts plans against
+/// what this one left. A group holds the turn of every host it names.
 pub struct Room {
-    _turn: tokio::sync::OwnedMutexGuard<()>,
+    _turns: Vec<tokio::sync::OwnedMutexGuard<()>>,
     /// Counts this switch as active until the waiting instance's activation
     /// ends, so another group's plan waits for it instead of refusing.
     _active: Option<Active>,
@@ -494,7 +494,7 @@ impl Switcher {
                 return Err(NoRoom::Fault(error));
             }
             rooms.push(Room {
-                _turn: turns.remove(&host).expect("a turn per planned host"),
+                _turns: vec![turns.remove(&host).expect("a turn per planned host")],
                 _active: Some(active),
                 switch_id,
                 host,
@@ -541,7 +541,7 @@ impl Switcher {
                 &Default::default(),
             )
             .map_err(fault)?;
-        let host = match plan {
+        let hosts = match plan {
             SwitchPlan::FitsNow => return Ok(None),
             // Another switch may hold its victims closed right now: wait for
             // it to end and plan again rather than refuse.
@@ -555,78 +555,115 @@ impl Switcher {
                 return Err(NoRoom::Moved);
             }
             SwitchPlan::Impossible(code) => return Err(NoRoom::Fault(capacity(target, &code))),
-            SwitchPlan::Evict { host, .. } => host,
+            SwitchPlan::Evict { host, .. } => vec![host],
+            // ADR 0028 §5: a group activates on every named host at once.
+            SwitchPlan::EvictGroup { hosts, .. } => hosts,
         };
-        // SPEC §10: the oldest waiting group first. Turns are FIFO.
-        let turn = self.turn(&host).lock_owned().await;
-        // Final review I4: planned again with the host's fresh observation,
+        // SPEC §10: the oldest waiting group first. Turns are FIFO, and taken
+        // in host order, so a group never waits crosswise on another switch.
+        let mut turns = Vec::with_capacity(hosts.len());
+        for host in hosts.iter().collect::<BTreeSet<_>>() {
+            turns.push(self.turn(host).lock_owned().await);
+        }
+        let head = hosts[0].clone();
+        // Final review I4: planned again with each host's fresh observation,
         // so a park its memory cannot take now is planned as a stop.
-        let observed = self.commands.observe_for_planning([host.clone()]).await;
+        let observed = self.commands.observe_for_planning(hosts.clone()).await;
         let plan = self
             .commands
             .plan_switch(target, only, explicit, &self.protected(), &observed)
             .map_err(fault)?;
-        match plan {
-            SwitchPlan::FitsNow => Ok(Some(Room {
-                _turn: turn,
-                _active: None,
-                switch_id: String::new(),
-                host,
-                victims: Vec::new(),
-                commands: None,
-                explicit,
-            })),
-            SwitchPlan::Impossible(code) => Err(NoRoom::Fault(capacity(target, &code))),
-            SwitchPlan::Evict { host: moved, .. } if moved != host => Err(NoRoom::Moved),
+        let (detail, victims, admission_window_ms) = match plan {
+            SwitchPlan::FitsNow => {
+                return Ok(Some(Room {
+                    _turns: turns,
+                    _active: None,
+                    switch_id: String::new(),
+                    host: head,
+                    victims: Vec::new(),
+                    commands: None,
+                    explicit,
+                }))
+            }
+            SwitchPlan::Impossible(code) => return Err(NoRoom::Fault(capacity(target, &code))),
+            SwitchPlan::Evict { host: moved, .. } if hosts != std::slice::from_ref(&moved) => {
+                return Err(NoRoom::Moved)
+            }
+            SwitchPlan::EvictGroup { hosts: moved, .. } if moved != hosts => {
+                return Err(NoRoom::Moved)
+            }
             SwitchPlan::Evict {
                 host,
                 instance,
                 wake,
                 victims,
                 admission_window_ms,
+            } => (
+                format!(
+                    "instance {instance} {} on {host} after releasing {} instance(s); admission window {admission_window_ms} ms",
+                    if wake { "wakes" } else { "starts" },
+                    victims.len()
+                ),
+                victims,
+                admission_window_ms,
+            ),
+            // ADR 0028 §5, SPEC §11: every named host's victims were planned
+            // before any is released; each is released once, a group victim
+            // whole.
+            SwitchPlan::EvictGroup {
+                hosts,
+                instance,
+                victims,
+                admission_window_ms,
             } => {
-                let switch_id = ulid::Ulid::new().to_string();
-                self.record(
-                    SwitchPhase::Planned,
-                    &switch_id,
-                    target,
-                    Some(&host),
-                    &victims,
-                    &format!(
-                        "instance {instance} {} on {host} after releasing {} instance(s); admission window {admission_window_ms} ms",
-                        if wake { "wakes" } else { "starts" },
+                let victims: Vec<SwitchVictim> = victims.into_values().flatten().collect();
+                (
+                    format!(
+                        "group instance {instance} starts on {} after releasing {} instance(s); admission window {admission_window_ms} ms",
+                        hosts.join(", "),
                         victims.len()
                     ),
-                    explicit,
-                );
-                let active = Active::enter(self);
-                let released = self
-                    .release(
-                        &switch_id,
-                        target,
-                        &host,
-                        &victims,
-                        admission_window_ms,
-                        explicit,
-                    )
-                    .await;
-                if released.is_err() {
-                    // A failure path records its own end; this covers one
-                    // that returned without it.
-                    let _ = self.commands.end_switch(&switch_id);
-                }
-                released?;
-                Ok(Some(Room {
-                    _turn: turn,
-                    _active: Some(active),
-                    switch_id,
-                    host,
                     victims,
-                    commands: Some(self.commands.clone()),
-                    explicit,
-                }))
+                    admission_window_ms,
+                )
             }
+        };
+        let switch_id = ulid::Ulid::new().to_string();
+        self.record(
+            SwitchPhase::Planned,
+            &switch_id,
+            target,
+            Some(&head),
+            &victims,
+            &detail,
+            explicit,
+        );
+        let active = Active::enter(self);
+        let released = self
+            .release(
+                &switch_id,
+                target,
+                &head,
+                &victims,
+                admission_window_ms,
+                explicit,
+            )
+            .await;
+        if released.is_err() {
+            // A failure path records its own end; this covers one that
+            // returned without it.
+            let _ = self.commands.end_switch(&switch_id);
         }
+        released?;
+        Ok(Some(Room {
+            _turns: turns,
+            _active: Some(active),
+            switch_id,
+            host: head,
+            victims,
+            commands: Some(self.commands.clone()),
+            explicit,
+        }))
     }
 
     async fn release(

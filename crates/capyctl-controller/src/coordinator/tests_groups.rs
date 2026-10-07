@@ -815,14 +815,36 @@ impl crate::group_activation::GroupHosts for WorldHosts {
     }
 }
 
-/// The world's bindings: no single-host engine, the scripted group hosts.
+/// The world's bindings: the scripted group hosts, and a Fake engine for a
+/// single-rank deployment beside the groups ([`GroupWorld::with_single_rank`]).
 struct WorldBindings(Arc<WorldHosts>);
 
 impl ExecutionBindings for WorldBindings {
-    fn resolve(&self, _: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError> {
+    fn resolve(&self, work: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError> {
         // ADR 0028 §5: a group never launches as a single-rank engine.
-        Err(CoordinatorError::Service(
-            "a group world has no single-host engine binding".into(),
+        if work.group().is_some() {
+            return Err(CoordinatorError::Service(
+                "a group never launches as a single-rank engine".into(),
+            ));
+        }
+        let engine = Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(|| {
+            Ok(capyctl_protocol::now_unix_ms())
+        })));
+        let cleanup = engine.clone();
+        Ok(ExecutionBinding::remote(
+            engine,
+            Arc::new(move |context: CleanupExecutionContext| {
+                let engine = cleanup.clone();
+                Box::pin(async move {
+                    engine
+                        .lifecycle_cleanup_observed(
+                            &context.binding_id,
+                            &context.incarnation,
+                            &context.identities,
+                        )
+                        .map_err(|e| CoordinatorError::Service(e.to_string()))
+                })
+            }),
         ))
     }
     fn groups(&self) -> Option<Arc<dyn crate::group_activation::GroupHosts>> {
@@ -1402,10 +1424,26 @@ impl GroupWorld {
             // ADR 0013 §3: a relative path resolves in each host's own store.
             deployment["model"]["path"] = serde_json::json!("toy");
         }
+        let hosts: Vec<&GroupHost> = self.hosts.iter().map(|h| h.as_ref()).collect();
+        let fence = self.create(name, &deployment, golden, &hosts)?;
+        if start {
+            self.start_fence(&fence)?;
+        }
+        Ok(fence.deployment_id)
+    }
+
+    /// Deployment `name` from `deployment`, accepted on each of `hosts` from
+    /// that host's own scoped document; recorded under its name.
+    fn create(
+        &self,
+        name: &str,
+        deployment: &serde_json::Value,
+        golden: &serde_json::Value,
+        hosts: &[&GroupHost],
+    ) -> Result<DeploymentFence, DeployError> {
         let fence = {
             let o = self.owner.lock().unwrap();
-            let targets: Vec<_> = self
-                .hosts
+            let targets: Vec<_> = hosts
                 .iter()
                 .map(|host| {
                     let document = self.host_document(golden, host);
@@ -1455,10 +1493,7 @@ impl GroupWorld {
             .lock()
             .unwrap()
             .insert(name.into(), fence.clone());
-        if start {
-            self.start_fence(&fence)?;
-        }
-        Ok(fence.deployment_id)
+        Ok(fence)
     }
 
     fn start_fence(&self, fence: &DeploymentFence) -> Result<(), DeployError> {
@@ -3109,4 +3144,279 @@ async fn a_restart_mid_stop_completes_the_stop_on_evidence() {
         0
     );
     assert!(!world.route_open("g"));
+}
+
+// ---- group eviction across named hosts (ADR 0028 §5, SPEC §11) --------------
+
+impl GroupWorld {
+    /// A single-rank deployment `name` on `host` alone, not started: the
+    /// golden deployment, restart-only, charged 26 GiB at every phase, which
+    /// the host's 32 GiB managed limit holds alone but not beside a group
+    /// member (8 GiB Ready, 10 GiB cold).
+    pub(super) fn with_single_rank(self, name: &str, host: &str) -> Self {
+        self.single_rank(name, host, false);
+        self
+    }
+
+    /// As [`Self::with_single_rank`], holding a warm-residency commitment
+    /// (SPEC §6.5): it is never a switch victim.
+    pub(super) fn with_warm_single_rank(self, name: &str, host: &str) -> Self {
+        self.single_rank(name, host, true);
+        self
+    }
+
+    /// Every host's agent fences per instance (SPEC §§3.1, 7.3): a host
+    /// running a launch still takes another, judged by memory alone.
+    pub(super) fn with_per_instance_claims(self) -> Self {
+        let sql = rusqlite::Connection::open(self._dir.path().join("srv.sqlite3")).unwrap();
+        for host in &self.hosts {
+            sql.execute(
+                "INSERT OR REPLACE INTO host_launch_claims(host_id,mode,recorded_at_ms) VALUES(?1,'per_instance',1)",
+                [&host.name],
+            )
+            .unwrap();
+        }
+        self
+    }
+
+    fn single_rank(&self, name: &str, host: &str, warm: bool) {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let golden = &source["input"]["host"];
+        self.enroll(golden);
+        let mut deployment = source["input"]["deployment"].clone();
+        deployment.as_object_mut().unwrap().remove("host");
+        deployment["name"] = serde_json::json!(name);
+        deployment["routes"] = serde_json::json!([name]);
+        deployment["recovery"] = serde_json::json!(self.recovery);
+        deployment["residency"] = serde_json::json!("restart_only");
+        for phase in ["cold", "ready", "parking", "wake"] {
+            deployment["resources"][phase]["allocations"][0]["bytes"] = serde_json::json!("26GiB");
+        }
+        if warm {
+            deployment["lifecycle"] = serde_json::json!({ "warm": true });
+        }
+        let on = self.host(host).clone();
+        self.create(name, &deployment, golden, &[on.as_ref()])
+            .unwrap();
+    }
+
+    /// SPEC §10: a request for deployment `name` while nothing serves it, as
+    /// the router hands it to the lifecycle authority: it activates one
+    /// instance, making room by switching when it fits nowhere.
+    pub(super) async fn try_request(&self, name: &str) -> Result<(), crate::fault::LifecycleFault> {
+        use crate::port::LifecyclePort;
+        let port = crate::coordinator_port::CoordinatorLifecycle::new(self.worker.commands())
+            .with_switch_options(crate::switching::SwitchOptions {
+                drain_timeout: Duration::from_secs(5),
+                poll: Duration::from_millis(10),
+                ..Default::default()
+            });
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            port.activate_for_request(&self.id(name)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the request for {name} never ended"))
+    }
+
+    /// As [`Self::try_request`]; panics unless `name` ends up serving.
+    pub(super) async fn request(&self, name: &str) {
+        self.try_request(name)
+            .await
+            .unwrap_or_else(|e| panic!("the request for {name} was refused: {e}"));
+    }
+
+    /// Deployment `name`'s instance state as status reads it (`ready`,
+    /// `stopped`, `parked`, ...).
+    pub(super) async fn state(&self, name: &str) -> String {
+        let id = self.id(name);
+        let o = self.owner.lock().unwrap();
+        let snapshot = o.store().snapshot().unwrap();
+        snapshot
+            .deployments
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.instances.first())
+            .map(|i| i.observed_state.clone())
+            .expect("a deployed instance")
+    }
+
+    /// ADR 0028 §11: every settled plan of deployment `name` released each
+    /// member on its own host's evidence: that member's own host was sent a
+    /// Terminate for the member's Launch, and no other host was.
+    pub(super) fn assert_release_evidence_per_member(&self, name: &str) {
+        let id = self.id(name);
+        let current = {
+            let o = self.owner.lock().unwrap();
+            o.store()
+                .group_plan(&id, 0)
+                .unwrap()
+                .map_or(0, |(plan, _)| plan.generation())
+        };
+        for generation in 1..=current {
+            let Some((_, members)) = ({
+                let o = self.owner.lock().unwrap();
+                o.store().group_plan_at(&id, 0, generation).unwrap()
+            }) else {
+                continue;
+            };
+            if members.iter().any(|m| m.state != MemberState::Settled) {
+                continue;
+            }
+            for member in &members {
+                let handle = member
+                    .launch_handle
+                    .as_deref()
+                    .expect("a released member was launched");
+                for host in &self.hosts {
+                    let terminated = host.received().iter().any(|c| {
+                        c.identity.deployment_id == id
+                            && matches!(&c.action, MemberAction::Terminate { owned_handle, .. }
+                                if owned_handle == handle)
+                    });
+                    assert_eq!(
+                        terminated,
+                        host.name == member.host_id,
+                        "rank {} of generation {generation} is released on {}'s evidence only",
+                        member.rank,
+                        member.host_id
+                    );
+                }
+            }
+        }
+    }
+}
+
+// T16: A -> B -> A with a group and a single-rank deployment on host A.
+// R5: the group parks as the victim, which group park brings.
+#[tokio::test]
+#[ignore = "enabled by Task 19"]
+async fn group_and_single_rank_alternate() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"])
+        .await
+        .with_single_rank("s", "host-a");
+    world.request("s").await;
+    assert_eq!(world.state("g").await, "parked");
+    world.request("g").await;
+    assert_eq!(world.state("g").await, "ready");
+    world.assert_release_evidence_per_member("g");
+}
+
+// T16, T27, T30 (ADR 0028 §5, §11): A -> B -> A with group g on host A and
+// host B and a single-rank s on host A, which do not fit together there. The
+// request for s evicts g whole, by the group stop: each host is sent one
+// Terminate for its own member and each member is released only on its own
+// host's evidence, on host B too although only host A needed room. The
+// request for g then evicts s and the group starts again on both hosts. Run
+// with single-claim agents (each launch occupies its host) and with agents
+// fencing per instance (memory alone decides).
+#[tokio::test]
+async fn a_group_victim_is_stopped_whole_and_released_per_member() {
+    for per_instance in [false, true] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"]);
+        let world = if per_instance {
+            world.with_per_instance_claims()
+        } else {
+            world
+        };
+        let world = world.ready("g").await.with_single_rank("s", "host-a");
+        let g = world.id("g");
+        world.request("s").await;
+        assert_eq!(world.state("s").await, "ready");
+        assert_eq!(world.state("g").await, "stopped");
+        world.wait_settled_generation("g", 1).await;
+        world.assert_release_evidence_per_member("g");
+        assert!(!world.group.alive(0) && !world.group.alive(1));
+        assert_eq!(
+            world.owner_bytes_on("host-a", &member_owner_id(&g, 0, 0)),
+            0
+        );
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+            0
+        );
+        assert!(world.port_free("host-a", 25000));
+
+        world.request("g").await;
+        assert_eq!(world.state("g").await, "ready");
+        assert_eq!(world.state("s").await, "stopped");
+        let (plan, members) = world.group_plan("g").unwrap();
+        assert!(plan.generation() > 1, "the group started again");
+        assert!(members.iter().all(|m| m.state == MemberState::Launched));
+        assert!(world.route_open("g"));
+    }
+}
+
+// T16, T27 (ADR 0028 §5, SPEC §11): a group request needing room on host A
+// and host B evicts on both or neither. Host A could make room by stopping
+// s, but host B holds only t, whose warm-residency commitment keeps it from
+// being a victim: the request is refused for capacity and s keeps serving.
+#[tokio::test]
+async fn a_group_request_evicts_nothing_unless_every_named_host_makes_room() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_per_instance_claims()
+        .ready("g")
+        .await
+        .with_single_rank("s", "host-a")
+        .with_warm_single_rank("t", "host-b");
+    world.request("s").await;
+    world.request("t").await;
+    assert_eq!(world.state("g").await, "stopped");
+    let refused = world.try_request("g").await.unwrap_err();
+    assert!(
+        refused.to_string().contains("insufficient_capacity"),
+        "{refused}"
+    );
+    assert_eq!(world.state("s").await, "ready");
+    assert_eq!(world.state("t").await, "ready");
+    assert_eq!(world.state("g").await, "stopped");
+    assert!(world
+        .group_plan("g")
+        .is_some_and(|(plan, _)| plan.generation() == 1));
+}
+
+impl GroupWorld {
+    /// Owner decision 2026-09-25 (`start deployment --evict`): make room for
+    /// every instance of deployment `name`; the host of each switch room,
+    /// released (and its turn ended) before this returns.
+    pub(super) async fn evicting_start(&self, name: &str) -> Vec<String> {
+        let port = crate::coordinator_port::CoordinatorLifecycle::new(self.worker.commands())
+            .with_switch_options(crate::switching::SwitchOptions {
+                drain_timeout: Duration::from_secs(5),
+                poll: Duration::from_millis(10),
+                ..Default::default()
+            });
+        let rooms = tokio::time::timeout(
+            Duration::from_secs(60),
+            port.switcher().make_room_for_start(&self.id(name)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the evicting start of {name} never ended"))
+        .unwrap_or_else(|e| panic!("the evicting start of {name} was refused: {e}"));
+        rooms.iter().map(|room| room.host.clone()).collect()
+    }
+}
+
+// T16, T27 (ADR 0028 §5, owner decision 2026-09-25): an evicting start of a
+// group plans every named host before releasing anything, then releases each
+// host's victims in its own switch: s on host A and u on host B.
+#[tokio::test]
+async fn an_evicting_start_of_a_group_releases_on_every_named_host() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_per_instance_claims()
+        .ready("g")
+        .await
+        .with_single_rank("s", "host-a")
+        .with_single_rank("u", "host-b");
+    world.request("s").await;
+    world.request("u").await;
+    assert_eq!(world.state("g").await, "stopped");
+    assert_eq!(world.evicting_start("g").await, ["host-a", "host-b"]);
+    assert_eq!(world.state("s").await, "stopped");
+    assert_eq!(world.state("u").await, "stopped");
+    world.request("g").await;
+    assert_eq!(world.state("g").await, "ready");
 }

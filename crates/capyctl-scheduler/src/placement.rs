@@ -11,12 +11,14 @@
 //! reason, never placed over budget (ADR 0013 §4 step 4).
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use capyctl_domain::resources::{
     claims_conflict, validate_footprint, LedgerSnapshot, MemoryLimit, PhaseFootprint, ResourcePhase,
 };
 
 use crate::device_choice::{choose_device, DeviceOption};
+use crate::switching::{choose_victims_within, Victim, VictimCandidate};
 
 /// ADR 0013 §4 step 3: how candidate hosts are ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +295,107 @@ pub fn candidate_fits(
         candidate.preferred_device.as_deref(),
     )
     .map(|(device, headroom)| (headroom, Some(device)))
+}
+
+/// ADR 0028 §5: a group has fixed hosts, so placement chooses nothing; it
+/// only validates that the member named for each host fits there, as that
+/// host's own admission sees it. `owners` maps every named host to its
+/// member's owner; `candidates` carry each host's member footprint. Every
+/// refusing host is listed (a named host without a candidate is
+/// ineligible), so the group is placed on all of its hosts or on none.
+pub fn fits_group(
+    candidates: &[HostCandidate],
+    owners: &BTreeMap<String, String>,
+) -> Result<(), Unplaceable> {
+    let mut refusals = Vec::new();
+    for (host, owner) in owners {
+        let verdict = match candidates.iter().find(|c| &c.host_id == host) {
+            None => Err(HostRefusal::Ineligible),
+            Some(c) if !c.eligible => Err(HostRefusal::Ineligible),
+            Some(c) if c.occupied => Err(HostRefusal::Occupied),
+            Some(c) => candidate_fits(c, owner).map(drop),
+        };
+        if let Err(refusal) = verdict {
+            refusals.push((host.clone(), refusal));
+        }
+    }
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(Unplaceable { refusals })
+    }
+}
+
+/// ADR 0028 §5: one named host of a waiting group as its admission sees it,
+/// for planning the eviction that lets the group's member there fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCandidateView {
+    /// The waiting member's owner on this host.
+    pub owner: String,
+    /// The ledger as this host's admission sees it, without the member.
+    pub ledger: LedgerSnapshot,
+    pub limits: Vec<MemoryLimit>,
+    /// Judged on this host alone: a group parked here counts once, as its
+    /// one member owner on this host (ADR 0028 §12).
+    pub max_parked: usize,
+    /// The READY instances on this host that may be released, in preference
+    /// order ([`crate::switching::order_victims`]). A group victim is listed
+    /// under its member owner on this host.
+    pub victims: Vec<VictimCandidate>,
+    /// Owners whose charge is not proven released or releasable (a group
+    /// member `uncertain`): their charge stays counted and they are never
+    /// released to make room (ADR 0028 §11).
+    pub uncertain: BTreeSet<String>,
+}
+
+/// ADR 0028 §5, SPEC §11: the victims each named host of a waiting group
+/// releases so that the group's member fits there, or `None` when any named
+/// host cannot make room even by releasing every candidate it offers, in
+/// which case nothing is evicted anywhere. `need` is each named host's
+/// member footprint; a named host without a view cannot make room. Each
+/// host's set is minimal and its park-or-stop choice is
+/// [`crate::switching::choose_victims`]'s.
+pub fn plan_group_eviction(
+    per_host: &BTreeMap<String, HostCandidateView>,
+    need: &BTreeMap<String, PhaseFootprint>,
+) -> Option<BTreeMap<String, Vec<Victim>>> {
+    plan_group_eviction_within(per_host, need, &|_, _| true)
+}
+
+/// [`plan_group_eviction`], keeping a park on a host only when `room` (the
+/// host's fresh observation, see [`crate::switching::observed_room`]) also
+/// accepts the state it leaves there.
+pub fn plan_group_eviction_within(
+    per_host: &BTreeMap<String, HostCandidateView>,
+    need: &BTreeMap<String, PhaseFootprint>,
+    room: &dyn Fn(&str, &LedgerSnapshot) -> bool,
+) -> Option<BTreeMap<String, Vec<Victim>>> {
+    // ADR 0028 §5, SPEC §11: validate all hosts before evicting. Every
+    // host's set is computed first; one host that cannot make room refuses
+    // the whole plan, so no host releases anything for it.
+    let mut plan = BTreeMap::new();
+    for (host, footprint) in need {
+        let view = per_host.get(host)?;
+        // Uncertainty keeps accounting: an unproven charge is never free room.
+        let offered: Vec<VictimCandidate> = view
+            .victims
+            .iter()
+            .filter(|v| !view.uncertain.contains(&v.owner))
+            .cloned()
+            .collect();
+        let victims = choose_victims_within(
+            &view.ledger,
+            &view.owner,
+            footprint,
+            &view.limits,
+            view.max_parked,
+            &offered,
+            &|state| room(host, state),
+        )
+        .ok()?;
+        plan.insert(host.clone(), victims);
+    }
+    Some(plan)
 }
 
 /// Bytes shown to the operator, in GiB with one decimal.
@@ -768,6 +871,230 @@ mod tests {
                 .unwrap()
                 .device,
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use crate::switching::{Release, Victim, VictimCandidate};
+    use capyctl_domain::resources::Allocation;
+    use std::collections::BTreeMap;
+
+    const GIB: i64 = 1 << 30;
+
+    fn unified(gib: i64, phase: ResourcePhase) -> PhaseFootprint {
+        PhaseFootprint {
+            phase,
+            allocations: vec![Allocation {
+                domain: "unified".into(),
+                bytes: gib * GIB,
+                host_kv_bytes: 0,
+            }],
+            devices: vec![],
+        }
+    }
+
+    /// GiB a host has left beside the victims it lists.
+    struct Free(i64);
+
+    fn free(gib: i64) -> Free {
+        Free(gib)
+    }
+
+    /// A READY instance charged `gib` GiB that parks to 1 GiB.
+    fn victim(owner: &str, gib: i64) -> (VictimCandidate, PhaseFootprint) {
+        (
+            VictimCandidate {
+                owner: owner.into(),
+                serves_elsewhere: false,
+                last_used_ms: 0,
+                parked: Some(unified(1, ResourcePhase::Parked)),
+            },
+            unified(gib, ResourcePhase::Ready),
+        )
+    }
+
+    /// One host's free GiB and the victims it lists.
+    type Host<'a> = (&'a str, Free, &'a [(VictimCandidate, PhaseFootprint)]);
+
+    /// Each host's limit is its free memory plus its victims' charges.
+    fn views(hosts: &[Host<'_>]) -> BTreeMap<String, HostCandidateView> {
+        hosts
+            .iter()
+            .map(|(host, Free(free), victims)| {
+                let charged: i64 = victims
+                    .iter()
+                    .map(|(_, f)| f.allocations[0].bytes)
+                    .sum::<i64>();
+                let view = HostCandidateView {
+                    owner: format!("member-on-{host}"),
+                    ledger: LedgerSnapshot {
+                        epoch: 1,
+                        owners: victims
+                            .iter()
+                            .map(|(v, f)| (v.owner.clone(), f.clone()))
+                            .collect(),
+                    },
+                    limits: vec![MemoryLimit {
+                        domain: "unified".into(),
+                        managed_bytes: free * GIB + charged,
+                        free_reserve_bytes: 0,
+                        reserve_absorbs_unmanaged: false,
+                        host_kv_bytes: None,
+                        parked_bytes: None,
+                    }],
+                    max_parked: 4,
+                    victims: victims.iter().map(|(v, _)| v.clone()).collect(),
+                    uncertain: BTreeSet::new(),
+                };
+                ((*host).to_owned(), view)
+            })
+            .collect()
+    }
+
+    /// Each named host's member footprint (cold), in GiB.
+    fn need(hosts: &[(&str, i64)]) -> BTreeMap<String, PhaseFootprint> {
+        hosts
+            .iter()
+            .map(|(host, gib)| ((*host).to_owned(), unified(*gib, ResourcePhase::Cold)))
+            .collect()
+    }
+
+    fn names(victims: &[Victim]) -> Vec<&str> {
+        victims.iter().map(|v| v.owner.as_str()).collect()
+    }
+
+    // T16, T27: if one named host cannot make room, nothing is evicted anywhere.
+    #[test]
+    fn eviction_is_all_or_nothing_across_hosts() {
+        let views = views(&[
+            ("host-a", free(10), &[victim("x", 80)]),
+            ("host-b", free(10), &[]),
+        ]);
+        assert!(plan_group_eviction(&views, &need(&[("host-a", 80), ("host-b", 80)])).is_none());
+    }
+
+    // T16: each host evicts only what it needs.
+    #[test]
+    fn each_host_evicts_its_minimum() {
+        let views = views(&[
+            ("host-a", free(10), &[victim("x", 80), victim("y", 10)]),
+            ("host-b", free(90), &[victim("z", 50)]),
+        ]);
+        let plan = plan_group_eviction(&views, &need(&[("host-a", 80), ("host-b", 80)])).unwrap();
+        assert_eq!(names(&plan["host-a"]), ["x"]);
+        assert!(plan["host-b"].is_empty());
+    }
+
+    // T16, T27: a named host without a view cannot make room, so nothing is
+    // evicted on the hosts that could.
+    #[test]
+    fn a_named_host_without_a_view_evicts_nothing() {
+        let views = views(&[("host-a", free(10), &[victim("x", 80)])]);
+        assert!(plan_group_eviction(&views, &need(&[("host-a", 80), ("host-b", 1)])).is_none());
+    }
+
+    // T32, ADR 0028 §11: an uncertain member's charge is never free room,
+    // even when it is offered as a victim.
+    #[test]
+    fn an_uncertain_member_is_never_released_for_room() {
+        let mut views = views(&[
+            ("host-a", free(10), &[victim("u", 80)]),
+            ("host-b", free(90), &[]),
+        ]);
+        let need = need(&[("host-a", 80), ("host-b", 80)]);
+        assert_eq!(
+            names(&plan_group_eviction(&views, &need).unwrap()["host-a"]),
+            ["u"]
+        );
+        views
+            .get_mut("host-a")
+            .unwrap()
+            .uncertain
+            .insert("u".into());
+        assert!(plan_group_eviction(&views, &need).is_none());
+    }
+
+    // T27, ADR 0028 §12: `max_parked` counts a group once on each host. Each
+    // host holds one parked member of group p; under `max_parked: 1` per host
+    // the victim x stops on each host rather than parking beside it, and the
+    // plan exists (a count across hosts would see two parked and refuse).
+    #[test]
+    fn max_parked_counts_a_group_once_per_host() {
+        let mut views = views(&[
+            ("host-a", free(10), &[victim("x", 80)]),
+            ("host-b", free(10), &[victim("x2", 80)]),
+        ]);
+        for (host, view) in &mut views {
+            view.max_parked = 1;
+            view.ledger.owners.insert(
+                format!("p-member-on-{host}"),
+                unified(0, ResourcePhase::Parked),
+            );
+        }
+        let plan = plan_group_eviction(&views, &need(&[("host-a", 80), ("host-b", 80)])).unwrap();
+        assert_eq!(plan["host-a"][0].release, Release::Stop);
+        assert_eq!(plan["host-b"][0].release, Release::Stop);
+        for view in views.values_mut() {
+            view.max_parked = 2;
+        }
+        let plan = plan_group_eviction(&views, &need(&[("host-a", 80), ("host-b", 80)])).unwrap();
+        assert_eq!(plan["host-a"][0].release, Release::Park);
+        assert_eq!(plan["host-b"][0].release, Release::Park);
+    }
+
+    // T16, ADR 0028 §5: a group has fixed hosts; placement only validates
+    // that its member fits on every one of them, each judged as its own
+    // admission sees it.
+    #[test]
+    fn a_group_fits_only_when_every_named_host_fits() {
+        let host = |id: &str, free: i64| HostCandidate {
+            host_id: id.into(),
+            eligible: true,
+            instances_here: 0,
+            footprint: unified(10, ResourcePhase::Cold),
+            limits: vec![MemoryLimit {
+                domain: "unified".into(),
+                managed_bytes: free * GIB,
+                free_reserve_bytes: 0,
+                reserve_absorbs_unmanaged: false,
+                host_kv_bytes: None,
+                parked_bytes: None,
+            }],
+            ledger: LedgerSnapshot {
+                epoch: 1,
+                owners: BTreeMap::new(),
+            },
+            max_parked: 4,
+            occupied: false,
+            whole_host: false,
+            device_options: vec![],
+            preferred_device: None,
+        };
+        let owners: BTreeMap<String, String> = [("host-a", "m0"), ("host-b", "m1")]
+            .map(|(h, o)| (h.to_owned(), o.to_owned()))
+            .into();
+        assert!(fits_group(&[host("host-a", 20), host("host-b", 20)], &owners).is_ok());
+        let refused = fits_group(&[host("host-a", 20), host("host-b", 5)], &owners).unwrap_err();
+        assert_eq!(
+            refused.refusals,
+            [("host-b".to_owned(), HostRefusal::Insufficient)]
+        );
+        let mut occupied = host("host-a", 20);
+        occupied.occupied = true;
+        assert_eq!(
+            fits_group(&[occupied, host("host-b", 20)], &owners)
+                .unwrap_err()
+                .code(),
+            "host_occupied"
+        );
+        assert_eq!(
+            fits_group(&[host("host-a", 20)], &owners)
+                .unwrap_err()
+                .refusals,
+            [("host-b".to_owned(), HostRefusal::Ineligible)]
         );
     }
 }
