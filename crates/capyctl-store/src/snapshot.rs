@@ -111,8 +111,10 @@ pub struct DeploymentSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<crate::lifecycle_windows::LifecycleWindows>,
     /// Owner decision 2026-09-23: the current revision's startup reservation
-    /// with its provenance (`declared`, `default`, `resources` or `request`)
-    /// and every startup peak measured for it. Additive.
+    /// with its provenance (`declared`, `default`, `resources`, `request`, or
+    /// `measured` once a peak is recorded on its host and installation, owner
+    /// decision 2026-10-07: the figure admission reserves) and every startup
+    /// peak measured for it. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup: Option<crate::ordinary_lifecycle::startup::StartupStatus>,
     /// ADR 0014 amendment A13: what a park of the current revision is

@@ -382,8 +382,11 @@ async fn until_sampled(host: &ScriptedAvailability, samples: i64) {
 /// on its first run. The run's peak drop in published availability is recorded
 /// for the revision on its host; the next start reserves that measured peak as
 /// its cold phase, status says it was measured, and at Ready the reservation
-/// drops to the steady request.
-// T29 T26
+/// drops to the steady request. Owner decision 2026-10-07 (found live: an
+/// SGLang deployment kept showing its 55.2 GiB placeholder after a 29.7 GiB
+/// peak was measured): the deployment's STARTUP figure is what admission
+/// reserves for its next start, the measured peak, as soon as it is recorded.
+// T29 T26 T14
 #[tokio::test]
 async fn a_measured_startup_peak_is_recorded_and_reused() {
     let (dir, owner, _, observations) = setup().await;
@@ -477,6 +480,19 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     let held = footprint(&owner, &fence.deployment_id).unwrap();
     assert_eq!(held.phase, ResourcePhase::Ready);
     assert_eq!(held.allocations[0].bytes, 8 * GIB + OVERHEAD);
+    let deployment_startup = |owner: &SharedCoordinatorState| {
+        let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+        let status = snapshot
+            .deployments
+            .iter()
+            .find(|d| d.id == fence.deployment_id)
+            .unwrap()
+            .clone();
+        serde_json::to_value(status.startup.as_ref().unwrap()).unwrap()
+    };
+    let measured = deployment_startup(&owner);
+    assert_eq!(measured["provenance"], "measured", "{measured}");
+    assert_eq!(measured["bytes"], 12 * GIB, "{measured}");
 
     // Stop, then start again through placement: the measured peak is reused.
     available.store(baseline, Ordering::SeqCst);
@@ -508,8 +524,8 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     assert_eq!(instance["bytes"], 12 * GIB);
     assert_eq!(instance["provenance"], "measured");
     let deployment = serde_json::to_value(status.startup.as_ref().unwrap()).unwrap();
-    assert_eq!(deployment["provenance"], "default");
-    assert_eq!(deployment["bytes"], 8 * GIB + GRAPHS + OVERHEAD);
+    assert_eq!(deployment["provenance"], "measured");
+    assert_eq!(deployment["bytes"], 12 * GIB);
     assert_eq!(deployment["measured"][0]["peak_bytes"], 12 * GIB);
     again.release.add_permits(1);
     until("the second start to reach Ready", || {

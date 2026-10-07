@@ -352,8 +352,8 @@ pub struct StartupMeasurement {
     pub measured_at_ms: i64,
 }
 
-/// A deployment's startup budget as status shows it: what its current
-/// revision reserves before any measurement, and every peak measured for it.
+/// A deployment's startup budget as status shows it: what a start of its
+/// current revision accepted now reserves, and every peak measured for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StartupStatus {
     pub bytes: i64,
@@ -392,10 +392,17 @@ pub(crate) fn status(
         return Ok(None);
     };
     let StartupBudget { bytes, provenance } = startup_budget(&e);
-    // The placeholder recomputed with weights sized since the freeze.
-    let (bytes, provenance) = match weighed_placeholder(conn, deployment_id, revision, &e) {
-        Ok(Some(estimate)) => (estimate, StartupProvenance::Default),
-        _ => (bytes, provenance),
+    // Owner decision 2026-10-07 (found live: an SGLang deployment showed its
+    // 55.2 GiB placeholder after a 29.7 GiB peak was measured): the figure is
+    // the one admission reserves (`frozen_plan_startup`), so a measured peak
+    // on the revision's host and installation replaces the placeholder here
+    // too, else the placeholder recomputed with weights sized since the freeze.
+    let (bytes, provenance) = match frozen_startup(conn, deployment_id, revision, &e) {
+        Ok(Some(measured)) => (measured, StartupProvenance::Measured),
+        _ => match weighed_placeholder(conn, deployment_id, revision, &e) {
+            Ok(Some(estimate)) => (estimate, StartupProvenance::Default),
+            _ => (bytes, provenance),
+        },
     };
     let measured = conn
         .prepare(
