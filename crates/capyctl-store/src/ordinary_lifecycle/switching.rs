@@ -90,6 +90,9 @@ pub enum SwitchPlan {
     EvictGroup {
         hosts: Vec<String>,
         instance: u32,
+        /// ADR 0028 §12: the group is parked on its named hosts and wakes
+        /// there; each host's need is its member's parked-to-wake delta.
+        wake: bool,
         victims: BTreeMap<String, Vec<SwitchVictim>>,
         /// The longest admission window of the hosts releasing anything.
         admission_window_ms: i64,
@@ -983,11 +986,34 @@ fn offer_victims(
                 false => None,
             }
         } else {
-            // ADR 0028 §5, §11: a group victim is evicted whole, by the
-            // group stop that terminates every member at once and releases
-            // each only on its own host's evidence; it is never parked here.
-            offered.parkable.insert(victim_owner.clone(), false);
-            None
+            // ADR 0028 §5, §11, §12 (R34): a group victim is released whole.
+            // A deep group parks whole through its head's collective, each
+            // member charged its parked budget on its own host; a
+            // restart_only group stops, every member released only on its
+            // own host's evidence.
+            let (source, _, _) = launch(tx, &deployment, index)?;
+            let footprints = super::park::group_parked_footprints(
+                tx,
+                &deployment,
+                source.revision,
+                index,
+                generation,
+            )?;
+            // R39, R40: a parked member still occupies a host whose agent
+            // takes one launch at a time, so there it stops instead.
+            let may_park = !c.whole_host
+                && !c.occupied
+                && footprints.is_some()
+                && !park_refused(tx, &deployment, index, generation)?
+                && !uncertain_leases(tx, &deployment, index)?;
+            offered.parkable.insert(victim_owner.clone(), may_park);
+            if footprints.is_some() && park_refused_for_room(tx, &deployment, index, generation)? {
+                offered.full.insert(victim_owner.clone());
+            }
+            match (may_park, footprints) {
+                (true, Some(parked)) => parked.get(&c.host_id).cloned(),
+                _ => None,
+            }
         };
         offered.candidates.push(VictimCandidate {
             owner: victim_owner.clone(),
@@ -1149,6 +1175,7 @@ fn plan_in(
             tx,
             target,
             instance,
+            wake,
             revision,
             &shape.hosts,
             eligible,
@@ -1473,6 +1500,7 @@ fn plan_group_in(
     tx: &Transaction<'_>,
     target: &str,
     instance: u32,
+    wake: bool,
     revision: i64,
     hosts: &[String],
     eligible: placement::Eligible<'_>,
@@ -1515,10 +1543,16 @@ fn plan_group_in(
             notes.push(format!("host {host} is not eligible for placement"));
             continue;
         }
-        // What the group's reservation charges this member on its own host.
+        // What the group's reservation charges this member on its own host;
+        // ADR 0028 §12: a parked group wakes in place, its member charged the
+        // wake peak over the parked budget it already holds there.
         let (raw, _) = frozen_on_host(tx, target, revision, Some(host))?;
         let e = decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
-        let footprint = super::phase(&e.resources.cold, ResourcePhase::Cold);
+        let footprint = if wake {
+            super::park::wake_peak(&e)
+        } else {
+            super::phase(&e.resources.cold, ResourcePhase::Cold)
+        };
         let offered = offer_victims(tx, c, target, protected, activity)?;
         // W10 gap (e): a host that cannot take another launch is freed only
         // by releasing every launch it runs.
@@ -1677,6 +1711,7 @@ fn plan_group_in(
         SwitchPlan::EvictGroup {
             hosts: hosts.to_vec(),
             instance,
+            wake,
             victims,
             admission_window_ms,
         },
@@ -1849,6 +1884,7 @@ fn plan_start_in(
             Planned::Evict(
                 SwitchPlan::EvictGroup {
                     instance,
+                    wake,
                     victims,
                     admission_window_ms,
                     ..
@@ -1862,7 +1898,7 @@ fn plan_start_in(
                     steps.push(StartStep {
                         host,
                         instance,
-                        wake: false,
+                        wake,
                         victims,
                         admission_window_ms,
                     });

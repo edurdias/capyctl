@@ -136,6 +136,24 @@ pub trait GroupHosts: Send + Sync + 'static {
         _outcome: Result<&GroupActivation, &GroupActivationError>,
     ) {
     }
+    /// ADR 0028 §12 (R12): the saver-map facts `member`'s own host reports
+    /// for a SGLang member it runs, read from that host's own observation
+    /// directory (enrolled at the member's launch): the bytes the member's
+    /// saver still maps and the host time they were observed at. `Err` is no
+    /// report; nothing falls back to process sampling.
+    fn saver_mapped<'a>(
+        &'a self,
+        deployment_id: &'a str,
+        member: &'a capyctl_store::ordinary_lifecycle::park::ArmedMember,
+    ) -> HostFuture<'a, Result<(i64, i64), String>>;
+    /// SPEC §17: how a group park or wake of `deployment_id` concluded.
+    fn residency_concluded(
+        &self,
+        _deployment_id: &str,
+        _kind: capyctl_store::ordinary_lifecycle::park::ResidencyKind,
+        _outcome: Result<(), &crate::group_residency::GroupResidencyError>,
+    ) {
+    }
 }
 
 /// What one group activation needs from its coordinator.
@@ -617,6 +635,25 @@ async fn activate(
     Ok(outcome)
 }
 
+/// ADR 0028 §5, §12: the memory limits a member host's own policy admits
+/// its member against, one per domain.
+pub(crate) fn host_limits(
+    controls: &capyctl_config::resource_controls::ResourceControls,
+) -> Vec<MemoryLimit> {
+    controls
+        .domains
+        .iter()
+        .map(|(domain, d)| MemoryLimit {
+            domain: domain.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect()
+}
+
 /// ADR 0028 §5, §12: one admission context per member host, from that host's
 /// own policy and observations, and every member reserved at once.
 async fn reserve(
@@ -644,19 +681,7 @@ async fn reserve(
                 .map(|policy| policy.controls)
                 .ok_or_else(|| format!("host {} has no resource policy", member.host))
         })?;
-        let limits: Vec<MemoryLimit> = controls
-            .domains
-            .iter()
-            .map(|(domain, d)| MemoryLimit {
-                domain: domain.clone(),
-                managed_bytes: d.managed_limit,
-                free_reserve_bytes: d.free_reserve,
-                reserve_absorbs_unmanaged: d.memory
-                    == capyctl_config::effective::DomainMemory::Device,
-                host_kv_bytes: d.host_kv_limit,
-                parked_bytes: d.parked_limit,
-            })
-            .collect();
+        let limits = host_limits(&controls);
         observed.insert(member.host.clone(), (observations, limits, controls));
     }
     let head = &members[0];
@@ -1198,6 +1223,10 @@ async fn ready(
     {
         return failed(error.to_string());
     }
+    // ADR 0028 §12 (decided 2026-10-06): the wake canary's reference is
+    // recorded at first readiness, after the readiness probe; a recording
+    // that fails leaves the group ready and its next wake records it.
+    crate::group_residency::record_canary(ctx, &head, work.instance_index()).await;
     let step = work.step_id().to_owned();
     let observed_at = head_reply.observed_at_unix_ms;
     let receipt = OwnedLaunchReceipt {

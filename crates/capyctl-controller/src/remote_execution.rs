@@ -1169,6 +1169,23 @@ impl crate::group_activation::GroupHosts for AgentGroupHosts {
             readiness.insert(binding_id.to_owned(), session);
         }
     }
+
+    /// ADR 0028 §12 (R12): no agent reports a SGLang group member's saver-map
+    /// facts on its session yet, so there is no report: the member is silent,
+    /// keeps its full charge, and its group's park or wake stops the group.
+    /// Nothing falls back to process sampling.
+    fn saver_mapped<'a>(
+        &'a self,
+        _deployment_id: &'a str,
+        member: &'a capyctl_store::ordinary_lifecycle::park::ArmedMember,
+    ) -> crate::group_activation::HostFuture<'a, Result<(i64, i64), String>> {
+        Box::pin(async move {
+            Err(format!(
+                "host {} reports no saver-map facts for group members on its session",
+                member.host_id
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

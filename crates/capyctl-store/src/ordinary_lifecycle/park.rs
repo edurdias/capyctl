@@ -40,6 +40,40 @@ use capyctl_domain::completion::{EffectObservation, Milestone, ProcessIdentity};
 use capyctl_domain::resources::LedgerSnapshot;
 use sha2::{Digest, Sha256};
 
+// ADR 0028 §12: a group instance's park and wake, member by member.
+#[path = "group_park.rs"]
+mod group;
+pub use group::{ArmedMember, MemberResidency};
+
+/// ADR 0028 §12: each member host's parked budget when the instance's group
+/// at `generation` parks (every member host's resolution parks), keyed by
+/// host; `None` when it does not park (it stops instead).
+pub(super) fn group_parked_footprints(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+    instance: u32,
+    generation: i64,
+) -> Result<Option<std::collections::BTreeMap<String, PhaseFootprint>>, LifecycleError> {
+    let members = group::members(tx, deployment, revision, instance, generation)?;
+    Ok(group::group_parks(&members).then(|| {
+        members
+            .iter()
+            .map(|m| (m.host.clone(), m.parked()))
+            .collect()
+    }))
+}
+
+/// SPEC §7.3: what a parked launch resolved as `e` is charged while it wakes:
+/// the peak of its parked budget into its wake phase.
+pub(super) fn wake_peak(e: &EffectiveDeployment) -> PhaseFootprint {
+    peak(
+        &phase(&e.resources.parked, ResourcePhase::Parked),
+        &phase(&e.resources.wake, ResourcePhase::Wake),
+        ResourcePhase::Wake,
+    )
+}
+
 /// Which residency change a step performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +256,9 @@ pub struct ResidencyWork {
     pub limits: Vec<MemoryLimit>,
     pub observation_ttl_ms: i64,
     pub max_parked: usize,
+    /// ADR 0028 §12: the instance runs as a multi-node group; the worker
+    /// arms it against every member host and runs it through the head.
+    pub group: bool,
 }
 
 /// The outcome of arming a planned park or restore.
@@ -741,7 +778,20 @@ fn accept_instance(
     }
     let (source, e, _) = launch(tx, deployment, instance)?;
     current(tx, s, &source, true)?;
-    if kind == ResidencyKind::Park && !parks(&e) {
+    let parkable = if group::is_group_at(tx, deployment, instance, source.generation)? {
+        // ADR 0028 §12: a group parks only where every member host's own
+        // resolution parks.
+        group::group_parks(&group::members(
+            tx,
+            deployment,
+            source.revision,
+            instance,
+            source.generation,
+        )?)
+    } else {
+        parks(&e)
+    };
+    if kind == ResidencyKind::Park && !parkable {
         // SPEC §6.3: fail clearly if explicit parking is unsupported.
         return Err(LifecycleError::Unsupported);
     }
@@ -877,7 +927,31 @@ impl crate::Store {
         }
         super::receipt::command_revision(&tx, deployment, expected_revision)?;
         super::check_managed_command_target(&tx, deployment)?;
-        if !parks(&declared(&tx, deployment)?) {
+        let e = declared(&tx, deployment)?;
+        if !parks(&e) {
+            // ADR 0028 §12 (R34): park follows the effective residency, not
+            // the engine. A restart_only group parks by a group stop and
+            // wakes by a group relaunch; any other restart_only deployment
+            // refuses the park.
+            if e.residency == Residency::RestartOnly
+                && super::worker::group_shape(&tx, deployment, expected_revision)?.is_some()
+            {
+                // The stop is the group's cleanup, bounded like any stop the
+                // store accepts on its own (the request window), not by the
+                // park's. Its own command receipt (instance scope, this key)
+                // is the only one its operation has: a retry replays it there.
+                let receipt = group::stop_restart_only(
+                    &tx,
+                    s,
+                    principal,
+                    deployment,
+                    key,
+                    now,
+                    now.saturating_add(e.request_deadline_ms).max(deadline),
+                )?;
+                tx.commit()?;
+                return Ok(receipt);
+            }
             return Err(LifecycleError::Unsupported);
         }
         let targets: Vec<u32> = tx
@@ -1221,6 +1295,7 @@ impl crate::Store {
                 limits: limits(&policy),
                 observation_ttl_ms: policy.controls.observation_ttl_ms,
                 max_parked: policy.controls.max_parked as usize,
+                group: group::is_group(&tx, &p)?,
             });
         }
         tx.commit()?;
@@ -1694,6 +1769,10 @@ fn arm(
         return Err(LifecycleError::Conflict);
     }
     let (source, e, identities) = current_residency(tx, s, &p)?;
+    // ADR 0028 §12: a group arms against every member host (`group::arm`).
+    if group::is_group(tx, &p)? {
+        return Err(LifecycleError::Conflict);
+    }
     if context.now_ms < p.accepted_at_ms || context.now_ms >= p.deadline_ms {
         return Err(LifecycleError::Conflict);
     }
@@ -1893,6 +1972,11 @@ fn complete(
     now: i64,
 ) -> Result<(), LifecycleError> {
     let (p, state) = read(tx, id)?;
+    // ADR 0028 §12: a group completes on every member's own report
+    // (`group::complete`).
+    if group::is_group(tx, &p)? {
+        return Err(LifecycleError::Conflict);
+    }
     if state != "armed" {
         return Err(LifecycleError::Conflict);
     }
@@ -2029,24 +2113,28 @@ fn refuse(
         return Err(LifecycleError::Conflict);
     }
     let (source, e, _) = current_residency(tx, s, &p)?;
-    let f = charged_footprints(tx, &source, &e)?;
-    let (held, back) = match p.kind {
-        ResidencyKind::Park => (&f.parking, &f.ready),
-        ResidencyKind::Restore => (&f.wake, &f.parked),
-    };
-    let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
-    if !ledger
-        .owners
-        .get(&p.owner())
-        .is_some_and(|current| same(current, held))
-    {
-        return Err(LifecycleError::Conflict);
+    if group::is_group(tx, &p)? {
+        group::refuse_members(tx, &p)?;
+    } else {
+        let f = charged_footprints(tx, &source, &e)?;
+        let (held, back) = match p.kind {
+            ResidencyKind::Park => (&f.parking, &f.ready),
+            ResidencyKind::Restore => (&f.wake, &f.parked),
+        };
+        let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+        if !ledger
+            .owners
+            .get(&p.owner())
+            .is_some_and(|current| same(current, held))
+        {
+            return Err(LifecycleError::Conflict);
+        }
+        one(tx.execute(
+            "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
+            params![p.owner(), resource_ledger::encode(back).map_err(resource)?],
+        )?)?;
     }
     let epoch = resource_ledger::advance_completion_epoch(tx)?;
-    one(tx.execute(
-        "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
-        params![p.owner(), resource_ledger::encode(back).map_err(resource)?],
-    )?)?;
     let code = format!("{}_refused", p.kind.operation_kind());
     one(tx.execute(
         "UPDATE lifecycle_steps SET state='cancelled' WHERE id=?1 AND state='armed'",
