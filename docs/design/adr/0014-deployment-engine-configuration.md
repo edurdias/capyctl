@@ -1356,3 +1356,72 @@ would be 22.9 GiB.
 CPU tests cover the formula's boundary, the gpt-oss-20b and gpt-oss-120b cases, a frozen
 revision's exact re-resolution and the #68 discrete case. Not qualification: a live run of
 gpt-oss-120b on vLLM on a GB10 should confirm the new Ready charge holds the footprint.
+
+## Amendment A18: a launch whose parked charge keeps growing restarts instead of parking (owner decision 2026-10-07)
+
+Problem: on the 2026-10-06 catalog run (GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4, request sized
+for 32 GiB, `deep` residency) every wake left CPU-side memory behind. vLLM's GPU memory was
+back at 22.1 GiB after each wake, but the machine's memory in use after four wakes was 38.0,
+41.9, 42.1 and 44.2 GiB against 32.7 GiB after the start, and the parked charge A13 measured
+grew from 4.7 to 9.6 and then 13.4 GiB over three parks of the same launch. The accounting
+stayed honest, because every park is measured, but the engine held more of the machine on
+every cycle, and the revision's charge (the largest residue measured, A13) rose with it until
+its parks would be refused `park_parked_capacity`. A stop and a fresh start return it to its
+first footprint (60.3 s to Ready warm, against about 20 s for a wake).
+
+Rule:
+
+- Each measured park is also recorded per launch (an instance's generation) and memory domain:
+  the charge of the launch's first measured park and of its latest, the charge being the
+  residue as A13 charges it (never below the placeholder, never above the Ready charge). Only
+  an instance's latest measured launch is kept (store schema v44).
+- The host bounds the growth with `resource_policy.parked_growth_limit`, host policy beside
+  `parked_limit` and `max_parked`: the host's memory is what the growth takes, and the same
+  engine grows on one platform and not on another. Forms: `auto` (the default: the first
+  charge again, 100 %), a whole percentage of the first charge (`0%` to `10000%`), a size of
+  growth (`8GiB`), or `off`. It is set three ways like every role setting: the YAML,
+  `--set resource_policy.parked_growth_limit=…` on `capyctl start host` (standalone:
+  `host.resource_policy.parked_growth_limit`) and `CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT`
+  (standalone: `CAPYCTL_SET__HOST__RESOURCE_POLICY__PARKED_GROWTH_LIMIT`), flag over
+  environment over YAML over the default.
+- When a launch's latest charge exceeds its first by more than the bound on any domain, its
+  next park is a stop: the idle policy's park (reason `ready_idle_parked_growth`), a switch
+  victim's release, and `park deployment` (which answers with the stop's operation, as a
+  `restart_only` group's park does, ADR 0028 §12). The stop is an ordinary one: it releases
+  nothing before its own cleanup evidence, the instance stays eligible for on-demand
+  activation, and its next activation is a fresh launch with no growth recorded.
+- Status records it: `parked.growth` lists each instance's latest measured launch with its
+  first and latest charge, the number of measured parks, the bound in bytes and its state
+  (`within_limit`, `past_limit` or `stopped` with the stop's operation id), and the text
+  status prints a `Parked` line for the last two. The stop's journal entry names
+  `parked_growth` and the numbers.
+- A host that states no `parked_growth_limit`, or `auto`, publishes, stores and resolves
+  exactly what it did before: the field is encoded only when stated, so no policy digest and
+  no frozen revision changes.
+
+Why on by default, at 100 %: without a bound, growth like the catalog's raises the revision's
+charge on every cycle until a park is refused and the engine stays loaded at its full footprint
+(the same outcome A17 found for a residue above the parked limit). Doubling is far above the
+variation of a residue that does not grow (SGLang's Qwen3-4B measured 6.30 GiB twice; the
+27B with DFlash2 33.4 GiB on three parks), and a residue at or below the placeholder never
+counts as growth, because charges are compared, not raw residues. With the default the catalog's
+deployment parks twice and its third park is a stop (4.9 GiB of growth past a 4.7 GiB first
+charge), so it holds at most 9.6 GiB parked instead of 13.4 GiB and rising.
+
+Not changed: the revision's charge is still the largest residue measured (A13), so after the
+stop the next launch is charged what the largest measured park held until a new revision is
+measured. A multi-node group's parks are not measured (ADR 0028 §12) and are not bounded.
+`preinitialize deployment` parks as before: it exists to leave instances parked.
+
+Evidence: `crates/capyctl-store/src/ordinary_lifecycle/parked_charge_tests.rs`
+(`a_park_after_the_parked_charge_outgrew_its_first_park_is_a_stop`,
+`a_park_within_the_growth_limit_parks_as_before`,
+`the_idle_policy_stops_an_outgrown_launch_instead_of_parking_it`,
+`a_switch_stops_an_outgrown_victim_instead_of_parking_it`,
+`the_hosts_parked_growth_limit_sets_the_bound`), `crates/capyctl-config/tests/current_resource_controls.rs`
+(`an_absent_or_auto_parked_growth_limit_changes_no_digest`), the three-ways tests
+`the_parked_growth_limit_is_set_three_ways` (standalone) and
+`a_hosts_parked_growth_limit_is_set_three_ways` (host), and
+`status_says_when_parked_growth_turns_a_park_into_a_stop` (CLI). CPU and Fake tests only; not
+qualification. Live check outstanding: the catalog deployment through three park and wake
+cycles on a GB10 with the default bound.

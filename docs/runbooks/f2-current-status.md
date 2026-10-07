@@ -1,5 +1,26 @@
 # Current implementation and launch status
 
+## A launch whose parked charge keeps growing stops instead of parking — 2026-10-07 (branch `park-growth-guard`)
+
+Owner decision 2026-10-07 (catalog finding 2, ADR 0014 amendment A18). On the catalog run
+(GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4 sized for 32 GiB) one launch's measured parked charge
+grew 4.7, 9.6, 13.4 GiB over three parks while its GPU memory returned to 22.1 GiB on every
+wake. Each measured park is now also recorded per launch (store schema v44,
+`parked_launch_residues`: first and latest charge per domain). When the latest exceeds the
+first by more than the host's `resource_policy.parked_growth_limit` (default `auto`, 100 % of
+the first charge; or `N%`, a size, `off`; YAML, `--set` and `CAPYCTL_SET__…`, standalone under
+`host.`), the next park of that launch is an ordinary stop: idle (`ready_idle_parked_growth`),
+switch victim, and `park deployment` (answered with the stop's operation). The stop releases
+only on its own cleanup evidence. Status shows `parked.growth` (`within_limit`, `past_limit`,
+`stopped`) and a `Parked` line. A host that states nothing, or `auto`, publishes and stores the
+same policy and freezes the same revisions.
+
+CPU and Fake tests only (failing before the change: the outgrown park, idle and switch cases
+parked; passing after; within the bound parks as before; unchanged digests; three ways). They are
+not qualification. Live check outstanding: the catalog's model 1 deployment, three park and wake
+cycles on a GB10 standalone with the default bound; the third park should be a stop
+(`ready_idle_parked_growth` or `park_growth_stop`) and the next request a fresh start.
+
 ## Group members reserve their share of the weights — 2026-10-08 (branch `feat/group-member-weight-share`)
 
 Owner decision 2026-10-07 (ADR 0028 amendment of that date). A group member whose phases derive from `engine_config.memory` was sized from the whole checkpoint, so a two-host TP2 group reserved its weights twice and a 126 GiB checkpoint could never be admitted on two 121.7 GiB GB10 hosts. Each member now holds `ceil(stage / T) + replicated`, with `replicated = W - sharded` and `stage = sharded` (P = 1) or `min(sharded, ceil(layers / P) x largest_layer)`, from the checkpoint's safetensors headers (`capyctl_config::checkpoint_layout`), or 10 % of `W` kept whole without them; the margin, startup placeholder, graph allowance, SGLang state reserve and `host_backed` copy derive from the share. Declared `resources` and world size 1 are byte-identical (recipe fingerprints pinned from `main`). The share is recorded as `engine_config.memory.member` (topology, whole weights, layout) so snapshots and provisional re-resolution keep it; the host reports the layout in `CheckpointDigestEvidence.layout`, and a member's launch plan names the whole weights (verified by the host) and `checkpoint_layout` (under `engine_groups`), so the host resolves the same share and SGLang's static pool holds it.

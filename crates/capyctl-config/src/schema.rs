@@ -161,6 +161,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // one host): the queue bounds, as on a host.
         ("queue", FieldSpec::Struct(QUEUE)),
         ("groups", GROUPS),
+        // ADR 0014 amendment A18: the bound on a launch's parked-charge
+        // growth, as on a host.
+        ("parked_growth_limit", SCALAR),
     ];
     const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
     const ALLOCATION: FieldSpec = FieldSpec::Struct(&[
@@ -285,6 +288,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("domains", FieldSpec::MapOf(&DOMAIN)),
         ("devices", FieldSpec::MapOf(&HOST_DEVICE)),
         ("max_parked", SCALAR),
+        // ADR 0014 amendment A18: `auto`, `off`, a percentage of a launch's
+        // first measured parked charge, or a size.
+        ("parked_growth_limit", SCALAR),
         ("observation_ttl", DURATION),
         ("device_sharing", SCALAR),
         (

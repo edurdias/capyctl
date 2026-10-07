@@ -1,4 +1,5 @@
 use crate::effective::{DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing};
+use crate::parked_growth::{ParkedGrowthLimit, MAX_PERCENT};
 use crate::{ConfigError, ConfigErrorCode};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,10 @@ pub struct ResourceControls {
     pub queue: QueuePolicy,
     pub device_sharing: Sharing,
     pub device_sharing_overrides: BTreeMap<String, Sharing>,
+    /// ADR 0014 amendment A18: the bound on one launch's parked-charge
+    /// growth before its next park is a stop. Encoded only when stated.
+    #[serde(skip_serializing_if = "ParkedGrowthLimit::is_auto")]
+    pub parked_growth_limit: ParkedGrowthLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +49,7 @@ impl ResourceControls {
                 .iter()
                 .map(|(id, policy)| (id.clone(), policy.sharing))
                 .collect(),
+            parked_growth_limit: host.parked_growth_limit,
         }
     }
 
@@ -90,6 +96,11 @@ impl ResourceControls {
             || !(1..=30_000).contains(&self.queue.admission_window_ms)
             || self.queue.admission_window_ms > self.queue.request_deadline_ms
             || !(1_000..=3_600_000).contains(&self.queue.stream_idle_ms)
+            || match self.parked_growth_limit {
+                ParkedGrowthLimit::Percent(percent) => percent > MAX_PERCENT,
+                ParkedGrowthLimit::Bytes(bytes) => bytes < 0,
+                ParkedGrowthLimit::Auto | ParkedGrowthLimit::Off => false,
+            }
         {
             return Err(invalid("invalid bounded resource controls"));
         }
@@ -144,6 +155,7 @@ mod tests {
             planner_max_states: controls.planner_max_states,
             queue: controls.queue,
             model_sources: Default::default(),
+            parked_growth_limit: controls.parked_growth_limit,
         }
     }
 
@@ -182,6 +194,7 @@ mod tests {
             },
             device_sharing: Sharing::Shared,
             device_sharing_overrides: BTreeMap::from([("gpu0".into(), Sharing::Exclusive)]),
+            parked_growth_limit: ParkedGrowthLimit::Auto,
         };
         (context, controls)
     }

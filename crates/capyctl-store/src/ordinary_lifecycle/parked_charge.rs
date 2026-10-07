@@ -22,8 +22,14 @@
 //! parked are moved to the new charge when it is recorded, so the ledger
 //! always holds the footprint this module computes. A deployment that declares
 //! its `resources:` keeps its declared parked phase.
+//!
+//! ADR 0014 amendment A18: each measured park is also recorded for its launch
+//! (an instance's generation), its first charge kept beside its latest. When
+//! the latest has grown past the first by more than the host's
+//! `resource_policy.parked_growth_limit`, the launch's next park is a stop
+//! (`outgrown`), so its next activation starts a fresh engine.
 use super::*;
-use capyctl_config::effective::DomainMemory;
+use capyctl_config::effective::{DomainMemory, ParkedGrowthLimit};
 use capyctl_domain::launch::SettingSource;
 use capyctl_domain::resources::{MemoryObservation, ProcessResident};
 use std::collections::BTreeMap;
@@ -98,6 +104,35 @@ pub struct ParkedStatus {
     pub provenance: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<ParkedMeasurement>,
+    /// ADR 0014 amendment A18: each instance's latest measured launch, its
+    /// first and latest parked charge per domain, against its host's
+    /// `parked_growth_limit`. Additive; absent until a launch is measured.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub growth: Vec<ParkedGrowth>,
+}
+
+/// ADR 0014 amendment A18: one launch's parked-charge growth on one domain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ParkedGrowth {
+    pub instance: u32,
+    pub generation: i64,
+    pub domain: String,
+    /// The charge its first measured park was given.
+    pub first_bytes: i64,
+    /// The charge its latest measured park was given.
+    pub last_bytes: i64,
+    /// How many of its parks were measured.
+    pub parks: i64,
+    /// The growth past `first_bytes` its host allows; absent when the
+    /// host's bound is `off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<i64>,
+    /// `within_limit`; `past_limit` (its next park is a stop, reason
+    /// `parked_growth`); or `stopped` (the bound turned a park of it into the
+    /// stop `stop_operation_id`, so its next activation starts fresh).
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_operation_id: Option<String>,
 }
 
 /// One recorded parked residue, for status.
@@ -127,7 +162,7 @@ fn device_memory(e: &EffectiveDeployment, domain: &str) -> bool {
 /// deployment whose parked phase is not measured (restart-only, declared
 /// resources) or whose revision does not decode.
 pub(crate) fn status(
-    conn: &rusqlite::Connection,
+    conn: &Transaction<'_>,
     deployment_id: &str,
 ) -> rusqlite::Result<Option<ParkedStatus>> {
     let row: Option<(String, i64)> = conn
@@ -175,6 +210,7 @@ pub(crate) fn status(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let growth = growth_status(conn, deployment_id, &e.host.name)?;
     Ok(Some(ParkedStatus {
         bytes,
         provenance: if here.is_empty() {
@@ -183,7 +219,183 @@ pub(crate) fn status(
             "measured"
         },
         measured,
+        growth,
     }))
+}
+
+/// ADR 0014 amendment A18: the bound the host `host` states (`auto` when it
+/// has published no policy).
+fn growth_limit(
+    tx: &Transaction<'_>,
+    host: &str,
+) -> Result<ParkedGrowthLimit, crate::resource_policy::ResourcePolicyError> {
+    Ok(read_selected_policy(tx, host)?
+        .map(|policy| policy.controls.parked_growth_limit)
+        .unwrap_or_default())
+}
+
+/// One launch's recorded parked charges on one domain.
+struct LaunchCharge {
+    domain: String,
+    first: i64,
+    last: i64,
+}
+
+/// Whether `last` grew past `first` by more than `limit` allows; `None` when
+/// the bound is off.
+fn past(limit: ParkedGrowthLimit, first: i64, last: i64) -> Option<(bool, i64)> {
+    let bound = limit.bound(first)?;
+    Some((last.saturating_sub(first) > bound, bound))
+}
+
+/// A launch whose parked charge grew past its host's bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Growth {
+    pub(super) domain: String,
+    pub(super) first_bytes: i64,
+    pub(super) last_bytes: i64,
+    pub(super) bound_bytes: i64,
+}
+
+impl Growth {
+    /// The evidence a stop the bound decided records.
+    pub(super) fn reason(&self) -> String {
+        const GIB: f64 = (1u64 << 30) as f64;
+        format!(
+            "its parked charge on {} grew from {:.1} GiB at its first park to {:.1} GiB, \
+             past the {:.1} GiB of growth the host's parked_growth_limit allows",
+            self.domain,
+            self.first_bytes as f64 / GIB,
+            self.last_bytes as f64 / GIB,
+            self.bound_bytes as f64 / GIB,
+        )
+    }
+}
+
+/// ADR 0014 amendment A18: whether the launch `p` (resolved as `e`) has a
+/// parked charge that grew past its host's `parked_growth_limit` since its
+/// first measured park. Its next park is then a stop, which releases nothing
+/// before its own cleanup evidence (AGENTS.md: uncertainty retains
+/// accounting), so its next activation starts a fresh engine.
+pub(super) fn outgrown(
+    tx: &Transaction<'_>,
+    p: &Plan,
+    e: &EffectiveDeployment,
+) -> Result<Option<Growth>, LifecycleError> {
+    let charges = launch_charges(tx, &p.deployment_id, p.instance_index, p.generation)?;
+    if charges.is_empty() {
+        return Ok(None);
+    }
+    let limit = growth_limit(tx, &e.host.name).map_err(resource)?;
+    Ok(charges.into_iter().find_map(|c| {
+        let (over, bound) = past(limit, c.first, c.last)?;
+        over.then_some(Growth {
+            domain: c.domain,
+            first_bytes: c.first,
+            last_bytes: c.last,
+            bound_bytes: bound,
+        })
+    }))
+}
+
+/// Record that the bound turned a park of the launch `p` into the stop
+/// `operation`, for status.
+pub(super) fn mark_stopped(
+    tx: &Transaction<'_>,
+    p: &Plan,
+    operation: &str,
+) -> Result<(), LifecycleError> {
+    tx.execute(
+        "UPDATE parked_launch_residues SET stop_operation_id=?4
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+        params![p.deployment_id, p.instance_index, p.generation, operation],
+    )?;
+    Ok(())
+}
+
+fn launch_charges(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+    generation: i64,
+) -> Result<Vec<LaunchCharge>, LifecycleError> {
+    Ok(tx
+        .prepare(
+            "SELECT domain,first_bytes,last_bytes FROM parked_launch_residues
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY domain",
+        )?
+        .query_map(params![deployment, instance, generation], |r| {
+            Ok(LaunchCharge {
+                domain: r.get(0)?,
+                first: r.get(1)?,
+                last: r.get(2)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Each instance's latest measured launch against its host's bound.
+fn growth_status(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision_host: &str,
+) -> rusqlite::Result<Vec<ParkedGrowth>> {
+    type Row = (
+        u32,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = tx
+        .prepare(
+            "SELECT r.instance_index,r.generation,r.domain,r.first_bytes,r.last_bytes,r.parks,
+                    r.stop_operation_id,i.host_id
+               FROM parked_launch_residues r LEFT JOIN deployment_instances i
+                 ON i.deployment_id=r.deployment_id AND i.instance_index=r.instance_index
+              WHERE r.deployment_id=?1 ORDER BY r.instance_index,r.domain",
+        )?
+        .query_map([deployment_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(instance, generation, domain, first, last, parks, stop, host)| {
+                let limit =
+                    growth_limit(tx, host.as_deref().unwrap_or(revision_host)).unwrap_or_default();
+                let verdict = past(limit, first, last);
+                ParkedGrowth {
+                    instance,
+                    generation,
+                    domain,
+                    first_bytes: first,
+                    last_bytes: last,
+                    parks,
+                    limit_bytes: verdict.map(|(_, bound)| bound),
+                    state: match (&stop, verdict) {
+                        (Some(_), _) => "stopped",
+                        (None, Some((true, _))) => "past_limit",
+                        _ => "within_limit",
+                    },
+                    stop_operation_id: stop,
+                }
+            },
+        )
+        .collect())
 }
 
 impl crate::Store {
@@ -278,10 +490,69 @@ impl crate::Store {
                 params![p.deployment_id, p.revision, e.host.name, installation, domain, bytes, step_id, now_ms],
             )?;
         }
+        record_launch_charges(&tx, &park, &e, &residue, step_id, now_ms)?;
         move_parked_owners(&tx, parked)?;
         tx.commit()?;
         Ok(true)
     }
+}
+
+/// ADR 0014 amendment A18: record this park's charge for its launch, the
+/// first one kept as the launch's baseline, and drop the instance's earlier
+/// launches. A charge is the residue as a park is charged it (never below the
+/// placeholder, never above the Ready charge), what status shows. A step
+/// recorded twice counts once.
+fn record_launch_charges(
+    tx: &Transaction<'_>,
+    park: &super::park::CompletedPark,
+    e: &EffectiveDeployment,
+    residue: &Measured,
+    step_id: &str,
+    now_ms: i64,
+) -> Result<(), LifecycleError> {
+    tx.execute(
+        "DELETE FROM parked_launch_residues WHERE deployment_id=?1 AND instance_index=?2 AND generation<?3",
+        params![park.deployment_id, park.instance, park.generation],
+    )?;
+    let charged = apply(
+        &phase(&e.resources.parked, ResourcePhase::Parked),
+        &phase(&e.resources.ready, ResourcePhase::Ready),
+        residue,
+    );
+    for domain in residue.keys() {
+        let Some(bytes) = charged
+            .allocations
+            .iter()
+            .find(|a| &a.domain == domain)
+            .map(|a| a.bytes)
+            .filter(|bytes| *bytes > 0)
+        else {
+            continue;
+        };
+        tx.execute(
+            "INSERT INTO parked_launch_residues(deployment_id,instance_index,generation,domain,
+                first_bytes,first_step_id,last_bytes,last_step_id,parks,measured_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?5,?6,1,?7)
+             ON CONFLICT(deployment_id,instance_index,generation,domain) DO UPDATE SET
+               parks=parks+(excluded.last_step_id!=last_step_id),
+               first_bytes=CASE WHEN excluded.last_step_id=first_step_id
+                 THEN MAX(first_bytes,excluded.first_bytes) ELSE first_bytes END,
+               last_bytes=CASE WHEN excluded.last_step_id=last_step_id
+                 THEN MAX(last_bytes,excluded.last_bytes) ELSE excluded.last_bytes END,
+               last_step_id=excluded.last_step_id,
+               measured_at_ms=excluded.measured_at_ms",
+            params![
+                park.deployment_id,
+                park.instance,
+                park.generation,
+                domain,
+                bytes,
+                step_id,
+                now_ms
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// The launches of `deployment` that are parked now.

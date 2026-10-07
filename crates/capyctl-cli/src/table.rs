@@ -539,6 +539,32 @@ fn status(value: &Value, names: &HostNames) -> String {
             ));
         }
     }
+    // ADR 0014 amendment A18: a launch whose parked charge grew past its
+    // host's `parked_growth_limit` says so, and that its park is a stop.
+    for growth in d["parked"]["growth"].as_array().into_iter().flatten() {
+        let action = match growth["state"].as_str() {
+            Some("past_limit") => "its next park stops it (parked_growth)",
+            Some("stopped") => {
+                "it was stopped instead of parked (parked_growth); its next start is fresh"
+            }
+            _ => continue,
+        };
+        let (Some(first), Some(last)) = (
+            number(&growth["first_bytes"]),
+            number(&growth["last_bytes"]),
+        ) else {
+            continue;
+        };
+        let limit = number(&growth["limit_bytes"])
+            .map(|bytes| format!(", limit +{}", gib(bytes)))
+            .unwrap_or_default();
+        notes.push(format!(
+            "Parked      instance {}: the parked charge grew from {} to {}{limit}; {action}",
+            text(&growth["instance"]),
+            gib(first),
+            gib(last),
+        ));
+    }
     if !notes.is_empty() {
         out.push('\n');
         for note in notes {
@@ -1134,6 +1160,34 @@ mod tests {
         assert!(out.contains(&format!("declared {declared}")), "{out}");
         assert!(out.contains(&format!("measured {measured}")), "{out}");
         assert!(out.contains("not a file hash"), "{out}");
+    }
+
+    // T16 (ADR 0014 amendment A18): a launch whose parked charge grew past
+    // its host's bound says that its park is a stop, and once stopped, why;
+    // one within the bound adds no line.
+    #[test]
+    fn status_says_when_parked_growth_turns_a_park_into_a_stop() {
+        let status = |state: &str| {
+            render(
+                View::Status,
+                &json!({"name": "q", "kind": "model", "desired_state": "running",
+                    "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+                    "revision": "1",
+                    "parked": {"bytes": 8_053_063_680_i64, "provenance": "measured",
+                        "growth": [{"instance": 0, "generation": 3, "domain": "unified",
+                            "first_bytes": 5_046_586_573_i64, "last_bytes": 10_307_921_510_i64,
+                            "parks": 2, "limit_bytes": 5_046_586_573_i64, "state": state}]},
+                    "instances": []}),
+                &names(),
+            )
+        };
+        let out = status("past_limit");
+        assert!(
+            out.contains("instance 0: the parked charge grew from 4.7 GiB to 9.6 GiB, limit +4.7 GiB; its next park stops it (parked_growth)"),
+            "{out}"
+        );
+        assert!(status("stopped").contains("stopped instead of parked (parked_growth)"));
+        assert!(!status("within_limit").contains("Parked "));
     }
 
     // T14 T26 (found live on a 16 GB card): an unusable checkpoint shows the

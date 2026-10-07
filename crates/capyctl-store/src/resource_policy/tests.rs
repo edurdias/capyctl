@@ -49,6 +49,7 @@ fn host() -> HostPolicy {
             stream_idle_ms: capyctl_config::effective::DEFAULT_STREAM_IDLE_MS,
         },
         model_sources: Default::default(),
+        parked_growth_limit: Default::default(),
     }
 }
 

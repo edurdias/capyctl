@@ -557,8 +557,16 @@ impl crate::Store {
             crate::switch_state::ClosureReason::Switch,
         )?;
         let deadline = now.saturating_add(e.request_deadline_ms);
+        // ADR 0014 amendment A18: a launch whose parked charge grew past its
+        // host's bound since its first park is stopped, not parked.
+        let growth = if parks(&e) {
+            super::parked_charge::outgrown(&tx, &source, &e)?
+        } else {
+            None
+        };
         let release = if may_park
             && parks(&e)
+            && growth.is_none()
             && !park_refused(&tx, deployment, instance, generation)?
         {
             let receipt = Self::instance_park_in_transaction(
@@ -595,26 +603,32 @@ impl crate::Store {
                     revision: Some(revision),
                 },
             )?;
+            let because = match &growth {
+                Some(growth) => format!(
+                    "parked_growth: {}, so its next activation starts a fresh engine",
+                    growth.reason()
+                ),
+                None if unknown_work => {
+                    "a request on it is uncertain, which is not quiescence for a park".into()
+                }
+                None if may_park => "it does not park".into(),
+                // Discrete GPU design §5: the plan stops a victim whose
+                // parked footprint does not fit after the switch, as it does
+                // every victim of a solo start.
+                None if parks(&e) => "the plan releases it by a stop (its parked copy does not fit the host after the switch, or the waiting instance needs an empty host)".into(),
+                None => "it does not park".into(),
+            };
             journal(
                 &tx,
                 &receipt.operation_id,
                 "switch_stop",
                 &format!(
-                    "deployment {deployment}: instance {instance} drained for a switch; {}, so it stops with absence proof and stays eligible for on-demand activation",
-                    if unknown_work {
-                        "a request on it is uncertain, which is not quiescence for a park"
-                    } else if may_park {
-                        "it does not park"
-                    } else if parks(&e) {
-                        // Discrete GPU design §5: the plan stops a victim
-                        // whose parked footprint does not fit after the
-                        // switch, as it does every victim of a solo start.
-                        "the plan releases it by a stop (its parked copy does not fit the host after the switch, or the waiting instance needs an empty host)"
-                    } else {
-                        "it does not park"
-                    }
+                    "deployment {deployment}: instance {instance} drained for a switch; {because}, so it stops with absence proof and stays eligible for on-demand activation"
                 ),
             )?;
+            if growth.is_some() {
+                super::parked_charge::mark_stopped(&tx, &source, &receipt.operation_id)?;
+            }
             SwitchRelease {
                 operation_id: receipt.operation_id,
                 parked: false,
@@ -970,10 +984,13 @@ fn offer_victims(
             .unwrap_or(0);
         let parked = if members.is_empty() {
             let (source, e, _) = launch(tx, &deployment, index)?;
+            // ADR 0014 amendment A18: a launch whose parked charge grew past
+            // its host's bound is released by a stop, which frees it all.
             let may_park = !c.whole_host
                 && parks(&e)
                 && !park_refused(tx, &deployment, index, generation)?
-                && !uncertain_leases(tx, &deployment, index)?;
+                && !uncertain_leases(tx, &deployment, index)?
+                && super::parked_charge::outgrown(tx, &source, &e)?.is_none();
             offered.parkable.insert(victim_owner.clone(), may_park);
             if parks(&e) && park_refused_for_room(tx, &deployment, index, generation)? {
                 offered.full.insert(victim_owner.clone());

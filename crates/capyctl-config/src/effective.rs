@@ -49,6 +49,7 @@ use crate::engine_env::{resolve_engine_env, ApprovedEnv, ResolvedEnv};
 use crate::engine_policy::{
     normalize_option_name, validate_profile_args, validate_profile_env, ExtraArgsPolicy,
 };
+pub use crate::parked_growth::ParkedGrowthLimit;
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
 use capyctl_domain::launch::LaunchSettings;
@@ -489,6 +490,12 @@ pub struct HostPolicy {
     /// model store's ceiling for them. Encoded only when stated.
     #[serde(skip_serializing_if = "ModelSourcePolicy::is_default")]
     pub model_sources: ModelSourcePolicy,
+    /// ADR 0014 amendment A18: how far one launch's measured parked charge
+    /// may grow past its first measured park before its next park is a stop
+    /// (`crate::parked_growth`). Encoded only when stated, so a host without
+    /// it keeps every digest.
+    #[serde(skip_serializing_if = "ParkedGrowthLimit::is_auto")]
+    pub parked_growth_limit: ParkedGrowthLimit,
 }
 
 /// Whether a domain's device memory and host memory are one physical pool.
@@ -944,6 +951,10 @@ struct RawHostPolicy {
     /// not part of the normalized policy, so a host without it keeps its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     groups: Option<serde_json::Value>,
+    /// ADR 0014 amendment A18: `auto` (the default), `off`, a percentage of
+    /// the first measured parked charge, or a size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked_growth_limit: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1044,6 +1055,7 @@ pub fn compose_resource_policy(
         }),
         labels: None,
         groups: None,
+        parked_growth_limit: controls.parked_growth_limit.stated(),
     };
     serde_json::to_value(&raw).expect("Raw* composition types always encode to JSON")
 }

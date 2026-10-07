@@ -36,6 +36,8 @@ host:
         managed_limit: auto   # 50 % of memory; or a size ("90GiB") or a share ("75%")
         free_reserve: auto    # 20 % of memory; or a size or a share
         parked_limit: auto    # 25 % of memory, what parked models may hold; a size or a share, at most the managed limit
+    parked_growth_limit: auto # how far one launch's parked charge may grow past its first park before
+                              # its next park is a stop: 100 % of that charge; a share ("50%"), a size ("8GiB") or off
     # Optional request queue bounds, as on a host (defaults shown):
     # queue:
     #   request_deadline: "1800s"     # until the first output, prefill included
