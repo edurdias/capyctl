@@ -227,4 +227,44 @@ mod tests {
         let gate = CapabilityGate::wrap(engine.clone(), &effective(|_| {}));
         assert!(Arc::ptr_eq(&gate, &engine), "nothing to refuse, no gate");
     }
+
+    /// SPEC §§6.2, 9.1 / ADR 0010: standalone's embedded host refuses a
+    /// parking launch of a gpt-oss checkpoint as a host agent does
+    /// (`a_gpt_oss_checkpoint_refuses_deep_on_vllm_and_sglang_but_not_restart_only`):
+    /// its launch, Park and Restore never reach the engine. Found on the
+    /// recipe catalog 2026-10-07: the wake reload fails on SGLang 0.5.21 and
+    /// on vLLM 0.30.0. `restart_only` on the same checkpoint is not gated.
+    // T22 T21
+    #[tokio::test]
+    async fn a_gpt_oss_launch_is_refused_its_launch_park_and_restore() {
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkpoint.path().join("config.json"),
+            r#"{"architectures":["GptOssForCausalLM"],"model_type":"gpt_oss"}"#,
+        )
+        .unwrap();
+        let on_checkpoint = |mut effective: EffectiveDeployment| {
+            effective.model.resolved_path = Some(checkpoint.path().to_str().unwrap().into());
+            effective
+        };
+        let engine = Arc::new(Counted::default());
+        let gate = CapabilityGate::wrap(engine.clone(), &on_checkpoint(effective(|_| {})));
+        for action in [
+            RuntimeAction::Initialize,
+            RuntimeAction::Park,
+            RuntimeAction::Restore,
+        ] {
+            assert_eq!(
+                gate.execute_persisted(&command(action)).await.unwrap_err(),
+                RuntimeError::Refused("capability_missing:deep_park".into()),
+                "{action:?}"
+            );
+        }
+        assert_eq!(engine.0.load(Ordering::SeqCst), 0);
+
+        let engine: Arc<dyn EngineAdapter> = Arc::new(Counted::default());
+        let restart = on_checkpoint(effective(|d| d["residency"] = json!("restart_only")));
+        let gate = CapabilityGate::wrap(engine.clone(), &restart);
+        assert!(Arc::ptr_eq(&gate, &engine), "restart_only is not gated");
+    }
 }

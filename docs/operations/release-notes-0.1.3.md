@@ -78,6 +78,14 @@ Unreleased.
   as a host agent already did, so nothing is parked. Deploy such a model
   `restart_only`. A model with speculative decoding, whose park keeps its
   weights, still parks.
+- **gpt-oss is not parked.** vLLM 0.30.0 and SGLang 0.5.21 cannot wake a
+  parked gpt-oss model: vLLM reloads its weights wrongly and the woken model
+  answers garbage (a request after such a wake failed with `engine_error`
+  after about 13 minutes), and SGLang's weight reload fails. A
+  `deep` or `host_backed` deployment of a gpt-oss checkpoint (its
+  `config.json` names `gpt_oss`) is now refused at start with
+  `capability_missing:deep_park`, by standalone and by a host agent, on both
+  engines. Deploy gpt-oss `restart_only`, as the gpt-oss recipes do.
 
 ## Multi-node groups
 

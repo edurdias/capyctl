@@ -1,5 +1,42 @@
 # Current implementation and launch status
 
+## gpt-oss refuses parking on vLLM and SGLang — 2026-10-07 (branch `gptoss-deep-refusal-wake-bound`)
+
+Owner decision 3 (2026-10-07), from the recipe catalog on host B (CapyCTL 7e50aa9, GB10,
+standalone, `openai/gpt-oss-20b`). vLLM 0.30.0 deep wake: the reload logs `OAIAttention:
+Failed to load weights` for 24 layers, then `Harmony parser ended in a non-terminal state`;
+the request sent to the parked deployment was answered after 778 s with
+`{"code":"engine_error","message":"backend completion unverified"}`. SGLang 0.5.21:
+`update_weights_from_disk` raises `TypeError: default_weight_loader() got an unexpected
+keyword argument 'weight_name'` (answered `activation_uncertain` after 6 s).
+
+`EffectiveDeployment::deep_wake_refusal` (SPEC §§6.2, 9.1, ADR 0010) now also refuses
+`deep` and `host_backed` for a checkpoint whose `config.json` names a family in
+`DEEP_WAKE_BROKEN_FAMILIES` for the launch's engine (`model_type`, else `architectures`, as
+parser defaults match): gpt-oss on vLLM and on SGLang, `capability_missing:deep_park`. The
+agent (`launch_capability`, `park_capability`) and standalone's `CapabilityGate` both
+apply it before any effect; `restart_only` and SGLang `resident` parks are unaffected. The
+effective deployment carries no engine version, so each entry records the versions it was
+observed on and is lifted by deleting it after a live park-and-wake on a fixed engine.
+A machine that does not see the checkpoint (a server whose host holds it) cannot read the
+family; the launching host refuses.
+
+The 778 s was not a request held by a failed wake. The status after it
+(`status-woken-1.json`) shows the restore operation succeeded and the instance ready: the
+8-token readiness probe after the wake got non-empty output, so the wake counted as
+usable, and the request (no `max_tokens`) was forwarded to the mis-reloaded engine
+[INFERENCE: it decoded to the 32,768-token context at about 46 tokens/s, ~700 s, and the
+relayed stream then failed validation, `Refused::Uncertain`]. A restore that fails or is
+retained uncertain already answers joined requests as soon as it is recorded
+(`wait_terminal`; the SGLang case above). Live check still owed: on host B, the engine log
+timestamps of the restore and of the Harmony line for that run.
+
+Tests (T22 T21), failing before and passing after: `gpt_oss_refuses_both_parking_tiers_on_vllm_and_sglang`
+(config), `a_gpt_oss_checkpoint_refuses_deep_on_vllm_and_sglang_but_not_restart_only`
+(agent), `a_gpt_oss_launch_is_refused_its_launch_park_and_restore` (controller); plus
+`the_gpt_oss_rule_leaves_restart_only_other_families_and_resident_parks`. CPU tests only;
+they are not qualification, and no live run was made after the change.
+
 ## Status startup figure and a role-shutdown test race — 2026-10-07 (branch `fix/status-startup-provenance-and-shutdown-race`)
 
 Owner decision 5 (a): the deployment's `startup` in status now uses the figure admission freezes into the next start's plan (`frozen_plan_startup`): a peak measured for the revision on its host and installation shows as `measured`, else the weighed placeholder or the revision's own budget as before. Found in the catalog runs: an SGLang deployment kept showing its 55.2 GiB default after a 29.7 GiB peak was measured. Owner decision 5 (d): `role_shutdown::remote_signals_restart_and_drain_host_stops_with_cleanup` deployed once the host was `online`, which the session sets before the host's inventory and resource policy are stored, so under load the deploy got `reconciliation_required`; it now waits for `session.reconciled` and `eligible` (SPEC §4.2). CPU tests only (the T29 measured-peak test failed first on the stale figure; the role test passed 10 of 10 beside a crate build); not qualification. Live check: on the catalog host, `capyctl status deployment <sglang model> --format json` after its first Ready shows `startup.provenance` `measured`.
