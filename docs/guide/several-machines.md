@@ -258,3 +258,108 @@ capyctl invite host gpu-box --recover --output gpu-box.join              # on th
 capyctl join host --join-file gpu-box.join --recover --config ~/host.yaml   # on gpu-box
 capyctl start host --config ~/host.yaml
 ```
+
+## One model across machines
+
+A model too large for one machine can run as a group: one engine process per
+machine, each holding part of the model (one tensor-parallel or
+pipeline-parallel rank). The first machine in `placement.hosts` is the head:
+it runs rank 0 and serves the API. The others are workers. vLLM, SGLang and
+TensorFold can run groups ([Engine support for groups](engines.md#groups-across-machines)).
+
+Below, host A (`192.0.2.10`) is the head and host B (`192.0.2.11`) the
+worker, joined by a direct link.
+
+### Before the first group
+
+On each machine, as root (CapyCTL reads these settings and never changes them):
+
+- `vm.compaction_proactiveness` set to 0 (`sysctl vm.compaction_proactiveness=0`).
+- Unlimited locked memory for the user CapyCTL runs as (the installed service
+  units set `LimitMEMLOCK=infinity`).
+- `/dev/infiniband/uverbs*` readable and writable by that user, if the link
+  supports RDMA.
+
+A gap is a `host_tuning_warning:<item>` in status and the group still runs.
+The compaction check never refuses. With `require_rdma: true`, a missing
+`memlock` or `infiniband` refuses the group (`host_tuning_missing:<item>`).
+
+Then, on each machine:
+
+- Declare its address on the direct link in the host document
+  (`resource_policy.groups.peer_address`, or `--peer-address`), and restart the
+  host. See [`host.yaml`](../examples/host.yaml) and
+  [`host-b.yaml`](../examples/host-b.yaml).
+- Register the same engine build under the same profile name
+  (`capyctl engine add`).
+- Keep the same model files on every machine. A SGLang group with
+  `residency: deep` also needs them at the same path.
+
+### Deploy a group
+
+[`deployment-multinode.yaml`](../examples/deployment-multinode.yaml) runs a
+model at `tensor_parallel: 2` on two machines:
+
+```yaml
+topology:
+  tensor_parallel: 2
+  pipeline_parallel: 1
+placement:
+  hosts: ["gpu-box", "host-b"]
+```
+
+Memory (`engine_config.memory` or `resources`) is per member: each machine
+charges its own rank. On the server:
+
+```bash
+capyctl deploy model --file deployment-multinode.yaml --activate --wait
+```
+
+Requests go to the server as for any model; the server forwards them to the
+head.
+
+### Status
+
+`capyctl status deployment <name>` lists each member. For a group on `host-a`
+and `host-b`:
+
+```text
+NAME            STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+qwen3-30b-tp2   ready   1/1     1          40.0 GiB   1800s        start succeeded
+
+INSTANCE   HOST            STATE   LIFECYCLE   DEVICES   LAST ERROR
+0          host-a,host-b   ready   active      -         -
+
+Group of instance 0: vllm, TP 2 x PP 1 on 2 hosts
+  rendezvous     192.0.2.10:25000
+  peer transport unauthenticated (keep group hosts on a private link)
+
+  RANK  HOST    ROLE    STATE     PROCESSES  CHARGED         RESIDENCY  LAST ERROR
+  0     host-a  head    launched  2          40.0 GiB ready  deep       -
+  1     host-b  worker  launched  1          40.0 GiB ready  deep       -
+
+  warnings  host-b: host_tuning_warning:compaction
+```
+
+### Park, wake, stop and failures
+
+- **Park and wake.** A group with `residency: deep` (vLLM, SGLang) parks on
+  every machine at once and wakes the same way. After a wake, CapyCTL checks
+  that the model answers a fixed prompt as before; if not, it stops the group
+  (`group_wake_mismatch`). TensorFold groups, and groups with
+  `residency: restart_only`, park by stopping and wake by starting again.
+- **Stop.** Stopping the deployment stops every member.
+- **A member fails.** If any member exits or fails, CapyCTL stops the whole
+  group (`group_member_failed`). A request with no first token within
+  `groups.stall_timeout` whose check through the head also fails stops the
+  group too (`group_stalled`).
+- **A machine cannot be reached.** Its member stays `uncertain` and keeps its
+  memory charged until that machine reconnects and proves the process gone (or
+  is revoked and recovered). Status shows which rank holds memory and why, in a
+  `held` line. The group does not start again until every member has settled.
+
+### Risk
+
+Group members talk to each other over unauthenticated ports. Anyone who can
+reach them can likely run code on those machines. Keep group machines on a
+private direct link ([Network access](../operations/network-access.md#multi-node-groups)).

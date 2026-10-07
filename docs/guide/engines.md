@@ -528,6 +528,39 @@ To clean up after each one, `capyctl delete deployment <name> --stop`, then
 `capyctl engine remove <profile>` once the stop has finished. Neither touches
 the downloaded weights.
 
+## Engine variables
+
+`--env` gives the engine a variable on every launch with the profile.
+`--approve-env` names the variables a deployment may set in
+`engine_config.env` (a name, or a name ending in `*`):
+
+```bash
+capyctl engine add ~/venvs/sglang --env SGLANG_ENABLE_JIT_DEEPGEMM=0 --approve-env 'MBX_*'
+```
+
+Both are repeatable. CapyCTL refuses names it sets itself
+(`engine_env_reserved:<name>`), and a deployment name the profile does not
+approve (`engine_env_not_approved:<name>`). For a model across machines,
+register the same variables and approvals on every machine. Variables, the
+names CapyCTL owns and how status shows them:
+[Engine environment](../operations/configuration.md#engine-environment).
+
+## Groups across machines
+
+A model can run as a group, one rank per machine
+([One model across machines](several-machines.md#one-model-across-machines)).
+What each engine runs:
+
+| | vLLM 0.30.0 | SGLang 0.5.21 | TensorFold 0.6.5 |
+|---|---|---|---|
+| Tensor parallel across machines | yes | yes | `tensor_parallel: 2` only |
+| Pipeline parallel across machines | yes | yes | no |
+| Machines | any number that divides tensor × pipeline parallel | any number that divides tensor × pipeline parallel | exactly 2 |
+| Parking | deep, every rank | deep, every rank | restart only |
+
+Any shape in the table is accepted, with no warning. Live qualification covers
+two machines only.
+
 ## List and remove
 
 ```bash

@@ -1,5 +1,9 @@
 # Current implementation and launch status
 
+## Multi-node engine groups — 2026-10-07 (branch `feat/multi-node-groups`)
+
+ADR 0028 is implemented on the feature branch slices through status, closed codes and exits, and the user docs (several-machines guide, settings, network-access risk, engines support table, 0.1.3 release notes). CPU and Fake-engine tests only; this is not qualification. The live rows MN1–MN9 on host A and host B are pending.
+
 ## Stored snapshots keep the deployment engine env — 2026-10-06 (branch `fix/snapshot-engine-env`)
 
 `decode_effective_snapshot` rebuilt the deployment without `engine_config.env`, so every revision with a deployment engine env (ADR 0028 §2.1, single host included) failed `CorruptStoredData` at start and load; the deployment entries of `engine_env` are now restated and the exact-equality check proves them. CPU round-trip tests only (deployment env, override of a profile value, profile env and `approved_env`, topology, placement and host `resource_policy.groups`); not run live.

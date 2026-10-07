@@ -44,6 +44,10 @@ name that profile instead.
 
 <!-- include: ../examples/host.yaml -->
 
+## Second host of a group
+
+<!-- include: ../examples/host-b.yaml -->
+
 ## Host with a discrete GPU
 
 <!-- include: ../examples/host-discrete.yaml -->

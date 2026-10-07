@@ -9,7 +9,8 @@
 # An illustration of the schema, not a tested engine recipe.
 name: qwen3-30b-tp2
 engine: vllm
-# The same path on both hosts (a SGLang group with `residency: deep` requires it).
+# The same files on both hosts; vLLM accepts a different path on each. Only a
+# SGLang group with `residency: deep` needs the same path on every host.
 model: qwen3-30b-a3b
 topology:
   tensor_parallel: 2

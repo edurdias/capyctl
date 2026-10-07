@@ -79,6 +79,43 @@ Unreleased.
   `restart_only`. A model with speculative decoding, whose park keeps its
   weights, still parks.
 
+## Multi-node groups
+
+Pending live qualification: the features below pass CPU and fake-engine tests
+only; the two-machine live rows have not run yet.
+
+- **One model across machines.** A deployment with a `topology` and
+  `placement.hosts` runs one engine rank per machine, head first. vLLM 0.30.0
+  and SGLang 0.5.21 run tensor and pipeline parallel on any number of machines
+  that divides `tensor_parallel` × `pipeline_parallel`, and park deep on every
+  rank. TensorFold 0.6.5 runs `tensor_parallel: 2` on exactly two machines,
+  restart only. Live qualification covers two machines. See
+  [One model across machines](../guide/several-machines.md#one-model-across-machines).
+- **New settings.** `--peer-address`, `--rendezvous-ports` (default
+  `25000-25099`) and `--require-rdma true|false` (default `false`) on hosts,
+  each also as a variable and a YAML key, and `--group-stall-timeout` (default
+  `120s`) on the server ([settings](configuration.md#multi-node-groups)).
+- **Engine variables.** `capyctl engine add --env` and `--approve-env`, and
+  `capyctl deploy model --engine-env`, each also as a variable
+  ([Engine environment](configuration.md#engine-environment)).
+- **Status** lists each member with its host, rank, state and memory charged,
+  and marks every group `peer transport unauthenticated`. Group peers talk on
+  unauthenticated ports: keep group machines on a private direct link
+  ([Network access](network-access.md#multi-node-groups)).
+
+Catalog models that run as groups in this release, on two machines at
+`tensor_parallel: 2` (all pending live qualification):
+
+| Model | SGLang 0.5.21 | vLLM 0.30.0 | TensorFold 0.6.5 |
+|---|---|---|---|
+| Qwen3.8-Flash-Next | NVFP4 | NVFP4 (stock build unverified) | MLX 4-bit only |
+
+Not yet: GLM-5.3-Flash, DeepSeek V4 Flash 0731, DeepSeek V4 Flash Vision and
+MiMo-V2.5 have a working build only as a container image; MiniMax M3, Hy4
+Preview and Nemotron 3 Ultra need three or more machines; Hy3 has no validated
+command. Next milestones: container launchers, and a live row on three or more
+rented machines.
+
 ## Fixes
 
 - **Deployments with an engine environment start again.** A deployment

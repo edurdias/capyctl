@@ -176,10 +176,59 @@ change needs a restart.
 | Setting | YAML | Flag | Variable | Default | Roles |
 |---|---|---|---|---|---|
 | Request-stall timeout: a request to a multi-node group with no first token within it makes the server probe the group's head once, and stop the group (`group_stalled`) if the probe fails too | `groups.stall_timeout` (server); `server.groups.stall_timeout` (standalone) | `--group-stall-timeout <duration>` (`start server`) | `CAPYCTL_GROUP_STALL_TIMEOUT` | `120s` (`1s` to `3600s`) | server, standalone |
+| Peer address: this machine's address on the direct link that group members use | `resource_policy.groups.peer_address` | `--peer-address <ip>` | `CAPYCTL_PEER_ADDRESS` | none (the machine cannot join a group) | host, standalone |
+| Rendezvous ports a group head picks from | `resource_policy.groups.rendezvous_port_range` (`start`, `end`) | `--rendezvous-ports <start-end>` | `CAPYCTL_RENDEZVOUS_PORTS` | `25000-25099` | host, standalone |
+| Refuse a group when `memlock` or `infiniband` is missing | `resource_policy.groups.require_rdma` | `--require-rdma true\|false` | `CAPYCTL_REQUIRE_RDMA` | `false` | host, standalone |
 
 An idle group is never probed: only a request in flight can start the probe,
 and requests to single-host deployments are not watched. Standalone never runs
 a group, so its value has no effect there.
+
+Each setting follows one order: flag, then variable, then YAML, then the
+default. The host checks are read, never changed. The `compaction` check never
+refuses: it warns with either value of `require_rdma`. `memlock` and
+`infiniband` warn by default and refuse only with `require_rdma: true`.
+
+For a group launch CapyCTL sets `GLOO_SOCKET_IFNAME` to the interface that
+holds the member's peer address. It sets no `NCCL_*` variable and passes none
+through, so there is no NCCL tuning setting.
+
+## Engine environment
+
+Engine variables come from two places: the engine profile (every launch with
+it) and the deployment (only that deployment, and only names the profile
+approves). A deployment value wins over a profile value of the same name.
+
+| Setting | YAML | Flag | Variable |
+|---|---|---|---|
+| Profile variables | `env` in the profile | `--env K=V` (repeatable, `capyctl engine add`) | `CAPYCTL_ENGINE_ADD_ENV` (`K=V;K=V`) |
+| Names a deployment may set | `security.approved_env` in the profile (a name, or a name ending in `*`) | `--approve-env <glob>` (repeatable, `capyctl engine add`) | `CAPYCTL_APPROVE_ENV` (`GLOB;GLOB`) |
+| Deployment variables | `engine_config.env` in the deployment | `--engine-env K=V` (repeatable, `capyctl deploy model`) | `CAPYCTL_ENGINE_ENV` (`K=V;K=V`) |
+
+Between flag and variable, a flag wins for the same name. Any `--approve-env`
+replaces `CAPYCTL_APPROVE_ENV` as a whole; the variable is used only when no
+flag is given. A name both in the deployment file and on the command line is
+refused (`engine_env_conflict:<name>`).
+
+Status and the effective configuration show each name and where it came from,
+never its value. Values are stored as written: this is not secret storage.
+
+CapyCTL owns these names; neither a profile nor a deployment can set them,
+whatever an approval says (`engine_env_reserved:<name>`):
+
+- prefixes `NCCL_`, `GLOO_`, `MASTER_`, `CAPYCTL_`, `LD_`, `PYTHON` (except
+  `PYTHONUNBUFFERED`);
+- `VLLM_HOST_IP`, `SGLANG_HOST_IP`, `HOST_IP`, `SGLANG_LOCAL_IP_NIC`,
+  `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`, `TF_COMM_BACKEND`, `TF_NCCL_LIB`,
+  `PATH`, `PYTHONPATH`, `CUDA_HOME`, `CUDA_VISIBLE_DEVICES`, `HOME`,
+  `CUDA_DEVICE_ORDER`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`,
+  `VLLM_PLUGINS`, `VLLM_SERVER_DEV_MODE`, `VLLM_API_KEY`,
+  `TORCH_EXTENSIONS_DIR`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`,
+  `TENSORFOLD_NO_UPDATE_CHECK`, `VLLM_PORT`,
+  `VLLM_ALLOW_INSECURE_SERIALIZATION`.
+
+Names are compared upper-cased. `RUST_LOG`, `TOKENIZERS_PARALLELISM`,
+`PYTHONUNBUFFERED`, `MAX_JOBS` and `FLASHINFER_NVCC_THREADS` need no approval.
 
 ## Secrets
 
