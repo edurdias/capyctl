@@ -21,7 +21,7 @@ use crate::resource_ledger::{read_snapshot, scoped_to_domain_hosts};
 use capyctl_config::instances::{Placement, PlacementStrategy};
 use capyctl_domain::resources::MemoryLimit;
 use capyctl_scheduler::device_choice::DeviceOption;
-use capyctl_scheduler::placement::{place, HostCandidate, Strategy};
+use capyctl_scheduler::placement::{fits_group, place, HostCandidate, Strategy};
 use std::collections::BTreeSet;
 
 /// Which hosts are eligible now (W12: a live reconciled session, approved
@@ -327,6 +327,19 @@ pub(crate) fn prepare(
         [deployment_id],
         |r| r.get(0),
     )?;
+    // ADR 0028 §5: a group has fixed hosts; placement only validates that
+    // its member fits on every one of them.
+    if let Some(shape) = super::worker::group_shape(tx, deployment_id, current)? {
+        return prepare_group(
+            tx,
+            deployment_id,
+            instance,
+            current,
+            generation,
+            &shape.hosts,
+            eligible,
+        );
+    }
     let spec = tx
         .query_row(
             "SELECT placement_json FROM deployment_revision_instances WHERE deployment_id=?1 AND revision=?2",
@@ -431,6 +444,84 @@ pub(crate) fn prepare(
     Ok(Prepared::Placed(DeploymentFence {
         deployment_id: deployment_id.into(),
         revision: current,
+        generation,
+    }))
+}
+
+/// ADR 0028 §5: place group instance `instance` on its named `hosts` (rank
+/// order): each host is judged for its own member's reservation (the cold
+/// footprint the group's activation charges it), as that host's admission
+/// sees it, and the start is accepted only when every host takes its member.
+/// Nothing chooses a host and no host is recorded on the instance: the
+/// group's activation reserves every member on its own host.
+fn prepare_group(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance: u32,
+    revision: i64,
+    generation: Option<i64>,
+    hosts: &[String],
+    eligible: Eligible<'_>,
+) -> Result<Prepared, LifecycleError> {
+    let owners: std::collections::BTreeMap<String, String> = hosts
+        .iter()
+        .enumerate()
+        .map(|(rank, host)| {
+            (
+                host.clone(),
+                crate::groups::member_owner_id(deployment_id, instance, rank as u32),
+            )
+        })
+        .collect();
+    let members = |reclaim_parked: bool| -> Result<Vec<HostCandidate>, LifecycleError> {
+        let mut hosts = candidates(
+            tx,
+            deployment_id,
+            revision,
+            instance,
+            eligible,
+            reclaim_parked,
+        )?;
+        hosts.retain(|c| owners.contains_key(&c.host_id));
+        for c in &mut hosts {
+            let (raw, _) = frozen_on_host(tx, deployment_id, revision, Some(&c.host_id))?;
+            let e =
+                decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+            c.footprint = super::phase(&e.resources.cold, ResourcePhase::Cold);
+            c.whole_host = false;
+            c.device_options.clear();
+        }
+        Ok(hosts)
+    };
+    if let Err(unplaceable) = fits_group(&members(false)?, &owners) {
+        // SPEC §6.5 (W5): only when nothing fits without it is parked
+        // capacity counted as reclaimable.
+        let reclaimed = members(true)?;
+        if let Err(still) = fits_group(&reclaimed, &owners) {
+            let head = hosts
+                .first()
+                .and_then(|h| owners.get(h))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(Prepared::Unplaceable(
+                unplaceable.code(),
+                still.detail(&reclaimed, &head),
+            ));
+        }
+    }
+    let generation = match generation {
+        Some(generation) => generation,
+        None => draw_generation(tx, deployment_id)?,
+    };
+    one(tx.execute(
+        "UPDATE deployment_instances SET revision=?3,generation=?4,
+                placed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE deployment_id=?1 AND instance_index=?2",
+        params![deployment_id, instance, revision, generation],
+    )?)?;
+    Ok(Prepared::Placed(DeploymentFence {
+        deployment_id: deployment_id.into(),
+        revision,
         generation,
     }))
 }

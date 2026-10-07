@@ -82,6 +82,18 @@ pub enum SwitchPlan {
         /// The host's bounded, non-resetting admission window (SPEC §10).
         admission_window_ms: i64,
     },
+    /// ADR 0028 §5, SPEC §11: release `victims` (keyed by the named host
+    /// whose plan chose them; each victim listed once, a group victim
+    /// released whole), then activate group instance `instance` on every one
+    /// of `hosts` (rank order). Planned only when every named host can make
+    /// room.
+    EvictGroup {
+        hosts: Vec<String>,
+        instance: u32,
+        victims: BTreeMap<String, Vec<SwitchVictim>>,
+        /// The longest admission window of the hosts releasing anything.
+        admission_window_ms: i64,
+    },
     /// No host can take it even by releasing every eligible READY instance.
     Impossible(String),
 }
@@ -801,10 +813,250 @@ fn host_occupants(
             Ok((r.get(0)?, r.get(1)?))
         })?
         .collect::<Result<_, _>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|(deployment, index)| instance_owner_id(&deployment, index))
-        .collect())
+    rows.into_iter()
+        .map(|(deployment, index)| ledger_owner_on(tx, &deployment, index, host))
+        .collect()
+}
+
+/// ADR 0028 §5: the owner an instance's charge on `host` is held under: a
+/// group instance's member there (of its unsettled plan), otherwise the
+/// instance's own owner, as for every single-host instance.
+fn ledger_owner_on(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+    host: &str,
+) -> Result<String, LifecycleError> {
+    let member: Option<String> = tx
+        .query_row(
+            "SELECT m.owner_id FROM group_members m JOIN group_plans g
+               ON g.deployment_id=m.deployment_id AND g.instance_index=m.instance_index AND g.generation=m.generation
+              WHERE m.deployment_id=?1 AND m.instance_index=?2 AND m.host_id=?3 AND g.state='active'
+              ORDER BY m.generation DESC LIMIT 1",
+            params![deployment, instance, host],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(member.unwrap_or_else(|| instance_owner_id(deployment, instance)))
+}
+
+/// ADR 0028 §5, §11: a group instance's members at `generation` as (host,
+/// owner, state), in rank order; empty for a single-host instance.
+fn group_members(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+    generation: i64,
+) -> Result<Vec<(String, String, String)>, LifecycleError> {
+    Ok(tx
+        .prepare(
+            "SELECT host_id,owner_id,state FROM group_members
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
+        )?
+        .query_map(params![deployment, instance, generation], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Every ledger owner releasing `victim` frees: a group victim's member on
+/// each host it occupies (it is released as one unit), otherwise its own.
+fn victim_owners(
+    tx: &Transaction<'_>,
+    victim: &SwitchVictim,
+) -> Result<Vec<String>, LifecycleError> {
+    let members = group_members(
+        tx,
+        &victim.deployment_id,
+        victim.instance,
+        victim.generation,
+    )?;
+    Ok(if members.is_empty() {
+        vec![instance_owner_id(&victim.deployment_id, victim.instance)]
+    } else {
+        members.into_iter().map(|(_, owner, _)| owner).collect()
+    })
+}
+
+/// The READY instances one host offers as switch victims (ADR 0013 §8 rules
+/// 3–4), each under the owner its charge on this host is held by.
+#[derive(Default)]
+struct Offered {
+    /// In preference order.
+    candidates: Vec<VictimCandidate>,
+    /// Each offered owner's (deployment, instance, generation, whether its
+    /// deployment serves elsewhere).
+    by_owner: BTreeMap<String, (String, u32, i64, bool)>,
+    /// Whether each offered victim may park at all: a victim of a solo first
+    /// start stops (a parked residual would still occupy the host it
+    /// empties), and SPEC §9.2: a victim with an uncertain request stops; its
+    /// release would refuse the park anyway.
+    parkable: BTreeMap<String, bool>,
+    /// Victims whose switch park this generation was refused for memory.
+    full: BTreeSet<String>,
+    /// ADR 0028 §11: members charged on this host of a READY group whose
+    /// members are not all proven launched; never released for room.
+    uncertain: BTreeSet<String>,
+}
+
+fn offer_victims(
+    tx: &Transaction<'_>,
+    c: &capyctl_scheduler::placement::HostCandidate,
+    target: &str,
+    protected: &BTreeSet<String>,
+    activity: &dyn Fn(&str, i64) -> Option<i64>,
+) -> Result<Offered, LifecycleError> {
+    let rows: Vec<(String, u32, i64)> = tx
+        .prepare(&format!(
+            "SELECT i.deployment_id,i.instance_index,i.generation FROM deployment_instances i
+               JOIN deployments d ON d.id=i.deployment_id
+              WHERE i.deployment_id!=?2 AND i.state='active' AND d.kind='model'
+                AND (i.host_id=?1 OR (i.host_id IS NULL AND EXISTS(SELECT 1 FROM host_effective_revisions h
+                     WHERE h.deployment_id=i.deployment_id AND h.revision=i.revision AND h.host_id=?1 AND h.outcome='resolved')))
+                AND i.observed_state='ready' AND i.dispatch_enabled=1 AND i.admission_enabled=1
+                AND d.suspended=0 AND i.generation IS NOT NULL AND NOT {}
+                AND NOT EXISTS(SELECT 1 FROM lifecycle_claims c WHERE c.deployment_id=i.deployment_id AND c.instance_index=i.instance_index)
+                AND NOT {}
+              ORDER BY i.deployment_id,i.instance_index",
+            open_runs_clause("i"),
+            // SPEC §6.5: a warm-residency commitment is never a victim.
+            crate::switch_state::warm_clause("i")
+        ))?
+        .query_map(params![c.host_id, target], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut offered = Offered::default();
+    for (deployment, index, generation) in rows {
+        // Rule 4: never an instance serving a waiting group.
+        if protected.contains(&deployment) {
+            continue;
+        }
+        let members = group_members(tx, &deployment, index, generation)?;
+        // ADR 0028 §5: a group is charged here as its member on this host,
+        // and releasing it releases every member, on every host it occupies.
+        let victim_owner = if members.is_empty() {
+            instance_owner_id(&deployment, index)
+        } else {
+            match members.iter().find(|(host, ..)| *host == c.host_id) {
+                Some((_, owner, _)) => owner.clone(),
+                None => continue,
+            }
+        };
+        if !c.ledger.owners.contains_key(&victim_owner) {
+            continue;
+        }
+        // ADR 0028 §11: uncertainty keeps accounting. A group with a member
+        // not proven launched is not a victim whose release frees memory.
+        if members.iter().any(|(_, _, state)| state != "launched") {
+            offered.uncertain.insert(victim_owner);
+            continue;
+        }
+        let elsewhere: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index!=?2
+                     AND observed_state='ready' AND dispatch_enabled=1)",
+            params![deployment, index],
+            |r| r.get(0),
+        )?;
+        let last_used_ms = activity(&deployment, generation)
+            .or_else(|| activity(&deployment, -1))
+            .unwrap_or(0);
+        let parked = if members.is_empty() {
+            let (source, e, _) = launch(tx, &deployment, index)?;
+            let may_park = !c.whole_host
+                && parks(&e)
+                && !park_refused(tx, &deployment, index, generation)?
+                && !uncertain_leases(tx, &deployment, index)?;
+            offered.parkable.insert(victim_owner.clone(), may_park);
+            if parks(&e) && park_refused_for_room(tx, &deployment, index, generation)? {
+                offered.full.insert(victim_owner.clone());
+            }
+            // Discrete GPU design §5: what it leaves charged once parked (for
+            // `host_backed`, the weights copy on the system domain), so the
+            // planner parks it only where that copy fits.
+            match may_park {
+                true => Some(charged_footprints(tx, &source, &e)?.parked),
+                false => None,
+            }
+        } else {
+            // ADR 0028 §5, §11: a group victim is evicted whole, by the
+            // group stop that terminates every member at once and releases
+            // each only on its own host's evidence; it is never parked here.
+            offered.parkable.insert(victim_owner.clone(), false);
+            None
+        };
+        offered.candidates.push(VictimCandidate {
+            owner: victim_owner.clone(),
+            serves_elsewhere: elsewhere,
+            last_used_ms,
+            parked,
+        });
+        offered
+            .by_owner
+            .insert(victim_owner, (deployment, index, generation, elsewhere));
+    }
+    order_victims(&mut offered.candidates);
+    Ok(offered)
+}
+
+/// A host's fresh observation and the resident floors admission credits
+/// beside it (see [`planning_floors`]).
+type Floors<'a> = (
+    &'a Vec<capyctl_domain::resources::MemoryObservation>,
+    Vec<capyctl_domain::resources::ResidentFloor>,
+);
+
+/// Final review I4 (found live, DG1): the host's fresh observation and the
+/// resident floors admission credits beside it, when the switch observed the
+/// host; `None` plans from the ledger alone.
+fn planning_floors<'a>(
+    tx: &Transaction<'_>,
+    c: &capyctl_scheduler::placement::HostCandidate,
+    owner: &str,
+    observed: &'a PlanningObservations,
+) -> Result<Option<Floors<'a>>, LifecycleError> {
+    let Some((observations, residents)) = observed.get(&c.host_id) else {
+        return Ok(None);
+    };
+    let kinds = read_selected_policy(tx, &c.host_id)
+        .ok()
+        .flatten()
+        .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+        .unwrap_or_default();
+    Ok(Some((
+        observations,
+        crate::resident_floors::resident_floors(
+            tx,
+            &c.ledger,
+            owner,
+            observations,
+            residents,
+            &kinds,
+        )?,
+    )))
+}
+
+/// One chosen victim as the switch releases it.
+fn switch_victim(
+    victim: &Victim,
+    by_owner: &BTreeMap<String, (String, u32, i64, bool)>,
+    parkable: &BTreeMap<String, bool>,
+    full: &BTreeSet<String>,
+) -> SwitchVictim {
+    let (deployment, index, generation, elsewhere) = by_owner[&victim.owner].clone();
+    let may_park = parkable.get(&victim.owner).copied().unwrap_or(false);
+    SwitchVictim {
+        // Discrete GPU design §5: it parks only where its parked footprint
+        // fits the host after the switch.
+        parks: may_park && victim.release == Release::Park,
+        // Final review M9: also when the arm refused its park for memory
+        // (`parked_capacity`) earlier.
+        park_does_not_fit: victim.release == Release::Stop
+            && (may_park || full.contains(&victim.owner)),
+        last_ready: false,
+        serves_elsewhere: elsewhere,
+        deployment_id: deployment,
+        instance: index,
+        generation,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -885,6 +1137,21 @@ fn plan_in(
             (k, false)
         }
     };
+    // ADR 0028 §5: a group activates on its fixed hosts, all at once.
+    if let Some(shape) = super::worker::group_shape(tx, target, revision)? {
+        return plan_group_in(
+            tx,
+            target,
+            instance,
+            revision,
+            &shape.hosts,
+            eligible,
+            protected,
+            activity,
+            assumed,
+            observed,
+        );
+    }
     let owner = instance_owner_id(target, instance);
     let spec = placement_spec(tx, target, revision)?;
     let mut hosts = placement::candidates(tx, target, revision, instance, eligible, true)?;
@@ -977,74 +1244,13 @@ fn plan_in(
                 device,
             });
         }
-        let rows: Vec<(String, u32, i64)> = tx
-            .prepare(&format!(
-                "SELECT i.deployment_id,i.instance_index,i.generation FROM deployment_instances i
-                   JOIN deployments d ON d.id=i.deployment_id
-                  WHERE i.deployment_id!=?2 AND i.state='active' AND d.kind='model'
-                    AND (i.host_id=?1 OR (i.host_id IS NULL AND EXISTS(SELECT 1 FROM host_effective_revisions h
-                         WHERE h.deployment_id=i.deployment_id AND h.revision=i.revision AND h.host_id=?1 AND h.outcome='resolved')))
-                    AND i.observed_state='ready' AND i.dispatch_enabled=1 AND i.admission_enabled=1
-                    AND d.suspended=0 AND i.generation IS NOT NULL AND NOT {}
-                    AND NOT EXISTS(SELECT 1 FROM lifecycle_claims c WHERE c.deployment_id=i.deployment_id AND c.instance_index=i.instance_index)
-                    AND NOT {}
-                  ORDER BY i.deployment_id,i.instance_index",
-                open_runs_clause("i"),
-                // SPEC §6.5: a warm-residency commitment is never a victim.
-                crate::switch_state::warm_clause("i")
-            ))?
-            .query_map(params![c.host_id, target], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<_, _>>()?;
-        let mut offered = Vec::new();
-        let mut by_owner = std::collections::BTreeMap::new();
-        // Whether each offered victim may park at all: a victim of a solo
-        // first start stops (a parked residual would still occupy the host it
-        // empties), and SPEC §9.2: a victim with an uncertain request stops;
-        // its release would refuse the park anyway.
-        let mut parkable = std::collections::BTreeMap::new();
-        // Victims whose switch park this generation was refused for memory.
-        let mut full = BTreeSet::new();
-        for (deployment, index, generation) in rows {
-            // Rule 4: never an instance serving a waiting group.
-            if protected.contains(&deployment) {
-                continue;
-            }
-            let victim_owner = instance_owner_id(&deployment, index);
-            if !c.ledger.owners.contains_key(&victim_owner) {
-                continue;
-            }
-            let elsewhere: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index!=?2
-                         AND observed_state='ready' AND dispatch_enabled=1)",
-                params![deployment, index],
-                |r| r.get(0),
-            )?;
-            let (source, e, _) = launch(tx, &deployment, index)?;
-            let may_park = !c.whole_host
-                && parks(&e)
-                && !park_refused(tx, &deployment, index, generation)?
-                && !uncertain_leases(tx, &deployment, index)?;
-            parkable.insert(victim_owner.clone(), may_park);
-            if parks(&e) && park_refused_for_room(tx, &deployment, index, generation)? {
-                full.insert(victim_owner.clone());
-            }
-            offered.push(VictimCandidate {
-                owner: victim_owner.clone(),
-                serves_elsewhere: elsewhere,
-                last_used_ms: activity(&deployment, generation)
-                    .or_else(|| activity(&deployment, -1))
-                    .unwrap_or(0),
-                // Discrete GPU design §5: what it leaves charged once parked
-                // (for `host_backed`, the weights copy on the system domain),
-                // so the planner parks it only where that copy fits.
-                parked: match may_park {
-                    true => Some(charged_footprints(tx, &source, &e)?.parked),
-                    false => None,
-                },
-            });
-            by_owner.insert(victim_owner, (deployment, index, generation, elsewhere));
-        }
-        order_victims(&mut offered);
+        let Offered {
+            candidates: offered,
+            by_owner,
+            parkable,
+            full,
+            ..
+        } = offer_victims(tx, c, target, protected, activity)?;
         // W10 gap (e): a host that cannot take another launch while it runs
         // these (a single-claim agent, or a per-launch one running another
         // instance of the target) is freed only by releasing every one of
@@ -1076,27 +1282,7 @@ fn plan_in(
         // ledger and by the host's fresh observation, the rule the arm
         // applies (resident floors credited as admission credits them), so a
         // copy host memory cannot take now is planned as a stop up front.
-        let floors = match observed.get(&c.host_id) {
-            Some((observations, residents)) => {
-                let kinds = read_selected_policy(tx, &c.host_id)
-                    .ok()
-                    .flatten()
-                    .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
-                    .unwrap_or_default();
-                Some((
-                    observations,
-                    crate::resident_floors::resident_floors(
-                        tx,
-                        &c.ledger,
-                        &owner,
-                        observations,
-                        residents,
-                        &kinds,
-                    )?,
-                ))
-            }
-            None => None,
-        };
+        let floors = planning_floors(tx, c, &owner, observed)?;
         let room = |state: &capyctl_domain::resources::LedgerSnapshot| match &floors {
             Some((observations, floors)) => {
                 observed_room(&c.ledger, &c.limits, observations, floors, state)
@@ -1194,26 +1380,10 @@ fn plan_in(
                 notes.push(format!("host {} cannot take another launch", c.host_id));
             }
             Ok(chosen) => {
-                let mut victims = Vec::new();
-                for victim in &chosen {
-                    let (deployment, index, generation, elsewhere) =
-                        by_owner[&victim.owner].clone();
-                    let may_park = parkable.get(&victim.owner).copied().unwrap_or(false);
-                    victims.push(SwitchVictim {
-                        // Discrete GPU design §5: it parks only where its
-                        // parked footprint fits the host after the switch.
-                        parks: may_park && victim.release == Release::Park,
-                        // Final review M9: also when the arm refused its
-                        // park for memory (`parked_capacity`) earlier.
-                        park_does_not_fit: victim.release == Release::Stop
-                            && (may_park || full.contains(&victim.owner)),
-                        last_ready: false,
-                        serves_elsewhere: elsewhere,
-                        deployment_id: deployment,
-                        instance: index,
-                        generation,
-                    });
-                }
+                let victims: Vec<SwitchVictim> = chosen
+                    .iter()
+                    .map(|victim| switch_victim(victim, &by_owner, &parkable, &full))
+                    .collect();
                 let candidate = HostChoice {
                     host: c.host_id.clone(),
                     instances_here: c.instances_here,
@@ -1283,6 +1453,243 @@ fn plan_in(
         },
         choice.device,
     ))
+}
+
+/// ADR 0028 §5, SPEC §11: plan the release that lets group instance
+/// `instance` of `target` activate on its named `hosts` (rank order). Every
+/// named host's victims are computed first, its member judged as that host's
+/// own admission sees it; the plan evicts only when every host can make
+/// room, and otherwise names each host's shortfall and evicts nothing. A
+/// victim occupying several named hosts (a group) is listed once, under the
+/// first host whose plan chose it, and released whole.
+#[allow(clippy::too_many_arguments)]
+fn plan_group_in(
+    tx: &Transaction<'_>,
+    target: &str,
+    instance: u32,
+    revision: i64,
+    hosts: &[String],
+    eligible: placement::Eligible<'_>,
+    protected: &BTreeSet<String>,
+    activity: &dyn Fn(&str, i64) -> Option<i64>,
+    assumed: &Assumed,
+    observed: &PlanningObservations,
+) -> Result<Planned, LifecycleError> {
+    use capyctl_scheduler::placement::{plan_group_eviction_within, HostCandidateView};
+    let mut candidates = placement::candidates(tx, target, revision, instance, eligible, true)?;
+    for c in &mut candidates {
+        for released in &assumed.released {
+            c.ledger.owners.remove(released);
+        }
+        for (on, charged, footprint) in &assumed.charges {
+            if *on == c.host_id {
+                c.ledger.owners.insert(charged.clone(), footprint.clone());
+            }
+        }
+    }
+    struct HostPlan<'a> {
+        c: &'a capyctl_scheduler::placement::HostCandidate,
+        footprint: PhaseFootprint,
+        offered: Offered,
+        occupants: Vec<String>,
+    }
+    let mut planned: BTreeMap<String, HostPlan<'_>> = BTreeMap::new();
+    let mut refusals: Vec<&'static str> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for host in hosts {
+        let Some(c) = candidates.iter().find(|c| &c.host_id == host) else {
+            refusals.push("host_ineligible");
+            notes.push(format!(
+                "host {host} did not resolve the deployment's revision"
+            ));
+            continue;
+        };
+        if !c.eligible {
+            refusals.push("host_ineligible");
+            notes.push(format!("host {host} is not eligible for placement"));
+            continue;
+        }
+        // What the group's reservation charges this member on its own host.
+        let (raw, _) = frozen_on_host(tx, target, revision, Some(host))?;
+        let e = decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+        let footprint = super::phase(&e.resources.cold, ResourcePhase::Cold);
+        let offered = offer_victims(tx, c, target, protected, activity)?;
+        // W10 gap (e): a host that cannot take another launch is freed only
+        // by releasing every launch it runs.
+        let occupants = if c.occupied {
+            host_occupants(tx, host, target, instance)?
+                .into_iter()
+                .filter(|o| !assumed.released.contains(o))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if occupants.iter().any(|o| !offered.by_owner.contains_key(o)) {
+            refusals.push("host_occupied");
+            notes.push(format!(
+                "host {host} runs a launch that cannot be released for it"
+            ));
+            continue;
+        }
+        planned.insert(
+            host.clone(),
+            HostPlan {
+                c,
+                footprint,
+                offered,
+                occupants,
+            },
+        );
+    }
+    if !refusals.is_empty() {
+        return Ok(group_impossible(&refusals, notes));
+    }
+    let mut views = BTreeMap::new();
+    let mut need = BTreeMap::new();
+    let mut floors = BTreeMap::new();
+    for (rank, host) in hosts.iter().enumerate() {
+        let p = &planned[host];
+        let member = crate::groups::member_owner_id(target, instance, rank as u32);
+        let mut ledger = p.c.ledger.clone();
+        for occupant in &p.occupants {
+            ledger.owners.remove(occupant);
+        }
+        views.insert(
+            host.clone(),
+            HostCandidateView {
+                owner: member.clone(),
+                ledger,
+                limits: p.c.limits.clone(),
+                max_parked: p.c.max_parked,
+                victims: p
+                    .offered
+                    .candidates
+                    .iter()
+                    .filter(|v| !p.occupants.contains(&v.owner))
+                    .cloned()
+                    .collect(),
+                uncertain: p.offered.uncertain.clone(),
+            },
+        );
+        need.insert(host.clone(), p.footprint.clone());
+        floors.insert(host.clone(), planning_floors(tx, p.c, &member, observed)?);
+    }
+    // Final review I4: park or stop on each host is also judged by its fresh
+    // observation, as the single-host plan judges it.
+    let room = |host: &str, state: &capyctl_domain::resources::LedgerSnapshot| match (
+        floors.get(host),
+        planned.get(host),
+    ) {
+        (Some(Some((observations, floors))), Some(p)) => {
+            observed_room(&p.c.ledger, &p.c.limits, observations, floors, state)
+        }
+        _ => true,
+    };
+    let Some(mut plan) = plan_group_eviction_within(&views, &need, &room) else {
+        // Nothing is evicted anywhere; each host that cannot make room says why.
+        for host in hosts {
+            let view = &views[host];
+            if let Err(refusal) = choose_victims_within(
+                &view.ledger,
+                &view.owner,
+                &need[host],
+                &view.limits,
+                view.max_parked,
+                &view.victims,
+                &|_| true,
+            ) {
+                refusals.push(refusal.code());
+                notes.push(shortfall(
+                    host,
+                    &view.ledger,
+                    &view.owner,
+                    &need[host],
+                    &view.limits,
+                    &planned[host].offered.by_owner.keys().cloned().collect(),
+                    refusal.code(),
+                ));
+            }
+        }
+        return Ok(group_impossible(&refusals, notes));
+    };
+    // W10 gap (e): occupants are released first, at their tier.
+    let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+    let mut victims: BTreeMap<String, Vec<SwitchVictim>> = BTreeMap::new();
+    for host in hosts {
+        let p = &planned[host];
+        let chosen = p
+            .occupants
+            .iter()
+            .map(|o| Victim {
+                owner: o.clone(),
+                release: if p.offered.parkable.get(o).copied().unwrap_or(false) {
+                    Release::Park
+                } else {
+                    Release::Stop
+                },
+            })
+            .chain(plan.remove(host).unwrap_or_default());
+        for victim in chosen {
+            let v = switch_victim(
+                &victim,
+                &p.offered.by_owner,
+                &p.offered.parkable,
+                &p.offered.full,
+            );
+            // ADR 0028 §5: a victim on several named hosts is one release.
+            if seen.insert((v.deployment_id.clone(), v.instance)) {
+                victims.entry(host.clone()).or_default().push(v);
+            }
+        }
+    }
+    if victims.is_empty() {
+        return Ok(Planned::Fits {
+            host: None,
+            device: None,
+        });
+    }
+    // Rule 5 over every host of the group.
+    let mut all: Vec<SwitchVictim> = victims.values().flatten().cloned().collect();
+    mark_last_ready(tx, &mut all)?;
+    let mut marked = all.into_iter();
+    for victim in victims.values_mut().flatten() {
+        if let Some(m) = marked.next() {
+            victim.last_ready = m.last_ready;
+        }
+    }
+    let mut admission_window_ms = 0;
+    for host in victims.keys() {
+        admission_window_ms = admission_window_ms.max(
+            read_selected_policy(tx, host)
+                .map_err(resource)?
+                .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
+                    p.controls.queue.admission_window_ms
+                }),
+        );
+    }
+    Ok(Planned::Evict(
+        SwitchPlan::EvictGroup {
+            hosts: hosts.to_vec(),
+            instance,
+            victims,
+            admission_window_ms,
+        },
+        None,
+    ))
+}
+
+/// A group's plan when one named host refuses: the closed code (that host's,
+/// or `no_host_fits` when the hosts disagree) and each host's reason.
+fn group_impossible(refusals: &[&str], notes: Vec<String>) -> Planned {
+    let code = match refusals {
+        [] => "insufficient_capacity",
+        [first, rest @ ..] if rest.iter().all(|r| r == first) => *first,
+        _ => "no_host_fits",
+    };
+    Planned::Impossible {
+        code: code.to_string(),
+        detail: notes.join("; "),
+    }
 }
 
 /// Rule 5: a victim is its deployment's last READY instance when no READY,
@@ -1420,9 +1827,7 @@ fn plan_start_in(
                 device,
             ) => {
                 for v in &victims {
-                    assumed
-                        .released
-                        .insert(instance_owner_id(&v.deployment_id, v.instance));
+                    assumed.released.extend(victim_owners(tx, v)?);
                 }
                 steps.push(StartStep {
                     host: host.clone(),
@@ -1432,6 +1837,31 @@ fn plan_start_in(
                     admission_window_ms,
                 });
                 Some((host, device))
+            }
+            // ADR 0028 §5: a group's victims are released per named host,
+            // each victim once; the group is placed on its fixed hosts.
+            Planned::Evict(
+                SwitchPlan::EvictGroup {
+                    instance,
+                    victims,
+                    admission_window_ms,
+                    ..
+                },
+                _,
+            ) => {
+                for (host, victims) in victims {
+                    for v in &victims {
+                        assumed.released.extend(victim_owners(tx, v)?);
+                    }
+                    steps.push(StartStep {
+                        host,
+                        instance,
+                        wake: false,
+                        victims,
+                        admission_window_ms,
+                    });
+                }
+                None
             }
             Planned::Evict(..) => continue,
             Planned::Impossible { code, detail } => {
