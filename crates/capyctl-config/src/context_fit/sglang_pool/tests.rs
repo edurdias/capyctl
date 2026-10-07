@@ -337,13 +337,132 @@ fn a_derived_request_fits_what_it_can() {
 #[test]
 fn a_dense_static_pool_holds_the_overhead() {
     let found = pool(&settings(16 * GIB, 4 * GIB, Some(4 * GIB)), &dense()).unwrap();
-    assert_eq!(found.static_bytes, Some(10 * GIB));
+    assert_eq!(found.static_bytes, Some(11 * GIB));
     // Never above the request, nor on a discrete device.
     let found = pool(&settings(9 * GIB, 4 * GIB, Some(4 * GIB)), &dense()).unwrap();
     assert_eq!(found.static_bytes, Some(9 * GIB));
     let mut discrete = settings(16 * GIB, 4 * GIB, Some(4 * GIB));
     discrete.memory.device_total_bytes = Some(16 * GIB);
     assert_eq!(pool(&discrete, &dense()).unwrap().static_bytes, None);
+}
+
+/// gpt-oss-20b's text model as SGLang 0.5.21 sees it: alternating sliding
+/// and full attention, which CapyCTL leaves to SGLang's own sizing.
+fn sliding() -> Value {
+    json!({
+        "num_hidden_layers": 24, "num_attention_heads": 64, "num_key_value_heads": 8,
+        "head_dim": 64, "hidden_size": 2880, "max_position_embeddings": 131072,
+        "torch_dtype": "bfloat16", "sliding_window": 128,
+    })
+}
+
+// T14 (catalog runs on GB10, 2026-10-07): SGLang 0.5.21 charges what it
+// allocates besides the weights against the static pool whether or not
+// CapyCTL sized the pools. A model left to SGLang's own sizing (gpt-oss-20b,
+// Gemma 4) had a static pool of exactly weights and KV cache, and a KV cache
+// of 2 GiB or less refused to start; it now holds the overhead too.
+#[test]
+fn a_pool_left_to_sglang_still_holds_the_overhead() {
+    let weights = 13_760_000_000;
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    for kv in [GIB, 2 * GIB] {
+        let found = pool(&derived(kv, weights), &sliding()).unwrap();
+        assert!(found.reason.as_deref().unwrap().contains("SGLang sizes"));
+        assert_eq!(found.max_total_tokens, None);
+        assert_eq!(found.static_bytes, Some(weights + kv + overhead), "{kv}");
+    }
+    // An unreadable configuration with known weights: no state to count.
+    let unread = sglang_pool(&derived(GIB, weights), &[], Err("no config".into()), None);
+    assert_eq!(unread.unwrap().static_bytes, Some(weights + GIB + overhead));
+    // Boundaries: exactly weights + KV + overhead fits; one byte less is the
+    // whole request; a larger explicit request keeps the request less the
+    // margin; unknown weights and a discrete device keep the static pool.
+    let exact = weights + GIB + overhead;
+    let mut explicit = settings(exact, GIB, Some(weights));
+    assert_eq!(
+        pool(&explicit, &sliding()).unwrap().static_bytes,
+        Some(exact)
+    );
+    explicit.memory.request_bytes = exact - 1;
+    assert_eq!(
+        pool(&explicit, &sliding()).unwrap().static_bytes,
+        Some(exact - 1)
+    );
+    let large = settings(32 * GIB, GIB, Some(weights));
+    assert_eq!(
+        pool(&large, &sliding()).unwrap().static_bytes,
+        Some(24 * GIB)
+    );
+    let unknown = settings(32 * GIB, GIB, None);
+    assert_eq!(pool(&unknown, &sliding()).unwrap().static_bytes, None);
+    let mut discrete = derived(GIB, weights);
+    discrete.memory.device_total_bytes = Some(24 * GIB);
+    assert_eq!(pool(&discrete, &sliding()).unwrap().static_bytes, None);
+}
+
+// T14 (catalog run of Qwen3.6-35B-A3B on GB10, 2026-10-07): with
+// `--max-mamba-cache-size 8` and a KV cache of 1536 MiB or 2 GiB, SGLang
+// refused to start: the arguments own the state pool, and the static pool
+// held neither that state nor SGLang's own allocations. It now holds the 9
+// slots SGLang reserves (8 plus a padding slot) and the overhead.
+#[test]
+fn arguments_that_fix_the_state_pool_are_held_by_the_static_pool() {
+    let target = qwen38_27b();
+    let weights = 21_920_000_000;
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    let slots = |extra: &[&str]| {
+        let mut owned = derived(1536 << 20, weights);
+        owned.extra_args = extra.iter().map(|arg| (*arg).to_owned()).collect();
+        pool(&owned, &target).unwrap()
+    };
+    let found = slots(&["--max-mamba-cache-size", "8"]);
+    assert_eq!(found.max_mamba_cache_size, None);
+    assert_eq!(
+        found.static_bytes,
+        Some(weights + (1536 << 20) + 9 * STATE as i64 + overhead)
+    );
+    // The `=` spelling counts alike.
+    assert_eq!(
+        slots(&["--max-mamba-cache-size=8"]).static_bytes,
+        found.static_bytes
+    );
+    // A ratio leaves the state to SGLang: the overhead only.
+    assert_eq!(
+        slots(&["--mamba-full-memory-ratio", "0.5"]).static_bytes,
+        Some(weights + (1536 << 20) + overhead)
+    );
+    // With speculative decoding SGLang keeps one intermediate state per draft
+    // token for each running request plus one: the declared count, at most
+    // the slots.
+    let spec = [
+        "--max-mamba-cache-size",
+        "8",
+        "--speculative-algorithm",
+        "DFLASH",
+        "--speculative-num-draft-tokens",
+        "4",
+    ];
+    let mut declared = derived(1536 << 20, weights);
+    declared.extra_args = spec.map(String::from).to_vec();
+    declared.common.max_concurrent_requests = Some(2);
+    assert_eq!(
+        pool(&declared, &target).unwrap().static_bytes,
+        Some(weights + (1536 << 20) + (9 + 3 * 4) * STATE as i64 + overhead)
+    );
+    // Undeclared, the slots bound it (a request large enough to hold it).
+    declared.common.max_concurrent_requests = None;
+    declared.memory.request_bytes += 8 * GIB;
+    assert_eq!(
+        pool(&declared, &target).unwrap().static_bytes,
+        Some(weights + (1536 << 20) + (9 + 9 * 4) * STATE as i64 + overhead)
+    );
+    // Never above the request.
+    let mut explicit = fp8(settings(24 * GIB, 1536 << 20, Some(weights)));
+    explicit.extra_args = ["--max-mamba-cache-size", "8"].map(String::from).to_vec();
+    assert_eq!(
+        pool(&explicit, &target).unwrap().static_bytes,
+        Some(24 * GIB)
+    );
 }
 
 /// The memory request a refusal names, in MiB.

@@ -1,5 +1,23 @@
 # Current implementation and launch status
 
+## SGLang's static pool on unified memory — 2026-10-07 (branch `fix/sglang-static-fraction-weights`)
+
+Owner decision 5 (b), note on ADR 0014 amendment A14. In the GB10 catalog runs (SGLang
+0.5.21) a `memory.kv_cache` of 2 GiB or less failed at start ("Loaded weights leave no GPU
+memory for the KV cache") on gpt-oss-20b, Gemma 4 26B-A4B and Qwen3.6-35B-A3B with
+`--max-mamba-cache-size 8`. Cause: CapyCTL added its 2 GiB for SGLang's own allocations to
+the static pool only when it sized the pools; those launches rendered exactly the weights
+on disk and the KV cache, while SGLang 0.5.21 charges the weights as loaded, its load-time
+memory and the argument-fixed state against the fraction first. Now every unified launch
+with known weights renders weights + KV + state + 3 GiB (`STATIC_OVERHEAD_BYTES`, the
+smallest whole GiB above the measured 1.7, 2.2 and about 2.9 GiB of the NVFP4 models),
+capped at the request, and an explicit `--max-mamba-cache-size N` counts its `N + 1` slots
+(and speculative intermediates). gpt-oss-20b's MXFP4 load (about 5.4 GiB) stays outside it
+and keeps a stated request. CPU tests only (capyctl-config `sglang_pool`); CPU and
+Fake-engine tests are not qualification. Live check pending (lab hosts reserved): model 2
+(Qwen3.6-35B-A3B NVFP4) on SGLang with `memory.kv_cache: 1GiB` and with
+`--max-mamba-cache-size 8` at 1536 MiB, Gemma 4 26B-A4B at `kv_cache: 1GiB`, all starting.
+
 ## The unified-memory margin grows with the weights — 2026-10-07 (branch `fix/unified-memory-margin`)
 
 Owner decision 4 of 2026-10-07 asked whether the flat 8 GiB margin on unified memory (a

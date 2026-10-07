@@ -834,7 +834,9 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   buffers), never less than the request less the margin nor more than the request; what it
   takes beyond the request less the margin comes out of the margin. Found live on
   2026-10-03: a static pool of exactly weights, KV cache and state held 356793 of the
-  399457 KV tokens passed, 1.7 GiB short. A discrete device keeps its static pool. The
+  399457 KV tokens passed, 1.7 GiB short. (Since 2026-10-07, 3 GiB, on every unified
+  launch: see the note on amendment A14, SGLang's static pool on unified memory.) A
+  discrete device keeps its static pool. The
   state must fit the request less the margin, the weights and the KV cache. The state is
   `(slots + 1) × slot`, plus `(running + 1) × draft tokens × slot` of intermediate states
   with speculative decoding (`--speculative-num-draft-tokens`), as SGLang reserves them.
@@ -932,6 +934,54 @@ Not covered in full: other processes' memory on the card when SGLang starts (a p
 engine's residue, for one) is outside its baseline too. The allowance covers the fraction
 of about 1 GiB in all; beyond that SGLang's KV pool is short again by the fraction of the
 rest, as before this note.
+
+## Note on amendment A14: SGLang's static pool on unified memory (owner decision 2026-10-07)
+
+Problem: found in the catalog runs on GB10 with SGLang 0.5.21 (2026-10-07). With a KV cache
+of 2 GiB or less, SGLang refused to start: "Loaded weights leave no GPU memory for the KV
+cache under --mem-fraction-static=…". Every failing start was one whose pools CapyCTL left
+to SGLang: a sliding-window model (gpt-oss-20b, Gemma 4 26B-A4B) or a hybrid whose arguments
+set `--max-mamba-cache-size` (Qwen3.6-35B-A3B with 8 slots, at 1536 MiB and at 2 GiB, cuda
+graphs on and off). Those launches rendered the static pool of §5, the request less the
+margin, which for a derived request is exactly the weights on disk and the KV cache; the 2
+GiB above was added only when CapyCTL sized the pools. The same Qwen3.6 deployment without
+the argument (CapyCTL sizing 20 slots, plus the 2 GiB) started at 1536 MiB.
+
+Cause, read in SGLang 0.5.21 (`KVCacheConfigurator._profile_available_bytes`): the pools
+get `mem_fraction_static` times SGLang's baseline (its free memory after its own start; on
+an integrated GPU, `MemAvailable`) less everything allocated since that baseline, the
+recurrent state the arguments fix (`_handle_max_mamba_cache`) and the multimodal cache;
+when that is not positive, the start fails. What it allocates since the baseline besides
+the weights on disk does not depend on who sizes the pools: the weights as loaded (padded or
+repacked), the CPU-side memory its process takes while loading (on unified memory it lowers
+`MemAvailable` too), and workspaces. With post-capture KV sizing off (SGLang's default),
+CUDA graphs come after the pools, outside the fraction. Measured on GB10 (in SGLang's GiB):
+Qwen3.8-27B NVFP4 1.7 GiB; Qwen3.6-35B-A3B NVFP4 2.2 GiB (with 2 GiB it held 141100 of
+157286 KV tokens); Gemma 4 26B-A4B NVFP4 about 2.9 GiB (a 24 GiB static pool held 3.6 GiB
+of KV beside 17.5 GiB of weights on disk); gpt-oss-20b MXFP4 about 5.4 GiB (SGLang loads
+12.85 GiB of checkpoint as 17.08 GiB, and as 20.79 GiB with the memory saver).
+
+Rule (unified memory; a discrete device keeps the note above):
+
+- Every launch whose weights are known renders a static pool of the weights, the KV cache,
+  the state and 3 GiB (`STATIC_OVERHEAD_BYTES`), whether CapyCTL sized the pools or left
+  them to SGLang. It is never less than the request less the margin nor more than the
+  request, and what it takes beyond the request less the margin comes out of the margin.
+  3 GiB is the smallest whole GiB above the NVFP4 measurements.
+- The state is the one CapyCTL sized, or, when the arguments fix it on a gated-delta-net
+  hybrid (`--max-mamba-cache-size N`), the `N + 1` slots SGLang reserves, plus with
+  speculative decoding `(running + 1) × draft tokens` intermediate states, the running
+  requests being the deployment's count, at most `N`. A state SGLang sizes itself
+  (`--mamba-full-memory-ratio`, another hybrid kind) is not counted.
+
+Consequence: on a pool left to SGLang (a sliding-window model), SGLang's KV pool now gets
+about the KV cache the deployment states, where it got that less SGLang's own allocations;
+a deployment that states only its request (the Gemma 4 and gpt-oss-20b recipes) gets a
+larger KV pool and a larger footprint, inside the request. Not covered: gpt-oss-20b's MXFP4
+load takes about 2.4 GiB more than the 3 GiB (5.4 GiB with the memory saver), which no
+checkpoint fact predicts; its deployments state a request that holds it. A pool CapyCTL
+fixes in tokens and slots allocates no more than it is told, so the extra fraction costs a
+model that needs less nothing but margin.
 
 ## Amendment A15: SGLang does not park a speculative deployment (owner decision 2026-10-03)
 

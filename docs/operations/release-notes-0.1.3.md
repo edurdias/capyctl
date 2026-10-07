@@ -17,6 +17,18 @@ Unreleased.
   cache CapyCTL passed and refused inputs over 42,772 tokens where `status`
   showed 63,920. The fraction now covers that difference; SGLang still
   allocates only the KV cache and state CapyCTL sized.
+- **SGLang starts with a small KV cache on unified memory.** On a GB10, SGLang
+  refused to start ("Loaded weights leave no GPU memory for the KV cache")
+  with `memory.kv_cache` of 2 GiB or less for sliding-window models such as
+  Gemma 4 and gpt-oss, and for hybrid models whose arguments set
+  `--max-mamba-cache-size`: their memory fraction held only the weights and
+  the KV cache, with no room for what SGLang allocates while it loads. Every
+  SGLang launch on unified memory now leaves 3 GiB for it (2 GiB before, and
+  only when CapyCTL sized the pools) and counts the state the arguments fix,
+  inside the memory request. A model whose pools SGLang sizes itself gets
+  about the KV cache it states, so one that states only its memory request
+  now uses more of it. gpt-oss-20b loads more than that on SGLang and still
+  needs a stated `memory.request` (32 GiB on a GB10).
 - **SGLang hybrid models get their concurrency.** When you state no memory
   request, CapyCTL now adds a hybrid model's per-request state to the request it
   derives, for `max_concurrent_requests` (or 8) as far as the machine holds it,
