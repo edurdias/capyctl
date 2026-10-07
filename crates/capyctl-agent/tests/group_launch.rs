@@ -708,38 +708,51 @@ impl FakeHost {
                 owned_handle,
                 max_tokens,
             } => {
-                let built = self.host();
-                let owner = built.journal.retained_command(&owned_handle).unwrap();
-                let mut command = MemberCommand {
-                    identity: identity(
-                        &format!("probe-{}", max_tokens.unwrap_or(0)),
-                        owner.identity.member.clone(),
-                        "ready",
-                        owner.identity.generation,
-                        &owner.identity.profile_fingerprint,
-                    ),
-                    action: MemberAction::Probe {
-                        owned_handle,
-                        max_tokens,
-                    },
-                };
-                command.identity.payload_digest = command.canonical_digest();
-                let result = built
-                    .executor
-                    .execute(built.session, command.clone())
+                self.send_probe(&self.probe_command(owned_handle, max_tokens))
                     .await
-                    .map_err(|_| "session".to_owned())?;
-                capyctl_protocol::execution::validate_result(&command, &result)
-                    .expect("the result is a valid answer to its Probe");
-                Ok(Launched {
-                    owned_handle: result.owned_handle.clone(),
-                    processes: result.processes.clone(),
-                    ingress: None,
-                    result,
-                })
             }
             _ => panic!("only a group Launch or a Probe is sent here"),
         }
+    }
+
+    /// ADR 0028 §9: the Probe the server sends the head, naming its retained
+    /// launch `owned_handle`.
+    fn probe_command(&self, owned_handle: String, max_tokens: Option<u32>) -> MemberCommand {
+        let built = self.host();
+        let owner = built.journal.retained_command(&owned_handle).unwrap();
+        let mut command = MemberCommand {
+            identity: identity(
+                &format!("probe-{}", max_tokens.unwrap_or(0)),
+                owner.identity.member.clone(),
+                "ready",
+                owner.identity.generation,
+                &owner.identity.profile_fingerprint,
+            ),
+            action: MemberAction::Probe {
+                owned_handle,
+                max_tokens,
+            },
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+
+    /// Send the Probe `command` to this host, exactly as given.
+    async fn send_probe(&self, command: &MemberCommand) -> Result<Launched, String> {
+        let built = self.host();
+        let result = built
+            .executor
+            .execute(built.session, command.clone())
+            .await
+            .map_err(|_| "session".to_owned())?;
+        capyctl_protocol::execution::validate_result(command, &result)
+            .expect("the result is a valid answer to its Probe");
+        Ok(Launched {
+            owned_handle: result.owned_handle.clone(),
+            processes: result.processes.clone(),
+            ingress: None,
+            result,
+        })
     }
 
     async fn send(&self, command: &MemberCommand) -> Result<Launched, String> {
@@ -1403,6 +1416,32 @@ async fn a_worker_answers_no_completion_probe() {
         .await
         .unwrap();
     assert!(reply.result.probe_tokens.is_empty());
+    let gone = host
+        .terminate(&out.owned_handle, &out.processes)
+        .await
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+// T30 (decided 2026-10-06, OD6): a completion probe sent again after a lost
+// reply answers its token ids again, so a lost reply never reads as a failed
+// probe of a healthy group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_completion_probe_answers_its_tokens() {
+    let host = FakeHost::new("host-a")
+        .with_groups_policy(HEAD_PEER)
+        .with_engine("vllm")
+        .with_fake_completion(vec![7, 8]);
+    let plan = two_member_plan(&host);
+    let out = host.execute(launch(plan)).await.unwrap();
+    assert!(out.result.model_usable, "{:?}", out.result);
+    let probe = host.probe_command(out.owned_handle.clone(), Some(2));
+    let first = host.send_probe(&probe).await.unwrap();
+    assert_eq!(first.result.probe_tokens, vec![7, 8]);
+    // The exact command again: the journal answers it as a replay.
+    let again = host.send_probe(&probe).await.unwrap();
+    assert_eq!(again.result.state, "completed", "{:?}", again.result);
+    assert_eq!(again.result.probe_tokens, vec![7, 8]);
     let gone = host
         .terminate(&out.owned_handle, &out.processes)
         .await
