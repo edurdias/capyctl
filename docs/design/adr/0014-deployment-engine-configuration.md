@@ -159,7 +159,9 @@ is derived as request minus weights minus margin and must be positive. At least 
 the two is required: an engine's own default takes all free memory, which SPEC §7.1
 forbids. Initial margins are conservative placeholders (proposed 8 GiB per family) until
 M16 measures peak minus weights minus KV for each model and engine; matrix budgets are
-then recomputed from those measurements. Derived phases: cold, ready, parking and wake
+then recomputed from those measurements (amendment A18, 2026-10-07: on unified memory the
+margin is `max(8 GiB, weights × 0.15 + 4 GiB)`; ADR 0019 §3: a discrete GPU's is the
+weights × 0.10). Derived phases: cold, ready, parking and wake
 equal the request; parked equals the engine's residual floor, also measured. An explicit
 `resources:` phase block still overrides derivation. Reservations always use the declared
 or derived request, never a sampled value (SPEC §7.3).
@@ -1211,3 +1213,96 @@ Decision (option B): the loader is the typed field `engine_config.vllm.safetenso
 - The field belongs to the vLLM block; another family refuses the block (§2).
 
 CPU tests cover rendering, refusal and identity; no live park has run with `lazy` yet.
+
+## Amendment A18: the margin on unified memory grows with the weights (owner decision 2026-10-07)
+
+Question: since ADR 0019 amendment A1 (2026-10-03) a request declared for a discrete GPU
+keeps a margin of the weights × 0.10, while unified memory kept §5's flat 8 GiB family
+margin. The 2026-10-07 GB10 catalog's SGLang gpt-oss-20b recipe needed `memory.request:
+32GiB` for 13.8 GB of weights, so the owner asked whether the flat margin is intended and
+what it should be.
+
+Why unified memory kept 8 GiB: the margin is everything an engine holds beside the weights
+and the KV cache that the request has to account for. On a discrete host that splits in
+two: the card holds the GPU-side part (CUDA graphs, activations, allocator slack: the
+weights × 0.10 of ADR 0019 §3), and the engine process's own memory (interpreter, CUDA
+runtime, tokenizer, staging buffers) is charged separately on the system domain
+(`ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES`, 4 GiB). On unified memory both come out of the
+one pool and nothing else charges the CPU-side part: the reservation is the request plus
+the engine's CUDA context and graphs (`ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES`, 1.25 GiB).
+A1 changed the discrete rule only, because the failure (a negative KV cache on a 16 GB card)
+was a discrete one.
+
+Measured on GB10 (capyctl-recipes, 2026-10-04 to 2026-10-07; vLLM 0.30.0, SGLang 0.5.21,
+TensorFold 0.6.5). Ready footprint is machine memory in use once ready less what was in use
+before the start; GPU is the engine's own GPU allocations; CPU-side is their difference.
+Weights are the checkpoint's bytes on disk, as CapyCTL records them. GiB throughout.
+
+| Engine, residency | Model, weights, KV | Ready footprint | GPU | CPU-side | Footprint − weights − KV |
+|---|---|---|---|---|---|
+| vLLM restart_only | gpt-oss-20b, 12.82, 4 | 23.1–23.2 | 19.5–19.6 | 3.6 | 6.4 |
+| vLLM restart_only | Qwen3.6-35B-A3B, 21.89, 2 | 26.4–27.2 | 23.0–23.3 | 3.4–3.9 | 3.3 |
+| vLLM restart_only | Gemma 4 26B-A4B, 17.51, 3 | 24.1–25.0 | 20.6–21.0 | 3.5–4.2 | 4.5 |
+| vLLM restart_only | Gemma 4 31B, 21.70, 4 | 26.9–27.5 | 23.2–23.7 | 3.7–4.3 | 1.8 |
+| vLLM restart_only | gpt-oss-120b, 60.77, 8 | 79.8–81.3 | 76.0–76.1 | 3.8–5.2 | 12.5 |
+| vLLM deep (sleep mode) | Nemotron 3.5 Lightning, 20.12, 2 | 25.4–28.8 (after a wake) | 21.3–24.4 | 4.1–4.4 | 6.7 |
+| vLLM deep (sleep mode) | Qwen3.8-27B, 20.40, 1.5 | 27.0–27.5 | 22.1 | 4.9–5.4 | 5.6 |
+| vLLM deep (sleep mode) | Qwen3.6-35B-A3B, 21.89, 2 | 41.6–42.2 | 23.0 | 18.6–19.2 | 18.3 |
+| vLLM deep (sleep mode) | Gemma 4 26B-A4B, 17.51, 3 | 39.7–40.2 | not reported | about 16 above restart_only | 19.7 |
+| SGLang restart_only | gpt-oss-20b, 12.82, request 32 | 27.5 | 22.4–22.5 | 5.0–5.1 | |
+| SGLang restart_only | Gemma 4 26B-A4B, 17.51, request 32 | 28.1–29.0 (30.6 under a 32k prompt) | 23.0–23.2 (25.5) | 4.9–6.0 (5.1) | |
+| SGLang restart_only | Qwen3.6-35B-A3B, 21.89, 1.5 | 31.2–31.7 | 26.4–26.7 | 4.8–5.0 | |
+| SGLang restart_only | Qwen3.8-27B, 20.40, 1 | 28.5–29.3 | 24.3 | 4.2–5.0 | |
+| SGLang restart_only | Nemotron 3.5 Lightning, 20.12, 3 | 26.7–26.9 (29.4) | 22.1–22.2 (24.6) | 4.5–4.8 | |
+| TensorFold restart_only | three models, 18.5–21.9 | 18.4–23.8 | 18.5–21.4 | 0.2–1.9 warm, up to 4.3 cold | |
+
+Reading: what the margin and the 1.25 GiB charge must hold is the last column for vLLM, and
+for SGLang the CPU-side memory plus whatever SGLang allocates above its static pool (1.5 GiB
+under Gemma's 32k prompt) plus SGLang's own allocations inside the pool that amendment A14
+takes out of the margin (2 GiB). vLLM up to 22 GiB of weights needs up to 6.7 GiB of the
+9.25 GiB held; SGLang about 5.1 to 6.6 GiB outside its pool plus the 2 GiB inside. The flat
+8 GiB is therefore justified for every checkpoint the catalog measured up to 22 GiB of
+weights: there is no evidence for a smaller margin. It is not enough for large ones:
+gpt-oss-120b on vLLM held 7.3 GiB of GPU memory beyond the weights and the KV cache (12 % of
+the weights) and 5.2 GiB on the CPU side, 12.5 GiB in all, against the 9.25 GiB held, so its
+Ready charge (78.0 GiB) was 3.3 GiB short of the 81.3 GiB in use. vLLM's sleep mode (deep
+parking) loads the weights eagerly and keeps 0.5 to 19 GiB of CPU-side memory depending on
+the checkpoint (most on multimodal checkpoints served as text only); no margin covers that,
+and those recipes run `restart_only`. gpt-oss-20b on SGLang needed 32 GiB because SGLang
+loads its MXFP4 checkpoint as 17.1 GB (20.8 GB with the memory saver) against 13.8 GB on
+disk, so the static pool of a 24 GiB request did not hold the loaded weights; that gap is
+SGLang's sizing, not the margin's.
+
+Rule:
+
+- On memory that is not a discrete GPU's (unified memory), the margin of a vLLM or SGLang
+  memory request, declared or derived, is `max(family margin, weights × 0.15 + 4 GiB)`
+  (`unified_margin`). The family margin, 8 GiB, is the floor; the 4 GiB is the CPU-side term
+  a discrete host is charged on its system domain; 0.15 is gpt-oss-120b's measured 0.12 of
+  GPU-side memory beyond the weights and the KV cache, rounded up. The term passes the floor
+  above 26.7 GiB of weights (28,633,115,400 bytes), so every checkpoint up to that keeps the
+  8 GiB it had. Unknown weights keep the floor; TensorFold keeps none (it declares its
+  resources).
+- The margin is recorded as `margin_bytes`, as before. A derived request is the weights, the
+  KV cache and this margin (plus the hybrid state of A16, which the same margin sizes); a KV
+  cache left out of a declared request is the request less the weights and this margin;
+  SGLang's static pool is the request less it. The startup placeholder (A2, A8) keeps the
+  family margin.
+- A revision that records the family margin (8 GiB) re-resolves with it, exactly as it was
+  frozen, on unified memory as beside a declared discrete request (ADR 0019 A1);
+  `CheckpointFacts::legacy_family_margin` replaces `legacy_device_margin` for both.
+- Discrete GPUs are unchanged: a declared request keeps the weights × 0.10, a derived one is
+  the weights × 1.10 plus the KV cache.
+
+Effect: no recipe in the catalog changes (all are below 26.7 GiB of weights). On a GB10
+managed to 96 GiB: gpt-oss-120b on vLLM with an 8 GiB KV cache derives a 81.9 GiB request
+(was 76.8; margin 13.1 GiB, was 8) and is charged 83.1 GiB once ready, above the 81.3 GiB
+measured; its declared 90 GiB startup is unchanged, and it still fits. On SGLang with a
+declared 90 GiB request it keeps that reservation with a 16.1 GiB KV cache instead of
+21.2 GiB. Qwen3.8-Flash-Next (126 GiB of weight files, 47.7 GiB of them an N-gram table) is
+refused against a 90 GiB request before and after (its weights alone exceed it); its margin
+would be 22.9 GiB.
+
+CPU tests cover the formula's boundary, the gpt-oss-20b and gpt-oss-120b cases, a frozen
+revision's exact re-resolution and the #68 discrete case. Not qualification: a live run of
+gpt-oss-120b on vLLM on a GB10 should confirm the new Ready charge holds the footprint.

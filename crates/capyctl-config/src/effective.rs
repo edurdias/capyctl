@@ -13,12 +13,12 @@ pub use current_policy::{compose_current_resource_controls, deployment_command_f
 pub use declared_resources::validate_declared_resources;
 pub use engine_config::{
     default_startup_bytes, host_backed_copy_bytes, overhead_margin, resolve_memory,
-    resolve_startup, startup_graph_allowance, CheckpointFacts, MemoryInputs, ResolvedMemory,
-    ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
-    HOST_BACKED_COPY_FACTOR, LEGACY_STARTUP_WEIGHTS_FACTOR,
+    resolve_startup, startup_graph_allowance, unified_margin, CheckpointFacts, MemoryInputs,
+    ResolvedMemory, ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
+    ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES, HOST_BACKED_COPY_FACTOR, LEGACY_STARTUP_WEIGHTS_FACTOR,
     PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES, PARKED_RESIDUAL_PLACEHOLDER_BYTES,
     SGLANG_OVERHEAD_MARGIN_BYTES, STARTUP_GRAPH_ALLOWANCE_BYTES, STARTUP_WEIGHTS_FACTOR,
-    VLLM_OVERHEAD_MARGIN_BYTES,
+    UNIFIED_MARGIN_HOST_BYTES, UNIFIED_MARGIN_WEIGHTS_PERCENT, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 pub use legacy::{
     is_legacy_effective, legacy_engine_config, legacy_retained_deployment,

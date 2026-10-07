@@ -1963,6 +1963,180 @@ fn a_request_declared_on_a_discrete_gpu_is_sized_for_the_card() {
     );
 }
 
+/// A GB10-like unified host: 121.7 GiB of memory, managed to 96 GiB as the
+/// 2026-10-07 catalog ran it.
+fn gb10_host() -> serde_json::Value {
+    let mut h = host();
+    h["resource_policy"]["domains"]["unified"]["managed_limit"] = "96GiB".into();
+    h["resource_policy"]["domains"]["unified"]["free_reserve"] = "24GiB".into();
+    h
+}
+
+/// A deployment on `engine` stating only `memory`.
+fn with_memory(engine: &str, memory: serde_json::Value) -> serde_json::Value {
+    let mut d = deployment_with("restart_only", engine, "1GiB");
+    d["engine_config"] = serde_json::json!({ "memory": memory });
+    d
+}
+
+// T14 (ADR 0014 amendment A18, owner decision 2026-10-07): on unified memory
+// the margin is max(8 GiB, weights x 0.15 + 4 GiB). Every checkpoint the GB10
+// catalog measured below 26.7 GiB of weights keeps the 8 GiB it measured
+// enough; gpt-oss-20b on SGLang (13,761,316,904 bytes of weights, a declared
+// 32 GiB request) derives the same KV cache as before.
+#[test]
+fn the_unified_margin_keeps_its_floor_below_26_gib_of_weights() {
+    const GPT_OSS_20B: i64 = 13_761_316_904;
+    for engine in ["vllm", "sglang"] {
+        let r = resolve_weighing(
+            &with_memory(engine, serde_json::json!({"request": "32GiB"})),
+            &gb10_host(),
+            Some(GPT_OSS_20B),
+        )
+        .unwrap();
+        let memory = r.engine_config.memory();
+        assert_eq!(memory.margin_bytes, 8 * GIB, "{engine}");
+        assert_eq!(memory.kv_cache_bytes, 32 * GIB - GPT_OSS_20B - 8 * GIB);
+        round_trips(&r);
+    }
+    // The boundary: weights x 0.15 + 4 GiB stays below 8 GiB at
+    // 28,633,115,399 bytes and passes it 100 bytes later.
+    let margin = |weights: i64| {
+        resolve_weighing(
+            &with_memory("vllm", serde_json::json!({"kv_cache": "4GiB"})),
+            &gb10_host(),
+            Some(weights),
+        )
+        .unwrap()
+        .engine_config
+        .memory()
+        .margin_bytes
+    };
+    assert_eq!(margin(28_633_115_399), 8 * GIB);
+    assert_eq!(margin(28_633_115_400), 286_331_154 * 15 + 4 * GIB);
+    assert!(margin(28_633_115_400) > 8 * GIB);
+    // Unknown weights keep the floor.
+    let unknown = resolve_weighing(
+        &with_memory(
+            "sglang",
+            serde_json::json!({"request": "32GiB", "kv_cache": "4GiB"}),
+        ),
+        &gb10_host(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(unknown.engine_config.memory().margin_bytes, 8 * GIB);
+}
+
+// T14 (ADR 0014 amendment A18, found live 2026-10-07 on GB10 with vLLM 0.30.0
+// and gpt-oss-120b, 65,248,893,184 bytes of weights, an 8 GiB KV cache): the
+// engine held 79.8 to 81.3 GiB once ready against a 78.02 GiB Ready charge
+// (weights + KV + the 8 GiB margin + the CUDA context). The margin is now the
+// weights x 0.15 + 4 GiB: a derived request grows by it, a declared one
+// leaves a smaller KV cache, and both still fit the 96 GiB managed limit.
+#[test]
+fn the_unified_margin_grows_with_large_weights() {
+    const GPT_OSS_120B: i64 = 65_248_893_184;
+    let margin = GPT_OSS_120B / 100 * 15 + 4 * GIB;
+    assert_eq!(margin, 14_082_301_261);
+    let overhead = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    let derived = resolve_weighing(
+        &with_memory(
+            "vllm",
+            serde_json::json!({"kv_cache": "8GiB", "startup": "90GiB"}),
+        ),
+        &gb10_host(),
+        Some(GPT_OSS_120B),
+    )
+    .unwrap();
+    let memory = derived.engine_config.memory();
+    assert_eq!(memory.margin_bytes, margin);
+    assert_eq!(memory.request_bytes, GPT_OSS_120B + 8 * GIB + margin);
+    // 83.1 GiB charged once ready, above the 81.3 GiB measured.
+    assert_eq!(
+        derived.resources.ready.allocations[0].bytes,
+        GPT_OSS_120B + 8 * GIB + margin + overhead
+    );
+    assert!(derived.resources.ready.allocations[0].bytes > 81 * GIB + 3 * GIB / 10);
+    round_trips(&derived);
+    let declared = resolve_weighing(
+        &with_memory(
+            "sglang",
+            serde_json::json!({"request": "90GiB", "startup": "90GiB"}),
+        ),
+        &gb10_host(),
+        Some(GPT_OSS_120B),
+    )
+    .unwrap();
+    let memory = declared.engine_config.memory();
+    assert_eq!(memory.margin_bytes, margin);
+    assert_eq!(memory.request_bytes, 90 * GIB);
+    assert_eq!(memory.kv_cache_bytes, 90 * GIB - GPT_OSS_120B - margin);
+    round_trips(&declared);
+    // TensorFold declares its resources and keeps no margin.
+    assert_eq!(
+        capyctl_config::effective::unified_margin(Engine::Tensorfold, Some(GPT_OSS_120B)),
+        0
+    );
+}
+
+// T14 (ADR 0014 amendment A18): a revision frozen with the 8 GiB family
+// margin re-resolves exactly as it was, so its digest does not change.
+#[test]
+fn a_revision_frozen_with_the_family_margin_keeps_it() {
+    const GPT_OSS_120B: i64 = 65_248_893_184;
+    let mut host = gb10_host();
+    let mut sglang = host.clone();
+    sglang_profile(&mut sglang);
+    host["runtime_profiles"]["vllm"] = host["runtime_profiles"]["local"].clone();
+    host["runtime_profiles"]["sglang"] = sglang["runtime_profiles"]["local"].clone();
+    for (engine, memory) in [
+        (
+            "vllm",
+            serde_json::json!({"kv_cache": "8GiB", "startup": "90GiB"}),
+        ),
+        (
+            "sglang",
+            serde_json::json!({"request": "90GiB", "startup": "90GiB"}),
+        ),
+    ] {
+        let frozen = resolve_effective_with_checkpoint(
+            &with_memory(engine, memory),
+            &host,
+            CheckpointFacts {
+                weights_bytes: Some(GPT_OSS_120B),
+                legacy_family_margin: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frozen.engine_config.memory().margin_bytes, 8 * GIB);
+        round_trips(&frozen);
+    }
+}
+
+// T26 (ADR 0019 §3, the case of #68: an 8B FP8 checkpoint of 10,605,572,552
+// bytes on a 16 GB card): a request declared for a discrete GPU keeps the
+// device margin, the weights x 0.10; amendment A18 changes unified memory
+// only.
+#[test]
+fn a_declared_discrete_request_keeps_the_device_margin() {
+    const WEIGHTS: i64 = 10_605_572_552;
+    let r = resolve_weighing(
+        &with_memory("vllm", serde_json::json!({"request": "12GiB"})),
+        &discrete_host(),
+        Some(WEIGHTS),
+    )
+    .unwrap();
+    let memory = r.engine_config.memory();
+    assert_eq!(memory.margin_bytes, WEIGHTS / 100 * 10);
+    assert_eq!(
+        memory.kv_cache_bytes,
+        12 * GIB - WEIGHTS - WEIGHTS / 100 * 10
+    );
+    round_trips(&r);
+}
+
 // T14, T39: no env keeps the fingerprint; a deployment env shows with its source.
 #[test]
 fn engine_env_is_in_the_effective_configuration() {

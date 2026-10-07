@@ -137,7 +137,10 @@ pub struct MemoryRequest {
     pub request_bytes: i64,
     /// The KV cache the engine is asked to size, declared or derived.
     pub kv_cache_bytes: i64,
-    /// The per-family overhead margin used when anything was derived.
+    /// The overhead margin beside the weights and the KV cache: on unified
+    /// memory `max(family margin, weights x 0.15 + 4 GiB)` (ADR 0014
+    /// amendment A18), on a discrete GPU the weights x 0.10 of a declared
+    /// request (ADR 0019 §3), else the family margin.
     pub margin_bytes: i64,
     /// Sum of weight-file sizes from the checkpoint manifest (ADR 0014 §7),
     /// when known at resolution. Recorded so a snapshot re-derives identically.
