@@ -3858,20 +3858,9 @@ impl GroupWorld {
     /// group's park is a group stop (R34) and answers once the stopped
     /// generation settled.
     pub(super) async fn park(&self, name: &str) -> Result<(), GroupResidencyError> {
-        let fence = self.deployed.lock().unwrap()[name].clone();
-        let id = fence.deployment_id.clone();
-        let before = self.residency_outcomes(&id, ResidencyKind::Park).len();
         let generation = self.group_plan(name).map(|(plan, _)| plan.generation());
-        self.worker
-            .commands()
-            .park(
-                "owner",
-                &id,
-                fence.revision,
-                &ulid::Ulid::new().to_string(),
-                capyctl_protocol::now_unix_ms() + RESIDENCY_WINDOW_MS,
-            )
-            .unwrap_or_else(|e| panic!("the park of {name} was refused: {e:?}"));
+        let before = self.issue_park(name);
+        let id = self.id(name);
         self.until(&format!("the park of {name}"), || {
             if let Some(outcome) = self
                 .residency_outcomes(&id, ResidencyKind::Park)
@@ -3889,6 +3878,81 @@ impl GroupWorld {
             (settled && self.observed_state(&id).as_deref() == Some("stopped")).then_some(Ok(()))
         })
         .await
+    }
+
+    /// Issue SPEC §6.3 `park deployment` of group `name` as an operator
+    /// does; returns how many of its parks had concluded before it.
+    fn issue_park(&self, name: &str) -> usize {
+        let fence = self.deployed.lock().unwrap()[name].clone();
+        let before = self
+            .residency_outcomes(&fence.deployment_id, ResidencyKind::Park)
+            .len();
+        self.worker
+            .commands()
+            .park(
+                "owner",
+                &fence.deployment_id,
+                fence.revision,
+                &ulid::Ulid::new().to_string(),
+                capyctl_protocol::now_unix_ms() + RESIDENCY_WINDOW_MS,
+            )
+            .unwrap_or_else(|e| panic!("the park of {name} was refused: {e:?}"));
+        before
+    }
+
+    /// How the park of deep group `name` issued after `before` concluded.
+    async fn park_concluded(&self, name: &str, before: usize) -> Result<(), GroupResidencyError> {
+        let id = self.id(name);
+        self.until(&format!("the park of {name}"), || {
+            self.residency_outcomes(&id, ResidencyKind::Park)
+                .get(before)
+                .cloned()
+        })
+        .await
+    }
+
+    /// The coordinator takes no command while the permit is held: every
+    /// command, a stop included, is refused `Busy`.
+    fn hold_commands(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let all = u32::try_from(CoordinatorOptions::default().max_observers).unwrap();
+        self.worker
+            .shared
+            .observers
+            .clone()
+            .try_acquire_many_owned(all)
+            .expect("no command in flight")
+    }
+
+    /// A request leased on group `name`'s instance, as the router holds one.
+    fn lease_request(&self, name: &str, lease: &str) {
+        let fence = self.deployed.lock().unwrap()[name].clone();
+        let generation = self.group_plan(name).unwrap().0.generation();
+        let session = self.owner.lock().unwrap().session().id().to_owned();
+        let sql = rusqlite::Connection::open(self._dir.path().join("srv.sqlite3")).unwrap();
+        sql.execute(
+            "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index) VALUES(?1,?2,?3,?4,?5,'inflight',0)",
+            rusqlite::params![lease, fence.deployment_id, fence.revision, generation, session],
+        )
+        .unwrap();
+    }
+
+    /// The leased request `lease` ended.
+    fn end_lease(&self, lease: &str) {
+        let sql = rusqlite::Connection::open(self._dir.path().join("srv.sqlite3")).unwrap();
+        sql.execute("DELETE FROM request_leases WHERE id=?1", [lease])
+            .unwrap();
+    }
+
+    /// Whether a dispatch closure reason is recorded for group `name`'s
+    /// instance, so no switch or re-proof reopens its gate.
+    fn dispatch_closure_recorded(&self, name: &str) -> bool {
+        let sql = rusqlite::Connection::open(self._dir.path().join("srv.sqlite3")).unwrap();
+        sql.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_closures WHERE deployment_id=?1 AND instance_index=0)",
+            [self.id(name)],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     /// SPEC §6.3 `start deployment` of parked group `name`: a deep group
@@ -3991,6 +4055,103 @@ async fn silent_member_keeps_full_charge() {
         world.member_request()
     );
     assert_eq!(world.status("g").await.member(1).state, "uncertain");
+}
+
+// T20, T32 (R42; ADR 0028 §11, §12): a park that failed after the head's
+// collective ran leaves the group half-parked. Its dispatch closes at once
+// under a recorded reason, so no switch or re-proof reopens it, and the
+// group stop the failure asks for is retried until it is accepted: refused
+// while the coordinator takes no command, the group is stopped once it does
+// and every member is released on its own host's evidence.
+#[tokio::test]
+async fn a_failed_park_closes_dispatch_and_retries_a_refused_stop() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let g = world.id("g");
+    world.group.sleep_leaves_rank_resident(1);
+    let before = world.issue_park("g");
+    let busy = world.hold_commands();
+    assert_eq!(
+        world.park_concluded("g", before).await.unwrap_err(),
+        GroupResidencyError::MemberResident { rank: 1 }
+    );
+    world.settle_for(Duration::from_millis(500)).await;
+    assert!(!world.route_open("g"), "a half-parked group serves nothing");
+    assert!(world.dispatch_closure_recorded("g"));
+    assert!(
+        world.group.alive(0) && world.group.alive(1),
+        "the refused stop sent nothing"
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        world.member_request()
+    );
+    drop(busy);
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_member_failed");
+    world.assert_release_evidence_per_member("g");
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    // Stopped under the failure principal (a rank failed), so it reads failed.
+    assert_eq!(world.state("g").await, "failed");
+    assert!(!world.route_open("g"));
+}
+
+// T20, T32 (R42; ADR 0028 §12): every member reported on its own host, but
+// the store refused to commit the evidence (a request leased on the instance
+// meanwhile). That proves nothing of any one rank: the group is stopped as
+// uncertain without naming a rank, and no member is marked uncertain for it.
+#[tokio::test]
+async fn a_refused_park_commit_is_uncertain_without_a_rank() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.group.disconnect_host("host-b");
+    let before = world.issue_park("g");
+    world
+        .until("the head's collective", || {
+            (world.group.sleep_calls() == 1).then_some(())
+        })
+        .await;
+    world.lease_request("g", "late-request");
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    let error = world.park_concluded("g", before).await.unwrap_err();
+    assert!(
+        matches!(error, GroupResidencyError::Unproven(_)),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "group_member_uncertain");
+    assert_eq!(error.failed_rank(), None);
+    let status = world.status("g").await;
+    assert_eq!(status.last_error(), "group_member_uncertain");
+    let states: Vec<&str> = status.members.iter().map(|m| m.state.as_str()).collect();
+    assert!(states.iter().all(|s| *s != "uncertain"), "{states:?}");
+    world.end_lease("late-request");
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+}
+
+// T16, T20, T27 (R39, R40; ADR 0028 §12): on single-claim hosts a parked
+// member still occupies its host, so a deep (parkable) group chosen as a
+// victim there is stopped whole, never parked: no collective is sent, and each
+// member is released only on its own host's evidence.
+#[tokio::test]
+async fn a_deep_group_victim_on_a_single_claim_host_is_stopped_not_parked() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"])
+        .await
+        .with_single_rank("s", "host-a");
+    let g = world.id("g");
+    world.request("s").await;
+    assert_eq!(world.state("s").await, "ready");
+    assert_eq!(world.state("g").await, "stopped");
+    assert_eq!(
+        world.group.sleep_calls(),
+        0,
+        "a single-claim victim never parks"
+    );
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        0
+    );
 }
 
 // T20: a wake whose canary differs stops the group.

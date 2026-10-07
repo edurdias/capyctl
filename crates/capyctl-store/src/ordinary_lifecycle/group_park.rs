@@ -662,6 +662,22 @@ pub(super) fn refuse_members(
     Ok(())
 }
 
+/// ADR 0028 §11, §12 (R42): a group instance whose park or wake ended
+/// uncertain and that no stop has fenced since: its group stop is still owed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupResidencyStop {
+    pub deployment_id: String,
+    pub instance_index: u32,
+    /// The generation the park or wake ran at.
+    pub generation: i64,
+    /// The park or restore operation that ended uncertain.
+    pub operation_id: String,
+    /// Whether a member failure was recorded on the plan (a stop under the
+    /// failure principal, which `recovery: reconcile` relaunches after
+    /// settlement), rather than an uncertainty alone.
+    pub failed: bool,
+}
+
 impl crate::Store {
     /// ADR 0028 §12: the members of the group a planned or armed park or wake
     /// acts on, in rank order, each with its own host and parked budget.
@@ -690,6 +706,41 @@ impl crate::Store {
         };
         tx.commit()?;
         Ok(out)
+    }
+
+    /// ADR 0028 §11, §12 (R42): every group instance whose park or wake ended
+    /// uncertain at its current generation while it still reads desired
+    /// ready: no stop has been accepted for it since (an accepted stop draws
+    /// a new generation). The coordinator retries each one's group stop until
+    /// it is accepted.
+    pub fn group_residency_stops_due(
+        &self,
+        s: &CoordinatorSession,
+    ) -> Result<Vec<GroupResidencyStop>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let due = tx
+            .prepare(
+                "SELECT i.deployment_id,i.instance_index,i.generation,o.id,g.failed_rank IS NOT NULL
+                   FROM deployment_instances i
+                   JOIN group_plans g ON g.deployment_id=i.deployment_id AND g.instance_index=i.instance_index AND g.generation=i.generation
+                   JOIN lifecycle_runs r ON r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.generation=i.generation
+                   JOIN operations o ON o.id=r.operation_id
+                  WHERE r.state='uncertain' AND o.kind IN ('park','restore') AND i.desired_state='ready'
+                  ORDER BY i.deployment_id,i.instance_index,o.id",
+            )?
+            .query_map([], |r| {
+                Ok(GroupResidencyStop {
+                    deployment_id: r.get(0)?,
+                    instance_index: r.get(1)?,
+                    generation: r.get(2)?,
+                    operation_id: r.get(3)?,
+                    failed: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        Ok(due)
     }
 
     /// ADR 0028 §12: arm one planned group park or wake at `now`. A wake is

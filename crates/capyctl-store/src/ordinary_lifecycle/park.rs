@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 // ADR 0028 §12: a group instance's park and wake, member by member.
 #[path = "group_park.rs"]
 mod group;
-pub use group::{ArmedMember, MemberResidency};
+pub use group::{ArmedMember, GroupResidencyStop, MemberResidency};
 
 /// ADR 0028 §12: each member host's parked budget when the instance's group
 /// at `generation` parks (every member host's resolution parks), keyed by
@@ -1394,6 +1394,21 @@ impl crate::Store {
             "UPDATE deployment_instances SET dispatch_enabled=0 WHERE deployment_id=?1 AND instance_index=?2",
             params![p.deployment_id, p.instance_index],
         )?;
+        // ADR 0028 §11, §12 (R42): a group park or wake that did not settle
+        // may have left the group half-parked, and its group stop may not be
+        // accepted at once. The reason is recorded, so no switch or re-proof
+        // reopens the gate before that stop proves every member gone. It is
+        // the engine-exit reason: a rank no longer serves as part of the
+        // group, as after its exit (the closure set is closed, schema v28).
+        if group::is_group(&tx, &p)? {
+            crate::switch_state::record_closure(
+                &tx,
+                &p.deployment_id,
+                p.instance_index,
+                p.generation,
+                crate::switch_state::ClosureReason::EngineExit,
+            )?;
+        }
         journal(
             &tx,
             &p.operation_id,

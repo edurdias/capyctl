@@ -488,6 +488,16 @@ impl Scheduler {
                 shared.changed.notify_waiters();
             }
         }
+        // ADR 0028 §11, §12 (R42): a group whose park or wake did not settle
+        // owes a group stop; one not accepted yet is retried every pass until
+        // it is, its dispatch closed and every member charged meanwhile.
+        if shared.groups.is_some()
+            && super::retry_group_residency_stops(&shared)
+                .await
+                .map_err(failed)?
+        {
+            shared.changed.notify_waiters();
+        }
         // Owner decision 2026-09-22: a drain Stop that expired, never armed,
         // while its host was offline is closed as expired and issued afresh
         // once the host is back. ADR 0015: that closes a planned cleanup, so it
