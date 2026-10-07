@@ -150,7 +150,6 @@ fn group_members<'t>(
     shape: &capyctl_config::topology::GroupShape,
     targets: &'t [HostTarget],
 ) -> Result<Vec<&'t HostTarget>> {
-    use capyctl_config::topology::GroupRefusal;
     let mut members: Vec<&HostTarget> = Vec::with_capacity(shape.hosts.len());
     for name in &shape.hosts {
         let target = targets
@@ -160,83 +159,38 @@ fn group_members<'t>(
         if members.iter().any(|m| m.host_id == target.host_id) {
             return Err(ManagedConfigurationError::Invalid);
         }
-        let policy = capyctl_config::groups_policy::host_groups_policy(&target.trusted_host)
+        capyctl_config::topology::check_member_peer_address(name, &target.trusted_host)
             .map_err(ManagedConfigurationError::Rejected)?;
-        if policy.peer_address.is_none() {
-            return Err(ManagedConfigurationError::Rejected(
-                GroupRefusal::PeerAddressMissing.at(
-                    "placement.hosts",
-                    &format!("host `{name}` declares no resource_policy.groups.peer_address"),
-                ),
-            ));
-        }
         members.push(target);
     }
     Ok(members)
 }
 
-/// ADR 0028 §2, spec §16: why one named host of a group did not resolve. A
-/// profile that does not resolve there is `group_profile_mismatch`; any other
-/// configuration reason (an engine env name not approved on that host,
-/// `engine_env_not_approved:<name>`) is named as it is.
+/// ADR 0028 §2, spec §16: why one named host of a group did not resolve
+/// (`capyctl_config::topology::member_resolution_error`).
 fn group_member_error(host: &str, error: ManagedConfigurationError) -> ManagedConfigurationError {
     match error {
-        ManagedConfigurationError::Rejected(error)
-            if matches!(
-                error.path.as_str(),
-                "runtime_profile" | "runtime_profile_revision"
-            ) =>
-        {
-            ManagedConfigurationError::Rejected(
-                capyctl_config::topology::GroupRefusal::ProfileMismatch.at(
-                    &error.path,
-                    &format!("the runtime profile does not resolve on host `{host}`"),
-                ),
-            )
-        }
+        ManagedConfigurationError::Rejected(error) => ManagedConfigurationError::Rejected(
+            capyctl_config::topology::member_resolution_error(host, error),
+        ),
         other => other,
     }
 }
 
-/// ADR 0028 §2: the members of one group run one build (else
-/// `group_profile_mismatch`), and the decision every host makes before a
-/// launch, Park or Restore (`EffectiveDeployment::deep_wake_refusal`, the
-/// capability gate) admits every member's resolution: one member refused
-/// refuses the group before anything is stored or reserved. `resolved` is in
-/// rank order, the head first.
+/// ADR 0028 §2: one build across the members and every member's resolution
+/// admitted by the capability gate
+/// (`capyctl_config::topology::check_group_members`). `resolved` is in rank
+/// order, the head first.
 fn check_group_members(resolved: &[Resolved]) -> Result<()> {
-    let Some(head) = resolved.first() else {
+    if resolved.is_empty() {
         return Err(ManagedConfigurationError::Invalid);
-    };
-    for member in resolved {
-        if member.effective.profile.engine != head.effective.profile.engine
-            || member.effective.profile.build_fingerprint
-                != head.effective.profile.build_fingerprint
-        {
-            return Err(ManagedConfigurationError::Rejected(
-                capyctl_config::topology::GroupRefusal::ProfileMismatch.at(
-                    "runtime_profile",
-                    &format!(
-                        "the runtime profile's build on host `{}` differs from the head's on `{}`",
-                        member.host_id, head.host_id
-                    ),
-                ),
-            ));
-        }
-        if let Some(reason) = member.effective.deep_wake_refusal() {
-            return Err(ManagedConfigurationError::Rejected(
-                capyctl_config::ConfigError::new(
-                    capyctl_config::ConfigErrorCode::UnsupportedCombination,
-                    "residency",
-                    format!(
-                        "{reason}: host `{}` cannot park and wake this group member",
-                        member.host_id
-                    ),
-                ),
-            ));
-        }
     }
-    Ok(())
+    let members: Vec<(&str, &capyctl_config::effective::EffectiveDeployment)> = resolved
+        .iter()
+        .map(|member| (member.host_id.as_str(), &member.effective))
+        .collect();
+    capyctl_config::topology::check_group_members(&members)
+        .map_err(ManagedConfigurationError::Rejected)
 }
 
 impl crate::Store {

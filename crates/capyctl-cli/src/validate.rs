@@ -12,7 +12,9 @@
 //!   (ADR 0013 §2), the declared `timeouts` (ADR 0014 amendment A1) and a
 //!   declared startup peak (owner decision 2026-09-23), then,
 //!   when `--host` names a host document, the effective resolution the host
-//!   agent performs before launch.
+//!   agent performs before launch; for a group deployment, one `--host` per
+//!   host it names and the group checks deploy runs across them (ADR 0028
+//!   §2, §3; design §15, decided 2026-10-06).
 //!
 //! Owner decision 2026-09-25: `--set path=value` (and `CAPYCTL_SET__…` in the
 //! environment) change a role document's settings before these checks, as the
@@ -21,7 +23,7 @@
 //! Nothing is written, created, or contacted: the command reads the named files
 //! and reports.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use capyctl_config::{parse_strict, ConfigError, ConfigErrorCode, ConfigKind};
 use serde_json::{json, Value};
@@ -31,18 +33,21 @@ use crate::output::StructuredError;
 /// Bound on a configuration file read, matching `deploy model --file`.
 const MAX_BYTES: u64 = 1024 * 1024;
 
-pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, StructuredError> {
-    validate_config_with(file, host, &[])
+/// `hosts` are the `--host` documents: none, one, or for a group deployment
+/// one per name in `placement.hosts` (ADR 0028, design §15, decided
+/// 2026-10-06).
+pub fn validate_config(file: &Path, hosts: &[PathBuf]) -> Result<Value, StructuredError> {
+    validate_config_with(file, hosts, &[])
 }
 
 /// As [`validate_config`], with `--set` overrides (`sets`) and the
 /// environment's `CAPYCTL_SET__…` applied to a role document first.
 pub fn validate_config_with(
     file: &Path,
-    host: Option<&Path>,
+    hosts: &[PathBuf],
     sets: &[String],
 ) -> Result<Value, StructuredError> {
-    validate_config_at(file, host, sets, None)
+    validate_config_at(file, hosts, sets, None)
 }
 
 /// As [`validate_config_with`], with the state root a start would use when
@@ -52,7 +57,7 @@ pub fn validate_config_with(
 /// names, else the document's directory.
 pub fn validate_config_at(
     file: &Path,
-    host: Option<&Path>,
+    hosts: &[PathBuf],
     sets: &[String],
     state_root: Option<&Path>,
 ) -> Result<Value, StructuredError> {
@@ -78,7 +83,7 @@ pub fn validate_config_at(
         .into_iter()
         .map(|item| json!({"path": item.path, "value": item.value, "source": item.source.as_str()}))
         .collect();
-    if host.is_some() && kind != ConfigKind::Deployment {
+    if !hosts.is_empty() && kind != ConfigKind::Deployment {
         return Err(invalid(format!(
             "{}: --host applies only to a deployment document, not a {} document",
             file.display(),
@@ -155,11 +160,12 @@ pub fn validate_config_at(
             // SPEC §15.3, ADR 0023 §4: `resources` is decoded as the server decodes it.
             capyctl_config::effective::validate_declared_resources(&deployment)
                 .map_err(|e| named(file, Some(kind), &e))?;
-            match host {
+            let group = instances.group.as_ref();
+            match (hosts, group) {
                 // Owner decision 2026-09-25: the document with the defaults a
                 // minimal file leaves out, as deploy sends it.
                 // SPEC §15.3: say plainly what was not checked.
-                None => {
+                ([], _) => {
                     let mut out = json!({
                         "valid": true,
                         "kind": kind.as_str(),
@@ -181,139 +187,27 @@ pub fn validate_config_at(
                     }
                     return Ok(out);
                 }
-                Some(host_file) => {
-                    read(host_file)?;
-                    let (name, host_document) = host_policy_document(
+                ([host_file], None) => {
+                    let (name, host_document) = host_file_document(host_file)?;
+                    let (out, _) = resolve_on_host(
+                        file,
+                        &deployment,
+                        &instances,
                         host_file,
-                        &capyctl_config::setting_overrides::SettingOverrides::none(
-                            ConfigKind::Host,
-                        ),
-                    )
-                    .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
-                    // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's
-                    // deploy runs against this host's publication, in its
-                    // order (`registry_targets`), so a file validate accepts
-                    // is not refused by deploy for a reason it could name.
-                    // A host outside the allowed set is no candidate.
-                    if !instances.placement.allows(&name) {
-                        return Err(invalid(format!(
-                            "{}: deployment document: its placement does not allow host `{name}`",
-                            file.display()
-                        )));
-                    }
-                    let labels = capyctl_config::instances::host_labels(&host_document)
-                        .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
-                    if !instances.placement.selector_matches(&labels) {
-                        return Err(invalid(format!(
-                            "{}: deployment document: its placement.selector does not match the labels of host `{name}` (deploy refuses it: selector_mismatch)",
-                            file.display()
-                        )));
-                    }
-                    let profiles = host_document["runtime_profiles"]
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default();
-                    if profiles.is_empty() {
-                        return Err(invalid(format!(
-                            "{}: host `{name}` declares no runtime profile, in its document or in {}; register one with `capyctl engine add` (deploy refuses it: no_runtime_profiles)",
-                            host_file.display(),
-                            capyctl_config::registration::engines_beside(host_file).display()
-                        )));
-                    }
-                    let profile = deployment["runtime_profile"].as_str().unwrap_or_default();
-                    // Owner decision 2026-09-25: an engine family names the
-                    // host's one profile of that family.
-                    if capyctl_config::deployment_defaults::profile_on_host(profile, &host_document)
-                        .is_none()
-                    {
-                        let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
-                        return Err(StructuredError {
-                            code: "profile_not_published",
-                            message: format!(
-                                "{}: deployment document: runtime profile `{profile}` is not declared by host `{name}` (it declares {}); register it with `capyctl engine add`, or name one of those",
-                                file.display(),
-                                names.join(", ")
-                            ),
-                        });
-                    }
-                    // Unnamed device claims take this host's devices, and the
-                    // per-host recipe carries no deployment-level field. ADR
-                    // 0028 §2: a group member's recipe keeps its rank-ordered
-                    // host list, so it resolves as the group it is (as the
-                    // server's deploy resolves each named host).
-                    let group = instances.group.is_some();
-                    let strip = |mut source: Value| {
-                        if let Some(object) = source.as_object_mut() {
-                            for field in ["instances", "placement", "host"] {
-                                if field == "placement" && group {
-                                    continue;
-                                }
-                                object.remove(field);
-                            }
-                        }
-                        source
-                    };
-                    // As the server resolves it: both documents scoped to the
-                    // host's ledger keys, and the host's resource policy
-                    // composed as the current controls (its first publication
-                    // stores exactly these).
-                    let scoped = scoped_resolution(&name, &deployment, &host_document)
-                        .map_err(|e| named(file, Some(kind), &e))?;
-                    resolve_for_acceptance(&strip(scoped.0), &scoped.1)
-                        .map_err(|e| named(file, Some(kind), &e))?;
-                    // The host-local view the operator reads (device and
-                    // domain names as the host document writes them).
-                    let source = strip(
-                        capyctl_config::instances::assign_devices(&deployment, &host_document)
-                            .map_err(|e| named(file, Some(kind), &e))?,
-                    );
-                    let (effective, provisional) = resolve_for_acceptance(&source, &host_document)
-                        .map_err(|e| named(file, Some(kind), &e))?;
-                    let mut out = json!({
-                        "valid": true,
-                        "kind": kind.as_str(),
-                        "file": file.display().to_string(),
-                        "resolved_against": name,
-                        "requires_server": REQUIRES_SERVER,
-                        "provisional": provisional,
-                        // Owner decision 2026-09-25: the document as this host
-                        // runs it, with every default filled.
-                        "document": source,
-                        "effective": {
-                            "name": effective.name,
-                            "routes": effective.routes,
-                            "runtime_profile": source["runtime_profile"],
-                            "runtime_profile_revision": effective.profile.revision,
-                            "selected_devices": effective.selected_devices,
-                            "memory": effective.engine_config.memory(),
-                            "provenance": serde_json::to_value(&effective.engine_config)
-                                .ok()
-                                .map(|config| config["provenance"].clone()),
-                            "residency": effective.residency,
-                            "recipe": effective.recipe,
-                            "recipe_fingerprint": effective.recipe_fingerprint,
-                            "resources": effective.resources,
-                            "request_deadline_ms": effective.request_deadline_ms,
-                            "timeouts": effective.timeouts,
-                            // Owner decision 2026-09-23: what admission
-                            // reserves from arm until Ready, before any
-                            // measurement on the host.
-                            "startup": capyctl_config::effective::startup_budget(&effective),
-                            // ADR 0014 §5 (owner decision 2026-09-25): the
-                            // context the launch passes, fitted to the KV
-                            // grant when undeclared, read from the checkpoint
-                            // as this machine sees it (a remote host fits it
-                            // again from its own copy at launch).
-                            "context": capyctl_config::context_fit::fit_for_effective(&effective),
-                            // ADR 0024: the parsers the launch passes,
-                            // chosen from the checkpoint as this machine sees it.
-                            "parsers": capyctl_config::parsers::parsers_for_effective(&effective),
-                        },
-                    });
-                    if provisional {
-                        unknown_until_measured(&mut out["effective"], &effective);
-                    }
+                        &name,
+                        &host_document,
+                    )?;
                     return Ok(out);
+                }
+                (_, None) => {
+                    return Err(invalid(format!(
+                        "{}: deployment document: it declares no group, so --host names one host document, not {}",
+                        file.display(),
+                        hosts.len()
+                    )));
+                }
+                (_, Some(shape)) => {
+                    return resolve_group(file, &deployment, &instances, shape, hosts);
                 }
             }
         }
@@ -331,6 +225,246 @@ pub fn validate_config_at(
         out["ignored"] = json!(standalone_ignored);
     }
     Ok(out)
+}
+
+/// A `--host` document as host publication reads it: its name and its policy
+/// document.
+fn host_file_document(host_file: &Path) -> Result<(String, Value), StructuredError> {
+    read(host_file)?;
+    host_policy_document(
+        host_file,
+        &capyctl_config::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+    )
+    .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))
+}
+
+/// The deployment resolved against one host document, as the server's deploy
+/// resolves it on that host: the report and the host-local resolution. For a
+/// group member, a profile that does not resolve there is the group's
+/// refusal (`capyctl_config::topology::member_resolution_error`), as deploy
+/// names it.
+fn resolve_on_host(
+    file: &Path,
+    deployment: &Value,
+    instances: &capyctl_config::instances::InstanceSpec,
+    host_file: &Path,
+    name: &str,
+    host_document: &Value,
+) -> Result<(Value, capyctl_config::effective::EffectiveDeployment), StructuredError> {
+    let kind = ConfigKind::Deployment;
+    let group = instances.group.is_some();
+    // ADR 0028 §2: a named host of a group that cannot resolve refuses the
+    // group with deploy's reason.
+    let refused = |error: ConfigError| {
+        let error = if group {
+            capyctl_config::topology::member_resolution_error(name, error)
+        } else {
+            error
+        };
+        named(file, Some(kind), &error)
+    };
+    // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's deploy runs
+    // against this host's publication, in its order (`registry_targets`), so
+    // a file validate accepts is not refused by deploy for a reason it could
+    // name. A host outside the allowed set is no candidate.
+    if !instances.placement.allows(name) {
+        return Err(invalid(format!(
+            "{}: deployment document: its placement does not allow host `{name}`",
+            file.display()
+        )));
+    }
+    let labels = capyctl_config::instances::host_labels(host_document)
+        .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
+    if !instances.placement.selector_matches(&labels) {
+        return Err(invalid(format!(
+            "{}: deployment document: its placement.selector does not match the labels of host `{name}` (deploy refuses it: selector_mismatch)",
+            file.display()
+        )));
+    }
+    let profiles = host_document["runtime_profiles"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let profile = deployment["runtime_profile"].as_str().unwrap_or_default();
+    let published = !profiles.is_empty()
+        && capyctl_config::deployment_defaults::profile_on_host(profile, host_document).is_some();
+    if !published && group {
+        return Err(refused(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "runtime_profile",
+            format!("runtime profile `{profile}` is not declared by host `{name}`"),
+        )));
+    }
+    if profiles.is_empty() {
+        return Err(invalid(format!(
+            "{}: host `{name}` declares no runtime profile, in its document or in {}; register one with `capyctl engine add` (deploy refuses it: no_runtime_profiles)",
+            host_file.display(),
+            capyctl_config::registration::engines_beside(host_file).display()
+        )));
+    }
+    // Owner decision 2026-09-25: an engine family names the host's one
+    // profile of that family.
+    if !published {
+        let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+        return Err(StructuredError {
+            code: "profile_not_published",
+            message: format!(
+                "{}: deployment document: runtime profile `{profile}` is not declared by host `{name}` (it declares {}); register it with `capyctl engine add`, or name one of those",
+                file.display(),
+                names.join(", ")
+            ),
+        });
+    }
+    // Unnamed device claims take this host's devices, and the per-host recipe
+    // carries no deployment-level field. ADR 0028 §2: a group member's recipe
+    // keeps its rank-ordered host list, so it resolves as the group it is (as
+    // the server's deploy resolves each named host).
+    let strip = |mut source: Value| {
+        if let Some(object) = source.as_object_mut() {
+            for field in ["instances", "placement", "host"] {
+                if field == "placement" && group {
+                    continue;
+                }
+                object.remove(field);
+            }
+        }
+        source
+    };
+    // As the server resolves it: both documents scoped to the host's ledger
+    // keys, and the host's resource policy composed as the current controls
+    // (its first publication stores exactly these).
+    let scoped = scoped_resolution(name, deployment, host_document).map_err(&refused)?;
+    resolve_for_acceptance(&strip(scoped.0), &scoped.1).map_err(&refused)?;
+    // The host-local view the operator reads (device and domain names as the
+    // host document writes them).
+    let source = strip(
+        capyctl_config::instances::assign_devices(deployment, host_document).map_err(&refused)?,
+    );
+    let (effective, provisional) =
+        resolve_for_acceptance(&source, host_document).map_err(&refused)?;
+    let mut out = json!({
+        "valid": true,
+        "kind": kind.as_str(),
+        "file": file.display().to_string(),
+        "resolved_against": name,
+        "requires_server": REQUIRES_SERVER,
+        "provisional": provisional,
+        // Owner decision 2026-09-25: the document as this host runs it, with
+        // every default filled.
+        "document": source,
+        "effective": {
+            "name": effective.name,
+            "routes": effective.routes,
+            "runtime_profile": source["runtime_profile"],
+            "runtime_profile_revision": effective.profile.revision,
+            "selected_devices": effective.selected_devices,
+            "memory": effective.engine_config.memory(),
+            "provenance": serde_json::to_value(&effective.engine_config)
+                .ok()
+                .map(|config| config["provenance"].clone()),
+            "residency": effective.residency,
+            "recipe": effective.recipe,
+            "recipe_fingerprint": effective.recipe_fingerprint,
+            "resources": effective.resources,
+            "request_deadline_ms": effective.request_deadline_ms,
+            "timeouts": effective.timeouts,
+            // Owner decision 2026-09-23: what admission reserves from arm
+            // until Ready, before any measurement on the host.
+            "startup": capyctl_config::effective::startup_budget(&effective),
+            // ADR 0014 §5 (owner decision 2026-09-25): the context the launch
+            // passes, fitted to the KV grant when undeclared, read from the
+            // checkpoint as this machine sees it (a remote host fits it again
+            // from its own copy at launch).
+            "context": capyctl_config::context_fit::fit_for_effective(&effective),
+            // ADR 0024: the parsers the launch passes, chosen from the
+            // checkpoint as this machine sees it.
+            "parsers": capyctl_config::parsers::parsers_for_effective(&effective),
+        },
+    });
+    if provisional {
+        unknown_until_measured(&mut out["effective"], &effective);
+    }
+    Ok((out, effective))
+}
+
+/// What a group's offline validation cannot judge: whether each host's model
+/// path is the one the engine needs (`group_model_path_mismatch`, ADR 0028
+/// OD2) is known only once every host has materialized the model, so the
+/// activation decides it.
+const GROUP_REQUIRES_ACTIVATION: &str = "the model path on each host (group_model_path_mismatch): known only once every host has materialized the model, so the activation checks it";
+
+/// ADR 0028, design §15, decided 2026-10-06: a group deployment checked as
+/// the server's deploy checks it, against one host document per name in
+/// `placement.hosts` (matched by the document's `name`): every named host
+/// declares its peer address, the deployment resolves on each with deploy's
+/// per-host checks (profile, engine shape and support, engine environment
+/// approvals), and the members agree on one build and pass the capability
+/// gate. The first refusal is reported with deploy's code; on success each
+/// host's resolution is listed under `hosts`, the head first.
+fn resolve_group(
+    file: &Path,
+    deployment: &Value,
+    instances: &capyctl_config::instances::InstanceSpec,
+    shape: &capyctl_config::topology::GroupShape,
+    hosts: &[PathBuf],
+) -> Result<Value, StructuredError> {
+    let mut documents: Vec<(&Path, String, Value)> = Vec::with_capacity(hosts.len());
+    for host_file in hosts {
+        let (name, document) = host_file_document(host_file)?;
+        if !shape.hosts.contains(&name) {
+            return Err(invalid(format!(
+                "{}: host `{name}` is not named in the group's placement.hosts ({}) of {}",
+                host_file.display(),
+                shape.hosts.join(", "),
+                file.display()
+            )));
+        }
+        if documents.iter().any(|(_, seen, _)| *seen == name) {
+            return Err(invalid(format!(
+                "{}: a second document for host `{name}`; pass one --host per named host",
+                host_file.display()
+            )));
+        }
+        documents.push((host_file, name, document));
+    }
+    // Rank order, the head first, as deploy resolves the members.
+    let mut members = Vec::with_capacity(shape.hosts.len());
+    for name in &shape.hosts {
+        let Some(member) = documents.iter().find(|(_, seen, _)| seen == name) else {
+            return Err(invalid(format!(
+                "{}: deployment document: the group names host `{name}`, but no --host document is named `{name}`; pass one --host per host in placement.hosts",
+                file.display()
+            )));
+        };
+        members.push(member);
+    }
+    for (_, name, document) in &members {
+        capyctl_config::topology::check_member_peer_address(name, document)
+            .map_err(|e| named(file, Some(ConfigKind::Deployment), &e))?;
+    }
+    let mut resolved = Vec::with_capacity(members.len());
+    for (host_file, name, document) in &members {
+        resolved.push(resolve_on_host(
+            file, deployment, instances, host_file, name, document,
+        )?);
+    }
+    let checked: Vec<(&str, &capyctl_config::effective::EffectiveDeployment)> = members
+        .iter()
+        .zip(&resolved)
+        .map(|((_, name, _), (_, effective))| (name.as_str(), effective))
+        .collect();
+    capyctl_config::topology::check_group_members(&checked)
+        .map_err(|e| named(file, Some(ConfigKind::Deployment), &e))?;
+    let mut requires_server: Vec<&str> = REQUIRES_SERVER.to_vec();
+    requires_server.push(GROUP_REQUIRES_ACTIVATION);
+    Ok(json!({
+        "valid": true,
+        "kind": ConfigKind::Deployment.as_str(),
+        "file": file.display().to_string(),
+        "resolved_against": shape.hosts,
+        "requires_server": requires_server,
+        "hosts": resolved.into_iter().map(|(out, _)| out).collect::<Vec<_>>(),
+    }))
 }
 
 /// Final review I10 (ADR 0014 §5, §7): a provisional resolution is sized

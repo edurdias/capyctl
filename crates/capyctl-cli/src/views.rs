@@ -226,7 +226,10 @@ fn validate(value: &Value) -> String {
         s(&value["file"]),
         s(&value["kind"])
     ))
-    .row_opt("Resolved against", opt(&value["resolved_against"]))
+    .row_opt(
+        "Resolved against",
+        resolved_against(&value["resolved_against"]),
+    )
     .render();
     text.push_str(&resource_phases(value));
     // SPEC §15.3: without a host, say what was not checked.
@@ -242,6 +245,14 @@ fn validate(value: &Value) -> String {
         }
     }
     text
+}
+
+/// The host a deployment was resolved on; a group's hosts, the head first.
+fn resolved_against(value: &Value) -> Option<String> {
+    match value.as_array() {
+        Some(hosts) => Some(hosts.iter().map(s).collect::<Vec<_>>().join(", ")),
+        None => opt(value),
+    }
 }
 
 /// The five phases of a deployment's resources: resolved on a host, by
@@ -598,7 +609,7 @@ mod tests {
         );
         let validate = Command::Validate {
             file: "d.yaml".into(),
-            host: None,
+            hosts: vec![],
             sets: vec![],
         };
         assert_eq!(
@@ -656,7 +667,7 @@ mod tests {
             },
             Command::Validate {
                 file: "f".into(),
-                host: None,
+                hosts: vec![],
                 sets: vec![],
             },
             Command::ConfigShow {

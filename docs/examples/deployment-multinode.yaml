@@ -5,7 +5,7 @@
 # (resource_policy.groups.peer_address in docs/examples/host.yaml and
 # docs/examples/host-b.yaml) and publish the `vllm` profile with the same build.
 # Parsed by the product: `capyctl validate config --file docs/examples/deployment-multinode.yaml
-# --host docs/examples/host.yaml` resolves it on the head.
+# --host docs/examples/host.yaml --host docs/examples/host-b.yaml` resolves it on both hosts.
 # An illustration of the schema, not a tested engine recipe.
 name: qwen3-30b-tp2
 engine: vllm

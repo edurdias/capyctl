@@ -309,7 +309,27 @@ placement:
 ```
 
 Memory (`engine_config.memory` or `resources`) is per member: each machine
-charges its own rank. On the server:
+charges its own rank.
+
+Check it first against the host document of every machine it names, with
+`--host` repeated once per host in `placement.hosts` (in any order; each is
+matched by its `name`):
+
+```bash
+capyctl validate config --file docs/examples/deployment-multinode.yaml \
+  --host docs/examples/host.yaml --host docs/examples/host-b.yaml
+```
+
+It runs the checks deploy runs on each host: the peer address, the profile and
+its build, the group shape the engine supports, and the engine variables each
+host approves. A refusal carries the same code as deploy's (for example
+`peer_address_missing` or `group_profile_mismatch`), and a named host without a
+document, or a document for a host the group does not name, is refused with
+the host named. It cannot check that the model files sit at the path an engine
+needs on each machine (`group_model_path_mismatch`): that is known only once
+every machine has the model, so the activation checks it.
+
+Then, on the server:
 
 ```bash
 capyctl deploy model --file deployment-multinode.yaml --activate --wait

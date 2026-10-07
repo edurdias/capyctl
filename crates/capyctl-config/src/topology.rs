@@ -165,3 +165,70 @@ pub fn refuse_in_standalone(deployment: &Value) -> Result<(), ConfigError> {
     }
     Ok(())
 }
+
+/// ADR 0028 §3: a host named in a group declares the peer address its peers
+/// reach it on (read from the host document's groups block, never from the
+/// normalized policy). Deploy and `validate config --host` both ask this.
+pub fn check_member_peer_address(name: &str, host: &Value) -> Result<(), ConfigError> {
+    if crate::groups_policy::host_groups_policy(host)?
+        .peer_address
+        .is_none()
+    {
+        return Err(GroupRefusal::PeerAddressMissing.at(
+            "placement.hosts",
+            &format!("host `{name}` declares no resource_policy.groups.peer_address"),
+        ));
+    }
+    Ok(())
+}
+
+/// ADR 0028 §2, spec §16: why one named host of a group did not resolve. A
+/// profile that does not resolve there is `group_profile_mismatch`; any other
+/// configuration reason (an engine env name not approved on that host,
+/// `engine_env_not_approved:<name>`) is named as it is.
+pub fn member_resolution_error(host: &str, error: ConfigError) -> ConfigError {
+    if matches!(
+        error.path.as_str(),
+        "runtime_profile" | "runtime_profile_revision"
+    ) {
+        return GroupRefusal::ProfileMismatch.at(
+            &error.path,
+            &format!("the runtime profile does not resolve on host `{host}`"),
+        );
+    }
+    error
+}
+
+/// ADR 0028 §2: the members of one group run one build (else
+/// `group_profile_mismatch`), and the decision every host makes before a
+/// launch, Park or Restore (`EffectiveDeployment::deep_wake_refusal`, the
+/// capability gate) admits every member's resolution: one member refused
+/// refuses the group. `members` is each host with its resolution, in rank
+/// order, the head first.
+pub fn check_group_members(
+    members: &[(&str, &crate::effective::EffectiveDeployment)],
+) -> Result<(), ConfigError> {
+    let Some((head_host, head)) = members.first() else {
+        return Ok(());
+    };
+    for (host, member) in members {
+        if member.profile.engine != head.profile.engine
+            || member.profile.build_fingerprint != head.profile.build_fingerprint
+        {
+            return Err(GroupRefusal::ProfileMismatch.at(
+                "runtime_profile",
+                &format!(
+                    "the runtime profile's build on host `{host}` differs from the head's on `{head_host}`"
+                ),
+            ));
+        }
+        if let Some(reason) = member.deep_wake_refusal() {
+            return Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "residency",
+                format!("{reason}: host `{host}` cannot park and wake this group member"),
+            ));
+        }
+    }
+    Ok(())
+}

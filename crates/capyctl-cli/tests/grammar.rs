@@ -246,14 +246,21 @@ fn request_identity_is_canonicalized() {
 fn validate_config_file() {
     let c = parse(["capyctl", "validate", "config", "--file", "host.yaml"]).unwrap();
     assert!(
-        matches!(c, Command::Validate{file, host: None, ..} if file == std::path::Path::new("host.yaml"))
+        matches!(c, Command::Validate{file, hosts, ..} if file == std::path::Path::new("host.yaml") && hosts.is_empty())
     );
     let c = parse([
         "capyctl", "validate", "config", "--file", "d.yaml", "--host", "h.yaml",
     ])
     .unwrap();
-    assert!(matches!(c, Command::Validate{file, host: Some(host), ..}
-        if file == std::path::Path::new("d.yaml") && host == std::path::Path::new("h.yaml")));
+    assert!(matches!(c, Command::Validate{file, hosts, ..}
+        if file == std::path::Path::new("d.yaml") && hosts == [std::path::PathBuf::from("h.yaml")]));
+    // T03 (ADR 0028, design §15): `--host` repeats, once per named host.
+    let c = parse([
+        "capyctl", "validate", "config", "--file", "d.yaml", "--host", "a.yaml", "--host", "b.yaml",
+    ])
+    .unwrap();
+    assert!(matches!(c, Command::Validate{hosts, ..}
+        if hosts == [std::path::PathBuf::from("a.yaml"), std::path::PathBuf::from("b.yaml")]));
 }
 
 #[test]
