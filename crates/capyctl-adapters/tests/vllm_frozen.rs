@@ -108,6 +108,61 @@ fn sleep_mode_follows_the_host_deep_park_switch() {
         .any(|w| w == ["--middleware", "capyctl_vllm_guard.RequireEngineKey"]));
 }
 
+/// ADR 0014 §4 (amended 2026-10-07, owner decision 1): under sleep mode the
+/// loader stays beside the switch, `eager` unless the deployment chose `lazy`;
+/// outside sleep mode a declared loader renders once as a typed field and an
+/// omitted one renders nothing (vLLM's own default).
+// T14 T21
+#[test]
+fn the_load_strategy_follows_the_deployment_setting() {
+    let strategy = |argv: &[String]| -> Vec<String> {
+        argv.windows(2)
+            .filter(|w| w[0] == "--safetensors-load-strategy")
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    let render = |deep_park: &str, declared: Option<&str>| {
+        let (mut deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = json!(deep_park);
+        if deep_park != "enabled" {
+            deployment["residency"] = json!("restart_only");
+        }
+        if let Some(declared) = declared {
+            deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": declared});
+        }
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+        let argv = render_command(&plan).unwrap().argv;
+        (plan.sleep_flags, strategy(&argv))
+    };
+
+    let (sleep, rendered) = render("enabled", None);
+    assert_eq!(
+        sleep,
+        [
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
+    );
+    assert_eq!(rendered, ["eager"]);
+
+    let (sleep, rendered) = render("enabled", Some("lazy"));
+    assert_eq!(
+        sleep,
+        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+    );
+    assert_eq!(rendered, ["lazy"]);
+
+    let (sleep, rendered) = render("disabled", Some("lazy"));
+    assert!(sleep.is_empty());
+    assert_eq!(rendered, ["lazy"]);
+
+    let (sleep, rendered) = render("disabled", None);
+    assert!(sleep.is_empty());
+    assert!(rendered.is_empty());
+}
+
 /// SPEC §6.2: `restart_only` prohibits sleep calls, so an enabled host switch
 /// (the ADR 0012 default) still yields no park policy for a deployment that
 /// declared the restart-only tier.

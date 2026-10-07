@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use capyctl_config::effective::EffectiveDeployment;
-use capyctl_domain::launch::{LaunchSettings, VllmLaunchSettings};
+use capyctl_domain::launch::{LaunchSettings, SafetensorsLoadStrategy, VllmLaunchSettings};
 
 use crate::policy::ParkPolicy;
 use crate::vllm::args::{device_utilization_pct, GrantedBudget, PlanInputVllm};
@@ -37,19 +37,28 @@ pub enum VllmPlanError {
 }
 
 /// The startup flags that put vLLM into the development mode its park controls
-/// live behind, with the eager checkpoint loader this project qualified on Spark:
-/// mmap-backed tensor copies during weight restoration are what the eager strategy
-/// avoids. Rendered only when the profile asks for sleep mode and the host has not
-/// opted out of deep park (Spec §3).
+/// live behind, with the deployment's checkpoint loader. Rendered only when the
+/// profile asks for sleep mode and the host has not opted out of deep park
+/// (Spec §3).
+///
+/// ADR 0014 §4 (amended 2026-10-07, owner decision 1): the loader defaults to
+/// `eager`, which this project qualified on Spark with vLLM 0.29 (mmap-backed
+/// tensor copies during weight restoration are what it avoids; deep wake 57 s
+/// to 7.5 s on Qwen3-4B). A deployment may choose `lazy` through
+/// `engine_config.vllm.safetensors_load_strategy`: on vLLM 0.30 NVFP4
+/// checkpoints eager keeps more memory once loaded and no longer wakes faster.
 pub fn sleep_flags(settings: &VllmLaunchSettings, deep_park_enabled: bool) -> Vec<String> {
     // ADR 0014 §3: sleep mode is reserved and derived at resolution from the
     // host's deep-park switch and the deployment's residency; the host switch is
     // checked again here so an opted-out host never renders development mode.
     if settings.enable_sleep_mode && deep_park_enabled {
+        let strategy = settings
+            .safetensors_load_strategy
+            .unwrap_or(SafetensorsLoadStrategy::Eager);
         vec![
             "--enable-sleep-mode".into(),
             "--safetensors-load-strategy".into(),
-            "eager".into(),
+            strategy.as_str().into(),
         ]
     } else {
         Vec::new()
@@ -130,6 +139,9 @@ pub fn plan_from_effective(
     let (tool_call_parser, reasoning_parser) = parsers
         .map(|parsers| (parsers.tool_call.name, parsers.reasoning.name))
         .unwrap_or_default();
+    // SPEC §3: deep park is one switch. A host that opted out never
+    // launches a development-mode engine, whatever the profile asked for.
+    let sleep = sleep_flags(settings, profile.security.deep_park.is_enabled());
     Ok(PlanInputVllm {
         engine_bin: profile.executable.clone(),
         // The engine's own bin directory has to be on PATH: the JIT compile
@@ -169,6 +181,16 @@ pub fn plan_from_effective(
             )
         }),
         max_num_batched_tokens: settings.max_num_batched_tokens,
+        // ADR 0014 §4 (amended 2026-10-07): outside sleep mode a declared
+        // loader renders as a typed field; under sleep mode `sleep_flags`
+        // renders it, declared or defaulted, beside the switch it belongs to.
+        safetensors_load_strategy: if sleep.is_empty() {
+            settings
+                .safetensors_load_strategy
+                .map(|strategy| strategy.as_str().to_owned())
+        } else {
+            None
+        },
         enforce_eager: common.cuda_graphs == Some(false),
         language_model_only: common.language_model_only,
         trust_remote_code: common.trust_remote_code,
@@ -196,9 +218,7 @@ pub fn plan_from_effective(
             &profile.security.approved_paths,
             profile.security.trust_remote_code,
         )),
-        // SPEC §3: deep park is one switch. A host that opted out never
-        // launches a development-mode engine, whatever the profile asked for.
-        sleep_flags: sleep_flags(settings, profile.security.deep_park.is_enabled()),
+        sleep_flags: sleep,
         // SPEC §13.3: the engine key travels in the child's environment. The
         // renderer must never see one, so it can never reach argv.
         api_key: None,

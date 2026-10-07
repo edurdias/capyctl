@@ -58,10 +58,11 @@ RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
 # VLLM_TYPED_OPTIONS); an extra argument may not restate or reverse them.
 TYPED = ("dtype", "quantization", "kv_cache_dtype", "max_model_len", "max_num_seqs",
          "enforce_eager", "language_model_only", "trust_remote_code", "block_size",
-         "max_num_batched_tokens")
+         "max_num_batched_tokens", "safetensors_load_strategy")
 # Whole families, matched on every destination the parser defines.
 RESERVED_FAMILIES = ("ssl_", "data_parallel_")
-# ADR 0014 §4: reserved only while sleep mode is on (capyctl renders `eager`).
+# ADR 0014 §4: reserved while sleep mode is on, where capyctl always renders
+# the loader (`eager` unless the deployment chose another, amended 2026-10-07).
 SLEEP_RESERVED = ("safetensors_load_strategy",)
 
 _CODES = frozenset({"invalid_launch_arguments", "config_file_refused",

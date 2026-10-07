@@ -8,7 +8,7 @@ use capyctl_config::effective::{
     PARKED_RESIDUAL_PLACEHOLDER_BYTES, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 use capyctl_config::{parse_strict, ConfigErrorCode, ConfigKind};
-use capyctl_domain::launch::{LaunchSettings, SettingSource};
+use capyctl_domain::launch::{LaunchSettings, SafetensorsLoadStrategy, SettingSource};
 use serde_json::{json, Value};
 
 const GIB: i64 = 1 << 30;
@@ -77,7 +77,8 @@ fn strict_yaml_accepts_the_typed_block_and_refuses_unknown_fields() {
         "context_length": 32768, "max_concurrent_requests": 16, "cuda_graphs": true,
         "language_model_only": true, "trust_remote_code": false,
         "memory": {"request": "40GiB", "kv_cache": "8GiB"},
-        "vllm": {"block_size_tokens": 16, "max_num_batched_tokens": 8192},
+        "vllm": {"block_size_tokens": 16, "max_num_batched_tokens": 8192,
+                 "safetensors_load_strategy": "lazy"},
         "sglang": {"max_total_tokens": 65536, "chunked_prefill_size": 4096},
         "accept_extra_args": true, "extra_args": ["--reasoning-parser", "qwen3"],
     });
@@ -209,18 +210,113 @@ fn sglang_rendezvous_address_and_port_are_reserved() {
     }
 }
 
-/// ADR 0014 §3: `--safetensors-load-strategy` is reserved only while capyctl
-/// renders sleep mode, which it does for a parking deployment.
+/// ADR 0014 §3, §4 (amended 2026-10-07, owner decision 1): the loader is the
+/// typed `engine_config.vllm.safetensors_load_strategy`, so its raw spelling is
+/// refused as an extra argument with or without sleep mode: one way per setting.
 // T14
 #[test]
-fn the_load_strategy_is_reserved_only_under_sleep_mode() {
-    let (deployment, host) =
-        with_extra_args("vllm", json!(["--safetensors-load-strategy", "lazy"]));
-    assert!(resolve_effective(&deployment, &host).is_err());
-    let (mut deployment, host) =
-        with_extra_args("vllm", json!(["--safetensors-load-strategy", "lazy"]));
+fn the_raw_load_strategy_is_refused_with_or_without_sleep_mode() {
+    for residency in [None, Some("restart_only")] {
+        for args in [
+            json!(["--safetensors-load-strategy", "lazy"]),
+            json!(["--safetensors-load-strategy=eager"]),
+            json!(["--safetensors-load", "lazy"]),
+        ] {
+            let (mut deployment, host) = with_extra_args("vllm", args.clone());
+            if let Some(residency) = residency {
+                deployment["residency"] = residency.into();
+            }
+            let error = resolve_effective(&deployment, &host)
+                .expect_err(&format!("{residency:?} {args} must be refused"));
+            assert_eq!(error.path, "engine_config.extra_args", "{args}: {error}");
+        }
+    }
+}
+
+/// ADR 0014 §4 (amended 2026-10-07): a vLLM deployment may choose `eager` or
+/// `lazy`; any other loader, and the field under another engine family, is
+/// refused.
+// T14
+#[test]
+fn the_load_strategy_is_a_typed_vllm_field() {
+    for (value, expected) in [
+        ("lazy", SafetensorsLoadStrategy::Lazy),
+        ("eager", SafetensorsLoadStrategy::Eager),
+    ] {
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": value});
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+            panic!("vLLM settings");
+        };
+        assert_eq!(settings.safetensors_load_strategy, Some(expected));
+        assert!(settings.enable_sleep_mode, "the fixture parks");
+        let snapshot = serde_json::to_value(&effective).unwrap();
+        assert_eq!(
+            snapshot["engine_config"]["safetensors_load_strategy"],
+            json!(value)
+        );
+        assert_eq!(
+            decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+            effective,
+            "{value} round-trips through the snapshot"
+        );
+    }
+
+    for value in [json!("prefetch"), json!("torchao"), json!("Lazy"), json!(1)] {
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": value});
+        assert!(
+            resolve_effective(&deployment, &host).is_err(),
+            "{value} must be refused"
+        );
+    }
+
+    let (mut deployment, mut host) = fixture();
+    sglang_profile(&mut host);
+    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
+    let error = resolve_effective(&deployment, &host).expect_err("not vLLM");
+    assert_eq!(error.path, "engine_config.vllm", "{error}");
+
+    // The installation's host-fixed arguments and the typed field contradict
+    // (outside sleep mode, where host-fixed arguments may name the loader).
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] = json!(["--safetensors-load-strategy", "eager"]);
+    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
     deployment["residency"] = "restart_only".into();
-    resolve_effective(&deployment, &host).expect("no sleep mode, no reservation");
+    let error = resolve_effective(&deployment, &host).expect_err("host-fixed duplicate");
+    assert_eq!(
+        error.path, "engine_config.vllm.safetensors_load_strategy",
+        "{error}"
+    );
+}
+
+/// ADR 0014 §4 (amended 2026-10-07): an omitted loader leaves every existing
+/// deployment's identity and resolved configuration as it was; declaring one
+/// changes the command identity. The pinned fingerprint is the one `main`
+/// computed before the field existed.
+// T09
+#[test]
+fn an_omitted_load_strategy_keeps_existing_identities() {
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["vllm"] = json!({"block_size_tokens": 16});
+    let original = deployment_command_fingerprint(&deployment, 300_000).unwrap();
+    assert_eq!(
+        original,
+        "c4295e65a6cb2cd8af6af4d15bb2c09e4ad47b9bed67efc8d0d9b4ac6c7f32c0"
+    );
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let snapshot = serde_json::to_value(&effective).unwrap();
+    assert!(snapshot["engine_config"]
+        .get("safetensors_load_strategy")
+        .is_none());
+
+    let mut declared = deployment.clone();
+    declared["engine_config"]["vllm"]["safetensors_load_strategy"] = "eager".into();
+    assert_ne!(
+        original,
+        deployment_command_fingerprint(&declared, 300_000).unwrap()
+    );
 }
 
 /// ADR 0014 §2, §6: shape and duplicates. A typed field's native spelling is a

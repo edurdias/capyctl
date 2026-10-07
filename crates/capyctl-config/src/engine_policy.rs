@@ -101,8 +101,9 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
 /// the vLLM renderer refuses it, so resolution must too, before any effect.
 const VLLM_RESERVED_FAMILIES: &[&str] = &["--ssl-", "--data-parallel-", "--capyctl-"];
 
-/// ADR 0014 §4: reserved only while sleep mode is on, where capyctl renders the
-/// eager loader it qualified for weight restoration.
+/// ADR 0014 §4: reserved while sleep mode is on, where capyctl always renders
+/// the loader: `eager` unless the deployment's typed
+/// `vllm.safetensors_load_strategy` chose another (amended 2026-10-07).
 const VLLM_SLEEP_RESERVED: &[&str] = &["--safetensors-load-strategy"];
 
 /// ADR 0014 §3: SGLang `ServerArgs` fields capyctl owns. The option spelling is the
@@ -308,6 +309,12 @@ const VLLM_TYPED_OPTIONS: &[(&str, &str)] = &[
     ("--trust-remote-code", "trust_remote_code"),
     ("--block-size", "vllm.block_size_tokens"),
     ("--max-num-batched-tokens", "vllm.max_num_batched_tokens"),
+    // ADR 0014 §4 (amended 2026-10-07): typed, so the raw spelling is refused
+    // with or without sleep mode; one way per setting.
+    (
+        "--safetensors-load-strategy",
+        "vllm.safetensors_load_strategy",
+    ),
 ];
 const SGLANG_TYPED_OPTIONS: &[(&str, &str)] = &[
     ("--dtype", "dtype"),

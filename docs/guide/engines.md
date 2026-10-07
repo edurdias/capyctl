@@ -322,6 +322,25 @@ those arguments are no longer needed for the families above. Naming a parser
 in the block and passing the same option in `extra_args` is refused.
 TensorFold handles tool calls itself and has no parser setting.
 
+## vLLM weight loading while parking
+
+A vLLM deployment that parks `deep` reloads its weights on every wake. By
+default CapyCTL starts it with vLLM's `eager` loader, which reads each weight
+file into memory first; on vLLM 0.29 and Qwen3-4B this cut a wake from 57 s to
+7.5 s. On vLLM 0.30 with NVFP4 models it instead held about 15–17 GiB more
+memory once loaded, and the wake still took about 55 s. Choose the loader in
+the deployment:
+
+```yaml
+engine_config:
+  vllm:
+    safetensors_load_strategy: lazy   # eager (default while parking) or lazy
+```
+
+`lazy` maps the weight files instead of reading them up front. A deployment
+that does not park renders the loader only when you set it. Passing
+`--safetensors-load-strategy` in `extra_args` is refused; use the field.
+
 ## First model on each engine
 
 One example per engine, from adding it to a first answer, on one GB10 machine

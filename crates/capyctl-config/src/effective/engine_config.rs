@@ -9,8 +9,8 @@ use crate::engine_policy::{
     option_names, typed_field_option, validate_extra_args, ExtraArgsContext, ExtraArgsPolicy,
 };
 use capyctl_domain::launch::{
-    CommonEngineSettings, LaunchSettings, MemoryRequest, SettingSource, SglangLaunchSettings,
-    TensorfoldLaunchSettings, VllmLaunchSettings,
+    CommonEngineSettings, LaunchSettings, MemoryRequest, SafetensorsLoadStrategy, SettingSource,
+    SglangLaunchSettings, TensorfoldLaunchSettings, VllmLaunchSettings,
 };
 
 /// ADR 0014 §5: conservative placeholder overhead margins, per engine family,
@@ -252,6 +252,10 @@ struct RawVllmFields {
     block_size_tokens: Option<u32>,
     #[serde(default)]
     max_num_batched_tokens: Option<u32>,
+    // ADR 0014 §4 (amended 2026-10-07): `eager` or `lazy`; omitted keeps the
+    // capyctl default (`eager` while sleep mode is on).
+    #[serde(default)]
+    safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
     // ADR 0024: `auto` (the default), `none`, or a parser name.
     #[serde(default)]
     tool_call_parser: Option<String>,
@@ -980,7 +984,7 @@ pub(super) fn normalize_engine_config(
     let vllm = raw.vllm.clone().unwrap_or_default();
     let sglang = raw.sglang.clone().unwrap_or_default();
     let tensorfold = raw.tensorfold.clone().unwrap_or_default();
-    let declared: [(&str, bool); 15] = [
+    let declared: [(&str, bool); 16] = [
         ("dtype", raw.dtype.is_some()),
         ("quantization", raw.quantization.is_some()),
         ("kv_cache_dtype", raw.kv_cache_dtype.is_some()),
@@ -996,6 +1000,10 @@ pub(super) fn normalize_engine_config(
         (
             "vllm.max_num_batched_tokens",
             vllm.max_num_batched_tokens.is_some(),
+        ),
+        (
+            "vllm.safetensors_load_strategy",
+            vllm.safetensors_load_strategy.is_some(),
         ),
         ("sglang.max_total_tokens", sglang.max_total_tokens.is_some()),
         (
@@ -1300,6 +1308,7 @@ pub(super) fn normalize_engine_config(
                 memory,
                 block_size_tokens: vllm.block_size_tokens,
                 max_num_batched_tokens: vllm.max_num_batched_tokens,
+                safetensors_load_strategy: vllm.safetensors_load_strategy,
                 tool_call_parser,
                 reasoning_parser,
                 enable_sleep_mode: sleep_mode,
@@ -1414,10 +1423,18 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
         "cuda_graphs": raw.cuda_graphs, "language_model_only": raw.language_model_only,
         "trust_remote_code": raw.trust_remote_code,
         "memory": declared_memory(&memory)?,
-        "vllm": raw.vllm.as_ref().map(|v| with_parsers(serde_json::json!({
-            "block_size_tokens": v.block_size_tokens,
-            "max_num_batched_tokens": v.max_num_batched_tokens,
-        }), &v.tool_call_parser, &v.reasoning_parser)),
+        "vllm": raw.vllm.as_ref().map(|v| {
+            let mut block = with_parsers(serde_json::json!({
+                "block_size_tokens": v.block_size_tokens,
+                "max_num_batched_tokens": v.max_num_batched_tokens,
+            }), &v.tool_call_parser, &v.reasoning_parser);
+            // ADR 0014 §4 (amended 2026-10-07): present only when declared,
+            // so every deployment written before the setting keeps its identity.
+            if let Some(strategy) = v.safetensors_load_strategy {
+                block["safetensors_load_strategy"] = serde_json::json!(strategy);
+            }
+            block
+        }),
         "sglang": raw.sglang.as_ref().map(|s| with_parsers(serde_json::json!({
             "max_total_tokens": s.max_total_tokens,
             "chunked_prefill_size": s.chunked_prefill_size,

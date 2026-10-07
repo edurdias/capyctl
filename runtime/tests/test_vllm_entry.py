@@ -293,8 +293,9 @@ class ExtraArgumentTests(unittest.TestCase):
 
     # T14 T21: a typed field cannot be restated or reversed by an extra.
     def test_extras_cannot_change_typed_fields(self):
+        # ADR 0014 §4 (amended 2026-10-07): the loader is typed, sleep or not.
         for extra in (["--dtype", "float16"], ["--trust-remote-code"],
-                      ["--no-enforce-eager"]):
+                      ["--no-enforce-eager"], ["--safetensors-load-strategy", "lazy"]):
             with self.subTest(extra=extra):
                 self.refused(extra, "effective_args_mismatch",
                              fixed=["--dtype", "bfloat16", "--enforce-eager"])

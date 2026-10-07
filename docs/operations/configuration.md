@@ -167,6 +167,11 @@ deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
 arguments, so `args` applies to the vLLM and TensorFold profiles only. Name `runtime_dir` only
 to run from a directory you maintain yourself; CapyCTL never writes to it.
 
+Engine tuning such as vLLM's loader under deep parking
+(`engine_config.vllm.safetensors_load_strategy`: `eager` or `lazy`) is a deployment
+setting, written in the deployment file like every other `engine_config` field; see
+[Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
+
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other
 change needs a restart.

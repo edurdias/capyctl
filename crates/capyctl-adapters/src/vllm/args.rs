@@ -51,6 +51,9 @@ pub struct PlanInputVllm {
     /// `--max-num-seqs`.
     pub max_concurrent_requests: Option<u32>,
     pub max_num_batched_tokens: Option<u32>,
+    /// `--safetensors-load-strategy` outside sleep mode (ADR 0014 §4, amended
+    /// 2026-10-07); under sleep mode `sleep_flags` carries it.
+    pub safetensors_load_strategy: Option<String>,
     /// `cuda_graphs: false` renders `--enforce-eager`.
     pub enforce_eager: bool,
     pub language_model_only: bool,
@@ -130,6 +133,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("context_length", &self.context_length)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("max_num_batched_tokens", &self.max_num_batched_tokens)
+            .field("safetensors_load_strategy", &self.safetensors_load_strategy)
             .field("enforce_eager", &self.enforce_eager)
             .field("language_model_only", &self.language_model_only)
             .field("trust_remote_code", &self.trust_remote_code)
@@ -477,6 +481,10 @@ fn typed_args(input: &PlanInputVllm) -> Vec<String> {
     value(
         "--max-num-batched-tokens",
         input.max_num_batched_tokens.map(|v| v.to_string()),
+    );
+    value(
+        "--safetensors-load-strategy",
+        input.safetensors_load_strategy.clone(),
     );
     // ADR 0024: names verified registered in vLLM 0.29.0 and 0.30.0.
     value("--tool-call-parser", input.tool_call_parser.clone());

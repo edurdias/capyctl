@@ -274,6 +274,7 @@ pub(super) fn declared_engine_config(
         Some("vllm") => &[
             "block_size_tokens",
             "max_num_batched_tokens",
+            "safetensors_load_strategy",
             "tool_call_parser",
             "reasoning_parser",
         ],
