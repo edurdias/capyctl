@@ -109,9 +109,10 @@ Catalog models that run as groups in this release, on two machines at
 | Model | SGLang 0.5.21 | vLLM 0.30.0 | TensorFold 0.6.5 |
 |---|---|---|---|
 | Qwen3.8-Flash-Next | NVFP4 | NVFP4 (stock build unverified) | MLX 4-bit only |
+| GLM-5.3-Flash | no (container image only) | unverified | MLX 4-bit, or EXL3 (experimental) |
 
-Not yet: GLM-5.3-Flash, DeepSeek V4 Flash 0731, DeepSeek V4 Flash Vision and
-MiMo-V2.5 have a working build only as a container image; MiniMax M3, Hy4
+Not yet: DeepSeek V4 Flash 0731, DeepSeek V4 Flash Vision and MiMo-V2.5 have
+a working build only as a container image; MiniMax M3, Hy4
 Preview and Nemotron 3 Ultra need three or more machines; Hy3 has no validated
 command. Next milestones: container launchers, and a live row on three or more
 rented machines.
