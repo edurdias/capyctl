@@ -12,6 +12,7 @@
 use super::{GpuReading, NativeHostExecution};
 use crate::{checkpoint::CheckpointError, journal::JournalError, session::SessionError};
 use capyctl_config::effective::DomainMemory;
+use capyctl_domain::group::GroupEngine;
 use capyctl_protocol::{
     execution::{MemberAction, MemberCommand, SingleLaunchPlan},
     pb,
@@ -415,14 +416,25 @@ impl NativeHostExecution {
                 // ADR 0012: only a parking tier (`deep`, or `host_backed`
                 // where it resolved, discrete GPU design §5) parks. A
                 // `restart_only` one (any engine, SPEC §6.2) is refused by its
-                // declared tier.
-                let tier = self
+                // declared tier. ADR 0028 §2, §12 (OD3): so is a TensorFold
+                // group's head, whatever it declared: TensorFold groups are
+                // restart-only (they park by a group stop).
+                let owner = self
                     .journal
                     .retained_command(owned_handle)
                     .ok()
-                    .filter(|owner| matches!(owner.action, MemberAction::LaunchSingle(_)))
-                    .and_then(|owner| self.resolve_retained(&owner).ok())
-                    .is_some_and(|effective| !effective.residency.parks());
+                    .filter(crate::journal::parks_in_place);
+                let tensorfold_group = owner.as_ref().is_some_and(|owner| {
+                    owner
+                        .action
+                        .group_launch()
+                        .is_some_and(|plan| plan.engine() == GroupEngine::Tensorfold)
+                });
+                let tier = tensorfold_group
+                    || owner
+                        .as_ref()
+                        .and_then(|owner| self.resolve_retained(owner).ok())
+                        .is_some_and(|effective| !effective.residency.parks());
                 // SPEC §§3.1, 7.3, 9.1: a wake that does not fit beside the
                 // other claims is refused by the rule it breaks.
                 let wake = || match &command.action {
@@ -438,11 +450,9 @@ impl NativeHostExecution {
                 };
                 // ADR 0008: a Park the installation's probe cannot support.
                 let capability = || {
-                    let owner = self.journal.retained_command(owned_handle).ok()?;
-                    let MemberAction::LaunchSingle(plan) = &owner.action else {
-                        return None;
-                    };
-                    let effective = self.resolve_retained(&owner).ok()?;
+                    let owner = owner.as_ref()?;
+                    let plan = owner.action.launch_plan()?;
+                    let effective = self.resolve_retained(owner).ok()?;
                     self.park_capability(&effective, &plan.profile_name)
                 };
                 Some(if tier {

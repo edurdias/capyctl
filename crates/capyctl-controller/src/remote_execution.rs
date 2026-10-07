@@ -1170,20 +1170,30 @@ impl crate::group_activation::GroupHosts for AgentGroupHosts {
         }
     }
 
-    /// ADR 0028 §12 (R12): no agent reports a SGLang group member's saver-map
-    /// facts on its session yet, so there is no report: the member is silent,
-    /// keeps its full charge, and its group's park or wake stops the group.
-    /// Nothing falls back to process sampling.
+    /// ADR 0028 §12 (R12): the saver map `member`'s own host last reported on
+    /// its session for the member's launch, read there from its own
+    /// observation directory with the member's own credential. A host with no
+    /// live session, or whose report names no whole map for the member, has
+    /// reported nothing: the member stays silent. Nothing falls back to
+    /// process sampling.
     fn saver_mapped<'a>(
         &'a self,
         _deployment_id: &'a str,
         member: &'a capyctl_store::ordinary_lifecycle::park::ArmedMember,
     ) -> crate::group_activation::HostFuture<'a, Result<(i64, i64), String>> {
         Box::pin(async move {
-            Err(format!(
-                "host {} reports no saver-map facts for group members on its session",
-                member.host_id
-            ))
+            let handle = member
+                .launch_handle
+                .as_deref()
+                .ok_or_else(|| format!("rank {} recorded no launch", member.rank))?;
+            self.sessions
+                .member_saver(&member.host_id, handle)
+                .ok_or_else(|| {
+                    format!(
+                        "host {} reports no saver map for rank {}",
+                        member.host_id, member.rank
+                    )
+                })
         })
     }
 }

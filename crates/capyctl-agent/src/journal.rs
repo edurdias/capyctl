@@ -2177,8 +2177,9 @@ fn residency_row(db: &Connection, owner: &str) -> Result<Option<(String, String)
     Ok(row)
 }
 
-/// The retained single launch a Park or Restore names: same member,
-/// deployment and approved profile, never a compacted or foreign command.
+/// The retained launch a Park or Restore names: same member, deployment and
+/// approved profile, never a compacted or foreign command, and one that
+/// parks in place ([`parks_in_place`]).
 fn residency_owner(
     db: &Connection,
     command: &MemberCommand,
@@ -2195,10 +2196,23 @@ fn residency_owner(
         return Err(JournalError::Unauthorized);
     };
     let owner = decode(&body)?;
-    if !same_owner(&owner, command) || !matches!(owner.action, MemberAction::LaunchSingle(_)) {
+    if !same_owner(&owner, command) || !parks_in_place(&owner) {
         return Err(JournalError::Unauthorized);
     }
     Ok(owner)
+}
+
+/// SPEC §§9.1, 10: the launches a Park or Restore may name: a single launch,
+/// or a group's head. ADR 0028 §12: the head is the one member that serves;
+/// its agent alone invokes the group's collective, once, on its own loopback
+/// control endpoint. A group worker never parks or restores on its own: its
+/// memory follows the head's collective, and its own host only reports it.
+pub(crate) fn parks_in_place(launch: &MemberCommand) -> bool {
+    match &launch.action {
+        MemberAction::LaunchSingle(_) => true,
+        MemberAction::Launch { member, .. } => member.service_port != 0,
+        _ => false,
+    }
 }
 
 /// SPEC §§9.1, 10: Park only from resident (ready), Restore only from parked.

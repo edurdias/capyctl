@@ -1025,6 +1025,8 @@ async fn serve_host(
         // SPEC §§3.1, 7.3: the native executor below advertises per-launch
         // claims in the inventory it publishes; this startup snapshot does not.
         launch_claims: String::new(),
+        // ADR 0028 §12: saver maps are sampled by the executor's refreshes.
+        member_savers: Vec::new(),
     };
     let ingress = capyctl_agent::ingress::Ingress::new().map_err(|_| unavailable())?;
     let (execution, ingress_listener) = if let Some(settings) = &config.ingress {

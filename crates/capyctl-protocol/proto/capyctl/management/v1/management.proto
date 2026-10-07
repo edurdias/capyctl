@@ -197,6 +197,13 @@ message ReportInventory {
   // ADR 0028 §14 (additive, capability `engine_groups`): what this host
   // reports for multi-node groups. Absent from a host without the capability.
   GroupInventory group = 8;
+  // ADR 0028 §12 (R12, additive, capability `engine_groups`): the saver-map
+  // facts this host reads from its own observation directory for each SGLang
+  // group member it runs with a parking residency (the head and every
+  // worker), sampled in the background. A member whose map is unreadable,
+  // partial or not the approved saver's is not listed; nothing here falls
+  // back to process sampling. Absent from a host without the capability.
+  repeated MemberSaver member_savers = 9;
 }
 // ADR 0028 §14: the host's group-relevant facts. `peer_address` is the
 // address this host offers to group peers; `findings` are the preflight
@@ -204,6 +211,15 @@ message ReportInventory {
 message GroupInventory {
   string peer_address = 1;
   repeated string findings = 2;
+}
+// ADR 0028 §12 (R12): one group member's saver map on this host. `owned_handle`
+// is the member's Launch command id; `mapped_bytes` the bytes its saver maps
+// across both tags (weights and KV cache), from a whole map; observed at
+// `observed_at_unix_ms` (host clock, when the read began).
+message MemberSaver {
+  string owned_handle = 1;
+  int64 mapped_bytes = 2;
+  int64 observed_at_unix_ms = 3;
 }
 message DomainObservation {
   string domain_id = 1;        // stable local identity

@@ -77,6 +77,50 @@ pub struct HostSessionView {
     pub capabilities_missing: Vec<String>,
     pub domains: Vec<DomainView>,
     pub profiles: Vec<ProfileView>,
+    /// ADR 0028 §12 (R12): the saver maps of the SGLang group members this
+    /// host runs, as its latest report gave them. Park and wake evidence
+    /// only; never shown in status.
+    #[serde(skip)]
+    pub member_savers: Vec<MemberSaverView>,
+}
+/// ADR 0028 §12 (R12): one SGLang group member's saver map, read by its own
+/// host from its own observation directory and reported on its session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSaverView {
+    /// The member's Launch command id.
+    pub owned_handle: String,
+    pub mapped_bytes: i64,
+    /// When the host began the read, on the controller clock.
+    pub observed_at_ms: i64,
+}
+/// ADR 0028 §12: the most member saver maps one report may carry.
+pub const MAX_MEMBER_SAVERS: usize = 64;
+impl MemberSaverView {
+    /// The saver maps one report carries. A report outside its bounds (too
+    /// many, a malformed handle, a negative size, a time beyond the tolerated
+    /// host clock lead) carries none: no partial evidence is kept.
+    pub(crate) fn of(inventory: &pb::ReportInventory) -> Vec<Self> {
+        if inventory.member_savers.len() > MAX_MEMBER_SAVERS {
+            return Vec::new();
+        }
+        let now = capyctl_protocol::now_unix_ms();
+        let one = |saver: &pb::MemberSaver| {
+            if !bounded_name(&saver.owned_handle) || saver.mapped_bytes < 0 {
+                return None;
+            }
+            Some(Self {
+                owned_handle: saver.owned_handle.clone(),
+                mapped_bytes: saver.mapped_bytes,
+                observed_at_ms: controller_time(saver.observed_at_unix_ms, now)?,
+            })
+        };
+        inventory
+            .member_savers
+            .iter()
+            .map(one)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    }
 }
 #[derive(Clone, serde::Serialize)]
 pub struct DomainView {
@@ -588,6 +632,21 @@ impl AgentSessions {
             .get(host)
             .filter(|s| s.view.online && s.view.reconciled && !s.draining && !s.unresponsive)
             .map(|s| s.view.session_id.clone())
+    }
+    /// ADR 0028 §12 (R12): the saver map `host` last reported on its live,
+    /// reconciled session for the SGLang group member launch `owned_handle`:
+    /// the bytes it maps and when (controller clock). `None` is no report.
+    pub fn member_saver(&self, host: &str, owned_handle: &str) -> Option<(i64, i64)> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(host)
+            .filter(|s| s.view.online && s.view.reconciled)?
+            .view
+            .member_savers
+            .iter()
+            .find(|saver| saver.owned_handle == owned_handle)
+            .map(|saver| (saver.mapped_bytes, saver.observed_at_ms))
     }
     /// ADR 0008: whether `host`'s current session executes MaterializeSource.
     pub fn supports_model_sources(&self, host: &str) -> bool {
@@ -1285,6 +1344,7 @@ impl AgentSessions {
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }
                                 s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
+                                s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 // Only an inventory `publish` accepted reaches here.
                                 s.prepared = crate::host_publication::eligible(&inventory);
@@ -1301,6 +1361,7 @@ impl AgentSessions {
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id { return Err(denied()); }
                                 s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
+                                s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 s.inventory = Some(*inventory);
                             }
@@ -1635,6 +1696,7 @@ impl AgentControl for AgentSessions {
                         capabilities_missing: missing,
                         domains: vec![],
                         profiles: vec![],
+                        member_savers: vec![],
                     },
                     peer: peer.clone(),
                     outgoing: Some(outgoing.clone()),
@@ -1833,6 +1895,66 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                 .collect();
             Ok((observed, residents))
         })
+    }
+}
+
+#[cfg(test)]
+mod member_saver_tests {
+    use super::*;
+
+    fn saver(handle: &str, mapped: i64, at: i64) -> pb::MemberSaver {
+        pb::MemberSaver {
+            owned_handle: handle.into(),
+            mapped_bytes: mapped,
+            observed_at_unix_ms: at,
+        }
+    }
+
+    fn report(savers: Vec<pb::MemberSaver>) -> pb::ReportInventory {
+        pb::ReportInventory {
+            member_savers: savers,
+            ..Default::default()
+        }
+    }
+
+    // T20 (ADR 0028 §12, R12): a host's member saver maps are kept as
+    // reported, on the controller clock; a report outside its bounds keeps
+    // none of them, so no partial evidence stands for a member.
+    #[test]
+    fn member_saver_maps_are_bounded_and_on_the_controller_clock() {
+        let now = capyctl_protocol::now_unix_ms();
+        let kept = MemberSaverView::of(&report(vec![
+            saver("launch-1", 0, now - 10),
+            saver("launch-2", 4 << 30, now + HOST_CLOCK_LEAD_MS - 100),
+        ]));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            (
+                kept[0].owned_handle.as_str(),
+                kept[0].mapped_bytes,
+                kept[0].observed_at_ms
+            ),
+            ("launch-1", 0, now - 10)
+        );
+        // A tolerated host clock lead is recorded no later than the controller's now.
+        assert!(kept[1].observed_at_ms <= capyctl_protocol::now_unix_ms());
+        for bad in [
+            saver("", 0, now),
+            saver("launch/../x y", 0, now),
+            saver("launch-1", -1, now),
+            saver("launch-1", 0, now + 60_000),
+            saver("launch-1", 0, -1),
+        ] {
+            assert!(
+                MemberSaverView::of(&report(vec![saver("launch-0", 0, now), bad.clone()]))
+                    .is_empty(),
+                "{bad:?}"
+            );
+        }
+        let crowded = (0..=MAX_MEMBER_SAVERS)
+            .map(|n| saver(&format!("launch-{n}"), 0, now))
+            .collect();
+        assert!(MemberSaverView::of(&report(crowded)).is_empty());
     }
 }
 

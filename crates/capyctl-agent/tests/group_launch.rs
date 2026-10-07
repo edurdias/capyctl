@@ -14,7 +14,11 @@ use capyctl_agent::{
     ingress::Ingress,
     ingress_identity::IngressIdentities,
     journal::HostJournal,
-    native_execution::{EnrolledSaver, NativeHostExecution},
+    native_execution::{
+        EnrolledSaver, NativeHostExecution, SaverMapped, SaverResidency, SaverScope,
+        SaverUnavailable,
+    },
+    process_residency::{GpuCollector, ResidencySampler},
     session::SessionExecution,
 };
 use capyctl_config::remote_roles::HostConfig;
@@ -46,12 +50,13 @@ const GATE: [u8; 32] = [7; 32];
 /// worker), SGLang as the protected `sglang_entry.py` (public settings on argv,
 /// keys on sealed descriptors), TensorFold as its own binary (`--rank r`). It
 /// records its argv, its environment's names, the group variables and each
-/// start, never a key. A worker forks one child and waits; the SGLang head
-/// serves the keyed model list and chat. With `ignore-sigterm` beside it the
-/// whole tree ignores SIGTERM, as SGLang's rank > 0 does. It ends itself when
-/// the test process or the fixture directory goes away.
+/// start, never a key. A worker forks one child and waits; the head serves the
+/// keyed model list and chat, and the engine's residency controls (ADR 0028
+/// §12: the collective the head's agent invokes). With `ignore-sigterm` beside
+/// it the whole tree ignores SIGTERM, as SGLang's rank > 0 does. It ends itself
+/// when the test process or the fixture directory goes away.
 const FAKE_ENGINE: &str = r#"
-import json, os, signal, sys, threading, time, http.server
+import json, os, signal, sys, threading, time, http.server, urllib.parse
 args = sys.argv[1:]
 here = os.path.dirname(os.path.abspath(__file__))
 name = os.path.basename(__file__)
@@ -111,10 +116,27 @@ if engine == "sglang":
     served = settings["served_name"]
     fd = int(args[args.index("--inference-credential-fd") + 1])
     key = os.pread(fd, 4096, 0).decode().strip()
+    admin = ""
+    if "--admin-credential-fd" in args:
+        admin = os.pread(int(args[args.index("--admin-credential-fd") + 1]), 4096, 0).decode().strip()
 else:
     port = int(args[args.index("--port") + 1])
     served = args[args.index("--served-model-name") + 1]
     key = os.environ.get("VLLM_API_KEY", "")
+    admin = os.environ.get("CAPYCTL_VLLM_ADMIN_KEY", "")
+# ADR 0028 §12: the head's residency surface. vLLM (development mode): sleep,
+# wake one class, reload weights, reset the prefix cache, `/is_sleeping`, the
+# running and waiting gauges. SGLang: release and resume memory occupation
+# (which writes or removes the `released` marker the test's saver reads), disk
+# reload, cache flush, the gauges. Control calls are keyed with the admin key
+# and appended to `residency.log`; chat answers only while usable.
+state = {"sleeping": False, "weights": True, "loaded": True, "kv": True}
+def logged(call):
+    with open(os.path.join(here, "residency.log"), "a") as f:
+        f.write(call + "\n")
+def usable():
+    return state["weights"] and state["loaded"] and state["kv"]
+FLUSH = "Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n"
 # ADR 0028 §9: the completion probe's answer, when the test installs one.
 def completion():
     try:
@@ -131,18 +153,86 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not key or self.headers.get("Authorization") != "Bearer " + key:
             self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers(); return False
         return True
+    def admin_keyed(self):
+        want = admin or key
+        if not want or self.headers.get("Authorization") != "Bearer " + want:
+            self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers(); return False
+        return True
+    def send_text(self, text):
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def control(self, path, query, body):
+        if engine == "vllm":
+            if path == "/sleep":
+                call = "sleep:" + query.get("level", [""])[0]
+            elif path == "/wake_up":
+                call = "wake:" + query.get("tags", [""])[0]
+            elif path == "/collective_rpc":
+                call = "collective:" + json.loads(body or b"{}").get("method", "")
+            else:
+                call = "reset_prefix_cache"
+            logged(call)
+            if call == "sleep:2":
+                state.update(sleeping=True, weights=False, loaded=False, kv=False)
+            elif call == "sleep:1":
+                state.update(sleeping=True, weights=False, kv=False)
+            elif call == "wake:weights":
+                state["weights"] = True
+            elif call == "wake:kv_cache":
+                state["kv"] = True
+            elif call == "collective:reload_weights" and state["weights"]:
+                state["loaded"] = True
+            elif call == "reset_prefix_cache":
+                self.send_body(json.dumps({"success": True}).encode()); return
+            else:
+                self.send_response(409); self.send_header("Content-Length", "0"); self.end_headers(); return
+            state["sleeping"] = not usable()
+            self.send_body(b"{}")
+            return
+        logged(path)
+        marker = os.path.join(here, "released")
+        if path == "/release_memory_occupation":
+            open(marker, "w").close()
+            self.send_body(b"null")
+        elif path == "/resume_memory_occupation":
+            if os.path.exists(marker):
+                os.remove(marker)
+            self.send_body(b"null")
+        elif path == "/update_weights_from_disk":
+            self.send_body(json.dumps({"success": True}).encode())
+        else:
+            self.send_text(FLUSH)
     def send_body(self, body):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
     def do_GET(self):
+        if self.path == "/is_sleeping":
+            if not self.admin_keyed(): return
+            self.send_body(json.dumps({"is_sleeping": state["sleeping"]}).encode()); return
         if not self.keyed(): return
         if self.path == "/v1/models":
             self.send_body(json.dumps({"object": "list", "data": [{"id": served, "object": "model"}]}).encode())
+        elif self.path == "/metrics":
+            if engine == "vllm":
+                self.send_text("vllm:num_requests_running{engine=\"0\"} 0.0\nvllm:num_requests_waiting{engine=\"0\"} 0.0\n")
+            else:
+                self.send_text("sglang:num_running_reqs 0.0\nsglang:num_queue_reqs 0.0\n")
         else:
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
     def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        controls = ("/sleep", "/wake_up", "/collective_rpc", "/reset_prefix_cache",
+                    "/release_memory_occupation", "/resume_memory_occupation",
+                    "/update_weights_from_disk", "/flush_cache")
+        if url.path in controls:
+            if not self.admin_keyed(): return
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.control(url.path, urllib.parse.parse_qs(url.query), body); return
         keyed = bool(key) and self.headers.get("Authorization") == "Bearer " + key
         if self.path in ("/v1/completions", "/generate"):
             with open(os.path.join(here, "last-request.tmp"), "w") as f:
@@ -150,6 +240,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os.replace(os.path.join(here, "last-request.tmp"), os.path.join(here, "last-request.json"))
         if not self.keyed(): return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        if not usable() or os.path.exists(os.path.join(here, "released")):
+            self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return
         ids = completion()
         if ids is not None and engine == "vllm" and self.path == "/v1/completions" and body.get("model") == served:
             self.send_body(json.dumps({"choices": [{"index": 0, "text": "ok", "token_ids": ids[:body["max_tokens"]]}]}).encode()); return
@@ -253,7 +345,42 @@ struct FakeHost {
     held: Vec<u16>,
     /// ADR 0028 §9: the token ids the engine answers a completion probe with.
     completion: Option<Vec<u32>>,
+    /// ADR 0028 §12 (R12): the host reads its SGLang saver map through
+    /// [`StubSaver`] instead of an enrolled scheduler.
+    stub_saver: bool,
+    /// ADR 0007: the host's GPU processes, as `nvidia-smi` would list them.
+    gpu: Option<Arc<GpuCollector>>,
     built: OnceLock<Built>,
+}
+
+/// SPEC §9.2, ADR 0028 §12 (R12): the saver map of the fake SGLang engine on
+/// this host: every allocation mapped until the engine released its memory
+/// occupation (the `released` marker beside it), none after. It answers
+/// only a scope naming a credential and recorded processes, and keeps every
+/// scope it was asked about.
+struct StubSaver {
+    dir: PathBuf,
+    marker: PathBuf,
+    scopes: std::sync::Mutex<Vec<SaverScope>>,
+}
+impl SaverResidency for StubSaver {
+    fn mapped(&self, scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable> {
+        self.scopes.lock().unwrap().push(scope.clone());
+        if scope.admin_key.is_empty() || scope.members.as_ref().is_none_or(Vec::is_empty) {
+            return Err(SaverUnavailable);
+        }
+        let mapped = if self.marker.exists() { 0 } else { 1 << 20 };
+        Ok(SaverMapped {
+            real_saver: true,
+            weight_bytes: mapped,
+            kv_bytes: mapped,
+            weight_virtual_bytes: 1 << 20,
+            kv_virtual_bytes: 1 << 20,
+        })
+    }
+    fn observation_dir(&self) -> Option<&Path> {
+        Some(&self.dir)
+    }
 }
 
 /// The host once built: its fixture, its executor and its open session.
@@ -270,6 +397,8 @@ struct Built {
     ingress: Arc<Ingress>,
     executor: Arc<NativeHostExecution>,
     session: u64,
+    saver: Option<Arc<StubSaver>>,
+    sampler: Option<Arc<ResidencySampler>>,
 }
 
 /// Kills whatever the journal recorded if a test fails mid way.
@@ -347,6 +476,8 @@ impl FakeHost {
             holds_peer: true,
             held: Vec::new(),
             completion: None,
+            stub_saver: false,
+            gpu: None,
             built: OnceLock::new(),
         }
     }
@@ -362,6 +493,19 @@ impl FakeHost {
             "tensorfold" => GroupEngine::Tensorfold,
             other => panic!("unknown engine {other}"),
         };
+        self
+    }
+    /// `residency: deep` on a host whose deep park is enabled, its SGLang
+    /// saver map read through [`StubSaver`].
+    fn with_deep_park_and_stub_saver(mut self) -> Self {
+        self.deep = true;
+        self.stub_saver = true;
+        self
+    }
+    /// ADR 0007: the host's `process_residency` reads its GPU processes
+    /// through `gpu`.
+    fn with_gpu_processes(mut self, gpu: Arc<GpuCollector>) -> Self {
+        self.gpu = Some(gpu);
         self
     }
     /// The worker forks a child 0.4 s after it starts and another after 3 s.
@@ -542,17 +686,40 @@ impl FakeHost {
             "controller".into(),
             config.runtime_dir.clone(),
             private(&path.join("logs")),
-            Default::default(),
+            // ADR 0007: the role's startup inventory names the host's one
+            // memory domain, which every availability refresh reports (with
+            // the processes its sampler found and its members' saver maps).
+            pb::ReportInventory {
+                domains: vec![pb::DomainObservation {
+                    domain_id: "unified".into(),
+                    kind: "system".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
         )
         .with_host_probes(probes)
         // SPEC §8.2: a single SGLang launch would keep its rendezvous here;
         // a group member never does.
         .with_rendezvous_root(private(&state.join("rendezvous")))
         .with_engine_cache_root(private(&path.join("engines")));
-        if self.deep {
+        let mut saver = None;
+        if self.stub_saver {
+            let stub = Arc::new(StubSaver {
+                dir: private(&state.join("observation")),
+                marker: runtime.join("released"),
+                scopes: std::sync::Mutex::new(Vec::new()),
+            });
+            executor = executor.with_saver_residency(stub.clone());
+            saver = Some(stub);
+        } else if self.deep {
             executor = executor.with_saver_residency(Arc::new(EnrolledSaver::new(private(
                 &state.join("observation"),
             ))));
+        }
+        let sampler = self.gpu.clone().map(ResidencySampler::with_collector);
+        if let Some(sampler) = &sampler {
+            executor = executor.with_process_residency(sampler.clone());
         }
         let session = journal.connect().unwrap();
         executor.connected(session).unwrap();
@@ -567,6 +734,8 @@ impl FakeHost {
             ingress,
             executor,
             session,
+            saver,
+            sampler,
         }
     }
 
@@ -866,6 +1035,69 @@ impl FakeHost {
             result,
         })
     }
+
+    /// ADR 0028 §12: the Park (or Restore) the server sends a group's head,
+    /// naming its retained launch `owned_handle`, under command id `id`. A
+    /// Restore carries the checkpoint digest every member measured.
+    fn residency_command(&self, id: &str, owned_handle: &str, park: bool) -> MemberCommand {
+        let owner = self.journal().retained_command(owned_handle).unwrap();
+        let mut command = MemberCommand {
+            identity: identity(
+                id,
+                owner.identity.member.clone(),
+                if park { "ready" } else { "parked" },
+                owner.identity.generation,
+                &owner.identity.profile_fingerprint,
+            ),
+            action: if park {
+                MemberAction::Park {
+                    owned_handle: owned_handle.into(),
+                }
+            } else {
+                MemberAction::Restore {
+                    owned_handle: owned_handle.into(),
+                    checkpoint_digest: self.digest(),
+                }
+            },
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+
+    /// Send the Park or Restore `command` to this host: its answer, checked
+    /// as a valid one.
+    async fn send_residency(&self, command: &MemberCommand) -> pb::MemberExecutionResult {
+        let built = self.host();
+        let result = built
+            .executor
+            .execute(built.session, command.clone())
+            .await
+            .expect("a Park or Restore is answered");
+        capyctl_protocol::execution::validate_result(command, &result)
+            .expect("the result is a valid answer to its Park or Restore");
+        result
+    }
+
+    /// The residency controls the engine received, in order.
+    fn controls(&self) -> Vec<String> {
+        let path = self.host().root.path();
+        [
+            path.join("venv/bin/residency.log"),
+            path.join("runtime/residency.log"),
+        ]
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .collect()
+    }
+}
+
+/// How a Park or Restore result reports the launch's residency.
+fn residency_state(result: &pb::MemberExecutionResult) -> &str {
+    result
+        .residency
+        .as_ref()
+        .map_or("none", |residency| residency.state.as_str())
 }
 
 /// ADR 0028 §8 (R23): whether `host` journaled a Launch of `plan`'s rank
@@ -1486,5 +1718,270 @@ async fn a_replayed_completion_probe_answers_its_tokens() {
         .terminate(&out.owned_handle, &out.processes)
         .await
         .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+// T20, T22 (ADR 0028 §12, R41): a deep group's head parks and restores in place
+// through the agent's own admission and journal, exactly as a single launch:
+// the collective is invoked once on its loopback control endpoint, the claim
+// and the process group are kept, a park never claims a usable model, and the
+// restore reopens the head only after a fresh model probe. A replay is answered
+// from the journal and never repeats the collective.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deep_group_head_parks_and_restores_in_place() {
+    for engine in ["vllm", "sglang"] {
+        let host = FakeHost::new("host-a")
+            .with_groups_policy(HEAD_PEER)
+            .with_engine(engine)
+            .with_deep_park_and_stub_saver();
+        let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+        assert!(out.result.model_usable, "{engine}: {:?}", out.result);
+        let handle = out.owned_handle.clone();
+
+        let park = host.residency_command("park", &handle, true);
+        let parked = host.send_residency(&park).await;
+        assert_eq!(
+            (parked.state.as_str(), residency_state(&parked)),
+            ("completed", "parked"),
+            "{engine}: {parked:?}"
+        );
+        assert!(parked.claim_retained && !parked.model_usable, "{engine}");
+        assert_eq!(parked.owned_handle, handle, "{engine}");
+        assert!(
+            parked.processes.iter().all(|p| p.presence == "alive"),
+            "{engine}"
+        );
+        assert_eq!(
+            host.journal().residency_of(&handle).unwrap().as_deref(),
+            Some("parked"),
+            "{engine}"
+        );
+        let collective = match engine {
+            "vllm" => vec!["sleep:2"],
+            _ => vec!["/release_memory_occupation"],
+        };
+        assert_eq!(host.controls(), collective, "{engine}");
+        // An exact resend is answered from the journal; nothing is slept again.
+        let replay = host.send_residency(&park).await;
+        assert_eq!(residency_state(&replay), "parked", "{engine}");
+        assert_eq!(host.controls(), collective, "{engine}");
+
+        let restore = host.residency_command("restore", &handle, false);
+        let restored = host.send_residency(&restore).await;
+        assert_eq!(
+            residency_state(&restored),
+            "restored",
+            "{engine}: {restored:?}"
+        );
+        assert!(restored.claim_retained && restored.model_usable, "{engine}");
+        assert_eq!(
+            host.controls(),
+            match engine {
+                "vllm" => vec![
+                    "sleep:2",
+                    "wake:weights",
+                    "collective:reload_weights",
+                    "wake:kv_cache",
+                    "reset_prefix_cache",
+                ],
+                _ => vec![
+                    "/release_memory_occupation",
+                    "/resume_memory_occupation",
+                    "/update_weights_from_disk",
+                    "/flush_cache",
+                ],
+            },
+            "{engine}"
+        );
+        assert_eq!(host.journal().residency_of(&handle).unwrap(), None);
+        if engine == "sglang" {
+            // SPEC §9.2: the head's own saver map, for its own launch, proved
+            // the release and the resume.
+            let scopes = host.host().saver.as_ref().unwrap().scopes.lock().unwrap();
+            assert!(!scopes.is_empty());
+            assert!(scopes
+                .iter()
+                .all(|scope| scope.binding_id == "01K00000000000000000000001"));
+        }
+        let gone = host.terminate(&handle, &out.processes).await.unwrap();
+        assert!(gone.all_gone(), "{engine}: {:?}", gone.result);
+    }
+}
+
+// T20 (ADR 0028 §12, OD3): the head's agent alone takes Park and Restore. A
+// worker's own Park or Restore is refused before anything is journaled, and
+// its engine is never touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_worker_never_parks_on_its_own() {
+    for engine in ["vllm", "sglang"] {
+        let host = FakeHost::new("host-b")
+            .with_groups_policy(WORKER_PEER)
+            .with_engine(engine)
+            .with_deep_park_and_stub_saver();
+        let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+        let handle = out.owned_handle.clone();
+        for (id, park) in [("park", true), ("restore", false)] {
+            let command = host.residency_command(id, &handle, park);
+            let refused = host.send_residency(&command).await;
+            assert_eq!(residency_state(&refused), "unchanged", "{engine} {id}");
+            assert_eq!(refused.refused, "unauthorized", "{engine} {id}");
+            assert!(!refused.model_usable, "{engine} {id}");
+        }
+        assert_eq!(host.journal().residency_of(&handle).unwrap(), None);
+        assert!(host.controls().is_empty(), "{engine}");
+        let gone = host.terminate(&handle, &out.processes).await.unwrap();
+        assert!(gone.all_gone(), "{engine}: {:?}", gone.result);
+    }
+}
+
+// T22 (ADR 0028 §2, §12, OD3): a TensorFold group is restart-only. Its head
+// refuses a Park with the closed `residency_tier` before anything is
+// journaled; the group parks by a group stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tensorfold_group_head_refuses_park_as_restart_only() {
+    let host = FakeHost::new("host-a")
+        .with_groups_policy(HEAD_PEER)
+        .with_engine("tensorfold");
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    let handle = out.owned_handle.clone();
+    let park = host.residency_command("park", &handle, true);
+    let refused = host.send_residency(&park).await;
+    assert_eq!(residency_state(&refused), "unchanged", "{refused:?}");
+    assert_eq!(refused.refused, "residency_tier");
+    assert_eq!(host.journal().residency_of(&handle).unwrap(), None);
+    let gone = host.terminate(&handle, &out.processes).await.unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+/// Every process in process group `group` now, from `/proc`.
+fn group_pids(group: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+                    fields.get(2)?.parse::<u32>().ok()
+                })
+                == Some(group)
+        })
+        .collect()
+}
+
+// T20 (ADR 0007, ADR 0028 §12): a vLLM worker member's processes are in its own
+// host's `process_residency` report under the identities its Launch reported
+// (pid, boot, start), so that report is the member's own park evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vllm_worker_members_processes_are_in_its_residency_report() {
+    let leader = Arc::new(OnceLock::<u32>::new());
+    let seen = leader.clone();
+    // `nvidia-smi` lists every process of the engine that holds GPU memory:
+    // here, every process of the worker's process group (the spawned leader
+    // and the child it forks, as vLLM's GPU worker is).
+    let gpu: Arc<GpuCollector> = Arc::new(move || {
+        let leader = *seen.get()?;
+        Some(
+            group_pids(leader)
+                .into_iter()
+                .map(|pid| (pid, 64 << 20))
+                .collect(),
+        )
+    });
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_engine("vllm")
+        .with_gpu_processes(gpu);
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    host.record();
+    leader.set(out.processes[0].pid).unwrap();
+    // ADR 0007: one sample now, which the next availability refresh reports.
+    let sampler = host.host().sampler.clone().unwrap();
+    assert!(!sampler.sample_fresh().is_empty());
+    let inventory = host
+        .host()
+        .executor
+        .inventory()
+        .expect("the host reports its availability");
+    let residents: Vec<pb::ProcessResidency> = inventory
+        .domains
+        .iter()
+        .flat_map(|domain| domain.residents.clone())
+        .collect();
+    assert!(!residents.is_empty(), "{inventory:?}");
+    for resident in &residents {
+        assert!(
+            out.processes.iter().any(|p| p.pid == resident.pid
+                && p.boot_id == resident.boot_id
+                && p.start_ticks == resident.start_ticks),
+            "{resident:?} is one of the member's reported processes: {:?}",
+            out.processes
+        );
+    }
+    // The forked child, not only the spawned leader, is reported.
+    assert!(residents.iter().any(|r| r.pid != out.processes[0].pid));
+    let gone = host
+        .terminate(&out.owned_handle, &out.processes)
+        .await
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+/// ADR 0028 §12 (R12): the saver-map facts `host` next reports on its session
+/// for its member launch `owned_handle`, observed at or after `since`.
+async fn reported_saver(host: &FakeHost, owned_handle: &str, since: i64) -> pb::MemberSaver {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let inventory = host.host().executor.inventory().unwrap_or_default();
+        if let Some(saver) = inventory
+            .member_savers
+            .into_iter()
+            .find(|s| s.owned_handle == owned_handle && s.observed_at_unix_ms >= since)
+        {
+            return saver;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{owned_handle} reported its saver map"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+// T20, T22 (ADR 0028 §12, R12): a deep SGLang worker's own host reports its
+// member's saver map on its session, read from its own observation directory
+// with the member's own credential and recorded processes: every byte mapped
+// while resident, none once the head's collective released the rank.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deep_sglang_worker_reports_its_saver_map_on_its_session() {
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_engine("sglang")
+        .with_deep_park_and_stub_saver();
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    let handle = out.owned_handle.clone();
+    let resident = reported_saver(&host, &handle, now_ms()).await;
+    assert_eq!(resident.mapped_bytes, 2 << 20);
+    {
+        let scopes = host.host().saver.as_ref().unwrap().scopes.lock().unwrap();
+        let scope = scopes.last().unwrap();
+        let member = host.journal().retained_command(&handle).unwrap();
+        let plan = member.action.launch_plan().unwrap();
+        assert_eq!(
+            (scope.binding_id.as_str(), scope.incarnation.as_str()),
+            (plan.binding_id.as_str(), plan.incarnation.as_str())
+        );
+        assert!(!scope.admin_key.is_empty());
+        let members = scope.members.clone().unwrap();
+        assert!(out.processes.iter().all(|p| members
+            .iter()
+            .any(|m| m.pid == p.pid && m.boot_id == p.boot_id && m.start_ticks == p.start_ticks)));
+    }
+    // The head's collective released every rank, this one included.
+    std::fs::write(host.host().root.path().join("runtime/released"), "").unwrap();
+    let released = reported_saver(&host, &handle, now_ms()).await;
+    assert_eq!(released.mapped_bytes, 0);
+    let gone = host.terminate(&handle, &out.processes).await.unwrap();
     assert!(gone.all_gone(), "{:?}", gone.result);
 }

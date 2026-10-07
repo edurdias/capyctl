@@ -585,7 +585,7 @@ impl NativeHostExecution {
     /// measurement that fails journals nothing (the wake falls back as
     /// documented on `checkpoint_unchanged`).
     pub(super) async fn journal_park_digest(&self, owner: &MemberCommand) {
-        let MemberAction::LaunchSingle(plan) = &owner.action else {
+        let Some(plan) = owner.action.launch_plan() else {
             return;
         };
         if !plan.checkpoint_digest.is_empty() {
@@ -618,7 +618,13 @@ impl NativeHostExecution {
         owner: &MemberCommand,
         expected: &[ProcessIdentity],
     ) -> Result<(ResidencyOutcome, pb::ResidencyEvidence), SessionError> {
-        let MemberAction::LaunchSingle(plan) = &owner.action else {
+        // ADR 0028 §12: a single launch or a group's head (admitted by
+        // `authorize_residency`); the head's collective reaches every rank.
+        let Some(plan) = owner
+            .action
+            .launch_plan()
+            .filter(|_| crate::journal::parks_in_place(owner))
+        else {
             return Err(SessionError);
         };
         let unchanged = |milestones: Vec<String>| {
