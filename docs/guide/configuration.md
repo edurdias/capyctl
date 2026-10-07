@@ -34,6 +34,10 @@ name that profile instead.
 
 ## Deployment on several hosts
 
+<!-- include: ../examples/deployment-spread.yaml -->
+
+## One model across two hosts
+
 <!-- include: ../examples/deployment-multinode.yaml -->
 
 ## Host with unified memory

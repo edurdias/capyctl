@@ -1,0 +1,87 @@
+# The second host of the group in docs/examples/deployment-multinode.yaml
+# (`capyctl start host --config host-b.yaml`): the same engines, under the same
+# names and builds, as docs/examples/host.yaml, and its own peer address on the
+# direct link between the two hosts. See docs/guide/several-machines.md, "One
+# model across machines".
+# Parsed by the product: `capyctl validate config --file docs/examples/host-b.yaml`.
+# An illustration of the schema, not a tested engine recipe: executables,
+# fingerprints and limits are placeholders for the host's own values.
+schema_version: 1
+kind: host
+name: host-b
+state_dir: /var/lib/capyctl/host
+identity_dir: /var/lib/capyctl/host/identity
+hardware_fingerprint: example-hw-1
+environment_fingerprint: example-env-1
+model_store:
+  path: /srv/models
+ingress:
+  transport: trusted_private_link
+  address: "http://100.64.0.22:8444"
+  bind: "100.64.0.22:8444"
+resource_policy:
+  domains:
+    unified:
+      memory: unified
+      managed_limit: "96GiB"
+      free_reserve: "12GiB"
+      parked_limit: "16GiB"
+      host_kv_limit: "8GiB"
+  devices:
+    gpu0:
+      domain: unified
+      sharing: shared
+  device_sharing: shared
+  max_parked: 3
+  observation_ttl: "2s"
+  endpoint_port_range:
+    start: 8100
+    end: 8199
+  planner_max_states: 4096
+  queue:
+    admission_window: "2s"
+    max_pending_per_deployment: 64
+    max_pending_total: 256
+    max_buffered_bytes_total: "64MiB"
+    request_deadline: "1800s"
+    stream_idle_timeout: "120s"
+  labels:
+    site: lab
+    accelerator: example-gpu
+  # The address host A's ranks reach this host on (also `--peer-address` or
+  # CAPYCTL_PEER_ADDRESS).
+  groups:
+    peer_address: 192.0.2.11
+runtime_profiles:
+  vllm:
+    engine: vllm
+    revision: 1
+    executable: /opt/vllm/bin/vllm
+    build_fingerprint: "vllm 0.29.0"
+    args: []
+    cuda_home: /usr/local/cuda
+    env: {}
+    log_policy:
+      max_file_bytes: "16MiB"
+      retained_files: 3
+    security:
+      deep_park: enabled
+      trust_remote_code: false
+      credential_ref: "secret://engine-key"
+      installation_drift: warn
+  sglang:
+    engine: sglang
+    revision: 1
+    executable: /opt/sglang/bin/python3
+    build_fingerprint: "sglang 0.5.20"
+    args: []
+    env: {}
+    log_policy:
+      max_file_bytes: "16MiB"
+      retained_files: 3
+    security:
+      deep_park: enabled
+      trust_remote_code: false
+      credential_ref: "secret://engine-key"
+      admin_credential_ref: "secret://admin-key"
+      installation_drift: refuse

@@ -1,0 +1,48 @@
+# capyctl deployment with two instances spread over two hosts. Each instance is a
+# whole engine on one host. To run one engine across hosts, see
+# deployment-multinode.yaml (a group, docs/guide/several-machines.md).
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-spread.yaml
+# --host docs/examples/host.yaml` also resolves it against that host.
+# An illustration of the schema, not a tested engine recipe.
+schema_version: 1
+kind: deployment
+name: coding-large
+instances: 2
+placement:
+  hosts: ["gpu-box", "workstation"]
+  # Only hosts whose labels match are candidates.
+  selector:
+    accelerator: example-gpu
+  strategy: spread
+  max_per_host: 1
+routes: ["coding-large"]
+runtime_profile: sglang
+runtime_profile_revision: 1
+recipe: standard
+residency: deep
+recovery: reconcile
+model:
+  source:
+    type: local
+    path: /srv/models/coding-large-r1
+  content_fingerprint: "sha256:coding-large-r1"
+  revision: r1
+# Devices are not named (`id`): a named device requires exactly one allowed
+# host. Each instance takes a shared device from its own host.
+devices:
+  - sharing: shared
+engine_config:
+  dtype: bfloat16
+  context_length: 32768
+  memory:
+    request: "72GiB"
+    kv_cache: "16GiB"
+  sglang:
+    chunked_prefill_size: 8192
+    # auto (default): chosen by model family; none; or the engine's parser name.
+    tool_call_parser: auto
+    reasoning_parser: none
+request_deadline: "1800s"
+timeouts:
+  initialize: "1200s"
+  wake: "600s"

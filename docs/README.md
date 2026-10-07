@@ -20,7 +20,9 @@ quickstart are in the repository [`README.md`](../README.md).
 | [`examples/standalone.yaml`](examples/standalone.yaml) | Standalone role document (embedded server and host on one machine), in the shape `capyctl start standalone` generates. |
 | [`examples/deployment-minimal.yaml`](examples/deployment-minimal.yaml) | The smallest deployment: `name`, `engine` and `model`, everything else defaulted. |
 | [`examples/deployment-single.yaml`](examples/deployment-single.yaml) | vLLM deployment on one host, with `engine_config` and `timeouts`. |
-| [`examples/deployment-multinode.yaml`](examples/deployment-multinode.yaml) | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
+| [`examples/deployment-spread.yaml`](examples/deployment-spread.yaml) | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
+| [`examples/deployment-multinode.yaml`](examples/deployment-multinode.yaml) | One vLLM model across two hosts: a tensor-parallel group of two ranks (`topology`, `placement.hosts`, head first). |
+| [`examples/host-b.yaml`](examples/host-b.yaml) | The group's second host: the same engines as `examples/host.yaml` and its own `resource_policy.groups.peer_address`. |
 
 Every example passes `capyctl validate config`, the deployments also resolve
 against `examples/host.yaml`, and the minimal one against

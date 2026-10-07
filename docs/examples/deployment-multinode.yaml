@@ -1,47 +1,25 @@
-# capyctl deployment with two instances spread over two hosts. Each instance is a
-# whole engine on one host; capyctl does not split one engine across hosts.
+# One model across two hosts: a group of two tensor-parallel ranks, one per
+# host (docs/guide/several-machines.md, "One model across machines"). The first
+# host in placement.hosts is the head: it runs rank 0 and serves the API. The
+# second runs rank 1. Each named host must declare its peer address
+# (resource_policy.groups.peer_address in docs/examples/host.yaml and
+# docs/examples/host-b.yaml) and publish the `vllm` profile with the same build.
 # Parsed by the product: `capyctl validate config --file docs/examples/deployment-multinode.yaml
-# --host docs/examples/host.yaml` also resolves it against that host.
+# --host docs/examples/host.yaml` resolves it on the head.
 # An illustration of the schema, not a tested engine recipe.
-schema_version: 1
-kind: deployment
-name: coding-large
-instances: 2
+name: qwen3-30b-tp2
+engine: vllm
+# The same path on both hosts (a SGLang group with `residency: deep` requires it).
+model: qwen3-30b-a3b
+topology:
+  tensor_parallel: 2
+  pipeline_parallel: 1
 placement:
-  hosts: ["gpu-box", "workstation"]
-  # Only hosts whose labels match are candidates.
-  selector:
-    accelerator: example-gpu
-  strategy: spread
-  max_per_host: 1
-routes: ["coding-large"]
-runtime_profile: sglang
-runtime_profile_revision: 1
-recipe: standard
+  hosts: ["gpu-box", "host-b"]
 residency: deep
-recovery: reconcile
-model:
-  source:
-    type: local
-    path: /srv/models/coding-large-r1
-  content_fingerprint: "sha256:coding-large-r1"
-  revision: r1
-# Devices are not named (`id`): a named device requires exactly one allowed
-# host. Each instance takes a shared device from its own host.
-devices:
-  - sharing: shared
+# Per member: each host charges its own rank this much.
 engine_config:
-  dtype: bfloat16
-  context_length: 32768
   memory:
-    request: "72GiB"
-    kv_cache: "16GiB"
-  sglang:
-    chunked_prefill_size: 8192
-    # auto (default): chosen by model family; none; or the engine's parser name.
-    tool_call_parser: auto
-    reasoning_parser: none
-request_deadline: "1800s"
+    request: "40GiB"
 timeouts:
-  initialize: "1200s"
-  wake: "600s"
+  initialize: "1800s"
