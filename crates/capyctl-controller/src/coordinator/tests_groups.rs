@@ -2906,8 +2906,8 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
     assert!(!world.port_free("host-a", 25000));
     world.group.reconnect_host("host-b", JournalState::Kept);
-    let status = world.wait_settled_generation("g", 1).await;
-    assert_eq!(status.last_error(), "group_member_failed");
+    world.wait_settled_generation("g", 1).await;
+    world.wait_last_error("g", "group_member_failed").await;
     let (_, rows) = world.group_plan("g").unwrap();
     let journaled = world
         .host("host-b")
@@ -3435,6 +3435,31 @@ impl GroupWorld {
             .expect("a deployed instance")
     }
 
+    /// Wait until deployment `name`'s instance reads `expected`. A group's
+    /// members settle (and their charges and port are released) before its
+    /// stop's cleanup commits the terminal state, so a test reading that
+    /// state after settlement waits for it here.
+    pub(super) async fn wait_state(&self, name: &str, expected: &str) {
+        let id = self.id(name);
+        self.until(&format!("{name} {expected}"), || {
+            (self.observed_state(&id).as_deref() == Some(expected)).then_some(())
+        })
+        .await
+    }
+
+    /// Wait until deployment `name`'s status names `code`; its status. The
+    /// group stop records its outcome's code once every member settled, so
+    /// a status that read `group_member_uncertain` before settlement is
+    /// waited for here.
+    pub(super) async fn wait_last_error(&self, name: &str, code: &str) -> GroupStatus {
+        let id = self.id(name);
+        self.until(&format!("the status of {name} naming {code}"), || {
+            self.read_status(&id)
+                .filter(|status| status.last_error() == code)
+        })
+        .await
+    }
+
     /// ADR 0028 §11: every settled plan of deployment `name` released each
     /// member on its own host's evidence: that member's own host was sent a
     /// Terminate for the member's Launch, and no other host was.
@@ -3528,8 +3553,8 @@ async fn a_group_victim_is_stopped_whole_and_released_per_member() {
         let g = world.id("g");
         world.request("s").await;
         assert_eq!(world.state("s").await, "ready");
-        assert_eq!(world.state("g").await, "stopped");
         world.wait_settled_generation("g", 1).await;
+        world.wait_state("g", "stopped").await;
         world.assert_release_evidence_per_member("g");
         assert!(!world.group.alive(0) && !world.group.alive(1));
         assert_eq!(
@@ -3677,8 +3702,8 @@ async fn a_host_running_only_a_group_worker_member_is_occupied() {
         assert!(refused.contains("host host-b: host_occupied"), "{refused}");
         world.request("s").await;
         assert_eq!(world.state("s").await, "ready");
-        assert_eq!(world.state("g").await, "stopped");
         world.wait_settled_generation("g", 1).await;
+        world.wait_state("g", "stopped").await;
         world.assert_release_evidence_per_member("g");
         assert_eq!(
             world.owner_bytes_on("host-a", &member_owner_id(&g, 0, 0)),
@@ -4103,8 +4128,9 @@ async fn a_failed_park_closes_dispatch_and_retries_a_refused_stop() {
     assert_eq!(status.last_error(), "group_member_failed");
     world.assert_release_evidence_per_member("g");
     assert!(!world.group.alive(0) && !world.group.alive(1));
-    // Stopped under the failure principal (a rank failed), so it reads failed.
-    assert_eq!(world.state("g").await, "failed");
+    // Stopped under the failure principal (a rank failed), so it reads failed
+    // once the stop's cleanup commits after every member settled.
+    world.wait_state("g", "failed").await;
     assert!(!world.route_open("g"));
 }
 
@@ -4152,13 +4178,13 @@ async fn a_deep_group_victim_on_a_single_claim_host_is_stopped_not_parked() {
     let g = world.id("g");
     world.request("s").await;
     assert_eq!(world.state("s").await, "ready");
-    assert_eq!(world.state("g").await, "stopped");
     assert_eq!(
         world.group.sleep_calls(),
         0,
         "a single-claim victim never parks"
     );
     world.wait_settled_generation("g", 1).await;
+    world.wait_state("g", "stopped").await;
     world.assert_release_evidence_per_member("g");
     assert!(!world.group.alive(0) && !world.group.alive(1));
     assert_eq!(
@@ -4435,8 +4461,8 @@ async fn stalled_group_keeps_an_unreachable_member_charged() {
         0
     );
     world.group.reconnect_host("host-b", JournalState::Kept);
-    let status = world.wait_settled_generation("g", 1).await;
-    assert_eq!(status.last_error(), "group_stalled");
+    world.wait_settled_generation("g", 1).await;
+    world.wait_last_error("g", "group_stalled").await;
     assert!(!world.group.alive(1));
 }
 
