@@ -783,6 +783,8 @@ fn end_victim_closure(
 /// `occupied`): every other retained launch on a host whose agent holds one
 /// journal claim at a time, or the target's other instances on a host with
 /// per-launch claims. Empty on a host fencing per instance or the embedded one.
+/// ADR 0028 §5, §11: a group occupies each host where a member is not yet
+/// settled, listed under its member owner there.
 fn host_occupants(
     tx: &Transaction<'_>,
     host: &str,
@@ -807,7 +809,11 @@ fn host_occupants(
                 AND (EXISTS(SELECT 1 FROM remote_binding_ingress r WHERE r.binding_id=b.id AND r.host_id=?1)
                      OR EXISTS(SELECT 1 FROM deployment_instances i WHERE i.deployment_id=b.deployment_id
                                   AND i.instance_index=b.instance_index AND i.host_id=?1))
-              ORDER BY b.deployment_id,b.instance_index",
+             UNION
+             SELECT m.deployment_id,m.instance_index FROM group_members m
+              WHERE m.host_id=?1 AND m.state!='settled' AND NOT (m.deployment_id=?2 AND m.instance_index=?3)
+                AND (?4=0 OR m.deployment_id=?2)
+              ORDER BY 1,2",
         )?
         .query_map(params![host, target, instance, mode], |r| {
             Ok((r.get(0)?, r.get(1)?))
