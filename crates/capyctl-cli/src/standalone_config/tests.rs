@@ -2472,3 +2472,28 @@ fn standalone_publishes_the_group_policy_from_every_layer() {
         std::env::remove_var(name);
     }
 }
+
+// T03 (owner decision 2026-10-07, ADR 0014 amendment A18): the parked growth
+// bound the standalone document states is carried into the embedded host's
+// published policy and normalizes there; `auto`, or nothing, leaves the
+// published policy byte for byte as before.
+#[test]
+fn a_stated_parked_growth_limit_reaches_the_published_policy() {
+    use capyctl_config::effective::{normalize_host_policy, ParkedGrowthLimit};
+    for nothing in [
+        serde_json::json!({}),
+        serde_json::json!({"resource_policy": {"parked_growth_limit": "auto"}}),
+    ] {
+        let mut host = derived_unified();
+        apply_stated_memory(&mut host, &nothing, CAPACITY).unwrap();
+        assert_eq!(host, derived_unified(), "{nothing}");
+    }
+    let stated = serde_json::json!({"resource_policy": {"parked_growth_limit": "50%"}});
+    let mut host = derived_unified();
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(host["resource_policy"]["parked_growth_limit"], "50%");
+    assert_eq!(
+        normalize_host_policy(&host).unwrap().parked_growth_limit,
+        ParkedGrowthLimit::Percent(50)
+    );
+}

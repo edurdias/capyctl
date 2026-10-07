@@ -329,6 +329,10 @@ pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
 /// parked and host-KV sub-limits are lowered to a managed limit below them.
 /// Forms and ranges were checked when the document was read
 /// ([`capyctl_config::standalone::check_honoured`]).
+///
+/// ADR 0014 amendment A18: the parked growth bound the document states under
+/// `host.resource_policy.parked_growth_limit` is carried as stated; `auto` is
+/// left out, so the published policy is the one published before it existed.
 pub fn apply_stated_memory(
     host: &mut Value,
     stated_host: &Value,
@@ -336,6 +340,12 @@ pub fn apply_stated_memory(
 ) -> Result<(), String> {
     use capyctl_config::standalone::{MemoryShare, STATED_MEMORY_LIMITS};
     const GIB: f64 = (1u64 << 30) as f64;
+    if let Some(text) = stated_host["resource_policy"]["parked_growth_limit"]
+        .as_str()
+        .filter(|text| *text != "auto")
+    {
+        host["resource_policy"]["parked_growth_limit"] = json!(text);
+    }
     let stated = &stated_host["resource_policy"]["memory"]["system"];
     let mut shares = Vec::new();
     for field in STATED_MEMORY_LIMITS {

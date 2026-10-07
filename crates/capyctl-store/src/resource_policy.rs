@@ -3,7 +3,7 @@ use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteErr
 use crate::resource_ledger::{read_snapshot, ResourceStoreError};
 use crate::OpState;
 use capyctl_config::effective::{
-    DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing,
+    DomainMemory, DomainPolicy, HostPolicy, ParkedGrowthLimit, PortRange, QueuePolicy, Sharing,
 };
 use capyctl_config::resource_controls::{ResourceContext, ResourceControls};
 use capyctl_domain::resources::{LedgerSnapshot, MemoryObservation, ResourcePhase};
@@ -126,6 +126,10 @@ struct StoredControls {
     queue: StoredQueue,
     device_sharing: String,
     device_sharing_overrides: BTreeMap<String, String>,
+    /// ADR 0014 amendment A18: absent in policies stored before it existed,
+    /// and omitted at `auto` so their stored identity is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked_growth_limit: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -283,6 +287,7 @@ impl StoredControls {
                 .iter()
                 .map(|(id, s)| (id.clone(), sharing(*s)))
                 .collect(),
+            parked_growth_limit: value.parked_growth_limit.stated(),
         }
     }
     fn to_public(&self) -> Result<ResourceControls, ResourcePolicyError> {
@@ -321,6 +326,13 @@ impl StoredControls {
                 .iter()
                 .map(|(id, s)| Ok((id.clone(), parse_sharing(s)?)))
                 .collect::<Result<_, ResourcePolicyError>>()?,
+            parked_growth_limit: self
+                .parked_growth_limit
+                .as_deref()
+                .map(ParkedGrowthLimit::parse)
+                .transpose()
+                .map_err(|_| ResourcePolicyError::CorruptStoredPolicy)?
+                .unwrap_or_default(),
         })
     }
 }

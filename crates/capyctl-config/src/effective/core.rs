@@ -353,6 +353,15 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
+    // ADR 0014 amendment A18: absent is `auto`.
+    let parked_growth_limit = h
+        .resource_policy
+        .parked_growth_limit
+        .as_deref()
+        .map(ParkedGrowthLimit::parse)
+        .transpose()
+        .map_err(|detail| invalid("resource_policy.parked_growth_limit", detail))?
+        .unwrap_or_default();
     // A published physical UUID is placement evidence the launcher sets the
     // child's CUDA namespace from, so it must be the exact shape the inventory
     // collector validates (`runtime/sglang_device.py`), not any opaque token.
@@ -382,6 +391,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         planner_max_states,
         queue,
         model_sources,
+        parked_growth_limit,
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)

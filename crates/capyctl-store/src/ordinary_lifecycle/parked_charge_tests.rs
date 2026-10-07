@@ -1,6 +1,9 @@
-//! ADR 0014 amendment A13: the parked charge measured per revision. CPU
-//! only; nothing here qualifies an engine.
-use super::super::park::{ResidencyArm, ResidencyKind, ResidencyReceipt, WakeScope};
+//! ADR 0014 amendments A13 and A18: the parked charge measured per revision,
+//! and the bound on one launch's parked-charge growth. CPU only; nothing here
+//! qualifies an engine.
+use super::super::park::{
+    IdleAction, IdlePolicy, ResidencyArm, ResidencyKind, ResidencyReceipt, WakeScope,
+};
 use super::*;
 use crate::Store;
 use capyctl_config::effective::{resolve_effective, PARKED_RESIDUAL_PLACEHOLDER_BYTES};
@@ -377,4 +380,282 @@ fn a_stale_sample_an_unmatched_group_or_declared_resources_record_nothing() {
     let step = lab.parked(&b, "park-b", 20, 2_300);
     assert!(!lab.record(&step, 2_400, &residents(20, [9, 5])));
     assert!(lab.status(&b.deployment_id).is_null());
+}
+
+// --- ADR 0014 amendment A18: the parked growth bound ---------------------------
+
+impl Lab {
+    /// A lab whose host states `edit` in its published policy.
+    fn with_host(edit: impl FnOnce(&mut Value)) -> Self {
+        let (mut config, mut host) = fixture();
+        edit(&mut host);
+        derived(&mut config);
+        let effective = resolve_effective(&config, &host).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        store
+            .import_resource_policy(&session, &effective.host, &observed(1), 1)
+            .unwrap();
+        Self {
+            store,
+            session,
+            host,
+        }
+    }
+
+    /// One park of instance 0 measured at `quarters` (quarters of a GiB per
+    /// process), then a wake: a park and wake cycle of the same launch.
+    fn cycle(&self, fence: &DeploymentFence, n: u32, quarters: [i64; 2], now: i64) {
+        let step = self.parked(fence, &format!("park-{n}"), 10, now);
+        assert!(self.record(&step, now + 100, &residents(10, quarters)));
+        self.woken(fence, &format!("wake-{n}"), 10, now + 500);
+    }
+
+    fn operation_kind(&self, id: &str) -> String {
+        self.store
+            .conn
+            .query_row("SELECT kind FROM operations WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn stored_policy(&self) -> String {
+        self.store
+            .conn
+            .query_row(
+                "SELECT policy_json FROM host_resource_policies WHERE host_id='lab'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn park_command(&self, fence: &DeploymentFence, key: &str, now: i64) -> ResidencyReceipt {
+        self.store
+            .accept_park_command(
+                &self.session,
+                "operator",
+                &fence.deployment_id,
+                fence.revision,
+                key,
+                now,
+                now + 60_000,
+            )
+            .unwrap()
+    }
+}
+
+/// The catalog's shape (GB10, vLLM 0.30.0): one launch parked and woken
+/// twice, its parked charge 3.5 GiB at the first park and 7.5 GiB at the
+/// second, growth (4 GiB) past the default bound (the first charge).
+fn outgrown_launch(lab: &Lab) -> DeploymentFence {
+    let a = lab.deploy("a", derived);
+    lab.ready(&a, 1_000, 10);
+    lab.cycle(&a, 1, [9, 5], 1_300);
+    lab.cycle(&a, 2, [20, 10], 3_000);
+    a
+}
+
+// T16 (owner decision 2026-10-07, ADR 0014 amendment A18): once a launch's
+// measured parked charge grew past its host's `parked_growth_limit` (default:
+// the first charge again), `park deployment` stops it instead. The stop
+// releases nothing yet (the instance keeps its Ready charge until the stop's
+// own cleanup evidence), and status says why.
+#[test]
+fn a_park_after_the_parked_charge_outgrew_its_first_park_is_a_stop() {
+    let lab = Lab::new();
+    let a = outgrown_launch(&lab);
+    let status = lab.status(&a.deployment_id);
+    let growth = &status["growth"][0];
+    assert_eq!(growth["first_bytes"], 14 * GIB / 4, "{status}");
+    assert_eq!(growth["last_bytes"], 30 * GIB / 4, "{status}");
+    assert_eq!(growth["parks"], 2);
+    assert_eq!(growth["limit_bytes"], 14 * GIB / 4);
+    assert_eq!(growth["state"], "past_limit");
+
+    let receipt = lab.park_command(&a, "park-3", 5_000);
+    assert_eq!(
+        lab.operation_kind(&receipt.operation_id),
+        "ordinary_cleanup"
+    );
+    assert_eq!(
+        lab.store.residency_step_state(&receipt.step_id).unwrap(),
+        None,
+        "no park step was accepted"
+    );
+    assert_eq!(lab.charge(&a.deployment_id).1, ResourcePhase::Ready);
+    let status = lab.status(&a.deployment_id);
+    assert_eq!(status["growth"][0]["state"], "stopped", "{status}");
+    assert_eq!(
+        status["growth"][0]["stop_operation_id"],
+        json!(receipt.operation_id)
+    );
+    let evidence: String = lab
+        .store
+        .conn
+        .query_row(
+            "SELECT evidence FROM journal_entries WHERE operation_id=?1 AND state='park_growth_stop'",
+            [&receipt.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(evidence.contains("parked_growth"), "{evidence}");
+    assert!(evidence.contains("grew from 3.5 GiB"), "{evidence}");
+    // An exact retry of the command replays the same stop.
+    assert_eq!(lab.park_command(&a, "park-3", 5_000), receipt);
+}
+
+// T16 (ADR 0014 amendment A18): growth within the bound parks as before.
+#[test]
+fn a_park_within_the_growth_limit_parks_as_before() {
+    let lab = Lab::new();
+    let a = lab.deploy("a", derived);
+    lab.ready(&a, 1_000, 10);
+    lab.cycle(&a, 1, [9, 5], 1_300);
+    // 4 GiB: 0.5 GiB of growth past 3.5 GiB.
+    lab.cycle(&a, 2, [10, 6], 3_000);
+    assert_eq!(
+        lab.status(&a.deployment_id)["growth"][0]["state"],
+        "within_limit"
+    );
+    let receipt = lab.park_command(&a, "park-3", 5_000);
+    assert_eq!(lab.operation_kind(&receipt.operation_id), "park");
+    let context = lab.arm(&receipt.step_id, 5_010);
+    lab.complete(&context, ResidencyKind::Park, 10, 5_020);
+    assert_eq!(lab.charge(&a.deployment_id).1, ResourcePhase::Parked);
+}
+
+// T16 (ADR 0014 amendment A18): the idle policy's park of an outgrown launch
+// is a stop with the reason `ready_idle_parked_growth`; within the bound it
+// parks.
+#[test]
+fn the_idle_policy_stops_an_outgrown_launch_instead_of_parking_it() {
+    let policy = IdlePolicy {
+        ready_idle_ms: Some(1_000),
+        parked_idle_ms: None,
+    };
+    let quiet = |_: &str, _: i64| None;
+    let lab = Lab::new();
+    let a = outgrown_launch(&lab);
+    let actions = lab
+        .store
+        .apply_idle_policy(&lab.session, 10_000, policy, &quiet, 0)
+        .unwrap();
+    let [IdleAction::Stopped {
+        reason,
+        operation_id,
+        ..
+    }] = actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    assert_eq!(*reason, "ready_idle_parked_growth");
+    assert_eq!(lab.operation_kind(operation_id), "ordinary_cleanup");
+    assert_eq!(
+        lab.status(&a.deployment_id)["growth"][0]["state"],
+        "stopped"
+    );
+
+    let lab = Lab::new();
+    let b = lab.deploy("b", derived);
+    lab.ready(&b, 1_000, 10);
+    lab.cycle(&b, 1, [9, 5], 1_300);
+    lab.cycle(&b, 2, [10, 6], 3_000);
+    let actions = lab
+        .store
+        .apply_idle_policy(&lab.session, 10_000, policy, &quiet, 0)
+        .unwrap();
+    assert!(
+        matches!(actions.as_slice(), [IdleAction::Parked { .. }]),
+        "{actions:?}"
+    );
+}
+
+// T16 T03 (ADR 0014 amendment A18): the host's `parked_growth_limit` sets the
+// bound: `off` never stops, a percentage or a size of growth is measured from
+// the first charge. A policy that states none stores no such field, so its
+// stored identity is the one it had before the setting existed.
+#[test]
+fn the_hosts_parked_growth_limit_sets_the_bound() {
+    assert!(!Lab::new().stored_policy().contains("parked_growth_limit"));
+    let auto = Lab::with_host(|host| {
+        host["resource_policy"]["parked_growth_limit"] = json!("auto");
+    });
+    assert_eq!(auto.stored_policy(), Lab::new().stored_policy());
+    // The outgrown launch grew 4 GiB from 3.5 GiB (114 %).
+    for (limit, stops) in [
+        ("off", false),
+        ("200%", false),
+        ("100%", true),
+        ("5GiB", false),
+        ("3GiB", true),
+    ] {
+        let lab = Lab::with_host(|host| {
+            host["resource_policy"]["parked_growth_limit"] = json!(limit);
+        });
+        assert!(
+            lab.stored_policy().contains("parked_growth_limit"),
+            "{limit}"
+        );
+        let a = outgrown_launch(&lab);
+        let receipt = lab.park_command(&a, "park-3", 5_000);
+        let kind = lab.operation_kind(&receipt.operation_id);
+        assert_eq!(kind == "ordinary_cleanup", stops, "{limit}: {kind}");
+        let growth = &lab.status(&a.deployment_id)["growth"][0];
+        assert_eq!(growth["limit_bytes"].is_null(), limit == "off", "{limit}");
+    }
+}
+
+// T16 T32 (ADR 0014 amendment A18): a switch releases an outgrown victim by
+// a stop even when the plan would park it, and records why.
+#[test]
+fn a_switch_stops_an_outgrown_victim_instead_of_parking_it() {
+    let lab = Lab::new();
+    let a = outgrown_launch(&lab);
+    let generation: i64 = lab
+        .store
+        .conn
+        .query_row(
+            "SELECT generation FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0",
+            [&a.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(lab
+        .store
+        .close_for_switch(&lab.session, &a.deployment_id, 0, generation)
+        .unwrap());
+    let release = lab
+        .store
+        .accept_switch_release(
+            &lab.session,
+            "switch",
+            &a.deployment_id,
+            0,
+            generation,
+            "switch-release",
+            5_000,
+            true,
+        )
+        .unwrap();
+    assert!(!release.parked);
+    assert_eq!(
+        lab.operation_kind(&release.operation_id),
+        "ordinary_cleanup"
+    );
+    let evidence: String = lab
+        .store
+        .conn
+        .query_row(
+            "SELECT evidence FROM journal_entries WHERE operation_id=?1 AND state='switch_stop'",
+            [&release.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(evidence.contains("parked_growth"), "{evidence}");
+    assert_eq!(
+        lab.status(&a.deployment_id)["growth"][0]["state"],
+        "stopped"
+    );
 }

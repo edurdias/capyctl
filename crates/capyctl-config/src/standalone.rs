@@ -19,9 +19,10 @@
 //! installation (`host.local_engine`), the runtime directory
 //! (`host.runtime_dir`), the engines' port range
 //! (`host.resource_policy.endpoint_port_range`), the queue bounds
-//! (`host.resource_policy.queue`) and the memory limits
-//! (`host.resource_policy.memory.system`, ADR 0025: a size or a share of the
-//! observed memory) are honoured as on a host
+//! (`host.resource_policy.queue`), the parked growth bound
+//! (`host.resource_policy.parked_growth_limit`, ADR 0014 amendment A18) and
+//! the memory limits (`host.resource_policy.memory.system`, ADR 0025: a size
+//! or a share of the observed memory) are honoured as on a host
 //! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` /
 //! `CAPYCTL_INFERENCE_ADDR` or `--management-listen` / `CAPYCTL_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
@@ -460,6 +461,16 @@ pub fn check_honoured(
             // The queue bounds are honoured as on a host; their values are
             // checked when the embedded host's policy is normalized.
             map.remove("queue");
+            // ADR 0014 amendment A18: the parked growth bound is honoured
+            // as on a host: `auto`, `off`, a percentage or a size.
+            if let Some(value) = map.remove("parked_growth_limit") {
+                let path = "host.resource_policy.parked_growth_limit";
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| refuse(path, "`auto`, `off`, a size or a percentage"))?;
+                crate::parked_growth::ParkedGrowthLimit::parse(text)
+                    .map_err(|detail| refuse(path, detail))?;
+            }
         }
         // Owner decision 2026-10-03: the memory limits take a size or a
         // share of the observed memory; the derived value stays the default.
@@ -826,6 +837,53 @@ mod tests {
         );
         assert_eq!(MemoryShare::Percent(75).of(200 << 30), 150 << 30);
         assert_eq!(MemoryShare::Bytes(90 << 30).of(200 << 30), 90 << 30);
+    }
+
+    // T03 (owner decision 2026-10-07, ADR 0014 amendment A18): the parked
+    // growth bound is set three ways with one precedence, `--set` over
+    // `CAPYCTL_SET__…` over the YAML, and takes `auto`, `off`, a percentage
+    // or a size.
+    #[test]
+    fn the_parked_growth_limit_is_set_three_ways() {
+        use crate::setting_overrides::SettingOverrides;
+        const FLAG: &str = "host.resource_policy.parked_growth_limit=50%";
+        const ENV: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__PARKED_GROWTH_LIMIT";
+        let mut yaml = generated("/s");
+        yaml["host"]["resource_policy"]["parked_growth_limit"] = json!("8GiB");
+        let growth = |flags: &[&str], env: &[(&str, &str)]| {
+            let overrides = SettingOverrides::parse(
+                crate::ConfigKind::Standalone,
+                &flags.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                &env.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let applied = overrides.apply_and_validate(yaml.clone()).unwrap();
+            check(&applied).unwrap();
+            applied["host"]["resource_policy"]["parked_growth_limit"].clone()
+        };
+        assert_eq!(growth(&[FLAG], &[(ENV, "off")]), "50%", "the flag wins");
+        assert_eq!(
+            growth(&[], &[(ENV, "off")]),
+            "off",
+            "the environment over YAML"
+        );
+        assert_eq!(growth(&[], &[]), "8GiB", "the YAML");
+        for good in ["auto", "off", "0%", "100%", "250%", "0B", "8GiB"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["parked_growth_limit"] = json!(good);
+            check(&doc).unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in ["10001%", "-1GiB", "7.5%", "lots", "1 GiB", "true"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["parked_growth_limit"] = json!(bad);
+            let error = check(&doc).expect_err(bad);
+            assert_eq!(
+                error.path, "host.resource_policy.parked_growth_limit",
+                "{bad}"
+            );
+        }
     }
 
     // T03 (owner decision 2026-10-06, ADR 0014 amendment A17): the parked

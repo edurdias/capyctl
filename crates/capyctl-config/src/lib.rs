@@ -28,6 +28,8 @@ pub mod model_source;
 pub mod model_settings;
 // ADR 0024: tool-call and reasoning parsers chosen by model family.
 pub mod parsers;
+// ADR 0014 amendment A18: the host's bound on a launch's parked-charge growth.
+pub mod parked_growth;
 // ADR 0018 §2: `engines.yaml`, the capyctl-owned engines file beside the role
 // document, its lock, atomic write, and the merge into the host document.
 pub mod registration;

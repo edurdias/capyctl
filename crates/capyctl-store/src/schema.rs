@@ -952,6 +952,29 @@ pub const SCHEMA_V42: &str = "-- group member launch handles (groups::migrate_v4
 /// columns are added by `groups::migrate_v43` only when missing.
 pub const SCHEMA_V43: &str = "-- group canary references (groups::migrate_v43)";
 
+/// v44 (ADR 0014 amendment A18): the parked residue of one launch (an
+/// instance's generation), per memory domain: its first measured park and
+/// its latest, so the next park of a launch whose charge grew past its host's
+/// `parked_growth_limit` is a stop. `stop_operation_id` names the stop the
+/// bound turned a park into. Only an instance's latest measured launch is
+/// kept. Additive and forward-only.
+pub const SCHEMA_V44: &str = r#"
+CREATE TABLE IF NOT EXISTS parked_launch_residues(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  domain TEXT NOT NULL,
+  first_bytes INTEGER NOT NULL CHECK(first_bytes>0),
+  first_step_id TEXT NOT NULL,
+  last_bytes INTEGER NOT NULL CHECK(last_bytes>0),
+  last_step_id TEXT NOT NULL,
+  parks INTEGER NOT NULL CHECK(parks>=1),
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  stop_operation_id TEXT,
+  PRIMARY KEY(deployment_id,instance_index,generation,domain)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

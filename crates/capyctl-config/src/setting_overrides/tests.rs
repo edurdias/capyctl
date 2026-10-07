@@ -296,3 +296,30 @@ fn management_address_and_state_dir_are_named_alike_on_every_role() {
         assert_eq!(named_forms(kind, "state_dir"), state, "{kind:?}");
     }
 }
+
+// T03 (owner decision 2026-10-07, ADR 0014 amendment A18): a host's parked
+// growth bound is set three ways, `--set resource_policy.parked_growth_limit`
+// over `CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT` over the YAML.
+#[test]
+fn a_hosts_parked_growth_limit_is_set_three_ways() {
+    const FLAG: &str = "resource_policy.parked_growth_limit=50%";
+    const ENV: &str = "CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT";
+    let document = json!({
+        "schema_version": 1, "kind": "host", "name": "h",
+        "resource_policy": {"parked_growth_limit": "8GiB"},
+    });
+    let growth = |flags: &[&str], vars: &[(&str, &str)]| {
+        let overrides =
+            SettingOverrides::parse(ConfigKind::Host, &sets(flags), &env(vars)).unwrap();
+        overrides.apply_and_validate(document.clone()).unwrap()["resource_policy"]
+            ["parked_growth_limit"]
+            .clone()
+    };
+    assert_eq!(growth(&[FLAG], &[(ENV, "off")]), "50%", "the flag wins");
+    assert_eq!(
+        growth(&[], &[(ENV, "off")]),
+        "off",
+        "the environment over YAML"
+    );
+    assert_eq!(growth(&[], &[]), "8GiB", "the YAML");
+}

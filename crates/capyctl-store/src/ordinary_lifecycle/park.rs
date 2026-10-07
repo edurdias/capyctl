@@ -895,6 +895,71 @@ fn declared(tx: &Transaction<'_>, deployment: &str) -> Result<EffectiveDeploymen
     decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)
 }
 
+/// ADR 0014 amendment A18: `park deployment` on a Ready instance whose
+/// parked charge grew past its host's `parked_growth_limit` since its first
+/// park stops it instead (an ordinary stop, so it stays eligible for
+/// on-demand activation and its next activation starts a fresh engine), as a
+/// restart_only group parks by a stop (ADR 0028 §12). The stop releases
+/// nothing before its own cleanup evidence. `None` when the instance parks:
+/// it is within the bound, has work open (a park in flight is joined), or
+/// runs no completed launch.
+#[allow(clippy::too_many_arguments)]
+fn growth_stop(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    principal: &str,
+    deployment: &str,
+    instance: u32,
+    key: &str,
+    now: i64,
+    deadline: i64,
+) -> Result<Option<ResidencyReceipt>, LifecycleError> {
+    if open_run(tx, deployment, instance)?.is_some() {
+        return Ok(None);
+    }
+    let Ok((source, e, _)) = launch(tx, deployment, instance) else {
+        return Ok(None);
+    };
+    let Some(growth) = super::parked_charge::outgrown(tx, &source, &e)? else {
+        return Ok(None);
+    };
+    let stop = crate::Store::accept_instance_stop_in_transaction(
+        tx,
+        s,
+        principal,
+        &source.fence(),
+        key,
+        now,
+        now.saturating_add(e.request_deadline_ms).max(deadline),
+        &StopCommand {
+            scope: Some(instance_scope(deployment, instance)),
+            revision: Some(source.revision),
+        },
+    )?;
+    journal(
+        tx,
+        &stop.operation_id,
+        "park_growth_stop",
+        &format!(
+            "deployment {deployment}: instance {instance} parked_growth: {}, so this park stops it instead and its next activation starts a fresh engine; an ordinary stop leaves it eligible for on-demand activation",
+            growth.reason()
+        ),
+    )?;
+    super::parked_charge::mark_stopped(tx, &source, &stop.operation_id)?;
+    Ok(Some(ResidencyReceipt {
+        operation_id: stop.operation_id,
+        step_id: stop.step_id,
+        deployment_id: deployment.into(),
+        instance,
+        kind: ResidencyKind::Park,
+        revision: stop.revision,
+        generation: stop.generation,
+        accepted_at_ms: stop.accepted_at_ms,
+        deadline_ms: stop.deadline_ms,
+        joined: false,
+    }))
+}
+
 impl crate::Store {
     /// SPEC §6.3 `park deployment`: drain and park every READY instance at the
     /// declared tier, leaving the deployment eligible for on-demand
@@ -966,16 +1031,23 @@ impl crate::Store {
             .collect::<Result<_, _>>()?;
         let mut first: Option<ResidencyReceipt> = None;
         for instance in targets {
-            match accept_instance(
-                &tx,
-                s,
-                ResidencyKind::Park,
-                deployment,
-                instance,
-                principal,
-                now,
-                deadline,
-            ) {
+            // ADR 0014 amendment A18: an instance whose parked charge grew
+            // past its host's bound is stopped instead, under this command.
+            let accepted =
+                match growth_stop(&tx, s, principal, deployment, instance, key, now, deadline)? {
+                    Some(receipt) => Ok(receipt),
+                    None => accept_instance(
+                        &tx,
+                        s,
+                        ResidencyKind::Park,
+                        deployment,
+                        instance,
+                        principal,
+                        now,
+                        deadline,
+                    ),
+                };
+            match accepted {
                 Ok(receipt) => {
                     if first.is_some() {
                         let scope = residency_scope(deployment, Some(instance), "park");
@@ -2441,8 +2513,9 @@ fn evidence_since(
 impl crate::Store {
     /// SPEC §6.5: the controller-owned idle policy, one pass. A Ready
     /// instance with nothing in flight whose last activity is older than
-    /// `ready_idle_ms` parks at its declared tier (a restart-only one, or one
-    /// whose park the engine refused, stops instead); a parked instance older
+    /// `ready_idle_ms` parks at its declared tier (a restart-only one, one
+    /// whose park the engine refused, or one whose parked charge grew past
+    /// its host's bound, ADR 0014 amendment A18, stops instead); a parked instance older
     /// than `parked_idle_ms` stops to reclaim its residual state. Every stop
     /// is ordinary, so automatic activation stays enabled. `activity` is the
     /// router's last request time for an instance generation; `floor` is the
@@ -2557,7 +2630,15 @@ fn idle_one(
         params![deployment, instance, generation],
         |r| r.get(0),
     )?;
-    if !parked && parks(&e) && !refused_park {
+    // ADR 0014 amendment A18: a launch whose parked charge grew past its
+    // host's bound since its first park stops instead, so its next
+    // activation starts a fresh engine.
+    let growth = if !parked && parks(&e) && !refused_park {
+        super::parked_charge::outgrown(tx, &source, &e)?
+    } else {
+        None
+    };
+    if !parked && parks(&e) && !refused_park && growth.is_none() {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
             tx, s, "idle", deployment, instance, &key, now, deadline,
@@ -2578,6 +2659,8 @@ fn idle_one(
         "parked_idle"
     } else if refused_park {
         "ready_idle_park_refused"
+    } else if growth.is_some() {
+        "ready_idle_parked_growth"
     } else {
         "ready_idle_restart_only"
     };
@@ -2599,12 +2682,19 @@ fn idle_one(
             revision: Some(revision),
         },
     )?;
+    let detail = growth
+        .as_ref()
+        .map(|growth| format!(": {}, so it stops instead of parking and its next activation starts a fresh engine", growth.reason()))
+        .unwrap_or_default();
     journal(
         tx,
         &receipt.operation_id,
         "idle_stop",
-        &format!("deployment {deployment}: instance {instance} idle since {since} ({reason}); an ordinary stop leaves it eligible for on-demand activation"),
+        &format!("deployment {deployment}: instance {instance} idle since {since} ({reason}){detail}; an ordinary stop leaves it eligible for on-demand activation"),
     )?;
+    if growth.is_some() {
+        super::parked_charge::mark_stopped(tx, &source, &receipt.operation_id)?;
+    }
     Ok(Some(IdleAction::Stopped {
         deployment_id: deployment.into(),
         instance,

@@ -265,7 +265,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
-| Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
+| Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 
@@ -395,6 +395,51 @@ derived quarter, and its stored policy is unchanged. A card's own parked limit
 its limits literally, in `resource_policy.domains.<domain>.parked_limit`, and
 takes `--set` and `CAPYCTL_SET__…` the same way.
 
+### Parked growth limit
+
+Some engines leave memory behind on every park and wake: vLLM 0.30 on a GB10
+held a parked charge of 4.7 GiB after its first park, 9.6 GiB after the
+second and 13.4 GiB after the third, while its GPU memory returned to the same
+22.1 GiB on every wake. CapyCTL measures every park, so it charges what the
+engine holds, but the engine holds more each cycle. A fresh start gives that
+memory back.
+
+So once a launch's parked charge has grown past a bound since its first
+measured park, its next park is a stop instead: an idle park, a switch that
+releases it, and `capyctl park` alike. The stop is an ordinary one, so the
+next request starts the model fresh; `capyctl status` prints a `Parked` line
+(`its next park stops it (parked_growth)`, then `stopped instead of parked`),
+and the JSON status lists the numbers under `parked.growth`.
+
+The bound is host policy, `resource_policy.parked_growth_limit`:
+
+- `auto` (the default): the first parked charge again, so a launch may double
+  it;
+- a whole percentage of the first parked charge, `0%` to `10000%`;
+- a size of growth, such as `8GiB`;
+- `off`: never stop for growth.
+
+```bash
+# A host role.
+capyctl start host --set resource_policy.parked_growth_limit=50%
+CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT=8GiB
+
+# Standalone.
+capyctl start standalone --set host.resource_policy.parked_growth_limit=off
+CAPYCTL_SET__HOST__RESOURCE_POLICY__PARKED_GROWTH_LIMIT=200%
+```
+
+```yaml
+host:
+  resource_policy:
+    parked_growth_limit: auto   # or "50%", "8GiB", off
+```
+
+A host document states it as `resource_policy.parked_growth_limit`. `--set`
+wins over the variable, and both over the document. A document that leaves it
+out or says `auto` keeps the default, and its published and stored policy is
+unchanged.
+
 ## Seeing the effective configuration
 
 `capyctl config show` prints the value each setting of a role will have, and
@@ -426,6 +471,7 @@ host.resource_policy.memory.accounting             auto                         
 host.resource_policy.memory.system.free_reserve    auto                                yaml
 host.resource_policy.memory.system.managed_limit   auto                                yaml
 host.resource_policy.memory.system.parked_limit    auto                                yaml
+host.resource_policy.parked_growth_limit           auto                                yaml
 host.state_dir                                     /home/me/.local/state/capyctl/host     yaml
 name                                               local                               yaml
 server.groups.stall_timeout                        120s                                default

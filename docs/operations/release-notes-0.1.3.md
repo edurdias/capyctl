@@ -63,6 +63,21 @@ Unreleased.
   refused at start. `auto`, or leaving it out, keeps the quarter and the
   stored policy unchanged. See
   [configuration](configuration.md#standalone-parked-limit).
+- **A model whose parked memory keeps growing restarts instead.** vLLM 0.30
+  on a GB10 left memory behind on every park and wake: one launch's parked
+  charge grew from 4.7 to 9.6 and then 13.4 GiB. Once a launch's parked charge
+  has grown past its first measured park by more than the host's
+  `resource_policy.parked_growth_limit` (default `auto`: the first charge
+  again, so it may double), its next park, idle, switch or `capyctl park`, is
+  a stop, and the next request starts it fresh. `capyctl status` says when
+  that is about to happen and when it did. Set the bound as a percentage
+  (`50%`), a size of growth (`8GiB`) or `off`, in the host document,
+  `--set resource_policy.parked_growth_limit=…` or
+  `CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT` (standalone:
+  `host.resource_policy.parked_growth_limit`). A host that does not state it
+  keeps its stored policy unchanged. See
+  [configuration](configuration.md#parked-growth-limit).
+
 - **A model split across machines reserves its share of the weights.** A
   deployment with a `topology` whose memory CapyCTL derives from the weights
   charged every machine the whole checkpoint, so a two-machine

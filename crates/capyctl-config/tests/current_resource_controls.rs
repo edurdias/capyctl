@@ -143,3 +143,60 @@ fn current_controls_preserve_the_groups_block() {
         resolve_effective(&deployment, &plain).unwrap()
     );
 }
+
+// T03 T14 (ADR 0014 amendment A18): a host that states no
+// `parked_growth_limit`, or `auto`, resolves, composes and fingerprints
+// exactly as before the setting existed; a stated bound is carried through
+// composition and the frozen snapshot.
+#[test]
+fn an_absent_or_auto_parked_growth_limit_changes_no_digest() {
+    use capyctl_config::effective::{decode_effective_snapshot, ParkedGrowthLimit};
+    let (deployment, host, context, controls) = fixture();
+    assert_eq!(controls.parked_growth_limit, ParkedGrowthLimit::Auto);
+    let plain = resolve_effective(&deployment, &host).unwrap();
+    let mut auto = host.clone();
+    auto["resource_policy"]["parked_growth_limit"] = json!("auto");
+    let with_auto = resolve_effective(&deployment, &auto).unwrap();
+    assert_eq!(
+        serde_json::to_string(&with_auto).unwrap(),
+        serde_json::to_string(&plain).unwrap(),
+        "the frozen revision is byte for byte the same"
+    );
+    assert!(!serde_json::to_string(&plain)
+        .unwrap()
+        .contains("parked_growth_limit"));
+    assert!(!serde_json::to_string(&controls)
+        .unwrap()
+        .contains("parked_growth_limit"));
+    let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
+    assert!(composed["resource_policy"]
+        .get("parked_growth_limit")
+        .is_none());
+
+    for (stated, limit) in [
+        ("50%", ParkedGrowthLimit::Percent(50)),
+        ("8GiB", ParkedGrowthLimit::Bytes(8 << 30)),
+        ("off", ParkedGrowthLimit::Off),
+    ] {
+        let mut bounded = host.clone();
+        bounded["resource_policy"]["parked_growth_limit"] = json!(stated);
+        let effective = resolve_effective(&deployment, &bounded).unwrap();
+        assert_eq!(effective.host.parked_growth_limit, limit, "{stated}");
+        let snapshot = serde_json::to_string(&effective).unwrap();
+        assert_eq!(decode_effective_snapshot(&snapshot).unwrap(), effective);
+        let controls = ResourceControls::from_host(&effective.host);
+        let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
+        assert_eq!(
+            resolve_effective(&deployment, &composed)
+                .unwrap()
+                .host
+                .parked_growth_limit,
+            limit,
+            "{stated} survives composition"
+        );
+    }
+    let mut bad = host.clone();
+    bad["resource_policy"]["parked_growth_limit"] = json!("lots");
+    let error = resolve_effective(&deployment, &bad).unwrap_err();
+    assert_eq!(error.path, "resource_policy.parked_growth_limit");
+}
