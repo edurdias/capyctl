@@ -934,6 +934,10 @@ pub(super) struct GroupWorld {
     witnessed: Arc<Mutex<Vec<(i64, bool)>>>,
     /// The hosts the coordinator's observations call eligible.
     eligible: Arc<Mutex<Option<BTreeSet<String>>>>,
+    /// The coordinator's observations, kept across a restart.
+    observations: Arc<WorldObservations>,
+    /// The current worker's handler of the hosts' exit reports.
+    exits: Arc<Mutex<crate::engine_exit::EngineExits>>,
     _dir: tempfile::TempDir,
 }
 
@@ -975,25 +979,19 @@ impl GroupWorld {
         });
         let domains = Arc::new(Mutex::new(BTreeMap::new()));
         let eligible = Arc::new(Mutex::new(None));
-        let worker = OwnedCoordinator::spawn_with_execution_bindings(
-            owner.clone(),
-            Arc::new(WorldObservations {
-                domains: domains.clone(),
-                fallback: fixture.observations.clone(),
-                eligible: eligible.clone(),
-            }),
-            Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
-            CoordinatorOptions {
-                retry_cooldown: Duration::from_millis(50),
-                ..Default::default()
-            },
-            Arc::new(WorldBindings(transport.clone())),
-        )
-        .unwrap();
+        let observations = Arc::new(WorldObservations {
+            domains: domains.clone(),
+            fallback: fixture.observations.clone(),
+            eligible: eligible.clone(),
+        });
+        let worker = spawn_world_worker(&owner, &observations, &transport);
         // SPEC §13.2 (W13): each host's exit watcher reports through the
         // controller's own exit path, as an agent session's `MemberExit` does:
-        // the wire report is decoded and validated, then handled.
-        let exits = crate::engine_exit::EngineExits::new(worker.commands());
+        // the wire report is decoded and validated, then handled by the
+        // current worker's exit handler.
+        let exits = Arc::new(Mutex::new(crate::engine_exit::EngineExits::new(
+            worker.commands(),
+        )));
         for host in &hosts {
             let (host, exits) = (host.clone(), exits.clone());
             tokio::spawn(async move {
@@ -1003,7 +1001,7 @@ impl GroupWorld {
                         let report =
                             capyctl_protocol::reports::MemberExit::try_from(exit.to_wire())
                                 .expect("a scripted exit report is valid on the wire");
-                        let (exits, name) = (exits.clone(), host.name.clone());
+                        let (exits, name) = (exits.lock().unwrap().clone(), host.name.clone());
                         let _ =
                             tokio::task::spawn_blocking(move || exits.remote(&name, &report)).await;
                     }
@@ -1047,10 +1045,45 @@ impl GroupWorld {
             recovery: "cold_restart".into(),
             witnessed,
             eligible,
+            observations,
+            exits,
             _dir: dir,
         }
     }
 
+    /// ADR 0016, ADR 0028 §11 (R38): the controller restarts on the same
+    /// store. Its session is retired (the old worker can no longer act, as
+    /// after a crash), a new worker adopts what the store holds, and the
+    /// hosts' exit reports go to the new worker.
+    pub(super) async fn restart(mut self) -> Self {
+        self.owner.lock().unwrap().restart_session().unwrap();
+        let worker = spawn_world_worker(&self.owner, &self.observations, &self.transport);
+        *self.exits.lock().unwrap() = crate::engine_exit::EngineExits::new(worker.commands());
+        drop(std::mem::replace(&mut self.worker, worker));
+        self
+    }
+}
+
+/// The world's coordinator worker on `owner`'s current session.
+fn spawn_world_worker(
+    owner: &SharedCoordinatorState,
+    observations: &Arc<WorldObservations>,
+    transport: &Arc<WorldHosts>,
+) -> OwnedCoordinator {
+    OwnedCoordinator::spawn_with_execution_bindings(
+        owner.clone(),
+        observations.clone(),
+        Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(50),
+            ..Default::default()
+        },
+        Arc::new(WorldBindings(transport.clone())),
+    )
+    .unwrap()
+}
+
+impl GroupWorld {
     /// Every host runs `engine` (`vllm`, `sglang` or `tensorfold`).
     pub(super) fn with_engine(mut self, engine: &str) -> Self {
         self.engine = engine.into();
@@ -2948,4 +2981,132 @@ async fn an_unanswered_launch_reads_uncertain_not_failed() {
         world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
         0
     );
+}
+
+/// The readiness supervisor's view of the world's hosts on one session.
+struct ReadinessSessions {
+    transport: Arc<WorldHosts>,
+    session: String,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl crate::remote_readiness::ReadinessHosts for ReadinessSessions {
+    fn current_session(&self, _: &str) -> Option<String> {
+        Some(self.session.clone())
+    }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+    fn probe(&self, command: MemberCommand) -> crate::remote_readiness::ProbeFuture {
+        let (transport, session) = (self.transport.clone(), self.session.clone());
+        Box::pin(async move {
+            let host = WorldHosts::host(&transport, &command.identity.member.host_id)
+                .cloned()
+                .ok_or(())?;
+            host.execute(command)
+                .await
+                .map(|r| (session, r))
+                .map_err(drop)
+        })
+    }
+}
+
+impl GroupWorld {
+    /// SPEC §13.2 (G2): the readiness supervisor sees the head's host on a
+    /// new session `session` and re-proves the head; waits for the route.
+    pub(super) async fn reprove_head(&self, session: &str) {
+        let (changes, _) = tokio::sync::watch::channel(0);
+        let ledger: crate::remote_execution::ReadinessLedger = Default::default();
+        let supervisor = crate::remote_readiness::RemoteReadiness::new(
+            self.owner(),
+            Arc::new(ReadinessSessions {
+                transport: self.transport.clone(),
+                session: session.into(),
+                changes,
+            }),
+            GROUP_CONTROLLER.into(),
+            ledger.clone(),
+        );
+        self.until("the head re-proven", || {
+            let pass = supervisor.clone();
+            pass.pass();
+            (ledger.lock().unwrap().values().any(|s| s == session) && self.route_open("g"))
+                .then_some(())
+        })
+        .await;
+    }
+}
+
+// T33 (R38, ADR 0016): a controller restart with a Ready group adopts it as it
+// stands; its head is re-proven by the completion probe and it serves again,
+// every member still launched and charged, nothing relaunched.
+#[tokio::test]
+async fn a_restart_keeps_a_ready_group_serving_after_reproof() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    let world = world.restart().await;
+    world.reprove_head("session-after-restart").await;
+    assert!(world.group.alive(0) && world.group.alive(1));
+    assert_eq!(world.launches(), 2, "nothing relaunched");
+    assert_eq!(world.last_probe_max_tokens(), 1);
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows.iter().all(|r| r.state == MemberState::Launched));
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+}
+
+// T32, T33 (R38): a restart while a failed group's worker host is away keeps
+// that member uncertain and charged, the port held and nothing relaunched;
+// when the host comes back with its journal the adopted stop completes on
+// its evidence, and only then does the group relaunch.
+#[tokio::test]
+async fn a_restart_with_a_member_host_away_keeps_it_charged() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    let id = world.id("g");
+    world.group.disconnect_host("host-b");
+    world.group.exit_rank(0);
+    world
+        .until("the head settled", || {
+            let (_, rows) = world.group_plan("g").unwrap();
+            (rows[0].state == MemberState::Settled).then_some(())
+        })
+        .await;
+    let world = world.restart().await;
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(!world.port_free("host-a", 25000));
+    assert!(!world.generation_started("g", 2));
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.generation_started_after_settlement("g", 2).await);
+}
+
+// T31, T33 (R38): a restart in the middle of an operator's Stop (one member's
+// host away) resumes it; the Stop completes on that host's evidence.
+#[tokio::test]
+async fn a_restart_mid_stop_completes_the_stop_on_evidence() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.disconnect_host("host-b");
+    world.stop(&id).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    let world = world.restart().await;
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(!world.route_open("g"));
 }
