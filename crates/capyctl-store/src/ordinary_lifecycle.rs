@@ -563,7 +563,12 @@ fn validate_local(
     let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
     match &p.execution {
         None if state == "planned" || cancelled => {
-            let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,p.step_id],|r|r.get(0))?;
+            // ADR 0028 §5: a group's members are charged under this
+            // Initialize operation by its group plan before the step arms;
+            // only those grants may exist while it is planned, and only when
+            // the instance has a group plan at this generation. A single-host
+            // step never has one, so nothing changes for it.
+            let effects: bool = tx.query_row("SELECT (EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) AND NOT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?3 AND instance_index=?4 AND generation=?5)) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,p.step_id,p.deployment_id,p.instance_index,p.generation],|r|r.get(0))?;
             if effects || ledger.owners.contains_key(&p.owner()) {
                 return Err(LifecycleError::Conflict);
             }
@@ -581,13 +586,12 @@ fn validate_local(
                 // generation, and the instance owner never holds anything.
                 let planned: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3)
-                       AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?4)
-                       AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?5 AND grant_id=?6)",
+                       AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE id=?5)
+                       AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?4 AND grant_id IS NULL)",
                     params![
                         p.deployment_id,
                         p.instance_index,
                         p.generation,
-                        p.operation_id,
                         p.step_id,
                         execution.grant_id
                     ],
@@ -1123,9 +1127,10 @@ pub(crate) fn arm_group(
         [&p.operation_id],
     )?)?;
     one(tx.execute("UPDATE lifecycle_runs SET state='running' WHERE operation_id=?1 AND session_id=?2 AND state='queued'",params![p.operation_id,s.id()])?)?;
-    let grant = execution.grant_id.clone();
     p.execution = Some(execution);
-    one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2,grant_id=?3 WHERE id=?1 AND session_id=?4 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,grant,s.id()])?)?;
+    // The step names no ledger grant (`grant_id` stays NULL): its members'
+    // grants are the group plan's.
+    one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2 WHERE id=?1 AND session_id=?3 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,s.id()])?)?;
     event(tx, s, &p, Transition::Armed, None)?;
     p.context(&e)
 }

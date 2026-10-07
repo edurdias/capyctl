@@ -124,8 +124,14 @@ pub trait GroupHosts: Send + Sync + 'static {
     /// SPEC §13.2 (G2): the head proved readiness for `binding_id` on its
     /// current session; dispatch to it is open while that session lasts.
     fn head_ready(&self, binding_id: &str, host_id: &str);
-    /// SPEC §17: how an activation concluded, for the activation's own record.
-    fn concluded(&self, _deployment_id: &str, _outcome: &GroupActivation) {}
+    /// SPEC §17: how an activation concluded (its outcome, or the refusal
+    /// that stopped it before any member was dispatched).
+    fn concluded(
+        &self,
+        _deployment_id: &str,
+        _outcome: Result<&GroupActivation, &GroupActivationError>,
+    ) {
+    }
 }
 
 /// What one group activation needs from its coordinator.
@@ -628,7 +634,9 @@ async fn reserve(
                 .map(|s| s.epoch)
                 .map_err(|e| e.to_string())
         })?;
-        let operation = ulid::Ulid::new().to_string();
+        // ADR 0028 §5: the members are charged under the start's own
+        // Initialize operation, each attempt with fresh grant ids.
+        let operation = work.operation_id().to_owned();
         let reservation = GroupReservation {
             deployment_id: fence.deployment_id.clone(),
             instance_index: instance,
