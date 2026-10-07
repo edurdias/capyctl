@@ -84,6 +84,9 @@ pub struct CoordinatorLifecycle {
     routing: Option<RoutingSignals>,
     /// SPEC §10, ADR 0013 §8 (W10): request-driven switching.
     switching: std::sync::Arc<crate::switching::Switcher>,
+    /// ADR 0028 §11 (decided 2026-10-06): `groups.stall_timeout`, the router's
+    /// first-token bound for requests forwarded to a group's head.
+    group_stall_timeout: std::time::Duration,
 }
 
 /// How one on-demand activation attempt ended before it was awaited.
@@ -143,7 +146,15 @@ impl CoordinatorLifecycle {
             leases: crate::request_leases::RequestLeaseWriter::spawn(backend),
             routing: None,
             switching,
+            group_stall_timeout: capyctl_config::remote_roles::DEFAULT_GROUP_STALL_TIMEOUT,
         }
+    }
+
+    /// ADR 0028 §11 (decided 2026-10-06): the server's `groups.stall_timeout`
+    /// (`--group-stall-timeout` > `CAPYCTL_GROUP_STALL_TIMEOUT` > the document).
+    pub fn with_group_stall_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.group_stall_timeout = timeout;
+        self
     }
 
     /// SPEC §10 (W10): bound request-driven switches (drain timeout, polling).
@@ -766,6 +777,7 @@ impl LifecyclePort for CoordinatorLifecycle {
                         host_unresponsive,
                         engine_exited: row.engine_exited,
                         load,
+                        group: row.group,
                     }
                 })
                 .collect(),
@@ -802,6 +814,18 @@ impl LifecyclePort for CoordinatorLifecycle {
             .await?;
         self.commands.note_activity(deployment, Some(generation));
         Ok(Some(lease))
+    }
+
+    fn group_stall_timeout(&self) -> std::time::Duration {
+        self.group_stall_timeout
+    }
+
+    /// ADR 0028 §11 (decided 2026-10-06): a report for anything but the
+    /// instance's current Ready group generation is ignored; otherwise that
+    /// generation's one probe through the head decides
+    /// ([`crate::group_stall::report`]).
+    async fn report_group_stall(&self, deployment_id: &str, instance: u32, generation: i64) {
+        crate::group_stall::report(&self.commands, deployment_id, instance, generation).await;
     }
 
     async fn observe_adapter(&self, _deployment: &str) -> Result<WorkObservation, LifecycleFault> {

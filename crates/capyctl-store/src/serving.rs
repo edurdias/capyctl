@@ -42,6 +42,9 @@ pub struct ServingInstanceRow {
     /// SPEC §13.2 (W13): an owned process of this binding's launch exited;
     /// its dispatch is closed until cleanup settles it.
     pub engine_exited: bool,
+    /// ADR 0028 §9, §11: this incarnation is a multi-node group, served at
+    /// its head's ingress (the router watches its requests' first token).
+    pub group: bool,
 }
 
 /// The gate a dispatch needs, over `deployment_instances i` and `deployments d`.
@@ -63,7 +66,9 @@ impl crate::Store {
                     {OPEN},
                     EXISTS(SELECT 1 FROM lifecycle_steps x JOIN operations o ON o.id=x.operation_id
                             JOIN journal_entries j ON j.operation_id=o.id
-                      WHERE x.binding_id=b.id AND o.kind='initialize' AND j.state='engine_exited')
+                      WHERE x.binding_id=b.id AND o.kind='initialize' AND j.state='engine_exited'),
+                    EXISTS(SELECT 1 FROM group_plans g WHERE g.deployment_id=i.deployment_id
+                      AND g.instance_index=i.instance_index AND g.generation=i.generation)
                FROM deployment_instances i
                JOIN deployments d ON d.id=i.deployment_id
                JOIN runtime_bindings b ON b.deployment_id=i.deployment_id
@@ -86,6 +91,7 @@ impl crate::Store {
                     launch_command_id: r.get(7)?,
                     dispatch_open: r.get(8)?,
                     engine_exited: r.get(9)?,
+                    group: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

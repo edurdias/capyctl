@@ -399,6 +399,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("lifecycle_defaults", FieldSpec::Struct(LIFECYCLE_DEFAULTS)),
         // SPEC §17 (M80): the router's per-request timing header.
         ("observability", FieldSpec::Struct(OBSERVABILITY)),
+        // ADR 0028 §11 (decided 2026-10-06): the embedded server's group
+        // request-stall timeout, as in a server document.
+        ("groups", FieldSpec::Struct(SERVER_GROUPS)),
     ];
     /// SPEC §4.3 (owner decision P3): a role's shutdown drain bound, role-local
     /// in the server, host and standalone documents.
@@ -413,6 +416,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     /// SPEC §17 (M80): router observability. `timing_header` adds the
     /// `x-capyctl-timing` response header; off unless set.
     const OBSERVABILITY: &[(&str, FieldSpec)] = &[("timing_header", SCALAR)];
+    /// ADR 0028 §11 (decided 2026-10-06): the group request-stall timeout.
+    const SERVER_GROUPS: &[(&str, FieldSpec)] = &[("stall_timeout", DURATION)];
     const STANDALONE_HOST: &[(&str, FieldSpec)] = &[
         ("name", SCALAR),
         ("state_dir", SCALAR),
@@ -464,6 +469,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("switching", FieldSpec::Struct(SWITCHING)),
                 // SPEC §17 (M80): router observability.
                 ("observability", FieldSpec::Struct(OBSERVABILITY)),
+                // ADR 0028 §11 (decided 2026-10-06): multi-node groups.
+                ("groups", FieldSpec::Struct(SERVER_GROUPS)),
             ],
         },
         ConfigKind::Host => &KindSchema {

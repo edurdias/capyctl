@@ -825,6 +825,33 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
     ));
 }
 
+// T14 (decided 2026-10-06, ADR 0028 §11): `--group-stall-timeout` on `start
+// server`; a zero or unreadable duration is refused by the parser, and the
+// flag belongs to no other start.
+#[test]
+fn group_stall_timeout_is_a_start_server_flag() {
+    let i =
+        parse_invocation(["capyctl", "start", "server", "--group-stall-timeout", "90s"]).unwrap();
+    assert_eq!(
+        i.group_stall_timeout,
+        Some(std::time::Duration::from_secs(90))
+    );
+    let i = parse_invocation(["capyctl", "start", "server"]).unwrap();
+    assert_eq!(i.group_stall_timeout, None);
+    for bad in ["0s", "soon", "3601s"] {
+        assert!(
+            parse_invocation(["capyctl", "start", "server", "--group-stall-timeout", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    for role in ["host", "standalone"] {
+        assert!(
+            parse_invocation(["capyctl", "start", role, "--group-stall-timeout", "90s"]).is_err(),
+            "{role}"
+        );
+    }
+}
+
 // T03 (owner decision 2026-09-25): `--set path=value` (repeatable) on every
 // role start, `validate config` and `config show`; `--management-listen` on
 // `start standalone` (loopback only).

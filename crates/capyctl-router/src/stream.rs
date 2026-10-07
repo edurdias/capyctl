@@ -4,6 +4,7 @@
 //! A client hang-up closes the engine connection; accounting stays charged until the engine reports quiescence (SPEC §10).
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -80,24 +81,65 @@ pub fn stream_lease_end(
     }
 }
 
-pub(crate) async fn bounded<F: std::future::Future>(
+/// ADR 0028 §11 (decided 2026-10-06): the first-token watch of one request
+/// forwarded to a group's head. It starts with the forward and ends at the
+/// backend's first event (the first generated token) or when the forward
+/// ends (completed, cut, or its client gone); if neither comes within
+/// `after`, the stall is reported once to the lifecycle authority, off the
+/// request's own path. A request to a single-host instance has none.
+pub(crate) struct StallWatch {
+    pub(crate) authority: Arc<dyn capyctl_controller::LifecyclePort>,
+    pub(crate) deployment: String,
+    pub(crate) instance: u32,
+    pub(crate) generation: i64,
+    pub(crate) after: std::time::Duration,
+}
+
+impl StallWatch {
+    /// Report the stall on its own task: the probe it starts may take up to
+    /// its own bound, and the request is neither held nor answered by it.
+    fn report(self) {
+        tokio::spawn(async move {
+            self.authority
+                .report_group_stall(&self.deployment, self.instance, self.generation)
+                .await;
+        });
+    }
+}
+
+pub(crate) async fn bounded<F: Future>(
     forward: F,
     progress: &Progress,
     bounds: &StreamBounds,
+    stall: Option<StallWatch>,
 ) -> Result<F::Output, ()> {
     tokio::pin!(forward);
     let mut marks = progress.0.subscribe();
+    // ADR 0028 §11: the watch observes the same progress the bounds do; it
+    // adds a timer, never a buffer or a wait, to the forward.
+    let mut stall = stall.map(|watch| (tokio::time::Instant::now() + watch.after, watch));
     loop {
-        let due = match *marks.borrow_and_update() {
+        let last = *marks.borrow_and_update();
+        let due = match last {
             None => bounds.first_event_by,
             Some(last) => last + bounds.idle,
         };
+        if last.is_some() {
+            // The first token arrived: the watch ends.
+            stall = None;
+        }
+        let stall_at = stall.as_ref().map(|(at, _)| *at);
         tokio::select! {
             biased;
             output = &mut forward => return Ok(output),
             // New progress re-arms the bound.
             _ = marks.changed() => {}
             _ = tokio::time::sleep_until(due) => return Err(()),
+            _ = tokio::time::sleep_until(stall_at.unwrap_or(due)), if stall_at.is_some() => {
+                if let Some((_, watch)) = stall.take() {
+                    watch.report();
+                }
+            }
         }
     }
 }
@@ -241,10 +283,12 @@ pub fn stream_planned_timed(
         let (result, refusal) = loop {
             let generation = attempt.generation;
             sink.timing.forwarding(attempt.instance, generation);
+            let stall = attempt.stall.take();
             let result = bounded(
                 attempt.forward.forward_chat_stream_async(&body, &mut sink),
                 &progress,
                 &bounds,
+                stall,
             )
             .await;
             let end = stream_lease_end(&result);

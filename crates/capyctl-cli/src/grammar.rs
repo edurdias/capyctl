@@ -750,6 +750,14 @@ enum StartTarget {
         /// listeners.management.bind.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
         management_listen: Option<SocketAddr>,
+        // ADR 0028 §11 (decided 2026-10-06). (A `//` comment: a doc comment
+        // would become user-facing help text.)
+        /// How long a request to a multi-node group may wait for its first
+        /// token before the server probes the group's head once (default
+        /// 120s, 1s to 3600s). Wins over CAPYCTL_GROUP_STALL_TIMEOUT and
+        /// groups.stall_timeout.
+        #[arg(long, value_name = "DURATION", value_parser = parse_group_stall_timeout)]
+        group_stall_timeout: Option<std::time::Duration>,
         #[command(flatten)]
         overrides: SetArgs,
     },
@@ -1219,6 +1227,9 @@ pub struct Invocation {
     /// Owner decision 2026-09-25: `--management-listen` on `start
     /// standalone`.
     pub management_listen: Option<SocketAddr>,
+    /// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
+    /// server`.
+    pub group_stall_timeout: Option<std::time::Duration>,
 }
 
 /// The command grammar. `--output` is accepted everywhere, but its help is
@@ -1387,6 +1398,18 @@ where
         } => *management_listen,
         _ => None,
     };
+    // ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
+    // server`, the role that runs groups.
+    let group_stall_timeout = match &cli.command {
+        CliCommand::Start {
+            target:
+                StartTarget::Server {
+                    group_stall_timeout,
+                    ..
+                },
+        } => *group_stall_timeout,
+        _ => None,
+    };
     let evict = matches!(
         &cli.command,
         CliCommand::Start {
@@ -1461,6 +1484,7 @@ where
         state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
         sets,
         management_listen,
+        group_stall_timeout,
     })
 }
 
@@ -1592,6 +1616,15 @@ fn parse_management_listen(text: &str) -> Result<SocketAddr, String> {
     capyctl_config::standalone::management_address(text).ok_or_else(|| {
         "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)".to_owned()
     })
+}
+
+/// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout <duration>`.
+fn parse_group_stall_timeout(text: &str) -> Result<std::time::Duration, String> {
+    capyctl_config::remote_roles::group_stall_timeout_value(
+        capyctl_config::remote_roles::GROUP_STALL_TIMEOUT_FLAG,
+        text,
+    )
+    .map_err(|error| error.detail)
 }
 
 /// A positive duration in the configuration's units (`90s`, `20m`, `1h`).

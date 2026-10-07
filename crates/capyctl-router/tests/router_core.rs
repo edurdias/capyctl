@@ -280,6 +280,18 @@ struct StubAuthority {
     leases: Mutex<Vec<(String, Option<capyctl_controller::LeaseEnd>)>>,
     /// When set, the ledger refuses the next grants this way.
     refuse_leases: Mutex<Option<capyctl_controller::LeaseRefused>>,
+    /// ADR 0028 §11: the instance it serves, and the group stalls reported.
+    instances: InstanceStub,
+}
+
+/// ADR 0028 §11 (decided 2026-10-06): the one instance a stub reports, when it
+/// reports instances at all (`None`: the router dispatches to the deployment
+/// whole), the stall timeout it sets, and every group stall reported to it.
+#[derive(Default)]
+struct InstanceStub {
+    serving: Option<capyctl_controller::ServingInstance>,
+    stall_timeout: std::time::Duration,
+    reports: Mutex<Vec<(String, u32, i64)>>,
 }
 
 impl StubAuthority {
@@ -298,6 +310,65 @@ impl StubAuthority {
             schema_version: 1,
             current_generation: 1,
         }
+    }
+
+    /// A READY deployment `deployment` (its route the same name) served by
+    /// exactly one open instance, a group's head when `group` is set.
+    fn with_instance(deployment: &str, index: u32, generation: i64, group: bool) -> Arc<Self> {
+        Arc::new(Self {
+            deployment: deployment.into(),
+            route: deployment.into(),
+            runtime: Mutex::new(capyctl_controller::RuntimeEndpoint {
+                endpoint: "http://127.0.0.1:9".into(),
+                served_model: "served-name".into(),
+                engine_key: None,
+                incarnation: generation.to_string(),
+            }),
+            leases: Mutex::new(Vec::new()),
+            refuse_leases: Mutex::new(None),
+            instances: InstanceStub {
+                serving: Some(capyctl_controller::ServingInstance {
+                    instance_index: index,
+                    generation,
+                    host_id: None,
+                    remote_host: Some("host-a".into()),
+                    launch_command_id: None,
+                    dispatch_open: true,
+                    host_live: true,
+                    host_unresponsive: false,
+                    engine_exited: false,
+                    load: None,
+                    group,
+                }),
+                stall_timeout: std::time::Duration::from_secs(120),
+                reports: Mutex::new(Vec::new()),
+            },
+        })
+    }
+
+    /// ADR 0028 §9: a multi-node group's instance `index` at `generation`,
+    /// served at its head.
+    fn with_group(deployment: &str, index: u32, generation: i64) -> Arc<Self> {
+        Self::with_instance(deployment, index, generation, true)
+    }
+
+    /// A single-host instance (instance 0, generation 1).
+    fn with_single(deployment: &str) -> Arc<Self> {
+        Self::with_instance(deployment, 0, 1, false)
+    }
+
+    /// ADR 0028 §11: the group stall timeout this authority sets.
+    fn stall_timeout(self: Arc<Self>, timeout: std::time::Duration) -> Arc<Self> {
+        let mut stub = Arc::try_unwrap(self)
+            .ok()
+            .expect("configured before it is shared");
+        stub.instances.stall_timeout = timeout;
+        Arc::new(stub)
+    }
+
+    /// Every group stall reported to this authority, in order.
+    fn stall_reports(&self) -> Vec<(String, u32, i64)> {
+        self.instances.reports.lock().unwrap().clone()
     }
 }
 
@@ -412,6 +483,28 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
         _action: capyctl_domain::LifecycleAction,
     ) -> Result<capyctl_controller::OperationHandle, capyctl_controller::LifecycleFault> {
         Err(Self::refuse("request a transition"))
+    }
+    fn serving_instances(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<Vec<capyctl_controller::ServingInstance>>, capyctl_controller::LifecycleFault>
+    {
+        Ok(self
+            .instances
+            .serving
+            .clone()
+            .filter(|_| deployment == self.deployment)
+            .map(|instance| vec![instance]))
+    }
+    fn group_stall_timeout(&self) -> std::time::Duration {
+        self.instances.stall_timeout
+    }
+    async fn report_group_stall(&self, deployment_id: &str, instance: u32, generation: i64) {
+        self.instances
+            .reports
+            .lock()
+            .unwrap()
+            .push((deployment_id.into(), instance, generation));
     }
 }
 
@@ -534,6 +627,7 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
+        instances: InstanceStub::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let router = capyctl_router::serve_router(RouterDeps {
@@ -615,6 +709,7 @@ fn stub_router(endpoint: &str) -> (Arc<StubAuthority>, RouterDeps) {
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
+        instances: InstanceStub::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let deps = RouterDeps {
@@ -1246,4 +1341,130 @@ async fn every_inference_route_needs_the_key() {
         let status = call(Some("Bearer test-key")).await.unwrap().status();
         assert_ne!(status, 401, "{method} {path}");
     }
+}
+
+/// ADR 0028 §11: a router over `authority`, its inference key off.
+struct TestRouter {
+    router: axum::Router,
+    authority: Arc<StubAuthority>,
+}
+
+fn router_with(authority: &Arc<StubAuthority>) -> TestRouter {
+    let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
+    TestRouter {
+        router: capyctl_router::serve_router(RouterDeps {
+            controller: port.clone(),
+            forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(port)),
+            limits: QueueLimits {
+                max_requests_per_deployment: 4,
+                max_buffered_bytes_total: 64 * 1024,
+            },
+            api_key: None,
+            inflight: Arc::new(capyctl_router::admission::InFlight::default()),
+            activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        }),
+        authority: authority.clone(),
+    }
+}
+
+impl TestRouter {
+    /// The engine accepts every request and never answers it: no first token.
+    fn with_upstream_silent(self) -> Self {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let address = socket.local_addr().unwrap();
+        let socket = tokio::net::TcpListener::from_std(socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((connection, _)) = socket.accept().await {
+                held.push(connection);
+            }
+        });
+        self.authority.runtime.lock().unwrap().endpoint = format!("http://{address}");
+        self
+    }
+
+    /// The engine answers at once with a complete reply.
+    async fn with_upstream_answering(self) -> Self {
+        let (endpoint, _) =
+            scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+        self.authority.runtime.lock().unwrap().endpoint = endpoint;
+        self
+    }
+
+    fn send(&self, alias: &str, stream: bool) -> tokio::task::JoinHandle<axum::http::StatusCode> {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "model": alias, "stream": stream,
+                    "messages": [{"role":"user","content":"hi"}],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let router = self.router.clone();
+        tokio::spawn(async move {
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+            status
+        })
+    }
+
+    /// A chat request for `alias`, in flight until it ends.
+    fn send_chat(&self, alias: &str) -> tokio::task::JoinHandle<axum::http::StatusCode> {
+        self.send(alias, false)
+    }
+
+    /// A streamed chat request for `alias`, in flight until it ends.
+    fn send_chat_stream(&self, alias: &str) -> tokio::task::JoinHandle<axum::http::StatusCode> {
+        self.send(alias, true)
+    }
+}
+
+// T31 (decided 2026-10-06): a first-token timeout in the router reaches the controller once, naming the generation.
+#[tokio::test]
+async fn first_token_timeout_reports_a_group_stall() {
+    use std::time::Duration;
+    let authority = StubAuthority::with_group("g", 0, 1).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&authority).with_upstream_silent();
+    let _pending = router.send_chat("g");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(authority.stall_reports(), vec![("g".to_string(), 0, 1)]);
+    let single = StubAuthority::with_single("s").stall_timeout(Duration::from_millis(50));
+    let router = router_with(&single).with_upstream_silent();
+    let _pending = router.send_chat("s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(single.stall_reports().is_empty());
+}
+
+// T31 T39 (ADR 0028 §11): the watch observes a group request without holding
+// it: a streamed group request that gets no first token is reported once, and
+// a group request answered in time, streamed or not, is never reported and is
+// relayed whole.
+#[tokio::test]
+async fn the_first_token_watch_reports_a_stalled_stream_once_and_never_an_answered_request() {
+    use std::time::Duration;
+    let authority = StubAuthority::with_group("g", 2, 7).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&authority).with_upstream_silent();
+    let _pending = router.send_chat_stream("g");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(authority.stall_reports(), vec![("g".to_string(), 2, 7)]);
+    let answered = StubAuthority::with_group("g", 0, 1).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&answered).with_upstream_answering().await;
+    let (status, body) = chat_once(&router.router, "g").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    let (status, text) = chat_stream(&router.router, "g").await;
+    assert_eq!(status, 200);
+    assert!(text.contains("hello") && text.contains("[DONE]"), "{text}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(answered.stall_reports().is_empty());
+    assert_eq!(
+        ends(&answered),
+        vec![Some(capyctl_controller::LeaseEnd::Completed); 2]
+    );
 }

@@ -130,6 +130,8 @@ struct HostState {
     witness: Option<LaunchObserver>,
     /// The engine environment the last Launch rendered here.
     launch_env: Option<BTreeMap<String, String>>,
+    /// ADR 0028 §11: how long the head takes to answer a completion probe.
+    probe_delay: Option<Duration>,
 }
 
 /// The scripted agent of one member host.
@@ -168,6 +170,7 @@ impl GroupHost {
                 launch_observer: None,
                 witness: None,
                 launch_env: None,
+                probe_delay: None,
             }),
         }
     }
@@ -316,6 +319,10 @@ impl GroupHost {
         }
         self.reconcile_journal();
         self.state().received.push(command.clone());
+        let delay = self.state().probe_delay;
+        if let (Some(delay), MemberAction::Probe { .. }) = (delay, &command.action) {
+            tokio::time::sleep(delay).await;
+        }
         // The agent receives the wire form: decode it, check its digest and
         // the capabilities it needs.
         let wire = command.to_wire();
@@ -1111,6 +1118,10 @@ pub(super) struct GroupWorld {
     observations: Arc<WorldObservations>,
     /// The current worker's handler of the hosts' exit reports.
     exits: Arc<Mutex<crate::engine_exit::EngineExits>>,
+    /// ADR 0028 §11: the requests in flight at the world's router stand-in,
+    /// and the time that stand-in has seen pass ([`GroupWorld::advance`]).
+    requests: Mutex<Vec<WorldRequest>>,
+    request_clock: Mutex<Duration>,
     _dir: tempfile::TempDir,
 }
 
@@ -1222,6 +1233,8 @@ impl GroupWorld {
             eligible,
             observations,
             exits,
+            requests: Mutex::new(Vec::new()),
+            request_clock: Mutex::new(Duration::ZERO),
             _dir: dir,
         }
     }
@@ -4229,4 +4242,345 @@ fn canary_matches_exact_tokens_only() {
     assert!(canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 8]));
     assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 9]));
     assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7]));
+}
+
+/// ADR 0028 §11: one request at the world's router stand-in, forwarded to an
+/// instance at the time `sent_at` of the stand-in's clock.
+struct WorldRequest {
+    deployment_id: String,
+    instance: u32,
+    generation: i64,
+    /// The instance is a group's head: the router watches its first token.
+    group: bool,
+    sent_at: Duration,
+    /// When its first token arrives; `None` never.
+    first_token_at: Option<Duration>,
+    reported: bool,
+    /// Still in flight: the client has not gone.
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A request in flight; dropping it is the client going away.
+pub(super) struct GroupRequest {
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for GroupRequest {
+    fn drop(&mut self) {
+        self.open.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl GroupWorld {
+    /// The lifecycle authority the router calls (`LifecyclePort`).
+    fn lifecycle(&self) -> crate::coordinator_port::CoordinatorLifecycle {
+        crate::coordinator_port::CoordinatorLifecycle::new(self.worker.commands())
+    }
+
+    /// ADR 0028 §11: a request for deployment `name` as the router forwards
+    /// it: to the instance the lifecycle authority reports open, watched
+    /// for its first token when that instance is a group's head. Its first
+    /// token comes as the group's engine gives it
+    /// ([`FakeGroup::first_token_after`]); time passes only through
+    /// [`Self::advance`]. The stand-in holds no durable lease.
+    pub(super) fn send_request(&self, name: &str) -> GroupRequest {
+        use crate::port::LifecyclePort;
+        let id = self.id(name);
+        let instance = self
+            .lifecycle()
+            .serving_instances(&id)
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|instance| instance.dispatch_open)
+            .unwrap_or_else(|| panic!("no instance of {name} is open for dispatch"));
+        let now = *self.request_clock.lock().unwrap();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first_token_at = if instance.group {
+            self.group.first_token_after().map(|after| now + after)
+        } else {
+            Some(now)
+        };
+        self.requests.lock().unwrap().push(WorldRequest {
+            deployment_id: id,
+            instance: instance.instance_index,
+            generation: instance.generation,
+            group: instance.group,
+            sent_at: now,
+            first_token_at,
+            reported: false,
+            open: open.clone(),
+        });
+        GroupRequest { open }
+    }
+
+    /// ADR 0028 §11: `by` passes at the router stand-in. Every request still
+    /// in flight at a group's head that has had no first token within the
+    /// authority's stall timeout is reported once, as the router reports it
+    /// (`LifecyclePort::report_group_stall`), the reports concurrently.
+    pub(super) async fn advance(&self, by: Duration) {
+        use crate::port::LifecyclePort;
+        let now = {
+            let mut clock = self.request_clock.lock().unwrap();
+            *clock += by;
+            *clock
+        };
+        let lifecycle = self.lifecycle();
+        let timeout = lifecycle.group_stall_timeout();
+        let due: Vec<(String, u32, i64)> = self
+            .requests
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|r| r.group && !r.reported && r.open.load(std::sync::atomic::Ordering::Acquire))
+            .filter(|r| {
+                let stalled_at = r.sent_at + timeout;
+                now >= stalled_at && r.first_token_at.is_none_or(|first| first > stalled_at)
+            })
+            .map(|r| {
+                r.reported = true;
+                (r.deployment_id.clone(), r.instance, r.generation)
+            })
+            .collect();
+        futures::future::join_all(due.iter().map(|(deployment, instance, generation)| {
+            lifecycle.report_group_stall(deployment, *instance, *generation)
+        }))
+        .await;
+    }
+
+    /// A stall report for deployment `name`'s `instance` at `generation`, as
+    /// the router sends it.
+    pub(super) async fn report_stall(&self, name: &str, instance: u32, generation: i64) {
+        use crate::port::LifecyclePort;
+        self.lifecycle()
+            .report_group_stall(&self.id(name), instance, generation)
+            .await;
+    }
+
+    /// The generation deployment `name`'s instance 0 serves at now.
+    pub(super) fn serving_generation(&self, name: &str) -> i64 {
+        use crate::port::LifecyclePort;
+        self.lifecycle()
+            .serving_instances(&self.id(name))
+            .unwrap()
+            .unwrap_or_default()
+            .first()
+            .map(|instance| instance.generation)
+            .expect("a serving instance")
+    }
+
+    /// How many Terminate commands `host` received.
+    pub(super) fn terminates_sent_to(&self, host: &str) -> usize {
+        self.host(host)
+            .received()
+            .iter()
+            .filter(|c| matches!(c.action, MemberAction::Terminate { .. }))
+            .count()
+    }
+
+    /// The head answers each completion probe only after `delay`.
+    pub(super) fn delay_probes(&self, delay: Duration) {
+        self.hosts[0].state().probe_delay = Some(delay);
+    }
+}
+
+// T31 (decided 2026-10-06): a stalled request and a failing probe stop the group on every host;
+// each member is released only on its own host's evidence.
+#[tokio::test]
+async fn stalled_request_with_failing_probe_stops_the_group() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.hang_collectives();
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_stalled");
+    assert_eq!(world.terminates_sent_to("host-a"), 1);
+    assert_eq!(world.terminates_sent_to("host-b"), 1);
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    world.assert_release_evidence_per_member("g");
+    assert!(!world.route_open("g"));
+}
+
+// T32 (decided 2026-10-06): if host B is unreachable when the stalled group stops, its share stays charged and uncertain.
+#[tokio::test]
+async fn stalled_group_keeps_an_unreachable_member_charged() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.hang_collectives();
+    world.group.disconnect_host("host-b");
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    world.settle_for(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert_eq!(
+        world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)),
+        0
+    );
+    // Lease expiry and time never free it: only its own host's evidence.
+    world.advance_past_lease_expiry().await;
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_stalled");
+    assert!(!world.group.alive(1));
+}
+
+// T31 (decided 2026-10-06): a slow request whose probe passes stops nothing.
+#[tokio::test]
+async fn stalled_request_with_passing_probe_stops_nothing() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let probes = world.probe_calls();
+    world
+        .group
+        .delay_first_token(std::time::Duration::from_secs(150));
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    world.settle_for(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.probe_calls(), probes + 1);
+    // ADR 0028 §9: the stall probe is the 1-token completion through the head.
+    assert_eq!(world.last_probe_max_tokens(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
+    assert_eq!(world.state("g").await, "ready");
+    assert!(world.route_open("g"));
+    assert_eq!(
+        world.terminates_sent_to("host-a") + world.terminates_sent_to("host-b"),
+        0
+    );
+}
+
+// T31 (decided 2026-10-06): an idle group is never probed.
+#[tokio::test]
+async fn idle_group_is_never_probed() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let probes = world.probe_calls();
+    world.advance(std::time::Duration::from_secs(3600)).await;
+    world.settle_for(std::time::Duration::from_secs(2)).await;
+    assert_eq!(world.probe_calls(), probes);
+    // A request answered in time ends its watch: still nothing is probed.
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(3600)).await;
+    assert_eq!(world.probe_calls(), probes);
+}
+
+// T31 (decided 2026-10-06, ADR 0028 §11): stalls reported for one generation
+// while its probe runs share that probe.
+#[tokio::test]
+async fn two_stalled_requests_share_one_probe() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let probes = world.probe_calls();
+    world
+        .group
+        .delay_first_token(std::time::Duration::from_secs(150));
+    world.delay_probes(std::time::Duration::from_millis(500));
+    let _first = world.send_request("g");
+    let _second = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    assert_eq!(world.probe_calls(), probes + 1);
+    assert_eq!(world.state("g").await, "ready");
+}
+
+// T31 (ADR 0028 §11): a report for a generation that is no longer current is
+// ignored: nothing is probed and the group serving now is untouched. Here the
+// group relaunched (`recovery: reconcile`) after a member's exit, and a
+// stalled request of the old generation is reported late.
+#[tokio::test]
+async fn a_stall_report_for_a_past_generation_is_ignored() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    let id = world.id("g");
+    let stalled = world.serving_generation("g");
+    world.group.exit_rank(1);
+    world.wait_settled_generation("g", stalled).await;
+    assert!(world.generation_started_after_settlement("g", 2).await);
+    world.wait_ready(&id).await;
+    let current = world.serving_generation("g");
+    assert_ne!(current, stalled);
+    let probes = world.probe_calls();
+    let terminates = world.terminates_sent_to("host-a");
+    world.report_stall("g", 0, stalled).await;
+    world.report_stall("g", 0, current + 1).await;
+    world.settle_for(std::time::Duration::from_secs(2)).await;
+    assert_eq!(world.probe_calls(), probes);
+    assert_eq!(world.terminates_sent_to("host-a"), terminates);
+    assert_eq!(world.state("g").await, "ready");
+    assert!(world.route_open("g"));
+}
+
+// T31 T39 (ADR 0028 §11): a single-host instance is never watched, and a
+// stall report naming one is ignored: nothing is probed or stopped.
+#[tokio::test]
+async fn a_single_host_instance_is_never_watched_and_its_report_is_ignored() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).with_single_rank("s", "host-a");
+    world.request("s").await;
+    let generation = world.serving_generation("s");
+    let _request = world.send_request("s");
+    world.advance(std::time::Duration::from_secs(3600)).await;
+    world.report_stall("s", 0, generation).await;
+    world.settle_for(std::time::Duration::from_secs(2)).await;
+    assert_eq!(world.commands_sent_to("host-a"), 0);
+    assert_eq!(world.state("s").await, "ready");
+}
+
+// T31 T32 (R42 pattern, ADR 0028 §11): the stall stop is owed durably: the
+// failed probe closes dispatch at once and records `group_stalled`; a stop the
+// coordinator cannot accept yet keeps every member alive and charged, and is
+// retried until it is accepted, then each member settles on its own host's
+// evidence.
+#[tokio::test]
+async fn a_refused_stall_stop_closes_dispatch_and_is_retried() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    world.group.hang_collectives();
+    let _request = world.send_request("g");
+    let held = world.hold_commands();
+    world.advance(std::time::Duration::from_secs(121)).await;
+    assert!(!world.route_open("g"));
+    assert!(world.dispatch_closure_recorded("g"));
+    assert_eq!(world.status("g").await.last_error(), "group_stalled");
+    world.settle_for(std::time::Duration::from_secs(1)).await;
+    assert!(world.group.alive(0) && world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        world.member_request()
+    );
+    drop(held);
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_stalled");
+    world.assert_release_evidence_per_member("g");
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+}
+
+// T31 (decided 2026-10-06; ADR 0028 §11): a stalled group is a failed group:
+// under `recovery: reconcile` it relaunches as a new generation, and only
+// after every member of the stalled one settled.
+#[tokio::test]
+async fn a_stalled_group_relaunches_under_reconcile_after_settlement() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    world.group.hang_collectives();
+    let _request = world.send_request("g");
+    world.advance(std::time::Duration::from_secs(121)).await;
+    world.wait_settled_generation("g", 1).await;
+    assert!(world.generation_started_after_settlement("g", 2).await);
+    world.wait_ready(&world.id("g")).await;
+    assert!(world.route_open("g"));
 }

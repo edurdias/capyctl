@@ -610,11 +610,14 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         capyctl_management::engines::StoreRetirements::new(actions.clone()),
     ));
     // ADR 0013 §10 (I3, D9): the router balances across instances on host
-    // liveness and the engine load each host agent reports.
+    // liveness and the engine load each host agent reports. ADR 0028 §11
+    // (decided 2026-10-06): it watches each request to a group's head for its
+    // first token within the stall timeout.
     let controller = Arc::new(
         capyctl_controller::CoordinatorLifecycle::new(coordinator.commands())
             .with_routing(capyctl_controller::RoutingSignals::from_sessions(&sessions))
-            .with_switcher(switcher.clone()),
+            .with_switcher(switcher.clone())
+            .with_group_stall_timeout(config.groups.stall_timeout),
     );
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     // SPEC §17 (M80): `observability.timing_header`, off unless set.
@@ -1345,6 +1348,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     ServerConfig::parse(&document.to_string()).map_err(invalid)
                 };
                 let mut config = parse(&source)?;
+                // ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` >
+                // CAPYCTL_GROUP_STALL_TIMEOUT > `groups.stall_timeout` > 120 s;
+                // a zero or malformed value refuses the start before anything
+                // is created.
+                config = config
+                    .with_group_stall_timeout(invocation.group_stall_timeout, &|name| {
+                        std::env::var(name).ok()
+                    })
+                    .map_err(invalid)?;
                 // Final review I8-bis: `--state-dir` > CAPYCTL_STATE_DIR > the
                 // document, before anything reads the state directory.
                 let state_dir = state_dir_override(invocation, &config.state_dir);

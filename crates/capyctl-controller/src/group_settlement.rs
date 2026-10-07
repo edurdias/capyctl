@@ -2,7 +2,8 @@
 //!
 //! A group stops as a whole. Whatever asked for it (an operator's or a
 //! policy Stop, a member's exit, a launch that failed, a readiness probe that
-//! failed), the head's ingress closed first: the lifecycle transition that
+//! failed, a stalled request whose head probe failed), the head's ingress
+//! closed first: the lifecycle transition that
 //! asked for the stop closed dispatch, and an ordinary Stop drained before it
 //! reached here. [`stop_group`] then sends `Terminate` to every member at
 //! once, each to the member's own host for the Launch that host journaled,
@@ -48,9 +49,8 @@ pub const RETAINED_STATE: &str = "retained";
 /// grace and SIGKILL escalation fit well inside it.
 pub const MEMBER_TERMINATE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Why a group is stopped. Extensible: the request-stall check (decided
-/// 2026-10-06, Task 19b) adds its own reason without reshaping
-/// [`stop_group`].
+/// Why a group is stopped. Extensible: each reason names its closed code
+/// without reshaping [`stop_group`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     /// An operator's or a policy Stop.
@@ -60,6 +60,9 @@ pub enum StopReason {
     MemberFailed { rank: u32 },
     /// ADR 0028 §12: a wake's canary differed from its reference.
     WakeMismatch,
+    /// ADR 0028 §11 (decided 2026-10-06): a request got no first token within
+    /// the stall timeout and the probe through the head failed too.
+    Stalled,
 }
 
 impl StopReason {
@@ -69,6 +72,7 @@ impl StopReason {
             Self::Requested => None,
             Self::MemberFailed { .. } => Some("group_member_failed"),
             Self::WakeMismatch => Some("group_wake_mismatch"),
+            Self::Stalled => Some("group_stalled"),
         }
     }
 }
@@ -107,6 +111,7 @@ pub fn recorded_reason(
     match recorded {
         None => StopReason::Requested,
         Some((_, Some(code))) if code == "group_wake_mismatch" => StopReason::WakeMismatch,
+        Some((_, Some(code))) if code == "group_stalled" => StopReason::Stalled,
         Some((rank, _)) => StopReason::MemberFailed { rank },
     }
 }

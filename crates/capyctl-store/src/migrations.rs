@@ -479,7 +479,13 @@ mod tests {
         assert!(conn
             .execute("UPDATE group_plans SET failure_code='anything'", [])
             .is_err());
-        for code in ["group_member_failed", "group_wake_mismatch"] {
+        // ADR 0028 §11 (decided 2026-10-06, Task 19b): `group_stalled` joins
+        // the closed list of the unreleased v43 column.
+        for code in [
+            "group_member_failed",
+            "group_wake_mismatch",
+            "group_stalled",
+        ] {
             conn.execute("UPDATE group_plans SET failure_code=?1", [code])
                 .unwrap();
         }

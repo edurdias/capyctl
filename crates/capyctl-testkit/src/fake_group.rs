@@ -77,6 +77,11 @@ struct State {
     /// What completions return after the next wake, when set.
     pending_wake_output: Option<Vec<u32>>,
     wake_output: Option<Vec<u32>>,
+    /// ADR 0028 §11: the running ranks sit in a hung collective.
+    hung: bool,
+    /// ADR 0028 §11: how long after it is sent a request through the head
+    /// gets its first token.
+    first_token_delay: std::time::Duration,
 }
 
 /// A clonable handle on one fake engine group.
@@ -112,6 +117,8 @@ impl FakeGroup {
                 sleep_calls: 0,
                 pending_wake_output: None,
                 wake_output: None,
+                hung: false,
+                first_token_delay: std::time::Duration::ZERO,
             })),
             changes: Arc::new(tokio::sync::watch::channel(0).0),
         }
@@ -178,6 +185,8 @@ impl FakeGroup {
     pub fn launch(&self, rank: u32) {
         self.change(|state| {
             state.launches += 1;
+            // A fresh process does not inherit a hung collective.
+            state.hung = false;
             let r = Self::rank_mut(state, rank);
             r.launched = true;
             r.ended = None;
@@ -333,6 +342,29 @@ impl FakeGroup {
         self.change(|state| state.pending_wake_output = Some(tokens));
     }
 
+    /// ADR 0028 §11: the running ranks hang in their collectives: a request
+    /// through the head never gets a first token and a completion generates
+    /// nothing, until the ranks are launched again.
+    pub fn hang_collectives(&self) {
+        self.change(|state| state.hung = true);
+    }
+
+    /// ADR 0028 §11: a request through the head gets its first token only
+    /// `delay` after it is sent (a long prefill or queue); completions still
+    /// answer.
+    pub fn delay_first_token(&self, delay: std::time::Duration) {
+        self.change(|state| state.first_token_delay = delay);
+    }
+
+    /// How long after it is sent a request through the head gets its first
+    /// token; `None` when it never does (a hung collective, or a group that
+    /// is not serving).
+    pub fn first_token_after(&self) -> Option<std::time::Duration> {
+        let state = self.state();
+        (!state.hung && !state.asleep && state.ranks.iter().all(Rank::alive))
+            .then_some(state.first_token_delay)
+    }
+
     // ---- the head's calls ------------------------------------------------
 
     /// How many times the head was asked to sleep.
@@ -388,11 +420,11 @@ impl FakeGroup {
     /// One completion through the head. A serving group answers with tokens
     /// that depend on `prompt` alone (the same prompt, the same tokens), or
     /// with the output a [`FakeGroup::wake_output`] fault installed at the
-    /// last wake. A group that is not serving (a rank down, or asleep)
-    /// answers nothing.
+    /// last wake. A group that is not serving (a rank down, asleep, or hung
+    /// in a collective) answers nothing.
     pub fn complete(&self, prompt: &str) -> Vec<u32> {
         let state = self.state();
-        if state.asleep || !state.ranks.iter().all(Rank::alive) {
+        if state.asleep || state.hung || !state.ranks.iter().all(Rank::alive) {
             return Vec::new();
         }
         match &state.wake_output {

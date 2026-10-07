@@ -4,6 +4,8 @@ pub mod cleanup;
 pub mod engine_exit;
 mod expiry;
 mod failed_launch;
+// ADR 0028 §11 (decided 2026-10-06): a stalled group's failure and owed stop.
+pub mod group_stall;
 // ADR 0015: discovery that skips instances the coordinator is already driving.
 pub mod lanes;
 pub(crate) mod legacy_engine_config;
