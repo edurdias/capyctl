@@ -613,13 +613,15 @@ impl Switcher {
             SwitchPlan::EvictGroup {
                 hosts,
                 instance,
+                wake,
                 victims,
                 admission_window_ms,
             } => {
                 let victims: Vec<SwitchVictim> = victims.into_values().flatten().collect();
                 (
                     format!(
-                        "group instance {instance} starts on {} after releasing {} instance(s); admission window {admission_window_ms} ms",
+                        "group instance {instance} {} on {} after releasing {} instance(s); admission window {admission_window_ms} ms",
+                        if wake { "wakes" } else { "starts" },
                         hosts.join(", "),
                         victims.len()
                     ),

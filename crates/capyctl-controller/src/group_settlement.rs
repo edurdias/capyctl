@@ -58,6 +58,8 @@ pub enum StopReason {
     /// SPEC §11 "Rank failure": the member at `rank` exited, failed its
     /// launch, or the head failed its readiness (the probe included).
     MemberFailed { rank: u32 },
+    /// ADR 0028 §12: a wake's canary differed from its reference.
+    WakeMismatch,
 }
 
 impl StopReason {
@@ -66,6 +68,7 @@ impl StopReason {
         match self {
             Self::Requested => None,
             Self::MemberFailed { .. } => Some("group_member_failed"),
+            Self::WakeMismatch => Some("group_wake_mismatch"),
         }
     }
 }
@@ -89,18 +92,23 @@ pub fn recorded_reason(
     instance_index: u32,
     generation: i64,
 ) -> StopReason {
-    ctx.owner
-        .lock()
-        .ok()
-        .and_then(|o| {
-            o.store()
-                .group_failure(deployment_id, instance_index, generation)
-                .ok()
-                .flatten()
-        })
-        .map_or(StopReason::Requested, |rank| StopReason::MemberFailed {
-            rank,
-        })
+    let recorded = ctx.owner.lock().ok().and_then(|o| {
+        let store = o.store();
+        let rank = store
+            .group_failure(deployment_id, instance_index, generation)
+            .ok()
+            .flatten()?;
+        let code = store
+            .group_failure_code(deployment_id, instance_index, generation)
+            .ok()
+            .flatten();
+        Some((rank, code))
+    });
+    match recorded {
+        None => StopReason::Requested,
+        Some((_, Some(code))) if code == "group_wake_mismatch" => StopReason::WakeMismatch,
+        Some((rank, _)) => StopReason::MemberFailed { rank },
+    }
 }
 
 /// ADR 0028 §11: terminate every unsettled member of `target`'s plan at once

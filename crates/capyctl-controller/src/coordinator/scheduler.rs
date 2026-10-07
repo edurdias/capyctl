@@ -629,7 +629,9 @@ impl Scheduler {
                     .lock()
                     .map_err(|_| failed(shared.fail("runtime registry poisoned")))?
                     .contains_key(&work.binding_id);
-                if !retained {
+                // ADR 0028 §12: a group retains no single-host runtime; its
+                // park or wake runs through its head's agent.
+                if !retained && !work.group {
                     continue;
                 }
                 let Ok(permit) = self.activation_slots.clone().try_acquire_owned() else {

@@ -27,6 +27,7 @@
 //! qualification; the live rows MN1–MN9 are.
 use super::*;
 use crate::group_activation::{GroupActivation, GroupActivationError};
+use crate::group_residency::{canary_matches, CanaryReference, GroupResidencyError, CANARY_TOKENS};
 use capyctl_agent::host_checks::{prepare_member, HostFacts, InfinibandAccess};
 use capyctl_config::groups_policy::GroupsPolicy;
 use capyctl_domain::completion::ProcessIdentity;
@@ -36,6 +37,7 @@ use capyctl_domain::group::{
 };
 use capyctl_protocol::execution::{MemberAction, MemberCommand, SingleLaunchPlan};
 use capyctl_protocol::{capabilities, pb};
+use capyctl_store::ordinary_lifecycle::park::ResidencyKind;
 use capyctl_testkit::{FakeGroup, JournalState};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -69,8 +71,8 @@ pub(super) enum HostError {
     /// The command does not decode, or names another host.
     Malformed,
     /// The agent's authorization refused it (another controller, a wrong
-    /// expected state, another owner, or a group Park, Restore or Probe,
-    /// which the agent admits for single-rank launches only).
+    /// expected state, another owner, a group readiness Probe, or a Park,
+    /// Restore or completion Probe of anything but the group's head).
     Unauthorized,
     /// ADR 0028 §8 (R23): another command already claims this member's launch.
     Uncertain,
@@ -363,11 +365,14 @@ impl GroupHost {
                 owned_handle,
                 max_tokens: Some(max_tokens),
             } => self.probe(&decoded, owned_handle, *max_tokens)?,
-            // ADR 0028 §9, §12: the agent admits Park, Restore and a readiness
-            // Probe for single-rank launches only, so far.
-            MemberAction::Park { .. }
-            | MemberAction::Restore { .. }
-            | MemberAction::Probe { .. } => return Err(HostError::Unauthorized),
+            // ADR 0028 §12, SPEC §11: the head's agent alone takes Park and
+            // Restore and invokes the collective once; a readiness probe of a
+            // group launch is refused, as the agent refuses it.
+            MemberAction::Park { owned_handle } => self.residency(&decoded, owned_handle, true)?,
+            MemberAction::Restore { owned_handle, .. } => {
+                self.residency(&decoded, owned_handle, false)?
+            }
+            MemberAction::Probe { .. } => return Err(HostError::Unauthorized),
             MemberAction::DigestCheckpoint(_) => self.digest(&decoded),
             MemberAction::LaunchSingle(_) => return Err(HostError::NotScripted("LaunchSingle")),
             MemberAction::Inspect => return Err(HostError::NotScripted("Inspect")),
@@ -467,6 +472,94 @@ impl GroupHost {
             incarnation,
             ..Self::reply(command)
         })
+    }
+
+    /// ADR 0028 §12: the head's Park or Restore runs the engine's collective
+    /// once (`FakeGroup::sleep`/`wake`) and reports the head's own launch;
+    /// each member's memory is then reported by its own host
+    /// ([`GroupHost::residents`], [`WorldHosts::saver_mapped`]). A worker,
+    /// or a launch in another state, is refused.
+    fn residency(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+        park: bool,
+    ) -> Result<pb::MemberExecutionResult, HostError> {
+        let state = self.state();
+        let Some(launch) = state.journal.get(owned_handle) else {
+            return Err(HostError::Unauthorized);
+        };
+        let expected = if park { "ready" } else { "parked" };
+        if launch.rank != 0
+            || command.identity.expected_state != expected
+            || launch.command.identity.deployment_id != command.identity.deployment_id
+        {
+            return Err(HostError::Unauthorized);
+        }
+        let effect = if park {
+            self.group.sleep()
+        } else {
+            self.group.wake()
+        };
+        let (binding_id, incarnation) = match &launch.command.action {
+            MemberAction::Launch { member, .. } => {
+                (member.binding_id.clone(), member.incarnation.clone())
+            }
+            _ => Default::default(),
+        };
+        let processes = self.observed(&state, &launch.identities);
+        let alive = processes.iter().all(|p| p.presence == "alive");
+        let residency = match (&effect, park) {
+            (Ok(()), true) if alive => "parked",
+            (Ok(()), false) if alive => "restored",
+            _ => "unknown",
+        };
+        Ok(pb::MemberExecutionResult {
+            owned_handle: owned_handle.into(),
+            processes,
+            claim_retained: true,
+            // The Restore's own fresh probe of the head's launch.
+            model_usable: residency == "restored",
+            binding_id,
+            incarnation,
+            residency: Some(pb::ResidencyEvidence {
+                state: residency.into(),
+                mem_available_before_bytes: -1,
+                mem_available_after_bytes: -1,
+                milestones: Vec::new(),
+            }),
+            ..Self::reply(command)
+        })
+    }
+
+    /// ADR 0007, ADR 0028 §12: what this host's `process_residency` reports:
+    /// the memory its rank's newest live process tree holds, keyed by the
+    /// leader's identity. A disconnected host reports nothing.
+    fn residents(&self) -> Option<Vec<capyctl_domain::resources::ProcessResident>> {
+        if !self.group.connected(&self.name) {
+            return None;
+        }
+        let state = self.state();
+        Some(
+            state
+                .spawned
+                .last()
+                .filter(|spawned| self.group.alive(spawned.rank))
+                .and_then(|spawned| {
+                    spawned.identities.first().map(|leader| {
+                        capyctl_domain::resources::ProcessResident {
+                            pid: leader.pid,
+                            boot_id: leader.boot_id.clone(),
+                            start_ticks: leader.start_ticks,
+                            bytes: self.group.resident_bytes(spawned.rank) as i64,
+                            device_bytes: 0,
+                            host_bytes: 0,
+                        }
+                    })
+                })
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// ADR 0028 §8 (R7, R23, R29): one member launch.
@@ -711,6 +804,9 @@ fn scripted(names: &[&str]) -> (FakeGroup, Vec<Arc<GroupHost>>) {
     (group, hosts)
 }
 
+/// How one group park or wake of a deployment concluded.
+type ResidencyOutcome = (String, ResidencyKind, Result<(), GroupResidencyError>);
+
 /// ADR 0028 §8: the coordinator's transport to the world's scripted hosts:
 /// every command goes to [`GroupHost::execute`], whose errors become the
 /// transport's "no answer".
@@ -722,6 +818,8 @@ struct WorldHosts {
     published: Mutex<BTreeMap<String, (Option<IpAddr>, String)>>,
     concluded: Mutex<BTreeMap<String, Result<GroupActivation, GroupActivationError>>>,
     ready: Mutex<Vec<(String, String)>>,
+    /// How each group park or wake concluded, per deployment, in order.
+    residency: Mutex<Vec<ResidencyOutcome>>,
 }
 
 impl WorldHosts {
@@ -813,6 +911,40 @@ impl crate::group_activation::GroupHosts for WorldHosts {
             .unwrap()
             .insert(deployment_id.into(), outcome.cloned().map_err(Clone::clone));
     }
+
+    /// ADR 0028 §12 (R12): the saver-map facts `member`'s own host reads
+    /// from its observation directory: the bytes its rank holds now. A
+    /// disconnected host reports nothing.
+    fn saver_mapped<'a>(
+        &'a self,
+        _deployment_id: &'a str,
+        member: &'a capyctl_store::ordinary_lifecycle::park::ArmedMember,
+    ) -> crate::group_activation::HostFuture<'a, Result<(i64, i64), String>> {
+        Box::pin(async move {
+            let host = WorldHosts::host(self, &member.host_id).ok_or("no such host")?;
+            if !host.group.connected(&host.name) {
+                return Err("unreachable".into());
+            }
+            let rank = host.group.rank_of(&host.name).ok_or("no rank")?;
+            Ok((
+                host.group.resident_bytes(rank) as i64,
+                capyctl_protocol::now_unix_ms(),
+            ))
+        })
+    }
+
+    fn residency_concluded(
+        &self,
+        deployment_id: &str,
+        kind: ResidencyKind,
+        outcome: Result<(), &GroupResidencyError>,
+    ) {
+        self.residency.lock().unwrap().push((
+            deployment_id.into(),
+            kind,
+            outcome.map_err(Clone::clone),
+        ));
+    }
 }
 
 /// The world's bindings: the scripted group hosts, and a Fake engine for a
@@ -859,6 +991,8 @@ struct WorldObservations {
     fallback: Vec<MemoryObservation>,
     /// The hosts eligible for a start; `None` while the world names none.
     eligible: Arc<Mutex<Option<BTreeSet<String>>>>,
+    /// The scripted hosts, whose `process_residency` the observations carry.
+    hosts: Vec<Arc<GroupHost>>,
 }
 
 impl ServiceObservation for WorldObservations {
@@ -888,6 +1022,23 @@ impl ServiceObservation for WorldObservations {
                 .collect(),
         };
         Box::pin(async move { Ok(observed) })
+    }
+    /// ADR 0007: a scripted host's observations carry its rank's resident
+    /// memory; a disconnected one answers nothing.
+    fn observe_with_residents(&self, host: String) -> ResidentObservationFuture {
+        let residents = match self.hosts.iter().find(|h| h.name == host) {
+            Some(scripted) => match scripted.residents() {
+                Some(residents) => residents,
+                None => {
+                    return Box::pin(async move {
+                        Err(CoordinatorError::Service(format!("{host} is unreachable")))
+                    })
+                }
+            },
+            None => Vec::new(),
+        };
+        let observed = self.observe(host);
+        Box::pin(async move { Ok((observed.await?, residents)) })
     }
 }
 
@@ -998,6 +1149,7 @@ impl GroupWorld {
             published: Mutex::new(BTreeMap::new()),
             concluded: Mutex::new(BTreeMap::new()),
             ready: Mutex::new(Vec::new()),
+            residency: Mutex::new(Vec::new()),
         });
         let domains = Arc::new(Mutex::new(BTreeMap::new()));
         let eligible = Arc::new(Mutex::new(None));
@@ -1005,6 +1157,7 @@ impl GroupWorld {
             domains: domains.clone(),
             fallback: fixture.observations.clone(),
             eligible: eligible.clone(),
+            hosts: hosts.clone(),
         });
         let worker = spawn_world_worker(&owner, &observations, &transport);
         // SPEC §13.2 (W13): each host's exit watcher reports through the
@@ -1833,18 +1986,36 @@ impl GroupWorld {
         self.probes(host).len()
     }
 
-    /// How many completion probes the group's head was sent.
-    pub(super) fn probe_calls(&self) -> usize {
-        self.probes(&self.hosts[0].name).len()
+    /// The readiness probes the group's head was sent: every completion
+    /// probe but the wake canary's (ADR 0028 §12), counted by
+    /// [`Self::canary_probe_calls`].
+    fn readiness_probes(&self) -> Vec<Option<u32>> {
+        self.probes(&self.hosts[0].name)
+            .into_iter()
+            .filter(|tokens| *tokens != Some(CANARY_TOKENS))
+            .collect()
     }
 
-    /// The token bound of the last probe the head was sent.
+    /// How many readiness probes the group's head was sent.
+    pub(super) fn probe_calls(&self) -> usize {
+        self.readiness_probes().len()
+    }
+
+    /// The token bound of the last readiness probe the head was sent.
     pub(super) fn last_probe_max_tokens(&self) -> u32 {
-        self.probes(&self.hosts[0].name)
+        self.readiness_probes()
             .last()
             .copied()
             .flatten()
             .expect("a completion probe")
+    }
+
+    /// How many canary probes (ADR 0028 §12) the group's head was sent.
+    pub(super) fn canary_probe_calls(&self) -> usize {
+        self.probes(&self.hosts[0].name)
+            .into_iter()
+            .filter(|tokens| *tokens == Some(CANARY_TOKENS))
+            .count()
     }
 
     /// The engine environment `host`'s Launch rendered, once it has one.
@@ -3297,12 +3468,17 @@ impl GroupWorld {
     }
 }
 
-// T16: A -> B -> A with a group and a single-rank deployment on host A.
-// R5: the group parks as the victim, which group park brings.
+// T16, T20: A -> B -> A with a group and a single-rank deployment on host A.
+// R5: the group parks as the victim (ADR 0028 §12: whole, through its head,
+// each member at its parked budget on its own host), and wakes in place on
+// both named hosts once host A's victim is released. The agents fence per
+// instance: a parked member still occupies a single-claim host (R39, R40),
+// where the victim is stopped instead (`a_group_victim_is_stopped_whole...`).
 #[tokio::test]
-#[ignore = "enabled by Task 19"]
 async fn group_and_single_rank_alternate() {
-    let world = GroupWorld::ready_group("g", &["host-a", "host-b"])
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_per_instance_claims()
+        .ready("g")
         .await
         .with_single_rank("s", "host-a");
     world.request("s").await;
@@ -3312,13 +3488,14 @@ async fn group_and_single_rank_alternate() {
     world.assert_release_evidence_per_member("g");
 }
 
-// T16, T27, T30 (ADR 0028 §5, §11): A -> B -> A with group g on host A and
-// host B and a single-rank s on host A, which do not fit together there. The
-// request for s evicts g whole, by the group stop: each host is sent one
-// Terminate for its own member and each member is released only on its own
-// host's evidence, on host B too although only host A needed room. The
-// request for g then evicts s and the group starts again on both hosts. Run
-// with single-claim agents (each launch occupies its host) and with agents
+// T16, T27, T30 (ADR 0028 §5, §11, §12): A -> B -> A with a restart_only group
+// g on host A and host B and a single-rank s on host A, which do not fit
+// together there. The request for s evicts g whole, by the group stop (R34:
+// a restart_only group parks by stopping): each host is sent one Terminate
+// for its own member and each member is released only on its own host's
+// evidence, on host B too although only host A needed room. The request for
+// g then evicts s and the group starts again on both hosts. Run with
+// single-claim agents (each launch occupies its host) and with agents
 // fencing per instance (memory alone decides).
 #[tokio::test]
 async fn a_group_victim_is_stopped_whole_and_released_per_member() {
@@ -3329,7 +3506,12 @@ async fn a_group_victim_is_stopped_whole_and_released_per_member() {
         } else {
             world
         };
-        let world = world.ready("g").await.with_single_rank("s", "host-a");
+        let id = world
+            .deploy_group_with_residency("g", &["host-a", "host-b"], "restart_only")
+            .await;
+        world.group.launch_completes();
+        world.wait_ready(&id).await;
+        let world = world.with_single_rank("s", "host-a");
         let g = world.id("g");
         world.request("s").await;
         assert_eq!(world.state("s").await, "ready");
@@ -3357,10 +3539,12 @@ async fn a_group_victim_is_stopped_whole_and_released_per_member() {
     }
 }
 
-// T16, T27 (ADR 0028 §5, SPEC §11): a group request needing room on host A
-// and host B evicts on both or neither. Host A could make room by stopping
-// s, but host B holds only t, whose warm-residency commitment keeps it from
-// being a victim: the request is refused for capacity and s keeps serving.
+// T16, T20, T27 (ADR 0028 §5, §12, SPEC §11): a group request needing room
+// on host A and host B evicts on both or neither. The deep group parked as
+// s's victim; waking it needs its wake peak on both hosts. Host A could make
+// room by stopping s, but host B holds only t, whose warm-residency
+// commitment keeps it from being a victim: the wake is refused for capacity
+// and s keeps serving.
 #[tokio::test]
 async fn a_group_request_evicts_nothing_unless_every_named_host_makes_room() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -3371,7 +3555,7 @@ async fn a_group_request_evicts_nothing_unless_every_named_host_makes_room() {
         .with_warm_single_rank("t", "host-b");
     world.request("s").await;
     world.request("t").await;
-    assert_eq!(world.state("g").await, "stopped");
+    assert_eq!(world.state("g").await, "parked");
     let refused = world.try_request("g").await.unwrap_err();
     assert!(
         refused.to_string().contains("insufficient_capacity"),
@@ -3379,7 +3563,7 @@ async fn a_group_request_evicts_nothing_unless_every_named_host_makes_room() {
     );
     assert_eq!(world.state("s").await, "ready");
     assert_eq!(world.state("t").await, "ready");
-    assert_eq!(world.state("g").await, "stopped");
+    assert_eq!(world.state("g").await, "parked");
     assert!(world
         .group_plan("g")
         .is_some_and(|(plan, _)| plan.generation() == 1));
@@ -3407,9 +3591,10 @@ impl GroupWorld {
     }
 }
 
-// T16, T27 (ADR 0028 §5, owner decision 2026-09-25): an evicting start of a
-// group plans every named host before releasing anything, then releases each
-// host's victims in its own switch: s on host A and u on host B.
+// T16, T20, T27 (ADR 0028 §5, §12, owner decision 2026-09-25): an evicting
+// start of a parked group plans its wake on every named host before
+// releasing anything, then releases each host's victims in its own switch:
+// s on host A and u on host B.
 #[tokio::test]
 async fn an_evicting_start_of_a_group_releases_on_every_named_host() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -3420,7 +3605,7 @@ async fn an_evicting_start_of_a_group_releases_on_every_named_host() {
         .with_single_rank("u", "host-b");
     world.request("s").await;
     world.request("u").await;
-    assert_eq!(world.state("g").await, "stopped");
+    assert_eq!(world.state("g").await, "parked");
     assert_eq!(world.evicting_start("g").await, ["host-a", "host-b"]);
     assert_eq!(world.state("s").await, "stopped");
     assert_eq!(world.state("u").await, "stopped");
@@ -3601,4 +3786,286 @@ async fn draining_an_absent_worker_host_keeps_its_member_charged() {
             (!world.drain_pending("host-b")).then_some(())
         })
         .await;
+}
+
+// ---- group park and wake (ADR 0028 §12) --------------------------------------
+
+/// The window a world park or wake is accepted with: room for the head's
+/// collective and every member's report, short enough that a silent
+/// member's wait ends within the test.
+const RESIDENCY_WINDOW_MS: i64 = 4_000;
+
+impl GroupWorld {
+    /// A world of `hosts` running `engine` whose group `name` is Ready.
+    pub(super) async fn ready_group_with(name: &str, hosts: &[&str], engine: &str) -> Self {
+        Self::hosts(hosts).with_engine(engine).ready(name).await
+    }
+
+    /// As [`Self::ready_group_with`], the group deployed with `residency`.
+    pub(super) async fn ready_group_with_residency(
+        name: &str,
+        hosts: &[&str],
+        engine: &str,
+        residency: &str,
+    ) -> Self {
+        let world = Self::hosts(hosts).with_engine(engine);
+        let id = world
+            .deploy_group_with_residency(name, hosts, residency)
+            .await;
+        world.group.launch_completes();
+        world.wait_ready(&id).await;
+        world
+    }
+
+    /// The bytes one member's parked budget charges on its own host: the
+    /// golden deployment's parked footprint (2 GiB).
+    pub(super) fn member_parked_budget(&self) -> i64 {
+        2 << 30
+    }
+
+    /// How every `kind` park or wake of deployment `id` concluded, in order.
+    fn residency_outcomes(
+        &self,
+        id: &str,
+        kind: ResidencyKind,
+    ) -> Vec<Result<(), GroupResidencyError>> {
+        self.transport
+            .residency
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, k, _)| d == id && *k == kind)
+            .map(|(_, _, outcome)| outcome.clone())
+            .collect()
+    }
+
+    /// Deployment `id`'s instance state as status reads it now.
+    fn observed_state(&self, id: &str) -> Option<String> {
+        let o = self.owner.lock().unwrap();
+        o.store()
+            .snapshot()
+            .unwrap()
+            .deployments
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.instances.first())
+            .map(|i| i.observed_state.clone())
+    }
+
+    /// SPEC §6.3 `park deployment` of group `name`, as an operator issues
+    /// it, waited on until it concluded. A deep group's park answers how its
+    /// head's collective and its members' reports ended; a restart_only
+    /// group's park is a group stop (R34) and answers once the stopped
+    /// generation settled.
+    pub(super) async fn park(&self, name: &str) -> Result<(), GroupResidencyError> {
+        let fence = self.deployed.lock().unwrap()[name].clone();
+        let id = fence.deployment_id.clone();
+        let before = self.residency_outcomes(&id, ResidencyKind::Park).len();
+        let generation = self.group_plan(name).map(|(plan, _)| plan.generation());
+        self.worker
+            .commands()
+            .park(
+                "owner",
+                &id,
+                fence.revision,
+                &ulid::Ulid::new().to_string(),
+                capyctl_protocol::now_unix_ms() + RESIDENCY_WINDOW_MS,
+            )
+            .unwrap_or_else(|e| panic!("the park of {name} was refused: {e:?}"));
+        self.until(&format!("the park of {name}"), || {
+            if let Some(outcome) = self
+                .residency_outcomes(&id, ResidencyKind::Park)
+                .get(before)
+            {
+                return Some(outcome.clone());
+            }
+            let settled = generation.is_some_and(|generation| {
+                let o = self.owner.lock().unwrap();
+                o.store()
+                    .group_plan_at(&id, 0, generation)
+                    .unwrap()
+                    .is_some_and(|(_, rows)| rows.iter().all(|r| r.state == MemberState::Settled))
+            });
+            (settled && self.observed_state(&id).as_deref() == Some("stopped")).then_some(Ok(()))
+        })
+        .await
+    }
+
+    /// SPEC §6.3 `start deployment` of parked group `name`: a deep group
+    /// wakes in place and this answers how its wake ended; a group with
+    /// nothing parked (a restart_only group, R34) relaunches, as on-demand
+    /// activation starts it.
+    pub(super) async fn wake(&self, name: &str) -> Result<(), GroupResidencyError> {
+        let fence = self.deployed.lock().unwrap()[name].clone();
+        let id = fence.deployment_id.clone();
+        let before = self.residency_outcomes(&id, ResidencyKind::Restore).len();
+        let woken = self
+            .worker
+            .commands()
+            .wake(
+                "owner",
+                &id,
+                capyctl_store::ordinary_lifecycle::park::WakeScope::All,
+                fence.revision,
+                &ulid::Ulid::new().to_string(),
+                capyctl_protocol::now_unix_ms() + RESIDENCY_WINDOW_MS,
+            )
+            .unwrap_or_else(|e| panic!("the wake of {name} was refused: {e:?}"));
+        if woken.is_none() {
+            self.request(name).await;
+            return Ok(());
+        }
+        self.until(&format!("the wake of {name}"), || {
+            self.residency_outcomes(&id, ResidencyKind::Restore)
+                .get(before)
+                .cloned()
+        })
+        .await
+    }
+}
+
+// T20: park settles only when every rank reports its memory released; one collective only.
+#[tokio::test]
+async fn park_needs_every_rank() {
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::ready_group_with("g", &["host-a", "host-b"], engine).await;
+        world.park("g").await.unwrap();
+        assert_eq!(world.group.sleep_calls(), 1, "{engine}");
+        assert_eq!(world.state("g").await, "parked", "{engine}");
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&world.id("g"), 0, 1)),
+            world.member_parked_budget(),
+            "{engine}"
+        );
+        // ADR 0028 §12: the head's agent alone was sent the collective.
+        assert!(!world.host("host-b").received().iter().any(|c| matches!(
+            c.action,
+            MemberAction::Park { .. } | MemberAction::Restore { .. }
+        )));
+    }
+}
+
+// Review Focus 4, T20: the head's call succeeds but rank 1 stays resident: charge kept, group stopped.
+#[tokio::test]
+async fn resident_rank_after_sleep_stops_the_group() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.group.sleep_leaves_rank_resident(1);
+    let err = world.park("g").await.unwrap_err();
+    assert_eq!(err.code(), "group_member_failed");
+    assert_eq!(world.group.sleep_calls(), 1);
+    assert_ne!(world.state("g").await, "parked");
+    world.wait_settled_generation("g", 1).await;
+}
+
+// T20, T32: the rank that stayed resident keeps its full Ready charge until its
+// own host proves it gone; it is never moved to its parked budget, and the
+// group is never reported parked.
+#[tokio::test]
+async fn a_resident_rank_is_never_charged_its_parked_budget() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let g = world.id("g");
+    world.group.sleep_leaves_rank_resident(1);
+    let err = world.park("g").await.unwrap_err();
+    assert_eq!(err, GroupResidencyError::MemberResident { rank: 1 });
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        world.member_request()
+    );
+    assert_ne!(world.state("g").await, "parked");
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+        0
+    );
+}
+
+// T20: a member that never reports keeps its full charge and is uncertain.
+#[tokio::test]
+async fn silent_member_keeps_full_charge() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.group.disconnect_host("host-b");
+    let _ = world.park("g").await;
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&world.id("g"), 0, 1)),
+        world.member_request()
+    );
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+}
+
+// T20: a wake whose canary differs stops the group.
+#[tokio::test]
+async fn wake_canary_mismatch_stops_the_group() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    world.park("g").await.unwrap();
+    world.group.wake_output(vec![9, 9, 9]);
+    assert_eq!(
+        world.wake("g").await.unwrap_err().code(),
+        "group_wake_mismatch"
+    );
+    let status = world.wait_settled_generation("g", 1).await;
+    assert_eq!(status.last_error(), "group_wake_mismatch");
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+}
+
+// T20: five clean cycles keep the canary identical.
+#[tokio::test]
+async fn repeated_cycles_are_clean() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    for _ in 0..5 {
+        world.park("g").await.unwrap();
+        world.wake("g").await.unwrap();
+    }
+    assert_eq!(world.group.sleep_calls(), 5);
+    // ADR 0028 §12: the reference was recorded once, at first readiness;
+    // every wake compared one canary against it.
+    assert_eq!(world.canary_probe_calls(), 6);
+    assert!(world.route_open("g"));
+    assert_eq!(world.state("g").await, "ready");
+}
+
+// T22, R34: TensorFold supports only restart_only, so its effective residency defaults there: it parks by stopping both ranks and wakes by relaunching.
+#[tokio::test]
+async fn tensorfold_group_is_restart_only() {
+    let world = GroupWorld::ready_group_with("g", &["host-a", "host-b"], "tensorfold").await;
+    world.park("g").await.unwrap();
+    assert_eq!(world.group.sleep_calls(), 0);
+    assert!(!world.group.alive(0) && !world.group.alive(1));
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&world.id("g"), 0, 1)),
+        0
+    );
+    world.wake("g").await.unwrap();
+    assert!(world.generation_started("g", 2));
+}
+
+// T20, R34: park and wake follow the effective residency, not the engine: a restart_only vLLM or SGLang group parks by stopping.
+#[tokio::test]
+async fn restart_only_residency_parks_by_stopping_on_any_engine() {
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::ready_group_with_residency(
+            "g",
+            &["host-a", "host-b"],
+            engine,
+            "restart_only",
+        )
+        .await;
+        world.park("g").await.unwrap();
+        assert_eq!(world.group.sleep_calls(), 0, "{engine}");
+        assert!(!world.group.alive(0) && !world.group.alive(1));
+        world.wake("g").await.unwrap();
+        assert!(world.generation_started("g", 2));
+    }
+}
+
+// T20 (decided 2026-10-06): the canary is compared by one function, exact tokens only.
+#[test]
+fn canary_matches_exact_tokens_only() {
+    let reference = CanaryReference {
+        prompt: "canary".into(),
+        tokens: vec![1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    assert!(canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 8]));
+    assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7, 9]));
+    assert!(!canary_matches(&reference, &[1, 2, 3, 4, 5, 6, 7]));
 }

@@ -2495,6 +2495,22 @@ async fn drive_residency(
             "shutdown before a residency arm".into(),
         ));
     }
+    // ADR 0028 §12: a group's park or wake goes through its head's agent
+    // alone, each member settled on its own host's report.
+    if work.group {
+        let Some(hosts) = shared.groups.clone() else {
+            return Ok(false);
+        };
+        let step = work.step_id.clone();
+        let members = shared
+            .read(move |owner, _| {
+                owner
+                    .store()
+                    .group_residency_members(owner.session(), &step)
+            })
+            .await?;
+        return drive_group_residency(shared, source, work, members, hosts, stop).await;
+    }
     let driver = shared
         .retained
         .lock()
@@ -2585,6 +2601,317 @@ async fn drive_residency(
     }
     Ok(true)
 }
+
+/// ADR 0028 §12: arm one planned group park or wake against every member
+/// host and run it through the head ([`crate::group_residency`]). A park
+/// arms on each host's ledger; a wake on each member host's own fresh
+/// observation, all or nothing. Settled, each member moves on its own host's
+/// report; refused before any effect, nothing changed; anything else leaves
+/// the step uncertain with every charge as it was and stops the group.
+async fn drive_group_residency(
+    shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
+    work: ResidencyWork,
+    members: Vec<capyctl_store::ordinary_lifecycle::park::ArmedMember>,
+    hosts: Arc<dyn crate::group_activation::GroupHosts>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<bool, CoordinatorError> {
+    use crate::group_residency::{park_group, wake_group, GroupResidencyError, ResidencyTarget};
+    let now = (shared.clock)()?;
+    let bound =
+        Duration::from_millis(u64::try_from(work.deadline_ms.saturating_sub(now)).unwrap_or(0))
+            .min(shared.options.protocol_timeout);
+    if bound.is_zero() {
+        return Ok(false);
+    }
+    // SPEC §7.3: a wake grows memory on every member host, so each host's own
+    // fresh observation admits it; a park only releases memory.
+    let mut observed = BTreeMap::new();
+    if work.kind == ResidencyKind::Restore {
+        for member in &members {
+            let observations = tokio::select! {
+                biased;
+                _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown before a residency arm".into())),
+                result = tokio::time::timeout(bound, source.observe(member.host_id.clone())) => match result {
+                    Ok(Ok(observed)) => observed,
+                    _ => return Ok(false),
+                },
+            };
+            let host = member.host_id.clone();
+            let controls = shared
+                .with_owner(move |owner| {
+                    owner
+                        .store()
+                        .resource_policy(&host)
+                        .map_err(|error| CoordinatorError::Service(error.to_string()))
+                })
+                .await?
+                .map(|policy| policy.controls)
+                .ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "host {} has no resource policy",
+                        member.host_id
+                    ))
+                })?;
+            let limits = crate::group_activation::host_limits(&controls);
+            observed.insert(
+                member.host_id.clone(),
+                (
+                    observations,
+                    limits,
+                    controls.observation_ttl_ms,
+                    controls.max_parked as usize,
+                ),
+            );
+        }
+    }
+    let step = work.step_id.clone();
+    let armed = shared
+        .read(move |owner, now| {
+            let contexts: BTreeMap<_, _> = observed
+                .iter()
+                .map(|(host, (observations, limits, ttl, max_parked))| {
+                    (
+                        host.clone(),
+                        capyctl_scheduler::residency::AdmissionContext::new(
+                            observations,
+                            limits,
+                            now,
+                            *ttl,
+                            *max_parked,
+                        ),
+                    )
+                })
+                .collect();
+            owner
+                .store()
+                .arm_group_residency(owner.session(), &step, now, &contexts)
+        })
+        .await;
+    let context = match armed {
+        Ok(ResidencyArm::New(context)) => *context,
+        Ok(ResidencyArm::Reclaiming(_) | ResidencyArm::Refused(_)) => return Ok(true),
+        Ok(ResidencyArm::Draining) => return Ok(false),
+        Ok(ResidencyArm::Blocked(why)) => {
+            log_blocked_residency(&work.step_id, &why);
+            return Ok(false);
+        }
+        Err(error) => {
+            if !shared.accepting.load(Ordering::Acquire) {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+    };
+    let (deployment, instance, generation) = (
+        work.deployment_id.clone(),
+        work.instance,
+        context.token.generation,
+    );
+    let plan = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .group_plan_at(&deployment, instance, generation)
+                .map_err(|error| CoordinatorError::Service(error.to_string()))
+        })
+        .await?
+        .map(|(plan, _)| plan)
+        .ok_or_else(|| shared.fail("an armed group step has no plan at its generation"))?;
+    let target = ResidencyTarget {
+        group: crate::group_settlement::GroupTarget {
+            deployment_id: work.deployment_id.clone(),
+            instance_index: work.instance,
+            revision: context.token.revision,
+            operation_id: context.token.operation_id.clone(),
+            plan,
+        },
+        members,
+        step_id: work.step_id.clone(),
+        deadline_ms: context.deadline_ms,
+    };
+    let ctx = crate::group_activation::GroupCtx {
+        owner: shared.owner.clone(),
+        hosts: hosts.clone(),
+        observations: shared.observations.clone(),
+        clock: shared.clock.clone(),
+    };
+    let outcome = tokio::select! {
+        biased;
+        _ = stop.changed() => None,
+        outcome = async {
+            match work.kind {
+                ResidencyKind::Park => park_group(&ctx, &target).await,
+                ResidencyKind::Restore => wake_group(&ctx, &target).await,
+            }
+        } => Some(outcome),
+    };
+    let step = work.step_id.clone();
+    let uncertain = |reason: String| {
+        let step = step.clone();
+        async move {
+            shared
+                .read(move |owner, _| {
+                    owner.store().mark_residency_uncertain(
+                        owner.session(),
+                        &step,
+                        &redact_text(&reason),
+                    )
+                })
+                .await
+                .map(drop)
+        }
+    };
+    let Some(outcome) = outcome else {
+        uncertain("the controller stopped during the group's collective".into()).await?;
+        return Err(CoordinatorError::Stopped(
+            "shutdown during a group park or wake".into(),
+        ));
+    };
+    let outcome = match outcome {
+        Ok(reports) => {
+            let (step, kind) = (step.clone(), work.kind);
+            let completed = shared
+                .read(move |owner, now| {
+                    owner.store().complete_group_residency(
+                        owner.session(),
+                        &step,
+                        &reports,
+                        match kind {
+                            ResidencyKind::Park => {
+                                "the head's collective, then every member's own host's residency report"
+                            }
+                            ResidencyKind::Restore => {
+                                "the head's collective, every member's own host's residency report, the head's readiness probe and the canary"
+                            }
+                        },
+                        now,
+                    )
+                })
+                .await;
+            match completed {
+                Ok(()) => {
+                    if work.kind == ResidencyKind::Restore {
+                        // SPEC §13.2 (G2): the head's readiness belongs to its
+                        // current session again.
+                        hosts
+                            .head_ready(&work.binding_id, &target.group.plan.head().member.host_id);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if !shared.accepting.load(Ordering::Acquire) {
+                        return Err(error);
+                    }
+                    // Evidence the store did not accept proves nothing: every
+                    // charge stays and the group stops as uncertain.
+                    Err(GroupResidencyError::MemberSilent { rank: 0 })
+                }
+            }
+        }
+        Err(error) => Err(error),
+    };
+    match &outcome {
+        Ok(()) => {}
+        // SPEC §13 (W4): refused before any effect: settled at once.
+        Err(GroupResidencyError::Refused { reason, .. }) => {
+            let (step, reason) = (step.clone(), redact_text(reason));
+            shared
+                .read(move |owner, _| {
+                    owner
+                        .store()
+                        .refuse_residency(owner.session(), &step, &reason)
+                })
+                .await?;
+        }
+        Err(error) => {
+            uncertain(error.to_string()).await?;
+            fail_group_residency(shared, &target, error).await;
+        }
+    }
+    hosts.residency_concluded(&work.deployment_id, work.kind, outcome.as_ref().map(drop));
+    Ok(true)
+}
+
+/// ADR 0028 §11, §12: a group park or wake that did not settle stops the
+/// group. A silent member is marked uncertain with its full charge
+/// (`group_member_uncertain`); a failure records the rank it failed at and
+/// its closed code (`group_member_failed`, `group_wake_mismatch`), and stops
+/// under the failure principal so `recovery: reconcile` relaunches it once
+/// every member settled. The stop's cleanup is the group stop: every member
+/// terminated at once, each released only on its own host's evidence.
+async fn fail_group_residency(
+    shared: &Arc<Shared>,
+    target: &crate::group_residency::ResidencyTarget,
+    error: &crate::group_residency::GroupResidencyError,
+) {
+    use crate::group_residency::GroupResidencyError;
+    let group = target.group.clone();
+    let generation = group.plan.generation();
+    let code = error.code().to_owned();
+    let failed = error.failed_rank();
+    let silent = match error {
+        GroupResidencyError::MemberSilent { rank } => Some(*rank),
+        _ => None,
+    };
+    let commands = CoordinatorCommands {
+        shared: shared.clone(),
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(owner) = commands.shared.owner.lock() {
+            let store = owner.store();
+            if let Some(rank) = silent {
+                let _ = store.mark_member_uncertain(
+                    &group.deployment_id,
+                    group.instance_index,
+                    generation,
+                    rank,
+                );
+                let _ = store.record_group_status(
+                    &group.deployment_id,
+                    group.instance_index,
+                    "group_member_uncertain",
+                );
+            }
+            if let Some(rank) = failed {
+                let _ = store.record_group_failure_code(
+                    &group.deployment_id,
+                    group.instance_index,
+                    generation,
+                    rank,
+                    &code,
+                );
+            }
+        }
+        let principal = if failed.is_some() {
+            crate::engine_exit::EXIT_PRINCIPAL
+        } else {
+            GROUP_RESIDENCY_PRINCIPAL
+        };
+        let key = format!("group-residency:{}:{generation}", group.operation_id);
+        if let Err(reason) = crate::engine_exit::accept_instance_stop(
+            &commands,
+            &group.deployment_id,
+            group.instance_index,
+            principal,
+            &key,
+        ) {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {} instance {}: the group stop after its park or wake was not \
+                     accepted yet ({reason}); every member stays charged",
+                    group.deployment_id, group.instance_index
+                ),
+            );
+        }
+    })
+    .await;
+}
+
+/// The principal a group stops under when a park or wake left a member
+/// uncertain (no member failed): it is not relaunched by recovery.
+const GROUP_RESIDENCY_PRINCIPAL: &str = "system:group_residency";
 
 /// ADR 0014 amendment A13: once a park completed, sample the host and record
 /// what the parked processes still hold, so later parks of the revision are

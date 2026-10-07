@@ -215,7 +215,25 @@ pub(crate) fn accept_exit_stop(
     commands: &CoordinatorCommands,
     launch: &ExitedLaunch,
 ) -> Result<Option<String>, String> {
-    let deployment = launch.fence.deployment_id.as_str();
+    accept_instance_stop(
+        commands,
+        &launch.fence.deployment_id,
+        launch.instance_index,
+        EXIT_PRINCIPAL,
+        &format!("engine-exit:{}", launch.binding_id),
+    )
+}
+
+/// SPEC §6.3: an ordinary stop of one instance under `principal`, at the
+/// deployment's current revision and within its stop window, so it stays
+/// eligible for on-demand activation. `key` makes a repeat replay it.
+pub(crate) fn accept_instance_stop(
+    commands: &CoordinatorCommands,
+    deployment: &str,
+    instance_index: u32,
+    principal: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
     let revision = commands
         .read(|store| store.current_revision(deployment))
         .map_err(|error| error.to_string())?
@@ -229,14 +247,13 @@ pub(crate) fn accept_exit_stop(
         .map_err(|error| error.to_string())?
         .checked_add(window)
         .ok_or_else(|| "clock overflow".to_owned())?;
-    let key = format!("engine-exit:{}", launch.binding_id);
     commands
         .stop_instance(
-            EXIT_PRINCIPAL,
+            principal,
             deployment,
-            launch.instance_index,
+            instance_index,
             revision,
-            &key,
+            key,
             deadline,
         )
         .map(|receipt| receipt.map(|receipt| receipt.operation_id().to_owned()))

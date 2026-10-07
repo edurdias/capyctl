@@ -292,7 +292,7 @@ fn canonical_identities(identities: &[ProcessIdentity]) -> String {
 }
 
 /// The stored form back to identities.
-fn decode_identities(json: &str) -> Result<Vec<ProcessIdentity>, GroupStoreError> {
+pub(crate) fn decode_identities(json: &str) -> Result<Vec<ProcessIdentity>, GroupStoreError> {
     let rows: Vec<(String, u32, String, u64)> =
         serde_json::from_str(json).map_err(|_| corrupt())?;
     Ok(rows
@@ -512,6 +512,36 @@ pub(crate) fn migrate_v42(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Schema v43 data step (ADR 0028 §12). Idempotent: each column is added only
+/// when missing. `canary_json` is the wake canary's reference recorded at the
+/// plan's first readiness; `failure_code` names why a failed group failed
+/// when it is not a member's own failure (a wake whose canary differed).
+pub(crate) fn migrate_v43(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !has_column(tx, "group_plans", "canary_json")? {
+        tx.execute_batch("ALTER TABLE group_plans ADD COLUMN canary_json TEXT;")?;
+    }
+    if !has_column(tx, "group_plans", "failure_code")? {
+        tx.execute_batch(
+            "ALTER TABLE group_plans ADD COLUMN failure_code TEXT
+               CHECK(failure_code IS NULL OR failure_code IN ('group_member_failed','group_wake_mismatch'));",
+        )?;
+    }
+    Ok(())
+}
+
+/// ADR 0028 §12 (decided 2026-10-06): the wake canary's reference, recorded
+/// at the plan's first readiness: the fixed prompt and the tokens the head
+/// generated for it at temperature 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredCanary {
+    pub prompt: String,
+    pub tokens: Vec<u32>,
+}
+
+/// The closed codes a group failure may name in status (spec §16).
+const FAILURE_CODES: [&str; 2] = ["group_member_failed", "group_wake_mismatch"];
+
 /// ADR 0028 §9, §11: a group head's binding with the plan it realizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundGroup {
@@ -595,6 +625,29 @@ pub(crate) fn record_failure(
     generation: i64,
     rank: u32,
 ) -> Result<(), GroupStoreError> {
+    record_failure_code(
+        tx,
+        deployment_id,
+        instance_index,
+        generation,
+        rank,
+        "group_member_failed",
+    )
+}
+
+/// As [`record_failure`], naming `code` (one of [`FAILURE_CODES`]): the first
+/// failure keeps both its rank and its code.
+fn record_failure_code(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+    rank: u32,
+    code: &str,
+) -> Result<(), GroupStoreError> {
+    if !FAILURE_CODES.contains(&code) {
+        return Err(GroupStoreError::Plan);
+    }
     let members: u32 = tx.query_row(
         "SELECT COUNT(*) FROM group_members
           WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
@@ -605,11 +658,22 @@ pub(crate) fn record_failure(
         return Err(GroupStoreError::Conflict);
     }
     tx.execute(
-        "UPDATE group_plans SET failed_rank=?4
+        "UPDATE group_plans SET failed_rank=?4,failure_code=?5
           WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND failed_rank IS NULL",
-        params![deployment_id, instance_index, generation, rank],
+        params![deployment_id, instance_index, generation, rank, code],
     )?;
-    record_status(tx, deployment_id, instance_index, "group_member_failed")
+    let kept: Option<String> = tx.query_row(
+        "SELECT COALESCE(failure_code,'group_member_failed') FROM group_plans
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+        params![deployment_id, instance_index, generation],
+        |r| r.get(0),
+    )?;
+    record_status(
+        tx,
+        deployment_id,
+        instance_index,
+        kept.as_deref().unwrap_or("group_member_failed"),
+    )
 }
 
 /// SPEC §17, ADR 0028 §16: the closed code a group's failure or stop leaves
@@ -1274,6 +1338,102 @@ impl crate::Store {
         record_failure(&tx, deployment_id, instance_index, generation, rank)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// ADR 0028 §12: as [`Self::record_group_failure`], naming `code`
+    /// (`group_member_failed` or `group_wake_mismatch`) as the failure's
+    /// closed code. The first failure keeps its rank and its code.
+    pub fn record_group_failure_code(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+        code: &str,
+    ) -> Result<(), GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        record_failure_code(&tx, deployment_id, instance_index, generation, rank, code)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The closed code of the failure the group at `generation` recorded,
+    /// if it failed (`group_member_failed` unless another was named).
+    pub fn group_failure_code(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<Option<String>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let code: Option<Option<String>> = tx
+            .query_row(
+                "SELECT CASE WHEN failed_rank IS NULL THEN NULL
+                             ELSE COALESCE(failure_code,'group_member_failed') END
+                   FROM group_plans
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+                params![deployment_id, instance_index, generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(code.flatten())
+    }
+
+    /// ADR 0028 §12 (decided 2026-10-06): record the wake canary's reference
+    /// for the active plan at `generation`, once. Returns whether this call
+    /// recorded it: an earlier reference is kept (`false`), and a plan that
+    /// is not active records nothing (`Conflict`).
+    pub fn record_canary_reference(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        reference: &StoredCanary,
+    ) -> Result<bool, GroupStoreError> {
+        if reference.tokens.is_empty() {
+            return Err(GroupStoreError::Plan);
+        }
+        let raw = serde_json::to_string(reference).map_err(|_| GroupStoreError::Plan)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_plans
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND state='active')",
+            params![deployment_id, instance_index, generation],
+            |r| r.get(0),
+        )?;
+        if !active {
+            return Err(GroupStoreError::Conflict);
+        }
+        let recorded = tx.execute(
+            "UPDATE group_plans SET canary_json=?4
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND canary_json IS NULL",
+            params![deployment_id, instance_index, generation, raw],
+        )? == 1;
+        tx.commit()?;
+        Ok(recorded)
+    }
+
+    /// The wake canary's reference recorded for the plan at `generation`.
+    pub fn canary_reference(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<Option<StoredCanary>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let raw: Option<Option<String>> = tx
+            .query_row(
+                "SELECT canary_json FROM group_plans
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+                params![deployment_id, instance_index, generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        raw.flatten()
+            .map(|raw| serde_json::from_str(&raw).map_err(|_| corrupt()))
+            .transpose()
     }
 
     /// SPEC §17, ADR 0028 §16: name `code` (`group_member_uncertain` while a
