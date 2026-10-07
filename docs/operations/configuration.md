@@ -171,6 +171,16 @@ A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other
 change needs a restart.
 
+## Multi-node groups
+
+| Setting | YAML | Flag | Variable | Default | Roles |
+|---|---|---|---|---|---|
+| Request-stall timeout: a request to a multi-node group with no first token within it makes the server probe the group's head once, and stop the group (`group_stalled`) if the probe fails too | `groups.stall_timeout` (server); `server.groups.stall_timeout` (standalone) | `--group-stall-timeout <duration>` (`start server`) | `CAPYCTL_GROUP_STALL_TIMEOUT` | `120s` (`1s` to `3600s`) | server, standalone |
+
+An idle group is never probed: only a request in flight can start the probe,
+and requests to single-host deployments are not watched. Standalone never runs
+a group, so its value has no effect there.
+
 ## Secrets
 
 A secret is never a command-line flag: flags are visible to every user in the
@@ -364,6 +374,7 @@ host.resource_policy.memory.system.managed_limit   auto                         
 host.resource_policy.memory.system.parked_limit    auto                                yaml
 host.state_dir                                     /home/me/.local/state/capyctl/host     yaml
 name                                               local                               yaml
+server.groups.stall_timeout                        120s                                default
 server.listeners.inference.authentication          api_key                             yaml
 server.listeners.inference.bind                    0.0.0.0:8443                        yaml
 server.listeners.management.authentication         admin_token                         yaml

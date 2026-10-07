@@ -125,6 +125,7 @@ impl Authority {
             host_unresponsive: false,
             engine_exited: false,
             load: None,
+            group: false,
         };
         Arc::new(Self {
             instances: Mutex::new(vec![instance(0, 5, "host-a"), instance(1, 6, "host-b")]),

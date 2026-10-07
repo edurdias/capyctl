@@ -25,6 +25,8 @@ pub mod group_residency;
 pub mod group_settlement;
 // ADR 0028 §6: a group's weights on every host and cross-host digest agreement.
 pub mod group_sources;
+// ADR 0028 §11 (decided 2026-10-06): a stalled group request probes the head once.
+pub mod group_stall;
 // ADR 0008: the embedded host's installation fingerprint and drift.
 pub mod engine_provider;
 pub mod fault;

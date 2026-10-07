@@ -498,6 +498,16 @@ impl Scheduler {
         {
             shared.changed.notify_waiters();
         }
+        // ADR 0028 §11 (decided 2026-10-06): a stalled group whose head probe
+        // failed owes a group stop; one not accepted yet is retried every
+        // pass, its dispatch closed and every member charged meanwhile.
+        if shared.groups.is_some()
+            && super::retry_group_stall_stops(&shared)
+                .await
+                .map_err(failed)?
+        {
+            shared.changed.notify_waiters();
+        }
         // Owner decision 2026-09-22: a drain Stop that expired, never armed,
         // while its host was offline is closed as expired and issued afresh
         // once the host is back. ADR 0015: that closes a planned cleanup, so it

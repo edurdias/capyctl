@@ -1636,6 +1636,7 @@ async fn start_standalone_in(
         management_bind,
         inference_auth,
         stated_host,
+        group_stall_timeout,
     ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
@@ -1702,6 +1703,15 @@ async fn start_standalone_in(
             // Owner decision 2026-09-25: `host.model_store` and
             // `host.model_sources`, validated by `check_honoured` above.
             document["host"].clone(),
+            // ADR 0028 §11 (decided 2026-10-06), owner rule (standalone is a
+            // server and one host): `server.groups.stall_timeout` and
+            // CAPYCTL_GROUP_STALL_TIMEOUT are honoured as on a server (a
+            // malformed or zero value refuses the start); standalone never
+            // runs a group, so no request of it is watched.
+            capyctl_config::remote_roles::server_groups(&document["server"])
+                .and_then(|groups| groups.with_overrides(None, &|name| std::env::var(name).ok()))
+                .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?
+                .stall_timeout,
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
@@ -2116,8 +2126,11 @@ async fn start_standalone_in(
         .merge(hosts_view)
         .merge(latency_view)
         .merge(inference_listener_view);
-    let controller =
-        Arc::new(CoordinatorLifecycle::new(coordinator.commands()).with_switcher(switcher.clone()));
+    let controller = Arc::new(
+        CoordinatorLifecycle::new(coordinator.commands())
+            .with_switcher(switcher.clone())
+            .with_group_stall_timeout(group_stall_timeout),
+    );
     let deps = capyctl_router::RouterDeps {
         controller: controller.clone(),
         // Spec §3: a leased port and a per-launch key belong to one launch, so the

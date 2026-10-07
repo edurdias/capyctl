@@ -78,6 +78,10 @@ pub struct ServingInstance {
     /// The latest fresh load sample reported for exactly this instance by the
     /// host that serves it, if any (W8). Absent is unknown load, never zero.
     pub load: Option<crate::load_table::LoadView>,
+    /// ADR 0028 §9, §11: this incarnation is a multi-node group served at its
+    /// head; the router watches each request it forwards here for its first
+    /// token ([`LifecyclePort::report_group_stall`]).
+    pub group: bool,
 }
 
 #[async_trait]
@@ -234,6 +238,24 @@ pub trait LifecyclePort: Send + Sync {
         let op = self.auto_activate(deployment).await?;
         self.wait_terminal(&op).await.map(|_| ())
     }
+
+    /// ADR 0028 §11 (decided 2026-10-06): how long a request forwarded to a
+    /// group's head may go without a first token before the router reports
+    /// it (`groups.stall_timeout`, 120 s unless the server states another).
+    fn group_stall_timeout(&self) -> std::time::Duration {
+        capyctl_config::remote_roles::DEFAULT_GROUP_STALL_TIMEOUT
+    }
+
+    /// ADR 0028 §11 (decided 2026-10-06): the boundary between the router and
+    /// the controller. The router calls it once for a request forwarded to
+    /// the head of group `instance` of `deployment_id` at `generation` that
+    /// got no first token within [`Self::group_stall_timeout`]; never for a
+    /// single-host instance, and never with no request in flight. The
+    /// authority probes that generation's head once and stops the group if
+    /// the probe fails too; a report for a generation that is no longer
+    /// current is ignored. The default is an authority without groups, which
+    /// has nothing to probe.
+    async fn report_group_stall(&self, _deployment_id: &str, _instance: u32, _generation: i64) {}
 }
 
 #[async_trait]

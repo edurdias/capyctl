@@ -268,6 +268,9 @@ struct Shared {
     /// ADR 0028 §8: the transport a group activation reaches its member
     /// hosts through; `None` where no host is enrolled (standalone).
     groups: Option<Arc<dyn crate::group_activation::GroupHosts>>,
+    /// ADR 0028 §11 (decided 2026-10-06): the request-stall probes running
+    /// now, one per group generation, which concurrent reports share.
+    stalls: crate::group_stall::StallChecks,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
 }
@@ -428,6 +431,41 @@ impl CoordinatorCommands {
     /// Verify composition uses the worker's exact owned Store and session.
     pub fn shares_state(&self, state: &SharedCoordinatorState) -> bool {
         Arc::ptr_eq(&self.shared.owner, state)
+    }
+
+    /// ADR 0028 §8, §11: what a group's head probe and group stop need from
+    /// this coordinator; `None` where no host is enrolled (standalone).
+    pub(crate) fn group_ctx(&self) -> Option<crate::group_activation::GroupCtx> {
+        let hosts = self.shared.groups.clone()?;
+        Some(crate::group_activation::GroupCtx {
+            owner: self.shared.owner.clone(),
+            hosts,
+            observations: self.shared.observations.clone(),
+            clock: self.shared.clock.clone(),
+        })
+    }
+
+    /// ADR 0028 §11 (decided 2026-10-06): the request-stall probes running
+    /// now, which concurrent reports for one group generation share.
+    pub(crate) fn stall_checks(&self) -> &crate::group_stall::StallChecks {
+        &self.shared.stalls
+    }
+
+    /// ADR 0028 §11: the group at `generation` stalled and failed its head
+    /// probe: its dispatch closes and `group_stalled` is recorded
+    /// ([`capyctl_store::Store::record_group_stall`]). `Ok(false)` when that
+    /// generation is no longer the instance's current Ready group.
+    pub(crate) fn record_group_stall(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<bool, String> {
+        let owner = self.owner_for_read().map_err(|error| error.to_string())?;
+        owner
+            .store()
+            .record_group_stall(owner.session(), deployment_id, instance_index, generation)
+            .map_err(|error| error.to_string())
     }
 
     /// Commit Stop using a service-resolved generation. History is observation only.
@@ -1594,6 +1632,7 @@ impl OwnedCoordinator {
             cancel_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             options,
             groups,
+            stalls: Default::default(),
         });
         let (stop, stop_rx) = watch::channel(false);
         let (status_tx, status) = watch::channel(WorkerStatus::Running);
@@ -2960,6 +2999,31 @@ async fn retry_group_residency_stops(shared: &Arc<Shared>) -> Result<bool, Coord
     Ok(tokio::task::spawn_blocking(move || {
         owed.iter()
             .filter(|owed| accept_group_residency_stop(&commands, owed).is_ok())
+            .count()
+            > 0
+    })
+    .await
+    .unwrap_or(false))
+}
+
+/// ADR 0028 §11 (decided 2026-10-06; R42 pattern): one scheduler pass's retry
+/// of every stop a stalled group still owes, read from the store (so a
+/// controller restart retries it too). Until one is accepted the group's
+/// dispatch stays closed under its recorded reason and every member stays
+/// charged. Returns whether any stop was accepted.
+async fn retry_group_stall_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    let owed = shared
+        .read(|owner, _| owner.store().group_stall_stops_due(owner.session()))
+        .await?;
+    if owed.is_empty() {
+        return Ok(false);
+    }
+    let commands = CoordinatorCommands {
+        shared: shared.clone(),
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        owed.iter()
+            .filter(|owed| crate::group_stall::accept_stall_stop(&commands, owed).is_ok())
             .count()
             > 0
     })

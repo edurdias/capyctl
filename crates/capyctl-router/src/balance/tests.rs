@@ -13,6 +13,7 @@ fn instance(index: u32, generation: i64, host: &str) -> ServingInstance {
         host_unresponsive: false,
         engine_exited: false,
         load: None,
+        group: false,
     }
 }
 

@@ -274,10 +274,14 @@ pub async fn dispatch_timed(
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
             let mut observer = crate::stream::ProgressOnly(progress.clone());
+            // ADR 0028 §11: a request to a group's head is watched for its
+            // first token; the watch holds nothing of the response.
+            let stall = attempt.stall.take();
             let bounded = crate::stream::bounded(
                 attempt.forward.forward_chat_observed(&body, &mut observer),
                 &progress,
                 &bounds,
+                stall,
             )
             .await;
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which

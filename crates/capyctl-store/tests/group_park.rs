@@ -1,4 +1,5 @@
-//! ADR 0028 §12: a multi-node group's park and wake bookkeeping, durably.
+//! ADR 0028 §12: a multi-node group's park and wake bookkeeping, durably
+//! (and §11's record of a stalled group, on the same Ready group).
 //!
 //! Each test brings a TP 2 group over host A (head) and host B to Ready
 //! through the store alone (accept the start, reserve every member, arm,
@@ -775,5 +776,90 @@ fn the_first_canary_reference_is_kept() {
             .canary_reference(&g.fence.deployment_id, 0, g.generation)
             .unwrap(),
         Some(first)
+    );
+}
+
+// T31 T32 (ADR 0028 §11, decided 2026-10-06; R42 pattern): a stalled group's
+// failure is recorded once, in one transaction: dispatch closes with a
+// recorded reason, `group_stalled` is kept at rank 0 and named in status,
+// every member keeps its full charge, and its stop is owed until one is
+// accepted. A report for another generation, or for a group already
+// failing, names nothing and records nothing.
+#[test]
+fn a_stalled_group_is_recorded_failed_once_with_every_charge_kept() {
+    use capyctl_store::ordinary_lifecycle::group_stall::GroupStallStop;
+    let w = world([16, 16]);
+    let g = w.ready("g", T0, 8100);
+    let id = g.fence.deployment_id.clone();
+    let serving = w.store.serving_instances(&id).unwrap();
+    assert!(serving.len() == 1 && serving[0].group, "{serving:?}");
+    assert_eq!(
+        w.store.stalled_group(&id, 0, g.generation + 1).unwrap(),
+        None
+    );
+    let stalled = w
+        .store
+        .stalled_group(&id, 0, g.generation)
+        .unwrap()
+        .expect("the instance's current Ready group");
+    assert_eq!(stalled.plan.generation(), g.generation);
+    assert_eq!(stalled.revision, g.fence.revision);
+    assert!(!w
+        .store
+        .record_group_stall(&w.session, &id, 0, g.generation + 1)
+        .unwrap());
+    assert!(w
+        .store
+        .group_stall_stops_due(&w.session)
+        .unwrap()
+        .is_empty());
+    assert_eq!(w.instance(&id), ("ready".into(), true));
+    assert!(w
+        .store
+        .record_group_stall(&w.session, &id, 0, g.generation)
+        .unwrap());
+    assert_eq!((w.charged(&g, 0), w.charged(&g, 1)), (READY, READY));
+    assert_eq!(w.instance(&id), ("ready".into(), false));
+    let closed: bool = w
+        .sql
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_closures WHERE deployment_id=?1 AND instance_index=0 AND generation=?2)",
+            rusqlite::params![id, g.generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(closed, "no re-proof or switch reopens a stalled group");
+    assert_eq!(
+        w.store.group_failure(&id, 0, g.generation).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        w.store
+            .group_failure_code(&id, 0, g.generation)
+            .unwrap()
+            .as_deref(),
+        Some("group_stalled")
+    );
+    let last_error: Option<String> = w
+        .sql
+        .query_row(
+            "SELECT last_error FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_error.as_deref(), Some("group_stalled"));
+    assert_eq!(w.store.stalled_group(&id, 0, g.generation).unwrap(), None);
+    assert!(!w
+        .store
+        .record_group_stall(&w.session, &id, 0, g.generation)
+        .unwrap());
+    assert_eq!(
+        w.store.group_stall_stops_due(&w.session).unwrap(),
+        vec![GroupStallStop {
+            deployment_id: id.clone(),
+            instance_index: 0,
+            generation: g.generation,
+        }]
     );
 }

@@ -29,6 +29,18 @@ pub fn flag_layer(invocation: &Invocation) -> NamedLayer {
             .management_listen
             .map(|address| address.to_string()),
         state_dir: invocation.state_dir.clone(),
+        // ADR 0028 §11: in its YAML form, whole seconds as `<n>s`.
+        group_stall_timeout: invocation.group_stall_timeout.map(duration_text),
+    }
+}
+
+/// A duration as a YAML value states it: `<n>s` in whole seconds, else
+/// `<n>ms`.
+fn duration_text(duration: std::time::Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
     }
 }
 
@@ -45,6 +57,16 @@ pub fn env_layer() -> Result<NamedLayer, ConfigError> {
         management_bind: env(crate::roles::MANAGEMENT_ADDR_ENV)
             .or_else(|| env(crate::roles::DEPRECATED_MANAGEMENT_ADDR_ENV)),
         state_dir: env(STATE_DIR_ENV).map(PathBuf::from),
+        // ADR 0028 §11: a malformed value is refused with the variable's name.
+        group_stall_timeout: env(capyctl_config::remote_roles::GROUP_STALL_TIMEOUT_ENV)
+            .map(|value| {
+                capyctl_config::remote_roles::group_stall_timeout_value(
+                    capyctl_config::remote_roles::GROUP_STALL_TIMEOUT_ENV,
+                    &value,
+                )
+                .map(|_| value)
+            })
+            .transpose()?,
     })
 }
 

@@ -36,6 +36,9 @@ pub struct ServerConfig {
     /// SPEC §17 (M80): `observability.timing_header`, whether the router adds
     /// the `x-capyctl-timing` header to inference responses. Off by default.
     pub timing_header: bool,
+    /// ADR 0028 §11 (decided 2026-10-06): `groups`, the server's multi-node
+    /// group settings.
+    pub groups: ServerGroups,
 }
 /// SPEC §17 (M80): `observability.timing_header` of a server (or a standalone
 /// document's `server:` block). Omitted, off; anything but a boolean is refused.
@@ -84,6 +87,91 @@ pub fn switch_drain_timeout(document: &Value) -> Result<Duration, ConfigError> {
                     "must be a duration from 1s to 600s",
                 )
             }),
+    }
+}
+/// ADR 0028 §11 (decided 2026-10-06): the server's multi-node group
+/// settings, `groups` in a server document (`server.groups` in a standalone
+/// one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerGroups {
+    /// `groups.stall_timeout`: how long a request forwarded to a group's head
+    /// may go without a first token before the server probes the head once.
+    pub stall_timeout: Duration,
+}
+impl Default for ServerGroups {
+    fn default() -> Self {
+        Self {
+            stall_timeout: DEFAULT_GROUP_STALL_TIMEOUT,
+        }
+    }
+}
+/// ADR 0028 §11 (decided 2026-10-06): the stall timeout when nothing states
+/// one.
+pub const DEFAULT_GROUP_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounds on the stall timeout: never zero, which would probe a group for
+/// every request, and at most an hour.
+pub const MIN_GROUP_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_GROUP_STALL_TIMEOUT: Duration = Duration::from_secs(3600);
+/// ADR 0028 §11: the stall timeout's named flag (`capyctl start server`).
+pub const GROUP_STALL_TIMEOUT_FLAG: &str = "--group-stall-timeout";
+/// ADR 0028 §11: the stall timeout's named variable.
+pub const GROUP_STALL_TIMEOUT_ENV: &str = "CAPYCTL_GROUP_STALL_TIMEOUT";
+/// ADR 0028 §11: a stall timeout stated as `text` by `name` (its YAML path,
+/// flag or variable, which a refusal names). A value outside 1 s to 3600 s,
+/// zero included, or one that is not a duration is refused, never read as
+/// the default.
+pub fn group_stall_timeout_value(name: &str, text: &str) -> Result<Duration, ConfigError> {
+    crate::effective::parse_duration_ms(text)
+        .ok()
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(Duration::from_millis)
+        .filter(|timeout| (MIN_GROUP_STALL_TIMEOUT..=MAX_GROUP_STALL_TIMEOUT).contains(timeout))
+        .ok_or_else(|| {
+            ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                name,
+                "must be a duration from 1s to 3600s",
+            )
+        })
+}
+/// ADR 0028 §11: `groups` of a server document (or of a standalone
+/// document's `server:` block). Omitted, the stall timeout is 120 s.
+pub fn server_groups(document: &Value) -> Result<ServerGroups, ConfigError> {
+    const PATH: &str = "groups.stall_timeout";
+    match document.get("groups").and_then(|g| g.get("stall_timeout")) {
+        None => Ok(ServerGroups::default()),
+        Some(value) => {
+            let text = value.as_str().ok_or_else(|| {
+                ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    PATH,
+                    "must be a duration from 1s to 3600s",
+                )
+            })?;
+            Ok(ServerGroups {
+                stall_timeout: group_stall_timeout_value(PATH, text)?,
+            })
+        }
+    }
+}
+impl ServerGroups {
+    /// ADR 0028 §11, owner rule (every setting three ways): the run's
+    /// `--group-stall-timeout` (`flag`, already read) wins over
+    /// `CAPYCTL_GROUP_STALL_TIMEOUT` (read through `env`; empty is unset),
+    /// which wins over the document.
+    pub fn with_overrides(
+        self,
+        flag: Option<Duration>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let stated = match flag {
+            Some(flag) => Some(flag),
+            None => env(GROUP_STALL_TIMEOUT_ENV)
+                .filter(|value| !value.is_empty())
+                .map(|value| group_stall_timeout_value(GROUP_STALL_TIMEOUT_ENV, &value))
+                .transpose()?,
+        };
+        Ok(stated.map_or(self, |stall_timeout| Self { stall_timeout }))
     }
 }
 /// Owner decision 2026-09-23: server and host agent exchange heartbeats every
@@ -405,7 +493,18 @@ impl ServerConfig {
             heartbeat: heartbeat_timeouts(&v)?,
             switch_drain_timeout: switch_drain_timeout(&v)?,
             timing_header: timing_header(&v)?,
+            groups: server_groups(&v)?,
         })
+    }
+    /// ADR 0028 §11: the stall timeout this run uses, `flag` > the variable
+    /// read through `env` > the document ([`ServerGroups::with_overrides`]).
+    pub fn with_group_stall_timeout(
+        mut self,
+        flag: Option<Duration>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        self.groups = self.groups.with_overrides(flag, env)?;
+        Ok(self)
     }
     /// Design §9: `--listen` replaces the inference bind for one run. The
     /// address follows the document's rule

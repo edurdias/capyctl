@@ -515,7 +515,8 @@ pub(crate) fn migrate_v42(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 /// Schema v43 data step (ADR 0028 §12). Idempotent: each column is added only
 /// when missing. `canary_json` is the wake canary's reference recorded at the
 /// plan's first readiness; `failure_code` names why a failed group failed
-/// when it is not a member's own failure (a wake whose canary differed).
+/// when it is not a member's own failure (a wake whose canary differed, or a
+/// stalled request whose head probe failed, ADR 0028 §11).
 pub(crate) fn migrate_v43(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     if !has_column(tx, "group_plans", "canary_json")? {
         tx.execute_batch("ALTER TABLE group_plans ADD COLUMN canary_json TEXT;")?;
@@ -523,7 +524,7 @@ pub(crate) fn migrate_v43(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     if !has_column(tx, "group_plans", "failure_code")? {
         tx.execute_batch(
             "ALTER TABLE group_plans ADD COLUMN failure_code TEXT
-               CHECK(failure_code IS NULL OR failure_code IN ('group_member_failed','group_wake_mismatch'));",
+               CHECK(failure_code IS NULL OR failure_code IN ('group_member_failed','group_wake_mismatch','group_stalled'));",
         )?;
     }
     Ok(())
@@ -540,7 +541,11 @@ pub struct StoredCanary {
 }
 
 /// The closed codes a group failure may name in status (spec §16).
-const FAILURE_CODES: [&str; 2] = ["group_member_failed", "group_wake_mismatch"];
+const FAILURE_CODES: [&str; 3] = [
+    "group_member_failed",
+    "group_wake_mismatch",
+    "group_stalled",
+];
 
 /// ADR 0028 §9, §11: a group head's binding with the plan it realizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,7 +642,7 @@ pub(crate) fn record_failure(
 
 /// As [`record_failure`], naming `code` (one of [`FAILURE_CODES`]): the first
 /// failure keeps both its rank and its code.
-fn record_failure_code(
+pub(crate) fn record_failure_code(
     tx: &Transaction<'_>,
     deployment_id: &str,
     instance_index: u32,
@@ -1341,8 +1346,9 @@ impl crate::Store {
     }
 
     /// ADR 0028 §12: as [`Self::record_group_failure`], naming `code`
-    /// (`group_member_failed` or `group_wake_mismatch`) as the failure's
-    /// closed code. The first failure keeps its rank and its code.
+    /// (`group_member_failed`, `group_wake_mismatch` or `group_stalled`) as
+    /// the failure's closed code. The first failure keeps its rank and its
+    /// code.
     pub fn record_group_failure_code(
         &self,
         deployment_id: &str,

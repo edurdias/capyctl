@@ -115,6 +115,9 @@ pub struct Scored {
     pub engine: Option<EngineGauges>,
     pub sample_age_ms: Option<i64>,
     pub score: u64,
+    /// ADR 0028 §11: a multi-node group's head; its requests are watched
+    /// for their first token.
+    pub group: bool,
 }
 
 impl Scored {
@@ -195,6 +198,7 @@ pub fn rank(
             engine,
             sample_age_ms: load.map(|(_, age)| age),
             score: score(router_in_flight, engine),
+            group: instance.group,
         });
     }
     ranking.order.sort_by_key(|c| (c.score, c.instance_index));
@@ -317,6 +321,8 @@ pub struct Attempt {
     pub generation: Option<i64>,
     /// SPEC §17: the chosen instance's index, for its timings.
     pub instance: Option<u32>,
+    /// ADR 0028 §11: the first-token watch, for a group's head only.
+    pub(crate) stall: Option<crate::stream::StallWatch>,
     _slot: Option<InstanceSlot>,
 }
 
@@ -331,6 +337,7 @@ impl Attempt {
             lease,
             generation: None,
             instance: None,
+            stall: None,
             _slot: None,
         }
     }
@@ -447,6 +454,7 @@ impl Plan {
                     lease: lease.map(|lease| (deps.controller.clone(), lease)),
                     generation: None,
                     instance: None,
+                    stall: None,
                     _slot: None,
                 })
             }
@@ -509,13 +517,24 @@ impl Plan {
                         .forwarder_for(&deployment, candidate.generation)
                     {
                         Ok(forward) => {
+                            // ADR 0028 §11 (decided 2026-10-06): a request to a
+                            // group's head is watched for its first token; a
+                            // single-host instance's never is.
+                            let stall = candidate.group.then(|| crate::stream::StallWatch {
+                                authority: deps.controller.clone(),
+                                deployment: deployment.clone(),
+                                instance: candidate.instance_index,
+                                generation: candidate.generation,
+                                after: deps.controller.group_stall_timeout(),
+                            });
                             return Ok(Attempt {
                                 forward,
                                 lease: lease.map(|lease| (deps.controller.clone(), lease)),
                                 generation: Some(candidate.generation),
                                 instance: Some(candidate.instance_index),
+                                stall,
                                 _slot: Some(slot),
-                            })
+                            });
                         }
                         Err(error) => {
                             crate::chat::close_lease(

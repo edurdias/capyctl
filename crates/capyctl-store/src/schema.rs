@@ -948,8 +948,8 @@ pub const SCHEMA_V42: &str = "-- group member launch handles (groups::migrate_v4
 
 /// v43 (ADR 0028 §12): each group plan's wake canary reference, recorded at
 /// its first readiness, and the closed code a failed group names when it is
-/// not a member's own failure (`group_wake_mismatch`). The columns are added
-/// by `groups::migrate_v43` only when missing.
+/// not a member's own failure (`group_wake_mismatch`, `group_stalled`). The
+/// columns are added by `groups::migrate_v43` only when missing.
 pub const SCHEMA_V43: &str = "-- group canary references (groups::migrate_v43)";
 
 #[cfg(test)]

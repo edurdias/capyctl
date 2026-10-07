@@ -688,6 +688,13 @@ const NAMED_FORMS: &[(&str, Scope, &str, &str)] = &[
         "CAPYCTL_MANAGEMENT_ADDR",
     ),
     ("state_dir", Scope::Role, "--state-dir", "CAPYCTL_STATE_DIR"),
+    // ADR 0028 §11 (decided 2026-10-06): the group request-stall timeout.
+    (
+        "groups.stall_timeout",
+        Scope::Server,
+        crate::remote_roles::GROUP_STALL_TIMEOUT_FLAG,
+        crate::remote_roles::GROUP_STALL_TIMEOUT_ENV,
+    ),
 ];
 
 /// The full path of a named setting in a `kind` document, or `None` when
@@ -728,6 +735,9 @@ pub struct NamedLayer {
     /// `--state-dir` / `CAPYCTL_STATE_DIR` (the state root; a server's or
     /// host's own state directory).
     pub state_dir: Option<std::path::PathBuf>,
+    /// ADR 0028 §11: `--group-stall-timeout` / `CAPYCTL_GROUP_STALL_TIMEOUT`
+    /// (server).
+    pub group_stall_timeout: Option<String>,
 }
 
 impl NamedLayer {
@@ -825,6 +835,10 @@ impl NamedLayer {
                 self.management_bind.clone().map(Value::String),
             ),
             ("state_dir", path_text(&self.state_dir)),
+            (
+                "groups.stall_timeout",
+                self.group_stall_timeout.clone().map(Value::String),
+            ),
         ];
         stated
             .into_iter()
@@ -857,8 +871,9 @@ pub fn defaults(
     state_root: &std::path::Path,
 ) -> Vec<(String, Value)> {
     use crate::remote_roles::{
-        DEFAULT_DRAIN_TIMEOUT, DEFAULT_HEARTBEAT_LOST_AFTER, DEFAULT_HEARTBEAT_SUSPEND_AFTER,
-        DEFAULT_LOAD_REPORT_INTERVAL, DEFAULT_SWITCH_DRAIN_TIMEOUT,
+        DEFAULT_DRAIN_TIMEOUT, DEFAULT_GROUP_STALL_TIMEOUT, DEFAULT_HEARTBEAT_LOST_AFTER,
+        DEFAULT_HEARTBEAT_SUSPEND_AFTER, DEFAULT_LOAD_REPORT_INTERVAL,
+        DEFAULT_SWITCH_DRAIN_TIMEOUT,
     };
     let host_block = |prefix: &str| -> Vec<(String, Value)> {
         let (start, end) = crate::engine_settings::DEFAULT_ENGINE_PORTS;
@@ -902,6 +917,8 @@ pub fn defaults(
                 secs(DEFAULT_SWITCH_DRAIN_TIMEOUT),
             ),
             ("observability.timing_header", Value::from(false)),
+            // ADR 0028 §11 (decided 2026-10-06).
+            ("groups.stall_timeout", secs(DEFAULT_GROUP_STALL_TIMEOUT)),
             (
                 "listeners.inference.bind",
                 Value::from(crate::standalone::DEFAULT_INFERENCE_BIND),
