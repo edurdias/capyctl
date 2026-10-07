@@ -125,12 +125,46 @@ pub fn default_startup_bytes(
         .map(|peak| peak.max(floor))
 }
 
-/// The per-family overhead margin a derived memory request adds.
+/// The per-family overhead margin: the floor of [`unified_margin`], and the
+/// margin of the startup placeholder ([`default_startup_bytes`]).
 pub fn overhead_margin(engine: Engine) -> i64 {
     match engine {
         Engine::Vllm => VLLM_OVERHEAD_MARGIN_BYTES,
         Engine::Sglang => SGLANG_OVERHEAD_MARGIN_BYTES,
         Engine::Tensorfold => TENSORFOLD_OVERHEAD_MARGIN_BYTES,
+    }
+}
+
+/// ADR 0014 amendment A18 (owner decision 2026-10-07): the percent of the
+/// weights the margin on unified memory carries beside the engine's
+/// CPU-side memory. Found live on GB10 with vLLM 0.30.0 and gpt-oss-120b
+/// (60.77 GiB of weights, an 8 GiB KV cache): the engine held 7.3 GiB of
+/// GPU memory beyond the weights and the KV cache (12 % of the weights)
+/// and 5.2 GiB on the CPU side; the 8 GiB family margin left the Ready
+/// charge 3.3 GiB short of the 81.3 GiB in use.
+pub const UNIFIED_MARGIN_WEIGHTS_PERCENT: i64 = 15;
+
+/// ADR 0014 amendment A18: the CPU-side term of the margin on unified
+/// memory, the host RAM a discrete host is charged for the same engine
+/// process ([`ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES`], discrete GPU design
+/// §3). On unified memory both come out of the one pool the request holds.
+pub const UNIFIED_MARGIN_HOST_BYTES: i64 = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+
+/// ADR 0014 amendment A18: the margin a memory request on unified memory
+/// holds beside the weights and the KV cache, declared or derived:
+/// `max(family margin, weights x 0.15 + 4 GiB)`. The family margin (8 GiB)
+/// is what the GB10 recipes measured for checkpoints up to 22 GiB and stays
+/// the floor, so the term only grows the margin above 26.7 GiB of weights.
+/// Unknown weights keep the floor; TensorFold, which declares its
+/// resources, keeps none.
+pub fn unified_margin(engine: Engine, weights: Option<i64>) -> i64 {
+    let floor = overhead_margin(engine);
+    match weights {
+        Some(weights) if floor > 0 => (weights / 100)
+            .saturating_mul(UNIFIED_MARGIN_WEIGHTS_PERCENT)
+            .saturating_add(UNIFIED_MARGIN_HOST_BYTES)
+            .max(floor),
+        _ => floor,
     }
 }
 
@@ -162,11 +196,13 @@ pub struct CheckpointFacts {
     /// re-resolves exactly as it was, without it. Never set for a new
     /// resolution.
     pub legacy_startup_graphs: bool,
-    /// ADR 0019 §3 (2026-10-03): a snapshot that records the engine family's
-    /// margin was sized before a request declared for a discrete GPU took the
-    /// device margin (weights x 0.10); it re-resolves exactly as it was. Never
-    /// set for a new resolution.
-    pub legacy_device_margin: bool,
+    /// A snapshot that records the engine family's margin (8 GiB) re-resolves
+    /// with it, exactly as it was: beside a request declared for a discrete
+    /// GPU it was sized before the device margin (weights x 0.10, ADR 0019 §3,
+    /// 2026-10-03), and on unified memory before the margin grew with the
+    /// weights (ADR 0014 amendment A18, 2026-10-07). Never set for a new
+    /// resolution.
+    pub legacy_family_margin: bool,
     /// ADR 0014 amendment A13: a snapshot frozen while CapyCTL turned SGLang's
     /// CUDA graphs off beside the memory saver records that default; it
     /// re-resolves exactly as it was. Never set for a new resolution.
@@ -352,7 +388,7 @@ fn sglang_state_reserve(
                 crate::context_fit::derived_request_bytes(
                     weights,
                     kv,
-                    overhead_margin(Engine::Sglang),
+                    host_margin(inputs),
                     state,
                     false,
                 )
@@ -364,6 +400,17 @@ fn sglang_state_reserve(
     };
     crate::context_fit::derived_state_reserve(slot, &args, declared_running, fits)
         .and_then(|bytes| i64::try_from(bytes).ok())
+}
+
+/// ADR 0014 amendment A18: the margin of a request on memory that is not a
+/// discrete GPU's ([`unified_margin`]); a snapshot that records the family
+/// margin keeps it.
+fn host_margin(inputs: &EngineInputs<'_>) -> i64 {
+    if inputs.facts.legacy_family_margin {
+        overhead_margin(inputs.engine)
+    } else {
+        unified_margin(inputs.engine, inputs.facts.weights_bytes)
+    }
 }
 
 /// Design §3: a device request is `weights x 1.10 + kv`, and vLLM's at least
@@ -1199,17 +1246,25 @@ pub(super) fn normalize_engine_config(
     // family margin and re-resolves as it was.
     let declared_device_margin = match (inputs.device, declared_request, inputs.facts.weights_bytes)
     {
-        (Some(_), Some(_), Some(weights)) if !inputs.facts.legacy_device_margin => {
+        (Some(_), Some(_), Some(weights)) if !inputs.facts.legacy_family_margin => {
             Some(weights / 100 * 10)
         }
         _ => None,
+    };
+    // ADR 0014 amendment A18 (owner decision 2026-10-07): on unified memory
+    // the margin holds the engine's CPU-side memory as well as its GPU memory
+    // beyond the weights and the KV cache, and grows with the weights.
+    let margin = match (declared_device_margin, inputs.device) {
+        (Some(margin), _) => margin,
+        (None, Some(_)) => overhead_margin(engine),
+        (None, None) => host_margin(&inputs),
     };
     let (mut memory, memory_provenance) = resolve_memory(MemoryInputs {
         request: device_request.or(declared_request),
         kv_cache,
         declared_ready_total: inputs.declared_ready_total,
         weights: inputs.facts.weights_bytes,
-        margin: declared_device_margin.unwrap_or_else(|| overhead_margin(engine)),
+        margin,
     })?;
     if engine == Engine::Sglang {
         memory.state_slot_bytes = inputs.facts.state_slot_bytes;

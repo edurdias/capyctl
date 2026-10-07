@@ -51,6 +51,17 @@ Unreleased.
   refused at start. `auto`, or leaving it out, keeps the quarter and the
   stored policy unchanged. See
   [configuration](configuration.md#standalone-parked-limit).
+- **Large models on unified memory keep a larger margin.** Beside the weights
+  and the KV cache, a memory request on a unified-memory machine such as a
+  GB10 keeps a margin for the engine's own memory: still 8 GiB, or the
+  weights x 0.15 plus 4 GiB when that is more (above 26.7 GiB of weights).
+  Measured on a GB10, every model up to 22 GiB of weights fitted in the
+  8 GiB, so those deployments are unchanged; gpt-oss-120b on vLLM used
+  3.3 GiB more than CapyCTL reserved for it. A request CapyCTL derives for
+  such a model grows by the difference, and one you state leaves a smaller
+  KV cache. A revision deployed before keeps its sizing. Discrete GPUs are
+  unchanged.
+
 - **vLLM's loader under deep parking is a setting.** CapyCTL starts a parking
   vLLM deployment with the `eager` weight loader, as before; set
   `engine_config.vllm.safetensors_load_strategy: lazy` to map the weights

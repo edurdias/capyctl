@@ -104,7 +104,8 @@ pub struct SglangPool {
 
 /// ADR 0014 §5: SGLang's static pool and the margin left outside it. A
 /// discrete device's margin is a tenth of the weights share (discrete GPU
-/// design §3, §6); unified memory keeps the family margin. An explicit request
+/// design §3, §6); unified memory keeps the recorded margin (ADR 0014
+/// amendment A18). An explicit request
 /// smaller than KV plus margin (a declared `resources:` Ready phase) gives the
 /// static pool the declared KV cache, and never more than the whole request.
 pub fn static_pool_bytes(memory: &MemoryRequest) -> (i64, i64) {

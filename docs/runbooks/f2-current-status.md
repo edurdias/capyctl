@@ -1,5 +1,30 @@
 # Current implementation and launch status
 
+## The unified-memory margin grows with the weights — 2026-10-07 (branch `fix/unified-memory-margin`)
+
+Owner decision 4 of 2026-10-07 asked whether the flat 8 GiB margin on unified memory (a
+declared `memory.request` less the weights and 8 GiB is the KV cache; SGLang's static pool is
+the request less 8 GiB) is intended, since a discrete GPU's has been the weights × 0.10 since
+`c5ebc1a` (ADR 0019 A1). Investigation (ADR 0014 amendment A18, measured table there): on
+unified memory the margin is the only charge for the engine's CPU-side memory, which a
+discrete host charges separately (4 GiB on the system domain); the GB10 recipes measured
+3.4 to 5.4 GiB CPU-side for vLLM `restart_only` and 4.2 to 6.0 GiB for SGLang, and up to
+6.7 GiB beyond weights and KV for vLLM, so 8 GiB is justified up to 22 GiB of weights and was
+not lowered. gpt-oss-120b on vLLM (60.77 GiB of weights) held 12.5 GiB beyond weights and KV
+against the 9.25 GiB held (Ready charge 78.0 GiB, in use up to 81.3). New rule: on unified
+memory the margin of a vLLM or SGLang request, declared or derived, is
+`max(8 GiB, weights × 0.15 + 4 GiB)`; it changes nothing below 26.7 GiB of weights, so no
+catalog recipe changes; frozen revisions (recording 8 GiB) re-resolve as they were
+(`CheckpointFacts::legacy_family_margin`, which replaces `legacy_device_margin`). The SGLang
+gpt-oss-20b recipe's 32 GiB came from SGLang loading the MXFP4 weights as 17.1 GB against
+13.8 GB on disk, which is SGLang sizing's (passed to that work), not the margin's. Agreed with
+the SGLang static-fraction fix: the margin's value is this change, what SGLang counts inside
+its static pool is that one. CPU tests (T14, T26): the boundary at 28,633,115,400 bytes,
+gpt-oss-20b unchanged, gpt-oss-120b derived and declared, a frozen revision's exact decode,
+and the #68 discrete case unchanged. Not run live; the check to schedule is gpt-oss-120b on
+vLLM on a GB10 (kv 8 GiB, startup 90 GiB, 96 GiB managed limit): the Ready charge (83.1 GiB)
+should hold the ready footprint.
+
 ## vLLM loader under deep parking is a deployment setting — 2026-10-07 (branch `feat/vllm-load-strategy-setting`)
 
 Owner decision 1 of 2026-10-07 (option B), recorded as the note on ADR 0014 §3 and §4.

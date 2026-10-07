@@ -343,10 +343,12 @@ pub(super) fn declared_engine_config(
             // ADR 0014 amendment A8: a snapshot frozen before the first-start
             // graph allowance re-derives its placeholder startup without it.
             legacy_startup_graphs: memory.get("startup_graphs_bytes").is_none(),
-            // ADR 0019 §3 (2026-10-03): the family margin recorded beside a
-            // declared request on a discrete GPU is the rule before the
-            // device margin.
-            legacy_device_margin: memory.get("margin_bytes").and_then(Value::as_i64)
+            // ADR 0019 §3 (2026-10-03) and ADR 0014 amendment A18
+            // (2026-10-07): the family margin recorded beside a declared
+            // request on a discrete GPU, or on unified memory, is the rule
+            // before the device margin and the margin that grows with the
+            // weights.
+            legacy_family_margin: memory.get("margin_bytes").and_then(Value::as_i64)
                 == Some(super::engine_config::VLLM_OVERHEAD_MARGIN_BYTES),
             // ADR 0014 amendment A13: the graphs-off default beside the
             // memory saver, as frozen before it was dropped.
