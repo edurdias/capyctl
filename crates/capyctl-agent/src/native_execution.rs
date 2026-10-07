@@ -1586,7 +1586,24 @@ impl NativeHostExecution {
             Err(_) => return Err(SessionError),
         };
         match acceptance {
-            Acceptance::Replay(_) => {}
+            // ADR 0028 §9 (decided 2026-10-06, OD6): the journal keeps no
+            // token ids, so an exact resend of a completion probe (its first
+            // reply lost) runs the bounded completion again. It records
+            // nothing and moves no gate, so running it twice is harmless; a
+            // reply without tokens would read as a failed probe and tear a
+            // healthy group down.
+            Acceptance::Replay(_) => {
+                if let MemberAction::Probe {
+                    owned_handle,
+                    max_tokens: Some(max_tokens),
+                } = &command.action
+                {
+                    probe_tokens = self
+                        .complete(&command, owned_handle, *max_tokens)
+                        .await
+                        .unwrap_or_default();
+                }
+            }
             Acceptance::Fresh(ticket) => match &command.action {
                 MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
                     // SPEC §§6.1, 13.2: a launch that fails (an engine that
