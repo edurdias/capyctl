@@ -86,3 +86,53 @@ fn other_structured_codes_are_documented_with_their_exit_code() {
         assert_eq!(documented_exit(code), Some(exit), "{code}");
     }
 }
+
+// T14 (ADR 0028 §16): every group code with an exit is on the page, in its
+// documented form, with the exit the binary takes for it.
+#[test]
+fn group_codes_are_documented_with_their_exit_code() {
+    for (documented, example) in [
+        ("group_placement_required", "group_placement_required"),
+        ("group_topology_invalid", "group_topology_invalid"),
+        ("group_profile_mismatch", "group_profile_mismatch"),
+        ("group_checkpoint_mismatch", "group_checkpoint_mismatch"),
+        ("group_model_path_mismatch", "group_model_path_mismatch"),
+        ("peer_address_missing", "peer_address_missing"),
+        ("peer_address_not_local", "peer_address_not_local"),
+        (
+            "engine_env_reserved:<name>",
+            "engine_env_reserved:NCCL_DEBUG",
+        ),
+        (
+            "engine_env_not_approved:<name>",
+            "engine_env_not_approved:X",
+        ),
+        ("engine_env_conflict:<name>", "engine_env_conflict:X"),
+        ("rendezvous_ports_exhausted", "rendezvous_ports_exhausted"),
+        (
+            "rendezvous_port_in_use:<port>",
+            "rendezvous_port_in_use:25000",
+        ),
+        ("service_port_in_use:<port>", "service_port_in_use:8100"),
+        ("host_tuning_missing:<item>", "host_tuning_missing:memlock"),
+        ("group_shape_unsupported", "group_shape_unsupported"),
+        (
+            "group_shape_unsupported:<engine>",
+            "group_shape_unsupported:tensorfold",
+        ),
+        ("group_instances_unsupported", "group_instances_unsupported"),
+        ("group_drift:<field>", "group_drift:node_rank"),
+        (
+            "host_capability_missing:engine_groups",
+            "host_capability_missing:engine_groups",
+        ),
+    ] {
+        let exit = StructuredError {
+            code: "invalid_config",
+            message: format!("{example}: detail"),
+        }
+        .exit_code()
+        .0;
+        assert_eq!(documented_exit(documented), Some(exit), "{documented}");
+    }
+}

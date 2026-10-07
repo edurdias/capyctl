@@ -1,5 +1,6 @@
 //! ADR 0028 §12: a multi-node group's park and wake bookkeeping, durably
-//! (and §11's record of a stalled group, on the same Ready group).
+//! (and §11's record of a stalled group, and §15's status of the group, on
+//! the same Ready group).
 //!
 //! Each test brings a TP 2 group over host A (head) and host B to Ready
 //! through the store alone (accept the start, reserve every member, arm,
@@ -862,4 +863,154 @@ fn a_stalled_group_is_recorded_failed_once_with_every_charge_kept() {
             generation: g.generation,
         }]
     );
+}
+
+/// Instance 0 of `group` as the status snapshot serializes it.
+fn instance_status(w: &World, group: &Group) -> Value {
+    let snapshot = serde_json::to_value(w.store.snapshot().unwrap()).unwrap();
+    snapshot["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == group.fence.deployment_id)
+        .map(|d| d["instances"][0].clone())
+        .expect("the group's instance")
+}
+
+// T21 T03 (ADR 0028 §13, §15): a group instance's status comes from its
+// plan, not from a placed host (a group records none): the engine, the
+// topology, the head's rendezvous address, the unauthenticated peer
+// transport, and every member with its host, rank, role, state, recorded
+// processes, its own charge on its own host and its residency.
+#[test]
+fn a_group_status_lists_every_member_from_its_plan() {
+    let w = world([16, 16]);
+    let g = w.ready("g", T0, 8100);
+    let s = instance_status(&w, &g);
+    assert_eq!(s["host_id"], Value::Null, "{s}");
+    assert_eq!(s["engine"], "vllm", "{s}");
+    assert_eq!(
+        s["topology"],
+        json!({"tensor_parallel": 2, "pipeline_parallel": 1})
+    );
+    assert_eq!(s["rendezvous"], "192.0.2.10:25000");
+    assert_eq!(s["peer_transport"], "unauthenticated");
+    assert_eq!(s["plan_generation"], g.generation.to_string());
+    assert_eq!(
+        s["members"],
+        json!([
+            {"host": "host-a", "node_rank": 0, "role": "head", "state": "launched",
+             "processes": 2, "reservation": {"phase": "ready", "bytes": READY.to_string()},
+             "residency": "deep", "last_error": null},
+            {"host": "host-b", "node_rank": 1, "role": "worker", "state": "launched",
+             "processes": 1, "reservation": {"phase": "ready", "bytes": READY.to_string()},
+             "residency": "deep", "last_error": null},
+        ])
+    );
+}
+
+// T20 T32 (ADR 0028 §11, §12, §15; Task 8 concern): a parked group shows
+// each member parked at its own budget on its own host; a member whose host
+// is unreachable shows its host, rank and the full charge it keeps, so the
+// operator sees why capacity is held.
+#[test]
+fn a_group_status_shows_parked_and_uncertain_members_with_their_charge() {
+    let w = world([16, 16]);
+    let g = w.ready("g", T0, 8100);
+    parked(&w, &g, T0 + 10);
+    let s = instance_status(&w, &g);
+    for rank in 0..2 {
+        assert_eq!(
+            s["members"][rank]["reservation"],
+            json!({"phase": "parked", "bytes": PARKED.to_string()}),
+            "{s}"
+        );
+    }
+    let id = &g.fence.deployment_id;
+    w.store
+        .mark_member_uncertain(id, 0, g.generation, 1)
+        .unwrap();
+    let member = instance_status(&w, &g)["members"][1].clone();
+    assert_eq!(member["host"], "host-b");
+    assert_eq!(member["node_rank"], 1);
+    assert_eq!(member["state"], "uncertain");
+    assert_eq!(member["last_error"], "group_member_uncertain");
+    assert_eq!(
+        member["reservation"],
+        json!({"phase": "parked", "bytes": PARKED.to_string()})
+    );
+}
+
+// T32 T33 (ADR 0028 §11, §16): the rank a group failed at reads `failed`
+// with the recorded code (`group_member_failed`, or the group's own code at
+// rank 0 such as `group_stalled`); a member proven gone by its own host
+// holds nothing and counts no process, and the failed rank keeps showing
+// why once it settled.
+#[test]
+fn a_group_status_names_the_failed_rank_and_what_settled() {
+    let w = world([16, 16]);
+    let g = w.ready("g", T0, 8100);
+    let id = g.fence.deployment_id.clone();
+    w.store
+        .record_group_failure(&id, 0, g.generation, 1)
+        .unwrap();
+    let s = instance_status(&w, &g);
+    assert_eq!(s["last_error"], "group_member_failed");
+    assert_eq!(s["members"][1]["state"], "failed");
+    assert_eq!(s["members"][1]["last_error"], "group_member_failed");
+    assert_eq!(s["members"][0]["state"], "launched");
+    assert_eq!(s["members"][0]["last_error"], Value::Null);
+    for rank in 0..2u32 {
+        w.store
+            .settle_member(
+                &id,
+                0,
+                g.generation,
+                rank,
+                capyctl_store::groups::MemberGone {
+                    member: MemberKey {
+                        host_id: HOSTS[rank as usize].into(),
+                        member_id: member_id(rank),
+                    },
+                    identities: member_identities(rank, 8100),
+                },
+            )
+            .unwrap();
+    }
+    let s = instance_status(&w, &g);
+    assert_eq!(s["members"][0]["state"], "settled", "{s}");
+    assert_eq!(s["members"][1]["state"], "failed", "{s}");
+    assert_eq!(s["members"][1]["last_error"], "group_member_failed");
+    for rank in 0..2 {
+        assert_eq!(s["members"][rank]["reservation"], Value::Null, "{s}");
+        assert_eq!(s["members"][rank]["processes"], 0, "{s}");
+    }
+
+    let w = world([16, 16]);
+    let g = w.ready("g", T0, 8100);
+    assert!(w
+        .store
+        .record_group_stall(&w.session, &g.fence.deployment_id, 0, g.generation)
+        .unwrap());
+    let s = instance_status(&w, &g);
+    assert_eq!(s["members"][0]["state"], "failed");
+    assert_eq!(s["members"][0]["last_error"], "group_stalled");
+    assert_eq!(s["members"][1]["last_error"], Value::Null);
+}
+
+// T37 (ADR 0028 §2.1, R10): a group whose engine environment every host
+// approves shows neither the value nor the name in status.
+#[test]
+fn a_group_status_carries_no_environment_value() {
+    let mut w = world([16, 16]);
+    for (_, document) in &mut w.documents {
+        document["runtime_profiles"]["local"]["security"]["approved_env"] =
+            json!(["GROUP_STATUS_FLAG"]);
+    }
+    w.config["engine_config"]["env"] = json!({"GROUP_STATUS_FLAG": "zq-env-value"});
+    let g = w.ready("g", T0, 8100);
+    let snapshot = serde_json::to_string(&w.store.snapshot().unwrap()).unwrap();
+    assert!(!snapshot.contains("zq-env-value"), "{snapshot}");
+    assert!(!snapshot.contains("GROUP_STATUS_FLAG"), "{snapshot}");
+    assert_eq!(instance_status(&w, &g)["peer_transport"], "unauthenticated");
 }

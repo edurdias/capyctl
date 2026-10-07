@@ -82,6 +82,42 @@ pub struct HostSessionView {
     /// only; never shown in status.
     #[serde(skip)]
     pub member_savers: Vec<MemberSaverView>,
+    /// ADR 0028 §3, §15: the peer address the host offers its group peers
+    /// and its check findings (`host_tuning_warning:<item>`, refusals under
+    /// `require_rdma`, `peer_address_not_local`), as its latest report gave
+    /// them. Absent for a host that declares no peer address. Status shows
+    /// the findings beside the host's group members.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupInventoryView>,
+}
+/// ADR 0028 §3: a host's group facts as its inventory reports them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GroupInventoryView {
+    pub peer_address: std::net::IpAddr,
+    pub findings: Vec<String>,
+}
+/// ADR 0028 §3: the most findings one report may carry (three tuning items
+/// and the address check, with room to spare).
+pub const MAX_GROUP_FINDINGS: usize = 16;
+impl GroupInventoryView {
+    /// The group facts one report carries. A report outside its bounds (an
+    /// address that does not parse, too many findings, one that is not a
+    /// closed code) carries none: nothing partial is shown.
+    pub(crate) fn of(inventory: &pb::ReportInventory) -> Option<Self> {
+        let group = inventory.group.as_ref()?;
+        if group.findings.len() > MAX_GROUP_FINDINGS
+            || !group
+                .findings
+                .iter()
+                .all(|f| capyctl_domain::diagnostics::is_closed_code(f))
+        {
+            return None;
+        }
+        Some(Self {
+            peer_address: group.peer_address.parse().ok()?,
+            findings: group.findings.clone(),
+        })
+    }
 }
 /// ADR 0028 §12 (R12): one SGLang group member's saver map, read by its own
 /// host from its own observation directory and reported on its session.
@@ -1345,6 +1381,7 @@ impl AgentSessions {
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }
                                 s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
                                 s.view.member_savers = MemberSaverView::of(&inventory);
+                                s.view.group = GroupInventoryView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 // Only an inventory `publish` accepted reaches here.
                                 s.prepared = crate::host_publication::eligible(&inventory);
@@ -1362,6 +1399,7 @@ impl AgentSessions {
                                 if s.view.session_id != id { return Err(denied()); }
                                 s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
                                 s.view.member_savers = MemberSaverView::of(&inventory);
+                                s.view.group = GroupInventoryView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 s.inventory = Some(*inventory);
                             }
@@ -1697,6 +1735,7 @@ impl AgentControl for AgentSessions {
                         domains: vec![],
                         profiles: vec![],
                         member_savers: vec![],
+                        group: None,
                     },
                     peer: peer.clone(),
                     outgoing: Some(outgoing.clone()),
@@ -1955,6 +1994,45 @@ mod member_saver_tests {
             .map(|n| saver(&format!("launch-{n}"), 0, now))
             .collect();
         assert!(MemberSaverView::of(&report(crowded)).is_empty());
+    }
+
+    // T14 T21 (ADR 0028 §3, §15): a host's peer address and check findings
+    // are kept as reported, for status to show beside its members; a report
+    // outside its bounds keeps none, and a host without the block shows none.
+    #[test]
+    fn group_inventory_is_kept_whole_or_not_at_all() {
+        let group = |address: &str, findings: Vec<String>| pb::ReportInventory {
+            group: Some(pb::GroupInventory {
+                peer_address: address.into(),
+                findings,
+            }),
+            ..Default::default()
+        };
+        let kept = GroupInventoryView::of(&group(
+            "192.0.2.11",
+            vec!["host_tuning_warning:compaction".into()],
+        ))
+        .unwrap();
+        assert_eq!(kept.peer_address.to_string(), "192.0.2.11");
+        assert_eq!(kept.findings, ["host_tuning_warning:compaction"]);
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::json!({"peer_address": "192.0.2.11",
+                "findings": ["host_tuning_warning:compaction"]})
+        );
+        assert_eq!(GroupInventoryView::of(&report(vec![])), None);
+        for bad in [
+            group("not an address", vec![]),
+            group("192.0.2.11", vec!["Free text, not a code".into()]),
+            group(
+                "192.0.2.11",
+                (0..=MAX_GROUP_FINDINGS)
+                    .map(|n| format!("host_tuning_warning:item{n}"))
+                    .collect(),
+            ),
+        ] {
+            assert_eq!(GroupInventoryView::of(&bad), None, "{bad:?}");
+        }
     }
 }
 

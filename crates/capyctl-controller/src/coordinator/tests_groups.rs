@@ -26,7 +26,7 @@
 //! qualifies an engine, a host or a group: CPU and Fake-engine tests are not
 //! qualification; the live rows MN1–MN9 are.
 use super::*;
-use crate::group_activation::{GroupActivation, GroupActivationError};
+use crate::group_activation::{GroupActivation, GroupActivationError, LaunchFailure};
 use crate::group_residency::{canary_matches, CanaryReference, GroupResidencyError, CANARY_TOKENS};
 use capyctl_agent::host_checks::{prepare_member, HostFacts, InfinibandAccess};
 use capyctl_config::groups_policy::GroupsPolicy;
@@ -2717,7 +2717,11 @@ async fn failing_readiness_probe_fails_the_activation() {
     world.group.launch_completes();
     assert!(matches!(
         world.wait_activation(&id).await,
-        GroupActivation::Failed { failed_rank: 0, .. }
+        GroupActivation::Failed {
+            failed_rank: 0,
+            failure: LaunchFailure::MemberFailed,
+            ..
+        }
     ));
     assert!(!world.route_open("g"));
     assert_eq!(world.probe_calls(), 1);
@@ -2872,9 +2876,15 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     }));
     let id = world.deploy_group("g", &["host-a", "host-b"]).await;
     world.group.launch_completes();
+    // T32 (Task 17 minor a): the outcome itself says the member is uncertain,
+    // not a message that happens to start with the code.
     assert!(matches!(
         world.wait_activation(&id).await,
-        GroupActivation::Failed { failed_rank: 1, .. }
+        GroupActivation::Failed {
+            failed_rank: 1,
+            failure: LaunchFailure::MemberUncertain,
+            ..
+        }
     ));
     let launches: Vec<_> = world
         .host("host-b")
@@ -3020,6 +3030,15 @@ async fn unreachable_host_keeps_charge_and_port() {
     world.wait_settled_generation("g", 1).await;
     assert!(world.port_free("host-a", 25000));
     assert!(!world.group.alive(1));
+    // T32 (Task 17 minor b): once the requested stop completes, the
+    // uncertainty it recorded while host B was away is no longer the status.
+    world
+        .until("the uncertain status cleared", || {
+            let status = world.read_status(&id)?;
+            (status.last_error() == "").then_some(())
+        })
+        .await;
+    world.wait_state("g", "stopped").await;
 }
 
 // Review Focus 3: a worker host back with an empty journal settles only on recorded identities.

@@ -237,10 +237,17 @@ pub fn validate_config_at(
                         });
                     }
                     // Unnamed device claims take this host's devices, and the
-                    // per-host recipe carries no deployment-level field.
+                    // per-host recipe carries no deployment-level field. ADR
+                    // 0028 §2: a group member's recipe keeps its rank-ordered
+                    // host list, so it resolves as the group it is (as the
+                    // server's deploy resolves each named host).
+                    let group = instances.group.is_some();
                     let strip = |mut source: Value| {
                         if let Some(object) = source.as_object_mut() {
                             for field in ["instances", "placement", "host"] {
+                                if field == "placement" && group {
+                                    continue;
+                                }
                                 object.remove(field);
                             }
                         }

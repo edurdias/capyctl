@@ -1457,6 +1457,23 @@ impl crate::Store {
         Ok(())
     }
 
+    /// ADR 0028 §16: the instance's status no longer names `code` (the
+    /// uncertainty a stop recorded while a host was away, once every member
+    /// settled). Any other recorded error is kept.
+    pub fn clear_group_status(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        code: &str,
+    ) -> Result<(), GroupStoreError> {
+        self.conn.execute(
+            "UPDATE deployment_instances SET last_error=NULL
+              WHERE deployment_id=?1 AND instance_index=?2 AND last_error=?3",
+            params![deployment_id, instance_index, code],
+        )?;
+        Ok(())
+    }
+
     /// The rank the group at `generation` failed at, if it failed.
     pub fn group_failure(
         &self,

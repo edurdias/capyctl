@@ -744,7 +744,7 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         "reconciliation_required" => "unreconciled",
         // SPEC §6.4: a stop is still being confirmed; nothing was started.
         "still_stopping" => "still_stopping",
-        "unsupported_capability" | "group_shape_unsupported" => "unsupported",
+        "unsupported_capability" => "unsupported",
         "not_found" => "not_found",
         "invalid_config" | "invalid_request" | "body_too_large" => "invalid_config",
         // ADR 0014 §7: the measured checkpoint does not resolve the revision's
@@ -1314,6 +1314,17 @@ pub async fn execute_with_start_options(
                     }
                 }
             }
+            // ADR 0028 §15: each group member's host check findings, from
+            // its host's live session in the host inventory (the snapshot
+            // holds durable state only). A server without them leaves the
+            // members as they were.
+            if has_group_members(&view) {
+                if let Ok((status, inventory)) = api.exchange(Method::GET, "/hosts", None).await {
+                    if status.is_success() {
+                        add_member_warnings(&mut view, &inventory);
+                    }
+                }
+            }
             Ok(view)
         }
         // SPEC §8.2: the resolved configuration and its provenance, with
@@ -1347,6 +1358,44 @@ pub async fn execute_with_start_options(
 
 /// What `status deployment` says on a role with no engine.
 pub const NO_ENGINE: &str = "none: run `capyctl engine add <path>`";
+
+fn has_group_members(deployment: &Value) -> bool {
+    deployment["instances"]
+        .as_array()
+        .is_some_and(|instances| instances.iter().any(|i| i["members"].is_array()))
+}
+
+/// ADR 0028 §3, §15: sets each group member's `warnings` to the findings its
+/// host's live session reports (`host_tuning_warning:<item>`, and under
+/// `require_rdma` the refusals), from a `GET /hosts` answer. A member whose
+/// host reports none gets an empty list.
+pub fn add_member_warnings(deployment: &mut Value, inventory: &Value) {
+    let findings = |host: &str| -> Value {
+        inventory["hosts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|h| h["host_id"] == host)
+            .and_then(|h| h["session"]["group"]["findings"].as_array())
+            .map(|found| Value::Array(found.iter().filter(|f| f.is_string()).cloned().collect()))
+            .unwrap_or_else(|| json!([]))
+    };
+    let Some(instances) = deployment
+        .get_mut("instances")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for instance in instances {
+        let Some(members) = instance.get_mut("members").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for member in members {
+            let host = member["host"].as_str().unwrap_or_default().to_owned();
+            member["warnings"] = findings(&host);
+        }
+    }
+}
 
 /// The installation a deployment actually runs, from the embedded host's
 /// `/installation` view and the deployment's pinned effective profile (ADR
@@ -1544,6 +1593,32 @@ mod tests {
         assert_eq!(window(&d, "start", None).unwrap(), LEGACY_WINDOW_MS);
         assert_eq!(window(&d, "stop", None).unwrap(), LEGACY_WINDOW_MS);
         assert_eq!(window(&d, "start", Some(1_200_000)).unwrap(), 1_200_000);
+    }
+
+    // T21 T39 (ADR 0028 §3, §15): each group member gets its own host's
+    // check findings from the host inventory, a host without any an empty
+    // list; a single-host status is not touched and asks nothing more.
+    #[test]
+    fn group_members_get_their_hosts_check_findings() {
+        let mut view = json!({"instances": [{"index": 0, "members": [
+            {"host": "01HOSTA", "node_rank": 0}, {"host": "01HOSTB", "node_rank": 1}]}]});
+        let inventory = json!({"hosts": [
+            {"host_id": "01HOSTA", "session": {"group": {"peer_address": "192.0.2.10",
+                "findings": []}}},
+            {"host_id": "01HOSTB", "session": {"group": {"peer_address": "192.0.2.11",
+                "findings": ["host_tuning_warning:compaction"]}}}]});
+        assert!(has_group_members(&view));
+        add_member_warnings(&mut view, &inventory);
+        assert_eq!(view["instances"][0]["members"][0]["warnings"], json!([]));
+        assert_eq!(
+            view["instances"][0]["members"][1]["warnings"],
+            json!(["host_tuning_warning:compaction"])
+        );
+        let single = json!({"instances": [{"index": 0, "host_id": "01HOSTA"}]});
+        assert!(!has_group_members(&single));
+        let mut touched = single.clone();
+        add_member_warnings(&mut touched, &inventory);
+        assert_eq!(touched, single);
     }
 
     /// SPEC §17 (found live 2026-09-24, M80): `status deployment <name>` asked

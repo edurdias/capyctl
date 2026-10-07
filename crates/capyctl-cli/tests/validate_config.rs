@@ -538,7 +538,7 @@ fn the_discrete_host_example_validates() {
 fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
     let dir = tempfile::tempdir().unwrap();
     let host = examples().join("host.yaml");
-    let source = std::fs::read_to_string(examples().join("deployment-multinode.yaml")).unwrap();
+    let source = std::fs::read_to_string(examples().join("deployment-spread.yaml")).unwrap();
     let elsewhere = write(
         dir.path(),
         "elsewhere.yaml",
@@ -558,6 +558,108 @@ fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
         value["message"].as_str().unwrap().contains("gpu-box"),
         "{raw}"
     );
+}
+
+/// T03 (ADR 0028 §2, §3; OD8): the deploy-time checks of a group against the
+/// document of each host it names, as the server makes them: every host in
+/// `placement.hosts` has a document here, declares its peer address and
+/// publishes the deployment's profile with the head's build, and the
+/// deployment resolves on it (`validate config --host`, one host at a time).
+/// `validate config` with `--host` repeated (Task 20b) does this itself.
+fn validate_example(deployment: &str, hosts: &[&str]) -> Result<(), String> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let resolve = |path: &str| {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo.join(path)
+        }
+    };
+    let read = |path: &Path| -> Result<Value, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        capyctl_config::parse_document(&text).map_err(|e| e.to_string())
+    };
+    let file = resolve(deployment);
+    let document = read(&file)?;
+    let shape = capyctl_config::instances::parse_instance_spec(&document)
+        .map_err(|e| e.to_string())?
+        .group
+        .ok_or("not a group deployment")?;
+    let profile = document["engine"]
+        .as_str()
+        .or(document["runtime_profile"].as_str())
+        .ok_or("no engine profile")?;
+    let documents: Vec<(PathBuf, Value)> = hosts
+        .iter()
+        .map(|host| Ok((resolve(host), read(&resolve(host))?)))
+        .collect::<Result<_, String>>()?;
+    let mut head_build = None;
+    for name in &shape.hosts {
+        let (path, host) = documents
+            .iter()
+            .find(|(_, d)| d["name"] == name.as_str())
+            .ok_or(format!("no document for the named host `{name}`"))?;
+        let groups =
+            capyctl_config::groups_policy::host_groups_policy(host).map_err(|e| e.to_string())?;
+        if groups.peer_address.is_none() {
+            return Err(format!("peer_address_missing: host `{name}`"));
+        }
+        let build = host["runtime_profiles"][profile]["build_fingerprint"].clone();
+        match &head_build {
+            None => head_build = Some(build),
+            Some(head) if *head != build => {
+                return Err(format!(
+                    "group_profile_mismatch: host `{name}` runs {build}, the head {head}"
+                ))
+            }
+            Some(_) => {}
+        }
+        let (code, value, raw) = validate(&[
+            "--file",
+            file.to_str().unwrap(),
+            "--host",
+            path.to_str().unwrap(),
+        ]);
+        if code != 0 || value["resolved_against"] != name.as_str() {
+            return Err(raw);
+        }
+    }
+    Ok(())
+}
+
+// T03 (ADR 0028 §2, §3): the multinode example validates against its two
+// host documents; a named host without a peer address, or with another
+// engine build, is refused as deploy refuses it.
+#[test]
+fn multinode_example_validates() {
+    validate_example(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml", "docs/examples/host-b.yaml"],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let host_b = std::fs::read_to_string(examples().join("host-b.yaml")).unwrap();
+    let host = examples().join("host.yaml");
+    for (changed, code) in [
+        (
+            host_b.replace("  groups:\n    peer_address: 192.0.2.11\n", ""),
+            "peer_address_missing",
+        ),
+        (
+            host_b.replace("\"vllm 0.29.0\"", "\"vllm 0.29.1\""),
+            "group_profile_mismatch",
+        ),
+    ] {
+        assert_ne!(changed, host_b, "{code}: the fixture changed");
+        let path = write(dir.path(), "host-b.yaml", &changed);
+        let refused = validate_example(
+            "docs/examples/deployment-multinode.yaml",
+            &[host.to_str().unwrap(), path.to_str().unwrap()],
+        )
+        .unwrap_err();
+        assert!(refused.starts_with(code), "{refused}");
+    }
 }
 
 // T03 (final review I10): `validate config` runs the checks `start

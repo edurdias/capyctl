@@ -150,22 +150,179 @@ const GENERIC_CLASSES: &[&str] = &[
     "unsupported",
 ];
 
-/// The first discrete GPU closed code in `message` stated as a detail prefix:
-/// the code as a whole word, directly followed by `:`.
-fn device_code_in(message: &str) -> Option<&'static str> {
-    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    DEVICE_CODES
+/// What may follow a closed code's name inside a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    /// The code alone: then a `:` detail prefix or the end of the message.
+    Bare,
+    /// Always `<code>:<name>` (a port, a field, an item, an environment name).
+    Required,
+    /// Either form (`group_shape_unsupported`, `group_shape_unsupported:<engine>`).
+    Optional,
+}
+
+/// ADR 0028 §16: the closed codes of multi-node groups and the exit each
+/// takes, or `None` for the codes that appear only in status and
+/// `last_error`. Like [`DEVICE_CODES`], they travel as a detail inside a
+/// refusal's message as well as on their own. No new exit number.
+const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
+    (
+        "group_placement_required",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "group_topology_invalid",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "group_profile_mismatch",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "group_checkpoint_mismatch",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "group_model_path_mismatch",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "peer_address_missing",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "peer_address_not_local",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "engine_env_reserved",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "engine_env_not_approved",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "engine_env_conflict",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "rendezvous_ports_exhausted",
+        Named::Bare,
+        Some(ExitCode::INSUFFICIENT_RESOURCES),
+    ),
+    (
+        "rendezvous_port_in_use",
+        Named::Required,
+        Some(ExitCode::INSUFFICIENT_RESOURCES),
+    ),
+    (
+        "service_port_in_use",
+        Named::Required,
+        Some(ExitCode::INSUFFICIENT_RESOURCES),
+    ),
+    (
+        "host_tuning_missing",
+        Named::Required,
+        Some(ExitCode::INSUFFICIENT_RESOURCES),
+    ),
+    (
+        "group_shape_unsupported",
+        Named::Optional,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "group_instances_unsupported",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    ("group_drift", Named::Required, Some(ExitCode::UNSUPPORTED)),
+    (
+        "host_capability_missing:engine_groups",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    // ADR 0023 §2: an existing code keeps its exit when a configuration
+    // refusal carries it (`capability_missing:deep_park`).
+    (
+        "capability_missing",
+        Named::Required,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    ("host_tuning_warning", Named::Required, None),
+    ("group_member_failed", Named::Bare, None),
+    ("group_member_uncertain", Named::Bare, None),
+    ("group_wake_mismatch", Named::Bare, None),
+    ("group_stalled", Named::Bare, None),
+];
+
+fn word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The length of the closed code `code` (of form `named`) at the start of
+/// `text`, its `:<name>` included, or `None` when `text` does not start with
+/// it. A name is one or more word characters directly after the colon; a
+/// bare code is followed by a `:` detail prefix or nothing.
+fn code_at(text: &str, code: &str, named: Named) -> Option<usize> {
+    let rest = text.strip_prefix(code)?;
+    let name = rest
+        .strip_prefix(':')
+        .map(|after| after.find(|c: char| !word(c)).unwrap_or(after.len()))
+        .filter(|len| *len > 0);
+    let bare = rest.is_empty() || (rest.starts_with(':') && name.is_none());
+    match (named, name) {
+        (Named::Required | Named::Optional, Some(len)) => Some(code.len() + 1 + len),
+        (Named::Bare | Named::Optional, None) if bare => Some(code.len()),
+        _ => None,
+    }
+}
+
+/// The first closed code in `message` that decides an exit, as written there
+/// (`rendezvous_port_in_use:25000`): a discrete GPU code as a detail prefix
+/// (the code as a whole word, directly followed by `:`), or a group code with
+/// an exit, as a whole word in its own form. Codes with no exit never decide
+/// one.
+fn closed_code_in(message: &str) -> Option<&str> {
+    let whole = |at: usize| !message[..at].ends_with(word);
+    let device = DEVICE_CODES.iter().filter_map(|code| {
+        message
+            .match_indices(code)
+            .find(|(at, _)| whole(*at) && message[at + code.len()..].starts_with(':'))
+    });
+    let group = GROUP_CODES
         .iter()
-        .filter_map(|code| {
-            message
-                .match_indices(code)
-                .find(|(at, _)| {
-                    !message[..*at].ends_with(word) && message[at + code.len()..].starts_with(':')
-                })
-                .map(|(at, _)| (at, *code))
-        })
+        .filter(|(_, _, exit)| exit.is_some())
+        .filter_map(|(code, named, _)| {
+            message.match_indices(code).find_map(|(at, _)| {
+                let len = code_at(&message[at..], code, *named).filter(|_| whole(at))?;
+                Some((at, &message[at..at + len]))
+            })
+        });
+    device
+        .chain(group)
         .min_by_key(|(at, _)| *at)
         .map(|(_, code)| code)
+}
+
+/// ADR 0028 §16: the exit of a closed group code, matched by its prefix
+/// when it carries a `:<name>`. `None` for any other code and for the group
+/// codes that have no exit.
+fn group_exit(code: &str) -> Option<ExitCode> {
+    GROUP_CODES
+        .iter()
+        .find(|(name, named, _)| code_at(code, name, *named) == Some(code.len()))
+        .and_then(|(_, _, exit)| *exit)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,13 +341,14 @@ impl StructuredError {
         }
     }
 
-    /// Design §11: the code that decides this refusal's exit. A generic class
-    /// (`invalid_config`, `command_rejected`, `operation_failed`, ...) whose
-    /// message carries one of the discrete GPU closed codes as a detail prefix
-    /// (`<code>: ...`) is that code; any other code is itself.
-    pub fn closed_code(&self) -> &'static str {
+    /// Design §11, ADR 0028 §16: the code that decides this refusal's exit. A
+    /// generic class (`invalid_config`, `command_rejected`, `operation_failed`,
+    /// ...) whose message carries a discrete GPU closed code as a detail
+    /// prefix (`<code>: ...`), or a group closed code with an exit, is that
+    /// code as written there; any other code is itself.
+    pub fn closed_code(&self) -> &str {
         if GENERIC_CLASSES.contains(&self.code) {
-            if let Some(code) = device_code_in(&self.message) {
+            if let Some(code) = closed_code_in(&self.message) {
                 return code;
             }
         }
@@ -198,7 +356,11 @@ impl StructuredError {
     }
 
     pub fn exit_code(&self) -> ExitCode {
-        match self.closed_code() {
+        let code = self.closed_code();
+        if let Some(exit) = group_exit(code) {
+            return exit;
+        }
+        match code {
             "internal" | "management_unavailable" | "operation_failed" => ExitCode::INTERNAL,
             "invalid_config" | "command_rejected" | "not_found" => ExitCode::INVALID_CONFIG,
             "unauthorized" => ExitCode::UNAUTHORIZED,
