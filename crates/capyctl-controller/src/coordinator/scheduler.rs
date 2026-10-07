@@ -472,10 +472,16 @@ impl Scheduler {
         }
         // ADR 0028 §11: under `recovery: reconcile` a group that failed after
         // READY relaunches as a new generation and plan, accepted only in a
-        // transaction that reads every member of its old plan settled.
+        // transaction that reads every member of its old plan settled, and
+        // only while every member host is eligible.
         if starts && shared.groups.is_some() {
+            let eligible = shared.observations.eligible_hosts();
             let relaunched = shared
-                .read(|owner, now| owner.store().relaunch_failed_groups(owner.session(), now))
+                .read(move |owner, now| {
+                    owner
+                        .store()
+                        .relaunch_failed_groups(owner.session(), now, eligible.as_ref())
+                })
                 .await
                 .map_err(failed)?;
             if !relaunched.is_empty() {

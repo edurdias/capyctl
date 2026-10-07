@@ -767,12 +767,17 @@ impl crate::Store {
     /// old plan settled (every member released on its own host's evidence)
     /// in the same transaction that accepts the start at the instance's new
     /// generation, the one its stop drew. An instance an operator stopped
-    /// since, one already started at that generation, or one whose start is
-    /// refused is left alone. Returns the starts accepted.
+    /// since, one already started at that generation, one whose start is
+    /// refused, or one whose newest plan names a host outside `eligible`
+    /// (the hosts with a live reconciled session and an approved
+    /// configuration, as single-host reconciliation reads them; `None`
+    /// judges every host eligible) is left alone. Returns the starts
+    /// accepted.
     pub fn relaunch_failed_groups(
         &self,
         s: &CoordinatorSession,
         now: i64,
+        eligible: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Vec<Start>, LifecycleError> {
         const DUE: &str = "SELECT i.deployment_id,i.instance_index,i.revision,i.generation
             FROM deployment_instances i
@@ -815,6 +820,21 @@ impl crate::Store {
             )?;
             if !still {
                 continue;
+            }
+            // SPEC §11, ADR 0013 §7: every member host must be eligible now.
+            if let Some(eligible) = eligible {
+                let hosts: Vec<String> = tx
+                    .prepare(
+                        "SELECT m.host_id FROM group_members m JOIN group_plans g
+                           ON g.deployment_id=m.deployment_id AND g.instance_index=m.instance_index AND g.generation=m.generation
+                          WHERE m.deployment_id=?1 AND g.generation=(SELECT MAX(generation) FROM group_plans x
+                                WHERE x.deployment_id=?1 AND x.instance_index=m.instance_index)",
+                    )?
+                    .query_map([&fence.deployment_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                if hosts.is_empty() || hosts.iter().any(|host| !eligible.contains(host)) {
+                    continue;
+                }
             }
             let (_, e) = effective(&tx, &fence)?;
             if e.recovery != capyctl_config::effective::Recovery::Reconcile {
