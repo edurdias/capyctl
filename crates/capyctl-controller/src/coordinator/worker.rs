@@ -2436,19 +2436,39 @@ async fn drive_group(
             reason,
         }) => {
             // ADR 0028 §11 (decided 2026-10-06: a failed readiness probe is a
-            // launch failure): the group failed at this rank.
+            // launch failure): the group failed at this rank. A member whose
+            // Launch went unanswered did not fail: it is uncertain and stays
+            // charged, and status says so (`group_member_uncertain`) until
+            // the group settles.
             let deployment = work.fence().deployment_id.clone();
             let instance = work.instance_index();
+            let uncertain = reason.starts_with("group_member_uncertain");
             let _ = shared
                 .with_owner(move |owner| {
-                    owner
-                        .store()
+                    let store = owner.store();
+                    store
                         .record_group_failure(&deployment, instance, plan.generation(), failed_rank)
+                        .and_then(|()| {
+                            if uncertain {
+                                store.record_group_status(
+                                    &deployment,
+                                    instance,
+                                    "group_member_uncertain",
+                                )
+                            } else {
+                                Ok(())
+                            }
+                        })
                         .map_err(|error| CoordinatorError::Service(error.to_string()))
                 })
                 .await;
+            let code = if uncertain {
+                "group_member_uncertain"
+            } else {
+                "group_member_failed"
+            };
             Err(CoordinatorError::Service(format!(
-                "group_member_failed: rank {failed_rank}: {reason}"
+                "{code}: rank {failed_rank}: {reason}"
             )))
         }
         // SPEC §13.2: a closed refusal before any effect is a host refusal.

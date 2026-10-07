@@ -145,16 +145,17 @@ pub async fn stop_group(
             unsettled: target.plan.members().iter().map(|m| m.rank).collect(),
         },
     };
-    // SPEC §17, ADR 0028 §16: the failure stays the instance's status; a
-    // requested stop that left a member charged names the uncertainty.
-    if reason.code().is_none() && matches!(settlement, GroupSettlement::Partial { .. }) {
-        if let Ok(o) = ctx.owner.lock() {
-            let _ = o.store().record_group_status(
-                &target.deployment_id,
-                target.instance_index,
-                "group_member_uncertain",
-            );
-        }
+    // SPEC §17, ADR 0028 §16: while any member stays charged and uncertain,
+    // status names the uncertainty; once every member settled, a failed group
+    // reads `group_member_failed` again.
+    let code = match (&settlement, reason.code()) {
+        (GroupSettlement::Partial { .. }, _) => Some("group_member_uncertain"),
+        (GroupSettlement::Complete, code) => code,
+    };
+    if let (Some(code), Ok(o)) = (code, ctx.owner.lock()) {
+        let _ = o
+            .store()
+            .record_group_status(&target.deployment_id, target.instance_index, code);
     }
     settlement
 }

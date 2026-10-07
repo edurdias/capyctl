@@ -835,9 +835,14 @@ impl ExecutionBindings for WorldBindings {
 struct WorldObservations {
     domains: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     fallback: Vec<MemoryObservation>,
+    /// The hosts eligible for a start; `None` while the world names none.
+    eligible: Arc<Mutex<Option<BTreeSet<String>>>>,
 }
 
 impl ServiceObservation for WorldObservations {
+    fn eligible_hosts(&self) -> Option<BTreeSet<String>> {
+        self.eligible.lock().unwrap().clone()
+    }
     fn observe(&self, host: String) -> ObservationFuture {
         let now = capyctl_protocol::now_unix_ms();
         let observed = match self.domains.lock().unwrap().get(&host) {
@@ -927,6 +932,8 @@ pub(super) struct GroupWorld {
     /// Every group Launch the hosts received: its generation, and whether the
     /// instance's previous plan had fully settled when it arrived.
     witnessed: Arc<Mutex<Vec<(i64, bool)>>>,
+    /// The hosts the coordinator's observations call eligible.
+    eligible: Arc<Mutex<Option<BTreeSet<String>>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -967,11 +974,13 @@ impl GroupWorld {
             ready: Mutex::new(Vec::new()),
         });
         let domains = Arc::new(Mutex::new(BTreeMap::new()));
+        let eligible = Arc::new(Mutex::new(None));
         let worker = OwnedCoordinator::spawn_with_execution_bindings(
             owner.clone(),
             Arc::new(WorldObservations {
                 domains: domains.clone(),
                 fallback: fixture.observations.clone(),
+                eligible: eligible.clone(),
             }),
             Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
             CoordinatorOptions {
@@ -1037,6 +1046,7 @@ impl GroupWorld {
             // Nothing relaunches unless a test asks for `reconcile`.
             recovery: "cold_restart".into(),
             witnessed,
+            eligible,
             _dir: dir,
         }
     }
@@ -2636,6 +2646,11 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     assert!(rows[1].dispatched);
     assert_eq!(rows[1].state, MemberState::Uncertain);
     assert_eq!(rows[1].identities, None);
+    // A member whose Launch went unanswered did not fail: it is uncertain.
+    assert_eq!(
+        world.status("g").await.last_error(),
+        "group_member_uncertain"
+    );
     assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
     assert!(!world.port_free("host-a", 25000));
     world.group.reconnect_host("host-b", JournalState::Kept);
@@ -2884,4 +2899,53 @@ async fn group_head_is_reproven_by_a_completion_probe_after_a_session_change() {
     assert_eq!(world.probe_calls(), 2);
     assert_eq!(world.last_probe_max_tokens(), 1);
     assert_eq!(world.probes_sent_to("host-b"), 0);
+}
+
+impl GroupWorld {
+    /// Only `hosts` are eligible for a start from now on.
+    pub(super) fn eligible_hosts(&self, hosts: &[&str]) {
+        *self.eligible.lock().unwrap() = Some(hosts.iter().map(|h| (*h).to_owned()).collect());
+    }
+}
+
+// T31 (ADR 0013 §7, ADR 0028 §11): a failed group relaunches only while every
+// member host is eligible; a settled group whose worker host is not stays
+// stopped until it is.
+#[tokio::test]
+async fn a_failed_group_relaunches_only_on_eligible_hosts() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .recovery_reconcile()
+        .ready("g")
+        .await;
+    world.eligible_hosts(&["host-a"]);
+    world.group.exit_rank(0);
+    world.wait_settled_generation("g", 1).await;
+    world.settle_for(Duration::from_secs(1)).await;
+    assert!(!world.generation_started("g", 2));
+    world.eligible_hosts(&["host-a", "host-b"]);
+    assert!(world.generation_started_after_settlement("g", 2).await);
+}
+
+// T32 (ADR 0028 §11, §16): a group whose worker's Launch went unanswered did
+// not fail at that member; status names the uncertainty while it is charged.
+#[tokio::test]
+async fn an_unanswered_launch_reads_uncertain_not_failed() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_replies_lost("host-b");
+    let group = world.group.clone();
+    world.host("host-b").state().launch_observer = Some(Arc::new(move |_: &MemberCommand| {
+        group.disconnect_host("host-b");
+    }));
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_activation(&id).await;
+    world
+        .until("the uncertain status", || {
+            let status = world.read_status(&id)?;
+            (status.last_error() == "group_member_uncertain").then_some(())
+        })
+        .await;
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
 }
