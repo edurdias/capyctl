@@ -4088,6 +4088,76 @@ mod tests {
         );
     }
 
+    /// SPEC §§6.2, 9.1 / ADR 0010: a parked gpt-oss cannot be woken on vLLM
+    /// 0.30.0 or SGLang 0.5.21 (`DEEP_WAKE_BROKEN_FAMILIES`), so a `deep`
+    /// launch of a checkpoint whose `config.json` names the family is refused
+    /// `capability_missing:deep_park` on both engines before any effect, and a
+    /// Park of one already journaled is refused `unchanged`. `restart_only`
+    /// on the same checkpoint passes the gate (it stops at the fixture's
+    /// unrecorded checkpoint).
+    // T22 T21
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gpt_oss_checkpoint_refuses_deep_on_vllm_and_sglang_but_not_restart_only() {
+        const GPT_OSS: &str = r#"{"architectures":["GptOssForCausalLM"],"model_type":"gpt_oss"}"#;
+        for engine in ["vllm", "sglang"] {
+            let root = directory();
+            let identity_dir = directory();
+            let (executor, deployment, policy) = if engine == "vllm" {
+                checkpoint_fixture(root.path(), identity_dir.path())
+            } else {
+                let fixture = sglang_fixture(root.path(), identity_dir.path(), "deep");
+                sglang_runtime(root.path());
+                fixture
+            };
+            std::fs::write(root.path().join("models/toy/config.json"), GPT_OSS).unwrap();
+            assert_eq!(deployment["residency"], "deep");
+            let (mut owner, _) = launch_with(&deployment, &policy, "");
+            owner.identity.payload_digest = owner.canonical_digest();
+            let MemberAction::LaunchSingle(plan) = owner.action.clone() else {
+                panic!("a launch");
+            };
+            assert_eq!(
+                executor.admit_launch(&owner, &plan, GpuReading::Now),
+                Err(LaunchVerdict::Refused("capability_missing:deep_park")),
+                "{engine}"
+            );
+
+            let session = executor.journal.connect().unwrap();
+            executor.connected(session).unwrap();
+            executor
+                .journal
+                .accept(session, &owner, capyctl_protocol::now_unix_ms(), &Admit)
+                .unwrap();
+            let mut park = MemberCommand {
+                identity: checkpoint_identity("park", "ready"),
+                action: MemberAction::Park {
+                    owned_handle: "launch".into(),
+                },
+            };
+            park.identity.payload_digest = park.canonical_digest();
+            let refused = executor.execute(session, park.clone()).await.unwrap();
+            capyctl_protocol::execution::validate_result(&park, &refused).unwrap();
+            assert_eq!(refused.refused, "capability_missing:deep_park", "{engine}");
+            assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
+        }
+
+        let root = directory();
+        let identity_dir = directory();
+        let (restart, mut deployment, policy) =
+            checkpoint_fixture(root.path(), identity_dir.path());
+        std::fs::write(root.path().join("models/toy/config.json"), GPT_OSS).unwrap();
+        deployment["residency"] = "restart_only".into();
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+            panic!("a launch");
+        };
+        assert_eq!(
+            restart.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+    }
+
     /// SPEC §§6.4, 13.2: a launch whose recorded processes all exited before
     /// readiness is reported with one bounded line that names the option the
     /// engine refused and never its value or any other engine output; one the

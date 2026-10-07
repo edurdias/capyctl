@@ -566,6 +566,63 @@ impl CudaNamespace {
 #[error("the selected GPU has neither a published UUID nor a gpuN index to pin the engine to")]
 pub struct UnpinnableDevice;
 
+/// SPEC §§6.2, 9.1 / ADR 0010: model families whose parked wake the engine
+/// cannot complete, matched on the checkpoint's `config.json` `model_type`,
+/// else its `architectures` (as parser defaults match a family). Each entry
+/// names the engine versions it was observed on; delete the entry to lift it
+/// once a live park-and-wake on a fixed engine answers correctly.
+pub struct DeepWakeBrokenFamily {
+    pub engine: Engine,
+    pub model_types: &'static [&'static str],
+    pub architectures: &'static [&'static str],
+    /// The engine versions the broken wake was observed on (documentation).
+    pub observed_on: &'static str,
+}
+
+/// The families [`EffectiveDeployment::deep_wake_refusal`] refuses to park.
+///
+/// gpt-oss (recipe catalog, host B, 2026-10-07): on vLLM 0.30.0 the wake's
+/// weight reload logs `OAIAttention: Failed to load weights` for each of the
+/// 24 attention layers, the woken engine still answers CapyCTL's readiness
+/// probe, and a request then decodes garbage to the context limit (answered
+/// `engine_error` after 778 s; `Harmony parser ended in a non-terminal
+/// state`). On SGLang 0.5.21 `update_weights_from_disk` raises `TypeError:
+/// default_weight_loader() got an unexpected keyword argument 'weight_name'`.
+pub const DEEP_WAKE_BROKEN_FAMILIES: &[DeepWakeBrokenFamily] = &[
+    DeepWakeBrokenFamily {
+        engine: Engine::Vllm,
+        model_types: &["gpt_oss"],
+        architectures: &["GptOssForCausalLM"],
+        observed_on: "vLLM 0.30.0",
+    },
+    DeepWakeBrokenFamily {
+        engine: Engine::Sglang,
+        model_types: &["gpt_oss"],
+        architectures: &["GptOssForCausalLM"],
+        observed_on: "SGLang 0.5.21",
+    },
+];
+
+/// Whether a parked wake of the checkpoint `config` describes is known broken
+/// on `engine` ([`DEEP_WAKE_BROKEN_FAMILIES`]).
+pub fn deep_wake_broken(engine: Engine, config: &serde_json::Value) -> bool {
+    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    let architectures: Vec<&str> = config
+        .get("architectures")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    DEEP_WAKE_BROKEN_FAMILIES
+        .iter()
+        .filter(|family| family.engine == engine)
+        .any(|family| match model_type {
+            Some(model_type) => family.model_types.contains(&model_type),
+            None => architectures
+                .iter()
+                .any(|name| family.architectures.contains(name)),
+        })
+}
+
 impl EffectiveDeployment {
     /// The directory this deployment's checkpoint must be inside: the host's
     /// model store for a local source, its sources store for a remote one
@@ -579,32 +636,44 @@ impl EffectiveDeployment {
     }
 
     /// SPEC §§6.2, 9.1 / ADR 0010: a residency tier the engine cannot honor
-    /// fails closed. Every SGLang deep wake reloads weights from disk, and
-    /// SGLang 0.5.20 and 0.5.21 cannot reload modelopt-quantized (NVFP4)
-    /// weights: the reload raises `AttributeError: 'Parameter' object has no
-    /// attribute 'weight_loader'` (live, host A, 2026-09-24 and 2026-10-06).
-    /// The launch-time probe inspects installation shapes only and cannot see
-    /// this, so it is a rule on the declared quantization method, not a probe
-    /// result. Lift it once a probe or a live run proves a disk reload of
-    /// modelopt weights works on the installed SGLang. vLLM is not affected.
+    /// fails closed. The launch-time probe inspects installation shapes only
+    /// and cannot see a wake that breaks on one kind of checkpoint, so these
+    /// are rules on the deployment and its checkpoint, not probe results:
     ///
-    /// It is kept for both parking tiers: a `host_backed` wake of a modelopt
-    /// checkpoint from the CPU backup is unproven, so it fails closed too.
-    /// ADR 0014 amendment A17: a launch whose park keeps the weights resident
-    /// reloads nothing from disk, so the rule does not apply to it.
+    /// - Every SGLang deep wake reloads weights from disk, and SGLang 0.5.20
+    ///   and 0.5.21 cannot reload modelopt-quantized (NVFP4) weights: the
+    ///   reload raises `AttributeError: 'Parameter' object has no attribute
+    ///   'weight_loader'` (live, host A, 2026-09-24 and 2026-10-06). Keyed on
+    ///   the declared quantization method. vLLM is not affected.
+    /// - A checkpoint of a model family in [`DEEP_WAKE_BROKEN_FAMILIES`] for
+    ///   the launch's engine (gpt-oss on vLLM 0.30.0 and SGLang 0.5.21,
+    ///   recipe catalog, host B, 2026-10-07). Keyed on the checkpoint's
+    ///   `config.json`, read where this machine sees the checkpoint.
+    ///
+    /// Lift a rule once a probe or a live run proves the wake works on the
+    /// installed engine. The engine version is not part of the effective
+    /// deployment, so the rules hold for every version of the engine.
+    ///
+    /// Both parking tiers are refused: a `host_backed` wake of these
+    /// checkpoints is unproven, so it fails closed too. ADR 0014 amendment
+    /// A17: an SGLang launch whose park keeps the weights resident reloads
+    /// nothing from disk, so neither rule applies to it.
     ///
     /// One decision for every host that runs the launch: a host agent and
     /// standalone's embedded host both refuse its launch, Park and Restore
-    /// with this closed reason (ADR 0008), before any effect.
+    /// with this closed reason (ADR 0008), before any effect. A machine that
+    /// does not see the checkpoint (a server whose host holds it) cannot read
+    /// its family; the host that launches it refuses it.
     pub fn deep_wake_refusal(&self) -> Option<&'static str> {
         let resident = matches!(
             &self.engine_config,
             capyctl_domain::launch::LaunchSettings::Sglang(settings)
                 if settings.weight_restore == "resident"
         );
-        let cannot_reload = self.residency.parks()
-            && self.profile.engine == Engine::Sglang
-            && !resident
+        if !self.residency.parks() || resident {
+            return None;
+        }
+        let modelopt = self.profile.engine == Engine::Sglang
             && self
                 .engine_config
                 .common()
@@ -612,7 +681,15 @@ impl EffectiveDeployment {
                 .as_deref()
                 .map(str::to_ascii_lowercase)
                 .is_some_and(|method| method.starts_with("modelopt") || method == "nvfp4");
-        cannot_reload.then_some("capability_missing:deep_park")
+        let broken_family = || {
+            let Some(root) = self.model.resolved_path.as_deref() else {
+                return false;
+            };
+            crate::context_fit::read_model_config(Path::new(root))
+                .ok()
+                .is_some_and(|config| deep_wake_broken(self.profile.engine, &config))
+        };
+        (modelopt || broken_family()).then_some("capability_missing:deep_park")
     }
 
     /// Discrete GPU design §7 (review decision): the namespace a launch's
