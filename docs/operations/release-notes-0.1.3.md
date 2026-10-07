@@ -51,6 +51,14 @@ Unreleased.
   refused at start. `auto`, or leaving it out, keeps the quarter and the
   stored policy unchanged. See
   [configuration](configuration.md#standalone-parked-limit).
+- **vLLM's loader under deep parking is a setting.** CapyCTL starts a parking
+  vLLM deployment with the `eager` weight loader, as before; set
+  `engine_config.vllm.safetensors_load_strategy: lazy` to map the weights
+  instead. On vLLM 0.30 NVFP4 models `eager` held about 15–17 GiB more once
+  loaded without a faster wake. Leaving the field out changes nothing for an
+  existing deployment. `--safetensors-load-strategy` in `extra_args` is now
+  refused for every vLLM deployment, parking or not; move it to the field. See
+  [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
 
 ## Checkpoints
 

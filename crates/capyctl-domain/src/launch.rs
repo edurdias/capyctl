@@ -193,6 +193,11 @@ pub struct VllmLaunchSettings {
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_batched_tokens: Option<u32>,
+    /// ADR 0014 §4 (amended 2026-10-07, owner decision 1): vLLM's safetensors
+    /// loader. `None` keeps the capyctl default: `eager` while sleep mode is
+    /// on, nothing rendered otherwise (the engine's own default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
     /// ADR 0024: the deployment's tool-call and reasoning parser choice:
     /// a parser name, or `none` to turn it off. `None` is `auto`: capyctl
     /// chooses by model family where the checkpoint is read, at launch.
@@ -207,6 +212,27 @@ pub struct VllmLaunchSettings {
     /// checked against the reserved and sensitive lists.
     pub extra_args: Vec<String>,
     pub provenance: BTreeMap<String, SettingSource>,
+}
+
+/// ADR 0014 §4 (amended 2026-10-07): the vLLM safetensors loaders a deployment
+/// may choose, spelled as vLLM 0.29 and 0.30 spell them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SafetensorsLoadStrategy {
+    /// Read each file into CPU memory before loading (capyctl's sleep-mode
+    /// default: the fast deep wake measured on vLLM 0.29).
+    Eager,
+    /// Memory-map each file and load on demand.
+    Lazy,
+}
+
+impl SafetensorsLoadStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Lazy => "lazy",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

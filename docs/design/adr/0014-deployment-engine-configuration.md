@@ -145,8 +145,10 @@ Some of today's pins encode live findings rather than a checkpoint. They become 
 the deployment may override, shown with provenance `mllm default` in the effective
 configuration (T14): SGLang CUDA graphs off while the memory saver is on (until A13), SGLang
 tokenizer and detokenizer workers 1, vLLM
-`--safetensors-load-strategy eager` whenever sleep mode is on (reserved there). Every
-other `_FIXED` value is dropped and the engine's own default applies.
+`--safetensors-load-strategy eager` whenever sleep mode is on (reserved there; the
+deployment chooses it with the typed `vllm.safetensors_load_strategy`, see the note on
+§4 of 2026-10-07). Every other `_FIXED` value is dropped and the engine's own default
+applies.
 
 ### 5. Memory request (P2)
 
@@ -1182,3 +1184,30 @@ most the managed limit (ADR 0025, amendment of 2026-10-06). `auto` keeps the qua
 raised above the measured 33.4 GiB (for example `40GiB`), a revision's later parks are admitted
 instead of refused `park_parked_capacity`. CPU and Fake tests cover the setting and the admission;
 no live park has run with a raised limit yet.
+
+## Note on §3 and §4: the vLLM loader is a deployment setting (owner decision 2026-10-07)
+
+Problem: §4 pinned `--safetensors-load-strategy eager` under sleep mode and §3 refused
+the flag there. The pin came from vLLM 0.29 on Qwen3-4B BF16, where eager loading cut
+the deep wake from 57 s to 7.5 s (commit 785b887, `docs/runbooks/deep-wake-optimization.md`).
+On vLLM 0.30 with NVFP4 checkpoints the catalog runs measured the opposite trade: eager
+kept about 15–17 GiB more memory once loaded and the wake still took about 55 s.
+
+Decision (option B): the loader is the typed field `engine_config.vllm.safetensors_load_strategy`,
+`eager` or `lazy`, as vLLM spells them (`prefetch` and `torchao` are not offered).
+
+- Omitted, nothing changes: under sleep mode capyctl renders `eager` beside
+  `--enable-sleep-mode`; outside it nothing is rendered and vLLM's own default
+  (memory-mapped, with NFS prefetch) applies. The field is absent from the resolved
+  configuration and from the command identity, so every existing revision keeps its
+  digest and fingerprint.
+- Declared, it renders `--safetensors-load-strategy <value>` with or without sleep mode.
+  `lazy` is rendered explicitly rather than omitted: vLLM 0.30's default (`None`) is lazy
+  plus automatic prefetch on NFS, which is not what was chosen.
+- One way per setting (§2): the raw option is now a typed field's native spelling, so in
+  `extra_args` it is refused with or without sleep mode (before, only under sleep mode).
+  Under sleep mode it also stays reserved, and the entry still compares the parsed value
+  with the rendered one.
+- The field belongs to the vLLM block; another family refuses the block (§2).
+
+CPU tests cover rendering, refusal and identity; no live park has run with `lazy` yet.

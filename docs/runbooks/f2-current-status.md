@@ -1,5 +1,19 @@
 # Current implementation and launch status
 
+## vLLM loader under deep parking is a deployment setting — 2026-10-07 (branch `feat/vllm-load-strategy-setting`)
+
+Owner decision 1 of 2026-10-07 (option B), recorded as the note on ADR 0014 §3 and §4.
+`engine_config.vllm.safetensors_load_strategy` (`eager` or `lazy`) chooses vLLM's loader;
+omitted, a parking deployment still renders `eager` and a non-parking one renders nothing,
+and the command fingerprint and resolved configuration are unchanged (pinned). The raw
+`--safetensors-load-strategy` in `extra_args` is refused with or without sleep mode. Origin
+of the default: commit 785b887 (vLLM 0.29, Qwen3-4B, wake 57 s to 7.5 s); catalog evidence
+against it on vLLM 0.30 NVFP4: about 15–17 GiB more held once loaded, wake about 55 s.
+
+CPU tests only (rendering under and outside sleep mode, refusal of the raw option and of
+other values and families, snapshot round trip, pinned identity). Not qualification; a live
+deep-park run with `lazy` is still needed.
+
 ## gpt-oss refuses parking on vLLM and SGLang — 2026-10-07 (branch `gptoss-deep-refusal-wake-bound`)
 
 Owner decision 3 (2026-10-07), from the recipe catalog on host B (CapyCTL 7e50aa9, GB10,

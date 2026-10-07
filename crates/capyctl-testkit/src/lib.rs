@@ -64,6 +64,7 @@ pub fn vllm_launch_settings() -> LaunchSettings {
         },
         block_size_tokens: None,
         max_num_batched_tokens: None,
+        safetensors_load_strategy: None,
         tool_call_parser: None,
         reasoning_parser: None,
         enable_sleep_mode: false,
