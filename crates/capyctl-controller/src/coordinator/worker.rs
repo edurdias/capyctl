@@ -2803,9 +2803,10 @@ async fn drive_group_residency(
                     if !shared.accepting.load(Ordering::Acquire) {
                         return Err(error);
                     }
-                    // Evidence the store did not accept proves nothing: every
-                    // charge stays and the group stops as uncertain.
-                    Err(GroupResidencyError::MemberSilent { rank: 0 })
+                    // Evidence the store did not accept proves nothing of any
+                    // one rank: every charge stays and the group stops as
+                    // uncertain, naming no rank (ADR 0028 §12).
+                    Err(GroupResidencyError::Unproven(error.to_string()))
                 }
             }
         }
@@ -2825,22 +2826,47 @@ async fn drive_group_residency(
                 .await?;
         }
         Err(error) => {
+            // The failure is recorded before the step reads uncertain, so the
+            // scheduler's retry of the group stop (R42) never reads the step
+            // without it and stops under the wrong principal.
+            record_group_residency_failure(shared, &target, error).await;
             uncertain(error.to_string()).await?;
-            fail_group_residency(shared, &target, error).await;
+            let owed = capyctl_store::ordinary_lifecycle::park::GroupResidencyStop {
+                deployment_id: target.group.deployment_id.clone(),
+                instance_index: target.group.instance_index,
+                generation: target.group.plan.generation(),
+                operation_id: target.group.operation_id.clone(),
+                failed: error.failed_rank().is_some(),
+            };
+            let commands = CoordinatorCommands {
+                shared: shared.clone(),
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(reason) = accept_group_residency_stop(&commands, &owed) {
+                    capyctl_domain::role_log::notice(
+                        capyctl_domain::role_log::Level::Warning,
+                        &format!(
+                            "deployment {} instance {}: the group stop after its park or wake \
+                             was not accepted yet ({reason}); dispatch stays closed, every \
+                             member stays charged and the stop is retried",
+                            owed.deployment_id, owed.instance_index
+                        ),
+                    );
+                }
+            })
+            .await;
         }
     }
     hosts.residency_concluded(&work.deployment_id, work.kind, outcome.as_ref().map(drop));
     Ok(true)
 }
 
-/// ADR 0028 §11, §12: a group park or wake that did not settle stops the
-/// group. A silent member is marked uncertain with its full charge
-/// (`group_member_uncertain`); a failure records the rank it failed at and
-/// its closed code (`group_member_failed`, `group_wake_mismatch`), and stops
-/// under the failure principal so `recovery: reconcile` relaunches it once
-/// every member settled. The stop's cleanup is the group stop: every member
-/// terminated at once, each released only on its own host's evidence.
-async fn fail_group_residency(
+/// ADR 0028 §11, §12: what a group park or wake that did not settle leaves
+/// recorded. A silent member is marked uncertain with its full charge; an
+/// uncertainty (a silent member, or evidence the store did not accept) reads
+/// `group_member_uncertain`; a failure records the rank it failed at and its
+/// closed code (`group_member_failed`, `group_wake_mismatch`).
+async fn record_group_residency_failure(
     shared: &Arc<Shared>,
     target: &crate::group_residency::ResidencyTarget,
     error: &crate::group_residency::GroupResidencyError,
@@ -2854,26 +2880,22 @@ async fn fail_group_residency(
         GroupResidencyError::MemberSilent { rank } => Some(*rank),
         _ => None,
     };
-    let commands = CoordinatorCommands {
-        shared: shared.clone(),
-    };
+    let shared = shared.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(owner) = commands.shared.owner.lock() {
-            let store = owner.store();
-            if let Some(rank) = silent {
-                let _ = store.mark_member_uncertain(
-                    &group.deployment_id,
-                    group.instance_index,
-                    generation,
-                    rank,
-                );
-                let _ = store.record_group_status(
-                    &group.deployment_id,
-                    group.instance_index,
-                    "group_member_uncertain",
-                );
-            }
-            if let Some(rank) = failed {
+        let Ok(owner) = shared.owner.lock() else {
+            return;
+        };
+        let store = owner.store();
+        if let Some(rank) = silent {
+            let _ = store.mark_member_uncertain(
+                &group.deployment_id,
+                group.instance_index,
+                generation,
+                rank,
+            );
+        }
+        match failed {
+            Some(rank) => {
                 let _ = store.record_group_failure_code(
                     &group.deployment_id,
                     group.instance_index,
@@ -2882,31 +2904,67 @@ async fn fail_group_residency(
                     &code,
                 );
             }
-        }
-        let principal = if failed.is_some() {
-            crate::engine_exit::EXIT_PRINCIPAL
-        } else {
-            GROUP_RESIDENCY_PRINCIPAL
-        };
-        let key = format!("group-residency:{}:{generation}", group.operation_id);
-        if let Err(reason) = crate::engine_exit::accept_instance_stop(
-            &commands,
-            &group.deployment_id,
-            group.instance_index,
-            principal,
-            &key,
-        ) {
-            capyctl_domain::role_log::notice(
-                capyctl_domain::role_log::Level::Warning,
-                &format!(
-                    "deployment {} instance {}: the group stop after its park or wake was not \
-                     accepted yet ({reason}); every member stays charged",
-                    group.deployment_id, group.instance_index
-                ),
-            );
+            None => {
+                let _ = store.record_group_status(
+                    &group.deployment_id,
+                    group.instance_index,
+                    "group_member_uncertain",
+                );
+            }
         }
     })
     .await;
+}
+
+/// ADR 0028 §11, §12 (R42): the group stop a park or wake that did not settle
+/// owes. It is an ordinary stop of the instance, whose cleanup is the group
+/// stop (every member terminated at once, each released only on its own
+/// host's evidence). A recorded failure stops under the failure principal, so
+/// `recovery: reconcile` relaunches the group once every member settled, as
+/// after a member's exit; an uncertainty alone stops under
+/// [`GROUP_RESIDENCY_PRINCIPAL`] and is never relaunched. Keyed by the
+/// residency operation, so the first attempt and every retry are one stop.
+fn accept_group_residency_stop(
+    commands: &CoordinatorCommands,
+    owed: &capyctl_store::ordinary_lifecycle::park::GroupResidencyStop,
+) -> Result<Option<String>, String> {
+    let principal = if owed.failed {
+        crate::engine_exit::EXIT_PRINCIPAL
+    } else {
+        GROUP_RESIDENCY_PRINCIPAL
+    };
+    crate::engine_exit::accept_instance_stop(
+        commands,
+        &owed.deployment_id,
+        owed.instance_index,
+        principal,
+        &format!("group-residency:{}:{}", owed.operation_id, owed.generation),
+    )
+}
+
+/// ADR 0028 §11, §12 (R42): one scheduler pass's retry of every group stop a
+/// failed park or wake still owes, read from the store (so a controller
+/// restart retries it too). Until one is accepted the group's dispatch stays
+/// closed under its recorded reason and every member stays charged. Returns
+/// whether any stop was accepted.
+async fn retry_group_residency_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    let owed = shared
+        .read(|owner, _| owner.store().group_residency_stops_due(owner.session()))
+        .await?;
+    if owed.is_empty() {
+        return Ok(false);
+    }
+    let commands = CoordinatorCommands {
+        shared: shared.clone(),
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        owed.iter()
+            .filter(|owed| accept_group_residency_stop(&commands, owed).is_ok())
+            .count()
+            > 0
+    })
+    .await
+    .unwrap_or(false))
 }
 
 /// The principal a group stops under when a park or wake left a member

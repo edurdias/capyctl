@@ -135,6 +135,12 @@ pub enum GroupResidencyError {
     /// The canary's tokens differ from the reference.
     #[error("group_wake_mismatch: the canary differs from its reference")]
     CanaryMismatch,
+    /// Every member reported, but the store did not accept the evidence
+    /// (its freshness at commit, a request leased meanwhile, a fence moved):
+    /// it proves nothing of any one rank, so no rank is named and every
+    /// charge stays whole.
+    #[error("group_member_uncertain: the members' reports were not accepted: {0}")]
+    Unproven(String),
     /// The head refused before any effect: nothing changed.
     #[error("{code}: {reason}")]
     Refused { code: String, reason: String },
@@ -144,7 +150,7 @@ impl GroupResidencyError {
     /// The closed code (spec §16).
     pub fn code(&self) -> &str {
         match self {
-            Self::MemberSilent { .. } => "group_member_uncertain",
+            Self::MemberSilent { .. } | Self::Unproven(_) => "group_member_uncertain",
             Self::MemberResident { .. } | Self::MemberAsleep { .. } | Self::HeadNotReady(_) => {
                 "group_member_failed"
             }
@@ -159,7 +165,7 @@ impl GroupResidencyError {
         match self {
             Self::MemberResident { rank } | Self::MemberAsleep { rank } => Some(*rank),
             Self::HeadNotReady(_) | Self::CanaryMismatch => Some(0),
-            Self::MemberSilent { .. } | Self::Refused { .. } => None,
+            Self::MemberSilent { .. } | Self::Unproven(_) | Self::Refused { .. } => None,
         }
     }
 }
