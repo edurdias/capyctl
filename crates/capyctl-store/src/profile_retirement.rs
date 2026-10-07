@@ -57,13 +57,21 @@ pub enum RetirementProgress {
 /// The most instances one retirement names; more is refused, never half done.
 const MAX_CANDIDATES: usize = 4096;
 
-/// The profile name a binding's revision was resolved with on `host`.
-const PROFILE_OF: &str = "COALESCE(
+/// The profile name revision `revision` of deployment `deployment` (SQL
+/// expressions) was resolved with on `host` (`?1`).
+fn profile_of(deployment: &str, revision: &str) -> String {
+    format!(
+        "COALESCE(
     (SELECT json_extract(h.source_json,'$.runtime_profile') FROM host_effective_revisions h
-      WHERE h.deployment_id=b.deployment_id AND h.revision=b.revision AND h.host_id=?1 AND h.source_json IS NOT NULL),
+      WHERE h.deployment_id={deployment} AND h.revision={revision} AND h.host_id=?1 AND h.source_json IS NOT NULL),
     (SELECT json_extract(s.config_json,'$.runtime_profile') FROM managed_configuration_sources s
-      WHERE s.deployment_id=b.deployment_id AND s.revision=b.revision))";
+      WHERE s.deployment_id={deployment} AND s.revision={revision}))"
+    )
+}
 
+/// ADR 0028 §5, §11: a group's binding names only its head's ingress, so a
+/// group also uses the profile on every host where one of its members is not
+/// yet settled on that host's own evidence (an uncertain member included).
 fn candidates(
     conn: &Connection,
     host: &str,
@@ -76,8 +84,16 @@ fn candidates(
             AND (EXISTS(SELECT 1 FROM deployment_instances i WHERE i.deployment_id=b.deployment_id
                           AND i.instance_index=b.instance_index AND i.host_id=?1)
                  OR EXISTS(SELECT 1 FROM remote_binding_ingress r WHERE r.binding_id=b.id AND r.host_id=?1))
-            AND {PROFILE_OF}=?2
-          ORDER BY d.id, b.instance_index LIMIT ?3"
+            AND {}=?2
+         UNION
+         SELECT d.id, d.name, COALESCE(i.revision,d.revision), m.instance_index FROM group_members m
+           JOIN deployments d ON d.id=m.deployment_id
+           JOIN deployment_instances i ON i.deployment_id=m.deployment_id AND i.instance_index=m.instance_index
+          WHERE m.host_id=?1 AND m.state!='settled' AND d.kind='model'
+            AND {}=?2
+          ORDER BY 1, 4 LIMIT ?3",
+        profile_of("b.deployment_id", "b.revision"),
+        profile_of("m.deployment_id", "COALESCE(i.revision,d.revision)"),
     );
     let found = conn
         .prepare(&sql)?
