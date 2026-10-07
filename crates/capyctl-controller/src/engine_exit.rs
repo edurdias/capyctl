@@ -170,17 +170,25 @@ impl EngineExits {
                 }
             }
         };
-        if launch.first {
-            capyctl_domain::role_log::notice(
-                capyctl_domain::role_log::Level::Warning,
-                &format!(
-                    "deployment {} instance {}: engine exited ({}); dispatch closed, settling \
-                 with verified cleanup",
-                    launch.fence.deployment_id, launch.instance_index, exit.status
-                ),
-            );
-        }
-        match self.stop(&launch) {
+        // ADR 0028 §11: a member of a group fails the whole group; its stop
+        // terminates every member.
+        let stopped = match launch.group_rank {
+            Some(rank) => crate::group_settlement::on_member_exit(&self.commands, &launch, rank),
+            None => {
+                if launch.first {
+                    capyctl_domain::role_log::notice(
+                        capyctl_domain::role_log::Level::Warning,
+                        &format!(
+                            "deployment {} instance {}: engine exited ({}); dispatch closed, \
+                             settling with verified cleanup",
+                            launch.fence.deployment_id, launch.instance_index, exit.status
+                        ),
+                    );
+                }
+                accept_exit_stop(&self.commands, &launch)
+            }
+        };
+        match stopped {
             Ok(operation_id) => ExitHandled::Settling { operation_id },
             Err(reason) => {
                 // Retried on every later observation of the same exit; said once.
@@ -198,41 +206,41 @@ impl EngineExits {
             }
         }
     }
+}
 
-    /// SPEC §6.3: an ordinary stop of exactly the exited instance, so the
-    /// deployment stays eligible for on-demand activation. Keyed by the
-    /// binding, so a repeated exit report replays the same stop.
-    fn stop(&self, launch: &ExitedLaunch) -> Result<Option<String>, String> {
-        let deployment = launch.fence.deployment_id.as_str();
-        let revision = self
-            .commands
-            .read(|store| store.current_revision(deployment))
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "the deployment is gone".to_owned())?;
-        let window = self
-            .commands
-            .read(|store| store.lifecycle_windows(deployment))
-            .map_err(|error| error.to_string())?
-            .map_or(DEFAULT_STOP_WINDOW_MS, |windows| windows.stop_ms);
-        let deadline = self
-            .commands
-            .now_ms()
-            .map_err(|error| error.to_string())?
-            .checked_add(window)
-            .ok_or_else(|| "clock overflow".to_owned())?;
-        let key = format!("engine-exit:{}", launch.binding_id);
-        self.commands
-            .stop_instance(
-                EXIT_PRINCIPAL,
-                deployment,
-                launch.instance_index,
-                revision,
-                &key,
-                deadline,
-            )
-            .map(|receipt| receipt.map(|receipt| receipt.operation_id().to_owned()))
-            .map_err(|error| error.to_string())
-    }
+/// SPEC §6.3: an ordinary stop of exactly the exited instance, so the
+/// deployment stays eligible for on-demand activation. Keyed by the binding,
+/// so a repeated exit report replays the same stop.
+pub(crate) fn accept_exit_stop(
+    commands: &CoordinatorCommands,
+    launch: &ExitedLaunch,
+) -> Result<Option<String>, String> {
+    let deployment = launch.fence.deployment_id.as_str();
+    let revision = commands
+        .read(|store| store.current_revision(deployment))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the deployment is gone".to_owned())?;
+    let window = commands
+        .read(|store| store.lifecycle_windows(deployment))
+        .map_err(|error| error.to_string())?
+        .map_or(DEFAULT_STOP_WINDOW_MS, |windows| windows.stop_ms);
+    let deadline = commands
+        .now_ms()
+        .map_err(|error| error.to_string())?
+        .checked_add(window)
+        .ok_or_else(|| "clock overflow".to_owned())?;
+    let key = format!("engine-exit:{}", launch.binding_id);
+    commands
+        .stop_instance(
+            EXIT_PRINCIPAL,
+            deployment,
+            launch.instance_index,
+            revision,
+            &key,
+            deadline,
+        )
+        .map(|receipt| receipt.map(|receipt| receipt.operation_id().to_owned()))
+        .map_err(|error| error.to_string())
 }
 
 /// A closed phrase for how a process ended.

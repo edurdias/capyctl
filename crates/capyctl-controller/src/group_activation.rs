@@ -82,6 +82,10 @@ pub const READINESS_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 /// ADR 0028 §8 (R23): how many times one Launch with no answer is resent,
 /// identically, before its member is left uncertain and charged.
 pub const LAUNCH_RESENDS: u32 = 2;
+/// ADR 0028 §8, §11: once a member's Launch failed, how long the Launches
+/// still in flight are driven before the group is stopped, so each reaches
+/// its host and a prompt reply has its identities recorded (R23).
+pub const FAILED_LAUNCH_GRACE: Duration = Duration::from_secs(1);
 
 pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -249,11 +253,27 @@ pub async fn probe_head(
     max_tokens: u32,
     deadline: Duration,
 ) -> Result<Vec<u32>, ProbeError> {
+    let command = probe_command(&ctx.hosts.controller_id(), head, max_tokens, deadline);
+    let result = tokio::time::timeout(deadline, ctx.hosts.execute(command))
+        .await
+        .map_err(|_| ProbeError::Timeout(deadline))?
+        .map_err(ProbeError::Failed)?;
+    probe_answer(&result, head, max_tokens)
+}
+
+/// The completion probe [`probe_head`] sends, for a transport of its own
+/// (the readiness supervisor re-proves a head on its new session with it).
+pub fn probe_command(
+    controller_id: &str,
+    head: &HeadLaunch,
+    max_tokens: u32,
+    deadline: Duration,
+) -> MemberCommand {
     let host = head.plan.head().member.host_id.clone();
     let id = ulid::Ulid::new().to_string();
     let mut command = MemberCommand {
         identity: CommandIdentity {
-            controller_id: ctx.hosts.controller_id(),
+            controller_id: controller_id.to_owned(),
             member: MemberKey {
                 host_id: host,
                 member_id: member_id(0),
@@ -277,10 +297,16 @@ pub async fn probe_head(
         },
     };
     command.identity.payload_digest = command.canonical_digest();
-    let result = tokio::time::timeout(deadline, ctx.hosts.execute(command))
-        .await
-        .map_err(|_| ProbeError::Timeout(deadline))?
-        .map_err(ProbeError::Failed)?;
+    command
+}
+
+/// The generated token ids of a completion probe's answer: completed on the
+/// head's own launch, at least one token and at most `max_tokens`.
+pub fn probe_answer(
+    result: &pb::MemberExecutionResult,
+    head: &HeadLaunch,
+    max_tokens: u32,
+) -> Result<Vec<u32>, ProbeError> {
     if result.state != "completed" || result.owned_handle != head.owned_handle {
         return Err(ProbeError::Failed(
             "the head did not complete the probe on its launch".into(),
@@ -289,7 +315,7 @@ pub async fn probe_head(
     if result.probe_tokens.is_empty() || result.probe_tokens.len() > max_tokens as usize {
         return Err(ProbeError::Failed("the head generated no token".into()));
     }
-    Ok(result.probe_tokens)
+    Ok(result.probe_tokens.clone())
 }
 
 /// One member as the activation prepares it.
@@ -568,7 +594,7 @@ async fn activate(
         }
     };
     let launches = launch_commands(ctx, work, &context, &plan, &members, &digest)?;
-    let outcome = launch_all(ctx, work, &plan, &members, &launches).await;
+    let outcome = launch_all(ctx, work, &members, &launches).await;
     let outcome = match outcome {
         Ok((head_reply, head_identities)) => {
             ready(
@@ -981,8 +1007,9 @@ fn launch_commands(
         .collect())
 }
 
-/// ADR 0028 §8 (R23): fence one member as dispatched, durably, then send its
-/// Launch; a Launch with no answer is fenced again and resent identically.
+/// ADR 0028 §8 (R23): fence one member as dispatched, durably, with its
+/// Launch's handle (the command id), then send its Launch; a Launch with no
+/// answer is fenced again and resent identically.
 async fn dispatch(
     ctx: &GroupCtx,
     work: &InitializeWork,
@@ -1001,6 +1028,7 @@ async fn dispatch(
                     work.instance_index(),
                     fence.generation,
                     rank,
+                    &command.identity.command_id,
                 )
                 .map_err(|e| e.to_string())
         })
@@ -1018,16 +1046,20 @@ async fn dispatch(
 
 /// ADR 0028 §8, §9: every Launch at once. The head's reply is its native
 /// readiness, bounded by `timeouts.initialize`; every member's reply is
-/// watched for an exit. Returns the head's reply and identities, or the
-/// first rank that failed and why. A member whose reply was lost stays
-/// dispatched and charged (R23); its host reconciles it.
+/// watched for an exit, and the first member that fails ends the wait (the
+/// group is stopped, ADR 0028 §11: a head never forms without it). Returns
+/// the head's reply and identities, or the first rank that failed and why.
+/// Every identity a reply reports is recorded for its member, gone ones too:
+/// they are the host's journal of that Launch, which its stop settles on. A
+/// member whose reply was lost stays dispatched and charged (R23); its
+/// host's journal names its identities when it is stopped.
 async fn launch_all(
     ctx: &GroupCtx,
     work: &InitializeWork,
-    plan: &GroupPlan,
     members: &[Member],
     launches: &[MemberCommand],
 ) -> Result<(pb::MemberExecutionResult, Vec<ProcessIdentity>), (u32, String)> {
+    use futures::StreamExt;
     let fence = work.fence();
     // ADR 0012: the head's ingress is provisioned before its Launch.
     ctx.hosts
@@ -1045,23 +1077,7 @@ async fn launch_all(
     let left = Duration::from_millis(
         u64::try_from(work.deadline_ms() - capyctl_protocol::now_unix_ms()).unwrap_or(0),
     );
-    let sends = futures::future::join_all(members.iter().zip(launches).map(
-        |(member, command)| async move {
-            (member.rank, dispatch(ctx, work, member.rank, command).await)
-        },
-    ));
-    // ADR 0028 §9, owner decision 5: head readiness within `timeouts.initialize`.
-    let replies = tokio::time::timeout(initialize.min(left), sends)
-        .await
-        .map_err(|_| {
-            (
-                0,
-                "the head did not become ready within timeouts.initialize".to_owned(),
-            )
-        })?;
-    let mut failed: Option<(u32, String)> = None;
-    let mut head = None;
-    for (rank, reply) in replies {
+    let judge = |rank: u32, reply: Result<pb::MemberExecutionResult, String>| {
         let result = match reply {
             Ok(result) => result,
             Err(reason) => {
@@ -1076,50 +1092,75 @@ async fn launch_all(
                         )
                         .map_err(|e| e.to_string())
                 });
-                failed.get_or_insert((rank, format!("group_member_uncertain: {reason}")));
-                continue;
+                return Err((rank, format!("group_member_uncertain: {reason}")));
             }
         };
         if !result.refused.is_empty() {
-            failed.get_or_insert((rank, result.refused.clone()));
-            continue;
+            return Err((rank, result.refused.clone()));
         }
-        let identities = alive(&result);
-        if result.state == "launched" && result.claim_retained && !identities.is_empty() {
-            let recorded = locked(ctx, |o| {
+        let reported: Vec<ProcessIdentity> = result.processes.iter().map(process).collect();
+        if result.state == "launched" && result.claim_retained && !reported.is_empty() {
+            locked(ctx, |o| {
                 o.store()
                     .mark_member_launched(
                         &fence.deployment_id,
                         work.instance_index(),
                         fence.generation,
                         rank,
-                        &identities,
+                        &reported,
                     )
                     .map_err(|e| e.to_string())
-            });
-            if let Err(error) = recorded {
-                failed.get_or_insert((rank, format!("identities not recorded: {error}")));
-                continue;
-            }
+            })
+            .map_err(|error| (rank, format!("identities not recorded: {error}")))?;
         }
+        let identities = alive(&result);
         if crate::agent_sessions::launch_ended_before_readiness(&result) || identities.is_empty() {
-            failed.get_or_insert((rank, "group_member_failed: the member exited".into()));
-            continue;
+            return Err((rank, "group_member_failed: the member exited".into()));
         }
-        if rank == 0 {
-            if !result.model_usable {
-                failed.get_or_insert((0, "the head did not prove readiness".into()));
-                continue;
+        if rank == 0 && !result.model_usable {
+            return Err((0, "the head did not prove readiness".into()));
+        }
+        Ok((rank == 0).then_some((result, identities)))
+    };
+    let mut sends: futures::stream::FuturesUnordered<_> = members
+        .iter()
+        .zip(launches)
+        .map(|(member, command)| async move {
+            (member.rank, dispatch(ctx, work, member.rank, command).await)
+        })
+        .collect();
+    // ADR 0028 §9, owner decision 5: head readiness within `timeouts.initialize`.
+    let failed = tokio::time::timeout(initialize.min(left), async {
+        let mut head = None;
+        while let Some((rank, reply)) = sends.next().await {
+            match judge(rank, reply) {
+                Ok(Some(found)) => head = Some(found),
+                Ok(None) => {}
+                Err(failed) => return Err(failed),
             }
-            head = Some((result, identities));
         }
-    }
-    let _ = plan;
-    match (failed, head) {
-        (Some(failed), _) => Err(failed),
-        (None, Some(head)) => Ok(head),
-        (None, None) => Err((0, "the head did not answer".into())),
-    }
+        head.ok_or((0, "the head did not answer".to_owned()))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err((
+            0,
+            "the head did not become ready within timeouts.initialize".to_owned(),
+        ))
+    });
+    let failed = match failed {
+        Ok(head) => return Ok(head),
+        Err(failed) => failed,
+    };
+    // The Launches still in flight get out to their hosts, and whatever
+    // answers soon has its identities recorded, before the group is stopped.
+    let _ = tokio::time::timeout(FAILED_LAUNCH_GRACE, async {
+        while let Some((rank, reply)) = sends.next().await {
+            let _ = judge(rank, reply);
+        }
+    })
+    .await;
+    Err(failed)
 }
 
 /// ADR 0028 §9 (decided 2026-10-06): one 1-token completion through the

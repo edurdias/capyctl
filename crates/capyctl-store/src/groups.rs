@@ -133,10 +133,24 @@ impl MemberState {
             _ => return Err(corrupt()),
         })
     }
+
+    /// The stored name, which status reports (ADR 0028 §15).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Dispatching => "dispatching",
+            Self::Launched => "launched",
+            Self::Settled => "settled",
+            Self::Uncertain => "uncertain",
+        }
+    }
 }
 
 /// One stored member of a group plan. `dispatched` records durably that its
 /// Launch may have been sent; it survives `Uncertain` and is never cleared.
+/// `launch_handle` is the command id that Launch carries (its owned handle on
+/// the member's host), recorded with the dispatch fence; `identities` are the
+/// processes recorded for it, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberRow {
     pub rank: u32,
@@ -144,6 +158,8 @@ pub struct MemberRow {
     pub owner_id: String,
     pub state: MemberState,
     pub dispatched: bool,
+    pub launch_handle: Option<String>,
+    pub identities: Option<Vec<ProcessIdentity>>,
 }
 
 /// SPEC §11, ADR 0028 §11: gone evidence for one member, reported by that
@@ -273,6 +289,21 @@ fn canonical_identities(identities: &[ProcessIdentity]) -> String {
         .collect();
     rows.sort();
     serde_json::to_string(&rows).unwrap_or_default()
+}
+
+/// The stored form back to identities.
+fn decode_identities(json: &str) -> Result<Vec<ProcessIdentity>, GroupStoreError> {
+    let rows: Vec<(String, u32, String, u64)> =
+        serde_json::from_str(json).map_err(|_| corrupt())?;
+    Ok(rows
+        .into_iter()
+        .map(|(role, pid, boot_id, start_ticks)| ProcessIdentity {
+            role,
+            pid,
+            boot_id,
+            start_ticks,
+        })
+        .collect())
 }
 
 fn now_ms() -> i64 {
@@ -464,6 +495,156 @@ pub(crate) fn migrate_v41(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             WHERE digest IS NOT NULL AND host_id!='';",
     )?;
     Ok(())
+}
+
+/// Schema v42 data step (ADR 0028 §8, §11). Idempotent: each column is added
+/// only when missing.
+pub(crate) fn migrate_v42(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !has_column(tx, "group_members", "launch_handle")? {
+        tx.execute_batch("ALTER TABLE group_members ADD COLUMN launch_handle TEXT;")?;
+    }
+    if !has_column(tx, "group_plans", "failed_rank")? {
+        tx.execute_batch(
+            "ALTER TABLE group_plans ADD COLUMN failed_rank INTEGER
+               CHECK(failed_rank IS NULL OR failed_rank>=0);",
+        )?;
+    }
+    Ok(())
+}
+
+/// ADR 0028 §9, §11: a group head's binding with the plan it realizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundGroup {
+    pub deployment_id: String,
+    pub instance_index: u32,
+    pub plan: GroupPlan,
+    pub members: Vec<MemberRow>,
+}
+
+/// The plan of an instance at `generation` with its members in rank order.
+pub(crate) fn plan_at(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+) -> Result<Option<(GroupPlan, Vec<MemberRow>)>, GroupStoreError> {
+    let json: Option<String> = tx
+        .query_row(
+            "SELECT plan_json FROM group_plans
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![deployment_id, instance_index, generation],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let plan = decode_plan(&json)?;
+    type Row = (
+        u32,
+        String,
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = tx
+        .prepare(
+            "SELECT rank,host_id,owner_id,state,dispatched,launch_handle,identities_json
+               FROM group_members
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
+        )?
+        .query_map(params![deployment_id, instance_index, generation], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let members = rows
+        .into_iter()
+        .map(
+            |(rank, host_id, owner_id, state, dispatched, launch_handle, identities)| {
+                Ok(MemberRow {
+                    rank,
+                    host_id,
+                    owner_id,
+                    state: MemberState::parse(&state)?,
+                    dispatched,
+                    launch_handle,
+                    identities: identities.as_deref().map(decode_identities).transpose()?,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, GroupStoreError>>()?;
+    Ok(Some((plan, members)))
+}
+
+/// ADR 0028 §11: keep the first rank a group failed at, and name the failure
+/// in the instance's status (`group_member_failed`, spec §16).
+pub(crate) fn record_failure(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+    rank: u32,
+) -> Result<(), GroupStoreError> {
+    let members: u32 = tx.query_row(
+        "SELECT COUNT(*) FROM group_members
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+        params![deployment_id, instance_index, generation],
+        |r| r.get(0),
+    )?;
+    if rank >= members {
+        return Err(GroupStoreError::Conflict);
+    }
+    tx.execute(
+        "UPDATE group_plans SET failed_rank=?4
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND failed_rank IS NULL",
+        params![deployment_id, instance_index, generation, rank],
+    )?;
+    record_status(tx, deployment_id, instance_index, "group_member_failed")
+}
+
+/// SPEC §17, ADR 0028 §16: the closed code a group's failure or stop leaves
+/// in its instance's status. Keyed by the instance: its stop moves it to a
+/// later generation while its members still settle.
+fn record_status(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    code: &str,
+) -> Result<(), GroupStoreError> {
+    tx.execute(
+        "UPDATE deployment_instances SET last_error=?3 WHERE deployment_id=?1 AND instance_index=?2",
+        params![deployment_id, instance_index, code],
+    )?;
+    Ok(())
+}
+
+/// ADR 0028 §11: whether an instance's generation ran as a group and, if it
+/// did, whether its plan settled (every member released on its own host's
+/// evidence, the port and worker leases freed). `None` for a single-host
+/// launch, which this never changes (T39).
+pub(crate) fn plan_settled(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+) -> rusqlite::Result<Option<bool>> {
+    tx.query_row(
+        "SELECT state='settled' FROM group_plans
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+        params![deployment_id, instance_index, generation],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// ADR 0028 §11: once no member of the plan at `generation` is reserved,
@@ -762,8 +943,12 @@ impl crate::Store {
     /// is no release on revocation alone: a member whose host never reports
     /// its identities keeps its charge, and status must show it as retained.
     ///
-    /// A repeated fence is accepted. Fencing a member that is settled, or
-    /// uncertain without having been dispatched, is a `Conflict`: nothing is
+    /// `launch_handle` is the command id of the Launch about to be sent (its
+    /// owned handle on the member's host); it is recorded with the first fence
+    /// so the member's stop reaches that launch from any later session
+    /// (ADR 0028 §11). A repeated fence naming the same handle is accepted;
+    /// one naming another handle is a `Conflict`, as is fencing a member that
+    /// is settled, or uncertain without having been dispatched: nothing is
     /// launched for it.
     pub fn mark_member_dispatching(
         &self,
@@ -771,30 +956,41 @@ impl crate::Store {
         instance_index: u32,
         generation: i64,
         rank: u32,
+        launch_handle: &str,
     ) -> Result<(), GroupStoreError> {
+        if launch_handle.trim().is_empty() {
+            return Err(GroupStoreError::Plan);
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let row: Option<(String, bool)> = tx
+        let row: Option<(String, bool, Option<String>)> = tx
             .query_row(
-                "SELECT state,dispatched FROM group_members
+                "SELECT state,dispatched,launch_handle FROM group_members
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
                 params![deployment_id, instance_index, generation, rank],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((state, dispatched)) = row else {
+        let Some((state, dispatched, handle)) = row else {
             return Err(GroupStoreError::Conflict);
         };
         match (MemberState::parse(&state)?, dispatched) {
             (MemberState::Reserved, false) => {
                 tx.execute(
-                    "UPDATE group_members SET state='dispatching',dispatched=1
+                    "UPDATE group_members SET state='dispatching',dispatched=1,launch_handle=?5
                       WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
-                    params![deployment_id, instance_index, generation, rank],
+                    params![
+                        deployment_id,
+                        instance_index,
+                        generation,
+                        rank,
+                        launch_handle
+                    ],
                 )?;
             }
-            // A retry of the fence, or of a Launch already fenced.
+            // A retry of the fence, or of a Launch already fenced: the same
+            // Launch, never another one.
             (MemberState::Settled, _) => return Err(GroupStoreError::Conflict),
-            (_, true) => {}
+            (_, true) if handle.as_deref() == Some(launch_handle) => {}
             _ => return Err(GroupStoreError::Conflict),
         }
         tx.commit()?;
@@ -1000,41 +1196,132 @@ impl crate::Store {
         instance_index: u32,
     ) -> Result<Option<(GroupPlan, Vec<MemberRow>)>, GroupStoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        let row: Option<(i64, String)> = tx
+        let generation: Option<i64> = tx
             .query_row(
-                "SELECT generation,plan_json FROM group_plans
+                "SELECT generation FROM group_plans
                   WHERE deployment_id=?1 AND instance_index=?2 ORDER BY generation DESC LIMIT 1",
                 params![deployment_id, instance_index],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()?;
-        let Some((generation, json)) = row else {
+        let Some(generation) = generation else {
             return Ok(None);
         };
-        let plan = decode_plan(&json)?;
-        let rows: Vec<(u32, String, String, String, bool)> = tx
-            .prepare(
-                "SELECT rank,host_id,owner_id,state,dispatched FROM group_members
-                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 ORDER BY rank",
-            )?
-            .query_map(params![deployment_id, instance_index, generation], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let members = rows
-            .into_iter()
-            .map(|(rank, host_id, owner_id, state, dispatched)| {
-                Ok(MemberRow {
-                    rank,
-                    host_id,
-                    owner_id,
-                    state: MemberState::parse(&state)?,
-                    dispatched,
-                })
-            })
-            .collect::<Result<Vec<_>, GroupStoreError>>()?;
+        let plan = plan_at(&tx, deployment_id, instance_index, generation)?;
         tx.commit()?;
-        Ok(Some((plan, members)))
+        Ok(plan)
+    }
+
+    /// The group plan of an instance at `generation`, with its members in
+    /// rank order, or `None` when that generation had none.
+    pub fn group_plan_at(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<Option<(GroupPlan, Vec<MemberRow>)>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let plan = plan_at(&tx, deployment_id, instance_index, generation)?;
+        tx.commit()?;
+        Ok(plan)
+    }
+
+    /// ADR 0028 §9, §11: the group a runtime binding realizes, when it is a
+    /// group head's: the binding's Initialize names its instance and
+    /// generation, and a plan exists there. `None` for any other binding.
+    pub fn group_of_binding(
+        &self,
+        binding_id: &str,
+    ) -> Result<Option<BoundGroup>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let lane: Option<(String, u32, i64)> = tx
+            .query_row(
+                "SELECT r.deployment_id,r.instance_index,r.generation FROM lifecycle_steps s
+                   JOIN operations o ON o.id=s.operation_id
+                   JOIN lifecycle_runs r ON r.operation_id=s.operation_id
+                  WHERE s.binding_id=?1 AND o.kind='initialize'",
+                [binding_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((deployment_id, instance_index, generation)) = lane else {
+            return Ok(None);
+        };
+        let bound =
+            plan_at(&tx, &deployment_id, instance_index, generation)?.map(|(plan, members)| {
+                BoundGroup {
+                    deployment_id,
+                    instance_index,
+                    plan,
+                    members,
+                }
+            });
+        tx.commit()?;
+        Ok(bound)
+    }
+
+    /// ADR 0028 §11: the group at `generation` failed at `rank` (an exit, a
+    /// launch failure or a failed readiness). The first failure is kept; a
+    /// later one changes nothing. Nothing is released here.
+    pub fn record_group_failure(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+    ) -> Result<(), GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        record_failure(&tx, deployment_id, instance_index, generation, rank)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// SPEC §17, ADR 0028 §16: name `code` (`group_member_uncertain` while a
+    /// stopped group still has an unreachable member) in the status of the
+    /// group's instance. Nothing else changes.
+    pub fn record_group_status(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        code: &str,
+    ) -> Result<(), GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        record_status(&tx, deployment_id, instance_index, code)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The rank the group at `generation` failed at, if it failed.
+    pub fn group_failure(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<Option<u32>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let rank: Option<Option<u32>> = tx
+            .query_row(
+                "SELECT failed_rank FROM group_plans
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+                params![deployment_id, instance_index, generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(rank.flatten())
+    }
+
+    /// ADR 0028 §11, §13: whether an unsettled group plan holds `port` on
+    /// `host_id` as its rendezvous port.
+    pub fn rendezvous_port_held_on(
+        &self,
+        host_id: &str,
+        port: u16,
+    ) -> Result<bool, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let held = rendezvous_port_held(&tx, host_id, port)?;
+        tx.commit()?;
+        Ok(held)
     }
 
     /// ADR 0028 §5, §7 (R15): a `Prepare` found `port` held outside CapyCTL on

@@ -760,6 +760,81 @@ impl crate::Store {
         Ok(accepted)
     }
 
+    /// ADR 0028 §11 (SPEC §11 "Recovery"): under `recovery: reconcile`, a
+    /// group that failed after it was Ready (a member exited, and the stop
+    /// that exit asked for completed) relaunches as a new generation and
+    /// plan. Each start is accepted in its own transaction, which reads the
+    /// old plan settled (every member released on its own host's evidence)
+    /// in the same transaction that accepts the start at the instance's new
+    /// generation, the one its stop drew. An instance an operator stopped
+    /// since, one already started at that generation, or one whose start is
+    /// refused is left alone. Returns the starts accepted.
+    pub fn relaunch_failed_groups(
+        &self,
+        s: &CoordinatorSession,
+        now: i64,
+    ) -> Result<Vec<Start>, LifecycleError> {
+        const DUE: &str = "SELECT i.deployment_id,i.instance_index,i.revision,i.generation
+            FROM deployment_instances i
+            JOIN group_plans g ON g.deployment_id=i.deployment_id AND g.instance_index=i.instance_index
+           WHERE g.state='settled' AND g.failed_rank IS NOT NULL
+             AND g.generation=(SELECT MAX(generation) FROM group_plans x WHERE x.deployment_id=i.deployment_id AND x.instance_index=i.instance_index)
+             AND i.generation>g.generation AND i.revision IS NOT NULL
+             AND i.desired_state='stopped' AND i.observed_state='stopped'
+             AND NOT EXISTS(SELECT 1 FROM deployments d WHERE d.id=i.deployment_id AND (d.admin_stopped=1 OR d.suspended=1))
+             AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id
+                             WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.generation=i.generation AND o.kind='initialize')
+             AND (SELECT c.principal_id FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id JOIN command_receipts c ON c.operation_id=o.id
+                   WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.generation=i.generation AND o.state='succeeded'
+                   ORDER BY o.accepted_at DESC,o.id DESC LIMIT 1)='system:engine_exit'";
+        let due: Vec<DeploymentFence> = {
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+            check_session(&tx, s)?;
+            let due = tx
+                .prepare(DUE)?
+                .query_map([], |r| {
+                    Ok(DeploymentFence {
+                        deployment_id: r.get(0)?,
+                        revision: r.get(2)?,
+                        generation: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            tx.commit()?;
+            due
+        };
+        let mut started = Vec::new();
+        for fence in due {
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            check_session(&tx, s)?;
+            // Read again under the write lock: still due, still reconcile.
+            let still: bool = tx.query_row(
+                &format!("SELECT EXISTS({DUE} AND i.deployment_id=?1 AND i.generation=?2)"),
+                params![fence.deployment_id, fence.generation],
+                |r| r.get(0),
+            )?;
+            if !still {
+                continue;
+            }
+            let (_, e) = effective(&tx, &fence)?;
+            if e.recovery != capyctl_config::effective::Recovery::Reconcile {
+                continue;
+            }
+            let Some(deadline) = now.checked_add(e.request_deadline_ms) else {
+                continue;
+            };
+            // A refused start rolls back with its transaction; the instance
+            // stays stopped, eligible for an operator's or on-demand start.
+            if let Ok(start) =
+                Self::accept_start_in_transaction(&tx, s, &fence, now, deadline, false)
+            {
+                tx.commit()?;
+                started.push(start);
+            }
+        }
+        Ok(started)
+    }
+
     fn accept_start_in_transaction(
         tx: &Transaction<'_>,
         s: &CoordinatorSession,
@@ -787,6 +862,21 @@ impl crate::Store {
             LifecycleError::Stale => LifecycleError::Conflict,
             error => error,
         })?;
+        // ADR 0028 §11: a group relaunches as a new generation and plan only
+        // once every member of its old plan has settled on its own host's
+        // evidence, checked in the transaction that accepts the start.
+        let unsettled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND state!='settled')",
+            params![f.deployment_id, instance],
+            |r| r.get(0),
+        )?;
+        if unsettled {
+            return Err(if detailed {
+                LifecycleError::RuntimeRetained
+            } else {
+                LifecycleError::Conflict
+            });
+        }
         let (raw, e) = effective(tx, f)?;
         // ADR 0014 §7 (WE3): a revision whose resources wait for its checkpoint
         // digest, or whose checkpoint is known not to match, never starts.

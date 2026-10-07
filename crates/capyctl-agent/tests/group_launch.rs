@@ -1276,6 +1276,46 @@ async fn worker_member_terminates_its_recorded_tree() {
     assert_eq!(named(&gone.result.processes), named(&out.processes));
 }
 
+// T31 (ADR 0028 §11): a worker never records readiness, yet its exit is
+// watched from its Launch on and reported as a `MemberExit` naming its own
+// Launch and the member role its Launch reported; a live worker reports none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_exit_is_reported_under_its_member_role() {
+    let host = FakeHost::new("host-b").with_groups_policy(WORKER_PEER);
+    let plan = two_member_plan(&host);
+    let out = host.execute(launch(plan.clone())).await.unwrap();
+    let scan = || capyctl_agent::exits::scan(host.journal(), "host-b", now_ms());
+    assert!(scan().is_empty(), "a live worker has not exited");
+    let leader = out.processes.iter().find(|p| p.role == "worker-1").unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the recorded leader.
+    assert_eq!(unsafe { libc::kill(leader.pid as i32, libc::SIGKILL) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let exited = loop {
+        let exited = scan();
+        if !exited.is_empty() {
+            break exited;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the exit was never reported"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let exit = &exited[0].exit;
+    assert_eq!(exit.owned_handle, out.owned_handle);
+    assert_eq!(exit.generation, plan.generation());
+    assert_eq!(exit.process.role, "worker-1");
+    assert_eq!(exit.process.pid, leader.pid);
+    // An exit report releases nothing: the claim stays until Terminate.
+    assert!(host
+        .journal()
+        .claimed_launches("")
+        .unwrap()
+        .iter()
+        .any(|claim| claim.command.identity.command_id == out.owned_handle));
+    let _ = host.terminate(&out.owned_handle, &out.processes).await;
+}
+
 // T21 (R11): a vLLM or SGLang member renders the interface holding its peer
 // address as GLOO_SOCKET_IFNAME and its own address, and no NCCL_* or
 // MASTER_* name; TensorFold renders none of them.

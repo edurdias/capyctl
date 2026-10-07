@@ -322,7 +322,19 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
         execution.expected_epoch,
         &footprint,
     ))?;
-    let grant:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE id=?1 AND deployment_id=?2 AND operation_id=?3 AND request_json=?4 AND committed_epoch=?5) AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?6 AND grant_id=?1) AND (SELECT COUNT(*) FROM resource_grants WHERE operation_id=?3)=1",params![execution.grant_id,p.deployment_id,p.operation_id,request,execution.expected_epoch.checked_add(1).ok_or(LifecycleError::CorruptStoredData)?,p.step_id],|r|r.get(0))?;
+    // ADR 0028 §5, §11: a group arm takes no grant; its members hold their
+    // own charges under the group plan of this generation.
+    let grant: bool = if execution.group {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_plans WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3)
+               AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE id=?5)
+               AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?4 AND grant_id IS NULL)",
+            params![p.deployment_id, p.instance_index, p.generation, p.step_id, execution.grant_id],
+            |r| r.get(0),
+        )?
+    } else {
+        tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE id=?1 AND deployment_id=?2 AND operation_id=?3 AND request_json=?4 AND committed_epoch=?5) AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?6 AND grant_id=?1) AND (SELECT COUNT(*) FROM resource_grants WHERE operation_id=?3)=1",params![execution.grant_id,p.deployment_id,p.operation_id,request,execution.expected_epoch.checked_add(1).ok_or(LifecycleError::CorruptStoredData)?,p.step_id],|r|r.get(0))?
+    };
     if !grant {
         return Err(LifecycleError::CorruptStoredData);
     }
@@ -609,7 +621,18 @@ fn retained(
     let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
     // SPEC §7.3 (W5): a completed launch may be parked, or held at a park
     // or restore peak that this stop took over while it was uncertain.
-    let held = if p.source_state == "completed" {
+    let held = if crate::groups::plan_settled(
+        tx,
+        &original.deployment_id,
+        original.instance_index,
+        original.generation,
+    )?
+    .is_some()
+    {
+        // ADR 0028 §5, §11: a group instance holds no instance-owner charge;
+        // each member is charged, and released, on its own host's evidence.
+        !ledger.owners.contains_key(&original.owner())
+    } else if p.source_state == "completed" {
         super::park::retained_footprint(tx, original, e, ledger.owners.get(&original.owner()))?
     } else {
         ledger.owners.get(&original.owner()) == Some(&super::startup::cold(original, e))
@@ -1455,10 +1478,22 @@ pub(crate) fn complete(
         one(tx.execute("UPDATE lifecycle_runs SET state='failed' WHERE operation_id=?1 AND state IN ('running','uncertain')",[&original.operation_id])?)?;
         one(tx.execute("UPDATE operations SET state='failed',error_code='resolved_by_owned_cleanup' WHERE id=?1 AND state='running'",[&original.operation_id])?)?;
     }
-    one(tx.execute(
-        "DELETE FROM resource_owners WHERE owner_id=?1",
-        [&original.owner()],
-    )?)?;
+    // ADR 0028 §11, SPEC §11: a group instance leaves its step only once
+    // every member settled on its own host's evidence (the port with them);
+    // it holds no instance-owner charge to release here.
+    match crate::groups::plan_settled(
+        tx,
+        &original.deployment_id,
+        original.instance_index,
+        original.generation,
+    )? {
+        Some(true) => {}
+        Some(false) => return Err(LifecycleError::Conflict),
+        None => one(tx.execute(
+            "DELETE FROM resource_owners WHERE owner_id=?1",
+            [&original.owner()],
+        )?)?,
+    }
     one(tx.execute(
         "DELETE FROM endpoint_leases WHERE binding_id=?1",
         [&p.receipt.binding_id],

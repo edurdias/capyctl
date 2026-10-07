@@ -2386,8 +2386,10 @@ async fn drive(
 /// ADR 0028 §5–§9: drive one planned group Initialize through its activation.
 /// A failure before any member is dispatched leaves the step planned (a
 /// closed refusal is classified like a host's refusal); once armed, a launch
-/// that does not reach READY is a failure of the armed step, whose members
-/// stay charged until their own hosts prove them gone (Task 17's group stop).
+/// that does not reach READY records the group failed at its rank
+/// (`group_member_failed`) and is a failure of the armed step, which
+/// [`native_failure::settle_failed_group`] settles by stopping every member
+/// (ADR 0028 §11).
 async fn drive_group(
     shared: &Arc<Shared>,
     work: &InitializeWork,
@@ -2429,12 +2431,26 @@ async fn drive_group(
     match outcome {
         Ok(GroupActivation::Ready { .. }) => Ok(()),
         Ok(GroupActivation::Failed {
+            plan,
             failed_rank,
             reason,
-            ..
-        }) => Err(CoordinatorError::Service(format!(
-            "group_member_failed: rank {failed_rank}: {reason}"
-        ))),
+        }) => {
+            // ADR 0028 §11 (decided 2026-10-06: a failed readiness probe is a
+            // launch failure): the group failed at this rank.
+            let deployment = work.fence().deployment_id.clone();
+            let instance = work.instance_index();
+            let _ = shared
+                .with_owner(move |owner| {
+                    owner
+                        .store()
+                        .record_group_failure(&deployment, instance, plan.generation(), failed_rank)
+                        .map_err(|error| CoordinatorError::Service(error.to_string()))
+                })
+                .await;
+            Err(CoordinatorError::Service(format!(
+                "group_member_failed: rank {failed_rank}: {reason}"
+            )))
+        }
         // SPEC §13.2: a closed refusal before any effect is a host refusal.
         Err(GroupActivationError::Refused { code, detail }) => Err(CoordinatorError::Service(
             RuntimeError::Refused(format!("{code}: {detail}")).to_string(),
@@ -3051,11 +3067,130 @@ async fn idle_before_terminate(
     }
 }
 
+/// ADR 0028 §11: the Stop of a Ready group. The head's ingress closed when
+/// the Stop was accepted and its requests drain as for any Stop; then every
+/// member is terminated at once and settled on its own host's evidence
+/// ([`crate::group_settlement::stop_group`]). The cleanup completes, freeing
+/// the head's binding and endpoint, only once every member has settled; a
+/// member left uncertain keeps its charge and the cleanup unproven, retried
+/// like any unproven cleanup.
+async fn drive_group_cleanup(
+    shared: &Arc<Shared>,
+    work: &OrdinaryCleanupReceipt,
+    hosts: Arc<dyn crate::group_activation::GroupHosts>,
+    bound: capyctl_store::groups::BoundGroup,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), CoordinatorError> {
+    use crate::group_settlement::{recorded_reason, stop_group, GroupTarget};
+    remaining(shared, work.deadline_ms)?;
+    if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Stopped(
+            "shutdown before cleanup arm".into(),
+        ));
+    }
+    drain_before_terminate(shared, work, stop).await?;
+    let step = work.step_id.clone();
+    let (arm, context) = shared
+        .read(move |owner, now| {
+            owner
+                .store()
+                .arm_ordinary_cleanup_with_context(owner.session(), &step, now)
+        })
+        .await?;
+    if !permits_send(&arm) {
+        return Err(CoordinatorError::Service(
+            "recorded cleanup arm is not replay permission".into(),
+        ));
+    }
+    let context = context.ok_or_else(|| shared.fail("new cleanup arm missing context"))?;
+    if context.binding_id != work.binding_id
+        || context.operation_id != work.operation_id
+        || context.step_id != work.step_id
+        || context.deadline_ms != work.deadline_ms
+    {
+        return Err(shared.fail("cleanup binding mismatch"));
+    }
+    let step = work.step_id.clone();
+    let expected = context.clone();
+    let ttl = shared
+        .read(move |owner, now| {
+            owner
+                .store()
+                .revalidate_ordinary_cleanup_send(owner.session(), &step, &expected, now)
+        })
+        .await?;
+    let ctx = crate::group_activation::GroupCtx {
+        owner: shared.owner.clone(),
+        hosts,
+        observations: shared.observations.clone(),
+        clock: shared.clock.clone(),
+    };
+    let reason = recorded_reason(
+        &ctx,
+        &bound.deployment_id,
+        bound.instance_index,
+        bound.plan.generation(),
+    );
+    let target = GroupTarget {
+        deployment_id: bound.deployment_id,
+        instance_index: bound.instance_index,
+        revision: work.revision,
+        operation_id: work.operation_id.clone(),
+        plan: bound.plan,
+    };
+    let settlement = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during group stop".into())),
+        settlement = stop_group(&ctx, &target, reason) => settlement,
+    };
+    if let capyctl_store::groups::GroupSettlement::Partial { unsettled } = settlement {
+        return Err(CoordinatorError::Service(format!(
+            "group_member_uncertain: ranks {unsettled:?} are not proven gone"
+        )));
+    }
+    // Every member, the head included, was proven gone by its own host; the
+    // head's binding records the head's identities.
+    let binding = work.binding_id.clone();
+    let identities = shared
+        .read(move |owner, _| owner.store().runtime_binding_identities(&binding))
+        .await?;
+    let evidence = CleanupEvidence {
+        binding_id: work.binding_id.clone(),
+        incarnation: work.incarnation.clone(),
+        identities,
+        observed_at_ms: (shared.clock)()?,
+        receipt: "every group member settled on its own host's gone evidence".into(),
+    };
+    let step = work.step_id.clone();
+    shared
+        .read(move |owner, now| {
+            owner
+                .store()
+                .complete_cleanup(owner.session(), &step, &evidence, now, ttl)
+        })
+        .await
+}
+
 async fn drive_cleanup(
     shared: &Arc<Shared>,
     work: &OrdinaryCleanupReceipt,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), CoordinatorError> {
+    // ADR 0028 §11: a group head's binding is stopped as its whole group.
+    if let Some(hosts) = shared.groups.clone() {
+        let binding = work.binding_id.clone();
+        let bound = shared
+            .with_owner(move |owner| {
+                owner
+                    .store()
+                    .group_of_binding(&binding)
+                    .map_err(|error| CoordinatorError::Service(error.to_string()))
+            })
+            .await?;
+        if let Some(bound) = bound {
+            return drive_group_cleanup(shared, work, hosts, bound, stop).await;
+        }
+    }
     // ADR 0015: the scheduler hands a cleanup to its instance's lane only after
     // the predecessor's effect task has exited. Generation fencing or claim
     // handoff never cancels that future.
