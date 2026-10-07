@@ -1988,6 +1988,68 @@ fn engine_env_is_in_the_effective_configuration() {
     assert_eq!(before.recipe_fingerprint, plain_again.recipe_fingerprint);
 }
 
+fn round_trips(effective: &capyctl_config::effective::EffectiveDeployment) {
+    let text = serde_json::to_string(effective).unwrap();
+    let decoded = capyctl_config::effective::decode_effective_snapshot(&text)
+        .unwrap_or_else(|error| panic!("stored snapshot must decode: {error}"));
+    assert_eq!(&decoded, effective);
+    assert_eq!(decoded.recipe_fingerprint, effective.recipe_fingerprint);
+}
+
+// T14, T39, ADR 0028 §2.1: a single-host deployment with an engine env stores a
+// snapshot that decodes to the same deployment, values included.
+#[test]
+fn a_snapshot_with_a_deployment_engine_env_round_trips() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["approved_env"] = serde_json::json!(["MBX_*"]);
+    deployment["engine_config"]["env"] = serde_json::json!({"MBX_FUSED_DRAFT": "1"});
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    round_trips(&effective);
+    let decoded = capyctl_config::effective::decode_effective_snapshot(
+        &serde_json::to_string(&effective).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.engine_env.values()["MBX_FUSED_DRAFT"], "1");
+    // A forged stored value is refused rather than launched.
+    let mut forged = serde_json::to_value(&effective).unwrap();
+    forged["engine_env"]["vars"]["MBX_FUSED_DRAFT"][0] = "2".into();
+    assert!(capyctl_config::effective::decode_effective_snapshot(&forged.to_string()).is_err());
+}
+
+// ADR 0028 §2.1: a deployment value overriding the profile's keeps its source.
+#[test]
+fn a_snapshot_with_a_deployment_env_overriding_the_profile_round_trips() {
+    let (mut deployment, mut host) = fixture();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["env"]["MBX_FUSED_DRAFT"] = "0".into();
+    profile["security"]["approved_env"] = serde_json::json!(["MBX_FUSED_DRAFT"]);
+    deployment["engine_config"]["env"] = serde_json::json!({"MBX_FUSED_DRAFT": "1"});
+    round_trips(&resolve_effective(&deployment, &host).unwrap());
+}
+
+// ADR 0028 §2.1: the profile env and approvals alone round-trip.
+#[test]
+fn a_snapshot_with_profile_env_and_approvals_round_trips() {
+    let (deployment, mut host) = fixture();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["env"]["MBX_FUSED_DRAFT"] = "1".into();
+    profile["security"]["approved_env"] = serde_json::json!(["MBX_*", "SGLANG_ENABLE_*"]);
+    round_trips(&resolve_effective(&deployment, &host).unwrap());
+}
+
+// ADR 0028 §2-3: deployment topology and group placement, and the host groups
+// policy, stay outside the per-host snapshot and do not break its decode.
+#[test]
+fn a_snapshot_with_topology_placement_and_host_groups_round_trips() {
+    let (mut deployment, mut host) = fixture();
+    deployment["topology"] = serde_json::json!({"tensor_parallel": 2, "pipeline_parallel": 1});
+    deployment["placement"] = serde_json::json!({"hosts": ["host-a", "host-b"]});
+    host["resource_policy"]["groups"] = serde_json::json!({"peer_address": "192.0.2.10"});
+    host["runtime_profiles"]["local"]["security"]["approved_env"] = serde_json::json!(["MBX_*"]);
+    deployment["engine_config"]["env"] = serde_json::json!({"MBX_FUSED_DRAFT": "1"});
+    round_trips(&resolve_effective(&deployment, &host).unwrap());
+}
+
 // T37: a deployment env name without an approval on its profile is refused.
 #[test]
 fn deployment_engine_env_needs_the_profile_approval() {

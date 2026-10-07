@@ -93,6 +93,23 @@ pub(super) fn snapshot_inputs(
         "request_deadline": quantity(&value["request_deadline_ms"], "ms")?,
         "engine_config": engine_config,
     });
+    // ADR 0028 §2.1: the deployment's engine environment is stored with its
+    // values in `engine_env`; its deployment entries are restated as declared,
+    // and the exact-equality check below proves the claim.
+    if let Some(vars) = value["engine_env"]["vars"].as_object() {
+        let mut env = serde_json::Map::new();
+        for (name, entry) in vars {
+            if entry[1] == "deployment" {
+                env.insert(name.clone(), entry[0].clone());
+            }
+        }
+        if !env.is_empty() {
+            deployment["engine_config"]
+                .as_object_mut()
+                .ok_or_else(|| invalid("snapshot.engine_config", "engine configuration required"))?
+                .insert("env".into(), Value::Object(env));
+        }
+    }
     // Owner decision 2026-09-25: a residency capyctl chose is chosen again from
     // the same host and facts (or from newly measured weights on a
     // re-resolution), and the exact-equality check below proves the claim.

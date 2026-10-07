@@ -78,3 +78,10 @@ Unreleased.
   as a host agent already did, so nothing is parked. Deploy such a model
   `restart_only`. A model with speculative decoding, whose park keeps its
   weights, still parks.
+
+## Fixes
+
+- **Deployments with an engine environment start again.** A deployment
+  stating `engine_config.env` was accepted and then failed to start or load
+  with `CorruptStoredData`, since its stored revision lost the variables; it
+  now keeps them, values stored for the launch and still shown redacted.
