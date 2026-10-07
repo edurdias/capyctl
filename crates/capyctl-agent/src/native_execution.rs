@@ -52,6 +52,9 @@ use refusal::charges_device;
 pub use refusal::{admit_memory_with, LaunchVerdict};
 // SPEC §§3.1, 7.3 (per-launch claims): host-side co-residence admission.
 mod coresidence;
+// ADR 0028 §12 (R12): each SGLang group member's saver map, reported by its
+// own host on its session.
+mod member_savers;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,6 +128,10 @@ pub struct NativeHostExecution {
     /// ADR 0028 §7, §10 (R11): where group checks read this host's
     /// interfaces and probe its ports.
     probes: crate::host_checks::HostProbes,
+    /// ADR 0028 §12 (R12): the latest saver-map facts of this host's SGLang
+    /// group members, sampled off the session loop and reported with every
+    /// availability refresh.
+    member_savers: Arc<member_savers::MemberSavers>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -233,6 +240,7 @@ impl NativeHostExecution {
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
             probes: Default::default(),
+            member_savers: Arc::default(),
             gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
                 crate::gpu_memory::sample,
             ))),
@@ -333,7 +341,11 @@ impl NativeHostExecution {
                     .journal
                     .retained_command(owned_handle)
                     .map_err(|_| LaunchVerdict::Refused("unauthorized"))?;
-                let MemberAction::LaunchSingle(plan) = &owner.action else {
+                let Some(plan) = owner
+                    .action
+                    .launch_plan()
+                    .filter(|_| crate::journal::parks_in_place(&owner))
+                else {
                     return Err(LaunchVerdict::Refused("unauthorized"));
                 };
                 let effective = self
@@ -1977,7 +1989,13 @@ impl LocalExecutionPolicy for NativeHostExecution {
         command: &MemberCommand,
         owner: &MemberCommand,
     ) -> Result<(), JournalError> {
-        let MemberAction::LaunchSingle(plan) = &owner.action else {
+        // ADR 0028 §12: a single launch, or a group's head (vLLM, SGLang),
+        // parks under exactly the rules below; a worker never does.
+        let Some(plan) = owner
+            .action
+            .launch_plan()
+            .filter(|_| crate::journal::parks_in_place(owner))
+        else {
             return Err(JournalError::Unauthorized);
         };
         if command.identity.controller_id != self.controller_id
@@ -2022,7 +2040,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
                 Ok(())
             }
             Engine::Sglang => Ok(()),
-            // ADR 0023 §6: TensorFold never parks.
+            // ADR 0023 §6: TensorFold never parks. ADR 0028 §2, §12 (OD3): a
+            // TensorFold group is restart-only; its head refuses by its tier.
             Engine::Tensorfold => Err(JournalError::Unauthorized),
         }
     }
@@ -2265,6 +2284,9 @@ impl SessionExecution for NativeHostExecution {
         // ADR 0028 §3, §14: the host's peer address and check findings,
         // read fresh for this report.
         inventory.group = group_inventory(&set.config.document);
+        // ADR 0028 §12 (R12): each SGLang group member's saver map, from this
+        // host's own observation directory; never waits for a read.
+        inventory.member_savers = self.reported_member_savers();
         Some(inventory)
     }
 }

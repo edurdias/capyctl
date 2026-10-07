@@ -439,6 +439,52 @@ mod tests {
             .is_err());
     }
 
+    /// ADR 0028 §12 (v43): a v42 store's plans keep their rows and gain no
+    /// canary reference and no failure code; the failure code is closed; the
+    /// data step applied again (or the whole set re-run) changes nothing.
+    // T20 T33
+    #[test]
+    fn v43_adds_canary_references_and_closed_failure_codes_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 42).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO group_plans(deployment_id,instance_index,generation,plan_json,rendezvous_host,rendezvous_port,state) VALUES('a',0,1,'{}','host-a',25000,'active');"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::groups::migrate_v43(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        let (canary, code): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT canary_json,failure_code FROM group_plans WHERE deployment_id='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((canary, code), (None, None));
+        let columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('group_plans') WHERE name IN ('canary_json','failure_code')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2);
+        assert!(conn
+            .execute("UPDATE group_plans SET failure_code='anything'", [])
+            .is_err());
+        for code in ["group_member_failed", "group_wake_mismatch"] {
+            conn.execute("UPDATE group_plans SET failure_code=?1", [code])
+                .unwrap();
+        }
+    }
+
     /// ADR 0028 §6 (v41): every measured digest is carried into the per-host
     /// table, `unusable` included (the measurement path writes its digest,
     /// host and time when the derived memory request cannot be resolved);
