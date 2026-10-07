@@ -29,17 +29,24 @@ pub(super) async fn adopt_retired_cleanups(
         let deployment = cleanup.work.fence().deployment_id.clone();
         let operation = cleanup.receipt.operation_id.clone();
         let binding = cleanup.receipt.binding_id.clone();
-        let driver = match factory(&cleanup.work) {
-            Ok(driver) => driver,
-            Err(error) => {
-                refused(
-                    shared,
-                    &deployment,
-                    &operation,
-                    &format!("its runtime could not be rebuilt: {error}"),
-                )
-                .await;
-                continue;
+        // ADR 0028 §11 (R38): a group's Stop needs no single-host runtime;
+        // the cleanup path stops every member through the group transport.
+        let group = cleanup.work.group().is_some() && shared.groups.is_some();
+        let driver = if group {
+            None
+        } else {
+            match factory(&cleanup.work) {
+                Ok(driver) => Some(driver),
+                Err(error) => {
+                    refused(
+                        shared,
+                        &deployment,
+                        &operation,
+                        &format!("its runtime could not be rebuilt: {error}"),
+                    )
+                    .await;
+                    continue;
+                }
             }
         };
         let step = cleanup.receipt.step_id.clone();
@@ -57,6 +64,9 @@ pub(super) async fn adopt_retired_cleanups(
             refused(shared, &deployment, &operation, &format!("{error}")).await;
             continue;
         }
+        let Some(driver) = driver else {
+            continue;
+        };
         let mut retained = shared
             .retained
             .lock()

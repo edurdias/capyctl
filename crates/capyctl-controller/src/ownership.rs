@@ -102,6 +102,16 @@ impl OwnedCoordinatorState {
         self.worker_claimed = true;
         true
     }
+
+    /// Tests only: a controller restart on this store. A new coordinator
+    /// session begins (the old one is retired, as after a crash) and a new
+    /// worker may claim it.
+    #[cfg(test)]
+    pub(crate) fn restart_session(&mut self) -> Result<(), OwnedStateError> {
+        self.session = self.store.begin_coordinator_session()?;
+        self.worker_claimed = false;
+        Ok(())
+    }
 }
 
 /// Found live 2026-10-03: the refusal names the path and the rule it breaks.

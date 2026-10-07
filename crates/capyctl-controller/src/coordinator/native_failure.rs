@@ -373,18 +373,26 @@ pub(super) async fn adopt_retired_remote_launches(
         let work = launch.work;
         let reference = LaunchRef::of(&work);
         let deployment = reference.fence.deployment_id.clone();
-        let driver = match factory(&work) {
-            Ok(driver) => driver,
-            Err(error) => {
-                journal(
-                    shared,
-                    &deployment,
-                    &reference.operation_id,
-                    "adoption_refused",
-                    &format!("its remote runtime could not be rebuilt: {error}"),
-                )
-                .await;
-                continue;
+        // ADR 0028 §11 (R38): a group head's launch is adopted without a
+        // single-host runtime: its members are reached through the group
+        // transport, by the handles and identities the store recorded.
+        let group = reference.group && shared.groups.is_some();
+        let driver = if group {
+            None
+        } else {
+            match factory(&work) {
+                Ok(driver) => Some(driver),
+                Err(error) => {
+                    journal(
+                        shared,
+                        &deployment,
+                        &reference.operation_id,
+                        "adoption_refused",
+                        &format!("its remote runtime could not be rebuilt: {error}"),
+                    )
+                    .await;
+                    continue;
+                }
             }
         };
         let step = reference.step_id.clone();
@@ -401,7 +409,7 @@ pub(super) async fn adopt_retired_remote_launches(
             }
             continue;
         }
-        {
+        if let Some(driver) = &driver {
             let mut retained = shared
                 .retained
                 .lock()
@@ -411,17 +419,18 @@ pub(super) async fn adopt_retired_remote_launches(
             }
             retained.insert(reference.binding_id.clone(), driver.clone());
         }
-        if launch.completed || driver.settle.is_none() {
+        // A Ready launch keeps its dispatch closed until the readiness
+        // supervisor re-proves it (a group head by its completion probe).
+        if launch.completed || driver.as_ref().is_some_and(|d| d.settle.is_none()) {
             continue;
         }
-        let settled = settle_failed_launch(
-            shared,
-            &driver,
-            &reference,
-            "the controller restarted before the launch outcome was observed",
-            true,
-        )
-        .await;
+        let reason = "the controller restarted before the launch outcome was observed";
+        let settled = match &driver {
+            Some(driver) => settle_failed_launch(shared, driver, &reference, reason, true).await,
+            // ADR 0028 §11: every member settles on its own host's evidence;
+            // one whose host is away stays uncertain and charged.
+            None => settle_failed_group(shared, &reference, reason, true).await,
+        };
         if !shared.accepting.load(Ordering::Acquire) {
             return Err(settled.err().unwrap_or_else(|| {
                 CoordinatorError::Stopped("worker stopped during adoption".into())
