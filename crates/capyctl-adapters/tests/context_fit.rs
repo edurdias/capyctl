@@ -9,6 +9,9 @@ use capyctl_adapters::vllm::{plan_from_effective, render_command};
 use capyctl_config::effective::{resolve_effective, EffectiveDeployment};
 use serde_json::{json, Value};
 
+/// SGLang's own allocations inside its static pool on unified memory.
+const OVERHEAD: i64 = capyctl_config::context_fit::STATIC_OVERHEAD_BYTES as i64;
+
 /// A dense model at 512 KiB of bfloat16 KV per token: 4 GiB holds 8192.
 fn dense() -> Value {
     json!({
@@ -382,7 +385,7 @@ fn a_derived_request_lends_the_state_part_of_its_margin() {
     let gib = 1i64 << 30;
     assert_eq!(
         settings["memory"]["static_bytes"],
-        json!(weights + 4 * gib + 26 * state + 2 * gib)
+        json!(weights + 4 * gib + 26 * state + OVERHEAD)
     );
     let fit = capyctl_config::context_fit::fit_for_effective(&effective);
     assert_eq!(fit.running_limit, Some(5));
@@ -604,7 +607,7 @@ fn a_derived_request_holds_the_state_of_its_running_requests() {
     assert_eq!(settings["max_total_tokens"], json!(131072));
     assert_eq!(
         settings["memory"]["static_bytes"],
-        json!(weights + 4 * GIB + state + 2 * GIB)
+        json!(weights + 4 * GIB + state + OVERHEAD)
     );
     // Status shows the limit below the router's in-flight bound.
     let fit = capyctl_config::context_fit::fit_for_effective(&effective);

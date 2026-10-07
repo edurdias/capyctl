@@ -37,6 +37,11 @@
 //! KV pool at what is left. Shapes this module does not model (sliding-window
 //! or latent attention, other hybrids) keep SGLang's own sizing, with the
 //! reason recorded.
+//!
+//! On unified memory every launch whose weights are known renders a static
+//! pool of the weights, the KV cache, the state (sized here, or fixed by the
+//! arguments) and [`STATIC_OVERHEAD_BYTES`], taken from the margin and never
+//! above the request, whether or not CapyCTL sized the pools.
 
 use std::path::Path;
 
@@ -55,12 +60,23 @@ use crate::engine_policy::{matches_name, parse_options, Engine};
 /// "max_mamba_cache_size=14, 5 state slots per request".
 pub const STATE_SLOTS_PER_REQUEST: u64 = 5;
 
-/// What SGLang allocates inside its static pool besides the weights and its
-/// pools (CUDA context, workspaces, load buffers). Found live on 2026-10-03
-/// with Qwen3.8-27B NVFP4 and DFlash2 on GB10: a static pool of exactly
-/// weights, KV cache and state held 356793 of 399457 KV tokens, 1.7 GiB short.
-/// A placeholder until measured per model.
-pub const STATIC_OVERHEAD_BYTES: u64 = 2 << 30;
+/// What SGLang charges against its static pool besides the weights as they
+/// sit on disk and its pools: the weights as loaded (repacked or padded),
+/// the memory its process takes while it loads them (on unified memory its
+/// baseline is `MemAvailable`, so CPU-side growth counts too), workspaces,
+/// the multimodal cache, and the fraction's shortfall from SGLang taking it of
+/// the memory free after its own start rather than of CapyCTL's baseline.
+/// SGLang 0.5.21 (`_profile_available_bytes`) charges all of it against
+/// `mem_fraction_static` × its baseline before the KV pool gets any.
+///
+/// Measured on GB10 (ADR 0014, note on amendment A14): Qwen3.8-27B NVFP4
+/// and DFlash2 held 356793 of 399457 KV tokens, 1.7 GiB short (2026-10-03);
+/// with 2 GiB, Qwen3.6-35B-A3B NVFP4 held 141100 of 157286 tokens, 2.2 GiB
+/// in all (2026-10-07); Gemma 4 26B-A4B NVFP4 took about 2.9 GiB beside
+/// 17.5 GiB of weights on disk (2026-10-07). gpt-oss-20b (MXFP4) takes about
+/// 5.4 GiB, which no flat term covers: its recipes state the request. The
+/// smallest whole GiB above the NVFP4 measurements.
+pub const STATIC_OVERHEAD_BYTES: u64 = 3 << 30;
 
 /// What the fraction rendered for a discrete GPU carries beyond the static
 /// pool when CapyCTL caps SGLang's pools (ADR 0014, note on amendment A14).
@@ -89,10 +105,10 @@ pub struct SglangPool {
     /// The running requests, when the state that fits holds fewer than the
     /// deployment's count (or CapyCTL's in-flight bound).
     pub running_limit: Option<u32>,
-    /// The static pool (`--mem-fraction-static` share) the launch renders
-    /// when CapyCTL sized the pools: weights, KV cache, state and
-    /// [`STATIC_OVERHEAD_BYTES`], taken from the margin. `None` keeps
-    /// [`static_pool_bytes`].
+    /// The static pool (`--mem-fraction-static` share) a unified launch
+    /// renders: weights, KV cache, the state CapyCTL sized or the arguments
+    /// fixed, and [`STATIC_OVERHEAD_BYTES`], taken from the margin. `None`
+    /// (a discrete device, or unknown weights) keeps [`static_pool_bytes`].
     pub static_bytes: Option<i64>,
     /// Why a pool is left to SGLang, or how it was sized.
     pub reason: Option<String>,
@@ -245,7 +261,28 @@ pub fn sglang_pool(
         .as_ref()
         .ok()
         .is_some_and(|config| gated_delta_attention_layers(config).is_some());
+    let args: Vec<String> = profile_args
+        .iter()
+        .chain(&settings.extra_args)
+        .cloned()
+        .collect();
+    let fixed_state = config
+        .as_ref()
+        .ok()
+        .map_or(0, |config| argument_state(settings, config, &args));
     let mut pool = sized_pool(settings, profile_args, config, draft)?;
+    // ADR 0014, note on amendment A14: SGLang 0.5.21 charges the weights as
+    // loaded and its own allocations against the static pool before any KV
+    // pool (`_profile_available_bytes`), whether CapyCTL fixed the pools or
+    // left them to SGLang. Found in the catalog runs on GB10 (2026-10-07):
+    // sliding-window models (gpt-oss-20b, Gemma 4 26B-A4B) and a hybrid whose
+    // arguments set `--max-mamba-cache-size` (Qwen3.6-35B-A3B) had a static
+    // pool of exactly weights and KV cache, and SGLang refused to start with
+    // a KV cache of 2 GiB or less ("Loaded weights leave no GPU memory for
+    // the KV cache").
+    if pool.static_bytes.is_none() {
+        pool.static_bytes = grown_static(&settings.memory, fixed_state);
+    }
     // Note on amendment A14: the fraction lets SGLang's profile reach pools
     // it cannot exceed. A pool left to SGLang's own sizing gets none, so
     // SGLang never takes more than the grant.
@@ -254,11 +291,6 @@ pub fn sglang_pool(
         .as_deref()
         .is_some_and(|reason| reason.ends_with(LEFT_TO_SGLANG));
     let kv_fixed = pool.max_total_tokens.is_some() || settings.max_total_tokens.is_some();
-    let args: Vec<String> = profile_args
-        .iter()
-        .chain(&settings.extra_args)
-        .cloned()
-        .collect();
     let state_fixed = !hybrid
         || pool.max_mamba_cache_size.is_some()
         || option_value(&args, "--max-mamba-cache-size").0;
@@ -266,6 +298,43 @@ pub fn sglang_pool(
         pool.static_allowance = Some(DISCRETE_BASELINE_ALLOWANCE_BYTES);
     }
     Ok(pool)
+}
+
+/// The recurrent state SGLang 0.5.21 reserves for the slots the arguments
+/// fix on a gated-delta-net hybrid (`--max-mamba-cache-size`,
+/// `_handle_max_mamba_cache`): the slots plus a padding slot and, with
+/// speculative decoding, one intermediate state per draft token for each
+/// request it runs plus one (it runs at most the deployment's count, and
+/// never more than the slots). Zero for any other model, or when SGLang
+/// sizes the state itself.
+fn argument_state(settings: &SglangLaunchSettings, config: &Value, args: &[String]) -> u64 {
+    let (_, ssm_dtype) = option_value(args, "--mamba-ssm-dtype");
+    let Some(hybrid) = gated_delta_hybrid(config, ssm_dtype.as_deref()) else {
+        return 0;
+    };
+    let Some(slots) = option_value(args, "--max-mamba-cache-size")
+        .1
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return 0;
+    };
+    let intermediate = if option_value(args, "--speculative-algorithm").0 {
+        let draft_tokens = option_value(args, "--speculative-num-draft-tokens")
+            .1
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let running = settings
+            .common
+            .max_concurrent_requests
+            .map_or(slots, |running| u64::from(running).min(slots));
+        running.saturating_add(1).saturating_mul(draft_tokens)
+    } else {
+        0
+    };
+    slots
+        .saturating_add(1)
+        .saturating_add(intermediate)
+        .saturating_mul(hybrid.state_bytes)
 }
 
 const LEFT_TO_SGLANG: &str = "; SGLang sizes its pools itself";

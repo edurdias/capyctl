@@ -41,6 +41,7 @@ pub(crate) use sglang_pool::{derived_request_bytes, derived_state_reserve};
 pub use sglang_pool::{
     sglang_pool, sglang_pool_for_effective, sglang_pool_for_launch, sglang_state_slot_bytes,
     static_pool_bytes, SglangPool, DISCRETE_BASELINE_ALLOWANCE_BYTES, STATE_SLOTS_PER_REQUEST,
+    STATIC_OVERHEAD_BYTES,
 };
 pub use vllm_hybrid::VllmFit;
 
