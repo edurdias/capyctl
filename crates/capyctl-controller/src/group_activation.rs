@@ -351,6 +351,38 @@ pub async fn activate_group(
     work: &InitializeWork,
     shape: &GroupShape,
 ) -> Result<GroupActivation, GroupActivationError> {
+    let outcome = activate(ctx, work, shape).await;
+    if let Err(GroupActivationError::Refused { code, .. }) = &outcome {
+        record_refusal(ctx, work, code)?;
+    }
+    outcome
+}
+
+/// SPEC §17, ADR 0028 §16: every refusal of an activation, wherever it
+/// arises, leaves its closed code in the instance's status.
+fn record_refusal(
+    ctx: &GroupCtx,
+    work: &InitializeWork,
+    code: &str,
+) -> Result<(), GroupActivationError> {
+    let fence = work.fence();
+    locked(ctx, |o| {
+        o.store()
+            .record_instance_error(
+                &fence.deployment_id,
+                work.instance_index(),
+                fence.generation,
+                code,
+            )
+            .map_err(|e| e.to_string())
+    })
+}
+
+async fn activate(
+    ctx: &GroupCtx,
+    work: &InitializeWork,
+    shape: &GroupShape,
+) -> Result<GroupActivation, GroupActivationError> {
     let fence = work.fence().clone();
     let instance = work.instance_index();
     let head_host = shape.head().to_owned();
@@ -877,15 +909,6 @@ fn release_refused(
                 plan.generation(),
             )
             .map(drop)
-            .map_err(|e| e.to_string())?;
-        // SPEC §17: the instance's status shows the closed code.
-        o.store()
-            .record_instance_error(
-                &fence.deployment_id,
-                work.instance_index(),
-                fence.generation,
-                code,
-            )
             .map_err(|e| e.to_string())
     })
 }

@@ -50,6 +50,9 @@ const GROUP_PROFILE: &str = "local";
 const GROUP_PROFILE_BUILD: &str = "vllm-build-1";
 /// The controller every scripted agent is enrolled with.
 const GROUP_CONTROLLER: &str = "controller";
+/// The private ingress every world host publishes (SPEC §15: loopback is a
+/// protected link).
+const WORLD_INGRESS: &str = "http://127.0.0.1:9443";
 
 /// Host `index`'s peer address: documentation addresses only (RFC 5737).
 fn peer_address(index: usize) -> IpAddr {
@@ -644,6 +647,7 @@ fn scripted(names: &[&str]) -> (FakeGroup, Vec<Arc<GroupHost>>) {
 /// transport's "no answer".
 struct WorldHosts {
     hosts: Vec<Arc<GroupHost>>,
+    owner: SharedCoordinatorState,
     /// What each host publishes: its peer address (`None` without one) and
     /// its policy fingerprint.
     published: Mutex<BTreeMap<String, (Option<IpAddr>, String)>>,
@@ -703,9 +707,24 @@ impl crate::group_activation::GroupHosts for WorldHosts {
 
     fn provision_head<'a>(
         &'a self,
-        _command: &'a MemberCommand,
+        command: &'a MemberCommand,
     ) -> crate::group_activation::HostFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let MemberAction::Launch { member, .. } = &command.action else {
+                return Err("not a group launch".into());
+            };
+            // SPEC §§6, 15: as production, the group's only replica is the
+            // head's ingress, frozen with the head's binding.
+            let owner = self.owner.lock().unwrap();
+            owner
+                .store()
+                .bind_remote_ingress(
+                    &member.binding_id,
+                    &command.identity.member.host_id,
+                    WORLD_INGRESS,
+                )
+                .map_err(|e| e.to_string())
+        })
     }
 
     fn head_ready(&self, binding_id: &str, host_id: &str) {
@@ -857,6 +876,7 @@ impl GroupWorld {
         ));
         let transport = Arc::new(WorldHosts {
             hosts: hosts.clone(),
+            owner: owner.clone(),
             published: Mutex::new(BTreeMap::new()),
             concluded: Mutex::new(BTreeMap::new()),
             ready: Mutex::new(Vec::new()),
@@ -943,6 +963,15 @@ impl GroupWorld {
         self
     }
 
+    /// `host` measures `digest` for its copy of the group's weights.
+    pub(super) fn checkpoint_digest(self, host: &str, digest: &str) -> Self {
+        let mut state = self.host(host).state();
+        let path = state.model_path.clone();
+        state.digests.insert(path, digest.into());
+        drop(state);
+        self
+    }
+
     /// The head's completion probes generate no token.
     pub(super) fn probe_fails(self) -> Self {
         self.hosts[0].state().probe_fails = true;
@@ -997,6 +1026,16 @@ impl GroupWorld {
     ) -> Result<String, DeployError> {
         let id = self.try_deploy(name, hosts, env, None, true)?;
         self.activation_refusal(&id).await.map(|()| id)
+    }
+
+    /// As [`Self::deploy_group`] with engine environment `env`.
+    pub(super) async fn deploy_group_with_env(
+        &self,
+        name: &str,
+        hosts: &[&str],
+        env: &[(&str, &str)],
+    ) -> String {
+        self.try_deploy(name, hosts, env, None, true).unwrap()
     }
 
     /// As [`Self::deploy_group`] with `residency`.
@@ -1359,7 +1398,9 @@ impl GroupWorld {
     }
 
     /// Whether deployment `name` has an instance open for dispatch, and that
-    /// it is the head's ingress (ADR 0028 §9: one replica, at the head).
+    /// it is the head's ingress (ADR 0028 §9: one replica, at the head). The
+    /// serving host is the binding's frozen ingress host; a group records no
+    /// single-host placement.
     pub(super) fn route_open(&self, name: &str) -> bool {
         let id = self.id(name);
         let o = self.owner.lock().unwrap();
@@ -1368,8 +1409,8 @@ impl GroupWorld {
         assert!(open.len() <= 1, "a group is one replica");
         open.first().is_some_and(|instance| {
             assert_eq!(
-                instance.host_id.as_deref().unwrap_or(&self.hosts[0].name),
-                self.hosts[0].name,
+                instance.remote_host.as_deref(),
+                Some(self.hosts[0].name.as_str()),
                 "the group serves at the head"
             );
             true
@@ -2030,7 +2071,8 @@ async fn concurrent_activation_is_single() {
     assert_eq!(world.launches(), 2);
 }
 
-// T34: a named host without engine_groups is refused typed and receives nothing.
+// T34: a named host without engine_groups is refused typed and receives nothing;
+// the instance's status names the code.
 #[tokio::test]
 async fn host_without_capability_is_refused() {
     for missing in ["host-a", "host-b"] {
@@ -2043,6 +2085,10 @@ async fn host_without_capability_is_refused() {
         assert_eq!(err.code(), "host_capability_missing:engine_groups");
         assert_eq!(world.commands_sent_to(missing), 0);
         assert!(world.group_plan("g").is_none(), "nothing is reserved");
+        assert_eq!(
+            world.wait_settled(&world.id("g")).await.last_error(),
+            "host_capability_missing:engine_groups"
+        );
     }
 }
 
@@ -2062,40 +2108,23 @@ async fn group_engine_env_is_approved_everywhere_and_equal() {
         .with_engine("sglang")
         .approved_env("host-a", &["SGLANG_ENABLE_*"])
         .approved_env("host-b", &["SGLANG_ENABLE_*"]);
-    // A frozen revision that sets engine env cannot be started yet: its
-    // effective snapshot does not re-resolve with the env (pre-existing,
-    // reported for Task 17). What every member's Launch is rendered from is
-    // compared instead: its own host-local document.
     let id = world
-        .try_deploy(
-            "e",
-            &["host-a", "host-b"],
-            &[("SGLANG_ENABLE_X", "1")],
-            None,
-            false,
-        )
-        .unwrap();
-    let documents: Vec<serde_json::Value> = {
-        let o = world.owner.lock().unwrap();
-        ["host-a", "host-b"]
-            .into_iter()
-            .map(|host| {
-                let source = o
-                    .store()
-                    .launch_configuration_source(&id, 1, host, None)
-                    .unwrap()
-                    .unwrap();
-                capyctl_config::remote_resources::local_deployment_document(host, &source).unwrap()
-            })
-            .collect()
+        .deploy_group_with_env("g", &["host-a", "host-b"], &[("SGLANG_ENABLE_X", "1")])
+        .await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    // ADR 0028 §2.1, §10: the members' final launch environments are equal
+    // apart from each member's own address variable, and carry the value.
+    let strip = |mut env: BTreeMap<String, String>| {
+        env.remove("SGLANG_HOST_IP");
+        env
     };
-    let env = |d: &serde_json::Value| d["engine_config"]["env"].clone();
-    assert_eq!(
-        env(&documents[0])["SGLANG_ENABLE_X"],
-        "1",
-        "real values (R10)"
+    let (a, b) = (
+        strip(world.launch_env("host-a").await),
+        strip(world.launch_env("host-b").await),
     );
-    assert_eq!(env(&documents[0]), env(&documents[1]));
+    assert_eq!(a.get("SGLANG_ENABLE_X").map(String::as_str), Some("1"));
+    assert_eq!(a, b);
 }
 
 // T14: one mismatched build or a host without a peer address refuses the deploy.
@@ -2165,6 +2194,10 @@ async fn sglang_deep_group_with_differing_paths_is_refused() {
     assert!(world.group_plan("g").is_none());
     let id = world.id("g");
     assert_eq!(
+        world.wait_settled(&id).await.last_error(),
+        "group_model_path_mismatch"
+    );
+    assert_eq!(
         world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
         0
     );
@@ -2178,6 +2211,27 @@ async fn sglang_deep_group_with_differing_paths_is_refused() {
         .await;
     world.group.launch_completes();
     world.wait_ready(&id).await;
+}
+
+// T14: members whose checkpoint digests differ refuse the group before anything is
+// reserved or launched; the instance's status names the code.
+#[tokio::test]
+async fn differing_checkpoint_digests_refuse_the_group() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).checkpoint_digest(
+        "host-b",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    );
+    let err = world
+        .try_deploy_group("g", &["host-a", "host-b"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "group_checkpoint_mismatch");
+    assert!(world.group_plan("g").is_none(), "nothing is reserved");
+    assert_eq!(world.launches(), 0);
+    assert_eq!(
+        world.wait_settled(&world.id("g")).await.last_error(),
+        "group_checkpoint_mismatch"
+    );
 }
 
 // T30, T33 (R23): every member is fenced dispatched, durably, before its host
