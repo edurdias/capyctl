@@ -401,14 +401,14 @@ private direct link ([Network access](../operations/network-access.md#multi-node
 
 ### Ports a group opens
 
-CapyCTL trusts the network between group machines (ADR 0028 decision 3): it
+CapyCTL trusts the network between group machines: it
 checks no firewall, and it passes each engine the member's address on the
 direct link wherever the engine takes one. The engines open the listeners
 below. **None of them is authenticated.** The rendezvous store, vLLM's
 broadcast queues, SGLang's DP-attention sockets and gloo's object
 collectives carry pickled Python objects, and unpickling data from the network
 runs code: anyone who can connect can likely run code as the engine's user and
-read its per-launch keys (ADR 0028 §13).
+read its per-launch keys.
 
 `P` is the group's rendezvous port, from the head's `--rendezvous-ports`
 range (default `25000-25099`). "Ephemeral" means a port the kernel picks from
@@ -454,7 +454,7 @@ With DP attention enabled, the head also binds, on the head's link address
 | Worker-port handshake (ZeroMQ REP; replies with a pickled port list) | `P+13` | the head's link address |
 | One scheduler input socket per DP rank (ZeroMQ PUSH) | ephemeral | the head's link address |
 
-CapyCTL's `Prepare` checks `P+1` to `P+6` on the head (ADR 0028 §7); it does
+CapyCTL's `Prepare` checks `P+1` to `P+6` on the head; it does
 not check `P+13` or the ephemeral DP sockets.
 
 #### TensorFold 0.6.5
@@ -463,7 +463,7 @@ not check `P+13` or the ephemeral DP sockets.
 |---|---|---|---|---|
 | Rank exchange (torch TCP store) | head | `P` | every interface (*inferred*, as above) | CapyCTL renders `--master <head> --master-port P`. TensorFold puts NCCL's unique id and readiness keys in this store (`cuda/comm.py` in 0.6.3). |
 | NCCL | both | ephemeral | an interface NCCL chooses | TensorFold drives NCCL directly and opens no gloo group. |
-| Extra port under `--parallel` | head | ephemeral | not established | Recorded in ADR 0028 §13 for 0.6.5 Flash Next; 0.6.3 refuses `--parallel` with `--tp 2`, so this was not read from source (*inferred*). |
+| Extra port under `--parallel` | head | ephemeral | not established | Recorded in the design notes for 0.6.5 Flash Next; 0.6.3 refuses `--parallel` with `--tp 2`, so this was not read from source (*inferred*). |
 
 Rank 1 opens no API port.
 
