@@ -13,7 +13,7 @@ pub struct ResourceControls {
     pub queue: QueuePolicy,
     pub device_sharing: Sharing,
     pub device_sharing_overrides: BTreeMap<String, Sharing>,
-    /// ADR 0014 amendment A18: the bound on one launch's parked-charge
+    /// ADR 0014 amendment A19: the bound on one launch's parked-charge
     /// growth before its next park is a stop. Encoded only when stated.
     #[serde(skip_serializing_if = "ParkedGrowthLimit::is_auto")]
     pub parked_growth_limit: ParkedGrowthLimit,

@@ -490,7 +490,7 @@ pub struct HostPolicy {
     /// model store's ceiling for them. Encoded only when stated.
     #[serde(skip_serializing_if = "ModelSourcePolicy::is_default")]
     pub model_sources: ModelSourcePolicy,
-    /// ADR 0014 amendment A18: how far one launch's measured parked charge
+    /// ADR 0014 amendment A19: how far one launch's measured parked charge
     /// may grow past its first measured park before its next park is a stop
     /// (`crate::parked_growth`). Encoded only when stated, so a host without
     /// it keeps every digest.
@@ -951,7 +951,7 @@ struct RawHostPolicy {
     /// not part of the normalized policy, so a host without it keeps its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     groups: Option<serde_json::Value>,
-    /// ADR 0014 amendment A18: `auto` (the default), `off`, a percentage of
+    /// ADR 0014 amendment A19: `auto` (the default), `off`, a percentage of
     /// the first measured parked charge, or a size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parked_growth_limit: Option<String>,

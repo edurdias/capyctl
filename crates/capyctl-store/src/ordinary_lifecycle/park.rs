@@ -895,7 +895,7 @@ fn declared(tx: &Transaction<'_>, deployment: &str) -> Result<EffectiveDeploymen
     decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)
 }
 
-/// ADR 0014 amendment A18: `park deployment` on a Ready instance whose
+/// ADR 0014 amendment A19: `park deployment` on a Ready instance whose
 /// parked charge grew past its host's `parked_growth_limit` since its first
 /// park stops it instead (an ordinary stop, so it stays eligible for
 /// on-demand activation and its next activation starts a fresh engine), as a
@@ -1031,7 +1031,7 @@ impl crate::Store {
             .collect::<Result<_, _>>()?;
         let mut first: Option<ResidencyReceipt> = None;
         for instance in targets {
-            // ADR 0014 amendment A18: an instance whose parked charge grew
+            // ADR 0014 amendment A19: an instance whose parked charge grew
             // past its host's bound is stopped instead, under this command.
             let accepted =
                 match growth_stop(&tx, s, principal, deployment, instance, key, now, deadline)? {
@@ -2515,7 +2515,7 @@ impl crate::Store {
     /// instance with nothing in flight whose last activity is older than
     /// `ready_idle_ms` parks at its declared tier (a restart-only one, one
     /// whose park the engine refused, or one whose parked charge grew past
-    /// its host's bound, ADR 0014 amendment A18, stops instead); a parked instance older
+    /// its host's bound, ADR 0014 amendment A19, stops instead); a parked instance older
     /// than `parked_idle_ms` stops to reclaim its residual state. Every stop
     /// is ordinary, so automatic activation stays enabled. `activity` is the
     /// router's last request time for an instance generation; `floor` is the
@@ -2630,7 +2630,7 @@ fn idle_one(
         params![deployment, instance, generation],
         |r| r.get(0),
     )?;
-    // ADR 0014 amendment A18: a launch whose parked charge grew past its
+    // ADR 0014 amendment A19: a launch whose parked charge grew past its
     // host's bound since its first park stops instead, so its next
     // activation starts a fresh engine.
     let growth = if !parked && parks(&e) && !refused_park {

@@ -126,7 +126,7 @@ struct StoredControls {
     queue: StoredQueue,
     device_sharing: String,
     device_sharing_overrides: BTreeMap<String, String>,
-    /// ADR 0014 amendment A18: absent in policies stored before it existed,
+    /// ADR 0014 amendment A19: absent in policies stored before it existed,
     /// and omitted at `auto` so their stored identity is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parked_growth_limit: Option<String>,

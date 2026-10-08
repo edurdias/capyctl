@@ -144,7 +144,7 @@ fn current_controls_preserve_the_groups_block() {
     );
 }
 
-// T03 T14 (ADR 0014 amendment A18): a host that states no
+// T03 T14 (ADR 0014 amendment A19): a host that states no
 // `parked_growth_limit`, or `auto`, resolves, composes and fingerprints
 // exactly as before the setting existed; a stated bound is carried through
 // composition and the frozen snapshot.

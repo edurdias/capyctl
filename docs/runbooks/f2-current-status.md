@@ -2,7 +2,7 @@
 
 ## A launch whose parked charge keeps growing stops instead of parking — 2026-10-07 (branch `park-growth-guard`)
 
-Owner decision 2026-10-07 (catalog finding 2, ADR 0014 amendment A18). On the catalog run
+Owner decision 2026-10-07 (catalog finding 2, ADR 0014 amendment A19). On the catalog run
 (GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4 sized for 32 GiB) one launch's measured parked charge
 grew 4.7, 9.6, 13.4 GiB over three parks while its GPU memory returned to 22.1 GiB on every
 wake. Each measured park is now also recorded per launch (store schema v44,

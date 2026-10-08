@@ -1357,7 +1357,7 @@ CPU tests cover the formula's boundary, the gpt-oss-20b and gpt-oss-120b cases, 
 revision's exact re-resolution and the #68 discrete case. Not qualification: a live run of
 gpt-oss-120b on vLLM on a GB10 should confirm the new Ready charge holds the footprint.
 
-## Amendment A18: a launch whose parked charge keeps growing restarts instead of parking (owner decision 2026-10-07)
+## Amendment A19: a launch whose parked charge keeps growing restarts instead of parking (owner decision 2026-10-07)
 
 Problem: on the 2026-10-06 catalog run (GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4, request sized
 for 32 GiB, `deep` residency) every wake left CPU-side memory behind. vLLM's GPU memory was

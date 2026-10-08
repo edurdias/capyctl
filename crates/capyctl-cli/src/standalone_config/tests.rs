@@ -2473,7 +2473,7 @@ fn standalone_publishes_the_group_policy_from_every_layer() {
     }
 }
 
-// T03 (owner decision 2026-10-07, ADR 0014 amendment A18): the parked growth
+// T03 (owner decision 2026-10-07, ADR 0014 amendment A19): the parked growth
 // bound the standalone document states is carried into the embedded host's
 // published policy and normalizes there; `auto`, or nothing, leaves the
 // published policy byte for byte as before.

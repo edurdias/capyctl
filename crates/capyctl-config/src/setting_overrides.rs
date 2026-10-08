@@ -899,7 +899,7 @@ pub fn defaults(
                 Value::from(start),
             ),
             ("resource_policy.endpoint_port_range.end", Value::from(end)),
-            // ADR 0014 amendment A18: growth up to the first parked charge.
+            // ADR 0014 amendment A19: growth up to the first parked charge.
             ("resource_policy.parked_growth_limit", Value::from("auto")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {

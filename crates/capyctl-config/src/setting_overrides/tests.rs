@@ -297,7 +297,7 @@ fn management_address_and_state_dir_are_named_alike_on_every_role() {
     }
 }
 
-// T03 (owner decision 2026-10-07, ADR 0014 amendment A18): a host's parked
+// T03 (owner decision 2026-10-07, ADR 0014 amendment A19): a host's parked
 // growth bound is set three ways, `--set resource_policy.parked_growth_limit`
 // over `CAPYCTL_SET__RESOURCE_POLICY__PARKED_GROWTH_LIMIT` over the YAML.
 #[test]

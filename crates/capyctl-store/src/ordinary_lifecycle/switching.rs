@@ -557,7 +557,7 @@ impl crate::Store {
             crate::switch_state::ClosureReason::Switch,
         )?;
         let deadline = now.saturating_add(e.request_deadline_ms);
-        // ADR 0014 amendment A18: a launch whose parked charge grew past its
+        // ADR 0014 amendment A19: a launch whose parked charge grew past its
         // host's bound since its first park is stopped, not parked.
         let growth = if parks(&e) {
             super::parked_charge::outgrown(&tx, &source, &e)?
@@ -984,7 +984,7 @@ fn offer_victims(
             .unwrap_or(0);
         let parked = if members.is_empty() {
             let (source, e, _) = launch(tx, &deployment, index)?;
-            // ADR 0014 amendment A18: a launch whose parked charge grew past
+            // ADR 0014 amendment A19: a launch whose parked charge grew past
             // its host's bound is released by a stop, which frees it all.
             let may_park = !c.whole_host
                 && parks(&e)

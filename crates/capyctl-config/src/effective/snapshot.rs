@@ -215,7 +215,7 @@ pub(super) fn snapshot_inputs(
             "endpoint_port_range":h["endpoint_port_range"], "planner_max_states":h["planner_max_states"], "queue":queue,
         },
     });
-    // ADR 0014 amendment A18: encoded only when stated, in its written form.
+    // ADR 0014 amendment A19: encoded only when stated, in its written form.
     if !h["parked_growth_limit"].is_null() {
         host["resource_policy"]["parked_growth_limit"] = h["parked_growth_limit"].clone();
     }

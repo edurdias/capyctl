@@ -353,7 +353,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
-    // ADR 0014 amendment A18: absent is `auto`.
+    // ADR 0014 amendment A19: absent is `auto`.
     let parked_growth_limit = h
         .resource_policy
         .parked_growth_limit
