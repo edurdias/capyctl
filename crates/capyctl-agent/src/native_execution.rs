@@ -26,7 +26,9 @@ use capyctl_config::{
 use capyctl_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
 use capyctl_domain::group::{GroupEngine, GroupPlan, MemberPlan};
 use capyctl_protocol::{
-    execution::{DigestCheckpointPlan, MemberAction, MemberCommand, SingleLaunchPlan},
+    execution::{
+        DigestCheckpointPlan, EngineLogTailPlan, MemberAction, MemberCommand, SingleLaunchPlan,
+    },
     pb,
 };
 use std::{
@@ -874,6 +876,83 @@ impl NativeHostExecution {
         })
     }
 
+    /// One engine log per incarnation, in this host's log directory. The one
+    /// derivation every engine's launch and the log tail use.
+    fn engine_log_path(&self, incarnation: &str) -> PathBuf {
+        self.log_dir.join(format!("{incarnation}.log"))
+    }
+
+    /// SPEC §13.3 / T21: the bounded, redacted end of one launch's engine
+    /// log. Not journaled: it reads and changes nothing. The log is derived
+    /// from this host's own log directory and only for a launch it still
+    /// claims for the command's deployment; the wire never names a path. A
+    /// failed read is a closed state in a completed result, never native
+    /// error text, and never ends the session.
+    async fn engine_log_tail(
+        &self,
+        command: &MemberCommand,
+        plan: &EngineLogTailPlan,
+    ) -> Result<pb::MemberExecutionResult, SessionError> {
+        use capyctl_adapters::engine_log::TailError;
+        let id = &command.identity;
+        if id.controller_id != self.controller_id
+            || id.member.host_id != self.host_id
+            || id.expected_state != "engine_log"
+            || id.deadline_ms <= capyctl_protocol::now_unix_ms()
+        {
+            return Err(SessionError);
+        }
+        let host = self.clone();
+        let deployment = id.deployment_id.clone();
+        let plan = plan.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let claimed = host
+                .journal
+                .claimed_launches("")
+                .map_err(|_| TailError::Unreadable(String::new()))?;
+            let owned = claimed.iter().any(|launch| {
+                launch.command.identity.deployment_id == deployment
+                    && launch
+                        .command
+                        .action
+                        .launch_plan()
+                        .is_some_and(|launch| launch.incarnation == plan.incarnation)
+            });
+            if !owned {
+                return Err(TailError::Missing);
+            }
+            capyctl_adapters::engine_log::read_tail(
+                &host.engine_log_path(&plan.incarnation),
+                plan.max_bytes as usize,
+            )
+        })
+        .await
+        .map_err(|_| SessionError)?;
+        let evidence = match read {
+            Ok(tail) => pb::EngineLogTailEvidence {
+                state: "served".into(),
+                text: tail.text,
+                truncated: tail.truncated,
+            },
+            Err(failure) => pb::EngineLogTailEvidence {
+                state: match failure {
+                    TailError::Missing => "missing",
+                    TailError::Raw => "raw",
+                    TailError::Unreadable(_) => "unreadable",
+                }
+                .into(),
+                ..Default::default()
+            },
+        };
+        Ok(pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
+            engine_log: Some(evidence),
+            ..Default::default()
+        })
+    }
+
     /// ADR 0028 §7 (owner decision 10): read, never change. A group Prepare
     /// answers whether this host's member of `plan` could launch now. It
     /// journals nothing, spawns nothing and holds no port: every check reads a
@@ -1176,11 +1255,7 @@ impl NativeHostExecution {
                         .with_tools(tools)
                         .with_session(plan.coordinator_session_id.clone())
                         .with_wrapper(self.runtime_dir.join("sglang_entry.py"))
-                        .with_log(
-                            self.log_dir
-                                .join(format!("{}.log", plan.incarnation))
-                                .to_string_lossy(),
-                        ),
+                        .with_log(self.engine_log_path(&plan.incarnation).to_string_lossy()),
                 )
             }
             PreparedLaunch::Vllm(launch) => Box::new(
@@ -1506,6 +1581,9 @@ impl NativeHostExecution {
         }
         if let MemberAction::MaterializeSource(plan) = &command.action {
             return self.materialize_source(&command, plan);
+        }
+        if let MemberAction::EngineLogTail(plan) = &command.action {
+            return self.engine_log_tail(&command, plan).await;
         }
         // ADR 0028 §7: a group Prepare is checked here and never journaled.
         if let MemberAction::Prepare(plan) = &command.action {
@@ -3255,6 +3333,97 @@ mod tests {
             .unwrap();
         assert_eq!(measured.state, "computed", "{measured:?}");
         assert_eq!(measured.total_bytes, 5000);
+    }
+
+    /// SPEC §13.3 / T21: an engine log tail reads this host's own log of a
+    /// launch it claims for the command's deployment, bounded and redacted.
+    /// A raw development log, an unclaimed incarnation and another
+    /// deployment's launch carry no text; none ends the session, and no
+    /// answer names a path.
+    // T21 T34
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_log_tail_serves_a_claimed_launch_bounded_and_redacted() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let (mut launch, plan) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let key = "0123456789abcdef".repeat(4);
+        std::fs::create_dir_all(root.path().join("logs")).unwrap();
+        let log = root.path().join(format!("logs/{}.log", plan.incarnation));
+        let filler = format!("{}\n", "x".repeat(99));
+        std::fs::write(
+            &log,
+            format!(
+                "{}engine key={key}\napi_key=s3cr3t-value-here\n\
+                 fetch https://h/p?X-Amz-Signature={key}\norigin https://user:pass@h/\nready\n",
+                filler.repeat(40)
+            ),
+        )
+        .unwrap();
+        let tail = |id: &str, deployment: &str, incarnation: &str, max_bytes: u32| {
+            let mut command = MemberCommand {
+                identity: checkpoint_identity(id, "engine_log"),
+                action: MemberAction::EngineLogTail(EngineLogTailPlan {
+                    incarnation: incarnation.into(),
+                    max_bytes,
+                }),
+            };
+            command.identity.deployment_id = deployment.into();
+            command.identity.payload_digest = command.canonical_digest();
+            command
+        };
+        let run = |command: MemberCommand| {
+            let executor = executor.clone();
+            async move {
+                let result = executor.execute(session, command.clone()).await.unwrap();
+                capyctl_protocol::execution::validate_result(&command, &result).unwrap();
+                result.engine_log.unwrap()
+            }
+        };
+        let served = run(tail("t1", "deployment", &plan.incarnation, 1024)).await;
+        assert_eq!(served.state, "served");
+        assert!(served.truncated);
+        assert!(served.text.len() <= 1024, "{}", served.text.len());
+        for secret in [key.as_str(), "s3cr3t-value-here", "user:pass"] {
+            assert!(!served.text.contains(secret), "{secret}: {}", served.text);
+        }
+        assert!(served.text.contains("<redacted>"), "{}", served.text);
+        assert!(served.text.ends_with("ready\n"), "{}", served.text);
+        // Another deployment's command, or an incarnation this host does not
+        // claim, reads nothing.
+        for (id, deployment, incarnation) in [
+            ("t2", "other", plan.incarnation.as_str()),
+            ("t3", "deployment", "01K00000000000000000000009"),
+        ] {
+            let answer = run(tail(id, deployment, incarnation, 1024)).await;
+            assert_eq!(
+                (answer.state.as_str(), answer.text.as_str()),
+                ("missing", "")
+            );
+        }
+        // SPEC §13.3: a log written under --debug-engine-logs is never served.
+        std::fs::write(capyctl_adapters::engine_log::raw_marker(&log), "").unwrap();
+        let raw = run(tail("t4", "deployment", &plan.incarnation, 1024)).await;
+        assert_eq!((raw.state.as_str(), raw.text.as_str()), ("raw", ""));
+        // A claimed launch whose log is gone is `missing`.
+        std::fs::remove_file(capyctl_adapters::engine_log::raw_marker(&log)).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        let gone = run(tail("t5", "deployment", &plan.incarnation, 1024)).await;
+        assert_eq!(gone.state, "missing");
+        // A command for another controller is not this host's to answer.
+        let mut foreign = tail("t6", "deployment", &plan.incarnation, 1024);
+        foreign.identity.controller_id = "other".into();
+        foreign.identity.payload_digest = foreign.canonical_digest();
+        assert!(executor.execute(session, foreign).await.is_err());
+        assert!(capyctl_protocol::capabilities::agent_capabilities()
+            .contains(&capyctl_protocol::capabilities::ENGINE_LOG_TAIL.to_owned()));
     }
 
     /// SPEC §13 (WE3 limit 1): a launch refused because its checkpoint no

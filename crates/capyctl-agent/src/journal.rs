@@ -1802,6 +1802,8 @@ impl HostJournal {
             // ADR 0028 §9: the executor adds a completion probe's token ids,
             // fresh or replayed; nothing journaled carries any.
             probe_tokens: Vec::new(),
+            // SPEC §13.3: an engine log tail is never journaled either.
+            engine_log: None,
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or

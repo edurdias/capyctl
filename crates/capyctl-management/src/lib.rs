@@ -21,6 +21,8 @@ pub mod actions;
 pub mod configuration;
 mod credentials;
 pub mod drain;
+// SPEC §13.3 / T21: one instance's bounded, redacted engine log tail.
+pub mod engine_log;
 pub mod enrollment;
 // ADR 0018 §4: runtime profile retirement over the ordinary stop path.
 pub mod engines;

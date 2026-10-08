@@ -1,11 +1,15 @@
 """Process-lifetime startup guards; stdlib only, never launch authority.
 
-Call contain_startup_output() in the fresh service-owned child BEFORE native
-imports or ServerArgs construction, then enforce_closed_plugins(). Never restore
-stdout/stderr: native buffers, threads and atexit handlers can outlive startup.
-Output is discarded by default, not heuristically redacted. Explicit operator
---debug-engine-logs retains full private output for development. Failure reporting
-must use fixed exit/status categories, not native exception text or arguments.
+Call preimport_guard() in the fresh service-owned child BEFORE native imports or
+ServerArgs construction. SPEC §13.3: engine output is kept in the launch's
+private (0600) log at SGLang's default level. The launcher pipes descriptors 1
+and 2 into capyctl's redacting log writer, which replaces the launch's keys by
+value and credential shapes by rule, so native writes are covered too; the
+scrubber installed here additionally scrubs Python-level records and streams.
+Request logging stays off (log_requests=False, sglang_server_args.py). Explicit
+operator --debug-engine-logs raises the level to debug and writes full private
+output without the writer. Failure reporting must use fixed exit/status
+categories, not native exception text or arguments.
 
 These are narrow controls, not a sandbox. The launcher must supply a clean isolated
 interpreter, no inherited alternate output FDs/handlers, a closed environment, and
@@ -17,7 +21,7 @@ Before plugin inventory and native imports, startup must explicitly establish
 the trusted package/metadata paths without executing .pth files or site.main().
 An empty metadata inventory under -S does not attest the installed environment.
 Do not enable native file/request/crash logging. Spawned interpreters must run the
-same preimport plugin check; fd 1/2 suppression survives fork and exec by itself.
+same preimport plugin check; the fd 1/2 pipe to the log writer is inherited by them.
 The protected sglang_entry script repeats these guards during CPython spawn's
 __mp_main__ preparation, before native Process arguments are unpickled. Keeping
 that exact protected main path and spawn method is a startup composition duty;
@@ -42,7 +46,6 @@ import importlib.metadata
 import logging
 import os
 import re
-import stat
 import sys
 
 
@@ -50,38 +53,12 @@ class StartupGuardError(Exception):
     """Only fixed public categories; never render intercepted native details."""
 
     def __init__(self, code):
-        if code not in ("output_containment_failed", "native_already_imported",
+        if code not in ("native_already_imported",
                         "external_plugin_selection", "external_plugins_present",
                         "plugin_inventory_unavailable"):
             code = "startup_guard_failed"
         self.code = code
         super().__init__(code)
-
-
-def contain_startup_output():
-    """Irreversibly redirect stdout/stderr at OS descriptor level on Linux.
-
-    Call once in a fresh, single-threaded launcher process. No original descriptor
-    is retained. Do not flush first: buffered secret output must also be discarded.
-    Failures require immediate process termination, never proceeding to imports.
-    This function intentionally is not a context manager.
-    """
-    sink = None
-    try:
-        if not sys.platform.startswith("linux"):
-            raise OSError()
-        sink = os.open("/dev/null", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        info = os.fstat(sink)
-        if not stat.S_ISCHR(info.st_mode) or info.st_rdev != os.makedev(1, 3):
-            raise OSError()
-        # dup2 clears CLOEXEC: spawned native children inherit suppression.
-        os.dup2(sink, 1, inheritable=True)
-        os.dup2(sink, 2, inheritable=True)
-    except OSError:
-        raise StartupGuardError("output_containment_failed") from None
-    finally:
-        if sink is not None and sink not in (1, 2):
-            os.close(sink)
 
 
 def enforce_closed_plugins():
@@ -136,12 +113,13 @@ class _ScrubbingStream:
 
 
 def install_log_scrubber():
-    """SPEC §13.3 / T21: debug engine logs never carry a credential.
+    """SPEC §13.3 / T21: engine logs never carry a credential.
 
     The engine formats its arguments (keys included) into log messages, so every
     log record's message is scrubbed as it is created, and Python-level writes
     to stdout and stderr are scrubbed too. Native writes to the descriptors are
-    not intercepted; the log file is private (0600) either way.
+    redacted by capyctl's log writer on the other end of the pipe; under
+    --debug-engine-logs they are not, and the log file is private (0600).
     """
     factory = logging.getLogRecordFactory()
 
@@ -162,20 +140,15 @@ def install_log_scrubber():
 def preimport_guard():
     """One-call preimport safety for a freshly spawned interpreter.
 
-    Normally runs contain_startup_output() then enforce_closed_plugins(), in that order.
-    Explicit debug opt-in skips output containment only. This runs
-    at the top of a spawned interpreter's main before native Process arguments
-    are unpickled. Raises a closed StartupGuardError category; the caller exits
-    without rendering native details. The selector rejection and installed
-    entry-point inventory observation in enforce_closed_plugins() are the
-    complete in-child posture: trusted immutable package/code/metadata/search
-    paths (including children), the clean isolated interpreter and the closed
-    environment remain launcher prerequisites that no child can self-attest.
+    Runs install_log_scrubber() then enforce_closed_plugins(), in that order,
+    with or without --debug-engine-logs. This runs at the top of a spawned
+    interpreter's main before native Process arguments are unpickled. Raises a
+    closed StartupGuardError category; the caller exits without rendering
+    native details. The selector rejection and installed entry-point inventory
+    observation in enforce_closed_plugins() are the complete in-child posture:
+    trusted immutable package/code/metadata/search paths (including children),
+    the clean isolated interpreter and the closed environment remain launcher
+    prerequisites that no child can self-attest.
     """
-    # Explicit operator development opt-in; plugin checks remain mandatory, and
-    # the retained output is scrubbed of credentials (SPEC §13.3).
-    if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") != "1":
-        contain_startup_output()
-    else:
-        install_log_scrubber()
+    install_log_scrubber()
     enforce_closed_plugins()

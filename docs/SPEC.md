@@ -550,6 +550,10 @@ Protect credentials, journals, checkpoint permissions, and sensitive cache direc
 
 The inference listener may be reachable from the network. It requires the API key by default; turning the key off (`authentication: none`, `--no-inference-auth` or `CAPYCTL_INFERENCE_AUTH=none`) prints a warning at start when the bind is not loopback, and there is no constant or fallback key. The router's allowlists, header stripping and amplification bounds apply on every bind. The management listener, engine listeners and the key-guard protections keep their loopback rules.
 
+> **Amended 2026-10-08 (owner decision).**
+
+Every engine's output is kept at the engine's default level in its launch's private owner-only log, written through a redacting writer: the launch's own credentials (engine and admin keys, observation credentials, secret-named environment values) are replaced by value, and URL credentials, URL query strings and fragments (presigned URLs), secret-named assignments, Hugging Face tokens, bearer values and long credential-shaped runs by rule. The log rotates at a fixed size, so each launch's log is bounded. Request logging stays off for every engine, so prompts and completions are not logged by default. An authenticated management read returns a bounded, redacted tail of one instance's engine log. A log written under `--debug-engine-logs` is raw development output and is never served.
+
 ## 14. Action-first CLI and interfaces
 
 Canonical grammar: `capyctl <action> <resource> [identifier] [options]`.

@@ -468,6 +468,16 @@ message MaterializeSourceRequest {
   string deployment_config = 1;
   string host_policy_fingerprint = 2;
 }
+// SPEC §13.3 / T21 (additive): the bounded, redacted end of one retained
+// launch's engine log, for the management surface. It names the launch by
+// its incarnation, never a path: the host derives the log from its own log
+// directory and answers only for a launch it still claims for the command's
+// deployment. Read-only: it never launches, releases or changes anything.
+message EngineLogTailRequest {
+  string incarnation = 1;
+  // 1 ..= 262144 (256 KiB); the answer's text is never longer.
+  uint32 max_bytes = 2;
+}
 message ExecuteMember {
   CommandIdentity identity = 1;
   oneof action {
@@ -489,6 +499,9 @@ message ExecuteMember {
     // ADR 0008 (additive): sent only to a host whose Connect declared
     // `model_sources`.
     MaterializeSourceRequest materialize_source = 14;
+    // SPEC §13.3 (additive): sent only to a host whose Connect declared
+    // `engine_log_tail`.
+    EngineLogTailRequest engine_log_tail = 17;
   }
   // ADR 0014 §7, owner decision 5 (2026-09-22), additive: with
   // restore_owned_handle only, the checkpoint digest the server recorded for
@@ -607,10 +620,20 @@ message MemberExecutionResult {
   // encodes exactly as before; an empty answer to a completion probe is a
   // failed probe.
   repeated uint32 probe_tokens = 17;
+  // SPEC §13.3 / T21 (additive): EngineLogTail results only.
+  EngineLogTailEvidence engine_log = 18;
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;
   int64 until_unix_ms = 2;
+}
+// SPEC §13.3 / T21: one engine log tail. `served` carries whole redacted
+// lines, at most the request's `max_bytes`; the other states carry nothing.
+// `raw`: the log was written under --debug-engine-logs and is never served.
+message EngineLogTailEvidence {
+  string state = 1;     // served | missing | raw | unreadable
+  string text = 2;      // served only
+  bool truncated = 3;   // served only: older output exists before `text`
 }
 message ModelSourceEvidence {
   string state = 1;                 // pending | downloading | verified | failed

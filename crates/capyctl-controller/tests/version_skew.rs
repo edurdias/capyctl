@@ -653,6 +653,98 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
     h.server.abort();
 }
 
+// T21 T34 (SPEC §13.3, ADR 0017): an engine log tail is refused, typed, and
+// never sent to a host that did not declare `engine_log_tail`. A host that
+// did is sent the read-only action naming the launch's incarnation (never a
+// path), and its bounded answer is the tail.
+#[tokio::test]
+async fn an_engine_log_tail_needs_the_capability_and_is_otherwise_answered() {
+    use capyctl_controller::engine_logs::{remote_tail, LaunchScope, Tail, TailFailure};
+    let scope = |host: &str| LaunchScope {
+        host_id: host.into(),
+        generation: 1,
+        revision: 1,
+        incarnation: "01K00000000000000000000002".into(),
+    };
+    let controller = |h: &Harness| h.authority.controller_id();
+
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::ENGINE_LOG_TAIL);
+    let (_send, mut stream) = h.reconciled(BINARY_VERSION, declared).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        remote_tail(
+            &h.sessions,
+            &controller(&h),
+            "deployment",
+            0,
+            &scope(&h.host),
+            1024,
+        ),
+    )
+    .await
+    .expect("answered at once");
+    assert_eq!(
+        refused,
+        Err(TailFailure::CapabilityMissing(
+            "host_capability_missing:engine_log_tail".into()
+        ))
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    h.server.abort();
+
+    let h = enrolled().await;
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    let pending = {
+        let (sessions, controller, scope) = (h.sessions.clone(), controller(&h), scope(&h.host));
+        tokio::spawn(async move {
+            remote_tail(&sessions, &controller, "deployment", 0, &scope, 1024).await
+        })
+    };
+    let sent = next_command(&mut stream, Duration::from_secs(5))
+        .await
+        .expect("the read is sent");
+    let Some(pb::execute_member::Action::EngineLogTail(request)) = &sent.action else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(request.incarnation, "01K00000000000000000000002");
+    assert_eq!(request.max_bytes, 1024);
+    send.send(pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::MemberResult(
+            pb::MemberExecutionResult {
+                identity: sent.identity.clone(),
+                state: "completed".into(),
+                observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
+                engine_log: Some(pb::EngineLogTailEvidence {
+                    state: "served".into(),
+                    text: "ready\n".into(),
+                    truncated: true,
+                }),
+                ..Default::default()
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(Tail {
+            text: "ready\n".into(),
+            truncated: true,
+        })
+    );
+    h.server.abort();
+}
+
 // T34: ADR 0028 §6 with ADR 0017: a group host that cannot measure a
 // checkpoint digest is refused, typed, before it is asked to download
 // anything: it is sent no MaterializeSource.

@@ -41,6 +41,8 @@ pub struct DurableSpawn {
     attempted: Mutex<HashSet<String>>,
     retained: Mutex<HashMap<String, RetainedChild>>,
     identity_collector: fn(u32, &str) -> Option<ProcessIdentity>,
+    /// SPEC §13.3 / T21: the redacting writer engine output passes through.
+    log_relay: Option<crate::engine_log_relay::LogRelay>,
 }
 
 struct RetainedChild {
@@ -62,7 +64,15 @@ impl DurableSpawn {
             attempted: Mutex::new(HashSet::new()),
             retained: Mutex::new(HashMap::new()),
             identity_collector: super::exec::process_identity,
+            log_relay: crate::engine_log_relay::installed(),
         }
+    }
+
+    /// Use `relay` as the engine log's writer instead of the process's
+    /// installed one.
+    pub fn with_log_relay(mut self, relay: crate::engine_log_relay::LogRelay) -> Self {
+        self.log_relay = Some(relay);
+        self
     }
 
     #[cfg(test)]
@@ -71,6 +81,7 @@ impl DurableSpawn {
             attempted: Mutex::new(HashSet::new()),
             retained: Mutex::new(HashMap::new()),
             identity_collector: collector,
+            log_relay: None,
         }
     }
 
@@ -167,13 +178,20 @@ impl DurableSpawn {
             .args(args)
             .envs(&cmd.env);
         match log {
-            Some(file) => {
-                let second = file
-                    .try_clone()
-                    .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
-                command
-                    .stdout(std::process::Stdio::from(file))
-                    .stderr(std::process::Stdio::from(second));
+            Some(path) => {
+                // SPEC §13.3 / T21: output reaches the log through the redacting
+                // writer, which knows this launch's credentials by value.
+                let (stdout, stderr) = crate::engine_log_relay::attach(
+                    &path,
+                    self.log_relay.as_ref(),
+                    &cmd.env,
+                    descriptors,
+                    open_private_log,
+                )
+                .map_err(|error| {
+                    DurableSpawnError::Spawn(format!("engine log {}: {error}", path.display()))
+                })?;
+                command.stdout(stdout).stderr(stderr);
             }
             None => {
                 command
@@ -298,21 +316,18 @@ impl Drop for DurableSpawn {
 }
 
 /// The engine's own output is evidence, so it is appended to the file the plan
-/// names rather than discarded. The log may hold prompts and tokens, so the
-/// directories are owner-only and the file is owner read/write.
+/// names rather than discarded. The directories are owner-only and the file is
+/// owner read/write (`open_private_log`).
 ///
-/// `ExecLauncher` opens the same variable but without creating parents or fixing
-/// the mode; sharing one helper would change that launcher's behaviour, so the
-/// stricter rule lives here with the gated spawn that needs it.
-fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::fs::File>, DurableSpawnError> {
+/// `ExecLauncher` opens the same variable but without creating parents; sharing
+/// one helper would change that launcher's behaviour, so the stricter rule
+/// lives here with the gated spawn that needs it.
+fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::path::PathBuf>, DurableSpawnError> {
     use std::os::unix::fs::DirBuilderExt;
     let Some(path) = cmd.env.get("CAPYCTL_ENGINE_LOG") else {
         return Ok(None);
     };
     let path = std::path::Path::new(path);
-    let failed = |error: std::io::Error| {
-        DurableSpawnError::Spawn(format!("engine log {}: {error}", path.display()))
-    };
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -321,9 +336,11 @@ fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::fs::File>, DurableSpa
             .recursive(true)
             .mode(0o700)
             .create(parent)
-            .map_err(failed)?;
+            .map_err(|error| {
+                DurableSpawnError::Spawn(format!("engine log {}: {error}", path.display()))
+            })?;
     }
-    open_private_log(path).map(Some).map_err(failed)
+    Ok(Some(path.to_path_buf()))
 }
 
 /// SPEC §13.3 / T21: open an engine log for append without following a

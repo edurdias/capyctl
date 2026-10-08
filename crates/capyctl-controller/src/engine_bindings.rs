@@ -154,11 +154,13 @@ impl ProfileBindings {
         capyctl_adapters::vllm::plan_from_effective(
             effective,
             port,
-            self.log_dir
-                .join(&work.fence().deployment_id)
-                .join(format!("{}.log", work.incarnation()))
-                .to_string_lossy()
-                .into_owned(),
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
             self.runtime_dir.to_string_lossy().into_owned(),
         )
         .map_err(Self::refuse)
@@ -192,11 +194,13 @@ impl ProfileBindings {
         let plan = capyctl_adapters::tensorfold::plan_from_effective(
             effective,
             port,
-            self.log_dir
-                .join(&work.fence().deployment_id)
-                .join(format!("{}.log", work.incarnation()))
-                .to_string_lossy()
-                .into_owned(),
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
             Some(dir.to_string_lossy().into_owned()),
         )
         .map_err(|error| refuse(error.to_string()))?;
@@ -348,11 +352,13 @@ impl EngineBindings for ProfileBindings {
                     // The engine's own output, one file per incarnation, next
                     // to every other engine's log.
                     log: Some(
-                        self.log_dir
-                            .join(&work.fence().deployment_id)
-                            .join(format!("{}.log", work.incarnation()))
-                            .to_string_lossy()
-                            .into_owned(),
+                        crate::engine_logs::standalone_log_path(
+                            &self.log_dir,
+                            &work.fence().deployment_id,
+                            work.incarnation(),
+                        )
+                        .to_string_lossy()
+                        .into_owned(),
                     ),
                     // The coordinator session is not the bindings' to know; the
                     // resolved-spawn factory threads it under the owner lock.

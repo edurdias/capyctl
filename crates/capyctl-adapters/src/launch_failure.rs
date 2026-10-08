@@ -70,7 +70,7 @@ const LOG_TAIL_LINES: usize = 20;
 
 /// The most log bytes read for a tail. An engine that logged a gigabyte before
 /// dying must not be read into memory to explain itself.
-const LOG_TAIL_BYTES: u64 = 64 * 1024;
+const LOG_TAIL_BYTES: usize = 64 * 1024;
 
 /// The last lines of the engine's log, bounded and redacted. The tail is the
 /// engine's own account of why it left, and it is quoted into an error that
@@ -79,8 +79,8 @@ pub fn log_tail(path: Option<&str>) -> String {
     let Some(path) = path else {
         return "(no engine log was configured for this launch)".into();
     };
-    let text = match read_tail_bytes(path) {
-        Ok(text) => text,
+    let text = match crate::engine_log::tail_bytes(std::path::Path::new(path), LOG_TAIL_BYTES) {
+        Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return format!("(engine log {path} could not be read: {e})"),
     };
     let tail: Vec<&str> = text
@@ -94,19 +94,7 @@ pub fn log_tail(path: Option<&str>) -> String {
     if tail.is_empty() {
         return format!("(engine log {path} is empty)");
     }
-    crate::vllm::args::redact_text(&tail.join("\n"))
-}
-
-fn read_tail_bytes(path: &str) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > LOG_TAIL_BYTES {
-        file.seek(SeekFrom::Start(len - LOG_TAIL_BYTES))?;
-    }
-    let mut buffer = Vec::new();
-    file.take(LOG_TAIL_BYTES).read_to_end(&mut buffer)?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
+    crate::engine_log::LogRedactor::new().redact(&tail.join("\n"))
 }
 
 /// The bounded summary of a launch whose engine exited before readiness.

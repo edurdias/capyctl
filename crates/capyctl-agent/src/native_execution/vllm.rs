@@ -51,8 +51,7 @@ impl NativeHostExecution {
             effective,
             plan.service_port,
             // One engine log per incarnation, beside the SGLang engine logs.
-            self.log_dir
-                .join(format!("{}.log", plan.incarnation))
+            self.engine_log_path(&plan.incarnation)
                 .to_string_lossy()
                 .into_owned(),
             self.runtime_dir.to_string_lossy().into_owned(),

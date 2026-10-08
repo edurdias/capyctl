@@ -9,6 +9,14 @@ use capyctl_cli::table::{self, HostNames};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
+    // SPEC §13.3 / T21: this binary is also the redacting writer between an
+    // engine and its log; launchers re-execute it with this one argument.
+    if args.len() == 2 && args[1] == capyctl_launchers::engine_log_relay::RELAY_ARG {
+        return ExitCode::from(capyctl_launchers::engine_log_relay::relay_main() as u8);
+    }
+    capyctl_launchers::engine_log_relay::install(
+        capyctl_launchers::engine_log_relay::LogRelay::this_binary(),
+    );
     let mut invocation = match grammar::parse_invocation(&args) {
         Ok(invocation) => invocation,
         Err(err) => return report_cli_error(&err),

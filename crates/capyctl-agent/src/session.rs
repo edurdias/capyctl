@@ -568,8 +568,9 @@ async fn connect_once(
     .await
     .map_err(end("outbound stream closed"))?;
     let mut stream = AgentControlClient::new(channel)
-        .max_decoding_message_size(65536)
-        .max_encoding_message_size(65536)
+        .max_decoding_message_size(capyctl_protocol::SERVER_MESSAGE_BYTES)
+        // SPEC §13.3: room for an engine log tail answer.
+        .max_encoding_message_size(capyctl_protocol::HOST_MESSAGE_BYTES)
         .session(ReceiverStream::new(receive))
         .await
         .map_err(refused_session)?

@@ -14,6 +14,8 @@ pub mod coordinator_port;
 pub mod engine_bindings;
 // SPEC §13.2 (W13): an owned engine that exited is closed and settled.
 pub mod engine_exit;
+// SPEC §13.3 / T21: an instance's bounded, redacted engine log tail.
+pub mod engine_logs;
 pub mod enrollment;
 pub mod host_publication;
 pub mod profile_retirement;

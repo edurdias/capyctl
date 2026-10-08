@@ -332,6 +332,7 @@ fn every_post_baseline_field_names_its_capability() {
             DEVICE_MEMORY_DOMAINS,
             CHECKPOINT_STATE_SLOT,
             ENGINE_GROUPS,
+            ENGINE_LOG_TAIL,
         ]
         .contains(name)
         {

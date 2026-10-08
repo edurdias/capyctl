@@ -71,18 +71,22 @@ and is separate from the policy's opaque hardware fingerprint. Trusted kernel
 mounts and service-side mapping/namespace provisioning remain required.
 
 `sglang_startup_guards` supplies narrow preimport helpers for a fresh, isolated
-service-owned child only. `contain_startup_output()` permanently redirects stdout
-and stderr to `/dev/null`, including C output and descendants. It is not a
-context manager and must never run in the controlling service process. Report
-only fixed exit/status categories externally; native output is discarded by default.
+service-owned child only. SPEC §13.3 (amended 2026-10-08): the engine's output
+is kept at SGLang's default level (info) with request logging off. The
+launcher pipes stdout and stderr into capyctl's redacting log writer
+(`crates/capyctl-launchers/src/engine_log_relay.rs`), which replaces the
+launch's keys by value and credential shapes by rule before anything reaches
+the private log, native writes and descendants included.
+`install_log_scrubber()` additionally scrubs Python-level log records and
+stream writes. Report only fixed exit/status categories externally.
 
 For development, the operator may explicitly run
 `capyctl start standalone --debug-engine-logs`. This enables native debug verbosity
-and retains full output in the launcher's private engine log files. Those files
-may contain credentials or other sensitive data; they are not copied into
-management errors or journals. The flag is process-local and is not persisted.
-Restart without it to restore output containment. Plugin, capability,
-checkpoint, and placement checks remain enforced in either mode.
+and writes full output to the launcher's private engine log files without the
+writer. Those files may contain credentials or other sensitive data; they are
+marked raw and never copied into management responses, errors or journals. The
+flag is process-local and is not persisted. Plugin, capability, checkpoint, and
+placement checks remain enforced in either mode.
 
 `enforce_closed_plugins()` rejects already imported `sglang`, `torch`,
 `transformers`, or `torch_memory_saver` roots and submodules, nonempty

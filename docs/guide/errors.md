@@ -87,10 +87,11 @@ instance's `LAST ERROR` column gives the reason, for example
 `launch_failed: launch failed: engine launch failed: the engine exited before readiness`.
 Each launch writes
 `~/.local/state/capyctl/logs/<deployment id>/<launch id>.log` (under the host's
-state directory on a GPU machine of several). For vLLM and TensorFold it holds
-the engine's own output. For SGLang it stays empty unless CapyCTL was started
-with `--debug-engine-logs`: restart CapyCTL with it and start the model again to
-see why SGLang stopped. That output may contain prompts.
+state directory on a GPU machine of several). It holds the engine's own output
+at its default level, with keys and other credentials replaced by `<redacted>`
+and no prompts, and the management API returns its end
+(`GET /management/v1/deployments/<id>/engine-log`,
+[engine logs](../operations/install.md#engine-logs-and-troubleshooting)).
 
 **A model stays queued.** `status deployment` shows why under its table, for
 example `Waiting     initialize pending: gave up: resource or evidence check failed: insufficient resources`:
@@ -132,7 +133,7 @@ check cannot prove that (for example, a group-writable environment on a
 machine whose groups come from a directory service), CapyCTL parks anyway and
 writes one warning to the engine log:
 `{"event":"capyctl_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
-You only see it with `--debug-engine-logs`. To clear it, remove group and
+To clear it, remove group and
 other write permission from the engine's environment
 (`chmod -R go-w <environment>`).
 

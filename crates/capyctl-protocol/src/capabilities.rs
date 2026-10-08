@@ -78,6 +78,10 @@ pub const DEVICE_MEMORY_DOMAINS: &str = "device_memory_domains";
 /// only on a host that declared it; any other host is refused
 /// `host_capability_missing:engine_groups` before anything is sent.
 pub const ENGINE_GROUPS: &str = "engine_groups";
+/// SPEC §13.3 / T21: the EngineLogTail action and its result's
+/// `engine_log` evidence. A host that did not declare it is refused
+/// `host_capability_missing:engine_log_tail` and sent nothing.
+pub const ENGINE_LOG_TAIL: &str = "engine_log_tail";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -118,6 +122,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (DEVICE_MEMORY_DOMAINS, Direction::ServerToHost),
     (CHECKPOINT_STATE_SLOT, Direction::ServerToHost),
     (ENGINE_GROUPS, Direction::ServerToHost),
+    (ENGINE_LOG_TAIL, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -197,6 +202,7 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
         }
         Some(Action::MaterializeSource(_)) => needs.push(MODEL_SOURCES),
+        Some(Action::EngineLogTail(_)) => needs.push(ENGINE_LOG_TAIL),
         _ => {}
     }
     if command
@@ -223,7 +229,8 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
 
 /// ADR 0017: the actions a drain-only host may still be sent. They stop,
 /// close, re-prove or observe what the server already owns there; none of
-/// them places, starts, wakes, parks, measures or downloads anything.
+/// them places, starts, wakes, parks, measures or downloads anything. An
+/// engine log tail (SPEC §13.3) only reads what a retained launch wrote.
 pub fn drain_only_permits(command: &pb::ExecuteMember) -> bool {
     use pb::execute_member::Action;
     matches!(
@@ -233,6 +240,7 @@ pub fn drain_only_permits(command: &pb::ExecuteMember) -> bool {
                 | Action::TerminateOwnedHandle(_)
                 | Action::CloseIngress(_)
                 | Action::ProbeOwnedHandle(_)
+                | Action::EngineLogTail(_)
         )
     )
 }

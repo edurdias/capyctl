@@ -785,20 +785,54 @@ the running role to publish it.
 
 ## Engine logs and troubleshooting
 
-Each launch has an owner-only log, `<state dir>/logs/<deployment id>/<launch
-id>.log`. What it holds depends on the engine:
+Each launch has an owner-only (0600) log, `<state dir>/logs/<deployment
+id>/<launch id>.log`, for every engine. It holds the engine's own output at the
+engine's default level (info for SGLang, vLLM and TensorFold), redacted as it
+is written:
 
-- **vLLM and TensorFold.** The engine's own output at its default log level is
-  kept. It logs no prompts, and CapyCTL never puts a key in an engine's
-  arguments. When a launch fails, CapyCTL reads the end
-  of this log, with credentials redacted, to name the refused option or the
-  missing drafter in status.
-- **SGLang.** CapyCTL discards the engine's output from the moment it imports
-  SGLang, so the file stays empty, even when a launch fails after that point.
+- The engine's output goes through a small writer process (the `capyctl`
+  binary itself, in its own process group) before it reaches the file. The
+  writer replaces the launch's own credentials wherever they appear (the
+  engine and admin keys, an observation credential, any secret-named variable
+  of the engine's environment), and, by rule, URL credentials (`user:pass@`),
+  URL query strings and fragments (presigned URLs), secret-named assignments
+  (`api_key=…`, `"password": …`, `Authorization: …`), Hugging Face tokens,
+  bearer values and long credential-shaped runs. Each becomes `<redacted>`.
+- The log rotates at 16 MiB to `<launch id>.log.1` and `.log.2`; older output
+  is dropped, so one launch's log never exceeds 48 MiB.
+- No engine logs prompts or completions: request logging stays off. SGLang
+  runs with `log_requests` off and no crash dump folder; vLLM's
+  `--enable-log-requests` is reserved and off by default; TensorFold has no
+  request logging. Per-request lines carry the method, path and status only.
+
+Read the end of an instance's log through the management API, on the
+management listener, with the admin token from the role's credentials file
+([configuration](configuration.md)):
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://<management listener>/management/v1/deployments/<id>/engine-log?instance=0&kib=64"
+```
+
+`kib` defaults to 64 and may be 1 to 256; `instance` (the index `status
+deployment` shows) may be left out when the deployment has one instance. The
+answer, `{deployment_id, instance, host_id, incarnation, kib, truncated, text,
+read_at_ms}`, holds at most `kib` KiB of whole lines, redacted again on the way
+out, and `truncated: true` when older output exists. The read continues into
+`<launch id>.log.1` when the current file is short. Refusals: `400
+invalid_request` (a bad query, or no `instance` for a deployment of several),
+`404 not_found` (unknown deployment or instance, no running launch, or no log
+yet), `403 forbidden` (a `--debug-engine-logs` log), `503
+unsupported_capability` (`host_capability_missing:engine_log_tail`: the host
+runs an older CapyCTL), `503 observation_stale` (the host is not connected),
+`504 deadline_exceeded` (no answer within 15 seconds) and `429 queue_full`
+(two reads already running). No answer carries a file path.
 
 `--debug-engine-logs` on `capyctl start host` or `capyctl start standalone`
-keeps SGLang's output too, at debug level and with credentials scrubbed, for
-launches from then on. That output may contain prompts. It is a flag only: a
+raises SGLang to debug level and writes every engine's full output to the log
+directly, without the writer, for launches from then on. That output may
+contain prompts and secrets, so the management API never serves it (it answers
+that the log was written under `--debug-engine-logs`). It is a flag only: a
 variable left in a unit file must not turn it on. For a unit, add it to
 `ExecStart=` in a drop-in while you investigate, then remove it.
 
@@ -807,16 +841,16 @@ variable left in a unit file must not turn it on. For a unit, add it to
   instance's `LAST ERROR` column can still read `-`. `--format json` has the
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
-  exited (for SGLang, only with `--debug-engine-logs`).
+  exited.
 - **SGLang saver permission warning.** Before an SGLang park, CapyCTL checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable
   environment on a machine whose groups come from a directory service such as
   `sss`), CapyCTL parks anyway and writes one line to the engine log:
   `{"event":"capyctl_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
-  The line is only in the engine log, so it is visible only with
-  `--debug-engine-logs`. To clear it, remove group and other write permission
-  from the engine's environment (`chmod -R go-w <environment>`); CapyCTL never
+  The line is only in the engine log. To clear it, remove group and other
+  write permission from the engine's environment (`chmod -R go-w
+  <environment>`); CapyCTL never
   changes engine files itself.
 - **`config show` does not match a running role.** `capyctl config show` reads
   the document, the environment of the shell it runs in and the `--set`

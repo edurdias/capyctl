@@ -294,6 +294,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         kernel_builds: Vec::new(),
         escalated: false,
         probe_tokens: Vec::new(),
+        engine_log: None,
     }
 }
 

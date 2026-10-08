@@ -19,6 +19,8 @@ use capyctl_domain::completion::ProcessIdentity;
 pub struct ExecLauncher {
     /// pid → /proc starttime captured at spawn time.
     spawned: Mutex<std::collections::HashMap<u32, ProcessIdentity>>,
+    /// SPEC §13.3 / T21: the redacting writer engine output passes through.
+    log_relay: Option<crate::engine_log_relay::LogRelay>,
 }
 
 impl Default for ExecLauncher {
@@ -46,7 +48,15 @@ impl ExecLauncher {
     pub fn new() -> Self {
         Self {
             spawned: Mutex::new(Default::default()),
+            log_relay: crate::engine_log_relay::installed(),
         }
+    }
+
+    /// Use `relay` as the engine log's writer instead of the process's
+    /// installed one.
+    pub fn with_log_relay(mut self, relay: crate::engine_log_relay::LogRelay) -> Self {
+        self.log_relay = Some(relay);
+        self
     }
 
     fn recorded_identity(&self, pid: u32) -> Option<ProcessIdentity> {
@@ -191,15 +201,17 @@ impl Launcher for ExecLauncher {
         // Engine output lands in the deployment's engine log when one is
         // requested (the runbook's evidence); otherwise discarded.
         if let Some(log) = cmd.env.get("CAPYCTL_ENGINE_LOG") {
-            // SPEC §13.3 / T21: never through a symlink, always owner-only.
-            let f = crate::durable::open_private_log(std::path::Path::new(log))
-                .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
-            let log_clone = f
-                .try_clone()
-                .map_err(|e| LauncherError::SpawnFailed(format!("engine log clone: {e}")))?;
-            command
-                .stdout(Stdio::from(log_clone))
-                .stderr(Stdio::from(f));
+            // SPEC §13.3 / T21: never through a symlink, always owner-only, and
+            // redacted on its way in.
+            let (stdout, stderr) = crate::engine_log_relay::attach(
+                std::path::Path::new(log),
+                self.log_relay.as_ref(),
+                &cmd.env,
+                None,
+                crate::durable::open_private_log,
+            )
+            .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
+            command.stdout(stdout).stderr(stderr);
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
