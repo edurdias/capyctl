@@ -86,6 +86,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: None,
     }
 }
@@ -100,6 +101,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         reason: String::new(),
         full_rehash: true,
         state_slot_bytes: None,
+        layout: None,
     }
 }
 
@@ -332,6 +334,93 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
         let mut refused = result(&open, evidence("computed", DIGEST));
         edit(&mut refused);
         assert!(validate_result(&open, &refused).is_err(), "{refused:?}");
+    }
+}
+
+// T03 T34 (ADR 0028 §5, amendment of 2026-10-07): the checkpoint layout rides
+// beside the weights it splits, in range, on the evidence and on a launch
+// plan, and a plan naming one needs `engine_groups`.
+#[test]
+fn the_checkpoint_layout_rides_beside_the_weights() {
+    let layout = pb::CheckpointLayout {
+        sharded_bytes: 8,
+        layer_count: 2,
+        largest_layer_bytes: 4,
+    };
+    let open = digest_command("");
+    let with_layout = pb::CheckpointDigestEvidence {
+        layout: Some(layout),
+        ..evidence("computed", DIGEST)
+    };
+    validate_result(&open, &result(&open, with_layout)).unwrap();
+    let out_of_range = [
+        pb::CheckpointLayout {
+            sharded_bytes: 11,
+            ..layout
+        },
+        pb::CheckpointLayout {
+            largest_layer_bytes: 9,
+            ..layout
+        },
+        pb::CheckpointLayout {
+            layer_count: 0,
+            ..layout
+        },
+        pb::CheckpointLayout {
+            sharded_bytes: -1,
+            ..layout
+        },
+    ];
+    for bad in out_of_range {
+        let evidence = pb::CheckpointDigestEvidence {
+            layout: Some(bad),
+            ..evidence("computed", DIGEST)
+        };
+        assert!(validate_result(&open, &result(&open, evidence)).is_err());
+    }
+    let refusal = pb::CheckpointDigestEvidence {
+        state: "refused".into(),
+        reason: "unsafe_file".into(),
+        layout: Some(layout),
+        ..Default::default()
+    };
+    assert!(validate_result(&open, &result(&open, refusal)).is_err());
+
+    let plan = pb::SingleLaunchPlan {
+        checkpoint_digest: DIGEST.into(),
+        checkpoint_weights_bytes: Some(10),
+        checkpoint_layout: Some(layout),
+        ..launch_plan()
+    };
+    let command = decode(pb::execute_member::Action::LaunchSingle(plan.clone())).unwrap();
+    let MemberAction::LaunchSingle(typed) = &command.action else {
+        panic!("not a launch");
+    };
+    assert_eq!(
+        typed.checkpoint_layout,
+        Some(capyctl_domain::member_weights::CheckpointLayout {
+            sharded_bytes: 8,
+            layer_count: 2,
+            largest_layer_bytes: 4,
+        })
+    );
+    assert!(capyctl_protocol::capabilities::required(&command.to_wire())
+        .contains(&capyctl_protocol::capabilities::ENGINE_GROUPS));
+    let refused = [
+        pb::SingleLaunchPlan {
+            checkpoint_weights_bytes: None,
+            ..plan.clone()
+        },
+        pb::SingleLaunchPlan {
+            checkpoint_layout: Some(pb::CheckpointLayout {
+                layer_count: 0,
+                ..layout
+            }),
+            ..plan.clone()
+        },
+    ];
+    for plan in refused {
+        assert!(decode(pb::execute_member::Action::LaunchSingle(plan)).is_err());
     }
 }
 

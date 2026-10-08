@@ -582,6 +582,7 @@ async fn activate(
                 &digest,
                 measured.weights_bytes,
                 measured.state_slot_bytes,
+                measured.layout,
                 capyctl_protocol::now_unix_ms(),
             )
             .map_err(|e| e.to_string())
@@ -1010,6 +1011,7 @@ fn launch_commands(
         .iter()
         .map(|member| {
             let effective = &member.resolution.effective;
+            let memory = effective.engine_config.memory();
             let head = member.rank == 0;
             let fresh = || ulid::Ulid::new().to_string();
             let launch = SingleLaunchPlan {
@@ -1032,8 +1034,12 @@ fn launch_commands(
                 issued_at_ms: context.issued_at_ms,
                 coordinator_session_id: session.clone(),
                 checkpoint_digest: digest.to_owned(),
-                checkpoint_weights_bytes: effective.engine_config.memory().weights_bytes,
-                checkpoint_state_slot_bytes: effective.engine_config.memory().state_slot_bytes,
+                // ADR 0028 §5 (amendment of 2026-10-07): the facts the
+                // member's share was resolved with: the whole checkpoint the
+                // host verifies, and the layout its share is taken with.
+                checkpoint_weights_bytes: memory.checkpoint_weights_bytes(),
+                checkpoint_state_slot_bytes: memory.state_slot_bytes,
+                checkpoint_layout: memory.member.and_then(|member| member.layout),
                 startup_bytes: None,
             };
             let command_id = if head {

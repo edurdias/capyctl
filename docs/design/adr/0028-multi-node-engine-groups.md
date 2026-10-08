@@ -287,7 +287,9 @@ digests agree) and before any `Prepare` or `Launch` is sent.
   head's API process is inside that figure, so the operator sizes for the head. On
   unified-memory hosts (GB10) the device and system domains are one pool, as today.
   TensorFold's memory cap (ADR 0025) applies
-  per rank.
+  per rank. Derived phases are sized for the member's share of the weights, not the
+  whole checkpoint (amendment of 2026-10-07 below); declared `resources` are the
+  member's as written.
 - **All or nothing.** Every member is reserved in one store transaction under ADR 0007
   (fresh observations, epoch compare-and-swap on every named host), so two group plans
   sharing a host cannot deadlock on partial acquisition. This is atomic accounting in
@@ -550,3 +552,101 @@ shared KV caches across members.
 - A group whose residency is `restart_only`, and so every TensorFold group, parks by
   stopping and wakes by relaunching.
 - The protocol gains one capability; the wire version does not change.
+
+## Amendment of 2026-10-07: derived memory is per rank (owner decision)
+
+Found in review: a member whose phases derive from `engine_config.memory` was sized
+from the whole checkpoint, as on one host (each member's grant is its own host's
+resolution, and every launch named the checkpoint's weights). A two-host TP2 group
+reserved its weights twice, and a checkpoint larger than one host could never be
+admitted. Decision: each member is charged its share of the weights. Declared
+`resources` stay the member's as written, and a single-host deployment (world size 1)
+is unchanged: its effective revision, recipe fingerprint and digests are byte-identical.
+
+**Formula.** For a checkpoint of `W` bytes of weights at `tensor_parallel` T and
+`pipeline_parallel` P:
+
+```text
+replicated = W - sharded
+stage      = sharded                                          when P = 1
+           = min(sharded, ceil(layers / P) x largest_layer)   otherwise
+share      = ceil(stage / T) + replicated
+```
+
+that is `W / (T x P)` plus an allowance for the tensors every rank keeps whole, and,
+with P above 1, for a stage holding more layers than another. `sharded`, `layers` and
+`largest_layer` are the checkpoint's layout, read by the host from the safetensors
+headers beside the weights (tensor names, shapes and byte ranges; no tensor data):
+inside a numbered decoder layer (`layers.N.`, `h.N.`, `blocks.N.`) every tensor of two
+or more dimensions is sharded except MoE routers (`mlp.gate.weight`,
+`shared_expert_gate`) and latent-attention low-rank and indexer projections
+(`q_a_proj`, `kv_a_proj_with_mqa`, `indexer`, `f_a_proj`, `g_a_proj`); everything
+else (tensors of at most one dimension, every tensor outside the layers, multimodal
+towers, other weight files, a draft model, the headers) counts as replicated. A
+checkpoint without readable safetensors headers, or one measured by an older host,
+keeps 10 % of `W` whole and splits the rest evenly across stages.
+
+**What the engines replicate** (read from the installed sources: vLLM 0.30.0,
+SGLang 0.5.21, TensorFold 0.6.5):
+
+- vLLM and SGLang shard the embeddings and the output head by vocabulary across
+  tensor-parallel ranks (vLLM `model_executor/layers/vocab_parallel_embedding.py:326`
+  and `ParallelLMHead` at `:569`; SGLang `srt/layers/vocab_parallel_embedding.py:324`
+  and `:602`). They keep whole on every rank: norms (full-size `RMSNorm`), the bias of
+  a row-parallel projection (vLLM `model_executor/layers/linear.py:1714`; SGLang
+  `srt/layers/linear.py:1507`), MoE routers (`ReplicatedLinear`, vLLM
+  `model_executor/models/qwen2_moe.py:139`, SGLang `srt/models/qwen2_moe.py:345`) and
+  latent attention's low-rank projections (vLLM `model_executor/models/deepseek_v2.py`,
+  `q_a_proj` and `kv_a_proj_with_mqa` as `ReplicatedLinear`). With fewer key-value
+  heads than tensor-parallel ranks they replicate the key and value projections
+  (vLLM `linear.py:1050`, SGLang `linear.py:1017`); the layout does not model that
+  case. Mamba and gated-delta convolutions, `A_log` and `dt_bias` are sharded by head.
+- Pipeline stages hold contiguous layers (`get_pp_indices`, vLLM
+  `distributed/utils.py:127`, remainder on all but the last stage; SGLang
+  `srt/distributed/utils.py:105`, remainder on the last stages; both overridable,
+  `VLLM_PP_LAYER_PARTITION` and `SGLANG_PP_LAYER_PARTITION`). The first stage holds
+  the embeddings and the last the final norm and head (vLLM
+  `model_executor/models/llama.py:388`, `:394`; with tied embeddings the last stage
+  holds the embeddings too, `:379`).
+- TensorFold runs `--tp 1` or `2` and has no pipeline parallelism
+  (`src/tensorfold/cli_args.py:129`). Its families keep the embeddings whole on both
+  ranks (`families/qwen3_5/cuda/distributed.py:165`,
+  `families/nemotron_h/cuda/tp.py:107`) and, for GLM-5.3-Flash, the output head too
+  (`families/glm5_next/cuda/split.py:32`, the `REP` rules); Qwen3.5-family and
+  Nemotron-H split the head by vocabulary rows (`families/qwen3_5/__init__.py:324`,
+  `families/nemotron_h/cuda/tp.py:108`).
+
+Counting the vocabulary tensors and every other tensor outside the layers whole is
+therefore exact for TensorFold's embeddings and conservative for vLLM and SGLang.
+
+**KV cache and state.** `engine_config.memory.kv_cache` (declared or defaulted) is per
+member, as `resources` are: each rank holds the cache of its own heads (the key-value
+heads divided by T, at least one) for its own stage's layers, and the engines take one
+token capacity for every rank, the smallest (vLLM `v1/core/kv_cache_utils.py:2760`;
+SGLang `srt/utils/common.py:551` and `srt/mem_cache/kv_cache_configurator.py:2285`;
+TensorFold `src/tensorfold/cuda/capacity.py:270`). vLLM's `--kv-cache-memory-bytes`
+and SGLang's static fraction are per rank (vLLM `v1/worker/gpu_worker.py:542`; SGLang
+takes the fraction of each rank's free memory, `kv_cache_configurator.py:2190`). The
+member's request is its share, its KV cache and its margin; the margin, the startup
+placeholder (`share x 2.25 + margin`), the graph allowance, an SGLang hybrid's state
+reserve and a `host_backed` copy are derived from the share as on one host. The
+context CapyCTL fits to the KV cache and the hybrid state slot still count the whole
+model per token, which is conservative for a member; the timeouts keep the whole
+checkpoint.
+
+**Records.** A member's `engine_config.memory` records `member`: the topology, the
+whole checkpoint's weights and the layout its share (`weights_bytes`) was taken with,
+so a stored snapshot (which no longer states the topology) re-derives the same share,
+and a provisional revision is re-resolved with its share once the checkpoint is
+measured. The digest evidence carries the layout (`CheckpointDigestEvidence.layout`)
+and a member's launch plan names the whole weights, which the host verifies, and the
+layout (`SingleLaunchPlan.checkpoint_layout`, under the `engine_groups` capability),
+so the host resolves the same share and SGLang's static pool holds the member's share.
+A group revision accepted before this amendment keeps the whole-checkpoint charge;
+deploy it again for the share.
+
+**Limits.** With the placeholder startup peak, a 126 GiB checkpoint at TP 2 on two
+121.7 GiB GB10 hosts (a share of about 64 GiB) fits once Ready but not while starting:
+`64 GiB x 2.25 + margin` exceeds the 97.4 GiB automatic managed limit, so such a
+deployment declares `memory.startup` (the group activation charges each member the
+cold phase its revision resolved; it has no first-start whole-host fallback).

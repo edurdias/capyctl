@@ -1,5 +1,13 @@
 # Current implementation and launch status
 
+## Group members reserve their share of the weights — 2026-10-08 (branch `feat/group-member-weight-share`)
+
+Owner decision 2026-10-07 (ADR 0028 amendment of that date). A group member whose phases derive from `engine_config.memory` was sized from the whole checkpoint, so a two-host TP2 group reserved its weights twice and a 126 GiB checkpoint could never be admitted on two 121.7 GiB GB10 hosts. Each member now holds `ceil(stage / T) + replicated`, with `replicated = W - sharded` and `stage = sharded` (P = 1) or `min(sharded, ceil(layers / P) x largest_layer)`, from the checkpoint's safetensors headers (`capyctl_config::checkpoint_layout`), or 10 % of `W` kept whole without them; the margin, startup placeholder, graph allowance, SGLang state reserve and `host_backed` copy derive from the share. Declared `resources` and world size 1 are byte-identical (recipe fingerprints pinned from `main`). The share is recorded as `engine_config.memory.member` (topology, whole weights, layout) so snapshots and provisional re-resolution keep it; the host reports the layout in `CheckpointDigestEvidence.layout`, and a member's launch plan names the whole weights (verified by the host) and `checkpoint_layout` (under `engine_groups`), so the host resolves the same share and SGLang's static pool holds it.
+
+Engine evidence (vLLM 0.30.0, SGLang 0.5.21, TensorFold 0.6.5 sources) is in the ADR amendment: vLLM and SGLang shard embeddings and head by vocabulary and keep norms, row-parallel biases, routers and latent low-rank projections whole; TensorFold keeps embeddings whole on both ranks (and GLM-5.3-Flash's head), and has no PP; every engine takes the smallest per-rank KV token capacity. Not modeled: key-value projections replicated when KV heads < TP; the fitted context and hybrid state slot still count the whole model per token (conservative). The placeholder startup (2.25 x share) still exceeds a GB10's 97.4 GiB managed limit for the 126 GiB case; such a deployment declares `memory.startup`.
+
+CPU tests only (config resolution TP2, PP2, TP2xPP2, fallback, provisional re-resolution, Flash-Next-sized fit, declared and single-host fingerprints; store measurement re-resolving both members; protocol plan and evidence validation). Failing first on `main`: the TP2 member charged 107374182400 bytes of weights against an expected 59055800320. Not run live; MN1–MN9 should confirm the per-member grants and each rank's measured peak against them.
+
 ## SGLang's static pool on unified memory — 2026-10-07 (branch `fix/sglang-static-fraction-weights`)
 
 Owner decision 5 (b), note on ADR 0014 amendment A14. In the GB10 catalog runs (SGLang

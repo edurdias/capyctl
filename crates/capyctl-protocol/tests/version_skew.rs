@@ -187,6 +187,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         },
         checkpoint_weights_bytes: digest.then_some(1 << 30),
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: startup.then_some(2 << 30),
     })
 }

@@ -621,6 +621,7 @@ impl World {
                         checkpoint_digest: host.digest(),
                         checkpoint_weights_bytes: None,
                         checkpoint_state_slot_bytes: None,
+                        checkpoint_layout: None,
                         startup_bytes: None,
                     },
                 },

@@ -40,6 +40,13 @@ impl CheckpointLocation {
     pub fn state_slot_bytes(&self) -> Option<i64> {
         crate::context_fit::sglang_state_slot_bytes(&self.checkpoint, self.sglang_args.as_ref()?)
     }
+
+    /// ADR 0028 §5 (amendment of 2026-10-07): how the checkpoint's weights
+    /// split across a group's ranks, from its safetensors headers; `None`
+    /// when it has none or one cannot be read.
+    pub fn layout(&self) -> Option<crate::checkpoint_layout::CheckpointLayout> {
+        crate::checkpoint_layout::read_checkpoint_layout(&self.checkpoint)
+    }
 }
 
 /// ADR 0014 §5 amendment A6: a draft model directory and the approved root
@@ -100,6 +107,14 @@ impl EffectiveDeployment {
             Path::new(self.model.resolved_path.as_deref()?),
             &args,
         )
+    }
+
+    /// ADR 0028 §5 (amendment of 2026-10-07): the layout of this
+    /// deployment's checkpoint, read on this machine.
+    pub fn checkpoint_layout(&self) -> Option<crate::checkpoint_layout::CheckpointLayout> {
+        crate::checkpoint_layout::read_checkpoint_layout(Path::new(
+            self.model.resolved_path.as_deref()?,
+        ))
     }
 }
 
@@ -182,14 +197,23 @@ pub fn declared_checkpoint_digest(content_fingerprint: &str) -> Option<&str> {
 /// the digest has since supplied. Values the snapshot derived (a memory request
 /// or KV cache, and derived resource phases) are derived again from the new
 /// facts; everything the deployment declared is kept. The stored snapshot must
-/// first decode exactly, so nothing unvalidated is carried forward.
+/// first decode exactly, so nothing unvalidated is carried forward. A group
+/// member's snapshot keeps the topology its share is taken of (ADR 0028 §5).
 pub fn resolve_snapshot_with_checkpoint(
     text: &str,
     facts: CheckpointFacts,
 ) -> Result<EffectiveDeployment, ConfigError> {
     decode_effective_snapshot(text)?;
     let value = crate::strict_yaml::build_value(text)?;
-    let (engine_config, resources_derived, _) = declared_engine_config(&value["engine_config"])?;
+    let (engine_config, resources_derived, frozen) =
+        declared_engine_config(&value["engine_config"])?;
     let (deployment, host) = snapshot_inputs(&value, engine_config, resources_derived)?;
-    resolve_effective_with_checkpoint(&deployment, &host, facts)
+    resolve_effective_with_checkpoint(
+        &deployment,
+        &host,
+        CheckpointFacts {
+            member_of: frozen.member_of,
+            ..facts
+        },
+    )
 }

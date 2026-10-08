@@ -292,6 +292,7 @@ fn launch() -> MemberAction {
         checkpoint_digest: format!("sha256:{}", "1".repeat(64)),
         checkpoint_weights_bytes: Some(1 << 30),
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: Some(2 << 30),
     })
 }

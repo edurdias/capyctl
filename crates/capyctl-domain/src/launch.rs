@@ -144,6 +144,8 @@ pub struct MemoryRequest {
     pub margin_bytes: i64,
     /// Sum of weight-file sizes from the checkpoint manifest (ADR 0014 §7),
     /// when known at resolution. Recorded so a snapshot re-derives identically.
+    /// For a group member with derived phases (`member`), the share of them it
+    /// holds (ADR 0028 §5), which everything sized from the weights uses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weights_bytes: Option<i64>,
     /// Owner decision 2026-09-23 (startup memory budget): the per-instance
@@ -186,6 +188,23 @@ pub struct MemoryRequest {
     /// draft-token states). Absent when the request holds none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_bytes: Option<i64>,
+    /// ADR 0028 §5 (amendment of 2026-10-07): the topology, whole checkpoint
+    /// and layout a group member's `weights_bytes` share was taken of.
+    /// Absent for a single-host deployment and a member whose `resources`
+    /// are declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<crate::member_weights::MemberWeights>,
+}
+
+impl MemoryRequest {
+    /// The whole checkpoint's measured weights: what a launch plan names and
+    /// the host verifies, whatever share of them this member holds.
+    pub fn checkpoint_weights_bytes(&self) -> Option<i64> {
+        match &self.member {
+            Some(member) => member.checkpoint_weights_bytes,
+            None => self.weights_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

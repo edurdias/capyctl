@@ -543,6 +543,9 @@ impl NativeHostExecution {
         let facts = capyctl_config::effective::CheckpointFacts {
             weights_bytes: plan.checkpoint_weights_bytes,
             state_slot_bytes: plan.checkpoint_state_slot_bytes,
+            // ADR 0028 §5: a group member's share is taken with the layout
+            // the server resolved it with.
+            layout: plan.checkpoint_layout,
             ..Default::default()
         };
         let mut effective =
@@ -688,6 +691,13 @@ impl NativeHostExecution {
         {
             return Err(CheckpointError::Mismatch);
         }
+        // ADR 0028 §5 (amendment of 2026-10-07): and the layout a group
+        // member's share of the weights was taken with.
+        if plan.checkpoint_layout.is_some()
+            && plan.checkpoint_layout != effective.checkpoint_layout()
+        {
+            return Err(CheckpointError::Mismatch);
+        }
         Ok(())
     }
 
@@ -744,13 +754,23 @@ impl NativeHostExecution {
                     let weights =
                         with_drafter(&checkpoints, &location, verified.manifest.weights_bytes)?;
                     // ADR 0014 amendment A16: the hybrid state slot, beside
-                    // the weights, from the checkpoint's configuration.
-                    Ok::<_, CheckpointError>((verified, weights, location.state_slot_bytes()))
+                    // the weights, from the checkpoint's configuration. ADR
+                    // 0028 §5: the layout a group member's share is taken
+                    // with, from its safetensors headers.
+                    let layout = location
+                        .layout()
+                        .filter(|layout| layout.sharded_bytes <= weights);
+                    Ok::<_, CheckpointError>((
+                        verified,
+                        weights,
+                        location.state_slot_bytes(),
+                        layout,
+                    ))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok((verified, weights_bytes, state_slot_bytes)) => {
+                    Ok((verified, weights_bytes, state_slot_bytes, layout)) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -765,6 +785,9 @@ impl NativeHostExecution {
                             reason: String::new(),
                             full_rehash: verified.full_rehash,
                             state_slot_bytes,
+                            layout: layout
+                                .as_ref()
+                                .map(capyctl_protocol::execution::layout_to_wire),
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -2576,6 +2599,7 @@ mod tests {
                 checkpoint_digest: String::new(),
                 checkpoint_weights_bytes: None,
                 checkpoint_state_slot_bytes: None,
+                checkpoint_layout: None,
                 startup_bytes: None,
             }),
         };
@@ -2721,6 +2745,7 @@ mod tests {
             checkpoint_digest: digest.into(),
             checkpoint_weights_bytes: None,
             checkpoint_state_slot_bytes: None,
+            checkpoint_layout: None,
             startup_bytes: None,
         };
         let command = MemberCommand {
@@ -3037,6 +3062,8 @@ mod tests {
         assert!(computed.full_rehash);
         // ADR 0014 amendment A16: no hybrid state slot for a vLLM launch.
         assert_eq!(computed.state_slot_bytes, None);
+        // ADR 0028 §5: weights that are not a safetensors file have no layout.
+        assert_eq!(computed.layout, None);
         // Owner decision 2026-09-23 (solo first start): a size-only request
         // sizes the weight files with the same confined walk and hashes nothing.
         let mut sizing = digest(&deployment, &policy, None);
@@ -3075,6 +3102,50 @@ mod tests {
         foreign.identity.controller_id = "other".into();
         foreign.identity.payload_digest = foreign.canonical_digest();
         assert!(executor.execute(1, foreign).await.is_err());
+    }
+
+    /// ADR 0028 §5 (amendment of 2026-10-07): the digest evidence carries the
+    /// layout read from the checkpoint's safetensors headers, which a group
+    /// member's share of the weights is taken with.
+    // T03 T34
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digest_checkpoint_reports_the_checkpoint_layout() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let header = serde_json::json!({
+            "model.layers.0.mlp.down_proj.weight":
+                {"dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 8]},
+            "model.norm.weight": {"dtype": "BF16", "shape": [2], "data_offsets": [8, 12]},
+        })
+        .to_string();
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        file.extend_from_slice(&[0; 12]);
+        std::fs::write(root.path().join("models/toy/model.safetensors"), &file).unwrap();
+        let mut command = MemberCommand {
+            identity: checkpoint_identity("digest", "checkpoint"),
+            action: MemberAction::DigestCheckpoint(DigestCheckpointPlan {
+                size_only: false,
+                deployment_config: deployment.to_string(),
+                host_policy_fingerprint: policy,
+                expected_digest: None,
+            }),
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        let result = executor.execute(1, command.clone()).await.unwrap();
+        capyctl_protocol::execution::validate_result(&command, &result).unwrap();
+        let evidence = result.checkpoint.unwrap();
+        assert_eq!(evidence.state, "computed");
+        assert_eq!(evidence.weights_bytes, file.len() as i64);
+        assert_eq!(
+            evidence.layout,
+            Some(capyctl_protocol::pb::CheckpointLayout {
+                sharded_bytes: 8,
+                layer_count: 1,
+                largest_layer_bytes: 8,
+            })
+        );
     }
 
     /// ADR 0008: MaterializeSource answers from this host's own policy and

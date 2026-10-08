@@ -184,6 +184,7 @@ fn a_revision_frozen_before_the_budget_still_decodes_with_its_request() {
             legacy_startup_graphs: true,
             legacy_family_margin: true,
             legacy_sglang_graphs_off: false,
+            ..Default::default()
         },
     )
     .unwrap();

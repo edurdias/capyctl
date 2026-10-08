@@ -189,6 +189,7 @@ fn frozen_restoring(endpoint: String, executable: &str, weight_restore: &str) ->
                 startup_graphs_bytes: None,
                 state_slot_bytes: None,
                 state_bytes: None,
+                member: None,
             },
             max_total_tokens: None,
             max_mamba_cache_size: None,
@@ -247,6 +248,7 @@ fn plan() -> SingleLaunchPlan {
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: None,
     }
 }

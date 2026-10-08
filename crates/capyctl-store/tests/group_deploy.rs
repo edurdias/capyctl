@@ -200,6 +200,70 @@ fn a_group_resolves_on_every_named_host_with_the_head_canonical() {
     );
 }
 
+// T03 (ADR 0028 §5, amendment of 2026-10-07): a group whose memory derives
+// from its weights is accepted provisional; the head's measurement, with the
+// checkpoint's layout, re-resolves every member to its own share of the
+// weights, and each member is charged that share, not the whole checkpoint.
+#[test]
+fn a_measured_group_charges_each_member_its_share_of_the_weights() {
+    const GIB: i64 = 1 << 30;
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut w = world();
+    let config = w.config.as_object_mut().unwrap();
+    config.remove("resources");
+    config.remove("residency");
+    w.config["model"]["content_fingerprint"] = json!(DIGEST);
+    let receipt = w.deploy("group").unwrap();
+    let layout = capyctl_domain::member_weights::CheckpointLayout {
+        sharded_bytes: 18 * GIB,
+        layer_count: 24,
+        largest_layer_bytes: 3 * GIB / 4,
+    };
+    let outcome = w
+        .store
+        .record_checkpoint_measurement(
+            &w.session,
+            &receipt.deployment_id,
+            receipt.revision,
+            "host-b",
+            DIGEST,
+            20 * GIB,
+            None,
+            Some(layout),
+            NOW,
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        capyctl_store::checkpoint_digests::RecordOutcome::Recorded { .. }
+    ));
+    let members = w
+        .store
+        .group_member_resolutions(
+            &receipt.deployment_id,
+            receipt.revision,
+            &["host-b".to_owned(), "host-a".to_owned()],
+        )
+        .unwrap();
+    assert_eq!(members.len(), 2);
+    for member in members {
+        let memory = member.effective.engine_config.memory();
+        // Half of the 18 GiB the layers split, and the 2 GiB kept whole.
+        assert_eq!(memory.weights_bytes, Some(11 * GIB), "{}", member.host_id);
+        assert_eq!(memory.checkpoint_weights_bytes(), Some(20 * GIB));
+        assert_eq!(memory.member.unwrap().layout, Some(layout));
+        let ready = member.effective.resources.ready.allocations[0].bytes;
+        assert_eq!(
+            ready,
+            11 * GIB
+                + 4 * GIB
+                + memory.margin_bytes
+                + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+        );
+        assert!(member.cold.allocations[0].bytes < 20 * GIB * 9 / 4);
+    }
+}
+
 // T14: one mismatched build, or a profile one named host lacks, refuses the deploy.
 #[test]
 fn every_named_host_runs_the_same_profile_build() {

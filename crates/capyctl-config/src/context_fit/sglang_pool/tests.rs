@@ -61,6 +61,7 @@ fn settings(request: i64, kv: i64, weights: Option<i64>) -> SglangLaunchSettings
             startup_graphs_bytes: None,
             state_slot_bytes: None,
             state_bytes: None,
+            member: None,
         },
         max_total_tokens: None,
         max_mamba_cache_size: None,

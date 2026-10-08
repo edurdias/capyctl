@@ -50,6 +50,9 @@ pub struct Measured {
     pub weights_bytes: i64,
     /// ADR 0014 amendment A16: the hybrid state slot read beside the weights.
     pub state_slot_bytes: Option<i64>,
+    /// ADR 0028 §5 (amendment of 2026-10-07): the checkpoint's layout, which a
+    /// group member's share of the weights is taken with.
+    pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
 }
 
 /// Why a measurement produced no digest.
@@ -93,6 +96,10 @@ pub fn measured_from(result: &pb::MemberExecutionResult) -> Result<Measured, Mea
             digest: evidence.digest.clone(),
             weights_bytes: evidence.weights_bytes,
             state_slot_bytes: evidence.state_slot_bytes,
+            layout: evidence
+                .layout
+                .as_ref()
+                .and_then(capyctl_protocol::execution::layout_from_wire),
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
@@ -133,6 +140,7 @@ pub fn record(
             &measured.digest,
             measured.weights_bytes,
             measured.state_slot_bytes,
+            measured.layout,
             capyctl_protocol::now_unix_ms(),
         )
         .map_err(|_| MeasureError::Unavailable)
@@ -410,6 +418,15 @@ impl LocalDigests {
     }
 }
 
+/// The checkpoint's verification, its weights with the draft model's, its
+/// hybrid state slot and its layout.
+type LocalMeasurement = (
+    capyctl_agent::checkpoint::Verification,
+    i64,
+    Option<i64>,
+    Option<capyctl_domain::member_weights::CheckpointLayout>,
+);
+
 /// Measure an effective revision's checkpoint on this machine, with the
 /// weight bytes of the draft model it loads beside it (ADR 0014 §5 amendment
 /// A4) and the hybrid state slot (amendment A16). The digest is the
@@ -417,7 +434,7 @@ impl LocalDigests {
 async fn measure_locally(
     checkpoints: Arc<CheckpointVerifier>,
     effective: &capyctl_config::effective::EffectiveDeployment,
-) -> Result<(capyctl_agent::checkpoint::Verification, i64, Option<i64>), MeasureError> {
+) -> Result<LocalMeasurement, MeasureError> {
     let store = effective.checkpoint_store().to_path_buf();
     let checkpoint = effective
         .model
@@ -432,7 +449,12 @@ async fn measure_locally(
             .drafter_weights(drafter.as_ref())?
             .checked_add(verified.manifest.weights_bytes)
             .ok_or(capyctl_agent::checkpoint::CheckpointError::TooLarge)?;
-        Ok((verified, weights, effective.state_slot_bytes()))
+        Ok((
+            verified,
+            weights,
+            effective.state_slot_bytes(),
+            effective.checkpoint_layout(),
+        ))
     })
     .await
     .map_err(|_| MeasureError::Unavailable)?
@@ -448,12 +470,13 @@ impl DigestSource for LocalDigests {
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {
         let checkpoints = self.checkpoints.clone();
         Box::pin(async move {
-            let (verified, weights_bytes, state_slot_bytes) =
+            let (verified, weights_bytes, state_slot_bytes, layout) =
                 measure_locally(checkpoints, &pending.effective).await?;
             Ok(Measured {
                 digest: verified.manifest.digest,
                 weights_bytes,
                 state_slot_bytes,
+                layout,
             })
         })
     }
@@ -708,7 +731,7 @@ impl CheckpointGate {
                 .recorded_checkpoint(&self.deployment_id, self.revision)
                 .map_err(|_| unrecorded())?
         };
-        let (measured, weights_bytes, state_slot_bytes) =
+        let (measured, weights_bytes, state_slot_bytes, layout) =
             measure_locally(self.checkpoints.clone(), &self.effective)
                 .await
                 .map_err(|error| match error {
@@ -728,6 +751,7 @@ impl CheckpointGate {
                         digest: measured.manifest.digest.clone(),
                         weights_bytes,
                         state_slot_bytes,
+                        layout,
                     },
                 )
                 .map_err(|_| unrecorded())?;

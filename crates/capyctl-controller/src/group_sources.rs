@@ -36,6 +36,8 @@ pub struct Materialized {
     pub weights_bytes: i64,
     /// ADR 0014 amendment A16: the hybrid state slot read beside them.
     pub state_slot_bytes: Option<i64>,
+    /// ADR 0028 §5 (amendment of 2026-10-07): the layout read beside them.
+    pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
 }
 
 /// Why one host has no verified copy.
@@ -266,6 +268,7 @@ impl SourceDriver for RemoteGroupSources {
             digest: measured.digest,
             weights_bytes: measured.weights_bytes,
             state_slot_bytes: measured.state_slot_bytes,
+            layout: measured.layout,
         })
     }
 }
@@ -327,6 +330,7 @@ mod tests {
             digest: digest.into(),
             weights_bytes: 1,
             state_slot_bytes: None,
+            layout: None,
         }
     }
 

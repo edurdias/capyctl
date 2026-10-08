@@ -88,6 +88,7 @@ fn a_pre_e1_launch_command_re_decodes_from_the_journal_unchanged() {
             checkpoint_digest: String::new(),
             checkpoint_weights_bytes: None,
             checkpoint_state_slot_bytes: None,
+            checkpoint_layout: None,
             startup_bytes: None,
         }),
     };

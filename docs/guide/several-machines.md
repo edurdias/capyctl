@@ -229,6 +229,21 @@ NAME       STATE   READY   REVISION   HOSTS
 my-model   ready   1/1     1          gpu-box
 ```
 
+### A model split across machines
+
+A deployment with a `topology` (for example `tensor_parallel: 2` over
+`placement.hosts: [gpu-a, gpu-b]`) runs one model on several machines. Its
+memory is per machine. When you state `resources`, each machine reserves them
+as written. When CapyCTL derives the memory from the weights, each machine
+reserves its own share, not the whole checkpoint: the weights divided by
+`tensor_parallel x pipeline_parallel`, plus the tensors every machine keeps
+whole (embeddings, output head, norms and routers, read from the checkpoint's
+safetensors headers; a tenth of the weights when they cannot be read), plus
+the KV cache and margin you would get on one machine. A 126 GiB checkpoint at
+`tensor_parallel: 2` reserves about 64 GiB of weights on each machine.
+CapyCTL's placeholder for the startup peak is 2.25 times that share, so on two
+128 GB machines state `memory.startup` (for example `90GiB`) for such a model.
+
 ## 6. Send a request
 
 On the server, with the server's API key:

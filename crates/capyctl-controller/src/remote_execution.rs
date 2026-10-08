@@ -967,6 +967,8 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             checkpoint_weights_bytes: work.effective().engine_config.memory().weights_bytes,
             // ADR 0014 amendment A16: and the hybrid state slot beside them.
             checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
+            // ADR 0028 §5: a single-host launch holds the whole checkpoint.
+            checkpoint_layout: None,
             // Owner decision 2026-09-23: the peak this launch reserved.
             startup_bytes: Some(work.startup_reservation().bytes),
             checkpoint_digest,
@@ -1223,6 +1225,7 @@ mod tests {
                 checkpoint_digest: String::new(),
                 checkpoint_weights_bytes: None,
                 checkpoint_state_slot_bytes: None,
+                checkpoint_layout: None,
                 startup_bytes: None,
             },
             ingress_gate_key: [7; 32],

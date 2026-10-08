@@ -200,6 +200,7 @@ fn group_member_launch(
         checkpoint_digest: digest.into(),
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: None,
     }
 }
@@ -236,6 +237,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
@@ -394,6 +396,7 @@ fn launch_single() -> MemberCommand {
         checkpoint_digest: String::new(),
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();

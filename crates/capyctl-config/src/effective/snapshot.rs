@@ -44,10 +44,11 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
 /// weights, and equal to the load term lowered to the request deadline.
 fn frozen_load_term_initialize(effective: &EffectiveDeployment, value: &Value) -> Option<i64> {
     let claimed = value["timeouts"]["initialize_ms"].as_i64()?;
+    // The timeouts are derived from the whole checkpoint, a group member's too.
     let weights = effective
         .engine_config
         .memory()
-        .weights_bytes
+        .checkpoint_weights_bytes()
         .filter(|bytes| *bytes > 0)?;
     let load_term = derived_initialize_ms(Some(weights)).min(effective.request_deadline_ms);
     (matches!(effective.profile.engine, Engine::Vllm | Engine::Sglang)
@@ -328,12 +329,21 @@ pub(super) fn declared_engine_config(
                 .ok_or_else(|| invalid("snapshot.engine_config", "state_slot_bytes invalid"))?,
         ),
     };
+    // ADR 0028 §5 (amendment of 2026-10-07): a group member's derivation
+    // records the whole checkpoint, its layout and the topology the share in
+    // `weights_bytes` was taken of; it is re-derived from them.
+    let (weights_bytes, layout, member_of) = match memory.get("member") {
+        None => (weights_bytes, None, None),
+        Some(member) => member_facts(member)?,
+    };
     Ok((
         Value::Object(block),
         provenance.contains_key("resources"),
         CheckpointFacts {
             weights_bytes,
             state_slot_bytes,
+            layout,
+            member_of,
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),
@@ -356,6 +366,53 @@ pub(super) fn declared_engine_config(
                 && provenance.get("cuda_graphs").and_then(Value::as_str) == Some("capyctl default"),
         },
     ))
+}
+
+type MemberFacts = (
+    Option<i64>,
+    Option<capyctl_domain::member_weights::CheckpointLayout>,
+    Option<crate::topology::Topology>,
+);
+
+/// The checkpoint facts and topology a snapshot's `memory.member` records.
+fn member_facts(member: &Value) -> Result<MemberFacts, ConfigError> {
+    let bad = || invalid("snapshot.engine_config", "member invalid");
+    let count = |key: &str| {
+        member
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n >= 1)
+            .ok_or_else(bad)
+    };
+    let bytes = |value: &Value, key: &str| value.get(key).and_then(Value::as_i64).ok_or_else(bad);
+    let topology = crate::topology::Topology {
+        tensor_parallel: count("tensor_parallel")?,
+        pipeline_parallel: count("pipeline_parallel")?,
+    };
+    let weights = match member.get("checkpoint_weights_bytes") {
+        None => None,
+        Some(_) => Some(
+            bytes(member, "checkpoint_weights_bytes")
+                .and_then(|w| (w >= 0).then_some(w).ok_or_else(bad))?,
+        ),
+    };
+    let layout = match member.get("layout") {
+        None => None,
+        Some(layout) => {
+            let parsed = capyctl_domain::member_weights::CheckpointLayout {
+                sharded_bytes: bytes(layout, "sharded_bytes")?,
+                layer_count: layout
+                    .get("layer_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(bad)?,
+                largest_layer_bytes: bytes(layout, "largest_layer_bytes")?,
+            };
+            Some(parsed.is_valid().then_some(parsed).ok_or_else(bad)?)
+        }
+    };
+    Ok((weights, layout, Some(topology)))
 }
 
 fn quantity(value: &Value, suffix: &str) -> Result<String, ConfigError> {

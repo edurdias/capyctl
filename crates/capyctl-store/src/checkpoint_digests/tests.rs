@@ -243,11 +243,21 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
     let id = &receipt.deployment_id;
     let (weights, slot): (i64, i64) = (2 << 30, 10 << 20);
     assert!(matches!(
-        store.record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(0), 2),
+        store.record_checkpoint_measurement(
+            &session,
+            id,
+            1,
+            "lab",
+            DIGEST,
+            weights,
+            Some(0),
+            None,
+            2
+        ),
         Err(CheckpointDigestError::Invalid)
     ));
     store
-        .record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(slot), 2)
+        .record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(slot), None, 2)
         .unwrap();
     let memory = frozen_memory(&store, &receipt);
     assert_eq!(memory["state_slot_bytes"], json!(slot));
@@ -273,6 +283,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
                 DIGEST,
                 weights,
                 Some(slot + 1),
+                None,
                 3
             )
             .unwrap(),
