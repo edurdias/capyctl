@@ -127,7 +127,7 @@ the document (or with `--set`).
 | Hugging Face endpoint for downloads | `model_sources.huggingface_endpoint` (`https://`) | `--hf-endpoint <url>` | `CAPYCTL_HF_ENDPOINT`, else `HF_ENDPOINT` | `https://huggingface.co` | host, standalone |
 | Plain `http://` URLs for HTTP downloads | `model_sources.plain_http` (`allowed` or `disabled`) | `--model-sources-plain-http allowed\|disabled` | `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP` | `denied` (HTTPS only) | host, standalone |
 | Hugging Face endpoint for pinning `hf:` references | the role document's `model_sources.huggingface_endpoint` | `--hf-endpoint <url>` on `deploy model` | `CAPYCTL_HF_ENDPOINT`, else `HF_ENDPOINT` | `https://huggingface.co` | `capyctl deploy model` |
-| Trust a local checkpoint's declared digest without a full read (ADR 0014 §7, amendment of 2026-10-08) | `checkpoints.trust_declared_digest` | `--trust-declared-digest true\|false` | `CAPYCTL_TRUST_DECLARED_DIGEST` | `false` | host, standalone |
+| Trust a local checkpoint's declared digest without a full read | `checkpoints.trust_declared_digest` | `--trust-declared-digest true\|false` | `CAPYCTL_TRUST_DECLARED_DIGEST` | `false` | host, standalone |
 | Hosts downloads may come from | `model_sources.allowed_hosts` | (none) | (none) | any | host, standalone |
 
 `deploy model` pins an `hf: owner/repo` reference without a commit to the
