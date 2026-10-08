@@ -88,7 +88,9 @@ impl ResourceControls {
             || self.max_parked > 16
             || !(1..=10_000).contains(&self.observation_ttl_ms)
             || !(1..=65_536).contains(&self.planner_max_states)
-            || !(1..=4_096).contains(&self.queue.max_pending_per_deployment)
+            // SPEC §10 (owner decision 2026-10-08): 0 lets no request wait for
+            // a deployment; one beyond its in-flight bound is refused at once.
+            || self.queue.max_pending_per_deployment > 4_096
             || !(1..=16_384).contains(&self.queue.max_pending_total)
             || self.queue.max_pending_per_deployment > self.queue.max_pending_total
             || !(1..=(1_i64 << 30)).contains(&self.queue.max_buffered_bytes_total)
@@ -249,9 +251,10 @@ mod tests {
         let mut value = controls.clone();
         value.planner_max_states = 0;
         assert!(value.validate(&context).is_err());
+        // SPEC §10 (owner decision 2026-10-08): no waiting is a valid bound.
         let mut value = controls.clone();
         value.queue.max_pending_per_deployment = 0;
-        assert!(value.validate(&context).is_err());
+        assert!(value.validate(&context).is_ok());
         let mut value = controls.clone();
         value.queue.max_pending_total = 0;
         assert!(value.validate(&context).is_err());

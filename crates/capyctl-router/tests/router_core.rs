@@ -1184,6 +1184,71 @@ async fn at_the_in_flight_bound_requests_wait_in_arrival_order() {
     assert_eq!(holder.await.unwrap().0, 200);
 }
 
+// T19, SPEC §10 (owner decision 2026-10-08): with `max_pending_per_deployment`
+// at 0 no request waits. One beyond the in-flight bound is refused at once with
+// the bounded queue's answer, 429 `queue_full` and `Retry-After`, never sent to
+// the engine, and the request holding the slot is untouched.
+#[tokio::test]
+async fn with_no_waiting_a_request_beyond_the_in_flight_bound_is_refused_at_once() {
+    let (endpoint, gate, order) = gated_engine().await;
+    let (_authority, mut deps) = stub_router(&endpoint);
+    deps.limits.max_requests_per_deployment = 1;
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            max_pending_per_deployment: 0,
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let holder = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let body = serde_json::json!({"model":"public-alias",
+                "messages":[{"role":"user","content":"r1"}]});
+            post_raw(&router, body.to_string().into_bytes(), None).await
+        })
+    };
+    until("r1 at the engine", || order.lock().unwrap().len() == 1).await;
+    let started = std::time::Instant::now();
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"model": "public-alias",
+                        "messages": [{"role":"user","content":"r2"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The default request deadline is 600 s: an answer this fast did not wait.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        response.headers()[axum::http::header::RETRY_AFTER],
+        "1",
+        "the existing retry hint"
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["code"], "queue_full", "{body}");
+    assert_eq!(body["retryable"], true);
+    assert_eq!(deps.inflight.slot_waiters("dep-1"), 0);
+    assert_eq!(deps.inflight.waiting.totals(), (0, 0));
+    assert_eq!(*order.lock().unwrap(), vec!["r1"], "never sent");
+    gate.add_permits(1);
+    assert_eq!(holder.await.unwrap().0, 200);
+}
+
 // T19 T17 (SPEC §10): a non-streaming request is bounded like a stream — its
 // first backend event by the request deadline, later ones by the idle bound —
 // not by a fixed 300 s / 60 s cap. A backend that stalls after its first event

@@ -792,5 +792,118 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
     }
 }
 
+/// SPEC §10, §17 (owner decision 2026-10-08): the requests a launch runs at
+/// once, for the management load read. Status distinguishes configured
+/// capacity from observation, so the figure names its source; an unknown one
+/// has no count, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MaxRunning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    pub source: MaxRunningSource,
+    /// Why the count is not what the launch passes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Where a launch's running limit came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxRunningSource {
+    /// The engine's own figure for the running launch (SGLang reports the
+    /// limit it resolved, `max_running_requests` in `/v1/loads`).
+    Engine,
+    /// The deployment's `engine_config.max_concurrent_requests`.
+    Declared,
+    /// CapyCTL's default for the engine: the router's in-flight bound for
+    /// vLLM (owner decision 2026-10-02), `TENSORFOLD_DEFAULT_PARALLEL` for
+    /// TensorFold.
+    Default,
+    /// ADR 0014 amendment A14: a hybrid model's state cache holds fewer
+    /// requests than the deployment's count or CapyCTL's bound.
+    StateCache,
+    /// The option among the deployment's extra arguments.
+    ExtraArgs,
+    /// The option among the installation's host-fixed arguments.
+    HostFixed,
+    /// CapyCTL passes nothing and the engine chooses at start.
+    EngineDefault,
+    /// The host that runs the launch sizes it from its own checkpoint.
+    OnHost,
+}
+
+impl MaxRunning {
+    /// The figure the running engine reported.
+    pub fn reported(count: u32) -> Self {
+        Self {
+            count: Some(count),
+            source: MaxRunningSource::Engine,
+            reason: None,
+        }
+    }
+
+    fn of(count: Option<u32>, source: MaxRunningSource) -> Self {
+        Self {
+            count,
+            source,
+            reason: None,
+        }
+    }
+}
+
+/// SPEC §10, §17 (owner decision 2026-10-08): the running limit CapyCTL
+/// derives for `effective`, from `fit` (its status fit: [`fit_for_effective`],
+/// or [`fit_on_remote_host`] when `remote`).
+pub fn max_running_for_effective(
+    effective: &crate::effective::EffectiveDeployment,
+    fit: &ContextFit,
+    remote: bool,
+) -> MaxRunning {
+    let args = &effective.profile.args;
+    match &effective.engine_config {
+        LaunchSettings::Vllm(s) => {
+            if let Some(declared) = s.common.max_concurrent_requests {
+                return MaxRunning::of(Some(declared), MaxRunningSource::Declared);
+            }
+            if let Some(default) = vllm_default_max_num_seqs(&effective.engine_config, args) {
+                return MaxRunning::of(Some(default), MaxRunningSource::Default);
+            }
+            // The typed option is refused among the extra arguments, so only
+            // the installation's arguments can pass it.
+            let passed = crate::engine_policy::parse_options(args)
+                .ok()
+                .and_then(|options| {
+                    options
+                        .into_iter()
+                        .rev()
+                        .find(|o| o.name == "--max-num-seqs")
+                        .and_then(|o| o.value)
+                })
+                .and_then(|value| value.parse().ok());
+            MaxRunning::of(passed, MaxRunningSource::HostFixed)
+        }
+        LaunchSettings::Sglang(s) => match (fit.running_limit, s.common.max_concurrent_requests) {
+            (Some(limit), _) => MaxRunning::of(Some(limit), MaxRunningSource::StateCache),
+            (None, Some(declared)) => MaxRunning::of(Some(declared), MaxRunningSource::Declared),
+            // A hybrid model's state is sized from the checkpoint where it is.
+            (None, None) if remote => MaxRunning::of(None, MaxRunningSource::OnHost),
+            (None, None) => MaxRunning::of(None, MaxRunningSource::EngineDefault),
+        },
+        LaunchSettings::Tensorfold(_) => match &fit.streams {
+            Some(streams) => MaxRunning {
+                count: streams.count,
+                source: match streams.source {
+                    StreamsSource::Declared => MaxRunningSource::Declared,
+                    StreamsSource::Default => MaxRunningSource::Default,
+                    StreamsSource::ExtraArgs => MaxRunningSource::ExtraArgs,
+                    StreamsSource::HostFixed => MaxRunningSource::HostFixed,
+                },
+                reason: streams.reason.clone(),
+            },
+            None => MaxRunning::of(None, MaxRunningSource::EngineDefault),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests;

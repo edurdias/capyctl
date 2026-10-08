@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 capyctl-adapters = { workspace = true }
+# SPEC §§10, 17: the derived running limit the load read reports.
+capyctl-config = { workspace = true }
 capyctl-controller = { path = "../capyctl-controller" }
 capyctl-domain = { workspace = true }
 capyctl-store = { path = "../capyctl-store" }

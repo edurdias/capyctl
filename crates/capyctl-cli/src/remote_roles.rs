@@ -450,6 +450,42 @@ pub(crate) fn wait_limits(
     }
 }
 
+/// SPEC §§10, 17 (owner decision 2026-10-08): the management load read: the
+/// store's deployments, instances and derived running limits, the router's
+/// in-flight and waiting counts and, where hosts report load (`loads`), their
+/// latest samples. The store is read under the owner lock; the report is
+/// composed after it is released.
+pub(crate) fn load_view(
+    credentials: ManagementCredentials,
+    owner: Arc<Mutex<capyctl_controller::OwnedCoordinatorState>>,
+    inflight: Arc<capyctl_router::admission::InFlight>,
+    loads: Option<Arc<capyctl_controller::load_table::LoadTable>>,
+) -> axum::Router {
+    use capyctl_management::metrics::LoadRead;
+    capyctl_management::metrics::load_router(
+        credentials,
+        Arc::new(move |deployment: Option<&str>| {
+            let read = match owner.lock() {
+                Ok(owner) => owner.store().capacity(deployment),
+                Err(_) => return LoadRead::Unavailable,
+            };
+            match read {
+                Ok(found) if deployment.is_some() && found.is_empty() => {
+                    LoadRead::UnknownDeployment
+                }
+                Ok(found) => LoadRead::Report(capyctl_router::capacity::capacity_report(
+                    &found,
+                    &inflight,
+                    capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+                    loads.as_deref(),
+                    capyctl_protocol::now_unix_ms(),
+                )),
+                Err(_) => LoadRead::Unavailable,
+            }
+        }),
+    )
+}
+
 async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
         identity_refused(
@@ -638,6 +674,14 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             }),
         )
     };
+    // SPEC §§10, 17 (owner decision 2026-10-08): live load, read by an
+    // operator or an external router.
+    let load_view = load_view(
+        management_credentials(&credentials)?,
+        owner.clone(),
+        inflight.clone(),
+        Some(sessions.load_table()),
+    );
     // SPEC §10 step 1, §16.2 (W10 gap b): waiting requests are bounded by the
     // hosts' published `resource_policy.queue` (the tightest of them), read
     // again as hosts enroll and publish.
@@ -700,6 +744,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                 sessions.clone(),
             ))
             .merge(latency_view)
+            .merge(load_view)
             // Design §9: the inference listener's bind and authentication.
             .merge(
                 capyctl_management::inference_listener::inference_listener_router(

@@ -940,6 +940,7 @@ impl capyctl_agent::session::SessionExecution for LoadingExecutor {
                         kv_usage_ppm: 500_000,
                     }),
                     latency: None,
+                    max_running: None,
                 }],
             }
             .to_wire()]
@@ -2073,6 +2074,7 @@ async fn a_replaced_session_leaves_no_load_behind() {
                         ingress_in_flight: 1,
                         engine: None,
                         latency: None,
+                        max_running: None,
                     }],
                 }
                 .to_wire(),

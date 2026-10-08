@@ -294,6 +294,10 @@ capyctl start server --set shutdown.drain_timeout=90s
 # A host that reports its engine load every 2 seconds, from its unit file.
 CAPYCTL_SET__LOAD_REPORT_INTERVAL=2s
 
+# A host where no request waits: one beyond a model's 32 running requests, or
+# for a model not loaded, is refused 429 at once (see the parking guide).
+capyctl start host --set resource_policy.queue.max_pending_per_deployment=0
+
 # Standalone: the switch drain bound and the response timing header.
 capyctl start standalone --set server.switching.drain_timeout=45s \
   --set server.observability.timing_header=true

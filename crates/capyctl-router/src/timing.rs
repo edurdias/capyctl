@@ -548,6 +548,7 @@ mod tests {
                     sampled_at_ms: 1,
                     ingress_in_flight: 0,
                     engine: None,
+                    max_running: None,
                     latency: Some(SampleLatency {
                         engine: Some(engine.into()),
                         histograms: vec![("ingress_time_to_last_byte".into(), histogram)],

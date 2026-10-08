@@ -32,6 +32,7 @@ fn sample(of: &ServingInstance, running: u32, waiting: u32, kv_ppm: u32) -> Load
             waiting,
             kv_usage_ppm: kv_ppm,
         }),
+        max_running: None,
     }
 }
 

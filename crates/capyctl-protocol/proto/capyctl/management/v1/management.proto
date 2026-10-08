@@ -124,6 +124,11 @@ message LoadSample {
   // SPEC §17 (M80): latency observed since the previous report for this scope.
   // Absent when nothing was observed. Additive: an older receiver ignores it.
   SampleLatency latency = 10;
+  // SPEC §§10, 17 (owner decision 2026-10-08): the running-request limit the
+  // engine itself reports for this launch (SGLang's resolved
+  // max_running_requests, summed over data-parallel ranks), 1..=MAX_LOAD_GAUGE.
+  // Absent when the engine reports none. Additive: an older receiver ignores it.
+  optional uint32 max_running = 11;
 }
 // SPEC §17: host-side latency distributions for one load sample's scope. Series
 // names come from a fixed set (reports::HOST_LATENCY_SERIES), so cardinality is

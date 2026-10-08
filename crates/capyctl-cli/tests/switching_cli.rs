@@ -235,6 +235,80 @@ async fn standalone_queue_bounds_follow_the_document_and_its_overrides() {
     assert!(error.contains("resource_policy"), "{error}");
 }
 
+// T19, SPEC §10 (owner decision 2026-10-08): a waiting bound of 0 per
+// deployment lets no request wait in the router. It is the existing
+// `resource_policy.queue.max_pending_per_deployment`, stated three ways:
+// the document, `CAPYCTL_SET__…` and `--set` (`--set` > environment > YAML).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_queue_of_zero_is_set_three_ways() {
+    use capyctl_cli::roles::SettingOverrides;
+    use capyctl_config::ConfigKind;
+    let dir = support::safe_state_dir();
+    let config = dir.path().join("standalone.yaml");
+    std::fs::write(
+        &config,
+        "schema_version: 1\nkind: standalone\nname: s\nhost:\n  resource_policy:\n    queue:\n      max_pending_per_deployment: 0\n",
+    )
+    .unwrap();
+    let ports = support::engine_ports();
+    let app = support::boot_with_overrides_on(
+        dir.path(),
+        Some(&config),
+        &SettingOverrides::none(ConfigKind::Standalone),
+        ports,
+    )
+    .await
+    .expect("standalone boots with no waiting");
+    assert_eq!(
+        app.deps()
+            .inflight
+            .waiting
+            .limits()
+            .max_pending_per_deployment,
+        0
+    );
+    let _ = app.shutdown().await;
+    const VARIABLE: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__MAX_PENDING_PER_DEPLOYMENT";
+    // The environment over the document.
+    let overrides = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &[],
+        &[(VARIABLE.to_owned(), "8".to_owned())],
+    )
+    .unwrap();
+    let app = support::boot_with_overrides_on(dir.path(), Some(&config), &overrides, ports)
+        .await
+        .expect("standalone boots with the environment's bound");
+    assert_eq!(
+        app.deps()
+            .inflight
+            .waiting
+            .limits()
+            .max_pending_per_deployment,
+        8
+    );
+    let _ = app.shutdown().await;
+    // `--set` over the environment.
+    let overrides = SettingOverrides::parse(
+        ConfigKind::Standalone,
+        &["host.resource_policy.queue.max_pending_per_deployment=0".to_owned()],
+        &[(VARIABLE.to_owned(), "8".to_owned())],
+    )
+    .unwrap();
+    let app = support::boot_with_overrides_on(dir.path(), Some(&config), &overrides, ports)
+        .await
+        .expect("standalone boots with the flag's bound");
+    assert_eq!(
+        app.deps()
+            .inflight
+            .waiting
+            .limits()
+            .max_pending_per_deployment,
+        0
+    );
+    let _ = app.shutdown().await;
+}
+
 // T03 T19 (owner decision 2026-10-03: standalone is a server and one host,
 // every setting three ways; found live 2026-10-03, the fixed 50 % limit
 // refused an 84 GiB declaration): the standalone document's

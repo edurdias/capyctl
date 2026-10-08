@@ -162,6 +162,7 @@ impl Authority {
                     waiting: 0,
                     kv_usage_ppm: 0,
                 }),
+                max_running: None,
             })
         });
     }

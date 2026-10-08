@@ -29,3 +29,5 @@ capyctl-domain.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 rusqlite.workspace = true
+# SPEC §§10, 17: the load route served with the router's composed report.
+capyctl-router = { path = "../capyctl-router" }

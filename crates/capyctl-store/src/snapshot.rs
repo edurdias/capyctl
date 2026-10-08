@@ -165,19 +165,7 @@ fn context_status(
     conn: &rusqlite::Connection,
     deployment_id: &str,
 ) -> rusqlite::Result<LaunchStatus> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(String, bool)> = conn
-        .query_row(
-            "SELECT e.effective_json,EXISTS(SELECT 1 FROM host_effective_revisions h JOIN enrolled_hosts x ON x.host_id=h.host_id WHERE h.deployment_id=d.id AND h.revision=d.revision)
-               FROM deployments d JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
-            [deployment_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((raw, remote)) = row else {
-        return Ok((None, None));
-    };
-    let Ok(effective) = capyctl_config::effective::decode_effective_snapshot(&raw) else {
+    let Some((effective, remote)) = current_effective(conn, deployment_id)? else {
         return Ok((None, None));
     };
     Ok(if remote {
@@ -191,6 +179,121 @@ fn context_status(
             capyctl_config::parsers::parsers_for_effective(&effective),
         )
     })
+}
+
+/// The current revision's effective configuration, and whether it was
+/// resolved on an enrolled remote host (which then fits it from its own
+/// checkpoint). `None` when the revision does not decode.
+fn current_effective(
+    conn: &rusqlite::Connection,
+    deployment_id: &str,
+) -> rusqlite::Result<Option<(capyctl_config::effective::EffectiveDeployment, bool)>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT e.effective_json,EXISTS(SELECT 1 FROM host_effective_revisions h JOIN enrolled_hosts x ON x.host_id=h.host_id WHERE h.deployment_id=d.id AND h.revision=d.revision)
+               FROM deployments d JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+            [deployment_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(raw, remote)| {
+        capyctl_config::effective::decode_effective_snapshot(&raw)
+            .ok()
+            .map(|effective| (effective, remote))
+    }))
+}
+
+/// SPEC §§10, 17 (owner decision 2026-10-08): one deployment as the
+/// management load read names it: its instances and the running limit
+/// CapyCTL derives for its current revision. Live figures (router counts,
+/// host samples) are joined by the service; nothing here is an observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentCapacity {
+    pub id: String,
+    pub name: String,
+    /// `None` when the current revision does not decode.
+    pub max_running: Option<capyctl_config::context_fit::MaxRunning>,
+    pub instances: Vec<InstanceCapacity>,
+}
+
+/// ADR 0013 §6: one instance of a [`DeploymentCapacity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceCapacity {
+    pub index: u32,
+    pub host_id: Option<String>,
+    /// The generation its last activation drew; `None` until activated.
+    pub generation: Option<i64>,
+    /// As status derives it (`ready`, `parked`, `starting`, ...).
+    pub observed_state: String,
+}
+
+impl Store {
+    /// SPEC §§10, 17 (owner decision 2026-10-08): the deployments the
+    /// management load read reports, every one or the one `deployment` names
+    /// (empty when it names none), with their instances and derived running
+    /// limit. One bounded read transaction; no engine is touched. The limit is
+    /// fitted as status fits it, so only for the deployments returned.
+    pub fn capacity(
+        &self,
+        deployment: Option<&str>,
+    ) -> Result<Vec<DeploymentCapacity>, SnapshotError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let mut budget = Budget::default();
+        let mut deployments: Vec<DeploymentCapacity> = budget
+            .read(
+                &tx,
+                "SELECT d.id,d.name FROM deployments d WHERE d.kind!='deleted' ORDER BY d.id",
+                |r| {
+                    Ok(DeploymentCapacity {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        max_running: None,
+                        instances: Vec::new(),
+                    })
+                },
+            )?
+            .into_iter()
+            .filter(|d| deployment.is_none_or(|wanted| d.id == wanted))
+            .collect();
+        if deployments.is_empty() {
+            return Ok(deployments);
+        }
+        let instances_sql = format!(
+            "SELECT i.deployment_id,i.instance_index,i.host_id,i.generation,{INSTANCE_OBSERVED_STATE} FROM deployment_instances i ORDER BY i.deployment_id,i.instance_index"
+        );
+        let instances = budget.read(&tx, &instances_sql, |r| {
+            let generation: Option<i64> = r.get(3)?;
+            if generation.is_some_and(|g| g < 0) {
+                return Err(SnapshotError::CorruptData);
+            }
+            Ok((
+                r.get::<_, String>(0)?,
+                InstanceCapacity {
+                    index: r.get(1)?,
+                    host_id: r.get(2)?,
+                    generation,
+                    observed_state: r.get(4)?,
+                },
+            ))
+        })?;
+        for (id, instance) in instances {
+            if let Some(entry) = deployments.iter_mut().find(|d| d.id == id) {
+                entry.instances.push(instance);
+            }
+        }
+        for entry in &mut deployments {
+            entry.max_running = current_effective(&tx, &entry.id)?.map(|(effective, remote)| {
+                let fit = if remote {
+                    capyctl_config::context_fit::fit_on_remote_host(&effective)
+                } else {
+                    capyctl_config::context_fit::fit_for_effective(&effective)
+                };
+                capyctl_config::context_fit::max_running_for_effective(&effective, &fit, remote)
+            });
+        }
+        Ok(deployments)
+    }
 }
 
 /// SPEC §6.4: an operation and its error as status shows them. The reason is
@@ -1232,5 +1335,46 @@ impl std::io::Write for SizeLimit {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use crate::Store;
+
+    // SPEC §§10, 17 (owner decision 2026-10-08): the load read lists every
+    // deployment or the one named, each with its instances as status derives
+    // them; an ID that names none reads empty; a revision that does not decode
+    // has no derived limit rather than a guess.
+    #[test]
+    fn the_load_read_names_deployments_and_their_instances() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                r#"INSERT INTO deployments(id,name,kind,desired_state,observed_state,admission_enabled,dispatch_enabled,suspended,current_generation,schema_version,revision) VALUES('d','chat','model','ready','ready',1,1,0,5,1,1);
+                INSERT INTO effective_revisions VALUES('d',1,'{}','f');
+                INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json) VALUES('d',1,2,'{"hosts":null,"selector":{},"strategy":"spread","max_per_host":null}');
+                INSERT INTO deployment_instances(deployment_id,instance_index) VALUES('d',1);
+                UPDATE deployment_instances SET revision=1,generation=4,desired_state='ready',observed_state='ready',admission_enabled=1,dispatch_enabled=1 WHERE deployment_id='d' AND instance_index=0;
+                INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('e','other','model','stopped',0,0,1,1);"#,
+            )
+            .unwrap();
+        let all = store.capacity(None).unwrap();
+        assert_eq!(
+            all.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["d", "e"]
+        );
+        let one = store.capacity(Some("d")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "chat");
+        assert_eq!(one[0].max_running, None);
+        let instances: Vec<_> = one[0]
+            .instances
+            .iter()
+            .map(|i| (i.index, i.generation, i.observed_state.as_str()))
+            .collect();
+        assert_eq!(instances, [(0, Some(4), "ready"), (1, None, "stopped")]);
+        assert!(store.capacity(Some("missing")).unwrap().is_empty());
     }
 }

@@ -158,7 +158,7 @@ next switch.
 | Drain bound | `server.switching.drain_timeout`, default 30 s, 1 s to 600 s | server: `switching.drain_timeout`, default 30 s, 1 s to 600 s |
 | How long a request may wait for its first output, the switch and the prompt's prefill included | `host.resource_policy.queue.request_deadline`, default 1800 s | host: `resource_policy.queue.request_deadline`, default 600 s, up to 3600 s |
 | Longest silence in a reply after its first output | `host.resource_policy.queue.stream_idle_timeout`, default 120 s | host: `resource_policy.queue.stream_idle_timeout`, default 120 s, 1 s to 3600 s |
-| Waiting requests per model | `host.resource_policy.queue.max_pending_per_deployment`, default 64 | host: `resource_policy.queue.max_pending_per_deployment`, default 64 |
+| Waiting requests per model | `host.resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 | host: `resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 |
 | Waiting requests in total | `host.resource_policy.queue.max_pending_total`, default 256 | host: `resource_policy.queue.max_pending_total`, default 256 |
 | Bodies of waiting requests, in total | `host.resource_policy.queue.max_buffered_bytes_total`, default 64 MiB | host: `resource_policy.queue.max_buffered_bytes_total`, default 64 MiB |
 | Requests running at once per model | 32, fixed | 32, fixed |
@@ -195,6 +195,94 @@ Each is an HTTP error with a JSON body holding `code`, `message` and
 | 429 | `queue_full` | `too many requests are waiting for deployment <deployment id>` | A waiting-request limit is reached. |
 | 429 | `queue_full` | `waiting requests exceed the buffered-bytes bound` | The waiting bodies would pass the byte limit. |
 | 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | 32 requests kept running for the whole request deadline. |
+| 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | 32 requests are running and the waiting limit per model is 0. |
+| 429 | `queue_full` | `deployment <deployment id> is not servable now and lets no request wait; retry shortly` | The model is parked, stopped or switching and the waiting limit per model is 0. Its wake or start has been asked for (an operator-stopped model is not started). |
+
+Every 429 carries `Retry-After: 1`.
+
+### No waiting
+
+A client that balances across several servers may rather be refused at once
+than wait: set the waiting limit per model to 0. A request then never waits in
+CapyCTL: one beyond the 32 running requests, or one for a model that is not
+loaded, is answered 429 `queue_full` with `Retry-After` straight away. A
+request for a model that is parked or stopped still wakes or starts it, so a
+retry after the hint finds it loaded. The 32 running requests per model stay
+as they are; requests above what the engine itself runs at once wait in the
+engine, as before (its waiting count is in the load read below).
+
+```yaml
+# host.yaml (standalone: under host:)
+resource_policy:
+  queue:
+    max_pending_per_deployment: 0
+```
+
+Or for one run, `--set resource_policy.queue.max_pending_per_deployment=0`
+(standalone: `--set host.resource_policy.queue.max_pending_per_deployment=0`)
+or `CAPYCTL_SET__RESOURCE_POLICY__QUEUE__MAX_PENDING_PER_DEPLOYMENT=0`
+(standalone: `CAPYCTL_SET__HOST__RESOURCE_POLICY__QUEUE__MAX_PENDING_PER_DEPLOYMENT=0`);
+`--set` wins over the variable, and both over the document. With several
+hosts the tightest limit applies, so one host at 0 makes it 0 for the server.
+
+### Reading load
+
+`GET /management/v1/metrics/load` on the management listener, with the admin
+token, reports the live conditions of every model; `?deployment=<id>` reports
+one, and an ID that names no model is answered 404 `not_found`. It reads only
+what CapyCTL holds in memory, so it is cheap enough to poll every second.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://127.0.0.1:7443/management/v1/metrics/load?deployment=$ID"
+```
+
+```json
+{
+  "observed_at_ms": 1791460000000,
+  "stale_after_ms": 3000,
+  "deployments": [{
+    "deployment_id": "01K…",
+    "name": "chat-a",
+    "router": {"in_flight": 3, "in_flight_limit": 32, "waiting": 0, "waiting_limit": 0},
+    "max_running": {"count": 8, "source": "state_cache"},
+    "instances": [{
+      "index": 0, "host_id": "gpu-box", "generation": 7, "observed_state": "ready",
+      "router_in_flight": 3,
+      "max_running": {"count": 8, "source": "engine"},
+      "sample": {
+        "sampled_at_ms": 1791459999600, "age_ms": 400, "fresh": true,
+        "ingress_in_flight": 3,
+        "engine": {"running": 3, "waiting": 0, "kv_usage_ppm": 121000}
+      }
+    }]
+  }]
+}
+```
+
+- `router`: requests CapyCTL is forwarding to the model now and its bound
+  (32), and requests waiting in CapyCTL for it (to load, or for one of the
+  32) and the waiting limit.
+- `max_running`: how many requests the engine runs at once. Per instance
+  `source: engine` is the engine's own figure (SGLang reports it); otherwise it
+  is what CapyCTL passed or expects, by source: `declared`
+  (`max_concurrent_requests`), `default` (CapyCTL's default: 32 for vLLM, 8
+  for TensorFold), `state_cache` (a hybrid model's state holds fewer),
+  `extra_args` or `host_fixed` (the option is in those arguments),
+  `engine_default` (the engine chooses at start and has not said) or `on_host`
+  (the host sizes it at launch). `count` is absent when it is not known.
+- `sample`: the latest load the host reported for the instance, about once a
+  second: when it was taken, its age and whether it is `fresh` (under
+  `stale_after_ms`). A stale sample is kept for 30 seconds, then dropped.
+  `engine` is the engine's running and waiting requests and its KV-cache use
+  in parts per million; it is `null` when the host could not read the engine's
+  metrics (SGLang reports them only with metrics on), and `sample` is `null`
+  when no sample is held (the instance is not loaded, or the server restarted
+  less than a second ago). Absent figures are unknown, never zero.
+
+Standalone reads no load from its own engine, so its instances always have
+`sample: null` and the `max_running` CapyCTL derives; the `router` figures
+are live.
 
 ### Tuning
 
