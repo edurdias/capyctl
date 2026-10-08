@@ -912,8 +912,12 @@ host (see "Layout"):
 |---|---|---|
 | State root (`CAPYCTL_STATE_DIR`) | read-write | Must persist across container restarts (identity, journal, ledger, logs, the managed runtime). The directory and its ancestors must be owned by root or the role's user and not group- or world-writable: prepare a host directory with `install -d -m 0700 -o <uid> -g <gid>`, since a new named volume is root-owned. |
 | Models directory (`CAPYCTL_MODELS_ROOT`) | read-only, or read-write when downloads are allowed | Downloads land in `<models>/sources` unless `CAPYCTL_MODEL_SOURCES_PATH` names another mount. |
-| Engine virtual environments | read-only | Mount each at the path its profile or `CAPYCTL_*_BIN` names. Owned by root or the role's user, nothing writable by others. |
+| Engine virtual environments | read-only | Mount each at the path its profile or `CAPYCTL_*_BIN` names. Owned by root or the role's user, nothing writable by others. A virtual environment links to the interpreter it was made with (`<venv>/bin/python` → `/usr/bin/python3.12`), so the image must carry that interpreter at the same path, or the environment must be built inside the image. |
 | `/dev/shm` | | Engines pass tensors through shared memory; give the container `--ipc=host` or a `--shm-size` of several GiB (Docker's default 64 MiB is too small). |
+
+The image also needs `python3` on `PATH`: the device inventory an SGLang
+deployment is placed by is collected at start by `python3` running CapyCTL's
+runtime module; without it SGLang deployments fail placement.
 
 **User and capabilities.** Run the role as the user that owns the state
 directory (`--user <uid>:<gid>`), or as root. It needs no added capabilities
