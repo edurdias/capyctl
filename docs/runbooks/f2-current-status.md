@@ -1,5 +1,9 @@
 # Current implementation and launch status
 
+## Status startup figure and a role-shutdown test race — 2026-10-07 (branch `fix/status-startup-provenance-and-shutdown-race`)
+
+Owner decision 5 (a): the deployment's `startup` in status now uses the figure admission freezes into the next start's plan (`frozen_plan_startup`): a peak measured for the revision on its host and installation shows as `measured`, else the weighed placeholder or the revision's own budget as before. Found in the catalog runs: an SGLang deployment kept showing its 55.2 GiB default after a 29.7 GiB peak was measured. Owner decision 5 (d): `role_shutdown::remote_signals_restart_and_drain_host_stops_with_cleanup` deployed once the host was `online`, which the session sets before the host's inventory and resource policy are stored, so under load the deploy got `reconciliation_required`; it now waits for `session.reconciled` and `eligible` (SPEC §4.2). CPU tests only (the T29 measured-peak test failed first on the stale figure; the role test passed 10 of 10 beside a crate build); not qualification. Live check: on the catalog host, `capyctl status deployment <sglang model> --format json` after its first Ready shows `startup.provenance` `measured`.
+
 ## Multi-node engine groups — 2026-10-07 (branch `feat/multi-node-groups`)
 
 ADR 0028 is implemented on the feature branch slices through status, closed codes and exits, and the user docs (several-machines guide, settings, network-access risk, engines support table, 0.1.3 release notes). CPU and Fake-engine tests only; this is not qualification. The live rows MN1–MN9 on host A and host B are pending.

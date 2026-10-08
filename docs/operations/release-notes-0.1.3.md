@@ -123,3 +123,9 @@ rented machines.
   stating `engine_config.env` was accepted and then failed to start or load
   with `CorruptStoredData`, since its stored revision lost the variables; it
   now keeps them, values stored for the launch and still shown redacted.
+- **`status` shows the measured startup peak.** Once a first run measured a
+  deployment's startup peak, the next start reserved it, but the STARTUP
+  column of `capyctl status deployment` kept showing the estimate made before
+  any run (55.2 GiB for an SGLang model whose peak measured 29.7 GiB). It now
+  shows the figure the next start reserves, with provenance `measured` in
+  `--format json`.

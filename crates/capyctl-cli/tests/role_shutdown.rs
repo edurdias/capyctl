@@ -1596,6 +1596,34 @@ impl TwoRoles {
         }
     }
 
+    /// SPEC §4.2 (U5-G4): wait until the one host is eligible, which the
+    /// session sets only once the host's inventory and resource policy are
+    /// published and its reconciliation pages are complete. `online` alone
+    /// is set when the session opens, before either is stored, so a deploy
+    /// sent then can be refused `reconciliation_required`
+    /// (`resource_policy_unavailable` or `host_unpublished`).
+    fn reconciled_host(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let out = self.manage(&["list", "hosts", "--format", "json"]);
+            if out.status.success() {
+                let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+                if value["hosts"].as_array().is_some_and(|hosts| {
+                    hosts.len() == 1
+                        && hosts[0]["session"]["reconciled"] == true
+                        && hosts[0]["eligible"] == true
+                }) {
+                    return value;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never became reconciled and eligible"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn api_key(&self) -> String {
         let credentials: Value = serde_json::from_slice(
             &std::fs::read(self.server_state.join("identity/server-credentials.json")).unwrap(),
@@ -1717,7 +1745,9 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
         String::from_utf8_lossy(&out.stderr)
     );
     let host = roles.start("host");
-    let listed = roles.hosts(true, 1);
+    // Deploy only once the host is reconciled: `online` comes before its
+    // resource policy is stored (found under load in the catalog runs).
+    let listed = roles.reconciled_host();
     let host_id = listed["hosts"][0]["host_id"].as_str().unwrap().to_owned();
 
     let golden: Value = serde_json::from_str(include_str!(
