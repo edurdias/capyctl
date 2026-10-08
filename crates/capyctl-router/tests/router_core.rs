@@ -323,6 +323,7 @@ impl StubAuthority {
                 served_model: "served-name".into(),
                 engine_key: None,
                 incarnation: generation.to_string(),
+                engine: Some("vllm".into()),
             }),
             leases: Mutex::new(Vec::new()),
             refuse_leases: Mutex::new(None),
@@ -624,6 +625,7 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
             served_model: "served-name".into(),
             engine_key: Some("k3y".into()),
             incarnation: "1".into(),
+            engine: Some("vllm".into()),
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
@@ -698,6 +700,11 @@ async fn scripted_engine(
 }
 
 fn stub_router(endpoint: &str) -> (Arc<StubAuthority>, RouterDeps) {
+    stub_router_on(endpoint, Some("vllm"))
+}
+
+/// As [`stub_router`], with the engine family the launch's revision froze.
+fn stub_router_on(endpoint: &str, engine: Option<&str>) -> (Arc<StubAuthority>, RouterDeps) {
     let authority = Arc::new(StubAuthority {
         deployment: "dep-1".into(),
         route: "public-alias".into(),
@@ -706,6 +713,7 @@ fn stub_router(endpoint: &str) -> (Arc<StubAuthority>, RouterDeps) {
             served_model: "served-name".into(),
             engine_key: None,
             incarnation: "1".into(),
+            engine: engine.map(str::to_owned),
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
@@ -1532,4 +1540,148 @@ async fn the_first_token_watch_reports_a_stalled_stream_once_and_never_an_answer
         ends(&answered),
         vec![Some(capyctl_controller::LeaseEnd::Completed); 2]
     );
+}
+
+/// An engine answering every chat request with `engine_sse` and recording the
+/// body it received.
+async fn recording_engine() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            recorded.lock().unwrap().push(body);
+            async move {
+                (
+                    [("content-type", "text/event-stream")],
+                    engine_sse("served-name"),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    (base, seen)
+}
+
+// SPEC §10 (`cache_salt`): a request's prefix-cache partition reaches vLLM and
+// SGLang byte for byte, streaming and not.
+#[tokio::test]
+async fn cache_salt_reaches_vllm_and_sglang_unchanged() {
+    let salt = "tenant-a/\u{fc}/0001";
+    for engine in ["vllm", "sglang"] {
+        let (endpoint, seen) = recording_engine().await;
+        let (authority, deps) = stub_router_on(&endpoint, Some(engine));
+        let router = capyctl_router::serve_router(deps);
+        for stream in [false, true] {
+            let body = chat_body(
+                "public-alias",
+                serde_json::json!({"cache_salt": salt, "stream": stream}),
+            );
+            let (status, answer) = post_raw(&router, body, None).await;
+            assert_eq!(status, 200, "{engine} stream={stream}: {answer}");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{engine}");
+        for body in &seen {
+            assert_eq!(body["cache_salt"], salt, "{engine}: {body}");
+        }
+        assert_eq!(
+            ends(&authority),
+            vec![Some(capyctl_controller::LeaseEnd::Completed); 2],
+            "{engine}"
+        );
+    }
+}
+
+// SPEC §10 (`cache_salt_unsupported`): TensorFold ignores `cache_salt`, and an
+// engine whose family is not recorded cannot be shown to honour it, so a
+// request carrying one is refused before anything is sent; isolation is never
+// silently absent. The same request without the field is served.
+#[tokio::test]
+async fn cache_salt_is_refused_for_an_engine_that_would_ignore_it() {
+    for engine in [Some("tensorfold"), None] {
+        let (endpoint, seen) = recording_engine().await;
+        let (authority, deps) = stub_router_on(&endpoint, engine);
+        let router = capyctl_router::serve_router(deps.clone());
+        let body = chat_body(
+            "public-alias",
+            serde_json::json!({"cache_salt": "tenant-a"}),
+        );
+        let (status, answer) = post_raw(&router, body, None).await;
+        assert_eq!(status, 400, "{engine:?}: {answer}");
+        assert_eq!(
+            answer["code"], "cache_salt_unsupported",
+            "{engine:?}: {answer}"
+        );
+        let streamed = chat_body(
+            "public-alias",
+            serde_json::json!({"cache_salt": "tenant-a", "stream": true}),
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(streamed))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("cache_salt_unsupported"),
+            "{engine:?}: {text}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing reached the engine"
+        );
+        assert_eq!(
+            ends(&authority),
+            vec![Some(capyctl_controller::LeaseEnd::NotAccepted); 2],
+            "{engine:?}"
+        );
+        assert_eq!(deps.inflight.current("dep-1"), 0);
+        let (status, answer) = post_raw(
+            &router,
+            chat_body("public-alias", serde_json::json!({})),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{engine:?}: {answer}");
+    }
+}
+
+// SPEC §10 (`cache_salt`): the value is a non-empty string of at most
+// `MAX_CACHE_SALT_BYTES` bytes; anything else is a 400 before any engine.
+#[tokio::test]
+async fn a_malformed_cache_salt_is_refused_before_any_engine() {
+    let (endpoint, seen) = recording_engine().await;
+    let (authority, deps) = stub_router_on(&endpoint, Some("sglang"));
+    let router = capyctl_router::serve_router(deps);
+    let long = "s".repeat(capyctl_adapters::forward::MAX_CACHE_SALT_BYTES + 1);
+    for salt in [
+        serde_json::json!(""),
+        serde_json::json!(7),
+        serde_json::json!(["tenant-a"]),
+        serde_json::json!(long),
+    ] {
+        let body = chat_body("public-alias", serde_json::json!({"cache_salt": salt}));
+        let (status, answer) = post_raw(&router, body, None).await;
+        assert_eq!(status, 400, "{answer}");
+        assert_eq!(answer["code"], "invalid_request", "{answer}");
+    }
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(ends(&authority).is_empty(), "no lease was opened");
+    let longest = "s".repeat(capyctl_adapters::forward::MAX_CACHE_SALT_BYTES);
+    let body = chat_body("public-alias", serde_json::json!({"cache_salt": longest}));
+    let (status, answer) = post_raw(&router, body, None).await;
+    assert_eq!(status, 200, "{answer}");
 }

@@ -268,6 +268,10 @@ pub enum AdapterError {
     /// nothing runs on the request's behalf; another instance would reject it
     /// the same way. `message` is the engine's own, bounded.
     Rejected { status: u16, message: String },
+    /// SPEC §10 (`cache_salt_unsupported`): the request asks for a prefix-cache
+    /// partition (`cache_salt`) and this engine would ignore it, so forwarding
+    /// would silently share its cache. Refused before anything is sent.
+    CacheSaltUnsupported,
 }
 
 /// Spec §3: an adapter error is quoted into failure reasons that reach a journal,
@@ -290,6 +294,9 @@ impl std::fmt::Display for AdapterError {
             AdapterError::Rejected { status, message } => {
                 write!(f, "the engine rejected the request ({status}): {message}")
             }
+            AdapterError::CacheSaltUnsupported => f.write_str(
+                "this deployment's engine does not partition its prefix cache by cache_salt",
+            ),
         }
     }
 }

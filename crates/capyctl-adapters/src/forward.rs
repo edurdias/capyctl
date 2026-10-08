@@ -84,7 +84,19 @@ pub const CHAT_REQUEST_FIELDS: &[&str] = &[
     "separate_reasoning",
     "stream_reasoning",
     "include_reasoning",
+    // Prefix-cache partition (SPEC §10): forwarded unchanged to an engine that
+    // honours it, refused for one that would ignore it.
+    "cache_salt",
 ];
+
+/// SPEC §10: the longest `cache_salt` forwarded, in bytes. vLLM bounds the
+/// field at 1024 characters, so no salt this admits is one it refuses.
+pub const MAX_CACHE_SALT_BYTES: usize = 1024;
+
+/// Whether `body` asks for a prefix-cache partition (a non-null `cache_salt`).
+pub fn carries_cache_salt(body: &Value) -> bool {
+    body.get("cache_salt").is_some_and(|salt| !salt.is_null())
+}
 
 /// Whether `body` is a JSON object carrying only [`CHAT_REQUEST_FIELDS`].
 pub fn chat_request_allowed(body: &Value) -> bool {
@@ -165,6 +177,16 @@ pub fn validate_chat_request(body: &Value) -> Result<(), ChatRequestRefusal> {
     {
         return Err(ChatRequestRefusal::Unsupported("n other than 1"));
     }
+    if fields.get("cache_salt").is_some_and(|salt| {
+        !salt.is_null()
+            && !salt
+                .as_str()
+                .is_some_and(|salt| !salt.is_empty() && salt.len() <= MAX_CACHE_SALT_BYTES)
+    }) {
+        return Err(ChatRequestRefusal::Malformed(
+            "cache_salt must be a non-empty string of at most 1024 bytes",
+        ));
+    }
     if fields.contains_key("functions") || fields.contains_key("function_call") {
         return Err(ChatRequestRefusal::Unsupported(
             "the deprecated functions/function_call parameters; use tools",
@@ -204,14 +226,31 @@ pub(crate) struct ChatHttp {
     model: String,
     key: Option<String>,
     client: reqwest::Client,
+    /// SPEC §10: whether this engine partitions its prefix cache by
+    /// `cache_salt`. When it does not, a request carrying one is refused.
+    honours_cache_salt: bool,
+}
+
+/// SPEC §10: whether an engine family partitions its prefix cache by
+/// `cache_salt`. vLLM and SGLang do; TensorFold ignores the field, and an
+/// unrecorded family is treated as not honouring it, so a requested isolation
+/// is never silently absent.
+pub fn engine_honours_cache_salt(engine: Option<&str>) -> bool {
+    matches!(engine, Some("vllm" | "sglang"))
 }
 
 impl ChatHttp {
-    pub(crate) fn new(base: reqwest::Url, model: String, key: Option<String>) -> Self {
+    pub(crate) fn new(
+        base: reqwest::Url,
+        model: String,
+        key: Option<String>,
+        honours_cache_salt: bool,
+    ) -> Self {
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             model,
             key,
+            honours_cache_salt,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -483,6 +522,12 @@ impl ChatHttp {
         // parameter the relay cannot answer faithfully is refused before
         // anything is sent (tools are forwarded: SPEC §10 preserves tool calls).
         validate_chat_request(body)?;
+        // SPEC §10: a requested prefix-cache partition is forwarded unchanged
+        // only to an engine that honours it; anywhere else it would be silently
+        // absent, so the request is refused before anything is sent.
+        if !self.honours_cache_salt && carries_cache_salt(body) {
+            return Err(AdapterError::CacheSaltUnsupported);
+        }
         let public = body
             .get("model")
             .and_then(Value::as_str)
@@ -757,12 +802,21 @@ impl crate::traits::ChatForward for EngineForward {
 /// Built per incarnation rather than per engine family. An endpoint and a key both
 /// belong to a single launch, so a forwarder built once at boot would keep
 /// addressing a port and presenting a credential that a later launch replaced.
+///
+/// `honours_cache_salt` is the engine family's answer from
+/// [`engine_honours_cache_salt`] (SPEC §10).
 pub fn engine_forwarder(
     base: reqwest::Url,
     model: String,
     key: Option<String>,
+    honours_cache_salt: bool,
 ) -> std::sync::Arc<dyn crate::traits::ChatForward> {
-    std::sync::Arc::new(EngineForward(ChatHttp::new(base, model, key)))
+    std::sync::Arc::new(EngineForward(ChatHttp::new(
+        base,
+        model,
+        key,
+        honours_cache_salt,
+    )))
 }
 
 struct Parser<'a> {
@@ -1144,7 +1198,7 @@ mod tests {
         let request = serde_json::json!({"model":"m","messages":[]});
         let refusal = serde_json::json!({"error":{"code":"shutting_down","message":"restarting","retryable":true}});
         let forward =
-            crate::forward::engine_forwarder(answering(503, refusal).await, "m".into(), None);
+            crate::forward::engine_forwarder(answering(503, refusal).await, "m".into(), None, true);
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::NotAccepted(_))
@@ -1154,8 +1208,12 @@ mod tests {
             serde_json::json!({"error":{"code":"shutting_down"}}),
             serde_json::json!({"object":"error","code":503}),
         ] {
-            let forward =
-                crate::forward::engine_forwarder(answering(503, body).await, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(
+                answering(503, body).await,
+                "m".into(),
+                None,
+                true,
+            );
             assert!(matches!(
                 forward.forward_chat(&request).await,
                 Err(AdapterError::Uncertain(_))
@@ -1163,7 +1221,7 @@ mod tests {
         }
         let refusal = serde_json::json!({"error":{"code":"shutting_down","retryable":true}});
         let forward =
-            crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None);
+            crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None, true);
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::Uncertain(_))
@@ -1197,8 +1255,12 @@ mod tests {
                 "prompt too large",
             ),
         ] {
-            let forward =
-                crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(
+                answering(status, body).await,
+                "m".into(),
+                None,
+                true,
+            );
             match forward.forward_chat(&request).await {
                 Err(AdapterError::Rejected {
                     status: got,
@@ -1215,6 +1277,7 @@ mod tests {
             answering(400, serde_json::json!({"error":{"message": long}})).await,
             "m".into(),
             None,
+            true,
         );
         match forward.forward_chat(&request).await {
             Err(AdapterError::Rejected { message, .. }) => {
@@ -1227,8 +1290,12 @@ mod tests {
             (401, serde_json::json!({"error":{"message":"Unauthorized"}})),
             (500, serde_json::json!({"error":{"message":"boom"}})),
         ] {
-            let forward =
-                crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(
+                answering(status, body).await,
+                "m".into(),
+                None,
+                true,
+            );
             assert!(
                 matches!(
                     forward.forward_chat(&request).await,
@@ -1252,6 +1319,7 @@ mod tests {
             format!("http://{address}").parse().unwrap(),
             "m".into(),
             None,
+            true,
         );
         assert!(matches!(
             forward.forward_chat(&request).await,
@@ -1271,6 +1339,7 @@ mod tests {
             format!("http://{address}").parse().unwrap(),
             "m".into(),
             None,
+            true,
         );
         assert!(matches!(
             forward.forward_chat(&request).await,
@@ -1319,6 +1388,7 @@ mod tests {
                 answering(200, serde_json::json!({})).await,
                 "m".into(),
                 None,
+                true,
             );
             assert!(
                 matches!(
@@ -1387,7 +1457,7 @@ mod tests {
         ]
         .concat();
         let (url, seen) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         let request = serde_json::json!({"model":"public","messages":[]});
         let response = forward.forward_chat(&request).await.unwrap();
         assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
@@ -1424,7 +1494,7 @@ mod tests {
         ]
         .concat();
         let (url, seen) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         let tools = serde_json::json!([{"type":"function","function":{"name":"get_weather",
             "parameters":{"type":"object"}}}]);
         let request = serde_json::json!({"model":"public","messages":[],"tools":tools,
@@ -1473,7 +1543,7 @@ mod tests {
         .map(|line| format!("{line}\n\n"))
         .concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         let request = serde_json::json!({"model":"public","messages":[],
             "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
             "tool_choice":{"type":"function","function":{"name":"get_weather"}}});
@@ -1665,7 +1735,7 @@ mod tests {
         let request = serde_json::json!({"model":"p","messages":[]});
         let sse = [error(400), "data: [DONE]\n\n".to_owned()].concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         match forward.forward_chat(&request).await {
             Err(AdapterError::Rejected { status, message }) => {
                 assert_eq!(status, 400);
@@ -1698,7 +1768,7 @@ mod tests {
             [error(500), "data: [DONE]\n\n".to_owned()].concat(),
         ] {
             let (url, _) = recording(sse).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
             let result = forward.forward_chat(&request).await;
             assert!(
                 matches!(result, Err(AdapterError::Uncertain(_))),
@@ -1726,7 +1796,7 @@ mod tests {
             ]
             .concat();
             let (url, _) = recording(sse).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
             let result = forward
                 .forward_chat(&serde_json::json!({"model":"p","messages":[]}))
                 .await;
@@ -1760,7 +1830,7 @@ mod tests {
                 "{field}"
             );
             let (url, seen) = recording(String::new()).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
             assert!(
                 matches!(
                     forward.forward_chat(&body).await,
@@ -1855,7 +1925,7 @@ mod tests {
         ]
         .concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         let request = json!({"model":"public","messages":[]});
         let mut sink = Counting::default();
         let end = forward
@@ -1901,5 +1971,69 @@ mod tests {
         ] {
             assert!(!opens_reply_only(&output), "{output}");
         }
+    }
+
+    // SPEC §10 (`cache_salt`): the field is allowed, its value is a non-empty
+    // string of at most MAX_CACHE_SALT_BYTES bytes, and null means absent.
+    #[test]
+    fn cache_salt_is_allowed_and_its_value_bounded() {
+        use super::{validate_chat_request, ChatRequestRefusal, MAX_CACHE_SALT_BYTES};
+        let with = |salt: Value| json!({"model":"m","messages":[],"cache_salt":salt});
+        for salt in [
+            json!("tenant-a"),
+            json!("s".repeat(MAX_CACHE_SALT_BYTES)),
+            Value::Null,
+        ] {
+            assert_eq!(validate_chat_request(&with(salt.clone())), Ok(()), "{salt}");
+            assert!(super::chat_request_allowed(&with(salt)));
+        }
+        for salt in [
+            json!(""),
+            json!(7),
+            json!({"tenant":"a"}),
+            json!("s".repeat(MAX_CACHE_SALT_BYTES + 1)),
+        ] {
+            assert!(
+                matches!(
+                    validate_chat_request(&with(salt.clone())),
+                    Err(ChatRequestRefusal::Malformed(_))
+                ),
+                "{salt}"
+            );
+        }
+    }
+
+    // SPEC §10 (`cache_salt_unsupported`): only vLLM and SGLang honour the
+    // partition; a forwarder for any other engine refuses a request carrying
+    // one before connecting (the endpoint here accepts no connection).
+    #[tokio::test]
+    async fn a_forwarder_for_an_engine_ignoring_cache_salt_refuses_it_before_sending() {
+        use super::engine_honours_cache_salt;
+        assert!(engine_honours_cache_salt(Some("vllm")));
+        assert!(engine_honours_cache_salt(Some("sglang")));
+        assert!(!engine_honours_cache_salt(Some("tensorfold")));
+        assert!(!engine_honours_cache_salt(None));
+        let forward = crate::forward::engine_forwarder(
+            "http://127.0.0.1:9".parse().unwrap(),
+            "m".into(),
+            None,
+            false,
+        );
+        let request = json!({"model":"m","messages":[],"cache_salt":"tenant-a"});
+        assert!(matches!(
+            forward.forward_chat(&request).await,
+            Err(AdapterError::CacheSaltUnsupported)
+        ));
+        let mut chunks = |_chunk: String| {};
+        assert!(matches!(
+            forward.forward_chat_stream(&request, &mut chunks).await,
+            Err(AdapterError::CacheSaltUnsupported)
+        ));
+        // Without the field the same forwarder sends (and here fails to connect).
+        let plain = json!({"model":"m","messages":[]});
+        assert!(!matches!(
+            forward.forward_chat(&plain).await,
+            Err(AdapterError::CacheSaltUnsupported)
+        ));
     }
 }

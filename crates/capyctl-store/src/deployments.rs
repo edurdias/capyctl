@@ -734,6 +734,31 @@ impl crate::Store {
         Ok(legacy.flatten().into_iter().collect())
     }
 
+    /// SPEC §10 (`cache_salt`): the engine family (`vllm`, `sglang`,
+    /// `tensorfold`) that `revision` of `deployment_id` froze in its effective
+    /// profile, so the router can tell whether a launch of that revision
+    /// honours a request's prefix-cache partition. `None` when the revision has
+    /// no frozen effective configuration (a deployment created before managed
+    /// configuration) or names no engine; callers treat that as unknown.
+    pub fn revision_engine(
+        &self,
+        deployment_id: &str,
+        revision: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let engine: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(effective_json) \
+                   AND json_type(effective_json,'$.profile.engine')='text' \
+                   THEN json_extract(effective_json,'$.profile.engine') END \
+                 FROM effective_revisions WHERE deployment_id=?1 AND revision=?2",
+                params![deployment_id, revision],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(engine.flatten())
+    }
+
     /// All enabled route ids for `/v1/models` (F1 design §5): enabled
     /// routes are listed without waking anything.
     pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {
@@ -1252,6 +1277,41 @@ mod tests {
             vec!["legacy-route".to_string()]
         );
         assert!(store.effective_routes("missing").unwrap().is_empty());
+    }
+
+    /// SPEC §10 (`cache_salt`): the engine family is read from the named
+    /// revision's frozen profile; a revision without one, a non-text engine or
+    /// an unknown deployment is unknown.
+    #[test]
+    fn a_revisions_engine_family_is_read_from_its_frozen_profile() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("salted", "salted")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        for (revision, effective) in [
+            (1, r#"{"profile":{"engine":"tensorfold"}}"#),
+            (2, r#"{"profile":{"engine":"sglang"}}"#),
+            (3, r#"{"profile":{"engine":7}}"#),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) \
+                     VALUES(?1,?2,?3,'fp')",
+                    params![&id, revision, effective],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.revision_engine(&id, 1).unwrap().as_deref(),
+            Some("tensorfold")
+        );
+        assert_eq!(
+            store.revision_engine(&id, 2).unwrap().as_deref(),
+            Some("sglang")
+        );
+        assert_eq!(store.revision_engine(&id, 3).unwrap(), None);
+        assert_eq!(store.revision_engine(&id, 4).unwrap(), None);
+        assert_eq!(store.revision_engine("missing", 1).unwrap(), None);
     }
 
     #[test]

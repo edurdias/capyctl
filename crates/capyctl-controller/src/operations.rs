@@ -1043,6 +1043,7 @@ fn adapter_code(err: &AdapterError) -> String {
         AdapterError::UnsupportedCombination => "unsupported_combination".to_string(),
         AdapterError::NotAccepted(detail) => format!("not_accepted:{detail}"),
         AdapterError::Rejected { status, .. } => format!("engine_rejected:{status}"),
+        AdapterError::CacheSaltUnsupported => "cache_salt_unsupported".to_string(),
     }
 }
 

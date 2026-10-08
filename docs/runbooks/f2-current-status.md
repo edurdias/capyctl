@@ -1,5 +1,9 @@
 # Current implementation and launch status
 
+## `cache_salt` passed to vLLM and SGLang, refused for TensorFold — 2026-10-08 (branch `feat/cache-salt-passthrough`)
+
+SPEC §10 note (owner decision 2026-10-08): `cache_salt` joins `CHAT_REQUEST_FIELDS` and is forwarded unchanged; `validate_chat_request` bounds it to a non-empty string of at most `MAX_CACHE_SALT_BYTES` (1024, vLLM's own bound; null is absent). `RuntimeEndpoint` now carries the engine family the launch's revision froze (`Store::revision_engine`, `$.profile.engine`), and the router's forwarder honours the salt only for `vllm` and `sglang` (`engine_honours_cache_salt`); for TensorFold, or an unrecorded family (a deployment from before managed configuration), the forwarder refuses before connecting with the new `AdapterError::CacheSaltUnsupported`, answered `400 cache_salt_unsupported` (in-band on a stream) with the lease closed not accepted. The engine adapters' own forwarders follow the same rule. Tests: `cache_salt_reaches_vllm_and_sglang_unchanged`, `cache_salt_is_refused_for_an_engine_that_would_ignore_it`, `a_malformed_cache_salt_is_refused_before_any_engine` (router), `cache_salt_is_allowed_and_its_value_bounded`, `a_forwarder_for_an_engine_ignoring_cache_salt_refuses_it_before_sending` (adapters). CPU tests only. Live check still needed: on a real SGLang (and vLLM 0.30) deployment, an identical long prefix sent twice under one salt reports `cached_tokens` > 0 on the second request, and under a second salt reports 0.
+
 ## Load read for external routers and a queue of zero — 2026-10-08 (branch `feat/management-load-route`)
 
 Owner decision 2026-10-08 (SPEC §10 note). `GET /management/v1/metrics/load[?deployment=<id>]`

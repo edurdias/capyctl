@@ -127,6 +127,8 @@ impl From<AdapterError> for LifecycleFault {
             AdapterError::NotAccepted(_) => Self::Unavailable(text),
             // The engine answered the request as invalid: deterministic.
             AdapterError::Rejected { .. } => Self::Blocked(text),
+            // A request this engine cannot isolate: deterministic, never sent.
+            AdapterError::CacheSaltUnsupported => Self::Blocked(text),
         }
     }
 }

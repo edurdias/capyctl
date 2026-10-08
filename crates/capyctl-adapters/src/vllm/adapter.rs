@@ -95,7 +95,12 @@ impl VllmAdapter {
         model_id: String,
     ) -> Self {
         Self {
-            forward: crate::forward::ChatHttp::new(base.clone(), model_id.clone(), api_key.clone()),
+            forward: crate::forward::ChatHttp::new(
+                base.clone(),
+                model_id.clone(),
+                api_key.clone(),
+                true,
+            ),
             endpoint: base.to_string(),
             http: EngineHttp::new(base, api_key),
             fingerprint,
@@ -203,6 +208,7 @@ impl VllmAdapter {
             base.clone(),
             self.model_id.clone(),
             Some(engine_key.clone()),
+            true,
         );
         self.http = EngineHttp::new(base, Some(engine_key.clone()));
         if let Some(admin) = &self.admin_key {

@@ -41,8 +41,12 @@ pub struct RuntimeEndpoint {
     /// The key that launch was given, hex-encoded as the engine received it.
     /// `None` when the runtime was started without one.
     pub engine_key: Option<String>,
-    /// The launch the three fields above were read from.
+    /// The launch the fields above were read from.
     pub incarnation: String,
+    /// SPEC §10 (`cache_salt`): the engine family the launch's revision froze
+    /// (`vllm`, `sglang`, `tensorfold`), or `None` when it is not recorded.
+    /// Decides whether a request's prefix-cache partition can be honoured.
+    pub engine: Option<String>,
 }
 
 /// ADR 0013 §10 (unit I3): one instance of a deployment that holds a runtime,
