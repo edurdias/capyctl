@@ -23,7 +23,7 @@
 //! always holds the footprint this module computes. A deployment that declares
 //! its `resources:` keeps its declared parked phase.
 //!
-//! ADR 0014 amendment A18: each measured park is also recorded for its launch
+//! ADR 0014 amendment A19: each measured park is also recorded for its launch
 //! (an instance's generation), its first charge kept beside its latest. When
 //! the latest has grown past the first by more than the host's
 //! `resource_policy.parked_growth_limit`, the launch's next park is a stop
@@ -104,14 +104,14 @@ pub struct ParkedStatus {
     pub provenance: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<ParkedMeasurement>,
-    /// ADR 0014 amendment A18: each instance's latest measured launch, its
+    /// ADR 0014 amendment A19: each instance's latest measured launch, its
     /// first and latest parked charge per domain, against its host's
     /// `parked_growth_limit`. Additive; absent until a launch is measured.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub growth: Vec<ParkedGrowth>,
 }
 
-/// ADR 0014 amendment A18: one launch's parked-charge growth on one domain.
+/// ADR 0014 amendment A19: one launch's parked-charge growth on one domain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ParkedGrowth {
     pub instance: u32,
@@ -223,7 +223,7 @@ pub(crate) fn status(
     }))
 }
 
-/// ADR 0014 amendment A18: the bound the host `host` states (`auto` when it
+/// ADR 0014 amendment A19: the bound the host `host` states (`auto` when it
 /// has published no policy).
 fn growth_limit(
     tx: &Transaction<'_>,
@@ -272,7 +272,7 @@ impl Growth {
     }
 }
 
-/// ADR 0014 amendment A18: whether the launch `p` (resolved as `e`) has a
+/// ADR 0014 amendment A19: whether the launch `p` (resolved as `e`) has a
 /// parked charge that grew past its host's `parked_growth_limit` since its
 /// first measured park. Its next park is then a stop, which releases nothing
 /// before its own cleanup evidence (AGENTS.md: uncertainty retains
@@ -497,7 +497,7 @@ impl crate::Store {
     }
 }
 
-/// ADR 0014 amendment A18: record this park's charge for its launch, the
+/// ADR 0014 amendment A19: record this park's charge for its launch, the
 /// first one kept as the launch's baseline, and drop the instance's earlier
 /// launches. A charge is the residue as a park is charged it (never below the
 /// placeholder, never above the Ready charge), what status shows. A step

@@ -62,7 +62,7 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V42,
     // ADR 0028 §12: wake canary references and group failure codes.
     SCHEMA_V43,
-    // ADR 0014 amendment A18: each launch's first and latest parked residue.
+    // ADR 0014 amendment A19: each launch's first and latest parked residue.
     SCHEMA_V44,
 ];
 

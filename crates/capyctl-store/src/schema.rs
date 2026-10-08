@@ -952,7 +952,7 @@ pub const SCHEMA_V42: &str = "-- group member launch handles (groups::migrate_v4
 /// columns are added by `groups::migrate_v43` only when missing.
 pub const SCHEMA_V43: &str = "-- group canary references (groups::migrate_v43)";
 
-/// v44 (ADR 0014 amendment A18): the parked residue of one launch (an
+/// v44 (ADR 0014 amendment A19): the parked residue of one launch (an
 /// instance's generation), per memory domain: its first measured park and
 /// its latest, so the next park of a launch whose charge grew past its host's
 /// `parked_growth_limit` is a stop. `stop_operation_id` names the stop the

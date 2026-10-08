@@ -330,7 +330,7 @@ pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
 /// Forms and ranges were checked when the document was read
 /// ([`capyctl_config::standalone::check_honoured`]).
 ///
-/// ADR 0014 amendment A18: the parked growth bound the document states under
+/// ADR 0014 amendment A19: the parked growth bound the document states under
 /// `host.resource_policy.parked_growth_limit` is carried as stated; `auto` is
 /// left out, so the published policy is the one published before it existed.
 pub fn apply_stated_memory(

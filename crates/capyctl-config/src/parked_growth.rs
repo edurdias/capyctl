@@ -1,4 +1,4 @@
-//! ADR 0014 amendment A18 (owner decision 2026-10-07): how far one launch's
+//! ADR 0014 amendment A19 (owner decision 2026-10-07): how far one launch's
 //! measured parked charge may grow past its first measured park before its
 //! next park is a stop.
 //!
@@ -115,7 +115,7 @@ impl Serialize for ParkedGrowthLimit {
 mod tests {
     use super::*;
 
-    // T03 (ADR 0014 amendment A18): the forms the setting takes.
+    // T03 (ADR 0014 amendment A19): the forms the setting takes.
     #[test]
     fn the_growth_limit_takes_auto_off_a_percentage_or_a_size() {
         assert_eq!(
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(ParkedGrowthLimit::Auto.stated(), None);
     }
 
-    // T16 (ADR 0014 amendment A18): the catalog's growth, 4.7 GiB first and
+    // T16 (ADR 0014 amendment A19): the catalog's growth, 4.7 GiB first and
     // 9.6 GiB on the second park, is past the default bound.
     #[test]
     fn the_default_bound_is_the_first_charge() {

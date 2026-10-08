@@ -20,7 +20,7 @@
 //! (`host.runtime_dir`), the engines' port range
 //! (`host.resource_policy.endpoint_port_range`), the queue bounds
 //! (`host.resource_policy.queue`), the parked growth bound
-//! (`host.resource_policy.parked_growth_limit`, ADR 0014 amendment A18) and
+//! (`host.resource_policy.parked_growth_limit`, ADR 0014 amendment A19) and
 //! the memory limits (`host.resource_policy.memory.system`, ADR 0025: a size
 //! or a share of the observed memory) are honoured as on a host
 //! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` /
@@ -461,7 +461,7 @@ pub fn check_honoured(
             // The queue bounds are honoured as on a host; their values are
             // checked when the embedded host's policy is normalized.
             map.remove("queue");
-            // ADR 0014 amendment A18: the parked growth bound is honoured
+            // ADR 0014 amendment A19: the parked growth bound is honoured
             // as on a host: `auto`, `off`, a percentage or a size.
             if let Some(value) = map.remove("parked_growth_limit") {
                 let path = "host.resource_policy.parked_growth_limit";
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(MemoryShare::Bytes(90 << 30).of(200 << 30), 90 << 30);
     }
 
-    // T03 (owner decision 2026-10-07, ADR 0014 amendment A18): the parked
+    // T03 (owner decision 2026-10-07, ADR 0014 amendment A19): the parked
     // growth bound is set three ways with one precedence, `--set` over
     // `CAPYCTL_SET__…` over the YAML, and takes `auto`, `off`, a percentage
     // or a size.

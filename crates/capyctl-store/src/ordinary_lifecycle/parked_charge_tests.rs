@@ -1,4 +1,4 @@
-//! ADR 0014 amendments A13 and A18: the parked charge measured per revision,
+//! ADR 0014 amendments A13 and A19: the parked charge measured per revision,
 //! and the bound on one launch's parked-charge growth. CPU only; nothing here
 //! qualifies an engine.
 use super::super::park::{
@@ -382,7 +382,7 @@ fn a_stale_sample_an_unmatched_group_or_declared_resources_record_nothing() {
     assert!(lab.status(&b.deployment_id).is_null());
 }
 
-// --- ADR 0014 amendment A18: the parked growth bound ---------------------------
+// --- ADR 0014 amendment A19: the parked growth bound ---------------------------
 
 impl Lab {
     /// A lab whose host states `edit` in its published policy.
@@ -457,7 +457,7 @@ fn outgrown_launch(lab: &Lab) -> DeploymentFence {
     a
 }
 
-// T16 (owner decision 2026-10-07, ADR 0014 amendment A18): once a launch's
+// T16 (owner decision 2026-10-07, ADR 0014 amendment A19): once a launch's
 // measured parked charge grew past its host's `parked_growth_limit` (default:
 // the first charge again), `park deployment` stops it instead. The stop
 // releases nothing yet (the instance keeps its Ready charge until the stop's
@@ -506,7 +506,7 @@ fn a_park_after_the_parked_charge_outgrew_its_first_park_is_a_stop() {
     assert_eq!(lab.park_command(&a, "park-3", 5_000), receipt);
 }
 
-// T16 (ADR 0014 amendment A18): growth within the bound parks as before.
+// T16 (ADR 0014 amendment A19): growth within the bound parks as before.
 #[test]
 fn a_park_within_the_growth_limit_parks_as_before() {
     let lab = Lab::new();
@@ -526,7 +526,7 @@ fn a_park_within_the_growth_limit_parks_as_before() {
     assert_eq!(lab.charge(&a.deployment_id).1, ResourcePhase::Parked);
 }
 
-// T16 (ADR 0014 amendment A18): the idle policy's park of an outgrown launch
+// T16 (ADR 0014 amendment A19): the idle policy's park of an outgrown launch
 // is a stop with the reason `ready_idle_parked_growth`; within the bound it
 // parks.
 #[test]
@@ -572,7 +572,7 @@ fn the_idle_policy_stops_an_outgrown_launch_instead_of_parking_it() {
     );
 }
 
-// T16 T03 (ADR 0014 amendment A18): the host's `parked_growth_limit` sets the
+// T16 T03 (ADR 0014 amendment A19): the host's `parked_growth_limit` sets the
 // bound: `off` never stops, a percentage or a size of growth is measured from
 // the first charge. A policy that states none stores no such field, so its
 // stored identity is the one it had before the setting existed.
@@ -607,7 +607,7 @@ fn the_hosts_parked_growth_limit_sets_the_bound() {
     }
 }
 
-// T16 T32 (ADR 0014 amendment A18): a switch releases an outgrown victim by
+// T16 T32 (ADR 0014 amendment A19): a switch releases an outgrown victim by
 // a stop even when the plan would park it, and records why.
 #[test]
 fn a_switch_stops_an_outgrown_victim_instead_of_parking_it() {

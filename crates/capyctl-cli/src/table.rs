@@ -539,7 +539,7 @@ fn status(value: &Value, names: &HostNames) -> String {
             ));
         }
     }
-    // ADR 0014 amendment A18: a launch whose parked charge grew past its
+    // ADR 0014 amendment A19: a launch whose parked charge grew past its
     // host's `parked_growth_limit` says so, and that its park is a stop.
     for growth in d["parked"]["growth"].as_array().into_iter().flatten() {
         let action = match growth["state"].as_str() {
@@ -1162,7 +1162,7 @@ mod tests {
         assert!(out.contains("not a file hash"), "{out}");
     }
 
-    // T16 (ADR 0014 amendment A18): a launch whose parked charge grew past
+    // T16 (ADR 0014 amendment A19): a launch whose parked charge grew past
     // its host's bound says that its park is a stop, and once stopped, why;
     // one within the bound adds no line.
     #[test]
