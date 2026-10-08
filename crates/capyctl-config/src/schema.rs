@@ -442,7 +442,13 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // Emitted empty by the generator; empty allowlist accepts `{}`
         // only until profile shapes are specified.
         ("runtime_profiles", FieldSpec::Struct(NO_FIELDS)),
+        // SPEC §6.5, §10: the embedded host's activation policy, as on a host.
+        ("lifecycle", FieldSpec::Struct(HOST_LIFECYCLE)),
     ];
+    /// SPEC §6.5, §10: a host's activation policy, for every deployment that
+    /// may run on it. Controller policy; never part of the document a
+    /// deployment is resolved against.
+    const HOST_LIFECYCLE: &[(&str, FieldSpec)] = &[("activation", SCALAR)];
 
     match kind {
         ConfigKind::Server => &KindSchema {
@@ -513,6 +519,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // Role-local: the period of the agent's engine load reports.
                 ("load_report_interval", DURATION),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
+                ("lifecycle", FieldSpec::Struct(HOST_LIFECYCLE)),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -562,8 +569,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ),
                 ("env", FieldSpec::Struct(NO_FIELDS)),
                 // SPEC §6.5 (ADR 0013 amendment 2026-09-23): the warm-residency
-                // commitment, a deployment-level policy like `instances`.
-                ("lifecycle", FieldSpec::Struct(&[("warm", SCALAR)])),
+                // commitment, a deployment-level policy like `instances`; SPEC
+                // §6.5, §10: the activation policy, beside it.
+                (
+                    "lifecycle",
+                    FieldSpec::Struct(&[("warm", SCALAR), ("activation", SCALAR)]),
+                ),
             ],
         },
         ConfigKind::Standalone => &KindSchema {

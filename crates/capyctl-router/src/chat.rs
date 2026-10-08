@@ -88,7 +88,13 @@ async fn resolve_held(
     // is refused at once, but it still starts (or joins) the one activation a
     // waiting request would have joined, so a retry finds the deployment
     // servable. The activation runs detached; this request does not await it.
+    // A deployment no request may start (an operator's stop, an explicit
+    // activation; SPEC §6.3, §6.5) is answered with that refusal instead: a
+    // retry would not help.
     if deps.inflight.waiting.limits().max_pending_per_deployment == 0 {
+        deps.controller
+            .refuse_inactive(&deployment_id)
+            .map_err(map_controller)?;
         let _ = futures::FutureExt::now_or_never(join_activation(deps, &deployment_id));
         return Err(err(
             "queue_full",
@@ -530,6 +536,9 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
             // SPEC §10 (owner decision 2026-09-25): an operator's stop is not
             // a capacity refusal; waiting does not help, starting it does.
             "deployment_stopped" => StatusCode::CONFLICT,
+            // SPEC §6.5, §10: an explicit activation that is not serving
+            // starts only on an operator's action; waiting does not help.
+            "deployment_inactive" => StatusCode::CONFLICT,
             // Still in progress as far as anyone can tell: not a failure the client
             // should read as "nothing happened".
             "activation_uncertain" => StatusCode::SERVICE_UNAVAILABLE,
@@ -560,6 +569,7 @@ pub(crate) fn map_controller(
         F::NotFound(d) => err("unknown_model", &format!("deployment {d} vanished")),
         F::Blocked(m) => err("insufficient_resources", &format!("admission blocked: {m}")),
         F::Stopped(m) => err("deployment_stopped", &m),
+        F::Inactive(m) => err("deployment_inactive", &m),
         F::Conflict(m) => err("conflict", &m),
         // The activation may still be running. Saying it failed would invite a
         // client to treat the deployment as untouched.

@@ -1619,9 +1619,10 @@ fn parked_lru(
     tx: &Transaction<'_>,
     scoped: &LedgerSnapshot,
 ) -> Result<Vec<Parked>, LifecycleError> {
-    // SPEC §6.5: a warm-residency commitment is never reclaimed by capacity
-    // (one already being stopped still leaves on its own evidence).
-    let warm = crate::switch_state::warm_clause("i");
+    // SPEC §6.5: a warm-residency commitment, or a deployment whose
+    // activation is explicit, is never reclaimed by capacity (one already
+    // being stopped still leaves on its own evidence).
+    let exempt = crate::switch_state::exempt_clause("i");
     // SPEC §6.5, §10: nor is the parked target of a switch in progress; it is
     // waking (see `switch_waking`).
     let waking = crate::switch_state::switch_target_clause("i");
@@ -1633,7 +1634,7 @@ fn parked_lru(
                JOIN runtime_bindings b ON b.deployment_id=i.deployment_id AND b.instance_index=i.instance_index AND b.state!='released'
               WHERE i.observed_state='parked'
                 AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action!='stop' AND r.state IN ('queued','running','uncertain'))
-                AND (NOT ({warm} OR {waking}) OR EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='stop' AND r.state IN ('queued','running','uncertain')))
+                AND (NOT ({exempt} OR {waking}) OR EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='stop' AND r.state IN ('queued','running','uncertain')))
               ORDER BY stopping DESC,
                        COALESCE((SELECT MAX(e.committed_epoch) FROM lifecycle_evidence e JOIN lifecycle_steps s ON s.id=e.step_id
                                   JOIN operations o ON o.id=s.operation_id
@@ -2535,7 +2536,8 @@ impl crate::Store {
         let candidates: Vec<(String, u32, i64, String)> = {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
             check_session(&tx, s)?;
-            // SPEC §6.5: a warm-residency commitment is never idled.
+            // SPEC §6.5: a warm-residency commitment, or a deployment whose
+            // activation is explicit, is never idled.
             let rows = tx.prepare(&format!(
                 "SELECT i.deployment_id,i.instance_index,i.generation,i.observed_state FROM deployment_instances i
                    JOIN deployments d ON d.id=i.deployment_id
@@ -2546,7 +2548,7 @@ impl crate::Store {
                     AND NOT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index)
                     AND NOT {}
                   ORDER BY i.deployment_id,i.instance_index",
-                crate::switch_state::warm_clause("i")
+                crate::switch_state::exempt_clause("i")
             ))?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<Result<_, _>>()?;

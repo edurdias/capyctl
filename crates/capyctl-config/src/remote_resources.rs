@@ -16,6 +16,8 @@ fn invalid() -> ConfigError {
     )
 }
 /// Remove role-local settings, retaining every engine and resource safety field.
+/// SPEC §6.5, §10: the host's activation policy (`lifecycle`) is controller
+/// policy, so deployments resolved against the host keep their recipes.
 pub fn local_host_document(raw: &Value) -> Result<Value, ConfigError> {
     let mut host = raw.clone();
     let object = host.as_object_mut().ok_or_else(invalid)?;
@@ -27,6 +29,7 @@ pub fn local_host_document(raw: &Value) -> Result<Value, ConfigError> {
         "ingress",
         "load_report_interval",
         "shutdown",
+        "lifecycle",
     ] {
         object.remove(field);
     }

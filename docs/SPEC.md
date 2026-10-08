@@ -261,6 +261,20 @@ diagnostic; stopping requires explicit policy that relinquishes warm residency o
 an authorized administrative/recovery action. Budget every cold, park, and wake
 transition, including already parked owners, before increasing resource use.
 
+*Amended 2026-10-08 (owner decision):* a deployment may declare
+`lifecycle.activation: explicit`, and a host may state it for every deployment
+that may run on it (`lifecycle.activation` in its document). Such a deployment
+is started, stopped, parked and woken only by an operator's action (start,
+stop, park, pre-initialize, delete, drain): a request neither starts nor wakes
+it (§10), and it is never a switch victim, never idled and never reclaimed from
+the parked set. It is explicit when its current revision says so or any host
+that revision resolved on does; a deployment cannot opt out of its host's
+policy. Omitted, `on_demand` keeps the behaviour above, and neither the
+deployment's command identity nor any recipe changes. It composes with the
+warm-residency commitment, which exempts a deployment from the same automatic
+releases but still lets a request start or wake it, and with an operator's
+stop, whose refusal stays `deployment_stopped`.
+
 Pre-initialize only an explicit selected set, sequentially under normal reservations: initialize, verify, park, then continue. Defer this work while it would displace active requests. A ready-idle timer does not reset a fairness window already opened for a waiting model.
 
 Enforce both the maximum parked count and aggregate residual budgets. Reclaim least-recently-used eligible parked groups first, coordinating any retained-cache owners separately. Keeping a deployment parked does not exempt it from host limits. An explicit pre-initialize command must fail rather than claim a restart-only deployment is prewarmed.
@@ -434,6 +448,8 @@ Note (2026-09-24): CapyCTL relays tool calls but does not parse them; the engine
 Note (owner decision 2026-10-08): `cache_salt` is a supported chat request field. It partitions the engine's prefix cache, so requests reuse cached prefixes only with requests carrying the same salt; an operator gives each tenant its own. Its value is a non-empty string of at most 1024 bytes (otherwise `400 invalid_request`). The router forwards it unchanged to vLLM and SGLang. An engine that would ignore it (TensorFold), or a launch whose engine family is not recorded, would leave the requested isolation silently absent, so such a request is refused before anything reaches the engine with HTTP 400 and the closed code `cache_salt_unsupported` (in-band on a stream, like the other refusals decided before sending); its lease closes as not accepted. The same request without `cache_salt` is served.
 
 Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `capyctl start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
+
+Note (owner decision 2026-10-08): a request for a deployment whose activation is explicit (§6.5), while no instance serves and no transition is in progress, is refused at once with HTTP 409 and code `deployment_inactive`; the message says its activation is explicit and names `capyctl start deployment <id>`. Nothing is queued, measured or switched. A request that arrives while an operator's start or wake runs waits for it as any request does; an operator's stop keeps `deployment_stopped`. Under a `max_pending_per_deployment` of 0 the same request is still 409 `deployment_inactive` (and an operator-stopped one 409 `deployment_stopped`), not 429 `queue_full`: no activation would start, so a retry would not help.
 
 Note (owner decision 2026-10-08): a host's `resource_policy.queue.max_pending_per_deployment` may be 0, meaning no request waits in the router for that deployment. A request beyond the deployment's in-flight bound is refused at once with HTTP 429, code `queue_full`, `retryable: true` and `Retry-After`, the same answer a full queue gives. A request for a deployment that is not servable is refused the same way, and it still starts (or joins) the deployment's one activation, so a retry finds it servable; step 1's enqueue is skipped, steps 2 onward are unchanged. The in-flight bound stays 32 per deployment at 0: a load sample is a routing hint, never admission evidence, so the router does not take its bound from the engine's reported running limit; requests above the engine's own limit wait in the engine's queue, where the engine reports them. Live conditions are read at `GET /management/v1/metrics/load[?deployment=<id>]`: per deployment the router's in-flight requests and waiting requests with their bounds, and per instance the engine's running and waiting requests, the running limit (as the engine reports it, else as CapyCTL derives it, with its source), the router's in-flight requests on it, and the sample's time, age and freshness. A missing sample or gauge is shown as absent, never as zero.
 

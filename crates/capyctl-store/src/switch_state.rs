@@ -18,6 +18,14 @@
 //! declaring `lifecycle.warm: true` is never chosen as a switch victim, never
 //! parked or stopped by the idle policy, and never reclaimed from the parked
 //! set by capacity. Only an explicit stop (or a recovery action) ends it.
+//!
+//! **Explicit activation** (SPEC §6.5, §10): a deployment whose current
+//! revision declares `lifecycle.activation: explicit`, or that may run on a
+//! host whose latest publication states it, is exempt in the same three
+//! places, and the coordinator refuses to start or wake it for a request
+//! ([`crate::Store::explicit_activation`]). Only an operator's action moves
+//! it.
+use capyctl_config::instances::Activation;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
@@ -57,6 +65,57 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             "ALTER TABLE deployment_revision_instances ADD COLUMN warm INTEGER NOT NULL DEFAULT 0 CHECK(warm IN (0,1));",
         )?;
     }
+    Ok(())
+}
+
+/// Schema v45 data step (SPEC §6.5, §10): the revision's activation policy,
+/// unless present, and each host's published one. A host is listed only while
+/// its policy is `explicit`.
+pub(crate) fn migrate_v45(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let mut statement = tx.prepare("PRAGMA table_info(deployment_revision_instances)")?;
+    let present = statement
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "activation");
+    drop(statement);
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE deployment_revision_instances ADD COLUMN activation TEXT NOT NULL DEFAULT 'on_demand' CHECK(activation IN ('on_demand','explicit'));",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS host_activation_policies(
+           host_id TEXT PRIMARY KEY,
+           activation TEXT NOT NULL CHECK(activation='explicit'));",
+    )
+}
+
+/// The stored text of an activation policy.
+pub(crate) fn activation_text(activation: Activation) -> &'static str {
+    match activation {
+        Activation::OnDemand => "on_demand",
+        Activation::Explicit => "explicit",
+    }
+}
+
+/// Record `host`'s activation policy, replacing the previous one.
+pub(crate) fn record_host_activation(
+    conn: &Connection,
+    host: &str,
+    activation: Activation,
+) -> rusqlite::Result<()> {
+    match activation {
+        Activation::OnDemand => conn.execute(
+            "DELETE FROM host_activation_policies WHERE host_id=?1",
+            [host],
+        )?,
+        Activation::Explicit => conn.execute(
+            "INSERT INTO host_activation_policies(host_id,activation) VALUES(?1,'explicit')
+             ON CONFLICT(host_id) DO NOTHING",
+            [host],
+        )?,
+    };
     Ok(())
 }
 
@@ -142,9 +201,34 @@ pub(crate) fn no_closure_clause(alias: &str) -> String {
 
 /// SQL: the deployment of `alias` (any row with a `deployment_id`) declares
 /// warm residency on its current revision (SPEC §6.5).
-pub(crate) fn warm_clause(alias: &str) -> String {
+fn warm_clause(alias: &str) -> String {
     format!(
         "EXISTS(SELECT 1 FROM deployment_revision_instances w JOIN deployments wd ON wd.id=w.deployment_id AND wd.revision=w.revision WHERE w.deployment_id={alias}.deployment_id AND w.warm=1)"
+    )
+}
+
+/// SQL: the deployment named by the SQL expression `deployment` moves only
+/// on an operator's action (SPEC §6.5, §10): its current revision declares
+/// `lifecycle.activation: explicit`, or a host its current revision resolved
+/// on states it.
+fn explicit_activation_clause(deployment: &str) -> String {
+    format!(
+        "(EXISTS(SELECT 1 FROM deployment_revision_instances x JOIN deployments xd ON xd.id=x.deployment_id AND xd.revision=x.revision WHERE x.deployment_id={deployment} AND x.activation='explicit')
+          OR EXISTS(SELECT 1 FROM host_effective_revisions xh JOIN deployments xd ON xd.id=xh.deployment_id AND xd.revision=xh.revision
+                      JOIN host_activation_policies xp ON xp.host_id=xh.host_id
+                     WHERE xh.deployment_id={deployment} AND xh.outcome='resolved'))"
+    )
+}
+
+/// SQL: the deployment of `alias` (any row with a `deployment_id`) is never
+/// released by CapyCTL on its own (SPEC §6.5): it holds a warm-residency
+/// commitment or its activation is explicit. Never a switch victim, never
+/// idled, never reclaimed from the parked set.
+pub(crate) fn exempt_clause(alias: &str) -> String {
+    format!(
+        "({} OR {})",
+        warm_clause(alias),
+        explicit_activation_clause(&format!("{alias}.deployment_id"))
     )
 }
 
@@ -263,4 +347,55 @@ pub(crate) fn is_warm(conn: &Connection, deployment: &str) -> rusqlite::Result<b
         )
         .optional()?
         .unwrap_or(false))
+}
+
+/// Whether the deployment moves only on an operator's action (SPEC §6.5,
+/// §10): see [`explicit_activation_clause`].
+pub(crate) fn is_explicit_activation(
+    conn: &Connection,
+    deployment: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        &format!("SELECT {}", explicit_activation_clause("?1")),
+        [deployment],
+        |r| r.get::<_, bool>(0),
+    )
+}
+
+impl crate::Store {
+    /// SPEC §6.5, §10: whether `deployment` moves only on an operator's
+    /// action, by its own declaration or a host's policy. The coordinator
+    /// refuses to start or wake it for a request while it is not serving.
+    pub fn explicit_activation(&self, deployment: &str) -> Result<bool, crate::StoreError> {
+        Ok(is_explicit_activation(&self.conn, deployment)?)
+    }
+
+    /// SPEC §6.5, §10: record the activation policy `host` states. A server
+    /// records it with each approved publication; standalone records its
+    /// embedded host's at every start.
+    pub fn record_host_activation(
+        &self,
+        host: &str,
+        activation: Activation,
+    ) -> Result<(), crate::StoreError> {
+        Ok(record_host_activation(&self.conn, host, activation)?)
+    }
+
+    /// The activation policy `host` last stated (`on_demand` when none).
+    pub fn host_activation(&self, host: &str) -> Result<Activation, crate::StoreError> {
+        let explicit = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM host_activation_policies WHERE host_id=?1",
+                [host],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(if explicit {
+            Activation::Explicit
+        } else {
+            Activation::OnDemand
+        })
+    }
 }

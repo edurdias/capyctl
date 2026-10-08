@@ -925,6 +925,75 @@ async fn a_request_for_an_operator_stopped_deployment_evicts_nothing() {
     lab.worker.shutdown().await.unwrap();
 }
 
+// T10 T16 (SPEC §6.5, §10): a deployment whose activation is explicit moves
+// only on an operator's action. While it is stopped, a request is refused at
+// once (`deployment_inactive`, naming the start command) and starts nothing;
+// the operator's start brings it up; a request for A, which does not fit
+// beside it, never makes it a victim; parked by the operator, a request is
+// refused again and wakes nothing; the operator's start wakes it in place.
+#[tokio::test]
+async fn an_explicit_activation_moves_only_on_an_operators_action() {
+    use capyctl_domain::{LifecycleAction, LifecycleState};
+    let lab = lab(15, 50).await;
+    let x = lab.deploy("explicit-x", SGLANG, |d| {
+        d["lifecycle"] = json!({"activation": "explicit"});
+    });
+    let port = &lab.port(Duration::from_secs(5));
+    let x = x.as_str();
+    let inactive = |fault: &LifecycleFault| {
+        matches!(fault, LifecycleFault::Inactive(m)
+            if m.contains(&format!("capyctl start deployment {x}")))
+    };
+    let request = || async move {
+        tokio::time::timeout(Duration::from_secs(5), port.activate_for_request(x))
+            .await
+            .expect("refused promptly, never queued")
+            .unwrap_err()
+    };
+    let refused = request().await;
+    assert!(inactive(&refused), "{refused:?}");
+    let refused = port.auto_activate(x).await.unwrap_err();
+    assert!(inactive(&refused), "{refused:?}");
+    assert_eq!(lab.state(x), "stopped");
+    assert_eq!(lab.engine.calls(RuntimeAction::Initialize, x), 0);
+    let settle = |action: LifecycleAction| async move {
+        let handle = port
+            .request_transition(x, action)
+            .await
+            .unwrap_or_else(|error| panic!("{action:?} was refused: {error:?}"));
+        tokio::time::timeout(Duration::from_secs(30), port.wait_terminal(&handle))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(settle(LifecycleAction::Start).await, LifecycleState::Ready);
+    // A cold (10 GiB) does not fit beside X Ready (8 GiB) in 15 GiB, and X
+    // is no victim: nothing is released and A is refused for capacity.
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(30),
+        port.activate_for_request(&lab.a.deployment_id),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(blocked, LifecycleFault::Blocked(_)), "{blocked:?}");
+    assert_eq!(lab.state(x), "ready");
+    assert!(lab.instance(x, 0).1, "X still admits");
+    assert_eq!(lab.engine.calls(RuntimeAction::Park, x), 0);
+    assert_eq!(settle(LifecycleAction::Park).await, LifecycleState::Parked);
+    let refused = request().await;
+    assert!(inactive(&refused), "{refused:?}");
+    assert_eq!(lab.state(x), "parked");
+    assert_eq!(lab.engine.calls(RuntimeAction::Restore, x), 0);
+    assert_eq!(settle(LifecycleAction::Start).await, LifecycleState::Ready);
+    assert_eq!(
+        lab.engine.calls(RuntimeAction::Restore, x),
+        1,
+        "woken in place"
+    );
+    lab.worker.shutdown().await.unwrap();
+}
+
 // SPEC §7 (T23): when even releasing every eligible READY instance cannot
 // make B fit, nothing is released and the request gets a capacity refusal.
 #[tokio::test]

@@ -132,6 +132,11 @@ pub struct DeploymentSnapshot {
     /// declares a warm-residency commitment. Additive; absent when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub warm: bool,
+    /// SPEC §6.5, §10: `explicit` when the deployment moves only on an
+    /// operator's action, by its own `lifecycle.activation` or a host's.
+    /// Additive; absent when on demand.
+    #[serde(skip_serializing_if = "capyctl_config::instances::Activation::is_on_demand")]
+    pub activation: capyctl_config::instances::Activation,
     /// SPEC §6.4: the deployment's most recently accepted operation, with its
     /// closed error code, the recorded reason and a fixed operator hint.
     /// Additive; absent when the deployment has no operation.
@@ -762,6 +767,7 @@ impl Store {
                 parked: None,
                 switch: None,
                 warm: false,
+                activation: capyctl_config::instances::Activation::OnDemand,
                 latest_operation: None,
                 context: None,
                 parsers: None,
@@ -794,6 +800,9 @@ impl Store {
             (entry.context, entry.parsers) = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
+            if crate::switch_state::is_explicit_activation(&tx, &entry.id)? {
+                entry.activation = capyctl_config::instances::Activation::Explicit;
+            }
             entry.latest_operation = latest_operation(
                 &tx,
                 &format!("SELECT {LATEST_OPERATION} FROM operations o WHERE o.deployment_id=?1 ORDER BY o.accepted_at DESC,o.rowid DESC LIMIT 1"),

@@ -38,6 +38,13 @@ pub enum LifecycleFault {
     #[error("stopped: {0}")]
     Stopped(String),
 
+    /// SPEC §6.5, §10: the deployment moves only on an operator's action
+    /// (`lifecycle.activation: explicit`, its own or a host's) and is not
+    /// serving, so a request neither starts nor wakes it. Not a capacity
+    /// refusal and not queued: the operator starts it.
+    #[error("inactive: {0}")]
+    Inactive(String),
+
     /// A revision, generation or idempotency precondition did not hold. The caller
     /// is acting on a view of the world that has moved.
     #[error("conflict: {0}")]
@@ -75,6 +82,15 @@ pub fn operator_stopped(deployment: &str, instances: bool) -> LifecycleFault {
             "deployment {deployment} was stopped by an operator; inference does not start it; start it with `capyctl start deployment {deployment}`"
         )
     })
+}
+
+/// SPEC §6.5, §10: what a request for a deployment whose activation is
+/// explicit is told while it is not serving: that only an operator starts or
+/// wakes it, and how.
+pub fn explicit_activation(deployment: &str) -> LifecycleFault {
+    LifecycleFault::Inactive(format!(
+        "deployment {deployment} is not running and its activation is explicit (lifecycle.activation: explicit); inference does not start or wake it; start it with `capyctl start deployment {deployment}`"
+    ))
 }
 
 impl From<StoreError> for LifecycleFault {

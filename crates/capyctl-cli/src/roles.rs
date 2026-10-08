@@ -2191,6 +2191,16 @@ async fn start_standalone_in(
         &embedded.profiles(),
     )
     .map_err(StartError::Deploy)?;
+    // SPEC §6.5, §10: the embedded host's activation policy
+    // (`host.lifecycle.activation`, validated by `check_honoured`), recorded
+    // at every start as a server records a host's with its publication, so a
+    // start that no longer states it is on demand again.
+    let activation = capyctl_config::remote_roles::host_activation(&stated_host)
+        .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
+    coordinator
+        .commands()
+        .read(|store| store.record_host_activation(&declared_host.name, activation))
+        .map_err(|error| StartError::Deploy(error.to_string()))?;
     supervision.supervise(tokio::spawn(crate::standalone_engines::expire_retirements(
         coordinator.commands(),
         supervision.cancel_signal(),

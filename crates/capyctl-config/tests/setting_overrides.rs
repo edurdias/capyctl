@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use capyctl_config::remote_roles::{
-    drain_timeout, group_stall_timeout_value, idle_timeouts, switch_drain_timeout, timing_header,
-    HostConfig, ServerConfig,
+    drain_timeout, group_stall_timeout_value, host_activation, idle_timeouts, switch_drain_timeout,
+    timing_header, HostConfig, ServerConfig,
 };
 use capyctl_config::setting_overrides::{
     defaults, named_forms, NamedLayer, SettingOverrides, Source,
@@ -118,6 +118,17 @@ fn document_only_settings_follow_set_env_yaml_default() {
             read: |d| secs(host(d).drain_timeout),
             expected: ["30000ms", "5000ms", "6000ms", "7000ms"],
         },
+        // SPEC §6.5: the host's activation policy, `on_demand` unless
+        // stated (YAML-only family: `--set` and `CAPYCTL_SET__…`).
+        Row {
+            kind: ConfigKind::Host,
+            path: "lifecycle.activation",
+            yaml: "explicit",
+            env: "on_demand",
+            set: "explicit",
+            read: |d| format!("{:?}", host(d).activation),
+            expected: ["OnDemand", "Explicit", "OnDemand", "Explicit"],
+        },
         Row {
             kind: ConfigKind::Standalone,
             path: "shutdown.drain_timeout",
@@ -155,6 +166,17 @@ fn document_only_settings_follow_set_env_yaml_default() {
             set: "false",
             read: |d| timing_header(&d["server"]).unwrap().to_string(),
             expected: ["false", "false", "true", "false"],
+        },
+        // Owner rule (standalone is a server and one host): the embedded
+        // host's activation policy, as on a host.
+        Row {
+            kind: ConfigKind::Standalone,
+            path: "host.lifecycle.activation",
+            yaml: "explicit",
+            env: "on_demand",
+            set: "explicit",
+            read: |d| format!("{:?}", host_activation(&d["host"]).unwrap()),
+            expected: ["OnDemand", "Explicit", "OnDemand", "Explicit"],
         },
     ];
     for row in rows {

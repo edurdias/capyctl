@@ -196,7 +196,7 @@ Each is an HTTP error with a JSON body holding `code`, `message` and
 | 429 | `queue_full` | `waiting requests exceed the buffered-bytes bound` | The waiting bodies would pass the byte limit. |
 | 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | 32 requests kept running for the whole request deadline. |
 | 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | 32 requests are running and the waiting limit per model is 0. |
-| 429 | `queue_full` | `deployment <deployment id> is not servable now and lets no request wait; retry shortly` | The model is parked, stopped or switching and the waiting limit per model is 0. Its wake or start has been asked for (an operator-stopped model is not started). |
+| 429 | `queue_full` | `deployment <deployment id> is not servable now and lets no request wait; retry shortly` | The model is parked, stopped or switching and the waiting limit per model is 0. Its wake or start has been asked for. A model an operator stopped, or one whose activation is explicit, is answered 409 instead (`deployment_stopped`, `deployment_inactive`). |
 
 Every 429 carries `Retry-After: 1`.
 
@@ -207,7 +207,9 @@ than wait: set the waiting limit per model to 0. A request then never waits in
 CapyCTL: one beyond the 32 running requests, or one for a model that is not
 loaded, is answered 429 `queue_full` with `Retry-After` straight away. A
 request for a model that is parked or stopped still wakes or starts it, so a
-retry after the hint finds it loaded. The 32 running requests per model stay
+retry after the hint finds it loaded; a model an operator stopped, or one
+whose activation is explicit, is answered 409 instead, since a retry would
+not help. The 32 running requests per model stay
 as they are; requests above what the engine itself runs at once wait in the
 engine, as before (its waiting count is in the load read below).
 
@@ -321,13 +323,66 @@ server:
     parked_idle_timeout: "30m"
 ```
 
+## Only on your command
+
+With `lifecycle.activation: explicit`, CapyCTL starts, stops, parks and wakes
+a model only when you tell it to: `start`, `stop`, `park`, `preinitialize`,
+`delete` or a host drain. Requests and memory pressure never move it. Set it
+on one deployment:
+
+```yaml title="my-model.yaml"
+name: my-model
+engine: vllm
+model: Qwen3-4B
+lifecycle:
+  activation: explicit
+```
+
+or for every model a host may run, in its host document (a standalone
+document puts it under `host:`):
+
+```yaml
+lifecycle:
+  activation: explicit
+```
+
+The host setting also takes `--set lifecycle.activation=explicit` or
+`CAPYCTL_SET__LIFECYCLE__ACTIVATION=explicit` on `capyctl start host`
+(`host.lifecycle.activation` and `CAPYCTL_SET__HOST__LIFECYCLE__ACTIVATION`
+on `capyctl start standalone`). A model is explicit when its deployment or any
+host it may run on says so; a deployment cannot opt out of its host's policy.
+
+Such a model:
+
+- is never started or woken by a request. A request while it is stopped or
+  parked gets `409` at once, with nothing queued or started:
+
+  ```text
+  {"code":"deployment_inactive","message":"deployment 01M3R7A6YJW402N962HH17A66W is not running and its activation is explicit (lifecycle.activation: explicit); inference does not start or wake it; start it with `capyctl start deployment 01M3R7A6YJW402N962HH17A66W`"}
+  ```
+
+  While it is starting or waking because you asked, a request waits for it as
+  usual. After your `stop`, the answer is `deployment_stopped` as for any
+  model.
+- is never parked or stopped to make room for another model, by a request or
+  by `start --evict`. A model that needs its memory is refused for capacity
+  instead.
+- is never parked or stopped by the idle timers, and never stopped to make
+  room in the parked set: a park that needs that room is refused
+  (`parked_capacity`) and that model serves again.
+
+`capyctl status deployment my-model --json` shows `"activation": "explicit"`.
+`lifecycle.warm: true` keeps a model loaded the same way, but requests still
+start or wake it; the two can be set together. A request does not restart an
+explicit model whose engine exited either; start it again.
+
 ## Park or stop
 
 | | Parked in host RAM | Parked, deep | Stopped |
 |---|---|---|---|
 | GPU memory | freed | freed | freed |
 | Host RAM | engine and a copy of the weights | engine | none |
-| A request | wakes it | wakes it | starts it after a pressure stop; refused after an operator stop |
+| A request | wakes it (refused under `activation: explicit`) | wakes it (refused under `activation: explicit`) | starts it after a pressure stop; refused after an operator stop or under `activation: explicit` |
 | Back to ready | seconds | a reload from disk | a full start |
 
 `capyctl stop deployment other-model` stops it; `capyctl start deployment other-model --wait`

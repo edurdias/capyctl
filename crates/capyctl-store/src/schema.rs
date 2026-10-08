@@ -975,6 +975,12 @@ CREATE TABLE IF NOT EXISTS parked_launch_residues(
 );
 "#;
 
+/// v45 (SPEC §6.5, §10): explicit activation. Each revision's
+/// `lifecycle.activation` (`on_demand` unless declared) and the hosts whose
+/// latest publication states `explicit`. Added by
+/// `switch_state::migrate_v45` only when missing.
+pub const SCHEMA_V45: &str = "-- explicit activation (switch_state::migrate_v45)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

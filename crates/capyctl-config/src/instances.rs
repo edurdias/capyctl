@@ -30,6 +30,40 @@ pub enum PlacementStrategy {
     Pack,
 }
 
+/// SPEC §6.5, §10: who may start, stop, park or wake a deployment, declared as
+/// `lifecycle.activation` by the deployment and, for every deployment that
+/// may run on it, by a host (its document's `lifecycle.activation`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    /// CapyCTL may also act on its own: an inference request starts or wakes
+    /// the deployment, and the idle policy, request-driven switching and
+    /// parked-capacity reclamation may park or stop it (default).
+    #[default]
+    OnDemand,
+    /// Only an operator's action (start, stop, park, pre-initialize, delete,
+    /// drain) changes it. A request for it while it is not serving is
+    /// refused at once (`deployment_inactive`); it is never a switch victim,
+    /// never idled and never reclaimed from the parked set.
+    Explicit,
+}
+
+impl Activation {
+    pub fn is_on_demand(&self) -> bool {
+        *self == Self::OnDemand
+    }
+
+    /// The value stated at `path` (a `lifecycle.activation` field), refused
+    /// by name when it is not `on_demand` or `explicit`.
+    pub fn parse(value: &Value, path: &str) -> Result<Self, ConfigError> {
+        match value.as_str() {
+            Some("on_demand") => Ok(Self::OnDemand),
+            Some("explicit") => Ok(Self::Explicit),
+            _ => Err(invalid(path, "must be on_demand or explicit")),
+        }
+    }
+}
+
 /// ADR 0013 §2: the deployment's placement constraints, normalized.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +120,11 @@ pub struct InstanceSpec {
     /// written before it existed keeps its idempotency fingerprint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm: bool,
+    /// SPEC §6.5, §10: `lifecycle.activation`. Absent unless `explicit`, so
+    /// a command that omits it, or states the default `on_demand`, keeps its
+    /// idempotency fingerprint.
+    #[serde(default, skip_serializing_if = "Activation::is_on_demand")]
+    pub activation: Activation,
     /// ADR 0028 §2: the multi-node group this deployment runs as, present only
     /// for a world size above one, so a single-host command keeps its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +137,7 @@ impl Default for InstanceSpec {
             instances: 1,
             placement: Placement::default(),
             warm: false,
+            activation: Activation::OnDemand,
             group: None,
         }
     }
@@ -459,14 +499,16 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
         }
         placement.hosts = Some(vec![host.to_owned()]);
     }
-    // SPEC §6.5 (ADR 0013 amendment 2026-09-23): the warm commitment.
+    // SPEC §6.5 (ADR 0013 amendment 2026-09-23): the warm commitment; SPEC
+    // §6.5, §10: the activation policy.
     let mut warm = false;
+    let mut activation = Activation::OnDemand;
     if let Some(raw) = object.get("lifecycle").filter(|v| !v.is_null()) {
         let raw = raw
             .as_object()
             .ok_or_else(|| invalid("lifecycle", "must be a mapping"))?;
         for key in raw.keys() {
-            if key != "warm" {
+            if key != "warm" && key != "activation" {
                 return Err(ConfigError::new(
                     ConfigErrorCode::UnknownField,
                     format!("lifecycle.{key}"),
@@ -479,11 +521,15 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
                 .as_bool()
                 .ok_or_else(|| invalid("lifecycle.warm", "must be true or false"))?;
         }
+        if let Some(value) = raw.get("activation") {
+            activation = Activation::parse(value, "lifecycle.activation")?;
+        }
     }
     let mut spec = InstanceSpec {
         instances,
         placement,
         warm,
+        activation,
         group: None,
     };
     spec.group = crate::topology::parse_group_shape(deployment, &spec)?;
