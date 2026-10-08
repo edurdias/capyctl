@@ -83,7 +83,7 @@ data: [DONE]
 
 CapyCTL relays each chunk unchanged except `model`, and checks it first: a
 `delta` key not in this table ends the stream as unverified, so an untested
-field never reaches a client (SPEC §10, §13.3). Fields beside `delta` in a
+field never reaches a client. Fields beside `delta` in a
 choice, and `usage` with its details, are relayed as the engine sent them.
 
 | Field | Where | vLLM 0.29, 0.30 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x |
