@@ -595,6 +595,12 @@ const NAMED_FORMS: &[(&str, Scope, &str, &str)] = &[
         "CAPYCTL_HF_ENDPOINT",
     ),
     (
+        "model_sources.plain_http",
+        Scope::Host,
+        "--model-sources-plain-http",
+        "CAPYCTL_MODEL_SOURCES_PLAIN_HTTP",
+    ),
+    (
         "local_engine.vllm",
         Scope::Host,
         "--vllm-bin",
@@ -750,7 +756,7 @@ impl NamedLayer {
             path.as_ref()
                 .map(|path| Value::String(path.to_string_lossy().into_owned()))
         };
-        let switch = self.models.sources.map(|switch| {
+        let switch_text = |switch: SourceSwitch| {
             Value::String(
                 match switch {
                     SourceSwitch::Allowed => "allowed",
@@ -758,7 +764,8 @@ impl NamedLayer {
                 }
                 .into(),
             )
-        });
+        };
+        let switch = self.models.sources.map(switch_text);
         let engines = &self.engines;
         let stated: Vec<(&str, Option<Value>)> = vec![
             ("model_store.path", path_text(&self.models.models_root)),
@@ -772,6 +779,10 @@ impl NamedLayer {
             (
                 "model_sources.huggingface_endpoint",
                 self.models.hf_endpoint.clone().map(Value::String),
+            ),
+            (
+                "model_sources.plain_http",
+                self.models.plain_http.map(switch_text),
             ),
             ("local_engine.vllm", path_text(&engines.vllm)),
             ("local_engine.sglang", path_text(&engines.sglang)),
@@ -891,6 +902,8 @@ pub fn defaults(
                 "model_sources.huggingface_endpoint",
                 Value::from("https://huggingface.co"),
             ),
+            // ADR 0008 amendment 2026-10-08.
+            ("model_sources.plain_http", Value::from("denied")),
             ("local_engine.deep_park", Value::from("on")),
             ("local_engine.trust_remote_code", Value::from(false)),
             ("local_engine.installation_drift", Value::from("warn")),

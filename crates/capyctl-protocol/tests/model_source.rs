@@ -101,7 +101,9 @@ fn materialize_source_round_trips_and_names_remote_sources_only() {
     for source in [
         serde_json::json!({"type": "local", "path": "toy"}),
         serde_json::json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": "main"}}),
-        serde_json::json!({"http": {"url": "http://example.test/w", "sha256": "a".repeat(64)}}),
+        serde_json::json!({"http": {"url": "ftp://example.test/w", "sha256": "a".repeat(64)}}),
+        serde_json::json!({"http": {"url": "http://user:pw@example.test/w", "sha256": "a".repeat(64)}}),
+        serde_json::json!({"http": {"sha256": "a".repeat(64)}}),
     ] {
         assert!(decode(deployment(source.clone())).is_err(), "{source}");
     }

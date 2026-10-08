@@ -247,3 +247,42 @@ server plus one host):
   sized from the weights, ADR 0014 §7) and activates once the copy is verified.
   The "Not yet" note above about standalone no longer applies.
 
+
+## Amendment 2026-10-08: plain HTTP by host approval, URLs by secret reference
+
+Owner approval of 2026-10-08, for an operator whose weights sit behind an
+internal mirror or a short-lived presigned link:
+
+- **Plain HTTP is the host's decision.** An `http` source's `url` may be
+  `http://` as well as `https://` (still without credentials). The document no
+  longer refuses it; the host does, unless it approves plain HTTP with
+  `model_sources.plain_http: allowed`, `--model-sources-plain-http
+  allowed|disabled` on `start host` and `start standalone`, or
+  `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP` (flag > environment > document >
+  default; default `denied`, and the setting is encoded only when allowed, so
+  existing host policies and revisions keep their encoding). Approval is
+  narrower than `http: allowed` and `allowed_hosts`, which still apply. The
+  payload is verified against its SHA-256 exactly as over HTTPS, which is what
+  makes a plain fetch acceptable at all. A fetch that starts on HTTPS never
+  follows a redirect down to plain HTTP, so a Hugging Face token is never sent
+  in the clear; the Hugging Face endpoint stays HTTPS-only.
+- **A URL by secret reference.** An `http` source states exactly one of `url`
+  and `url_ref: secret://<name>`. A `url_ref` resolves on the host from
+  `<state_dir>/secrets/<name>` under the `token_ref` rules (an owner-only
+  file, read at the moment of the fetch, `secret_unavailable` otherwise). The
+  deployment document, its frozen revision, the server's ledger, status and
+  every log line hold the reference only; the store directory is named by the
+  digest (`sources/http/<sha256>`), so it does not depend on the URL either.
+  The host checks the resolved URL against its own policy (scheme,
+  `plain_http`, `allowed_hosts`) before any request and answers `denied`
+  otherwise; the server, which never sees the URL, cannot. A presigned URL that
+  expired fails `unauthorized`; rotating the secret's contents is enough for
+  the next attempt, since the declaration (and so the revision) is unchanged.
+- **Redaction.** Materialization failures carry closed reasons only, as
+  before, and the sources store's log lines pass through
+  `capyctl_domain::redact::redact_urls`, which replaces any URL's userinfo,
+  query and fragment with `<redacted>`, as a second line of defence.
+
+CPU tests serve both forms from a loopback origin; they are not qualification.
+A live fetch from a plain-HTTP mirror and from a presigned URL has not been
+run.

@@ -24,7 +24,11 @@
 //!   setting three ways): `--hf-endpoint`, `CAPYCTL_HF_ENDPOINT` (else the
 //!   Hugging Face tools' own `HF_ENDPOINT`), or
 //!   `model_sources.huggingface_endpoint`; default `https://huggingface.co`.
-//!   A host fetches over HTTPS only.
+//!   A host fetches over HTTPS only, unless it approves plain `http://` URLs
+//!   for `http` sources (ADR 0008 amendment 2026-10-08):
+//!   `--model-sources-plain-http allowed|disabled`,
+//!   `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP`, or `model_sources.plain_http`;
+//!   default `denied`.
 //!
 //! Precedence, for every setting: CLI flag > environment > YAML > default.
 //! The resolved values are written into the host document before it is
@@ -46,6 +50,9 @@ pub const MODEL_SOURCES_ENV: &str = "CAPYCTL_MODEL_SOURCES";
 pub const MODEL_SOURCES_MAX_ENV: &str = "CAPYCTL_MODEL_SOURCES_MAX";
 /// The variable naming the sources store (`model_sources.path`).
 pub const MODEL_SOURCES_PATH_ENV: &str = "CAPYCTL_MODEL_SOURCES_PATH";
+/// The variable approving plain `http://` sources
+/// (`model_sources.plain_http`): `allowed` or `disabled`.
+pub const MODEL_SOURCES_PLAIN_HTTP_ENV: &str = "CAPYCTL_MODEL_SOURCES_PLAIN_HTTP";
 /// The variable naming the Hugging Face endpoint
 /// (`model_sources.huggingface_endpoint`).
 pub const HF_ENDPOINT_ENV: &str = "CAPYCTL_HF_ENDPOINT";
@@ -71,6 +78,8 @@ pub struct ModelOverrides {
     pub sources_path: Option<PathBuf>,
     /// `--hf-endpoint` / `CAPYCTL_HF_ENDPOINT` (else `HF_ENDPOINT`), as written.
     pub hf_endpoint: Option<String>,
+    /// `--model-sources-plain-http` / `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP`.
+    pub plain_http: Option<SourceSwitch>,
 }
 
 impl ModelOverrides {
@@ -97,6 +106,9 @@ impl ModelOverrides {
                     .map(|value| hf_endpoint(HF_TOOLS_ENDPOINT_ENV, &value))
                     .transpose()?,
             },
+            plain_http: get(MODEL_SOURCES_PLAIN_HTTP_ENV)
+                .map(|value| switch(MODEL_SOURCES_PLAIN_HTTP_ENV, &value))
+                .transpose()?,
         })
     }
 
@@ -232,6 +244,9 @@ pub fn resolve(
     }
     if let Some(endpoint) = flag.hf_endpoint.as_ref().or(env.hf_endpoint.as_ref()) {
         sources.huggingface_endpoint = Some(endpoint.clone());
+    }
+    if let Some(plain_http) = flag.plain_http.or(env.plain_http) {
+        sources.plain_http = Some(plain_http);
     }
     // Owner ruling 2026-09-25: with no `model_sources.path`, downloads stay
     // in `<model_store>/sources` (ModelSourcePolicy::root), the layout every
@@ -465,6 +480,40 @@ mod tests {
         );
         let tools = env_layer(&[(HF_TOOLS_ENDPOINT_ENV, "https://tools.example")]).unwrap();
         assert_eq!(tools.hf_endpoint.as_deref(), Some("https://tools.example"));
+    }
+
+    // T14 T03 T37 (ADR 0008 amendment 2026-10-08, owner rule: every setting
+    // three ways): plain `http://` sources follow flag > environment > YAML >
+    // default, and the default is `denied`. The resolved block a host
+    // publishes states it only when a layer did.
+    #[test]
+    fn plain_http_follows_flag_env_document_default() {
+        let yaml_on = json!({"model_sources": {"plain_http": "allowed"}});
+        let env_off = env_layer(&[(MODEL_SOURCES_PLAIN_HTTP_ENV, "disabled")]).unwrap();
+        let env_on = env_layer(&[(MODEL_SOURCES_PLAIN_HTTP_ENV, "allowed")]).unwrap();
+        let flag_on = ModelOverrides {
+            plain_http: Some(SourceSwitch::Allowed),
+            ..Default::default()
+        };
+        let none = ModelOverrides::default();
+        let resolved = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
+            resolve(document, flag, env, home().as_deref()).unwrap()
+        };
+        let plain = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
+            resolved(flag, env, document).policy.plain_http
+        };
+        assert_eq!(plain(&flag_on, &env_off, &json!({})), SourceSwitch::Allowed);
+        assert_eq!(plain(&none, &env_off, &yaml_on), SourceSwitch::Denied);
+        assert_eq!(plain(&none, &env_on, &json!({})), SourceSwitch::Allowed);
+        assert_eq!(plain(&none, &none, &yaml_on), SourceSwitch::Allowed);
+        assert_eq!(plain(&none, &none, &json!({})), SourceSwitch::Denied);
+        let mut document = json!({});
+        resolved(&none, &none, &json!({})).write_into(&mut document);
+        assert_eq!(document["model_sources"], json!({}));
+        resolved(&none, &env_on, &json!({})).write_into(&mut document);
+        assert_eq!(document["model_sources"], json!({"plain_http": "allowed"}));
+        let error = env_layer(&[(MODEL_SOURCES_PLAIN_HTTP_ENV, "yes")]).unwrap_err();
+        assert_eq!(error.path, MODEL_SOURCES_PLAIN_HTTP_ENV);
     }
 
     // T03: malformed variables are refused with their names.

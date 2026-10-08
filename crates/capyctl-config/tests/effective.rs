@@ -1266,6 +1266,58 @@ fn remote_sources_are_allowed_by_default_need_pins_and_resolve_into_the_store() 
     }
 }
 
+/// ADR 0008 amendment 2026-10-08: a plain `http://` source resolves only on a
+/// host that approves plain HTTP, and a source whose URL is a host secret
+/// resolves to the same digest-named directory while its frozen revision
+/// holds the reference alone.
+// T14 T37
+#[test]
+fn plain_http_and_secret_url_sources_resolve_into_the_store() {
+    let digest = "c".repeat(64);
+    let with_source = |source: serde_json::Value, policy: serde_json::Value| {
+        let (mut deployment, mut host) = fixture();
+        let model = deployment["model"].as_object_mut().expect("model object");
+        model.remove("path");
+        model.insert("source".into(), source);
+        host["model_sources"] = policy;
+        (deployment, host)
+    };
+    let expected = format!("/srv/models/sources/http/{digest}");
+    let plain = serde_json::json!({"http": {"url": "http://mirror.lan/w.gguf", "sha256": digest}});
+    let (deployment, host) = with_source(plain.clone(), serde_json::json!({}));
+    let error = resolve_effective(&deployment, &host).expect_err("plain HTTP is off by default");
+    assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied);
+    let (deployment, host) = with_source(plain, serde_json::json!({"plain_http": "allowed"}));
+    let effective = resolve_effective(&deployment, &host).expect("approved plain HTTP");
+    assert_eq!(
+        effective.model.resolved_path.as_deref(),
+        Some(expected.as_str())
+    );
+    let text = serde_json::to_string(&effective).unwrap();
+    assert_eq!(
+        capyctl_config::effective::decode_effective_snapshot(&text).unwrap(),
+        effective
+    );
+
+    let by_ref = serde_json::json!({"http": {"url_ref": "secret://weights-url", "sha256": digest}});
+    let (deployment, host) = with_source(by_ref, serde_json::json!({}));
+    let effective = resolve_effective(&deployment, &host).expect("a secret URL resolves");
+    assert_eq!(
+        effective.model.resolved_path.as_deref(),
+        Some(expected.as_str())
+    );
+    let text = serde_json::to_string(&effective).unwrap();
+    assert!(
+        text.contains("\"url_ref\":\"secret://weights-url\""),
+        "{text}"
+    );
+    assert!(!text.contains("\"url\":"), "{text}");
+    assert_eq!(
+        capyctl_config::effective::decode_effective_snapshot(&text).unwrap(),
+        effective
+    );
+}
+
 /// Spec §3: admission reserves the Ready footprint before the engine starts, so a
 /// requested KV cache larger than that reservation would hand the engine a grant
 /// nothing accounted for. The overrun would otherwise appear much later, as an

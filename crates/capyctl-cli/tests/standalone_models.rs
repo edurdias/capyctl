@@ -336,7 +336,8 @@ async fn the_embedded_host_downloads_into_the_sources_store() {
         .deploy(
             "m",
             ModelSource::Http {
-                url: "https://weights.example.test/w.bin".into(),
+                url: Some("https://weights.example.test/w.bin".into()),
+                url_ref: None,
                 sha256: sha.clone(),
                 archive: Archive::None,
             },

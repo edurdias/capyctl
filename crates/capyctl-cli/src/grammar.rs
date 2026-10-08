@@ -609,6 +609,16 @@ struct RoleSettingsArgs {
     /// model_sources.huggingface_endpoint.
     #[arg(long, value_name = "URL", value_parser = parse_hf_endpoint)]
     hf_endpoint: Option<String>,
+    /// Allow plain http:// URLs for HTTP model downloads on this run
+    /// (default disabled; the download is still checked against its
+    /// sha256). Wins over CAPYCTL_MODEL_SOURCES_PLAIN_HTTP and
+    /// model_sources.plain_http.
+    #[arg(
+        long,
+        value_name = "allowed|disabled",
+        value_parser = parse_model_sources_plain_http
+    )]
+    model_sources_plain_http: Option<capyctl_config::model_source::SourceSwitch>,
     /// The vLLM executable this role runs as its `local` profile. Wins over
     /// CAPYCTL_VLLM_BIN and local_engine.vllm.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
@@ -698,6 +708,7 @@ impl RoleSettingsArgs {
             sources_max: self.model_sources_max.clone(),
             sources_path: self.model_sources_path.clone(),
             hf_endpoint: self.hf_endpoint.clone(),
+            plain_http: self.model_sources_plain_http,
         }
     }
 
@@ -1575,6 +1586,14 @@ fn parse_kv_cache(text: &str) -> Result<String, String> {
 /// Owner decision 2026-09-25: `--model-sources allowed|disabled`.
 fn parse_model_sources(text: &str) -> Result<capyctl_config::model_source::SourceSwitch, String> {
     capyctl_config::model_settings::switch("--model-sources", text).map_err(|error| error.detail)
+}
+
+/// ADR 0008 amendment 2026-10-08: `--model-sources-plain-http allowed|disabled`.
+fn parse_model_sources_plain_http(
+    text: &str,
+) -> Result<capyctl_config::model_source::SourceSwitch, String> {
+    capyctl_config::model_settings::switch("--model-sources-plain-http", text)
+        .map_err(|error| error.detail)
 }
 
 /// Owner decision 2026-09-25: `--model-sources-max <size>`, e.g. `500GiB`.

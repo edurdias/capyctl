@@ -6,7 +6,11 @@
 //! - `local`: a path on the host (relative paths resolve against the store);
 //! - `huggingface`: a repository pinned to a commit SHA, optionally narrowed by
 //!   allow patterns, with an optional `secret://` token reference;
-//! - `http`: an HTTPS URL pinned by SHA-256, optionally a tar archive.
+//! - `http`: a URL pinned by SHA-256, optionally a tar archive. HTTPS unless
+//!   the host approves plain `http://` (`model_sources.plain_http`); the URL
+//!   is written in the document (`url`) or named by a host secret
+//!   (`url_ref: secret://<name>`), so a short-lived presigned URL never
+//!   reaches a document, a revision, a status or a log.
 //!
 //! Both spellings are accepted on input: the internally tagged form
 //! (`{type: huggingface, repo, revision}`) that deployments have used since the
@@ -75,9 +79,18 @@ pub enum ModelSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_ref: Option<String>,
     },
-    /// A payload over HTTPS, pinned by content digest.
+    /// A payload over HTTP(S), pinned by content digest. Exactly one of
+    /// `url` and `url_ref` is stated.
     Http {
-        url: String,
+        /// The URL as written. HTTPS unless the host approves plain HTTP.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// ADR 0008 amendment 2026-10-08: `secret://<name>`, a host secret
+        /// whose contents are the URL. The host resolves it at the moment of
+        /// the fetch; the URL is never part of any document, revision,
+        /// status or log, so a presigned URL's signature stays on the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_ref: Option<String>,
         sha256: String,
         #[serde(default, skip_serializing_if = "Archive::is_none")]
         archive: Archive,
@@ -100,7 +113,10 @@ enum Tagged {
         token_ref: Option<String>,
     },
     Http {
-        url: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        url_ref: Option<String>,
         sha256: String,
         #[serde(default)]
         archive: Archive,
@@ -125,7 +141,10 @@ struct HuggingFaceFields {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HttpFields {
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    url_ref: Option<String>,
     sha256: String,
     #[serde(default)]
     archive: Archive,
@@ -148,10 +167,12 @@ impl From<Tagged> for ModelSource {
             },
             Tagged::Http {
                 url,
+                url_ref,
                 sha256,
                 archive,
             } => Self::Http {
                 url,
+                url_ref,
                 sha256,
                 archive,
             },
@@ -194,6 +215,7 @@ impl<'de> Deserialize<'de> for ModelSource {
             "http" => serde_json::from_value::<HttpFields>(fields)
                 .map(|f| Self::Http {
                     url: f.url,
+                    url_ref: f.url_ref,
                     sha256: f.sha256,
                     archive: f.archive,
                 })
@@ -268,7 +290,9 @@ impl ModelSource {
     }
 
     /// SPEC §13.3, ADR 0008: validate a declared source's shape. Pinned
-    /// revisions and digests only; HTTPS only; secret references only.
+    /// revisions and digests only; secret references only. Whether a plain
+    /// `http://` URL may be fetched is the host's decision
+    /// ([`ModelSourcePolicy::permits`]), not the document's.
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self {
             Self::Local { path } => {
@@ -314,12 +338,39 @@ impl ModelSource {
                     }
                 }
             }
-            Self::Http { url, sha256, .. } => {
-                // Weights fetched over plain HTTP could be replaced in flight,
-                // and a digest is the only thing that makes the fetch
-                // reproducible, so both are required rather than recommended.
-                if https_host(url).is_none() {
-                    return Err(invalid("model.source.url", "must be an https:// URL"));
+            Self::Http {
+                url,
+                url_ref,
+                sha256,
+                ..
+            } => {
+                // A digest is the only thing that makes the fetch
+                // reproducible (and the only defence against a payload
+                // replaced in flight over plain HTTP), so it is required.
+                match (url, url_ref) {
+                    (Some(url), None) => {
+                        if url_origin(url).is_none() {
+                            return Err(invalid(
+                                "model.source.url",
+                                "must be an https:// (or host-approved http://) URL \
+                                 without credentials",
+                            ));
+                        }
+                    }
+                    (None, Some(reference)) => {
+                        if secret_name(reference).is_none() {
+                            return Err(invalid(
+                                "model.source.url_ref",
+                                "must be a secret reference `secret://<name>`",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "model.source.url",
+                            "state exactly one of url and url_ref",
+                        ))
+                    }
                 }
                 if !is_sha256_hex(sha256) {
                     return Err(invalid(
@@ -396,7 +447,28 @@ pub fn secret_name(reference: &str) -> Option<&str> {
 /// The lowercase `host[:port]` of an `https://` URL, or `None` when the URL is
 /// not HTTPS, carries credentials, or names no host.
 pub fn https_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
+    match url_origin(url)? {
+        UrlOrigin { plain: false, host } => Some(host),
+        UrlOrigin { plain: true, .. } => None,
+    }
+}
+
+/// Where an `http` source's URL fetches from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlOrigin {
+    /// `http://` rather than `https://`.
+    pub plain: bool,
+    /// The lowercase `host[:port]`.
+    pub host: String,
+}
+
+/// The origin of an `https://` or `http://` URL, or `None` when the URL has
+/// another scheme, carries credentials, or names no host.
+pub fn url_origin(url: &str) -> Option<UrlOrigin> {
+    let (plain, rest) = match url.strip_prefix("https://") {
+        Some(rest) => (false, rest),
+        None => (true, url.strip_prefix("http://")?),
+    };
     let authority = rest.split(['/', '?', '#']).next()?;
     if authority.is_empty()
         || authority.contains('@')
@@ -407,7 +479,10 @@ pub fn https_host(url: &str) -> Option<String> {
     {
         return None;
     }
-    Some(authority.to_ascii_lowercase())
+    Some(UrlOrigin {
+        plain,
+        host: authority.to_ascii_lowercase(),
+    })
 }
 
 /// ADR 0008 (owner decision 2026-09-25): the ceiling on the bytes downloads
@@ -437,6 +512,10 @@ impl SourceSwitch {
             _ => None,
         }
     }
+
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied)
+    }
 }
 
 /// The host's `model_sources` block as written.
@@ -460,6 +539,10 @@ pub struct RawModelSources {
     /// source that names no `token_ref` (owner rule 2026-09-25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub huggingface_token_file: Option<String>,
+    /// ADR 0008 amendment 2026-10-08: whether an `http` source may fetch
+    /// over plain `http://` (default `denied`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plain_http: Option<SourceSwitch>,
 }
 
 /// ADR 0008, SPEC §7: the host's policy for remote model sources. The sources
@@ -468,7 +551,8 @@ pub struct RawModelSources {
 ///
 /// Owner decision 2026-09-25: Hugging Face and HTTP sources are allowed by
 /// default on every host, with a 500 GiB ceiling; a host that states
-/// `denied` (or `disabled`) keeps them off.
+/// `denied` (or `disabled`) keeps them off. Plain `http://` is off unless the
+/// host approves it (ADR 0008 amendment 2026-10-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelSourcePolicy {
     pub huggingface: SourceSwitch,
@@ -491,6 +575,11 @@ pub struct ModelSourcePolicy {
     /// token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub huggingface_token_file: Option<std::path::PathBuf>,
+    /// ADR 0008 amendment 2026-10-08: whether an `http` source may fetch
+    /// over plain `http://`. Default `denied`; encoded only when allowed, so
+    /// existing host policies keep their encoding.
+    #[serde(skip_serializing_if = "SourceSwitch::is_denied")]
+    pub plain_http: SourceSwitch,
 }
 
 impl Default for ModelSourcePolicy {
@@ -503,6 +592,9 @@ impl Default for ModelSourcePolicy {
             huggingface_endpoint: None,
             path: None,
             huggingface_token_file: None,
+            // ADR 0008 amendment 2026-10-08: plain HTTP only where the host
+            // says so.
+            plain_http: SourceSwitch::Denied,
         }
     }
 }
@@ -557,6 +649,7 @@ impl ModelSourcePolicy {
             huggingface_endpoint: raw.huggingface_endpoint,
             path,
             huggingface_token_file,
+            plain_http: raw.plain_http.unwrap_or(SourceSwitch::Denied),
         };
         if policy.max_bytes.is_some_and(|bytes| bytes <= 0) {
             return Err(invalid("model_sources.max_bytes", "must be positive"));
@@ -601,6 +694,9 @@ impl ModelSourcePolicy {
                 .huggingface_token_file
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            // Stated only when it differs from the default, so a host
+            // document rebuilt from an earlier snapshot is unchanged.
+            plain_http: (!self.plain_http.is_denied()).then_some(self.plain_http),
         }
     }
 
@@ -615,20 +711,22 @@ impl ModelSourcePolicy {
     /// ADR 0008: whether this host permits materializing `source`. A local
     /// source is always permitted; a remote one needs its kind allowed (the
     /// default since the owner decision of 2026-09-25) and, where the host
-    /// lists allowed hosts, a listed origin.
+    /// lists allowed hosts, a listed origin. A plain `http://` URL also needs
+    /// `plain_http: allowed` (amendment 2026-10-08). A URL named by
+    /// `url_ref` is known only to the host that resolves it, which checks it
+    /// with [`Self::permits_url`] before the fetch.
     pub fn permits(&self, source: &ModelSource) -> Result<(), ConfigError> {
-        let denied = |detail: &str| {
-            ConfigError::new(ConfigErrorCode::ModelSourceDenied, "model.source", detail)
-        };
-        let origin = match source {
-            ModelSource::Local { .. } => return Ok(()),
+        match source {
+            ModelSource::Local { .. } => Ok(()),
             ModelSource::HuggingFace { .. } => {
                 if self.huggingface != SourceSwitch::Allowed {
                     return Err(denied(
                         "this host does not allow huggingface sources (model_sources.huggingface)",
                     ));
                 }
-                https_host(self.huggingface_endpoint())
+                let origin = https_host(self.huggingface_endpoint())
+                    .ok_or_else(|| denied("the source names no HTTPS origin"))?;
+                self.permits_host(&origin)
             }
             ModelSource::Http { url, .. } => {
                 if self.http != SourceSwitch::Allowed {
@@ -636,17 +734,39 @@ impl ModelSourcePolicy {
                         "this host does not allow http sources (model_sources.http)",
                     ));
                 }
-                https_host(url)
+                url.as_deref().map_or(Ok(()), |url| self.permits_url(url))
             }
-        };
-        let origin = origin.ok_or_else(|| denied("the source names no HTTPS origin"))?;
-        if !self.allowed_hosts.is_empty() && !self.allowed_hosts.contains(&origin) {
+        }
+    }
+
+    /// ADR 0008 (amendment 2026-10-08): whether this host fetches an `http`
+    /// source from `url`: HTTPS, or plain HTTP where `plain_http` is
+    /// allowed, from a listed origin where the host lists origins. The
+    /// refusal never repeats the URL, which may carry a signature.
+    pub fn permits_url(&self, url: &str) -> Result<(), ConfigError> {
+        let origin = url_origin(url).ok_or_else(|| {
+            denied("the source names no https:// or http:// origin without credentials")
+        })?;
+        if origin.plain && self.plain_http != SourceSwitch::Allowed {
+            return Err(denied(
+                "this host does not allow plain http:// sources (model_sources.plain_http)",
+            ));
+        }
+        self.permits_host(&origin.host)
+    }
+
+    fn permits_host(&self, origin: &str) -> Result<(), ConfigError> {
+        if !self.allowed_hosts.is_empty() && !self.allowed_hosts.iter().any(|h| h == origin) {
             return Err(denied(
                 "the source's origin is not in this host's model_sources.allowed_hosts",
             ));
         }
         Ok(())
     }
+}
+
+fn denied(detail: &str) -> ConfigError {
+    ConfigError::new(ConfigErrorCode::ModelSourceDenied, "model.source", detail)
 }
 
 /// The closed failure categories a materialization reports (`reason`).
@@ -850,7 +970,8 @@ mod tests {
             );
         }
         let http = |url: &str, sha: &str| ModelSource::Http {
-            url: url.into(),
+            url: Some(url.into()),
+            url_ref: None,
             sha256: sha.into(),
             archive: Archive::None,
         };
@@ -858,7 +979,8 @@ mod tests {
             .validate()
             .unwrap();
         for (url, sha) in [
-            ("http://example.test/w", "a".repeat(64)),
+            ("ftp://example.test/w", "a".repeat(64)),
+            ("http://user:pw@example.test/w", "a".repeat(64)),
             ("https://", "a".repeat(64)),
             ("https://user:pw@example.test/w", "a".repeat(64)),
             ("https://example.test/w", "A".repeat(64)),
@@ -914,7 +1036,8 @@ mod tests {
             token_ref: None,
         };
         let http = ModelSource::Http {
-            url: "https://weights.example.test/w".into(),
+            url: Some("https://weights.example.test/w".into()),
+            url_ref: None,
             sha256: "a".repeat(64),
             archive: Archive::None,
         };
@@ -969,6 +1092,121 @@ mod tests {
             ModelSourcePolicy::from_raw(Some(policy.to_raw())).unwrap(),
             policy
         );
+    }
+
+    // T14 T37 (ADR 0008 amendment 2026-10-08): a plain http:// URL is a valid
+    // declaration, fetched only by a host that approves plain HTTP. HTTPS
+    // stays the default, credentials in a URL are still refused, and the
+    // Hugging Face endpoint stays HTTPS.
+    #[test]
+    fn plain_http_sources_need_the_hosts_approval() {
+        let source = |url: &str| -> ModelSource {
+            serde_json::from_value(json!({"http": {"url": url, "sha256": "a".repeat(64)}})).unwrap()
+        };
+        let raw = |value: serde_json::Value| {
+            ModelSourcePolicy::from_raw(Some(serde_json::from_value(value).unwrap()))
+        };
+        let plain = source("http://mirror.lan:8080/w.gguf");
+        plain.validate().unwrap();
+        assert!(source("http://user:pw@mirror.lan/w").validate().is_err());
+        assert!(source("ftp://mirror.lan/w").validate().is_err());
+        for refusing in [
+            ModelSourcePolicy::default(),
+            raw(json!({})).unwrap(),
+            raw(json!({"plain_http": "denied"})).unwrap(),
+            raw(json!({"plain_http": "disabled"})).unwrap(),
+        ] {
+            let error = refusing.permits(&plain).unwrap_err();
+            assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied);
+            assert!(
+                error.detail.contains("model_sources.plain_http"),
+                "{error:?}"
+            );
+            refusing.permits(&source("https://mirror.lan/w")).unwrap();
+            // The default leaves every encoding as it was.
+            assert!(serde_json::to_value(&refusing).unwrap()["plain_http"].is_null());
+            assert!(serde_json::to_value(refusing.to_raw()).unwrap()["plain_http"].is_null());
+        }
+        let approving = raw(json!({"plain_http": "allowed"})).unwrap();
+        approving.permits(&plain).unwrap();
+        assert!(!approving.is_default());
+        assert_eq!(
+            serde_json::to_value(&approving).unwrap()["plain_http"],
+            "allowed"
+        );
+        assert_eq!(
+            ModelSourcePolicy::from_raw(Some(approving.to_raw())).unwrap(),
+            approving
+        );
+        // Plain HTTP is a narrower grant inside `http` and `allowed_hosts`.
+        for narrower in [
+            json!({"plain_http": "allowed", "http": "denied"}),
+            json!({"plain_http": "allowed", "allowed_hosts": ["other.lan"]}),
+        ] {
+            assert!(
+                raw(narrower.clone()).unwrap().permits(&plain).is_err(),
+                "{narrower}"
+            );
+        }
+        raw(json!({"plain_http": "allowed", "allowed_hosts": ["mirror.lan:8080"]}))
+            .unwrap()
+            .permits(&plain)
+            .unwrap();
+        assert!(
+            raw(json!({"plain_http": "allowed", "huggingface_endpoint": "http://mirror"})).is_err()
+        );
+    }
+
+    // T14 T37 (ADR 0008 amendment 2026-10-08): an http source may name its
+    // URL by a host secret. The reference is all any encoding holds, the
+    // store key depends on the digest alone, and exactly one of `url` and
+    // `url_ref` is stated.
+    #[test]
+    fn a_secret_url_reference_is_all_a_declaration_holds() {
+        let sha = "b".repeat(64);
+        let signed = "https://bucket.example.test/w.tar?X-Amz-Signature=deadbeef";
+        let by_ref: ModelSource = serde_json::from_value(json!({"http": {
+            "url_ref": "secret://weights-url", "sha256": sha, "archive": "tar"}}))
+        .unwrap();
+        by_ref.validate().unwrap();
+        let tagged: ModelSource = serde_json::from_value(json!({"type": "http",
+            "url_ref": "secret://weights-url", "sha256": sha, "archive": "tar"}))
+        .unwrap();
+        assert_eq!(by_ref, tagged);
+        assert_eq!(
+            serde_json::to_value(&by_ref).unwrap(),
+            json!({"type": "http", "url_ref": "secret://weights-url", "sha256": sha, "archive": "tar"})
+        );
+        let by_url: ModelSource = serde_json::from_value(json!({"http": {
+            "url": signed, "sha256": sha, "archive": "tar"}}))
+        .unwrap();
+        // One pinned payload is one directory, however its URL is named.
+        assert_eq!(by_ref.store_key(), by_url.store_key());
+        // A source written with `url` keeps its exact encoding.
+        assert_eq!(
+            serde_json::to_value(&by_url).unwrap(),
+            json!({"type": "http", "url": signed, "sha256": sha, "archive": "tar"})
+        );
+        for bad in [
+            json!({"http": {"sha256": sha}}),
+            json!({"http": {"url": "https://h/w", "url_ref": "secret://u", "sha256": sha}}),
+            json!({"http": {"url_ref": signed, "sha256": sha}}),
+            json!({"http": {"url_ref": "secret://../x", "sha256": sha}}),
+        ] {
+            let source: ModelSource = serde_json::from_value(bad.clone()).unwrap();
+            let error = source.validate().unwrap_err();
+            // A refusal never repeats what was written.
+            assert!(!format!("{error:?}").contains("X-Amz"), "{bad}");
+        }
+        // The URL is known only to the host that resolves it, which checks
+        // its origin before the fetch; the declaration itself is accepted.
+        let policy = |value: serde_json::Value| {
+            ModelSourcePolicy::from_raw(Some(serde_json::from_value(value).unwrap())).unwrap()
+        };
+        policy(json!({"allowed_hosts": ["bucket.example.test"]}))
+            .permits(&by_ref)
+            .unwrap();
+        assert!(policy(json!({"http": "denied"})).permits(&by_ref).is_err());
     }
 
     // T14 (owner decision 2026-09-25): downloads live in their own store,

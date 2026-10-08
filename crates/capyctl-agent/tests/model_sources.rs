@@ -262,6 +262,7 @@ fn policy(max_bytes: i64) -> ModelSourcePolicy {
         huggingface_endpoint: Some("https://hub.example.test".into()),
         path: None,
         huggingface_token_file: None,
+        plain_http: SourceSwitch::Denied,
     }
 }
 
@@ -276,7 +277,8 @@ fn hf(files: Vec<&str>, token: bool) -> ModelSource {
 
 fn http(name: &str, bytes: &[u8], archive: Archive) -> ModelSource {
     ModelSource::Http {
-        url: format!("https://weights.example.test/files/{name}"),
+        url: Some(format!("https://weights.example.test/files/{name}")),
+        url_ref: None,
         sha256: sha256_hex(bytes),
         archive,
     }
@@ -451,7 +453,8 @@ async fn hash_mismatch_is_refused_and_temp_removed() {
     );
     let store = f.source_store(1 << 30);
     let wrong = ModelSource::Http {
-        url: "https://weights.example.test/files/w.gguf".into(),
+        url: Some("https://weights.example.test/files/w.gguf".into()),
+        url_ref: None,
         sha256: sha256_hex(b"something else"),
         archive: Archive::None,
     };
@@ -737,6 +740,171 @@ async fn secret_token_is_never_logged_or_persisted() {
     let failure = store.materialize(&other).await.unwrap_err();
     assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE);
     assert!(!lines.lock().unwrap().join("\n").contains(TOKEN));
+}
+
+/// The query of a presigned URL: the credential it carries.
+const SIGNATURE: &str = "X-Amz-Signature=0b5e55ed5ec2e7a1&X-Amz-Expires=300";
+
+fn presigned(name: &str) -> String {
+    format!("https://bucket.example.test/files/{name}?{SIGNATURE}")
+}
+
+impl Fixture {
+    fn payload(&self, name: &str, bytes: &[u8]) {
+        self.hub.lock().unwrap().payloads.insert(
+            name.into(),
+            Payload {
+                bytes: bytes.to_vec(),
+                cut_after_once: None,
+                chunked: false,
+                delay: None,
+            },
+        );
+    }
+
+    fn secret(&self, name: &str, value: &str, mode: u32) {
+        let path = self.secrets.join(name);
+        std::fs::write(&path, format!("{value}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+fn by_ref(reference: &str, bytes: &[u8]) -> ModelSource {
+    serde_json::from_value(serde_json::json!({"http": {
+        "url_ref": reference, "sha256": sha256_hex(bytes)}}))
+    .unwrap()
+}
+
+fn capture(store: &SourceStore) -> Arc<Mutex<Vec<String>>> {
+    let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+    let captured = lines.clone();
+    store.set_log(Arc::new(move |line| {
+        captured.lock().unwrap().push(line.to_string())
+    }));
+    lines
+}
+
+// T14 T37 (ADR 0008 amendment 2026-10-08, SPEC §13.3): an http source whose
+// URL is a host secret materializes verified against its digest. The URL (a
+// presigned one, whose query is its credential) is read at the moment of the
+// fetch and appears in no stored file, status, failure or log line; the
+// host checks its origin against its own policy before any request.
+#[tokio::test]
+async fn a_secret_url_is_fetched_verified_and_never_persisted_or_logged() {
+    let f = fixture().await;
+    let bytes = vec![7_u8; 40_000];
+    f.payload("w.gguf", &bytes);
+    f.payload("x.gguf", b"other");
+    f.secret("weights-url", &presigned("w.gguf"), 0o600);
+    let store = f.source_store(1 << 30);
+    let lines = capture(&store);
+    let source = by_ref("secret://weights-url", &bytes);
+    let verified = store.materialize(&source).await.expect("verified");
+    assert_eq!(verified, bytes.len() as u64);
+    let directory = f.store.join(source.store_key().unwrap());
+    assert_eq!(std::fs::read(directory.join("w.gguf")).unwrap(), bytes);
+    assert_eq!(f.requests("/files/w.gguf").len(), 1);
+    let mut failures = Vec::new();
+    // The same secret behind a different pin: the digest still decides.
+    let wrong = by_ref("secret://weights-url", b"something else");
+    let failure = store.materialize(&wrong).await.unwrap_err();
+    assert_eq!(failure.reason, reason::HASH_MISMATCH);
+    failures.push(failure);
+    // A missing secret, one others may read, and one that holds no URL.
+    f.secret("loose-url", &presigned("x.gguf"), 0o644);
+    f.secret("not-a-url", "ftp://bucket.example.test/x.gguf", 0o600);
+    for reference in [
+        "secret://absent",
+        "secret://loose-url",
+        "secret://not-a-url",
+    ] {
+        let failure = store
+            .materialize(&by_ref(reference, b"other"))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE, "{reference}");
+        failures.push(failure);
+    }
+    // A host that lists origins checks the resolved URL's before fetching.
+    f.secret("x-url", &presigned("x.gguf"), 0o600);
+    let mut listed = policy(1 << 30);
+    listed.allowed_hosts = vec!["weights.example.test".into()];
+    let listing = f.source_store_with(listed, &[]);
+    let listing_lines = capture(&listing);
+    let failure = listing
+        .materialize(&by_ref("secret://x-url", b"other"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, reason::DENIED);
+    failures.push(failure);
+    assert!(
+        f.requests("/files/x.gguf").is_empty(),
+        "nothing was fetched"
+    );
+
+    let credential = "0b5e55ed5ec2e7a1";
+    let mut files = Vec::new();
+    walk(&f.store, &mut files);
+    assert!(!files.is_empty());
+    for file in files {
+        let contents = std::fs::read(&file).unwrap();
+        assert!(
+            !contents
+                .windows(credential.len())
+                .any(|w| w == credential.as_bytes())
+                && !contents.windows(9).any(|w| w == b"X-Amz-Sig"),
+            "{} holds the URL",
+            file.display()
+        );
+    }
+    let status = serde_json::to_string(&store.status(&source)).unwrap();
+    let reported = format!("{status} {failures:?} {:?}", store.status(&wrong));
+    assert!(!reported.contains(credential), "{reported}");
+    assert!(!reported.contains("bucket.example.test"), "{reported}");
+    let mut log = lines.lock().unwrap().join("\n");
+    log.push_str(&listing_lines.lock().unwrap().join("\n"));
+    assert!(!log.is_empty(), "the store logged its outcomes");
+    assert!(!log.contains(credential), "{log}");
+    assert!(!log.contains("bucket.example.test"), "{log}");
+}
+
+// T14 T37 (ADR 0008 amendment 2026-10-08): a plain http:// source is fetched
+// only by a host whose policy approves plain HTTP, and is still verified
+// against its digest; the same holds for a plain URL named by a secret.
+#[tokio::test]
+async fn plain_http_sources_are_fetched_only_where_the_host_approves() {
+    let f = fixture().await;
+    let bytes = vec![9_u8; 30_000];
+    f.payload("p.bin", &bytes);
+    let written: ModelSource = serde_json::from_value(serde_json::json!({"http": {
+        "url": "http://mirror.lan:8080/files/p.bin", "sha256": sha256_hex(&bytes)}}))
+    .unwrap();
+    f.secret("plain-url", "http://mirror.lan:8080/files/p.bin", 0o600);
+    let named = by_ref("secret://plain-url", &bytes);
+    let refusing = f.source_store(1 << 30);
+    for source in [&written, &named] {
+        let failure = refusing.materialize(source).await.unwrap_err();
+        assert_eq!(failure.reason, reason::DENIED);
+    }
+    assert!(f.requests("/files/p.bin").is_empty(), "nothing was fetched");
+    let mut approved = policy(1 << 30);
+    approved.plain_http = SourceSwitch::Allowed;
+    let approving = f.source_store_with(approved, &[]);
+    assert_eq!(
+        approving.materialize(&written).await.unwrap(),
+        bytes.len() as u64
+    );
+    assert_eq!(
+        approving.materialize(&named).await.unwrap(),
+        bytes.len() as u64
+    );
+    let wrong: ModelSource = serde_json::from_value(serde_json::json!({"http": {
+        "url": "http://mirror.lan:8080/files/p.bin", "sha256": sha256_hex(b"tampered")}}))
+    .unwrap();
+    assert_eq!(
+        approving.materialize(&wrong).await.unwrap_err().reason,
+        reason::HASH_MISMATCH
+    );
 }
 
 // T14 T37 (owner rule 2026-09-25: a secret is a variable or a protected file,
