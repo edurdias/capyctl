@@ -1,5 +1,44 @@
 # Current implementation and launch status
 
+## Load read for external routers and a queue of zero — 2026-10-08 (branch `feat/management-load-route`)
+
+Owner decision 2026-10-08 (SPEC §10 note). `GET /management/v1/metrics/load[?deployment=<id>]`
+on the management listener (admin token; an ID naming no deployment is `404 not_found`; two
+blocking reads at a time, the rest `429 queue_full`) reports per deployment the router's
+in-flight and waiting requests with their bounds, and per instance its router in-flight count,
+the latest host sample (time, age, `fresh` under the 3 s stale bound, ingress in-flight, engine
+running/waiting/KV ppm or `null`) and `max_running` with its source. The engine's own figure
+(`source: engine`) comes from SGLang's loopback `/v1/loads?include=core` (`max_running_requests`
+summed over data-parallel ranks), read by the host agent once per launch with the launch's key and
+carried on `LoadSample.max_running` (proto field 11, optional, additive both ways); otherwise the
+derived value names `declared`, `default`, `state_cache`, `extra_args`, `host_fixed`,
+`engine_default` or `on_host` (`context_fit::max_running_for_effective`, as status fits it). vLLM
+exposes `max_num_seqs` only on a development route behind the admin key and TensorFold not at all,
+so both stay derived. Standalone has no host load report, so its instances read `sample: null`.
+`resource_policy.queue.max_pending_per_deployment` now accepts 0 (YAML, `--set`,
+`CAPYCTL_SET__…`; tightest host wins): a request beyond the in-flight bound is refused at once with
+`429 queue_full` and `Retry-After: 1`; a request for a deployment that is not servable is refused
+the same way after starting (or joining) its detached activation. The in-flight bound stays 32:
+load samples are routing hints, never admission evidence, so the router does not follow the
+engine's reported limit (requests above it wait in the engine and show as its `waiting`).
+Recipe fingerprints are unchanged, with or without the setting.
+
+Tests: `a_host_queue_of_zero_lets_no_request_wait` (failed before: `invalid bounded resource
+controls`), `with_no_waiting_a_request_is_refused_at_once_but_starts_the_activation` (failed
+before: no activation), `with_no_waiting_a_request_beyond_the_in_flight_bound_is_refused_at_once`,
+`standalone_queue_of_zero_is_set_three_ways`, `the_running_limit_names_its_source`,
+`the_running_limit_of_a_tensorfold_launch_is_its_streams`,
+`the_engines_running_limit_travels_with_the_sample`, `the_engines_running_limit_is_kept_with_its_sample`,
+`sglangs_running_limit_is_read_from_its_loads`, `an_sglang_launch_reports_its_running_limit_once_read`,
+`the_load_read_names_deployments_and_their_instances` (store),
+`the_load_read_reports_fresh_then_stale_then_no_sample`, `unknown_load_is_null_never_zero`
+(router), `the_load_read_is_authenticated_filtered_and_names_unknown_deployments` and
+`the_load_read_serves_fresh_then_stale_samples` (management). CPU and fake-engine tests only; they
+are not qualification. Live check still needed: SGLang 0.5.21 on an enrolled host answers
+`/v1/loads?include=core` with the launch's inference key and its `max_running_requests` matches the
+limit it enforces (a hybrid model capped by its state cache is the interesting case); the fixture
+is SGLang 0.5.20's shape.
+
 ## Streamed delta fields audited — 2026-10-08 (branch `fix/relay-delta-allowlist`)
 
 The SSE relay's delta allowlist (`STREAM_DELTA_FIELDS`, capyctl-adapters forward.rs) was checked against every `DeltaMessage` field vLLM 0.29.0, SGLang 0.5.20 and TensorFold 0.6.0/0.6.3 serialize on `/v1/chat/completions`: `role`, `content`, `reasoning` (vLLM), `reasoning_content` (SGLang, TensorFold), `tool_calls` — already all listed, so no new key; SGLang `hidden_states` stays excluded (only for the refused `return_hidden_states`), vLLM `citations` is Cohere-endpoint only. Choice fields (`logprobs`, `stop_reason`, `token_ids`, `matched_stop`) and usage details were never key-checked and survive. CPU tests replay real-shaped chunks per engine. Not run live; vLLM 0.30, SGLang 0.5.18/0.5.19/0.5.21 sources were not on hand, so a live stream on each (reasoning parser, tool parser, `include_usage`, cache report) is still needed. Table: docs/guide/requests.md "Streamed fields".

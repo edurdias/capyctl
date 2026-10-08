@@ -5,6 +5,8 @@
 
 pub mod admission;
 pub mod balance;
+// SPEC §§10, 17 (owner decision 2026-10-08): the management load read.
+pub mod capacity;
 pub mod chat;
 pub mod forwarders;
 // SPEC §10 step 1 (W10): bounded waiting for a deployment to become servable.

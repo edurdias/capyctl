@@ -368,6 +368,7 @@ fn sample(deployment: &str, generation: i64) -> pb::LoadSample {
         kv_usage_ppm: 250_000,
         scrape_ok: true,
         latency: None,
+        max_running: None,
     }
 }
 fn load(samples: Vec<pb::LoadSample>) -> pb::ReportLoad {
@@ -433,6 +434,8 @@ fn load_report_is_bounded() {
         |s| s.waiting = (1 << 20) + 1,
         |s| s.ingress_in_flight = u32::MAX,
         |s| s.scrape_ok = false,
+        |s| s.max_running = Some(0),
+        |s| s.max_running = Some((1 << 20) + 1),
     ];
     for edit in edits {
         let mut s = sample("model", 1);
@@ -446,6 +449,28 @@ fn load_report_is_bounded() {
     let mut anonymous = load(vec![sample("model", 1)]);
     anonymous.host_id.clear();
     assert!(LoadReport::try_from(anonymous).is_err());
+}
+
+// SPEC §§10, 17 (owner decision 2026-10-08): the running limit an engine
+// reports travels with the sample, also beside a failed scrape (it is read
+// once per launch), and a sender that predates it sends none.
+#[test]
+fn the_engines_running_limit_travels_with_the_sample() {
+    let mut reported = sample("model", 3);
+    reported.max_running = Some(48);
+    let mut failed = sample("other", 1);
+    (
+        failed.scrape_ok,
+        failed.running,
+        failed.waiting,
+        failed.kv_usage_ppm,
+    ) = (false, 0, 0, 0);
+    failed.max_running = Some(8);
+    let report = LoadReport::try_from(load(vec![reported, failed, sample("older", 2)])).unwrap();
+    let limits: Vec<_> = report.samples.iter().map(|s| s.max_running).collect();
+    assert_eq!(limits, [Some(48), Some(8), None]);
+    let decoded = pb::ReportLoad::decode(report.to_wire().encode_to_vec().as_slice()).unwrap();
+    assert_eq!(LoadReport::try_from(decoded).unwrap(), report);
 }
 
 // T18 T34: a sample for another generation is stale and dropped by the receiver.

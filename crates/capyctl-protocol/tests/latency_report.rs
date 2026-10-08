@@ -16,6 +16,7 @@ fn sample(latency: Option<SampleLatency>) -> LoadSample {
         ingress_in_flight: 0,
         engine: None,
         latency,
+        max_running: None,
     }
 }
 fn wire(latency: Option<SampleLatency>) -> pb::ReportLoad {

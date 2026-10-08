@@ -18,6 +18,8 @@ use std::time::Duration;
 /// (`resource_policy.queue`, SPEC §16.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitLimits {
+    /// SPEC §10 (owner decision 2026-10-08): 0 lets no request wait; the
+    /// router then refuses at once where it would have queued (`chat.rs`).
     pub max_pending_per_deployment: usize,
     pub max_pending_total: usize,
     pub max_buffered_bytes_total: usize,

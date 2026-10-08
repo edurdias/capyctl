@@ -84,26 +84,24 @@ async fn resolve_held(
         timing.queued(std::time::Duration::ZERO, None);
         return Ok((deployment_id, None));
     }
+    // SPEC §10 (owner decision 2026-10-08): with no waiting allowed the request
+    // is refused at once, but it still starts (or joins) the one activation a
+    // waiting request would have joined, so a retry finds the deployment
+    // servable. The activation runs detached; this request does not await it.
+    if deps.inflight.waiting.limits().max_pending_per_deployment == 0 {
+        let _ = futures::FutureExt::now_or_never(join_activation(deps, &deployment_id));
+        return Err(err(
+            "queue_full",
+            &format!(
+                "deployment {deployment_id} is not servable now and lets no request wait; retry shortly"
+            ),
+        ));
+    }
     // SPEC §17: the W10 wait, measured from entering the queue.
     let waited = std::time::Instant::now();
     let ticket = enter_queue(deps, &deployment_id, body_bytes)?;
     let deadline = received + deps.inflight.waiting.limits().deadline;
-    let controller = deps.controller.clone();
-    let id = deployment_id.clone();
-    let joined = deps.activation_join.join_detached(
-        &deployment_id,
-        move || async move {
-            controller
-                .activate_for_request(&id)
-                .await
-                .map(|()| 0)
-                .map_err(map_controller)
-        },
-        err(
-            "activation_uncertain",
-            "the activation task ended without an outcome; retry shortly",
-        ),
-    );
+    let joined = join_activation(deps, &deployment_id);
     let joined_at = std::time::Instant::now();
     match tokio::time::timeout_at(deadline, joined).await {
         Ok(Ok(_)) => {
@@ -120,6 +118,33 @@ async fn resolve_held(
             ),
         )),
     }
+}
+
+/// SPEC §10 step 2 (T15, W10): join (or start) the deployment's one
+/// activation. It runs as its own task, so no caller that stops waiting (a
+/// deadline, a disconnect, a refusal) cancels it for the others.
+async fn join_activation(
+    deps: &RouterDeps,
+    deployment_id: &str,
+) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    let controller = deps.controller.clone();
+    let id = deployment_id.to_owned();
+    deps.activation_join
+        .join_detached(
+            deployment_id,
+            move || async move {
+                controller
+                    .activate_for_request(&id)
+                    .await
+                    .map(|()| 0)
+                    .map_err(map_controller)
+            },
+            err(
+                "activation_uncertain",
+                "the activation task ended without an outcome; retry shortly",
+            ),
+        )
+        .await
 }
 
 /// SPEC §10 step 1 (T19): hold a place in the bounded waiting queue.
@@ -163,6 +188,15 @@ pub async fn admit_timed(
     }
     let _ticket = match ticket {
         Some(ticket) => ticket,
+        // SPEC §10 (owner decision 2026-10-08): no request waits for a slot.
+        None if deps.inflight.waiting.limits().max_pending_per_deployment == 0 => {
+            return Err(err(
+                "queue_full",
+                &format!(
+                    "deployment {deployment_id} is at its in-flight bound and lets no request wait; retry shortly"
+                ),
+            ));
+        }
         None => enter_queue(deps, &deployment_id, body_bytes)?,
     };
     let deadline = received + deps.inflight.waiting.limits().deadline;

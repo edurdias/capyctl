@@ -326,8 +326,9 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
         host["resource_policy"]["queue"]["stream_idle_timeout"] = value.into();
         assert!(resolve_effective(&deployment, &host).is_err(), "{value}");
     }
+    // SPEC §10 (owner decision 2026-10-08): a deployment's waiting bound may
+    // be 0 (`a_host_queue_of_zero_lets_no_request_wait`); the others may not.
     for pointer in [
-        "/resource_policy/queue/max_pending_per_deployment",
         "/resource_policy/queue/max_pending_total",
         "/resource_policy/planner_max_states",
     ] {
@@ -358,6 +359,36 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
         *host.pointer_mut(pointer).unwrap() = value;
         assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
     }
+}
+
+// T19, SPEC §10 (owner decision 2026-10-08): `max_pending_per_deployment: 0`
+// lets no request wait in the router; it is a router bound, so the launched
+// recipe and its fingerprint are the same as with the default, and a host
+// that leaves the queue unset resolves exactly as before.
+#[test]
+fn a_host_queue_of_zero_lets_no_request_wait() {
+    let (deployment, mut host) = fixture();
+    host["resource_policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("queue");
+    let unset = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(unset.host.queue.max_pending_per_deployment, 64);
+    host["resource_policy"]["queue"] = serde_json::json!({"max_pending_per_deployment": 0});
+    let zero = resolve_effective(&deployment, &host).expect("0 is a valid waiting bound");
+    assert_eq!(zero.host.queue.max_pending_per_deployment, 0);
+    assert_eq!(
+        zero.host.queue.max_pending_total,
+        unset.host.queue.max_pending_total
+    );
+    assert_eq!(zero.recipe_fingerprint, unset.recipe_fingerprint);
+    let (golden_deployment, golden_host) = fixture();
+    assert_eq!(
+        resolve_effective(&golden_deployment, &golden_host)
+            .unwrap()
+            .recipe_fingerprint,
+        unset.recipe_fingerprint
+    );
 }
 
 #[test]

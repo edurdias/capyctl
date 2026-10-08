@@ -156,6 +156,7 @@ mod tests {
                 sampled_at_ms: 1,
                 ingress_in_flight: 0,
                 engine: None,
+                max_running: None,
                 latency: Some(SampleLatency {
                     engine: Some("vllm".into()),
                     histograms: vec![(series.into(), h)],

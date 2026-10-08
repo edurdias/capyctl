@@ -186,6 +186,24 @@ Preview and Nemotron 3 Ultra need three or more machines; Hy3 has no validated
 command. Next milestones: container launchers, and a live row on three or more
 rented machines.
 
+## Requests
+
+- **Live load on the management API.** `GET /management/v1/metrics/load`
+  (`?deployment=<id>` for one) reports, for every model, the requests CapyCTL
+  is forwarding and the ones waiting, with their limits, and for every
+  instance the engine's running and waiting requests, how many requests the
+  engine runs at once (SGLang's own figure, else the one CapyCTL passed, with
+  where it came from) and when the host last sampled it, with the sample's age
+  and whether it is still fresh. A client that balances across several
+  servers can poll it every second. Standalone shows no engine figures. See
+  [reading load](../guide/parking.md#reading-load).
+- **A model can let no request wait.** `max_pending_per_deployment: 0` in a
+  host's `resource_policy.queue` (or `--set`, or `CAPYCTL_SET__…`) makes
+  CapyCTL refuse a request at once, with `429 queue_full` and `Retry-After`,
+  where it would have made it wait: beyond the 32 running requests, or for a
+  model that is not loaded (which still starts loading). The default stays
+  64. See [no waiting](../guide/parking.md#no-waiting).
+
 ## Fixes
 
 - **The streamed fields CapyCTL relays are documented.** The

@@ -361,3 +361,38 @@ async fn a_request_waiting_past_its_deadline_is_refused_retryably() {
     .await;
     assert_eq!(f.authority.activations.load(Ordering::SeqCst), 1);
 }
+
+// T15 T19, SPEC §10 (owner decision 2026-10-08): with no waiting allowed
+// (`max_pending_per_deployment: 0`), a request for a deployment that is not
+// servable is refused at once, retryably, yet it still starts the one
+// activation a waiting request would have joined, so a retry after the hint
+// finds the deployment servable. Concurrent refusals start no second one.
+#[tokio::test]
+async fn with_no_waiting_a_request_is_refused_at_once_but_starts_the_activation() {
+    let f = fixture(limits(0, 1 << 20, 10_000));
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (status, refused) = request(&f, 16).await.unwrap().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it did not wait"
+        );
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused["code"], "queue_full", "{refused}");
+        assert_eq!(refused["retryable"], true);
+    }
+    assert_eq!(f.deps.inflight.waiting.totals(), (0, 0));
+    until("the activation started", || {
+        f.authority.activations.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(f.engine.served.load(Ordering::SeqCst), 0);
+    f.authority.release.add_permits(1);
+    until("activation finished", || {
+        f.authority.finished.load(Ordering::SeqCst)
+    })
+    .await;
+    request(&f, 16).await.unwrap().unwrap();
+    assert_eq!(f.authority.activations.load(Ordering::SeqCst), 1);
+    assert_eq!(f.engine.served.load(Ordering::SeqCst), 1);
+}

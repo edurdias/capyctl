@@ -880,6 +880,7 @@ async fn crashed_request_leases_close_only_on_quiescence_after_a_fresh_probe() {
             waiting: 0,
             kv_usage_ppm: 0,
         }),
+        max_running: None,
     };
     let ledger = crate::remote_execution::ReadinessLedger::default();
     let supervisor = crate::remote_readiness::RemoteReadiness::new(
@@ -1429,6 +1430,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
             kv_usage_ppm: 100_000,
         }),
         latency: None,
+        max_running: None,
     };
     load.accept(
         "lab",
@@ -1738,6 +1740,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                         kv_usage_ppm: 0,
                     }),
                     latency: None,
+                    max_running: None,
                 }],
             },
             capyctl_protocol::now_unix_ms(),
@@ -1894,6 +1897,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                         kv_usage_ppm: 0,
                     }),
                     latency: None,
+                    max_running: None,
                 }],
             },
             capyctl_protocol::now_unix_ms(),

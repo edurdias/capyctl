@@ -75,6 +75,10 @@ pub struct LoadView {
     /// `None` when the host could not scrape the engine's metrics: missing
     /// metrics are unknown load, never zero.
     pub engine: Option<EngineGauges>,
+    /// SPEC §§10, 17 (owner decision 2026-10-08): the running-request limit
+    /// the engine reports for this launch, when it reports one. An
+    /// observation for status, never an admission bound.
+    pub max_running: Option<u32>,
 }
 
 impl LoadView {
@@ -91,6 +95,7 @@ struct Entry {
     sampled_at_ms: i64,
     ingress_in_flight: u32,
     engine: Option<EngineGauges>,
+    max_running: Option<u32>,
 }
 
 /// Why a whole report was refused. A refused report ends the host session;
@@ -178,6 +183,7 @@ impl LoadTable {
                         waiting: e.waiting,
                         kv_usage_ppm: e.kv_usage_ppm,
                     }),
+                    max_running: sample.max_running,
                 },
             );
             outcome.applied += 1;
@@ -274,6 +280,7 @@ fn view(key: &InstanceKey, entry: &Entry, age_ms: i64) -> LoadView {
         fresh: age_ms <= LOAD_STALE_AFTER_MS,
         ingress_in_flight: entry.ingress_in_flight,
         engine: entry.engine,
+        max_running: entry.max_running,
     }
 }
 
@@ -297,6 +304,7 @@ mod tests {
                 kv_usage_ppm: 250_000,
             }),
             latency: None,
+            max_running: None,
         }
     }
     fn report(host: &str, samples: Vec<LoadSample>) -> LoadReport {
@@ -324,6 +332,7 @@ mod tests {
                 waiting: 0,
                 kv_usage_ppm: 0,
             }),
+            max_running: None,
         };
         let proves = |view: &LoadView| proves_quiescence(view, "h1", "launch", 2, NOW);
         assert!(proves(&idle));
@@ -383,6 +392,29 @@ mod tests {
         table.retain_generations("d", &[4]);
         assert!(table.sample_at(&InstanceKey::new("d", 3), NOW).is_none());
         assert!(table.sample_at(&InstanceKey::new("d", 4), NOW).is_some());
+    }
+
+    // SPEC §§10, 17 (owner decision 2026-10-08): the running limit an engine
+    // reports is kept with its sample, and a sample without one reads none.
+    #[test]
+    fn the_engines_running_limit_is_kept_with_its_sample() {
+        let table = LoadTable::new();
+        let mut limited = sample("d", 1, NOW, 2);
+        limited.max_running = Some(48);
+        table
+            .accept(
+                "h1",
+                report("h1", vec![limited, sample("e", 1, NOW, 2)]),
+                NOW,
+            )
+            .unwrap();
+        let read = |deployment: &str| {
+            table
+                .sample_at(&InstanceKey::new(deployment, 1), NOW)
+                .unwrap()
+                .max_running
+        };
+        assert_eq!((read("d"), read("e")), (Some(48), None));
     }
 
     // ADR 0013 §10: a sample older than 3 s is stale and not scored; one older

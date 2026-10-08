@@ -317,11 +317,139 @@ async fn many_scopes_split_into_bounded_reports() {
             ingress_in_flight: 0,
             engine: None,
             latency: None,
+            max_running: None,
         })
         .collect();
     let batched = load::batch("host", big);
     assert!(batched.len() >= 3);
     assert_eq!(samples(batched).len(), 20);
+}
+
+/// SGLang 0.5.20 `/v1/loads?include=core` shape (`entrypoints/v1_loads.py`,
+/// `managers/load_snapshot.py`): one entry per data-parallel rank.
+const SGLANG_LOADS: &str = r#"{"timestamp":"2026-10-08T00:00:00+00:00","version":"0.5.20",
+"accelerator":"GPU","num_accelerators":1,"loads":[
+{"timestamp":1.0,"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":1,"max_running_requests":24,"max_total_num_tokens":131072},
+{"timestamp":1.0,"dp_rank":1,"num_running_reqs":0,"num_waiting_reqs":0,"max_running_requests":24,"max_total_num_tokens":131072}]}"#;
+
+// SPEC §§10, 17 (owner decision 2026-10-08): SGLang's resolved running limit is
+// the sum of its data-parallel ranks' `max_running_requests`; anything else
+// (a rank without it, a zero, a malformed body) is no figure, never a guess.
+#[test]
+fn sglangs_running_limit_is_read_from_its_loads() {
+    assert_eq!(
+        load::parse_sglang_max_running(SGLANG_LOADS.as_bytes()),
+        Some(48)
+    );
+    for body in [
+        r#"{"loads":[]}"#,
+        r#"{"loads":[{"dp_rank":0,"max_running_requests":0}]}"#,
+        r#"{"loads":[{"dp_rank":0,"max_running_requests":8},{"dp_rank":1}]}"#,
+        r#"{"loads":[{"dp_rank":0,"max_running_requests":-1}]}"#,
+        r#"{"loads":[{"dp_rank":0,"max_running_requests":2000000}]}"#,
+        r#"{"loads":{"max_running_requests":8}}"#,
+        "not json",
+    ] {
+        assert_eq!(
+            load::parse_sglang_max_running(body.as_bytes()),
+            None,
+            "{body}"
+        );
+    }
+}
+
+/// A fake SGLang engine: keyed `/metrics` and `/v1/loads`, counting reads of
+/// the latter.
+async fn sglang_engine(
+    native: [u8; 32],
+    loads: &'static str,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let expected = format!("Bearer {}", hex::encode(native));
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keyed = move |headers: &HeaderMap| {
+        headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(expected.as_str())
+    };
+    let (metrics_key, loads_key, counter) = (keyed.clone(), keyed, reads.clone());
+    let router =
+        Router::new()
+            .route(
+                "/metrics",
+                get(move |headers: HeaderMap| async move {
+                    if !metrics_key(&headers) {
+                        return (StatusCode::UNAUTHORIZED, String::new());
+                    }
+                    (StatusCode::OK, SGLANG_METRICS.to_owned())
+                }),
+            )
+            .route(
+                "/v1/loads",
+                get(
+                    move |headers: HeaderMap,
+                          query: axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if !loads_key(&headers)
+                            || query.get("include").map(String::as_str) != Some("core")
+                        {
+                            return (StatusCode::UNAUTHORIZED, String::new());
+                        }
+                        (StatusCode::OK, loads.to_owned())
+                    },
+                ),
+            );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (address, reads)
+}
+
+// SPEC §§10, 17 (owner decision 2026-10-08): a host reports the running limit
+// SGLang resolved for each launch, read on loopback with the launch's key once
+// per launch (the limit is fixed for its life) and carried on every sample;
+// another engine's sample carries none.
+#[tokio::test]
+async fn an_sglang_launch_reports_its_running_limit_once_read() {
+    let ingress = Ingress::new().unwrap();
+    let sglang = scope("sglang", 2);
+    let vllm = scope("vllm", 1);
+    let (address, reads) = sglang_engine([4; 32], SGLANG_LOADS).await;
+    register(&ingress, &sglang, address, 3, [4; 32]);
+    register(
+        &ingress,
+        &vllm,
+        engine([2; 32], VLLM_METRICS, Duration::ZERO).await,
+        1,
+        [2; 32],
+    );
+    for (s, handle) in [(&sglang, "launch-s"), (&vllm, "launch-v")] {
+        ingress.bind_handle(s, handle).unwrap();
+        ingress.open(s).unwrap();
+    }
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    for _ in 0..3 {
+        let all = samples(reporter.reports().await);
+        let limits: Vec<_> = all
+            .iter()
+            .map(|s| (s.deployment_id.as_str(), s.max_running))
+            .collect();
+        assert_eq!(limits, [("sglang", Some(48)), ("vllm", None)]);
+    }
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "read once per launch"
+    );
+    // A new launch of the deployment is read again.
+    ingress.close_all().unwrap();
+    let next = scope("sglang", 3);
+    let (address, again) = sglang_engine([5; 32], SGLANG_LOADS).await;
+    register(&ingress, &next, address, 6, [5; 32]);
+    ingress.bind_handle(&next, "launch-s3").unwrap();
+    ingress.open(&next).unwrap();
+    let all = samples(reporter.reports().await);
+    assert_eq!(all[0].max_running, Some(48));
+    assert_eq!(again.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 // T37 / M08 / SPEC §13.3: engine metrics are never reachable through ingress.

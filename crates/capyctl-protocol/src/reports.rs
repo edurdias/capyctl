@@ -153,6 +153,9 @@ pub struct LoadSample {
     pub engine: Option<EngineLoad>,
     /// SPEC §17 (M80): latency observed since the previous report, if any.
     pub latency: Option<SampleLatency>,
+    /// SPEC §§10, 17 (owner decision 2026-10-08): the running-request limit
+    /// the engine reports for this launch; `None` when it reports none.
+    pub max_running: Option<u32>,
 }
 
 impl LoadSample {
@@ -191,6 +194,10 @@ impl TryFrom<pb::ReportLoad> for LoadReport {
                 || sample.running > MAX_LOAD_GAUGE
                 || sample.waiting > MAX_LOAD_GAUGE
                 || sample.kv_usage_ppm > KV_USAGE_PPM_FULL
+                // A reported limit is a positive gauge.
+                || sample
+                    .max_running
+                    .is_some_and(|limit| limit == 0 || limit > MAX_LOAD_GAUGE)
                 // A failed scrape carries no engine numbers at all.
                 || (!sample.scrape_ok
                     && (sample.running != 0 || sample.waiting != 0 || sample.kv_usage_ppm != 0))
@@ -205,6 +212,7 @@ impl TryFrom<pb::ReportLoad> for LoadReport {
             };
             samples.push(LoadSample {
                 latency,
+                max_running: sample.max_running,
                 engine: sample.scrape_ok.then_some(EngineLoad {
                     running: sample.running,
                     waiting: sample.waiting,
@@ -248,6 +256,7 @@ impl LoadReport {
                         kv_usage_ppm: engine.kv_usage_ppm,
                         scrape_ok: s.engine.is_some(),
                         latency: s.latency.as_ref().map(SampleLatency::to_wire),
+                        max_running: s.max_running,
                     }
                 })
                 .collect(),

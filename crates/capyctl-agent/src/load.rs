@@ -2,7 +2,9 @@
 //!
 //! Once per tick the host scrapes each Ready scope's engine `/metrics` on
 //! loopback, with that launch's native key, and reports the gauges with the
-//! ingress in-flight count over the control session as W3 `ReportLoad`.
+//! ingress in-flight count over the control session as W3 `ReportLoad`. An
+//! SGLang launch's resolved running limit is read once from its loopback
+//! `/v1/loads` and carried on its samples (owner decision 2026-10-08).
 //!
 //! A sample is a routing hint, never readiness or admission evidence and never
 //! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
@@ -400,9 +402,51 @@ pub fn fold_tensorfold_health(load: EngineLoad, health: Option<&HealthReport>) -
     }
 }
 
+/// SPEC §§10, 17 (owner decision 2026-10-08): where SGLang reports the
+/// running-request limit it resolved for the launch: `max_running_requests`
+/// per data-parallel rank in `/v1/loads` (SGLang 0.5.20
+/// `sglang/srt/entrypoints/v1_loads.py`, `managers/load_snapshot.py`). The
+/// `core` section carries no request content and no server arguments.
+pub const SGLANG_LOADS_PATH: &str = "/v1/loads?include=core";
+
+/// The running limit in one SGLang `/v1/loads` body: the sum over its ranks.
+/// `None` unless every rank names a positive limit and the sum is a bounded
+/// gauge; a missing figure is unknown, never zero.
+pub fn parse_sglang_max_running(body: &[u8]) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let loads = value.get("loads")?.as_array()?;
+    if loads.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for load in loads {
+        let limit = load
+            .get("max_running_requests")?
+            .as_u64()
+            .filter(|limit| *limit > 0)?;
+        total = total.checked_add(limit)?;
+    }
+    u32::try_from(total)
+        .ok()
+        .filter(|total| *total <= MAX_LOAD_GAUGE)
+}
+
 /// Previous cumulative engine histograms, keyed by scope and series, so each
 /// report carries only what was observed since the last one.
 type EngineBaselines = HashMap<(String, u32, i64, String), Histogram>;
+
+/// One launch of one scope: its deployment, instance, generation and owned
+/// handle.
+type LaunchKey = (String, u32, i64, String);
+
+fn launch_key(target: &LoadTarget) -> LaunchKey {
+    (
+        target.scope.deployment_id.clone(),
+        target.scope.instance_index,
+        target.scope.generation,
+        target.owned_handle.clone(),
+    )
+}
 
 /// Scrapes Ready scopes and builds bounded load reports for one host.
 pub struct LoadReporter {
@@ -412,6 +456,10 @@ pub struct LoadReporter {
     interval: Duration,
     /// SPEC §17: bounded by the Ready scopes of this tick (pruned each tick).
     baselines: Mutex<EngineBaselines>,
+    /// SPEC §§10, 17: the running limit each launch's engine reported. It is
+    /// fixed for the launch's life, so it is read once; bounded and pruned as
+    /// the baselines are.
+    limits: Mutex<HashMap<LaunchKey, u32>>,
 }
 
 /// A response body, refused as soon as it passes the scrape size bound.
@@ -440,6 +488,7 @@ impl LoadReporter {
             host_id,
             interval: DEFAULT_LOAD_INTERVAL,
             baselines: Mutex::new(HashMap::new()),
+            limits: Mutex::new(HashMap::new()),
         })
     }
     pub fn with_interval(mut self, period: Duration) -> Result<Self, LoadError> {
@@ -503,6 +552,74 @@ impl LoadReporter {
             .flatten()
     }
 
+    /// SPEC §§10, 17 (owner decision 2026-10-08): SGLang's resolved running
+    /// limit, on the same loopback target with the launch's key, within the
+    /// scrape bound.
+    async fn sglang_max_running(&self, target: &LoadTarget) -> Option<u32> {
+        if !target.target.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = self
+                .client
+                .get(format!("http://{}{SGLANG_LOADS_PATH}", target.target))
+                .bearer_auth(hex::encode(target.native))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
+            }
+            parse_sglang_max_running(&bounded_body(response).await?)
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The running limit of each target's launch: known from an earlier tick,
+    /// else read now from an SGLang engine (the only one that reports it).
+    async fn max_running(
+        &self,
+        targets: &[LoadTarget],
+        families: &[Option<&'static str>],
+    ) -> Vec<Option<u32>> {
+        let known: Vec<Option<u32>> = {
+            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            // SPEC §17: limits of launches no longer Ready are dropped.
+            let live: std::collections::HashSet<LaunchKey> =
+                targets.iter().map(launch_key).collect();
+            limits.retain(|key, _| live.contains(key));
+            targets
+                .iter()
+                .map(|target| limits.get(&launch_key(target)).copied())
+                .collect()
+        };
+        let read = futures::future::join_all(targets.iter().zip(families).zip(&known).map(
+            |((target, family), known)| async move {
+                match (known, family) {
+                    (Some(_), _) => None,
+                    (None, Some("sglang")) => self.sglang_max_running(target).await,
+                    (None, _) => None,
+                }
+            },
+        ))
+        .await;
+        let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+        targets
+            .iter()
+            .zip(known)
+            .zip(read)
+            .map(|((target, known), read)| {
+                if let Some(read) = read {
+                    limits.insert(launch_key(target), read);
+                }
+                known.or(read)
+            })
+            .collect()
+    }
+
     /// One tick: a sample per Ready scope, split into reports that each pass
     /// the W3 bounds. Empty when no scope is Ready.
     pub async fn reports(&self) -> Vec<pb::ReportLoad> {
@@ -514,16 +631,21 @@ impl LoadReporter {
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
         let scraped = futures::future::join_all(targets.iter().map(|t| self.scrape(t))).await;
+        let families: Vec<Option<&'static str>> = scraped
+            .iter()
+            .map(|body| body.as_deref().and_then(family_of).map(|(name, ..)| name))
+            .collect();
         // Only a TensorFold scrape is folded with its health.
-        let healths = futures::future::join_all(targets.iter().zip(&scraped).map(
-            |(target, body)| async move {
-                match body.as_deref().and_then(family_of) {
-                    Some(("tensorfold", ..)) => Some(self.health(target).await),
+        let healths = futures::future::join_all(targets.iter().zip(&families).map(
+            |(target, family)| async move {
+                match family {
+                    Some("tensorfold") => Some(self.health(target).await),
                     _ => None,
                 }
             },
         ))
         .await;
+        let limits = self.max_running(&targets, &families).await;
         let mut baselines = self.baselines.lock().unwrap_or_else(|p| p.into_inner());
         // SPEC §17: baselines of scopes no longer Ready are dropped.
         baselines.retain(|(deployment, instance, generation, _), _| {
@@ -537,7 +659,8 @@ impl LoadReporter {
             .into_iter()
             .zip(scraped)
             .zip(healths)
-            .map(|((target, body), health)| {
+            .zip(limits)
+            .map(|(((target, body), health), max_running)| {
                 let engine =
                     body.as_deref()
                         .and_then(parse_engine_load)
@@ -558,6 +681,7 @@ impl LoadReporter {
                             .min(MAX_LOAD_GAUGE),
                         engine,
                         latency,
+                        max_running,
                     },
                 )
             })

@@ -478,3 +478,42 @@ fn the_streams_a_launch_decodes_together_are_shown_with_their_source() {
     assert_eq!(streams.count, Some(1));
     assert!(streams.reason.unwrap().contains("one request at a time"));
 }
+
+// SPEC §10 and §17 (owner decision 2026-10-08): the load read's running limit
+// for TensorFold is its streams, with the same source.
+#[test]
+fn the_running_limit_of_a_tensorfold_launch_is_its_streams() {
+    use capyctl_config::context_fit::{
+        fit_for_effective, max_running_for_effective, MaxRunningSource,
+    };
+    let running = |deployment: &Value, host: &Value| {
+        let effective = resolve_effective(deployment, host).unwrap();
+        let running = max_running_for_effective(&effective, &fit_for_effective(&effective), false);
+        (running.count, running.source)
+    };
+    let (mut deployment, mut host) = fixture();
+    assert_eq!(
+        running(&deployment, &host),
+        (
+            Some(capyctl_domain::launch::TENSORFOLD_DEFAULT_PARALLEL),
+            MaxRunningSource::Default
+        )
+    );
+    deployment["engine_config"]["max_concurrent_requests"] = 4.into();
+    assert_eq!(
+        running(&deployment, &host),
+        (Some(4), MaxRunningSource::Declared)
+    );
+    deployment["engine_config"] = json!({"context_length": 8192, "accept_extra_args": true,
+        "extra_args": ["--parallel", "many"]});
+    assert_eq!(
+        running(&deployment, &host),
+        (None, MaxRunningSource::ExtraArgs)
+    );
+    deployment["engine_config"] = json!({"context_length": 8192});
+    host["runtime_profiles"]["local"]["args"] = json!(["--parallel", "2"]);
+    assert_eq!(
+        running(&deployment, &host),
+        (Some(2), MaxRunningSource::HostFixed)
+    );
+}

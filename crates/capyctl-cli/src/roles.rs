@@ -2045,6 +2045,9 @@ async fn start_standalone_in(
     // one embedded host: its published document (so `engine add` shows at
     // once) and its memory as observed now (one `/proc` read, plus a bounded
     // GPU sample on a discrete-GPU host).
+    // SPEC §§10, 17 (owner decision 2026-10-08): the load read below reads the
+    // same store.
+    let load_owner = owner.clone();
     let hosts_view = capyctl_management::hosts::standalone_hosts_router(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
@@ -2107,6 +2110,16 @@ async fn start_standalone_in(
             }),
         )
     };
+    // SPEC §§10, 17 (owner decision 2026-10-08): live load. The embedded engine
+    // reports no load, so instances carry no sample; the router's figures and
+    // the derived running limits are live.
+    let load_view = crate::remote_roles::load_view(
+        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?,
+        load_owner,
+        inflight.clone(),
+        None,
+    );
     // ADR 0018 §4, §5: removal retires through the store, as a server does.
     let retirements = Arc::new(capyctl_management::engines::StoreRetirements::new(
         source.clone(),
@@ -2125,6 +2138,7 @@ async fn start_standalone_in(
         .merge(installation_view)
         .merge(hosts_view)
         .merge(latency_view)
+        .merge(load_view)
         .merge(inference_listener_view);
     let controller = Arc::new(
         CoordinatorLifecycle::new(coordinator.commands())

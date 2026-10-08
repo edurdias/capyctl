@@ -629,6 +629,63 @@ fn a_derived_request_holds_the_state_of_its_running_requests() {
     assert_eq!(fit.running_limit, None);
 }
 
+// T14, SPEC §10 and §17 (owner decision 2026-10-08): the load read names the
+// running requests a launch is held to and where the figure came from, as
+// status shows it: what CapyCTL passes (declared, its default, a hybrid
+// model's state cache), what the installation's arguments pass, or nothing
+// known (the engine chooses, or the host sizes it at launch).
+#[test]
+fn the_running_limit_names_its_source() {
+    use capyctl_config::context_fit::{
+        fit_for_effective, fit_on_remote_host, max_running_for_effective, MaxRunningSource,
+    };
+    let local = |effective: &EffectiveDeployment| {
+        let running = max_running_for_effective(effective, &fit_for_effective(effective), false);
+        (running.count, running.source)
+    };
+    let remote = |effective: &EffectiveDeployment| {
+        let running = max_running_for_effective(effective, &fit_on_remote_host(effective), true);
+        (running.count, running.source)
+    };
+    // vLLM: the router's bound unless the deployment or the installation says.
+    let (_store, effective) = resolved("vllm", Some(&dense()), |_, _| {});
+    assert_eq!(local(&effective), (Some(32), MaxRunningSource::Default));
+    assert_eq!(remote(&effective), (Some(32), MaxRunningSource::Default));
+    let (_store, effective) = resolved("vllm", Some(&dense()), |d, _| {
+        d["engine_config"]["max_concurrent_requests"] = json!(8);
+    });
+    assert_eq!(local(&effective), (Some(8), MaxRunningSource::Declared));
+    let (_store, effective) = resolved("vllm", Some(&dense()), |_, host| {
+        host["runtime_profiles"]["local"]["args"] = json!(["--max-num-seqs", "64"]);
+    });
+    assert_eq!(local(&effective), (Some(64), MaxRunningSource::HostFixed));
+    // SGLang, dense and undeclared: SGLang chooses at start.
+    let (_store, effective) = resolved("sglang", Some(&dense()), |_, _| {});
+    assert_eq!(local(&effective), (None, MaxRunningSource::EngineDefault));
+    assert_eq!(remote(&effective), (None, MaxRunningSource::OnHost));
+    let (_store, effective) = resolved("sglang", Some(&dense()), |d, _| {
+        d["engine_config"]["max_concurrent_requests"] = json!(16);
+    });
+    assert_eq!(local(&effective), (Some(16), MaxRunningSource::Declared));
+    assert_eq!(remote(&effective), (Some(16), MaxRunningSource::Declared));
+    // SGLang, hybrid: the state cache holds the default 8.
+    let (_store, effective) = unified_sglang(
+        &qwen38_27b(),
+        21_920_000_000,
+        Some(QWEN38_STATE),
+        "120GiB",
+        |d| {
+            d["engine_config"]["memory"] = json!({"kv_cache": "4GiB"});
+        },
+    );
+    assert_eq!(local(&effective), (Some(8), MaxRunningSource::StateCache));
+    let reported = capyctl_config::context_fit::MaxRunning::reported(5);
+    assert_eq!(
+        (reported.count, reported.source),
+        (Some(5), MaxRunningSource::Engine)
+    );
+}
+
 // T14 (amendment A16): the state reserved is what the memory domain still
 // holds beside the request, the engine's CUDA context and the first-start
 // graph allowance; the running requests are limited to it, and status says so.
