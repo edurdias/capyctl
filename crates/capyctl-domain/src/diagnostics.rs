@@ -69,7 +69,7 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "engine_exited",
-        "the engine exited before it was ready; check the deployment's engine_config and the host's private engine log (SGLang writes its output there only when capyctl runs with --debug-engine-logs; restart capyctl with it and start again to see the reason)",
+        "the engine exited before it was ready; check the deployment's engine_config and the end of the instance's engine log (redacted, from GET /management/v1/deployments/<id>/engine-log, or the host's private log file)",
     ),
     (
         "port_conflict",
@@ -250,14 +250,15 @@ mod tests {
             .contains("--evict"));
     }
 
-    // T16 (found live 2026-10-03): SGLang keeps no output unless capyctl runs
-    // with --debug-engine-logs, so the hint that sends an operator to the log
-    // says so; a launch refused for its engine port names what to do.
+    // T16 (found live 2026-10-03; SPEC §13.3 amended 2026-10-08): every
+    // engine's output is kept, redacted, so the hint that sends an operator to
+    // the log names where to read it; a launch refused for its engine port
+    // names what to do.
     #[test]
-    fn hints_name_debug_engine_logs_and_a_busy_engine_port() {
+    fn hints_name_the_engine_log_and_a_busy_engine_port() {
         assert!(operator_hint("engine_exited")
             .unwrap()
-            .contains("--debug-engine-logs"));
+            .contains("/engine-log"));
         assert_eq!(
             classify(Some("launch_failed"), "launch refused: port_conflict"),
             Some("port_conflict")

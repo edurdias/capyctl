@@ -364,15 +364,21 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             with self.subTest(phase=phase), self.assertRaises(mapping.ServerArgsError):
                 construct(self.build(), self.placement(), changed)
 
-    def test_debug_logging_requires_exact_operator_opt_in(self):
-        for selected, expected in ((None, "error"), ("0", "error"), ("true", "error"), ("1", "debug")):
+    # T21 / SPEC §13.3: SGLang's own default level (info) unless the operator
+    # opted into debug; request logging and crash dumps stay off either way,
+    # so no prompt or completion text is logged (SGLang 0.5.21 logs request
+    # text only under log_requests: srt/utils/request_logger.py:88-90, 159-163).
+    def test_info_is_the_default_level_and_request_logging_stays_off(self):
+        for selected, expected in ((None, "info"), ("0", "info"), ("true", "info"), ("1", "debug")):
             with self.subTest(selected=selected), mock.patch.dict(os.environ, {}, clear=True):
                 if selected is not None:
                     os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = selected
                 result = construct(self.build(), self.placement())
                 self.assertEqual(result._native.log_level, expected)
                 self.assertEqual(result._native.log_level_http, expected)
-                self.assertFalse(result._native.log_requests)
+                self.assertIs(result._native.log_requests, False)
+                self.assertIsNone(result._native.log_requests_target)
+                self.assertIsNone(result._native.crash_dump_folder)
                 result.revalidate()
 
     def test_placement_must_match_binding_and_physical_namespace(self):
@@ -448,9 +454,9 @@ class MappingTests(LaunchFixture, unittest.TestCase):
 
     # T16 (found live 2026-10-03): SGLang's own reason for refusing the
     # arguments (here language_model_only on an architecture it does not
-    # support) reaches the private engine log when the operator turned debug
-    # engine logs on, scrubbed of credentials; without it nothing is written.
-    def test_a_refusal_reason_is_logged_only_with_debug_engine_logs(self):
+    # support) reaches the private engine log, scrubbed of credentials, with
+    # or without debug engine logs (SPEC §13.3: the default log is kept).
+    def test_a_refusal_reason_is_logged_without_credentials(self):
         import contextlib
         import io
         key = self.inference.decode()
@@ -458,7 +464,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         def refusing(**kwargs):
             raise ValueError("--language-model-only does not support "
                              "['Qwen3_5ForConditionalGeneration'] " + key)
-        for debug, expected in (("1", True), (None, False)):
+        for debug in ("1", None):
             with self.subTest(debug=debug):
                 env = {} if debug is None else {"CAPYCTL_DEBUG_ENGINE_LOGS": debug}
                 captured = io.StringIO()
@@ -470,7 +476,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                         construct(self.build(), self.placement(), refusing)
                 self.assertEqual(str(caught.exception), "server_args_construction_failed")
                 text = captured.getvalue()
-                self.assertEqual("language-model-only does not support" in text, expected, text)
+                self.assertIn("language-model-only does not support", text)
                 self.assertNotIn(key, text)
 
     def test_import_is_cpu_only_and_the_boundary_requires_a_held_contract(self):

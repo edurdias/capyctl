@@ -1,6 +1,8 @@
 // ADR 0028 §9 (decided 2026-10-06): the completion probe's request forms.
 pub mod completion_probe;
 pub mod engine_env;
+// SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
+pub mod engine_log;
 pub mod forward;
 // ADR 0028 §10: the engine-neutral arguments of a multi-node group member.
 pub mod group;

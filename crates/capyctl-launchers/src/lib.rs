@@ -1,5 +1,7 @@
 //! Process launchers: owned-handle execution semantics.
 mod durable;
+// SPEC §13.3 / T21: the redacting, rotating writer between an engine and its log.
+pub mod engine_log_relay;
 pub mod exec;
 pub mod group_observation;
 pub mod native_observation;

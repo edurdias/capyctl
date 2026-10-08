@@ -738,6 +738,15 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                 .map_err(|_| unavailable())?
                 .reset_fallback(),
             )
+            // SPEC §13.3 / T21: an instance's engine log, read on its host.
+            .merge(capyctl_management::engine_log::engine_log_router(
+                management_credentials(&credentials)?,
+                capyctl_management::engine_log::RemoteEngineLogs::new(
+                    owner.clone(),
+                    sessions.clone(),
+                    authority.controller_id(),
+                ),
+            ))
             .merge(capyctl_management::hosts::hosts_router(
                 management_credentials(&credentials)?,
                 owner,
@@ -816,8 +825,9 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         )
         .add_service(
             AgentControlServer::from_arc(sessions.clone())
-                .max_decoding_message_size(65536)
-                .max_encoding_message_size(65536),
+                // SPEC §13.3: room for an engine log tail answer.
+                .max_decoding_message_size(capyctl_protocol::HOST_MESSAGE_BYTES)
+                .max_encoding_message_size(capyctl_protocol::SERVER_MESSAGE_BYTES),
         )
         .serve_with_incoming_shutdown(
             TcpListenerStream::new(control_listener),

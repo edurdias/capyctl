@@ -550,6 +550,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             kernel_builds: Vec::new(),
             escalated: false,
             probe_tokens: Vec::new(),
+            engine_log: None,
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }

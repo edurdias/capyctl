@@ -26,6 +26,15 @@ pub const COMMAND_ENCODING_VERSION: &str = "1";
 
 pub const SKEW_TOLERANCE_MS: i64 = 30_000;
 
+/// The bound on one control-session message the server decodes from a host
+/// (and the host encodes). 64 KiB for every report, plus room for the one
+/// larger answer, an engine log tail (SPEC §13.3), whose text is at most
+/// [`execution::MAX_ENGINE_LOG_TAIL_BYTES`].
+pub const HOST_MESSAGE_BYTES: usize = 64 * 1024 + execution::MAX_ENGINE_LOG_TAIL_BYTES as usize;
+
+/// The bound on one control-session message the server encodes to a host.
+pub const SERVER_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// SPEC §4.1, ADR 0016: the exact message of the control-session refusal a
 /// controller sends, with `PermissionDenied`, when the certificate the host
 /// presented over mutual TLS is revoked. The host stops reconnecting only on

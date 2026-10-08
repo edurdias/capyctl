@@ -52,7 +52,7 @@ if __name__ == "__mp_main__":
         from runtime.sglang_startup_guards import preimport_guard
         preimport_guard()
     except BaseException:
-        # No native/input exception text, including if containment itself fails.
+        # No native/input exception text, including if the guard itself fails.
         raise SystemExit(1) from None
 
 _MAX_DESCRIPTOR = 65536

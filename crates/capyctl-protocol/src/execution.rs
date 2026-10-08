@@ -290,6 +290,48 @@ impl TryFrom<pb::MaterializeSourceRequest> for MaterializeSourcePlan {
     }
 }
 
+/// SPEC §13.3: the most an engine log tail carries, request and answer alike.
+pub const MAX_ENGINE_LOG_TAIL_BYTES: u32 = 256 * 1024;
+
+/// SPEC §13.3 / T21 (additive): read the bounded, redacted end of one
+/// retained launch's engine log. It names the launch by its incarnation,
+/// never a path; the host derives the log from its own log directory and
+/// answers only for a launch it still claims for the command's deployment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineLogTailPlan {
+    pub incarnation: String,
+    /// 1 ..= [`MAX_ENGINE_LOG_TAIL_BYTES`].
+    pub max_bytes: u32,
+}
+impl EngineLogTailPlan {
+    fn to_wire(&self) -> pb::EngineLogTailRequest {
+        pb::EngineLogTailRequest {
+            incarnation: self.incarnation.clone(),
+            max_bytes: self.max_bytes,
+        }
+    }
+}
+/// An incarnation as the store issues it (a ULID): a short run of ASCII
+/// letters and digits, so it is one file name and never a path.
+pub fn is_incarnation(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+impl TryFrom<pb::EngineLogTailRequest> for EngineLogTailPlan {
+    type Error = GroupIdentityError;
+    fn try_from(plan: pb::EngineLogTailRequest) -> Result<Self, Self::Error> {
+        if !is_incarnation(&plan.incarnation)
+            || plan.max_bytes == 0
+            || plan.max_bytes > MAX_ENGINE_LOG_TAIL_BYTES
+        {
+            return Err(GroupIdentityError);
+        }
+        Ok(Self {
+            incarnation: plan.incarnation,
+            max_bytes: plan.max_bytes,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberAction {
     Prepare(GroupPlan),
@@ -355,6 +397,10 @@ pub enum MemberAction {
     /// engine resources; the store bytes a download reserves are the host's
     /// own filesystem accounting. Its result carries only source evidence.
     MaterializeSource(MaterializeSourcePlan),
+    /// SPEC §13.3 / T21 (additive): read the bounded, redacted end of one
+    /// retained launch's engine log. Read-only; its result carries only the
+    /// tail evidence.
+    EngineLogTail(EngineLogTailPlan),
 }
 
 impl MemberAction {
@@ -598,6 +644,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             }
             Action::DigestCheckpoint(plan) => MemberAction::DigestCheckpoint(plan.try_into()?),
             Action::MaterializeSource(plan) => MemberAction::MaterializeSource(plan.try_into()?),
+            Action::EngineLogTail(plan) => MemberAction::EngineLogTail(plan.try_into()?),
             // SPEC §13.1, T34: an action this build does not know (including a
             // newer peer's field, which decodes as no action) is never guessed.
             _ => return Err(GroupIdentityError),
@@ -669,6 +716,7 @@ impl MemberCommand {
                 }
                 MemberAction::DigestCheckpoint(plan) => Action::DigestCheckpoint(plan.to_wire()),
                 MemberAction::MaterializeSource(plan) => Action::MaterializeSource(plan.to_wire()),
+                MemberAction::EngineLogTail(plan) => Action::EngineLogTail(plan.to_wire()),
             }),
             restore_checkpoint_digest: match &self.action {
                 MemberAction::Restore {
@@ -893,6 +941,29 @@ pub fn validate_result(
             }
         }
         (MemberAction::MaterializeSource(_), None) => return Err(GroupIdentityError),
+        (_, Some(_)) => return Err(GroupIdentityError),
+        (_, None) => {}
+    }
+    // SPEC §13.3: tail evidence belongs to EngineLogTail results only, and
+    // such a result is nothing but that evidence.
+    match (&command.action, &result.engine_log) {
+        (MemberAction::EngineLogTail(plan), Some(evidence)) => {
+            validate_engine_log(plan, evidence)?;
+            if result.state != "completed"
+                || result.claim_retained
+                || result.model_usable
+                || !result.processes.is_empty()
+                || !result.owned_handle.is_empty()
+                || !result.binding_id.is_empty()
+                || !result.incarnation.is_empty()
+                || result.checkpoint.is_some()
+                || result.residency.is_some()
+                || result.source.is_some()
+            {
+                return Err(GroupIdentityError);
+            }
+        }
+        (MemberAction::EngineLogTail(_), None) => return Err(GroupIdentityError),
         (_, Some(_)) => return Err(GroupIdentityError),
         (_, None) => {}
     }
@@ -1243,6 +1314,23 @@ fn validate_source(
             }
             _ => false,
         };
+    if !ok {
+        return Err(GroupIdentityError);
+    }
+    Ok(())
+}
+
+/// SPEC §13.3: `served` carries at most the plan's bytes of text; `missing`,
+/// `raw` and `unreadable` carry nothing.
+fn validate_engine_log(
+    plan: &EngineLogTailPlan,
+    evidence: &pb::EngineLogTailEvidence,
+) -> Result<(), GroupIdentityError> {
+    let ok = match evidence.state.as_str() {
+        "served" => evidence.text.len() <= plan.max_bytes as usize,
+        "missing" | "raw" | "unreadable" => evidence.text.is_empty() && !evidence.truncated,
+        _ => false,
+    };
     if !ok {
         return Err(GroupIdentityError);
     }

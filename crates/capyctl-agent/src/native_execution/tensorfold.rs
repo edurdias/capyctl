@@ -43,8 +43,7 @@ impl NativeHostExecution {
         let mut input = plan_from_effective(
             effective,
             plan.service_port,
-            self.log_dir
-                .join(format!("{}.log", plan.incarnation))
+            self.engine_log_path(&plan.incarnation)
                 .to_string_lossy()
                 .into_owned(),
             Some(dir.to_string_lossy().into_owned()),

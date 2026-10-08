@@ -97,6 +97,24 @@ impl ProtectedLaunchDescriptors {
     pub fn numbers(&self) -> Vec<i32> {
         self.files.iter().map(AsRawFd::as_raw_fd).collect()
     }
+
+    /// SPEC §13.3 / T21: hand the credentials (every descriptor after the
+    /// launch descriptor) to the engine log's redacting writer, which replaces
+    /// them by value wherever the engine echoes them. They go nowhere else.
+    pub fn own_credentials(
+        &self,
+        redactor: &mut crate::engine_log::LogRedactor,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        for file in self.files.iter().skip(1) {
+            let mut bytes = vec![0; file.metadata()?.len() as usize];
+            file.read_exact_at(&mut bytes, 0)?;
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                redactor.own(text);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn invalid() -> ProtectedDescriptorError {

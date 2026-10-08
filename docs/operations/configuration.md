@@ -523,8 +523,10 @@ variables.
 the other per-command options change one command's behaviour, not the role's
 configuration, so they have no variable or YAML form. `--debug-engine-logs` on
 `start host` and `start standalone` is a flag only on purpose: full engine logs
-may contain secrets, so a variable left in a shell or unit file must not turn
-them on.
+are written without redaction and may contain secrets, so a variable left in a
+shell or unit file must not turn them on. The engine log's redaction, rotation
+(16 MiB, two older files) and the management tail bound (256 KiB) are fixed,
+not settings ([engine logs](install.md#engine-logs-and-troubleshooting)).
 
 Commands print text (tables, or a summary with details) unless `--format json`
 is given, even when their output is piped. `start server`, `start host` and

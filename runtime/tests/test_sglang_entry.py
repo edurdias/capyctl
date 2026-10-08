@@ -922,17 +922,17 @@ class StartupTests(LaunchFixture, unittest.TestCase):
 
 
 class PreimportGuardTests(unittest.TestCase):
-    def test_preimport_guard_runs_containment_then_plugin_closure_in_order(self):
+    def test_preimport_guard_installs_the_scrubber_then_plugin_closure_in_order(self):
         events = []
-        with mock.patch.object(guards, "contain_startup_output",
-                               side_effect=lambda: events.append("containment")), \
+        with mock.patch.object(guards, "install_log_scrubber",
+                               side_effect=lambda: events.append("scrubber")), \
                 mock.patch.object(guards, "enforce_closed_plugins",
                                   side_effect=lambda: events.append("plugins")):
             guards.preimport_guard()
-        self.assertEqual(events, ["containment", "plugins"])
+        self.assertEqual(events, ["scrubber", "plugins"])
 
     def test_guard_fails_closed_on_nonempty_plugin_selection(self):
-        with mock.patch.object(guards, "contain_startup_output"), \
+        with mock.patch.object(guards, "install_log_scrubber"), \
                 mock.patch.dict(os.environ, {"SGLANG_PLUGINS": "PRIVATE-SELECTION"}):
             with self.assertRaises(guards.StartupGuardError) as caught:
                 guards.preimport_guard()
@@ -940,7 +940,7 @@ class PreimportGuardTests(unittest.TestCase):
         self.assertNotIn("PRIVATE-SELECTION", str(caught.exception))
         self.assertNotIn("PRIVATE-SELECTION", repr(caught.exception))
         for platform in ("SGLANG_PLATFORM",):
-            with mock.patch.object(guards, "contain_startup_output"), \
+            with mock.patch.object(guards, "install_log_scrubber"), \
                     mock.patch.dict(os.environ, {platform: "PRIVATE-SELECTION"}):
                 with self.assertRaises(guards.StartupGuardError) as caught:
                     guards.preimport_guard()

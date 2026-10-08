@@ -8,6 +8,7 @@ pub mod launch;
 pub mod lifecycle;
 pub mod member_weights;
 pub mod park;
+pub mod redact;
 pub mod resources;
 pub mod role_log;
 

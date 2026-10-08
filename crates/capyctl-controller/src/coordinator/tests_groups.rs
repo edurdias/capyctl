@@ -387,6 +387,7 @@ impl GroupHost {
             MemberAction::MaterializeSource(_) => {
                 return Err(HostError::NotScripted("MaterializeSource"))
             }
+            MemberAction::EngineLogTail(_) => return Err(HostError::NotScripted("EngineLogTail")),
         };
         capyctl_protocol::execution::validate_result(&decoded, &result)
             .expect("the scripted host answers as an agent does");

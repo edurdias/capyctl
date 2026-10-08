@@ -93,9 +93,13 @@ _RESERVED_CONSTANT = {
     "fastapi_root_path": "", "enable_http2": False,
     "ssl_keyfile": None, "ssl_certfile": None, "ssl_ca_certs": None,
     "ssl_keyfile_password": None, "enable_ssl_refresh": False,
-    # These levels suppress ordinary argument info logs, NOT a complete logging
-    # guard: native code formats f"{server_args=}" before logger filtering.
-    "log_level": "error", "log_level_http": "error", "log_requests": False,
+    # SPEC §13.3: SGLang's own default level. Its output reaches the private
+    # log only through capyctl's redacting writer, which replaces the launch's
+    # keys by value (SGLang 0.5.21 logs `server_args=` with both keys at info,
+    # srt/entrypoints/engine.py:1123). Prompts and completions are logged only
+    # under log_requests (srt/utils/request_logger.py:88-90, 159-163), which
+    # stays off; crash dumps (pickles holding requests) stay off too.
+    "log_level": "info", "log_level_http": "info", "log_requests": False,
     "log_requests_target": None, "crash_dump_folder": None,
     # W8: the host agent scrapes loopback /metrics for load reports.
     "enable_metrics": True,
@@ -397,11 +401,9 @@ _MISSING = object()
 
 def _log_refusal(error):
     """SPEC §13.3 (found live 2026-10-03): SGLang's own reason for refusing the
-    arguments, for the private engine log, only when the operator turned debug
-    engine logs on (`--debug-engine-logs`); scrubbed of credentials and bounded.
-    The raised category stays closed either way."""
-    if os.environ.get("CAPYCTL_DEBUG_ENGINE_LOGS") != "1":
-        return
+    arguments, for the private engine log; scrubbed of credentials and bounded,
+    and redacted again by capyctl's log writer. The raised category stays
+    closed either way."""
     from .sglang_startup_guards import scrub
     try:
         text = "%s: %s" % (type(error).__name__, error)

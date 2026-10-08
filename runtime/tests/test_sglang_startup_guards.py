@@ -48,37 +48,26 @@ class StartupGuardsTests(unittest.TestCase):
              textwrap.dedent(body)], capture_output=True, timeout=10,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
-    def test_containment_suppresses_python_native_and_child_output(self):
-        child = self.child('''
-            from runtime.sglang_startup_guards import contain_startup_output
-            import ctypes, logging, os, subprocess, traceback
-            contain_startup_output()
-            print("PRIVATE-PRINT", flush=True)
-            logging.error("PRIVATE-LOG")
+    # T21 / SPEC §13.3: the default guard keeps engine output (it reaches the
+    # private log through capyctl's redacting writer) and still rejects plugins.
+    def test_default_guard_keeps_output_and_still_rejects_plugins(self):
+        child = self.child("""
+            from runtime.sglang_startup_guards import preimport_guard, StartupGuardError
+            import os
+            os.environ.pop("CAPYCTL_DEBUG_ENGINE_LOGS", None)
+            os.environ["SGLANG_PLATFORM"] = "untrusted"
             try:
-                raise ValueError("PRIVATE-TRACE")
-            except ValueError:
-                traceback.print_exc()
-            os.write(1, b"PRIVATE-WRITE")
-            os.write(2, b"PRIVATE-WRITE")
-            libc = ctypes.CDLL(None)
-            libc.puts(b"PRIVATE-C")
-            libc.fflush(None)
-            subprocess.run([sys.executable, "-IS", "-B", "-c",
-                            "import os; os.write(2,b'PRIVATE-CHILD')"], check=True)
-        ''')
+                preimport_guard()
+            except StartupGuardError as error:
+                assert error.code == "external_plugin_selection"
+                print("default-visible", flush=True)
+                os.write(2, b"native-visible")
+            else:
+                raise AssertionError("plugin gate bypassed")
+        """)
         self.assertEqual(child.returncode, 0, child.stderr)
-        self.assertEqual((child.stdout, child.stderr), (b"", b""))
-
-    def test_containment_survives_unhandled_exception_and_buffered_shutdown(self):
-        child = self.child('''
-            from runtime.sglang_startup_guards import contain_startup_output
-            print("PRIVATE-BUFFER", end="")
-            contain_startup_output()
-            raise RuntimeError("PRIVATE-UNHANDLED")
-        ''')
-        self.assertNotEqual(child.returncode, 0)
-        self.assertEqual((child.stdout, child.stderr), (b"", b""))
+        self.assertEqual(child.stdout, b"default-visible\n")
+        self.assertEqual(child.stderr, b"native-visible")
 
     def test_empty_plugin_environment_does_not_bypass_installed_entry_points(self):
         # Omitting the platform group check would execute its registered loader.
@@ -137,27 +126,32 @@ class StartupGuardsTests(unittest.TestCase):
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual(child.stdout, b"debug-visible\n")
 
-    # T21: SPEC §13.3. Debug engine logs keep output but never a credential:
-    # log records and Python-level writes are scrubbed of bearer values and
-    # credential-shaped runs (capyctl's keys are 64 hex characters).
-    def test_debug_output_is_scrubbed_of_credentials(self):
+    # T21: SPEC §13.3. Engine logs keep output but never a credential, at the
+    # default level and under debug alike: log records and Python-level writes
+    # are scrubbed of bearer values and credential-shaped runs (capyctl's keys
+    # are 64 hex characters).
+    def test_output_is_scrubbed_of_credentials(self):
         key = "ab" * 32
-        child = self.child(f"""
-            import logging, os, sys
-            os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = "1"
-            from runtime.sglang_startup_guards import preimport_guard
-            preimport_guard()
-            logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
-            logging.getLogger("sglang").info("server_args=ServerArgs(api_key=%r)", "{key}")
-            print("Authorization: Bearer {key} and plain", flush=True)
-            print("ordinary line", flush=True)
-        """)
-        self.assertEqual(child.returncode, 0, child.stderr)
-        output = child.stdout + child.stderr
-        self.assertNotIn(key.encode(), output)
-        self.assertIn(b"<redacted>", child.stderr)
-        self.assertIn(b"ordinary line", child.stdout)
-        self.assertIn(b"and plain", child.stdout)
+        for debug in ("1", None):
+            with self.subTest(debug=debug):
+                select = ('os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = "1"' if debug
+                          else 'os.environ.pop("CAPYCTL_DEBUG_ENGINE_LOGS", None)')
+                child = self.child(f"""
+                    import logging, os, sys
+                    {select}
+                    from runtime.sglang_startup_guards import preimport_guard
+                    preimport_guard()
+                    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+                    logging.getLogger("sglang").info("server_args=ServerArgs(api_key=%r)", "{key}")
+                    print("Authorization: Bearer {key} and plain", flush=True)
+                    print("ordinary line", flush=True)
+                """)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                output = child.stdout + child.stderr
+                self.assertNotIn(key.encode(), output)
+                self.assertIn(b"<redacted>", child.stderr)
+                self.assertIn(b"ordinary line", child.stdout)
+                self.assertIn(b"and plain", child.stdout)
 
     def test_prior_native_import_is_too_late(self):
         child = self.child('''
@@ -201,21 +195,6 @@ class StartupGuardsTests(unittest.TestCase):
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
 
-    def test_output_setup_failure_denies_without_native_import(self):
-        child = self.child('''
-            from runtime.sglang_startup_guards import contain_startup_output, StartupGuardError
-            import resource
-            resource.setrlimit(resource.RLIMIT_NOFILE, (0, 0))
-            try:
-                contain_startup_output()
-            except StartupGuardError as error:
-                assert str(error) == "output_containment_failed"
-            else:
-                raise AssertionError("failed setup accepted")
-            assert "sglang" not in sys.modules
-        ''')
-        self.assertEqual(child.returncode, 0, child.stderr)
-
     def test_metadata_discovery_failure_is_closed_and_sanitized(self):
         child = self.child('''
             from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError
@@ -236,9 +215,12 @@ class StartupGuardsTests(unittest.TestCase):
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
 
-    def test_spawn_preparation_contains_output_before_process_unpickle(self):
+    def test_spawn_preparation_runs_the_guard_before_process_unpickle(self):
         # Exercise CPython's actual spawn preparation phase. It runs the main
         # script before unpickling the Process (and its native argument classes).
+        # SPEC §13.3: output after preparation is kept (the launcher's log
+        # writer redacts it), and Python-level writes are scrubbed.
+        key = "cd" * 32
         child = self.child(f'''
             import multiprocessing.spawn, os
             os.environ.pop("SGLANG_PLATFORM", None)
@@ -246,11 +228,12 @@ class StartupGuardsTests(unittest.TestCase):
             multiprocessing.spawn.prepare({{"init_main_from_path": {str(Path(ROOT, "runtime/sglang_entry.py"))!r}}})
             assert "sglang" not in sys.modules
             assert "torch" not in sys.modules
-            os.write(1, b"PRIVATE-AFTER-PREPARATION")
-            os.write(2, b"PRIVATE-ARGUMENT-UNPICKLE")
+            print("key {key}", flush=True)
+            os.write(2, b"AFTER-PREPARATION")
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
-        self.assertEqual((child.stdout, child.stderr), (b"", b""))
+        self.assertEqual((child.stdout, child.stderr),
+                         (b"key <redacted>\n", b"AFTER-PREPARATION"))
 
     def test_spawn_preparation_denies_plugins_before_process_unpickle(self):
         for name in ("SGLANG_PLUGINS", "SGLANG_PLATFORM"):
@@ -320,7 +303,11 @@ class StartupGuardsTests(unittest.TestCase):
                     assert process.exitcode == {1 if denied else 0}, process.exitcode
                 ''')
                 self.assertEqual(child.returncode, 0, child.stderr)
-                self.assertEqual((child.stdout, child.stderr), (b"", b""))
+                # A denied spawn never unpickles its arguments; an admitted one
+                # keeps its output for the launcher's log writer.
+                probe = (b"", b"") if denied else (b"PRIVATE-UNPICKLE-OUTPUT",
+                                                   b"PRIVATE-UNPICKLE-ERROR")
+                self.assertEqual((child.stdout, child.stderr), probe)
                 self.assertEqual(marker.exists(), not denied)
 
 

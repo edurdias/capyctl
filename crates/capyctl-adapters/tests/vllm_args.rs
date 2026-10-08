@@ -653,3 +653,50 @@ fn chosen_parsers_render_as_typed_arguments() {
     p.extra_args = vec!["--tool-call-parser".into(), "hermes".into()];
     assert!(render_command(&p).is_err());
 }
+
+/// T21 / SPEC §13.3: vLLM logs no prompt or completion text at its default
+/// level. vLLM 0.30.0 logs request text only with `--enable-log-requests`
+/// (default off, vllm/engine/arg_utils.py:3000, 3007-3020; prompts at DEBUG,
+/// vllm/entrypoints/serve/utils/request_logger.py:44-61) and completions only
+/// with `--enable-log-outputs` on top of it. capyctl renders none of them, no
+/// logging configuration or level, and refuses the request-logging switch in
+/// host-fixed and deployment arguments alike.
+#[test]
+fn request_logging_is_never_rendered_and_cannot_be_enabled() {
+    let mut input = base_input();
+    input.engine_log = Some("/var/lib/capyctl/logs/d/i.log".into());
+    let cmd = render_command(&input).unwrap();
+    for flag in [
+        "--enable-log-requests",
+        "--enable-log-outputs",
+        "--log-config-file",
+        "--uvicorn-log-level",
+    ] {
+        assert!(
+            !cmd.argv.iter().any(|a| a.starts_with(flag)),
+            "{flag} rendered: {:?}",
+            cmd.argv
+        );
+    }
+    for name in [
+        "VLLM_LOGGING_LEVEL",
+        "VLLM_LOGGING_CONFIG_PATH",
+        "VLLM_CONFIGURE_LOGGING",
+    ] {
+        assert!(!cmd.env.contains_key(name), "{name} rendered");
+    }
+    for spelling in ["--enable-log-requests", "--enable-log-requests=true"] {
+        let mut fixed = base_input();
+        fixed.engine_args.push(spelling.into());
+        assert!(
+            matches!(render_command(&fixed), Err(ArgsError::ReservedConflict(_))),
+            "{spelling} accepted in host-fixed arguments"
+        );
+        let mut extra = base_input();
+        extra.extra_args = vec![spelling.into()];
+        assert!(
+            render_command(&extra).is_err(),
+            "{spelling} accepted in deployment arguments"
+        );
+    }
+}

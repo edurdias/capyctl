@@ -2041,6 +2041,16 @@ async fn start_standalone_in(
             .map_err(|_| StartError::MissingCredentials)?,
         embedded.installations(),
     );
+    // SPEC §13.3 / T21: an instance's engine log, read in-process from the
+    // embedded host's log directory (no agent session in a standalone role).
+    let engine_log_view = capyctl_management::engine_log::engine_log_router(
+        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?,
+        capyctl_management::engine_log::StandaloneEngineLogs::new(
+            owner.clone(),
+            state_dir.join("logs"),
+        ),
+    );
     // SPEC §4.2: the same host and engine inventory a server serves, for the
     // one embedded host: its published document (so `engine add` shows at
     // once) and its memory as observed now (one `/proc` read, plus a bounded
@@ -2137,6 +2147,7 @@ async fn start_standalone_in(
         .merge(drain)
         .merge(installation_view)
         .merge(hosts_view)
+        .merge(engine_log_view)
         .merge(latency_view)
         .merge(load_view)
         .merge(inference_listener_view);
