@@ -79,6 +79,36 @@ data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":17904
 data: [DONE]
 ```
 
+### Streamed fields
+
+CapyCTL relays each chunk unchanged except `model`, and checks it first: a
+`delta` key not in this table ends the stream as unverified, so an untested
+field never reaches a client (SPEC §10, §13.3). Fields beside `delta` in a
+choice, and `usage` with its details, are relayed as the engine sent them.
+
+| Field | Where | vLLM 0.29, 0.30 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x |
+|---|---|---|---|---|
+| `role` | delta | yes | yes (may be `null`) | yes |
+| `content` | delta | yes | yes | yes |
+| `reasoning` | delta | yes | — | — |
+| `reasoning_content` | delta | — | yes | yes |
+| `tool_calls` | delta | yes | yes | yes |
+| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` |
+| `stop_reason`, `token_ids` | choice | yes | — | — |
+| `matched_stop` | choice | — | yes | — |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes |
+| `prompt_tokens_details.cached_tokens` | usage | yes | yes (`--enable-cache-report`) | yes |
+| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes |
+| `reasoning_tokens` | usage | — | yes | — |
+| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) |
+
+Not relayed: SGLang's `hidden_states` delta (sent only for
+`return_hidden_states`, a request field CapyCTL refuses) and vLLM's `citations`
+delta (its Cohere endpoint only). The table was read from the vLLM 0.29.0,
+SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources; vLLM 0.30's `reasoning`
+was confirmed live, and the other listed versions are assumed to match until
+run against them.
+
 ## Python
 
 With the `openai` package (`pip install openai`):

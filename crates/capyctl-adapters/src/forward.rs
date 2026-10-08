@@ -316,6 +316,32 @@ pub(crate) async fn startup_probe(
 /// SPEC §10: each is relayed, and collected, under the name the engine used.
 const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 
+/// SPEC §10 (preserve stream events), §13.3 (allowlists): the `delta` keys a
+/// streamed chunk may carry. Any other key ends the stream uncertain, so a field
+/// is listed only once an engine is shown to emit it on `/v1/chat/completions`.
+/// Every `DeltaMessage` field the supported engines serialize on that path:
+/// - vLLM 0.29 (`vllm/entrypoints/generate/base/protocol.py:329-333`):
+///   `role`, `content`, `reasoning`, `tool_calls`; 0.30 found live 2026-10-02.
+/// - SGLang 0.5.20 (`sglang/srt/entrypoints/openai/protocol.py:1262-1266`):
+///   `role`, `content`, `reasoning_content`, `tool_calls`.
+/// - TensorFold 0.6.0 and 0.6.3 (`tensorfold/server/app.py` `on_delta`,
+///   `http.py` `stream_chunk`): `role`, `content`, `reasoning_content`,
+///   `tool_calls`.
+///
+/// Deliberately absent: SGLang's `hidden_states` (protocol.py:1267) is sent only
+/// for `return_hidden_states`, a request field this relay refuses; vLLM's
+/// `citations` belongs to its Cohere endpoint, not chat completions. Choice
+/// fields beside `delta` (`logprobs`, vLLM `stop_reason`/`token_ids`, SGLang
+/// `matched_stop`) and chunk fields (`usage` with its details) are relayed
+/// unchanged. Table: docs/guide/requests.md "Streamed fields".
+const STREAM_DELTA_FIELDS: [&str; 5] = [
+    "role",
+    "content",
+    REASONING_FIELDS[0],
+    REASONING_FIELDS[1],
+    "tool_calls",
+];
+
 /// SPEC §6.1, ADR 0023 §6: a readiness probe's answer is non-empty content
 /// or, for a model that reasons first, non-empty reasoning in either field.
 pub fn probe_answered(answer: &Value) -> bool {
@@ -860,14 +886,12 @@ impl<'a> Parser<'a> {
             // once their shape is validated (see `valid_tool_call_deltas`).
             // A null role is an absent role: SGLang 0.5.20 serializes every
             // tool-call delta with `"role": null` (found live 2026-09-24).
-            if delta.keys().any(|k| {
-                !matches!(
-                    k.as_str(),
-                    "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls"
-                )
-            }) || delta
-                .get("role")
-                .is_some_and(|r| !r.is_null() && r != "assistant")
+            if delta
+                .keys()
+                .any(|k| !STREAM_DELTA_FIELDS.contains(&k.as_str()))
+                || delta
+                    .get("role")
+                    .is_some_and(|r| !r.is_null() && r != "assistant")
                 || ["content", REASONING_FIELDS[0], REASONING_FIELDS[1]]
                     .iter()
                     .any(|key| {
@@ -1468,6 +1492,159 @@ mod tests {
             "id":"call_x","type":"function",
             "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}])
         );
+    }
+
+    /// Streams `lines` (each one SSE `data:` event) through the engine
+    /// forwarder and returns the stream's end and the relayed chunks.
+    async fn relay_stream(
+        lines: &[&str],
+    ) -> (
+        Result<crate::traits::StreamEnded, crate::traits::AdapterError>,
+        Vec<String>,
+    ) {
+        let sse = lines
+            .iter()
+            .map(|line| format!("{line}\n\n"))
+            .collect::<String>();
+        let (url, _) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let request = serde_json::json!({"model":"public","messages":[],
+            "stream_options":{"include_usage":true}});
+        let mut relayed = Vec::new();
+        let end = forward
+            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .await;
+        (end, relayed)
+    }
+
+    /// SPEC §10, §13.3, T19: every delta, choice and usage field vLLM 0.29
+    /// serializes on a streamed chat completion survives the relay: `role`,
+    /// `reasoning`, `content`, `tool_calls` deltas
+    /// (generate/base/protocol.py:329-333), the choice's `logprobs`,
+    /// `stop_reason` and `token_ids` (chat_completion/protocol.py:151-162), and
+    /// usage with `prompt_tokens_details.cached_tokens` and
+    /// `completion_tokens_details` (serve/engine/protocol.py:96-115).
+    // T19
+    #[tokio::test]
+    async fn vllm_stream_fields_survive_the_relay() {
+        let usage = r#""usage":{"prompt_tokens":12,"total_tokens":20,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}"#;
+        let usage_chunk = format!(
+            r#"data: {{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],{usage}}}"#
+        );
+        let (end, relayed) = relay_stream(&[
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning":"think"},"logprobs":null,"finish_reason":null,"token_ids":[11]}]}"#,
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"logprobs":{"content":[{"token":"Hi","logprob":-0.1,"bytes":[72,105],"top_logprobs":[]}]},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","index":0,"function":{"name":"f","arguments":"{}"}}]},"logprobs":null,"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"tool_calls","stop_reason":null}]}"#,
+            &usage_chunk,
+            "data: [DONE]",
+        ])
+        .await;
+        assert_eq!(end.unwrap(), crate::traits::StreamEnded::Completed);
+        assert_eq!(relayed.len(), 6);
+        assert!(
+            relayed[1].contains(r#""reasoning":"think""#),
+            "{}",
+            relayed[1]
+        );
+        assert!(relayed[1].contains(r#""token_ids":[11]"#), "{}", relayed[1]);
+        assert!(
+            relayed[4].contains(r#""stop_reason":null"#),
+            "{}",
+            relayed[4]
+        );
+        assert!(
+            relayed[5].contains(r#""cached_tokens":8"#),
+            "{}",
+            relayed[5]
+        );
+        assert!(
+            relayed[5].contains(r#""reasoning_tokens":3"#),
+            "{}",
+            relayed[5]
+        );
+    }
+
+    /// SPEC §10, §13.3, T19: SGLang 0.5.20's streamed fields survive:
+    /// `reasoning_content` and null siblings (protocol.py:1262-1266), the
+    /// choice's `matched_stop` (protocol.py:1286, set on the finish chunk by
+    /// serving_chat.py:1939-1947), and the usage chunk's
+    /// `prompt_tokens_details.cached_tokens` and `reasoning_tokens`
+    /// (protocol.py:188-214, `--enable-cache-report`).
+    // T19
+    #[tokio::test]
+    async fn sglang_stream_fields_survive_the_relay() {
+        let (end, relayed) = relay_stream(&[
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":"think","tool_calls":null},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":null,"content":"Hi","reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151645}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":12,"total_tokens":20,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":8},"reasoning_tokens":3}}"#,
+            "data: [DONE]",
+        ])
+        .await;
+        assert_eq!(end.unwrap(), crate::traits::StreamEnded::Completed);
+        assert_eq!(relayed.len(), 5);
+        assert!(
+            relayed[3].contains(r#""matched_stop":151645"#),
+            "{}",
+            relayed[3]
+        );
+        assert!(
+            relayed[4].contains(r#""cached_tokens":8"#),
+            "{}",
+            relayed[4]
+        );
+    }
+
+    /// SPEC §10, §13.3, T19: TensorFold 0.6.x streams `role`, `content`,
+    /// `reasoning_content` and `tool_calls` deltas (app.py `on_delta`, http.py
+    /// `stream_chunk`), puts its run statistics beside `choices` on the finish
+    /// chunk (http.py `response_extras`: `exact_mode`, `tensorfold`,
+    /// `speculative`), and sends usage with `prompt_tokens_details` and
+    /// `completion_tokens_details` in its own chunk. All of it survives.
+    // T19
+    #[tokio::test]
+    async fn tensorfold_stream_fields_survive_the_relay() {
+        let (end, relayed) = relay_stream(&[
+            r#"data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"exact_mode":"target-verified","tensorfold":{"tokens_per_second":40.5,"prefill_seconds":0.2,"time_to_first_token":0.3}}"#,
+            r#"data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+            "data: [DONE]",
+        ])
+        .await;
+        assert_eq!(end.unwrap(), crate::traits::StreamEnded::Completed);
+        assert_eq!(relayed.len(), 5);
+        assert!(
+            relayed[3].contains(r#""tokens_per_second":40.5"#),
+            "{}",
+            relayed[3]
+        );
+        assert!(
+            relayed[4].contains(r#""cached_tokens":8"#),
+            "{}",
+            relayed[4]
+        );
+    }
+
+    /// SPEC §13.3, T19: the delta allowlist stays closed. Fields an engine can
+    /// stream only on paths this relay does not serve (SGLang `hidden_states`,
+    /// vLLM Cohere `citations`) and any unknown key still end the stream
+    /// uncertain instead of being relayed untested.
+    // T19
+    #[tokio::test]
+    async fn unlisted_delta_keys_still_end_the_stream_uncertain() {
+        for key in ["hidden_states", "citations", "audio"] {
+            let chunk = format!(
+                r#"data: {{"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{{"index":0,"delta":{{"content":"Hi","{key}":[1]}},"finish_reason":null}}]}}"#
+            );
+            let (end, relayed) = relay_stream(&[&chunk, "data: [DONE]"]).await;
+            assert!(end.is_err(), "{key}: {end:?}");
+            assert!(relayed.is_empty(), "{key}");
+        }
     }
 
     /// SPEC §10, T19 (found live 2026-10-03): SGLang checks a prompt against its

@@ -188,6 +188,13 @@ rented machines.
 
 ## Fixes
 
+- **The streamed fields CapyCTL relays are documented.** The
+  [requests guide](../guide/requests.md#streamed-fields) lists every delta,
+  choice and usage field each supported vLLM, SGLang and TensorFold version
+  streams, read from their sources. All are relayed, including
+  `prompt_tokens_details.cached_tokens`; a delta field outside the list still
+  ends the stream as unverified.
+
 - **Deployments with an engine environment start again.** A deployment
   stating `engine_config.env` was accepted and then failed to start or load
   with `CorruptStoredData`, since its stored revision lost the variables; it
