@@ -245,6 +245,11 @@ message DomainObservation {
   // ADR 0019 (additive, capability `device_memory_domains`): the device a
   // `device` domain reads, by its host-local id (`gpuN`). Empty otherwise.
   string device_id = 9;
+  // SPEC §7.2 (additive): what bounded a host-memory domain's reading:
+  // `meminfo`, `cgroup_v2:<cgroup path>` (a cgroup v2 `memory.max`),
+  // `meminfo:cgroup_v1_unread` or `meminfo:cgroup_v2_unreadable`. Status only;
+  // empty for a device domain and from an older host.
+  string memory_source = 10;
 }
 message ProcessResidency {
   uint32 pid = 1;

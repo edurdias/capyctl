@@ -527,8 +527,9 @@ GPU and the CPU share one pool. The steps are the same on both; this section
 covers what differs.
 
 **Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
-(or `/bin/nvidia-smi`), which every driver package installs. CapyCTL runs it with
-a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
+(or `/bin/nvidia-smi`), which every driver package installs, or else in a
+directory on the role's `PATH` (see "Running in a container"). CapyCTL runs it
+with a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
 address and memory; it needs no other library. A machine that mixes an
 integrated and a discrete GPU is refused at start (`unsupported_gpu_topology`,
 exit 5).
@@ -884,6 +885,106 @@ Writable paths are the state root and `/tmp`, `/var/tmp`. If a recipe must
 write into the model store, add `ReadWritePaths=` for it in a drop-in. These
 restrictions may need loosening for some engine builds; if an engine fails to
 start under the unit but starts by hand, check these first.
+
+## Running in a container
+
+A host or standalone role can run as the main process of a container. CapyCTL
+publishes no image: build one from a base that carries the NVIDIA user-space
+tools your engine needs, add the `capyctl` binary and the engine virtual
+environments, and start the role in the foreground. Not yet run live in a
+container; the behaviour below is covered by CPU tests only.
+
+**GPUs.** Inject them with the NVIDIA Container Toolkit, either through CDI
+(`--device nvidia.com/gpu=all` with Podman, or Docker with CDI enabled) or with
+`docker run --gpus all`. Either injects the device nodes, the driver libraries
+and `nvidia-smi`. CapyCTL looks for `nvidia-smi` at `/usr/bin/nvidia-smi`,
+then `/bin/nvidia-smi`, then in each absolute directory on the role's `PATH`,
+so an image that installs it elsewhere works when that directory is on
+`PATH`. Each run is still bounded to 3 s, with a cleared environment, so the
+NVIDIA libraries must be on the default library path (the toolkit's injection
+registers them). Without `nvidia-smi` the role sees no GPU: a discrete card is
+unobserved, and an SGLang deployment fails placement.
+
+**Mounts.** The paths inside the container follow the same rules as on a
+host (see "Layout"):
+
+| Mount | Access | Notes |
+|---|---|---|
+| State root (`CAPYCTL_STATE_DIR`) | read-write | Must persist across container restarts (identity, journal, ledger, logs, the managed runtime). The directory and its ancestors must be owned by root or the role's user and not group- or world-writable: prepare a host directory with `install -d -m 0700 -o <uid> -g <gid>`, since a new named volume is root-owned. |
+| Models directory (`CAPYCTL_MODELS_ROOT`) | read-only, or read-write when downloads are allowed | Downloads land in `<models>/sources` unless `CAPYCTL_MODEL_SOURCES_PATH` names another mount. |
+| Engine virtual environments | read-only | Mount each at the path its profile or `CAPYCTL_*_BIN` names. Owned by root or the role's user, nothing writable by others. |
+| `/dev/shm` | | Engines pass tensors through shared memory; give the container `--ipc=host` or a `--shm-size` of several GiB (Docker's default 64 MiB is too small). |
+
+**User and capabilities.** Run the role as the user that owns the state
+directory (`--user <uid>:<gid>`), or as root. It needs no added capabilities
+and no privileged mode: it signals only its own engines, and making itself a
+child subreaper needs no privilege.
+
+**`--init` is not required.** At start a host or standalone role makes itself a
+child subreaper, so the processes its engines leave behind are handed to it,
+and it reaps them; as PID 1 of a container without an init it reaps every
+orphan there. A process it reaped reads gone, so a stop's verified cleanup
+completes. An exited process whose parent is another live process that never
+waits for it is reported (`... exited but its parent has not reaped it (a
+zombie); ownership is retained`) rather than read as running. `--init`
+(tini) still works and changes nothing: CapyCTL remains the reaper of its own
+engines' processes. The role handles SIGTERM itself, as PID 1 too.
+
+**Stopping.** Engines do not outlive the container: when the role exits the
+container's PID namespace ends and the kernel kills every engine in it. Drain
+first (`docker exec <container> capyctl drain standalone`), then stop, with a
+stop timeout above `shutdown.drain_timeout` (`docker stop -t 60`).
+
+**`/proc`.** Use the container's own `/proc` as the runtime mounts it. CapyCTL
+proves an engine's processes gone from `/proc`, so it refuses to observe
+(and cleanup stays retained) when `/proc` is mounted with `hidepid=` (other
+than `hidepid=0`) or `subset=`, when there is more than one `/proc` mount, or
+when something is mounted over a `/proc/<pid>` path. The runtime's masking of
+files such as `/proc/kcore` is fine. Do not bind-mount the host's `/proc`.
+
+**Memory limits.** With cgroup v2, a container memory limit (`--memory`, or
+any `memory.max` above the role's cgroup) bounds what the role observes: the
+capacity is the smaller of the host's memory and the tightest `memory.max` of
+its cgroup and every ancestor, and the available memory the smaller of
+`MemAvailable` and that cgroup's limit minus its usage (its inactive page cache
+counted as free, since the kernel reclaims it first). Standalone derives its
+limits from that capacity, and on a unified-memory machine (GB10) the single
+`unified` domain follows the same bound. At start the role says which cgroup
+bounds its memory, and `capyctl inspect host <name> --json` shows
+`memory_source` on each host domain: `meminfo`, or `cgroup_v2:<cgroup>`.
+cgroup v1 limits are not
+read: on a v1 host the role warns at start (`memory_source`
+`meminfo:cgroup_v1_unread`) and reads the whole machine, so state the limits in
+the role document instead (see
+[configuration](configuration.md#standalone-memory-limits)).
+`meminfo:cgroup_v2_unreadable` means the role is in a v2 cgroup whose limits it
+could not read under `/sys/fs/cgroup`. The JIT compile-job count (`MAX_JOBS`)
+is still sized from the machine's `MemAvailable`; in a tightly limited container,
+set `MAX_JOBS` in the engine env.
+
+A standalone role on a GB10, as an example:
+
+```bash
+install -d -m 0700 -o 1000 -g 1000 /srv/capyctl-state
+docker run -d --name capyctl --gpus all --ipc=host --memory 100g \
+  --user 1000:1000 \
+  -v /srv/capyctl-state:/var/lib/capyctl \
+  -v /srv/models:/models:ro \
+  -v /opt/vllm:/opt/vllm:ro \
+  -e CAPYCTL_STATE_DIR=/var/lib/capyctl \
+  -e HOME=/var/lib/capyctl \
+  -e CAPYCTL_MODELS_ROOT=/models \
+  -e CAPYCTL_MODEL_SOURCES=disabled \
+  -e CAPYCTL_VLLM_BIN=/opt/vllm/bin/vllm \
+  -p 8443:8443 \
+  <image> capyctl start standalone
+docker exec capyctl capyctl list hosts
+```
+
+`HOME` points at the state root, as the service user's home does under systemd,
+so the engines' caches (Triton, FlashInfer) land in persistent private state.
+The management listener stays on the container's loopback; run client
+commands with `docker exec` as above.
 
 ## Upgrade
 

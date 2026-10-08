@@ -10,6 +10,12 @@
 //! `Unknown` is returned whenever the question cannot be settled, and the caller
 //! must treat it as retained rather than as absent.
 //!
+//! A process that has exited but that its parent has not reaped (a zombie) still
+//! has its `/proc/<pid>`, and still holds its pid. It is neither alive nor gone:
+//! when this role is its parent (`subreaper`), it is reaped here and then reads
+//! gone; otherwise it reads `Unknown`, and a recorded set holding one is
+//! reported as `Unreaped` rather than read as alive forever (SPEC §13.2, T12).
+//!
 //! Unlike `ExecLauncher`'s handle check, this works from a recorded identity set
 //! rather than a live handle, so it survives the restart that destroys handles.
 
@@ -26,6 +32,11 @@ pub enum GoneProof {
     /// No process is known alive, but at least one could not be settled. This is not
     /// a release: it is the uncertainty that has to be reconciled later.
     Indeterminate,
+    /// No process is known alive, and at least one recorded process has exited but
+    /// its parent, another live process, has not reaped it. Its pid is still held,
+    /// so this is not a release either; it ends when that parent waits for it or
+    /// exits (the zombie is then handed to this role, which reaps it).
+    Unreaped,
 }
 
 fn current_boot() -> Option<String> {
@@ -44,17 +55,6 @@ fn current_boot() -> Option<String> {
     .then(|| boot.to_owned())
 }
 
-fn start_ticks(pid: u32) -> Option<u64> {
-    // Field 22 of /proc/<pid>/stat, counted after the comm field, which may itself
-    // contain spaces and parentheses; split after its final ')'.
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let close = raw.rfind(')')?;
-    raw[close + 2..]
-        .split_whitespace()
-        .nth(19)
-        .and_then(|field| field.parse().ok())
-}
-
 /// What the system reported about one recorded pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
@@ -62,6 +62,9 @@ pub enum Observed {
     NoSuchPid,
     /// A process exists and its start time was read.
     StartedAt(u64),
+    /// A process with this start time has exited and waits for its parent to
+    /// reap it (a zombie with no live threads).
+    Exited(u64),
     /// A process directory exists but its start time could not be read — a race
     /// with exit, or a permission boundary. Deliberately distinct from `NoSuchPid`.
     Unreadable,
@@ -87,18 +90,51 @@ pub fn resolve(identity: &ProcessIdentity, boot: Option<&str>, observed: Observe
         // process is gone even though the number is in use again.
         Observed::StartedAt(t) if t != identity.start_ticks => Presence::Gone,
         Observed::StartedAt(_) => Presence::Alive,
+        Observed::Exited(t) if t != identity.start_ticks => Presence::Gone,
+        // SPEC §13.2: exited, but its pid is held until its parent reaps it.
+        // Neither alive nor proven gone.
+        Observed::Exited(_) => Presence::Unknown,
         Observed::Unreadable => Presence::Unknown,
     }
 }
 
+fn observe(pid: u32) -> Observed {
+    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return Observed::NoSuchPid;
+    }
+    match crate::subreaper::proc_stat(pid) {
+        None => Observed::Unreadable,
+        Some(stat) if stat.exited() => Observed::Exited(stat.start_ticks),
+        Some(stat) => Observed::StartedAt(stat.start_ticks),
+    }
+}
+
+/// The reading `presence` decides from. An exited process this role inherited
+/// is reaped first (T12), so the reading that follows proves it gone.
+fn assess(identity: &ProcessIdentity) -> (Presence, Observed) {
+    let boot = current_boot();
+    let mut observed = observe(identity.pid);
+    if observed == Observed::Exited(identity.start_ticks)
+        && boot.as_deref() == Some(identity.boot_id.as_str())
+        && crate::subreaper::reap_exited(identity.pid, identity.start_ticks)
+    {
+        observed = observe(identity.pid);
+    }
+    (resolve(identity, boot.as_deref(), observed), observed)
+}
+
 /// Resolve one recorded identity against the running system.
 pub fn presence(identity: &ProcessIdentity) -> Presence {
-    let observed = if std::path::Path::new(&format!("/proc/{}", identity.pid)).exists() {
-        start_ticks(identity.pid).map_or(Observed::Unreadable, Observed::StartedAt)
-    } else {
-        Observed::NoSuchPid
-    };
-    resolve(identity, current_boot().as_deref(), observed)
+    assess(identity).0
+}
+
+/// Whether this exact recorded process has exited and still waits for a parent
+/// other than this role to reap it: the case `Unreaped` reports.
+pub fn exited_unreaped(identity: &ProcessIdentity) -> bool {
+    matches!(
+        assess(identity),
+        (Presence::Unknown, Observed::Exited(t)) if t == identity.start_ticks
+    )
 }
 
 /// SPEC §13.2 (W13): whether a process launched on this boot has exited. Only
@@ -117,14 +153,20 @@ pub fn verify_gone(identities: &[ProcessIdentity]) -> GoneProof {
         return GoneProof::Indeterminate;
     }
     let mut indeterminate = false;
+    let mut unreaped = false;
     for identity in identities {
-        match presence(identity) {
-            Presence::Alive => return GoneProof::SomeAlive,
-            Presence::Unknown => indeterminate = true,
-            Presence::Gone => {}
+        match assess(identity) {
+            (Presence::Alive, _) => return GoneProof::SomeAlive,
+            (Presence::Unknown, Observed::Exited(t)) if t == identity.start_ticks => {
+                unreaped = true
+            }
+            (Presence::Unknown, _) => indeterminate = true,
+            (Presence::Gone, _) => {}
         }
     }
-    if indeterminate {
+    if unreaped {
+        GoneProof::Unreaped
+    } else if indeterminate {
         GoneProof::Indeterminate
     } else {
         GoneProof::AllGone

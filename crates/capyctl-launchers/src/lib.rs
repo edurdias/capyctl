@@ -10,6 +10,8 @@ mod ownership;
 pub mod process_absence;
 // SPEC §13.2 (W13): how a launched engine ended, recorded by its reaper.
 pub mod reaped;
+// SPEC §13.2 / T12: a role reaps the orphans of its engines.
+pub mod subreaper;
 pub use durable::{
     AssociationError, DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
 };

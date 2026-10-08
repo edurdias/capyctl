@@ -1778,7 +1778,7 @@ async fn start_standalone_in(
         None => "standalone-none".to_owned(),
     };
     let capacity_bytes = memory()
-        .map(|sample| sample.capacity_bytes)
+        .map(|sample| sample.memory.capacity_bytes)
         .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
 
     // Design §1: the GPUs are sampled once, and the shape they describe decides
@@ -2075,17 +2075,16 @@ async fn start_standalone_in(
             domains: {
                 let observed = crate::host_observation::observed_domains(&declared_host.domains);
                 let (memory, gpu) = (memory.clone(), gpu.clone());
-                let host = declared_host.name.clone();
                 Arc::new(move || {
-                    let (observed, memory, gpu, host) =
-                        (observed.clone(), memory.clone(), gpu.clone(), host.clone());
+                    let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
                     Box::pin(async move {
                         let kinds = observed.clone();
-                        let Ok(observations) = HostMemoryObservation::with_domains(observed)
-                            .with_memory_reader(memory)
-                            .with_gpu_sampler(gpu)
-                            .observe(host)
-                            .await
+                        let Ok((observations, source)) =
+                            HostMemoryObservation::with_domains(observed)
+                                .with_memory_reader(memory)
+                                .with_gpu_sampler(gpu)
+                                .observe_sourced()
+                                .await
                         else {
                             return Vec::new();
                         };
@@ -2095,12 +2094,18 @@ async fn start_standalone_in(
                                 let device = kinds.iter().any(|d| {
                                     matches!(d, crate::host_observation::ObservedDomain::Device { domain, .. } if *domain == o.domain)
                                 });
-                                serde_json::json!({
+                                let mut domain = serde_json::json!({
                                     "domain_id": o.domain,
                                     "kind": if device { "device" } else { "host" },
                                     "capacity_bytes": o.capacity_bytes,
                                     "available_bytes": o.available_bytes,
-                                })
+                                });
+                                // SPEC §7.2: what bounded a host domain's reading,
+                                // `/proc/meminfo` or a cgroup v2 limit.
+                                if !device {
+                                    domain["memory_source"] = source.token().into();
+                                }
+                                domain
                             })
                             .collect()
                     })

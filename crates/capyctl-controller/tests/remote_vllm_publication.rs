@@ -85,6 +85,7 @@ async fn an_enrolled_host_publishes_vllm_profiles_beside_sglang() {
     let inventory = pb::ReportInventory {
         domains: vec![pb::DomainObservation {
             device_id: String::new(),
+            memory_source: String::new(),
             residents: vec![],
             domain_id: "unified".into(),
             kind: "system".into(),

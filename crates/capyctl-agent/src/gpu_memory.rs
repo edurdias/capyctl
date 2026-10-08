@@ -3,13 +3,16 @@
 //! A discrete GPU's VRAM is a physical domain distinct from host RAM; an
 //! integrated device (GB10) reports `[N/A]` memory because it has none of its
 //! own, which is how a unified host is recognised — never from a product name.
-//! Sampling runs `nvidia-smi` from a fixed path with a cleared environment,
-//! bounded in time and output, exactly like `process_residency`. Every parse
-//! failure invalidates the whole sample: an unknown device closes admission
-//! on its domain (SPEC §7.2), it is never filled in.
+//! Sampling runs `nvidia-smi` ([`nvidia_smi`]: a fixed path, else the role's
+//! `PATH`) with a cleared environment, bounded in time and output, exactly like
+//! `process_residency`. Every parse failure invalidates the whole sample: an
+//! unknown device closes admission on its domain (SPEC §7.2), it is never
+//! filled in.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -269,12 +272,43 @@ pub fn device_index(device_id: &str) -> Option<u32> {
         .ok()
 }
 
+/// The fixed locations `nvidia-smi` is looked for at first.
+pub const NVIDIA_SMI_PATHS: [&str; 2] = ["/usr/bin/nvidia-smi", "/bin/nvidia-smi"];
+
+/// SPEC §7.2 / T26: where `nvidia-smi` is. The fixed system paths first, then
+/// each directory on this process's `PATH`, so a container image that puts
+/// the NVIDIA tools elsewhere (`/usr/local/nvidia/bin`, a toolkit prefix) is
+/// still observed. Each run stays bounded by [`BOUND`].
+pub fn nvidia_smi() -> Option<PathBuf> {
+    locate_nvidia_smi(&NVIDIA_SMI_PATHS, std::env::var_os("PATH").as_deref())
+}
+
+/// [`nvidia_smi`] with explicit inputs: the first executable file among
+/// `fixed`, then `nvidia-smi` in each absolute directory of `path`. A relative
+/// entry is skipped: it names the working directory, not a tool location.
+pub fn locate_nvidia_smi(fixed: &[&str], path: Option<&OsStr>) -> Option<PathBuf> {
+    let on_path = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("nvidia-smi"));
+    fixed
+        .iter()
+        .map(PathBuf::from)
+        .chain(on_path)
+        .find(|candidate| executable(candidate))
+}
+
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
 /// The live sample; `None` on any failure (no binary, timeout, bad output).
 pub fn sample() -> Option<GpuSample> {
-    let program = ["/usr/bin/nvidia-smi", "/bin/nvidia-smi"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).is_file())?;
-    let text = run_bounded(program, &[QUERY, "--format=csv,noheader,nounits"], BOUND)?;
+    let program = nvidia_smi()?;
+    let text = run_bounded(&program, &[QUERY, "--format=csv,noheader,nounits"], BOUND)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
@@ -286,7 +320,7 @@ pub fn sample() -> Option<GpuSample> {
 /// discarded; killed at `bound`. `None` on a failed spawn, a timeout, a
 /// non-zero exit or unreadable output. Output beyond [`MAX_OUTPUT`] is kept
 /// one byte over the limit so the parser refuses it.
-fn run_bounded(program: &str, args: &[&str], bound: Duration) -> Option<String> {
+fn run_bounded(program: impl AsRef<OsStr>, args: &[&str], bound: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .env_clear()
@@ -392,6 +426,39 @@ mod tests {
             run_bounded("/bin/echo", &["ok"], BOUND).as_deref(),
             Some("ok\n")
         );
+    }
+
+    // T26: a container image may install `nvidia-smi` off the fixed paths; it
+    // is found on PATH, after the fixed paths, and only as an executable file
+    // in an absolute directory.
+    #[test]
+    fn nvidia_smi_is_found_on_path_after_the_fixed_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = |dir: &Path, mode: u32| {
+            let path = dir.join("nvidia-smi");
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let toolkit = tempfile::tempdir().unwrap();
+        let found = tool(toolkit.path(), 0o755);
+        let plain = tempfile::tempdir().unwrap();
+        tool(plain.path(), 0o644);
+        let none = ["/nonexistent/nvidia-smi"];
+        let path = std::env::join_paths([
+            Path::new("relative"),
+            plain.path(),
+            Path::new("/nonexistent"),
+            toolkit.path(),
+        ])
+        .unwrap();
+        assert_eq!(locate_nvidia_smi(&none, Some(&path)), Some(found));
+        assert_eq!(locate_nvidia_smi(&none, None), None);
+        // A fixed path wins over PATH.
+        let fixed = tempfile::tempdir().unwrap();
+        let first = tool(fixed.path(), 0o755);
+        let fixed_path = first.to_str().unwrap();
+        assert_eq!(locate_nvidia_smi(&[fixed_path], Some(&path)), Some(first));
     }
 
     #[test]

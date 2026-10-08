@@ -170,6 +170,10 @@ pub struct DomainView {
     /// ADR 0019: the host-local device a `device` domain reads.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub device_id: String,
+    /// SPEC §7.2: what bounded a host-memory domain's reading (`meminfo`, or
+    /// `cgroup_v2:<cgroup>` when a container or unit limit did). Status only.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub memory_source: String,
     /// ADR 0007: per-process resident memory sampled beside this domain's
     /// availability (`process_residency`). Evidence for admission only; never
     /// shown in status.
@@ -209,6 +213,7 @@ impl DomainView {
             available_bytes: d.available_bytes,
             observed_at_unix_ms: d.observed_at_unix_ms.min(capyctl_protocol::now_unix_ms()),
             device_id: d.device_id.clone(),
+            memory_source: d.memory_source.clone(),
             residents: if valid {
                 d.residents
                     .iter()
@@ -339,6 +344,8 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
                 } else {
                     d.device_id.is_empty()
                 }
+                // SPEC §7.2: a status token, bounded like every other name.
+                && (d.memory_source.is_empty() || bounded_name(&d.memory_source))
         })
         && inventory.profiles.iter().all(|p| {
             bounded_name(&p.name)
@@ -2095,6 +2102,55 @@ mod installation_tests {
         // An older host publishes none of it.
         assert!(installation_fields_valid(
             &pb::RuntimeProfileStatus::default()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod memory_source_tests {
+    use super::*;
+
+    fn inventory(source: &str) -> pb::ReportInventory {
+        pb::ReportInventory {
+            domains: vec![pb::DomainObservation {
+                domain_id: "unified".into(),
+                kind: "system".into(),
+                observed_bytes: 8 << 30,
+                capacity_bytes: 16 << 30,
+                available_bytes: 8 << 30,
+                memory_source: source.into(),
+                ..Default::default()
+            }],
+            envelope: Some(pb::Envelope {
+                host_id: "host-a".into(),
+                protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // T26 (SPEC §7.2): a host says what bounded its memory reading, and status
+    // shows it; an older host says nothing, and a malformed token refuses the
+    // inventory like any other unbounded name.
+    #[test]
+    fn the_memory_source_is_kept_for_status_and_bounded() {
+        for source in ["", "meminfo", "cgroup_v2:/system.slice/docker-1.scope"] {
+            let report = inventory(source);
+            assert!(inventory_shape_valid(&report, "host-a"), "{source}");
+            let view = serde_json::to_value(DomainView::of(&report.domains[0])).unwrap();
+            assert_eq!(
+                view.get("memory_source").and_then(|s| s.as_str()),
+                (!source.is_empty()).then_some(source)
+            );
+        }
+        assert!(!inventory_shape_valid(
+            &inventory("cgroup v2 with spaces"),
+            "host-a"
+        ));
+        assert!(!inventory_shape_valid(
+            &inventory(&"x".repeat(257)),
+            "host-a"
         ));
     }
 }

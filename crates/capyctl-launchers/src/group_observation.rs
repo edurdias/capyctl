@@ -100,7 +100,15 @@ pub fn observe_process_group(
 pub fn observe_process_group_or_empty(
     expected_api: &ProcessIdentity,
 ) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
-    match super::process_absence::presence(expected_api) {
+    let presence = match super::process_absence::presence(expected_api) {
+        // SPEC §13.2 / T12: a leader that exited and waits to be reaped is not
+        // running; the group is what is left in it, the unreaped leader included.
+        Presence::Unknown if super::process_absence::exited_unreaped(expected_api) => {
+            Presence::Gone
+        }
+        presence => presence,
+    };
+    match presence {
         Presence::Unknown => Err(GroupObservationError::Visibility),
         Presence::Alive => observe_process_group(expected_api).map(|o| o.members().to_vec()),
         Presence::Gone => {

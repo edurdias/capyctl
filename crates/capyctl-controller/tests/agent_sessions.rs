@@ -522,6 +522,7 @@ async fn enrolled_host() -> Enrolled {
 fn domain(observed_bytes: i64) -> pb::DomainObservation {
     pb::DomainObservation {
         device_id: String::new(),
+        memory_source: String::new(),
         domain_id: "system-memory".into(),
         kind: "system".into(),
         observed_bytes,

@@ -1043,9 +1043,8 @@ async fn serve_host(
         }
         _ => error("Host journal is unsafe or owned by another process"),
     })?;
-    let memory = capyctl_agent::memory::read_host_memory()
-        .map_err(|_| error("Host memory inventory unavailable"))?
-        .memory;
+    let reading = capyctl_agent::memory::read_host_memory()
+        .map_err(|_| error("Host memory inventory unavailable"))?;
     // SPEC §7.2 / ADR 0019: the device domains are published from a sample
     // taken beside the memory reading, so both are fresh at publication.
     let gpu = if discrete {
@@ -1055,8 +1054,12 @@ async fn serve_host(
     } else {
         None
     };
-    let domains =
-        capyctl_agent::device_domains::startup_domains(&config.document, &memory, gpu.as_ref());
+    let domains = capyctl_agent::device_domains::startup_domains(
+        &config.document,
+        &reading.memory,
+        &reading.source,
+        gpu.as_ref(),
+    );
     // ADR 0008 (owner decision 2026-09-23): registration measures each
     // installation (engine package version and a digest over its files);
     // later drift is flagged against this. Unmeasurable is never a refusal.

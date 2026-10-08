@@ -44,6 +44,11 @@ fn main() -> ExitCode {
     );
     // Notices from shared code (join, init, engine add) follow the same rule.
     capyctl_cli::role_text::install(format);
+    // SPEC §§7.2, 13.2 / T12 T26: before a role launches anything, it becomes
+    // the reaper of what it inherits and says what bounds its memory.
+    if role {
+        capyctl_cli::role_process::start();
+    }
     let view = table::View::of(&invocation.command);
     let context = capyctl_cli::views::Context {
         names: &HostNames::default(),
