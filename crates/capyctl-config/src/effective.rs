@@ -1245,13 +1245,43 @@ pub fn resolve_effective_with_checkpoint(
             SGLANG_SPECULATIVE_HOST_BACKED,
         ));
     }
+    // ADR 0028 §5 (amendment of 2026-10-07): a group member whose phases
+    // derive from `engine_config.memory` holds its share of the weights, not
+    // the whole checkpoint, and every rule sized from the weights (margin,
+    // request, startup peak, recurrent state, host copy, residency) applies
+    // to that share as on a single host. Declared `resources` are the
+    // member's as written, and the timeouts keep the whole checkpoint.
+    let member_of = instance_spec
+        .group
+        .as_ref()
+        .map(|group| group.topology)
+        .or(facts.member_of)
+        .filter(|topology| topology.world_size() > 1 && d.resources.is_none());
+    let sizing = match member_of {
+        Some(topology) => CheckpointFacts {
+            weights_bytes: facts
+                .weights_bytes
+                .map(|weights| {
+                    capyctl_domain::member_weights::member_weights_bytes(
+                        weights,
+                        facts.layout.as_ref(),
+                        topology.tensor_parallel,
+                        topology.pipeline_parallel,
+                    )
+                    .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))
+                })
+                .transpose()?,
+            ..facts
+        },
+        None => facts,
+    };
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
         // A17: a speculative SGLang deployment never defaults to the host-RAM
         // tier, so it is sized as on a unified host (`deep`).
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)
-            .map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
+            .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
         // ADR 0023 §6: TensorFold never parks, so its default is restart_only.
         crate::deployment_defaults::default_residency(
             raw_profile.security.deep_park.is_enabled() && raw_profile.engine != Engine::Tensorfold,
@@ -1331,7 +1361,7 @@ pub fn resolve_effective_with_checkpoint(
             profile_args: &profile.args,
             checkpoint_root: model.resolved_path.as_deref().map(Path::new),
             declared_ready_total,
-            facts,
+            facts: sizing,
             device: match &declared_resources {
                 Some(_) => None,
                 None => device_sizing,
@@ -1339,6 +1369,15 @@ pub fn resolve_effective_with_checkpoint(
             domain_limit: core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
         },
     )?;
+    if let Some(topology) = member_of {
+        let known = facts.weights_bytes.is_some();
+        engine_config.memory_mut().member = Some(capyctl_domain::member_weights::MemberWeights {
+            tensor_parallel: topology.tensor_parallel,
+            pipeline_parallel: topology.pipeline_parallel,
+            checkpoint_weights_bytes: facts.weights_bytes,
+            layout: facts.layout.filter(|_| known),
+        });
+    }
     {
         // T14: what capyctl chose is named as its default, so a snapshot
         // re-resolution chooses it again rather than restating it.
@@ -1373,7 +1412,7 @@ pub fn resolve_effective_with_checkpoint(
                 residency,
                 &devices,
                 &host,
-                facts.weights_bytes,
+                sizing.weights_bytes,
                 overhead,
             )?;
             if !facts.legacy_overhead {

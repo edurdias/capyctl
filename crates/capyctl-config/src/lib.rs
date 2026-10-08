@@ -1,6 +1,8 @@
 //! `capyctl-config`: strict YAML config loading, schema validation, and
 //! normalized JSON view production.
 
+// ADR 0028 §5 (amendment of 2026-10-07): a group member's share of the weights.
+pub mod checkpoint_layout;
 // ADR 0014 §5 (owner decision 2026-09-25): context fitted to the KV grant.
 pub mod context_fit;
 pub mod defaults;

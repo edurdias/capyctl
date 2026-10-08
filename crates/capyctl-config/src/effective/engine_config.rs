@@ -207,6 +207,15 @@ pub struct CheckpointFacts {
     /// CUDA graphs off beside the memory saver records that default; it
     /// re-resolves exactly as it was. Never set for a new resolution.
     pub legacy_sglang_graphs_off: bool,
+    /// ADR 0028 §5 (amendment of 2026-10-07): how the checkpoint's weights
+    /// split across ranks, read by the host from its safetensors headers
+    /// beside the weights. Used only by a group member whose phases derive
+    /// from `engine_config.memory`; `None` takes the fallback allowance.
+    pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
+    /// ADR 0028 §5: the topology of the group a member snapshot was resolved
+    /// for (its `memory.member`), which the document rebuilt from the
+    /// snapshot no longer states. Never set for a resolution from source.
+    pub member_of: Option<crate::topology::Topology>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -620,6 +629,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             startup_graphs_bytes: None,
             state_slot_bytes: None,
             state_bytes: None,
+            member: None,
         },
         derived,
     ))

@@ -72,9 +72,10 @@ pub const LIVE_PROFILE_UPDATE: &str = "live_profile_update";
 /// anything is sent. A unified host needs it for nothing.
 pub const DEVICE_MEMORY_DOMAINS: &str = "device_memory_domains";
 /// ADR 0028 §14: multi-node engine groups. Covers the Prepare and Launch group
-/// plans' engine, topology, generation, role, model path and worker port, and
-/// `ReportInventory.group`. The server places a group member only on a host
-/// that declared it; any other host is refused
+/// plans' engine, topology, generation, role, model path and worker port, the
+/// member launch plan's `checkpoint_layout` (ADR 0028 §5, amendment of
+/// 2026-10-07), and `ReportInventory.group`. The server places a group member
+/// only on a host that declared it; any other host is refused
 /// `host_capability_missing:engine_groups` before anything is sent.
 pub const ENGINE_GROUPS: &str = "engine_groups";
 
@@ -182,6 +183,9 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
             if plan.checkpoint_state_slot_bytes.is_some() {
                 needs.push(CHECKPOINT_STATE_SLOT);
+            }
+            if plan.checkpoint_layout.is_some() {
+                needs.push(ENGINE_GROUPS);
             }
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.

@@ -428,6 +428,17 @@ message SingleLaunchPlan {
   // ADR 0014 amendment A16: the hybrid state slot the server resolved this
   // revision with, beside the weights. Absent when it resolved without one.
   optional int64 checkpoint_state_slot_bytes = 14;
+  // ADR 0028 §5 (amendment of 2026-10-07): the checkpoint layout the server
+  // resolved a group member's share of the weights with. Absent for a
+  // single-host launch and when it resolved without one.
+  CheckpointLayout checkpoint_layout = 15;
+}
+// ADR 0028 §5 (amendment of 2026-10-07): how a checkpoint's weights split
+// across a group's ranks, read from its safetensors headers.
+message CheckpointLayout {
+  int64 sharded_bytes = 1;        // the tensors the engines split across ranks
+  uint32 layer_count = 2;         // numbered decoder layers
+  int64 largest_layer_bytes = 3;  // the largest layer's sharded bytes
 }
 // ADR 0014 §7 (WE3): measure one deployment's checkpoint on this host. The host
 // locates it from its own approved document and the deployment's model block;
@@ -615,6 +626,9 @@ message CheckpointDigestEvidence {
   // ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
   // state on SGLang, read from config.json; computed and mismatch only.
   optional int64 state_slot_bytes = 8;
+  // ADR 0028 §5 (amendment of 2026-10-07): the checkpoint's layout, when its
+  // safetensors headers could be read; computed and mismatch only.
+  CheckpointLayout layout = 9;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown

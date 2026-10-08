@@ -7,6 +7,7 @@ use capyctl_domain::group::{
     CommandIdentity, GroupEngine, GroupIdentityError, GroupPlan, GroupTopology, MemberKey,
     MemberPlan, MemberRole,
 };
+use capyctl_domain::member_weights::CheckpointLayout;
 
 /// SPEC §§3, 7, 13: only local approved profile resolution may render a launch.
 /// The server supplies immutable requests and a grant identity, never native argv.
@@ -37,12 +38,34 @@ pub struct SingleLaunchPlan {
     /// ADR 0014 amendment A16: the hybrid state slot the server resolved this
     /// revision with, beside the weights.
     pub checkpoint_state_slot_bytes: Option<i64>,
+    /// ADR 0028 §5 (amendment of 2026-10-07): the checkpoint layout the
+    /// server resolved a group member's share of the weights with.
+    pub checkpoint_layout: Option<CheckpointLayout>,
 }
 /// ADR 0014 §7: an empty digest (pre-WE3 journal) or a canonical one; weights
 /// only alongside a digest, and never negative.
 fn recorded_checkpoint_ok(digest: &str, weights: Option<i64>) -> bool {
     (digest.is_empty() || capyctl_config::effective::is_checkpoint_digest(digest))
         && weights.is_none_or(|bytes| bytes >= 0 && !digest.is_empty())
+}
+
+/// ADR 0028 §5: a checkpoint layout from the wire, if every field is in range.
+pub fn layout_from_wire(layout: &pb::CheckpointLayout) -> Option<CheckpointLayout> {
+    let layout = CheckpointLayout {
+        sharded_bytes: layout.sharded_bytes,
+        layer_count: layout.layer_count,
+        largest_layer_bytes: layout.largest_layer_bytes,
+    };
+    layout.is_valid().then_some(layout)
+}
+
+/// ADR 0028 §5: a checkpoint layout on the wire.
+pub fn layout_to_wire(layout: &CheckpointLayout) -> pb::CheckpointLayout {
+    pb::CheckpointLayout {
+        sharded_bytes: layout.sharded_bytes,
+        layer_count: layout.layer_count,
+        largest_layer_bytes: layout.largest_layer_bytes,
+    }
 }
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
@@ -83,6 +106,10 @@ impl SingleLaunchPlan {
             || plan
                 .checkpoint_state_slot_bytes
                 .is_some_and(|bytes| bytes <= 0 || plan.checkpoint_digest.is_empty())
+            // ADR 0028 §5: a layout only beside the weights it splits.
+            || plan.checkpoint_layout.as_ref().is_some_and(|layout| {
+                layout_from_wire(layout).is_none() || plan.checkpoint_weights_bytes.is_none()
+            })
         {
             return Err(GroupIdentityError);
         }
@@ -109,6 +136,7 @@ impl SingleLaunchPlan {
             checkpoint_weights_bytes: plan.checkpoint_weights_bytes,
             startup_bytes: plan.startup_bytes,
             checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
+            checkpoint_layout: plan.checkpoint_layout.as_ref().and_then(layout_from_wire),
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -133,6 +161,7 @@ impl SingleLaunchPlan {
             checkpoint_weights_bytes: self.checkpoint_weights_bytes,
             startup_bytes: self.startup_bytes,
             checkpoint_state_slot_bytes: self.checkpoint_state_slot_bytes,
+            checkpoint_layout: self.checkpoint_layout.as_ref().map(layout_to_wire),
         }
     }
 }
@@ -1139,7 +1168,11 @@ fn validate_checkpoint(
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
         && evidence.file_count <= 65_536
         && evidence.reason.is_empty()
-        && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0);
+        && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0)
+        // ADR 0028 §5: a layout splits no more than the weights measured.
+        && evidence.layout.as_ref().is_none_or(|layout| {
+            layout_from_wire(layout).is_some_and(|l| l.sharded_bytes <= evidence.weights_bytes)
+        });
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
@@ -1152,6 +1185,7 @@ fn validate_checkpoint(
                 && evidence.reason.is_empty()
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
+                && evidence.layout.is_none()
         }
         "computed" => {
             measured
@@ -1174,6 +1208,7 @@ fn validate_checkpoint(
                 && evidence.total_bytes == 0
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
+                && evidence.layout.is_none()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

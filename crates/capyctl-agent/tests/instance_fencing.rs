@@ -80,6 +80,7 @@ fn launch(id: &str, deployment: &str, instance: u32, generation: i64, slot: u8) 
             checkpoint_digest: String::new(),
             checkpoint_weights_bytes: None,
             checkpoint_state_slot_bytes: None,
+            checkpoint_layout: None,
             startup_bytes: None,
         }),
     })

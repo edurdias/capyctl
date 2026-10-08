@@ -63,6 +63,21 @@ Unreleased.
   refused at start. `auto`, or leaving it out, keeps the quarter and the
   stored policy unchanged. See
   [configuration](configuration.md#standalone-parked-limit).
+- **A model split across machines reserves its share of the weights.** A
+  deployment with a `topology` whose memory CapyCTL derives from the weights
+  charged every machine the whole checkpoint, so a two-machine
+  `tensor_parallel: 2` group reserved its weights twice and a model larger than
+  one machine could never start. Each machine now reserves the weights divided
+  by `tensor_parallel x pipeline_parallel`, plus the tensors every machine
+  keeps whole, read from the checkpoint's safetensors headers (a tenth of the
+  weights when they cannot be read), and the KV cache, margin and startup
+  placeholder are derived from that share. A 126 GiB checkpoint at
+  `tensor_parallel: 2` reserves about 64 GiB of weights per machine; with
+  CapyCTL's startup placeholder (2.25 times the share) it still needs
+  `memory.startup` on two 128 GB machines. Declared `resources` and
+  single-machine deployments are unchanged. See
+  [several machines](../guide/several-machines.md#a-model-split-across-machines).
+
 - **Large models on unified memory keep a larger margin.** Beside the weights
   and the KV cache, a memory request on a unified-memory machine such as a
   GB10 keeps a margin for the engine's own memory: still 8 GiB, or the

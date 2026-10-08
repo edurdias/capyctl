@@ -734,18 +734,30 @@ pub fn sglang_pool_for_launch(
     // A revision that declares its request and KV cache is not re-resolved
     // with the measured weights (found live 2026-10-03), so the launch sizes
     // them here, where it reads the checkpoint: the weight files of the
-    // checkpoint and of the draft model (amendment A6).
+    // checkpoint and of the draft model (amendment A6). A group member's
+    // static pool holds its own share of them (ADR 0028 §5).
     let mut measured;
     let settings = match (settings.memory.weights_bytes, checkpoint_root) {
         (None, Some(root)) => {
             measured = settings.clone();
-            measured.memory.weights_bytes = [Some(root), draft_path.as_deref().map(Path::new)]
+            let whole = [Some(root), draft_path.as_deref().map(Path::new)]
                 .into_iter()
                 .flatten()
                 .map(weight_file_bytes)
                 .sum::<Option<u64>>()
                 .and_then(|bytes| i64::try_from(bytes).ok())
                 .filter(|bytes| *bytes > 0);
+            measured.memory.weights_bytes = match settings.memory.member {
+                Some(member) => whole.and_then(|weights| {
+                    capyctl_domain::member_weights::member_weights_bytes(
+                        weights,
+                        crate::checkpoint_layout::read_checkpoint_layout(root).as_ref(),
+                        member.tensor_parallel,
+                        member.pipeline_parallel,
+                    )
+                }),
+                None => whole,
+            };
             &measured
         }
         _ => settings,

@@ -531,15 +531,18 @@ impl crate::Store {
             digest,
             weights_bytes,
             None,
+            None,
             now_ms,
         )
     }
 
     /// [`Self::record_checkpoint_digest`] with the hybrid state slot the host
-    /// measured beside the weights (ADR 0014 amendment A16), which a
-    /// provisional revision is re-resolved with too. Once recorded, a
-    /// measurement naming another state slot is a mismatch, as for the
-    /// weights; one naming none (an older host) is not.
+    /// measured beside the weights (ADR 0014 amendment A16) and the
+    /// checkpoint's layout (ADR 0028 §5, amendment of 2026-10-07), which a
+    /// provisional revision is re-resolved with too: a group member's share
+    /// of the weights is taken with the layout. Once recorded, a measurement
+    /// naming another state slot is a mismatch, as for the weights; one naming
+    /// none (an older host) is not.
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_measurement(
         &self,
@@ -550,11 +553,13 @@ impl crate::Store {
         digest: &str,
         weights_bytes: i64,
         state_slot_bytes: Option<i64>,
+        layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
         if !is_checkpoint_digest(digest)
             || weights_bytes < 0
             || state_slot_bytes.is_some_and(|bytes| bytes <= 0)
+            || layout.is_some_and(|layout| !layout.is_valid())
             || now_ms < 0
             || host_id.is_empty()
         {
@@ -629,6 +634,7 @@ impl crate::Store {
             let facts = CheckpointFacts {
                 weights_bytes: Some(weights_bytes),
                 state_slot_bytes,
+                layout,
                 ..Default::default()
             };
             // Final review I7 (design §7): each GPU of a multi-GPU host is

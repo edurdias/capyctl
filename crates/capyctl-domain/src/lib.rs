@@ -6,6 +6,7 @@ pub mod identity;
 pub mod latency;
 pub mod launch;
 pub mod lifecycle;
+pub mod member_weights;
 pub mod park;
 pub mod resources;
 pub mod role_log;
