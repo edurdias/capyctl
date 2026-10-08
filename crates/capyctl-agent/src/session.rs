@@ -525,8 +525,12 @@ fn first_inventory(
         let gpu = (!crate::device_domains::device_domains(document).is_empty())
             .then(crate::gpu_memory::sample)
             .flatten();
-        inventory.domains =
-            crate::device_domains::startup_domains(document, &reading.memory, gpu.as_ref());
+        inventory.domains = crate::device_domains::startup_domains(
+            document,
+            &reading.memory,
+            &reading.source,
+            gpu.as_ref(),
+        );
     }
     inventory
 }
@@ -1092,7 +1096,12 @@ mod tests {
             ..reading
         };
         let startup = pb::ReportInventory {
-            domains: crate::device_domains::startup_domains(&config.document, &stale, None),
+            domains: crate::device_domains::startup_domains(
+                &config.document,
+                &stale,
+                &crate::memory::MemorySource::Meminfo,
+                None,
+            ),
             ..Default::default()
         };
         assert!(!startup.domains.is_empty());

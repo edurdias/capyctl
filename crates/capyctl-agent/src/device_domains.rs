@@ -15,6 +15,7 @@ use capyctl_domain::resources::MemoryObservation;
 use capyctl_protocol::pb;
 
 use crate::gpu_memory::{GpuSample, HostShape};
+use crate::memory::MemorySource;
 
 /// The device domains of an approved host document, each with the
 /// nvidia-smi index its `gpuN` device names (`None`: a device id with no
@@ -69,10 +70,11 @@ fn unknown(domain: &str, kind: &str, sampled_at_ms: i64) -> pb::DomainObservatio
 /// single `unified` or `distinct` system domain reads `memory`; several host
 /// domains would need their own observers, so each is unknown rather than a
 /// copied reading. A document without a resource policy reports one
-/// `system` domain.
+/// `system` domain. A host domain names `source`, what bounded `memory`.
 pub fn startup_domains(
     document: &serde_json::Value,
     memory: &MemoryObservation,
+    source: &MemorySource,
     gpu: Option<&GpuSample>,
 ) -> Vec<pb::DomainObservation> {
     let Some(declared) = document["resource_policy"]["domains"].as_object() else {
@@ -84,6 +86,7 @@ pub fn startup_domains(
             capacity_bytes: memory.capacity_bytes,
             available_bytes: memory.available_bytes,
             observed_at_unix_ms: memory.sampled_at_ms,
+            memory_source: source.token(),
             ..Default::default()
         }];
     };
@@ -138,6 +141,7 @@ pub fn startup_domains(
                 capacity_bytes: memory.capacity_bytes,
                 available_bytes: memory.available_bytes,
                 observed_at_unix_ms: memory.sampled_at_ms,
+                memory_source: source.token(),
                 ..Default::default()
             }
         })
@@ -264,7 +268,12 @@ mod tests {
     // GPU sample the device is unknown, never RAM.
     #[test]
     fn a_discrete_host_reports_its_gpu_as_a_device_domain() {
-        let report = startup_domains(&discrete(), &memory(), Some(&sample()));
+        let report = startup_domains(
+            &discrete(),
+            &memory(),
+            &MemorySource::Meminfo,
+            Some(&sample()),
+        );
         let find = |id: &str| report.iter().find(|d| d.domain_id == id).unwrap().clone();
         let gpu = find("gpu0");
         assert_eq!(
@@ -282,7 +291,7 @@ mod tests {
             (64 << 30, 40 << 30)
         );
 
-        let blind = startup_domains(&discrete(), &memory(), None);
+        let blind = startup_domains(&discrete(), &memory(), &MemorySource::Meminfo, None);
         let gpu = blind.iter().find(|d| d.domain_id == "gpu0").unwrap();
         assert_eq!(
             (gpu.capacity_bytes, gpu.available_bytes, gpu.observed_bytes),
@@ -293,14 +302,19 @@ mod tests {
 
     // T26: a unified host (today's two-host setup) reports exactly what it
     // did before device domains: one `system`-kind observation of RAM, no
-    // device id; two host pools are each unknown rather than a copy.
+    // device id; two host pools are each unknown rather than a copy. Its one
+    // pool is the bounded host reading, so a unified (GB10) host in a
+    // memory-limited container publishes the cgroup's figures and names it.
     #[test]
     fn a_unified_host_reports_as_before() {
         let unified = host(
             json!({"unified": {"memory": "unified", "managed_limit": "96GiB", "free_reserve": "8GiB"}}),
             json!({"gpu0": {"domain": "unified", "sharing": "shared"}}),
         );
-        let report = startup_domains(&unified, &memory(), Some(&sample()));
+        let limited = MemorySource::CgroupV2 {
+            cgroup: "/capyctl".into(),
+        };
+        let report = startup_domains(&unified, &memory(), &limited, Some(&sample()));
         assert_eq!(
             report,
             vec![pb::DomainObservation {
@@ -311,6 +325,7 @@ mod tests {
                 capacity_bytes: 64 << 30,
                 available_bytes: 40 << 30,
                 observed_at_unix_ms: 12_345,
+                memory_source: "cgroup_v2:/capyctl".into(),
                 ..Default::default()
             }]
         );
@@ -321,12 +336,14 @@ mod tests {
             }),
             json!({"gpu0": {"domain": "a", "sharing": "shared"}}),
         );
-        assert!(startup_domains(&two, &memory(), None)
-            .iter()
-            .all(|d| d.available_bytes == -1 && d.capacity_bytes == -1));
+        assert!(
+            startup_domains(&two, &memory(), &MemorySource::Meminfo, None)
+                .iter()
+                .all(|d| d.available_bytes == -1 && d.capacity_bytes == -1)
+        );
         let mut bare = unified.clone();
         bare.as_object_mut().unwrap().remove("resource_policy");
-        let report = startup_domains(&bare, &memory(), None);
+        let report = startup_domains(&bare, &memory(), &MemorySource::Meminfo, None);
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].domain_id, "system");
     }

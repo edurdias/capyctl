@@ -218,7 +218,10 @@ pub fn check_version(resolved: &Resolved, timeout: Duration) -> Result<String, V
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
-    let mut child = command.spawn().map_err(|_| VersionCheckError::Spawn)?;
+    // SPEC §13.2: its own group, so registered with the role's reaper, which
+    // leaves its exit status to the wait below.
+    let mut child = capyctl_launchers::subreaper::spawn_direct(&mut command)
+        .map_err(|_| VersionCheckError::Spawn)?;
     let pgid = child.id() as i32;
     let mut stdout = child.stdout.take().ok_or(VersionCheckError::Spawn)?;
     let reader = std::thread::spawn(move || {

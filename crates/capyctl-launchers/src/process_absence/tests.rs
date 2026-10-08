@@ -21,7 +21,9 @@ fn own_identity() -> ProcessIdentity {
     let pid = std::process::id();
     identity(
         pid,
-        start_ticks(pid).expect("own stat is readable"),
+        crate::subreaper::proc_stat(pid)
+            .expect("own stat is readable")
+            .start_ticks,
         &boot(),
     )
 }
@@ -143,4 +145,17 @@ fn the_decision_covers_every_observation() {
     );
     // An unreadable boot id must not read as a different boot.
     assert_eq!(resolve(&id, None, Observed::NoSuchPid), Presence::Unknown);
+}
+
+// T12 (SPEC §13.2): an exited, unreaped process is neither alive nor gone; one
+// with another start time is a different process, so the recorded one is gone.
+#[test]
+fn an_exited_unreaped_process_is_unknown_not_alive() {
+    let b = boot();
+    let id = identity(41, 12, &b);
+    assert_eq!(
+        resolve(&id, Some(&b), Observed::Exited(12)),
+        Presence::Unknown
+    );
+    assert_eq!(resolve(&id, Some(&b), Observed::Exited(13)), Presence::Gone);
 }

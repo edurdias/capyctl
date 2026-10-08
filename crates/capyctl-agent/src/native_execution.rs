@@ -2376,7 +2376,8 @@ impl SessionExecution for NativeHostExecution {
         let [host] = host[..] else {
             return None;
         };
-        let memory = crate::memory::read_host_memory().ok()?.memory;
+        let reading = crate::memory::read_host_memory().ok()?;
+        let memory = reading.memory;
         // ADR 0007: availability first, then the processes still alive, so a
         // process that grew in between is under-credited, never over-credited.
         let residents = self
@@ -2390,6 +2391,9 @@ impl SessionExecution for NativeHostExecution {
         domain.capacity_bytes = memory.capacity_bytes;
         domain.observed_at_unix = memory.sampled_at_ms / 1000;
         domain.observed_at_unix_ms = memory.sampled_at_ms;
+        // SPEC §7.2: what bounded the reading, `/proc/meminfo` or a cgroup v2
+        // limit (status only).
+        domain.memory_source = reading.source.token();
         domain.residents = residents
             .into_iter()
             .map(|p| pb::ProcessResidency {

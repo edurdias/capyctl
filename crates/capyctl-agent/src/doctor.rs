@@ -61,13 +61,6 @@ pub fn redact_api_keys(s: &str) -> String {
     out
 }
 
-fn meminfo_total_bytes() -> Option<i64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: i64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
-}
-
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -128,11 +121,13 @@ pub fn doctor_host(profiles: &[ProfileInput]) -> Result<DoctorReport, DoctorErro
         });
     }
 
-    if let Some(bytes) = meminfo_total_bytes() {
+    // SPEC §7.2: the host's capacity as admission reads it, bounded by the
+    // process's cgroup v2 limits.
+    if let Ok(reading) = crate::memory::read_host_memory() {
         report.domains.push(DomainObservation {
             kind: DomainKind::System,
             label: None,
-            observed_bytes: bytes,
+            observed_bytes: reading.memory.capacity_bytes,
             observed_at_unix: now_unix(),
         });
     }

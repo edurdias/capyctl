@@ -10,12 +10,22 @@
 //! an unavailable reading as "no memory in use" would admit work the host cannot
 //! hold, which is the specific failure aggregate accounting exists to prevent.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use capyctl_agent::gpu_memory::{GpuSample, GpuSampler};
-use capyctl_agent::memory::HostMemorySample;
+use capyctl_agent::memory::{HostMemorySample, MemorySource};
 use capyctl_controller::coordinator::{CoordinatorError, ObservationFuture, ServiceObservation};
 use capyctl_domain::resources::MemoryObservation;
+
+/// [`HostMemoryObservation::observe_sourced`]'s answer.
+pub type SourcedObservationFuture = Pin<
+    Box<
+        dyn Future<Output = Result<(Vec<MemoryObservation>, MemorySource), CoordinatorError>>
+            + Send,
+    >,
+>;
 
 /// Reads the host's memory through the agent's `/proc/meminfo` parser, and a
 /// discrete GPU's memory through the GPU collector, and reports each under the
@@ -112,20 +122,16 @@ pub fn observed_domains(
         .collect()
 }
 
-/// Where standalone reads its host's memory from: `/proc/meminfo` in
-/// production. A test states an explicit capacity instead, so its fixtures
-/// and the standalone policy derived from them do not depend on how much
-/// memory the machine running the suite happens to have free.
-pub type MemoryReader =
-    Arc<dyn Fn() -> Result<capyctl_domain::resources::MemoryObservation, String> + Send + Sync>;
+/// Where standalone reads its host's memory from: `/proc/meminfo` bounded by
+/// the process's cgroup v2 limits in production. A test states an explicit
+/// capacity instead, so its fixtures and the standalone policy derived from
+/// them do not depend on how much memory the machine running the suite
+/// happens to have free.
+pub type MemoryReader = Arc<dyn Fn() -> Result<HostMemorySample, String> + Send + Sync>;
 
-/// The production reader: the agent's `/proc/meminfo` parser.
+/// The production reader: the agent's host memory reading (SPEC §7.2).
 pub fn proc_meminfo() -> MemoryReader {
-    Arc::new(|| {
-        capyctl_agent::memory::read_host_memory()
-            .map(|sample| sample.memory)
-            .map_err(|error| error.to_string())
-    })
+    Arc::new(|| capyctl_agent::memory::read_host_memory().map_err(|error| error.to_string()))
 }
 
 /// A fixed reading: `capacity_bytes` total with `available_bytes` free, dated
@@ -136,11 +142,15 @@ pub fn fixed_memory(capacity_bytes: i64, available_bytes: i64) -> MemoryReader {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_millis();
-        Ok(capyctl_domain::resources::MemoryObservation {
-            domain: "system".into(),
-            capacity_bytes,
-            available_bytes,
-            sampled_at_ms: i64::try_from(sampled_at_ms).map_err(|error| error.to_string())?,
+        Ok(HostMemorySample {
+            memory: capyctl_domain::resources::MemoryObservation {
+                domain: "system".into(),
+                capacity_bytes,
+                available_bytes,
+                sampled_at_ms: i64::try_from(sampled_at_ms).map_err(|error| error.to_string())?,
+            },
+            swap_used_bytes: 0,
+            source: MemorySource::Meminfo,
         })
     })
 }
@@ -194,6 +204,41 @@ impl HostMemoryObservation {
         self.residency = Some(sampler);
         self
     }
+
+    /// The observations, with the source that bounded host memory (SPEC
+    /// §7.2): `/proc/meminfo`, or a cgroup v2 limit.
+    pub fn observe_sourced(&self) -> SourcedObservationFuture {
+        let domains = self.domains.clone();
+        let reader = self.reader.clone();
+        let gpu = self.gpu.clone().filter(|_| {
+            domains
+                .iter()
+                .any(|d| matches!(d, ObservedDomain::Device { .. }))
+        });
+        Box::pin(async move {
+            // Synchronous and short: `/proc` and cgroup reads, not a syscall
+            // that blocks.
+            let host = reader().map_err(|error| {
+                CoordinatorError::Service(format!("host memory observation failed: {error}"))
+            })?;
+            // The collector spawns a bounded process, so it runs off the async
+            // thread. A failed or panicked sample is no sample: the device
+            // domains go unobserved (SPEC §7.2), host domains are unaffected.
+            let sample = match gpu {
+                Some(sampler) => tokio::task::spawn_blocking(move || sampler())
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            // A host domain reports the one host reading; on a unified host its
+            // single domain is that whole physical pool.
+            Ok((
+                observe_domains(&domains, &host, sample.as_ref()),
+                host.source,
+            ))
+        })
+    }
 }
 
 impl ServiceObservation for HostMemoryObservation {
@@ -221,37 +266,8 @@ impl ServiceObservation for HostMemoryObservation {
     }
 
     fn observe(&self, _host_id: String) -> ObservationFuture {
-        let domains = self.domains.clone();
-        let reader = self.reader.clone();
-        let gpu = self.gpu.clone().filter(|_| {
-            domains
-                .iter()
-                .any(|d| matches!(d, ObservedDomain::Device { .. }))
-        });
-        Box::pin(async move {
-            // Synchronous and short: a `/proc` read, not a syscall that blocks.
-            let memory = reader().map_err(|error| {
-                CoordinatorError::Service(format!("host memory observation failed: {error}"))
-            })?;
-            // Only the memory figure is reported; swap is not an observation.
-            let host = HostMemorySample {
-                memory,
-                swap_used_bytes: 0,
-            };
-            // The collector spawns a bounded process, so it runs off the async
-            // thread. A failed or panicked sample is no sample: the device
-            // domains go unobserved (SPEC §7.2), host domains are unaffected.
-            let sample = match gpu {
-                Some(sampler) => tokio::task::spawn_blocking(move || sampler())
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
-            };
-            // A host domain reports the one host reading; on a unified host its
-            // single domain is that whole physical pool.
-            Ok(observe_domains(&domains, &host, sample.as_ref()))
-        })
+        let sourced = self.observe_sourced();
+        Box::pin(async move { sourced.await.map(|(observed, _)| observed) })
     }
 }
 
@@ -337,6 +353,7 @@ mod tests {
                 sampled_at_ms,
             },
             swap_used_bytes: 0,
+            source: MemorySource::Meminfo,
         }
     }
 

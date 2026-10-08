@@ -226,8 +226,9 @@ impl DurableSpawn {
                 Ok(())
             });
         }
-        let child = command
-            .spawn()
+        // SPEC §13.2: registered with the role's reaper, which leaves this
+        // child's exit status to its retained handle.
+        let child = crate::subreaper::spawn_direct(&mut command)
             .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
         let pid = child.id();
         drop(read_gate);

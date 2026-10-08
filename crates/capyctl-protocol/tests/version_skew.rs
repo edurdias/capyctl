@@ -587,3 +587,26 @@ fn device_memory_domains_is_one_additive_capability() {
         split
     );
 }
+
+// T34 T26 (SPEC §7.2): `memory_source` is additive and status only: an
+// observation without it encodes exactly as an older host's, and one with it
+// decodes back unchanged (an older server skips the unknown field).
+#[test]
+fn the_memory_source_is_an_additive_field() {
+    let older = pb::DomainObservation {
+        domain_id: "unified".into(),
+        kind: "system".into(),
+        capacity_bytes: 128 << 30,
+        available_bytes: 100 << 30,
+        ..Default::default()
+    };
+    let mut same = older.clone();
+    same.memory_source.clear();
+    assert_eq!(older.encode_to_vec(), same.encode_to_vec());
+    let bounded = pb::DomainObservation {
+        memory_source: "cgroup_v2:/system.slice/docker-1.scope".into(),
+        ..older
+    };
+    let decoded = pb::DomainObservation::decode(bounded.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, bounded);
+}

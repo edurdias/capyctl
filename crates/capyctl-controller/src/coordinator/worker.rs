@@ -1245,6 +1245,11 @@ fn observed_gone(
         GoneProof::Indeterminate => Err(CoordinatorError::Service(
             "process absence could not be established; ownership is retained".into(),
         )),
+        // SPEC §13.2 / T12: an exited process whose parent never waits for it
+        // is reported, never read as alive or as gone.
+        GoneProof::Unreaped => Err(CoordinatorError::Service(
+            "a recorded process exited but its parent has not reaped it (a zombie); ownership is retained".into(),
+        )),
     }
 }
 

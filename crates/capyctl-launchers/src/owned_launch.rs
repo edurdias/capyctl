@@ -178,7 +178,13 @@ impl DurableProcessLaunch {
         // Presence that cannot be established is retention, never absence, so it is
         // settled before anything is signalled or released.
         for identity in identities {
-            if presence(identity) == Presence::Unknown {
+            // SPEC §13.2 / T12: an exited process its parent has not reaped yet
+            // is not unreadable. It holds nothing but its pid, and stopping the
+            // group can end that parent, which hands it to this role to reap;
+            // the proof below still waits for it.
+            if presence(identity) == Presence::Unknown
+                && !crate::process_absence::exited_unreaped(identity)
+            {
                 return Err(uncertain(format!(
                     "presence of pid {} could not be established",
                     identity.pid
@@ -252,6 +258,9 @@ impl DurableProcessLaunch {
             (GoneProof::Indeterminate, _) => {
                 Err(uncertain("process absence could not be established"))
             }
+            (GoneProof::Unreaped, _) => Err(uncertain(
+                "a recorded process exited but its parent has not reaped it (a zombie)",
+            )),
         }
     }
 }

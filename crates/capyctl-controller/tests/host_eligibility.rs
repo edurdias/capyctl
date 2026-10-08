@@ -62,6 +62,7 @@ fn inventory(document: &Value) -> pb::ReportInventory {
     pb::ReportInventory {
         domains: vec![pb::DomainObservation {
             device_id: String::new(),
+            memory_source: String::new(),
             residents: vec![],
             domain_id: "unified".into(),
             kind: "system".into(),

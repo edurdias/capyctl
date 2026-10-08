@@ -223,8 +223,9 @@ impl Launcher for ExecLauncher {
                     .map_err(std::io::Error::other)
             });
         }
-        let mut child = command
-            .spawn()
+        // SPEC §13.2: registered with the role's reaper, which leaves this
+        // child's exit status to the thread below.
+        let mut child = crate::subreaper::spawn_direct(&mut command)
             .map_err(|e| LauncherError::SpawnFailed(format!("spawn {program}: {e}")))?;
         let pid = child.id();
         // Reap on exit in a detached thread so no zombie accumulates while

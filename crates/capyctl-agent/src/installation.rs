@@ -434,7 +434,8 @@ pub fn probe_capabilities(
     // Its own process group, so a timeout ends everything the probe started.
     // SPEC §9.1 / T21: the probe writes no bytecode beside the checked source
     // and inherits nothing of the agent's environment.
-    let mut child = Command::new(&interpreter)
+    let mut command = Command::new(&interpreter);
+    command
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg("-I")
@@ -446,9 +447,10 @@ pub fn probe_capabilities(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()?;
+        .process_group(0);
+    // SPEC §13.2: its own group, so registered with the role's reaper, which
+    // leaves its exit status to the wait below.
+    let mut child = capyctl_launchers::subreaper::spawn_direct(&mut command).ok()?;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
