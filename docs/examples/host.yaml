@@ -64,6 +64,16 @@ resource_policy:
   labels:
     site: lab
     accelerator: example-gpu
+  # One model across machines (docs/guide/several-machines.md): the address
+  # this host's group peers reach it on, over the direct link. A host without
+  # it is never named in a group. Also `--peer-address` or
+  # CAPYCTL_PEER_ADDRESS. docs/examples/host-b.yaml is the second host.
+  groups:
+    peer_address: 192.0.2.10
+    # The head's rendezvous ports (default 25000-25099), and whether a missing
+    # memlock or InfiniBand setting refuses a group (default false: warn).
+    # rendezvous_port_range: {start: 25000, end: 25099}
+    # require_rdma: false
 # Engine installations. Engine tuning belongs to each deployment's
 # `engine_config`; a profile keeps host-fixed settings only.
 runtime_profiles:

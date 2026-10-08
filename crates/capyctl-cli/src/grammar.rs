@@ -140,7 +140,7 @@ pub enum Command {
     /// Owner decision 2026-09-25: `sets` are its `--set` overrides.
     Validate {
         file: PathBuf,
-        host: Option<PathBuf>,
+        hosts: Vec<PathBuf>,
         sets: Vec<String>,
     },
     /// Owner decision 2026-09-25: the effective configuration of a role, each
@@ -973,9 +973,10 @@ enum ValidateArgs {
         /// The file to check.
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
-        /// The host document a deployment file is resolved against.
-        #[arg(long, value_name = "FILE")]
-        host: Option<PathBuf>,
+        /// The host document a deployment file is resolved against; for a
+        /// group deployment, repeat it once per host in placement.hosts.
+        #[arg(long = "host", value_name = "FILE")]
+        hosts: Vec<PathBuf>,
         /// Validate a role document with this setting changed, as `start`
         /// would (repeatable), e.g. --set shutdown.drain_timeout=45s.
         #[arg(long = "set", value_name = "PATH=VALUE", value_parser = parse_set)]
@@ -1124,7 +1125,9 @@ impl From<CliCommand> for Command {
                 DeleteArgs::Deployment { deployment, stop } => Command::Delete { deployment, stop },
             },
             CliCommand::Validate { resource } => match resource {
-                ValidateArgs::Config { file, host, sets } => Command::Validate { file, host, sets },
+                ValidateArgs::Config { file, hosts, sets } => {
+                    Command::Validate { file, hosts, sets }
+                }
             },
             CliCommand::Config {
                 action: ConfigArgs::Show { role, sets },

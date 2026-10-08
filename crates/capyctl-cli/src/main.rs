@@ -224,7 +224,7 @@ fn main() -> ExitCode {
         };
     }
     // SPEC §14 / §15.3: offline validation; no runtime, state, or network.
-    if let Command::Validate { file, host, sets } = &invocation.command {
+    if let Command::Validate { file, hosts, sets } = &invocation.command {
         // The state root a start would use, when this invocation names one.
         let named_root = invocation.state_dir.clone().or_else(|| {
             std::env::var_os("CAPYCTL_STATE_DIR")
@@ -233,7 +233,7 @@ fn main() -> ExitCode {
         });
         return match capyctl_cli::validate::validate_config_at(
             file,
-            host.as_deref(),
+            hosts,
             sets,
             named_root.as_deref(),
         ) {

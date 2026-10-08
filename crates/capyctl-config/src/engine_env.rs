@@ -3,8 +3,9 @@
 //! ADR 0028 §2.1: a profile's own `env` is host-authored; a deployment's
 //! `engine_config.env` names must match a profile `security.approved_env` entry.
 //! Names CapyCTL owns are never settable at either level, whatever an approval
-//! says. Values are bounded, single-line, and shown in the effective
-//! configuration: they are not secret storage.
+//! says. Values are bounded and single-line; they are stored for the launch
+//! and the recipe fingerprint, and output shows each name with its source,
+//! never its value (R10). They are not secret storage.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -236,6 +237,42 @@ impl ResolvedEnv {
         self.vars
             .values()
             .all(|(_, source)| *source == EnvSource::Profile)
+    }
+}
+
+/// ADR 0028 §2.1 (R10): replace every engine environment value in a stored
+/// effective configuration (or a view holding several) with [`REDACTED`],
+/// keeping each name and source: a profile's or a declaration's `env`
+/// object, and the resolved `engine_env.vars` (`[value, source]`).
+pub fn redact_values(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(fields) => {
+            for (name, field) in fields.iter_mut() {
+                match (name.as_str(), &mut *field) {
+                    ("env", Value::Object(env)) => {
+                        for entry in env.values_mut() {
+                            *entry = Value::String(REDACTED.into());
+                        }
+                    }
+                    ("engine_env", Value::Object(resolved)) => {
+                        if let Some(Value::Object(vars)) = resolved.get_mut("vars") {
+                            for entry in vars.values_mut() {
+                                match entry {
+                                    Value::Array(pair) if !pair.is_empty() => {
+                                        pair[0] = Value::String(REDACTED.into());
+                                    }
+                                    other => *other = Value::String(REDACTED.into()),
+                                }
+                            }
+                        }
+                    }
+                    (_, field) => redact_values(field),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_values),
+        _ => {}
     }
 }
 

@@ -984,15 +984,21 @@ fn secret_name(name: &str) -> bool {
 /// SPEC §8.2 / §13.3: redact secrets from an effective configuration before it
 /// leaves the service: any field whose name marks a secret or credential
 /// reference, and the value of any engine argument whose option name does
-/// (`--hf-token value`, `--api-key=value`).
+/// (`--hf-token value`, `--api-key=value`). ADR 0028 §2.1 (R10): every engine
+/// environment value too; its name and source stay visible.
 pub fn redact_effective(value: &mut Value) {
+    capyctl_config::engine_env::redact_values(value);
+    redact_secrets(value);
+}
+
+fn redact_secrets(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             for (name, field) in fields.iter_mut() {
                 if secret_name(name) && !field.is_null() {
                     *field = Value::String(REDACTED.into());
                 } else {
-                    redact_effective(field);
+                    redact_secrets(field);
                 }
             }
         }
@@ -1017,7 +1023,7 @@ pub fn redact_effective(value: &mut Value) {
                     }
                 } else {
                     redact_next = false;
-                    redact_effective(item);
+                    redact_secrets(item);
                 }
             }
         }

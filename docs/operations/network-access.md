@@ -157,7 +157,32 @@ Open only port 443 to the internet, never 8443.
   each get a key generated for that launch and checked by CapyCTL's guard;
   TensorFold has no key. The router
   is the only path from the network to an engine, and it forwards only the
-  allowlisted inference routes.
+  allowlisted inference routes. A model running across machines also opens
+  peer ports; see below.
+
+## Multi-node groups
+
+A model running across machines ([One model across machines](../guide/several-machines.md#one-model-across-machines))
+keeps its API and control endpoints on loopback, behind the same keys. Its
+members also talk to each other on ports that have no authentication:
+
+- the rendezvous port on the head, from `--rendezvous-ports` (default
+  `25000-25099`), on every interface;
+- the engine's own ports, which CapyCTL does not choose: the gloo ports of the
+  CPU process group on each member, vLLM's broadcast queue port, an extra port
+  TensorFold opens on rank 0, six ports next to the rendezvous port for SGLang
+  with DP attention, and NCCL's dynamic ports.
+
+The engines exchange pickled Python objects over these ports. Anyone who can
+reach them can likely run code as the user the engine runs as, and read the
+per-launch keys inside that process; at the least they can disturb or crash
+the group. This holds on every network the machines are on, including a
+wireless or overlay network such as a tailnet.
+
+CapyCTL checks no firewall. Keep group machines on a private direct link, and
+block the ports above on every other interface. Status marks every group
+`peer transport unauthenticated` (`"peer_transport": "unauthenticated"` in
+JSON).
 
 ## Upgrading from an earlier release
 

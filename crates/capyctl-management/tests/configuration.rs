@@ -1273,6 +1273,72 @@ fn effective_view_redacts_secret_argument_values() {
     assert_eq!(ordinary, before);
 }
 
+/// ADR 0028 §2.1 (R10): the effective configuration shows every engine
+/// environment name with its source and never a value, from the profile or
+/// the deployment, in the deployment's view and in each host's.
+// T37
+#[tokio::test]
+async fn effective_configuration_shows_engine_env_names_never_values() {
+    let (_directory, state, mut config, mut host) = fixture();
+    host["runtime_profiles"]["local"]["env"]["PROFILE_FLAG"] = json!("zq-profile-value");
+    host["runtime_profiles"]["local"]["security"]["approved_env"] = json!(["DEPLOY_FLAG"]);
+    config["engine_config"]["env"] = json!({"DEPLOY_FLAG": "zq-deploy-value"});
+    let router = app(state, host);
+    let (status, created) = deploy(&router, "env-effective", &config).await;
+    assert!(created["deployment_id"].is_string(), "{status} {created}");
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/management/v1/deployments/toy/effective-config")
+                .header("authorization", format!("Bearer {MANAGEMENT}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let view = json_response(response).await;
+    let text = view.to_string();
+    for value in ["zq-profile-value", "zq-deploy-value"] {
+        assert!(!text.contains(value), "{text}");
+    }
+    let effective = &view["effective"];
+    assert_eq!(
+        effective["engine_env"]["vars"]["DEPLOY_FLAG"],
+        json!(["<redacted>", "deployment"]),
+        "{view}"
+    );
+    assert_eq!(
+        effective["engine_env"]["vars"]["PROFILE_FLAG"],
+        json!(["<redacted>", "profile"]),
+        "{view}"
+    );
+    assert_eq!(effective["profile"]["env"]["PROFILE_FLAG"], "<redacted>");
+}
+
+/// ADR 0028 §2.1 (R10): the redaction keeps every name and source and
+/// replaces every value, wherever an engine environment appears.
+// T37
+#[test]
+fn effective_view_redacts_engine_env_values() {
+    let mut value = json!({
+        "profile": {"env": {"A_FLAG": "a-value"}},
+        "engine_config": {"declared": {"env": {"B_FLAG": "b-value"}}},
+        "engine_env": {"vars": {"A_FLAG": ["a-value", "profile"], "B_FLAG": ["b-value", "deployment"]}},
+    });
+    capyctl_management::configuration::redact_effective(&mut value);
+    assert_eq!(
+        value,
+        json!({
+            "profile": {"env": {"A_FLAG": "<redacted>"}},
+            "engine_config": {"declared": {"env": {"B_FLAG": "<redacted>"}}},
+            "engine_env": {"vars": {"A_FLAG": ["<redacted>", "profile"],
+                "B_FLAG": ["<redacted>", "deployment"]}},
+        })
+    );
+}
+
 /// ADR 0008: a deployment declaring a remote source is refused on a host that
 /// turned its kind off (`model_source_denied` names why), accepted on one that
 /// allows it (the default since the owner decision of 2026-09-25), and its

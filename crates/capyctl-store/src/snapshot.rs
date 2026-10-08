@@ -283,6 +283,69 @@ pub struct InstanceSnapshot {
     /// error (see [`LatestOperation`]). Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_operation: Option<LatestOperation>,
+    /// ADR 0028 §15: a group instance's plan and members, flattened into the
+    /// instance. Absent for a single-host instance (T39). Additive.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupStatus>,
+}
+
+/// ADR 0028 §15: a group instance as status shows it, read from its newest
+/// group plan (the unsettled one while any member is unsettled; a group
+/// never records a placed host). Recorded facts, not proof that a rank runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GroupStatus {
+    /// `vllm`, `sglang` or `tensorfold`.
+    pub engine: &'static str,
+    pub topology: GroupTopologyStatus,
+    /// The head's peer address and the plan's rendezvous port.
+    pub rendezvous: String,
+    /// ADR 0028 §13: always `unauthenticated`. The engines' rendezvous,
+    /// broadcast and collective ports take no credential.
+    pub peer_transport: &'static str,
+    /// The generation the plan was drawn for; the instance's own
+    /// `generation` moves on while a stopped plan's members still settle.
+    pub plan_generation: String,
+    /// In node-rank order, the head first.
+    pub members: Vec<GroupMemberStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GroupTopologyStatus {
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+}
+
+/// ADR 0028 §11, §15: one member of a group instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GroupMemberStatus {
+    /// The member's host id.
+    pub host: String,
+    pub node_rank: u32,
+    /// `head` or `worker`.
+    pub role: &'static str,
+    /// `reserved`, `dispatching`, `launched`, `uncertain` (its host has not
+    /// proven it gone; it keeps its charge) or `settled`, or `failed` for the
+    /// rank the group failed at once it is no longer uncertain.
+    pub state: &'static str,
+    /// The processes recorded for it while it is unsettled; 0 once settled.
+    pub processes: u32,
+    /// Its charge on its own host, `None` once released.
+    pub reservation: Option<MemberReservationStatus>,
+    /// Its residency as resolved on its own host.
+    pub residency: Option<String>,
+    /// The closed code (spec §16) that names what happened to it:
+    /// the group's failure code at the failed rank, else
+    /// `group_member_uncertain` while uncertain.
+    pub last_error: Option<String>,
+}
+
+/// ADR 0028 §5: what one member's owner holds on its own host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberReservationStatus {
+    /// `cold`, `ready`, `parking`, `parked` or `wake`.
+    pub phase: &'static str,
+    /// The bytes it holds across its host's domains, as a decimal string.
+    pub bytes: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteSnapshot {
@@ -698,6 +761,7 @@ impl Store {
                     last_error: r.get(15)?,
                     startup: None,
                     latest_operation: None,
+                    group: None,
                 },
             ))
         })?;
@@ -710,6 +774,14 @@ impl Store {
                     &format!("SELECT {LATEST_OPERATION} FROM operations o JOIN lifecycle_runs r ON r.operation_id=o.id WHERE r.deployment_id=?1 AND r.instance_index=?2 AND r.generation=(SELECT i.generation FROM deployment_instances i WHERE i.deployment_id=?1 AND i.instance_index=?2) ORDER BY o.accepted_at DESC,o.rowid DESC LIMIT 1"),
                     rusqlite::params![deployment, instance.index],
                 )?;
+                // ADR 0028 §15: a group instance is shown from its plan,
+                // each member's residency as resolved on its own host for
+                // the revision the instance runs.
+                let revision = instance
+                    .revision
+                    .clone()
+                    .unwrap_or_else(|| entry.revision.clone());
+                instance.group = group_status(&tx, &deployment, instance.index, &revision)?;
                 entry.instances.push(instance);
             }
         }
@@ -839,13 +911,7 @@ impl Store {
                     .map_err(|_| SnapshotError::CorruptData)?;
                 Ok(ReservationSnapshot {
                     owner_id: r.get(0)?,
-                    phase: match f.phase {
-                        ResourcePhase::Cold => "cold",
-                        ResourcePhase::Ready => "ready",
-                        ResourcePhase::Parking => "parking",
-                        ResourcePhase::Parked => "parked",
-                        ResourcePhase::Wake => "wake",
-                    },
+                    phase: phase_name(f.phase),
                     allocations: f
                         .allocations
                         .into_iter()
@@ -979,6 +1045,141 @@ fn latest_operation(
         hint,
         given_up: failed && r.get::<_, Option<bool>>(5)?.unwrap_or(false),
     }))
+}
+
+/// ADR 0028 §15: the group status of instance `index` of `deployment_id`, or
+/// `None` when it never ran as a group. Read from its newest plan: while a
+/// member is unsettled that is the only unsettled plan (one per instance),
+/// since a new generation never starts before every member settled.
+fn group_status(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    index: u32,
+    revision: &str,
+) -> Result<Option<GroupStatus>, SnapshotError> {
+    use crate::groups::MemberState;
+    use capyctl_domain::group::MemberRole;
+    use rusqlite::OptionalExtension;
+    let newest: Option<(i64, Option<u32>, Option<String>)> = tx
+        .prepare_cached(
+            "SELECT generation,failed_rank,failure_code FROM group_plans
+              WHERE deployment_id=?1 AND instance_index=?2 ORDER BY generation DESC LIMIT 1",
+        )?
+        .query_row(rusqlite::params![deployment_id, index], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    let Some((generation, failed_rank, failure_code)) = newest else {
+        return Ok(None);
+    };
+    let (plan, rows) = crate::groups::plan_at(tx, deployment_id, index, generation)
+        .map_err(|_| SnapshotError::CorruptData)?
+        .ok_or(SnapshotError::CorruptData)?;
+    let revision: i64 = revision.parse().map_err(|_| SnapshotError::CorruptData)?;
+    let residency_sql = format!(
+        "SELECT {} FROM host_effective_revisions h
+          WHERE h.deployment_id=?1 AND h.revision=?2 AND h.host_id=?3 AND h.outcome='resolved'",
+        json_text("h.effective_json", "$.residency")
+    );
+    let mut members = Vec::with_capacity(rows.len());
+    for (member, row) in plan.members().iter().zip(&rows) {
+        if member.rank != row.rank || member.member.host_id != row.host_id {
+            return Err(SnapshotError::CorruptData);
+        }
+        let charge: Option<String> = tx
+            .prepare_cached("SELECT footprint_json FROM resource_owners WHERE owner_id=?1")?
+            .query_row([&row.owner_id], |r| r.get(0))
+            .optional()?;
+        let reservation = charge
+            .map(|json| {
+                let footprint = crate::resource_ledger::decode(&json)
+                    .map_err(|_| SnapshotError::CorruptData)?;
+                let bytes = footprint
+                    .allocations
+                    .iter()
+                    .try_fold(0_i64, |sum, a| sum.checked_add(a.bytes))
+                    .ok_or(SnapshotError::CorruptData)?;
+                Ok::<_, SnapshotError>(MemberReservationStatus {
+                    phase: phase_name(footprint.phase),
+                    bytes: bytes.to_string(),
+                })
+            })
+            .transpose()?;
+        let residency: Option<String> = tx
+            .prepare_cached(&residency_sql)?
+            .query_row(
+                rusqlite::params![deployment_id, revision, row.host_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let failed = failed_rank == Some(row.rank);
+        let uncertain = row.state == MemberState::Uncertain;
+        let settled = row.state == MemberState::Settled;
+        let processes = if settled {
+            0
+        } else {
+            u32::try_from(row.identities.as_ref().map_or(0, Vec::len))
+                .map_err(|_| SnapshotError::CorruptData)?
+        };
+        members.push(GroupMemberStatus {
+            host: row.host_id.clone(),
+            node_rank: row.rank,
+            role: match member.role {
+                MemberRole::Head => "head",
+                MemberRole::Worker => "worker",
+            },
+            // ADR 0028 §11: an uncertain member keeps its charge, whatever
+            // else is known of it; the failed rank reads failed otherwise.
+            state: if uncertain {
+                MemberState::Uncertain.as_str()
+            } else if failed {
+                "failed"
+            } else {
+                row.state.as_str()
+            },
+            processes,
+            reservation,
+            residency,
+            last_error: if failed {
+                Some(
+                    failure_code
+                        .clone()
+                        .unwrap_or_else(|| "group_member_failed".into()),
+                )
+            } else if uncertain {
+                Some("group_member_uncertain".into())
+            } else {
+                None
+            },
+        });
+    }
+    if members.len() != plan.members().len() {
+        return Err(SnapshotError::CorruptData);
+    }
+    let topology = plan.topology();
+    Ok(Some(GroupStatus {
+        engine: plan.engine().as_str(),
+        topology: GroupTopologyStatus {
+            tensor_parallel: topology.tensor_parallel,
+            pipeline_parallel: topology.pipeline_parallel,
+        },
+        rendezvous: std::net::SocketAddr::new(plan.head().peer_address, plan.rendezvous_port())
+            .to_string(),
+        peer_transport: "unauthenticated",
+        plan_generation: plan.generation().to_string(),
+        members,
+    }))
+}
+
+fn phase_name(phase: ResourcePhase) -> &'static str {
+    match phase {
+        ResourcePhase::Cold => "cold",
+        ResourcePhase::Ready => "ready",
+        ResourcePhase::Parking => "parking",
+        ResourcePhase::Parked => "parked",
+        ResourcePhase::Wake => "wake",
+    }
 }
 
 /// ADR 0013 §6: a deployment's observed state from its instances. `ready`

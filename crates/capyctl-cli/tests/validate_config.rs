@@ -442,7 +442,10 @@ fn every_documented_example_passes_validate_config() {
         let standalone = file.file_name().is_some_and(|n| {
             n == "deployment-standalone.yaml" || n == "deployment-tensorfold.yaml"
         });
-        if kind == "deployment" && !standalone {
+        // ADR 0028 §2 (OD8): the group example resolves on both hosts it
+        // names; `a_group_validates_against_every_named_host` checks it.
+        let group = file.ends_with("deployment-multinode.yaml");
+        if kind == "deployment" && !standalone && !group {
             let host = examples().join("host.yaml");
             let (code, value, raw) = validate(&[
                 "--file",
@@ -538,7 +541,7 @@ fn the_discrete_host_example_validates() {
 fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
     let dir = tempfile::tempdir().unwrap();
     let host = examples().join("host.yaml");
-    let source = std::fs::read_to_string(examples().join("deployment-multinode.yaml")).unwrap();
+    let source = std::fs::read_to_string(examples().join("deployment-spread.yaml")).unwrap();
     let elsewhere = write(
         dir.path(),
         "elsewhere.yaml",
@@ -556,6 +559,269 @@ fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
     assert_eq!(code, 2, "{raw}");
     assert!(
         value["message"].as_str().unwrap().contains("gpu-box"),
+        "{raw}"
+    );
+}
+
+/// The checkout's root; the example paths below are relative to it.
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// `validate config` of a checkout-relative deployment against the given
+/// host documents (checkout-relative or absolute).
+fn validate_group(deployment: &str, hosts: &[&str]) -> (i32, Value, String) {
+    let resolve = |path: &str| repo().join(path).to_str().unwrap().to_owned();
+    let mut args = vec!["--file".to_owned(), resolve(deployment)];
+    for host in hosts {
+        args.push("--host".into());
+        args.push(resolve(host));
+    }
+    validate(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The second example host (`docs/examples/host-b.yaml`) as a document named
+/// `name`, with state under `root` and the peer address given (none: the
+/// groups block removed).
+fn group_host_document(root: &Path, name: &str, peer: Option<&str>) -> Value {
+    let text = std::fs::read_to_string(examples().join("host-b.yaml")).unwrap();
+    let mut host = capyctl_config::parse_document(&text).unwrap();
+    let state = root.join(format!("{name}-state"));
+    host["name"] = json!(name);
+    host["state_dir"] = json!(state);
+    host["identity_dir"] = json!(state.join("identity"));
+    match peer {
+        Some(peer) => host["resource_policy"]["groups"] = json!({"peer_address": peer}),
+        None => {
+            host["resource_policy"]
+                .as_object_mut()
+                .unwrap()
+                .remove("groups");
+        }
+    }
+    host
+}
+
+/// As [`group_host_document`], with the `vllm` profile on another build.
+fn group_host_document_other_build(root: &Path, name: &str, peer: &str) -> Value {
+    let mut host = group_host_document(root, name, Some(peer));
+    host["runtime_profiles"]["vllm"]["build_fingerprint"] = json!("vllm 0.29.1");
+    host
+}
+
+/// As [`group_host_document`], with the `vllm` profile approving `approved`.
+fn group_host_document_approving(root: &Path, name: &str, peer: &str, approved: &[&str]) -> Value {
+    let mut host = group_host_document(root, name, Some(peer));
+    host["runtime_profiles"]["vllm"]["security"]["approved_env"] = json!(approved);
+    host
+}
+
+/// The multinode example placed on `host-a` and `host-b`, setting one
+/// engine environment variable.
+fn group_deployment_with_env(name: &str, value: &str) -> Value {
+    let text = std::fs::read_to_string(examples().join("deployment-multinode.yaml")).unwrap();
+    let mut deployment = capyctl_config::parse_document(&text).unwrap();
+    deployment["placement"]["hosts"] = json!(["host-a", "host-b"]);
+    deployment["engine_config"]["env"] = json!({ name: value });
+    deployment
+}
+
+// T03 (ADR 0028 §2, §3; OD8, decided 2026-10-06): the multinode example
+// validates against its two host documents, one resolution per named host,
+// the head first.
+#[test]
+fn a_group_validates_against_every_named_host() {
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml", "docs/examples/host-b.yaml"],
+    );
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["hosts"].as_array().unwrap().len(), 2, "{raw}");
+    assert_eq!(
+        value["resolved_against"],
+        json!(["gpu-box", "host-b"]),
+        "{raw}"
+    );
+    assert_eq!(value["hosts"][0]["resolved_against"], "gpu-box", "{raw}");
+    assert_eq!(value["hosts"][1]["resolved_against"], "host-b", "{raw}");
+    // The order of the documents on the command line does not matter.
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host-b.yaml", "docs/examples/host.yaml"],
+    );
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(
+        value["resolved_against"],
+        json!(["gpu-box", "host-b"]),
+        "{raw}"
+    );
+}
+
+// T14: a named host without a peer address is refused.
+#[test]
+fn a_named_host_without_a_peer_address_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_b = write(
+        dir.path(),
+        "host-b.yaml",
+        &group_host_document(dir.path(), "host-b", None).to_string(),
+    );
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml", host_b.to_str().unwrap()],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "peer_address_missing", "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("host-b"),
+        "{raw}"
+    );
+}
+
+// T14: a profile whose build differs on one named host is refused.
+#[test]
+fn a_profile_mismatch_on_one_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_b = write(
+        dir.path(),
+        "host-b.yaml",
+        &group_host_document_other_build(dir.path(), "host-b", "192.0.2.11").to_string(),
+    );
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml", host_b.to_str().unwrap()],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "group_profile_mismatch", "{raw}");
+    // A named host that does not publish the profile at all is the same refusal.
+    let mut bare = group_host_document(dir.path(), "host-b", Some("192.0.2.11"));
+    bare["runtime_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("vllm");
+    let host_b = write(dir.path(), "host-b.yaml", &bare.to_string());
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml", host_b.to_str().unwrap()],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "group_profile_mismatch", "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("host-b"),
+        "{raw}"
+    );
+}
+
+// T14, T37: an engine environment name approved on host A but not on host B is refused.
+#[test]
+fn an_env_name_not_approved_on_one_host_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let deployment = write(
+        dir.path(),
+        "deployment.yaml",
+        &group_deployment_with_env("SGLANG_ENABLE_X", "1").to_string(),
+    );
+    let approving = |name: &str, peer: &str, approved: &[&str]| {
+        write(
+            dir.path(),
+            &format!("{name}.yaml"),
+            &group_host_document_approving(dir.path(), name, peer, approved).to_string(),
+        )
+    };
+    let host_a = approving("host-a", "192.0.2.10", &["SGLANG_ENABLE_*"]);
+    let host_b = approving("host-b", "192.0.2.11", &[]);
+    let (code, value, raw) = validate(&[
+        "--file",
+        deployment.to_str().unwrap(),
+        "--host",
+        host_a.to_str().unwrap(),
+        "--host",
+        host_b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(
+        value["code"], "engine_env_not_approved:SGLANG_ENABLE_X",
+        "{raw}"
+    );
+    // Approved on both, the group validates.
+    let host_b = approving("host-b", "192.0.2.11", &["SGLANG_ENABLE_*"]);
+    let (code, _, raw) = validate(&[
+        "--file",
+        deployment.to_str().unwrap(),
+        "--host",
+        host_a.to_str().unwrap(),
+        "--host",
+        host_b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+}
+
+// T03: `--host` is repeatable; a named host without a document is refused, naming it.
+#[test]
+fn every_named_host_needs_its_document() {
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &["docs/examples/host.yaml"],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("host-b"),
+        "{raw}"
+    );
+    let (code, value, raw) = validate_group("docs/examples/deployment-multinode.yaml", &[]);
+    assert_eq!(code, 0, "{raw}");
+    assert!(value["resolved_against"].is_null(), "{raw}");
+}
+
+// T03: a host document for a host the group does not name, or two documents
+// for one host, is refused with the host named.
+#[test]
+fn a_document_for_a_host_not_named_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = write(
+        dir.path(),
+        "host-c.yaml",
+        &group_host_document(dir.path(), "host-c", Some("192.0.2.12")).to_string(),
+    );
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &[
+            "docs/examples/host.yaml",
+            "docs/examples/host-b.yaml",
+            other.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("host-c"),
+        "{raw}"
+    );
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-multinode.yaml",
+        &[
+            "docs/examples/host.yaml",
+            "docs/examples/host-b.yaml",
+            "docs/examples/host-b.yaml",
+        ],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("host-b"),
+        "{raw}"
+    );
+}
+
+// T39: a deployment without a group takes at most one `--host`.
+#[test]
+fn a_deployment_without_a_group_takes_one_host() {
+    let (code, value, raw) = validate_group(
+        "docs/examples/deployment-minimal.yaml",
+        &["docs/examples/host.yaml", "docs/examples/host-b.yaml"],
+    );
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "invalid_config", "{raw}");
+    assert!(
+        value["message"].as_str().unwrap().contains("--host"),
         "{raw}"
     );
 }

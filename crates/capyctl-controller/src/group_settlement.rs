@@ -160,15 +160,24 @@ pub async fn stop_group(
     };
     // SPEC §17, ADR 0028 §16: while any member stays charged and uncertain,
     // status names the uncertainty; once every member settled, a failed group
-    // reads `group_member_failed` again.
+    // reads `group_member_failed` again, and a requested stop leaves no
+    // uncertainty it recorded while a host was away.
     let code = match (&settlement, reason.code()) {
         (GroupSettlement::Partial { .. }, _) => Some("group_member_uncertain"),
         (GroupSettlement::Complete, code) => code,
     };
-    if let (Some(code), Ok(o)) = (code, ctx.owner.lock()) {
-        let _ = o
-            .store()
-            .record_group_status(&target.deployment_id, target.instance_index, code);
+    if let Ok(o) = ctx.owner.lock() {
+        let store = o.store();
+        let _ = match code {
+            Some(code) => {
+                store.record_group_status(&target.deployment_id, target.instance_index, code)
+            }
+            None => store.clear_group_status(
+                &target.deployment_id,
+                target.instance_index,
+                "group_member_uncertain",
+            ),
+        };
     }
     settlement
 }

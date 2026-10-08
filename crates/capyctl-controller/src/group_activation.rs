@@ -175,8 +175,30 @@ pub enum GroupActivation {
     Failed {
         plan: GroupPlan,
         failed_rank: u32,
+        failure: LaunchFailure,
         reason: String,
     },
+}
+
+/// ADR 0028 §11, §16: what happened at the rank an activation ended at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFailure {
+    /// The member exited or refused, or the head did not prove readiness
+    /// (the readiness probe included).
+    MemberFailed,
+    /// The member's Launch went unanswered: it may run, so it stays charged
+    /// and uncertain until its own host proves it gone.
+    MemberUncertain,
+}
+
+impl LaunchFailure {
+    /// The closed code (spec §16) the instance's status names.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::MemberFailed => "group_member_failed",
+            Self::MemberUncertain => "group_member_uncertain",
+        }
+    }
 }
 
 /// Why an activation stopped before any member was dispatched. Every
@@ -626,9 +648,10 @@ async fn activate(
             )
             .await
         }
-        Err((rank, reason)) => GroupActivation::Failed {
+        Err((rank, failure, reason)) => GroupActivation::Failed {
             plan: plan.clone(),
             failed_rank: rank,
+            failure,
             reason,
         },
     };
@@ -1083,8 +1106,9 @@ async fn launch_all(
     work: &InitializeWork,
     members: &[Member],
     launches: &[MemberCommand],
-) -> Result<(pb::MemberExecutionResult, Vec<ProcessIdentity>), (u32, String)> {
+) -> Result<(pb::MemberExecutionResult, Vec<ProcessIdentity>), (u32, LaunchFailure, String)> {
     use futures::StreamExt;
+    use LaunchFailure::{MemberFailed, MemberUncertain};
     let fence = work.fence();
     // ADR 0012: the head's ingress is provisioned before its Launch.
     ctx.hosts
@@ -1093,6 +1117,7 @@ async fn launch_all(
         .map_err(|reason| {
             (
                 0,
+                MemberFailed,
                 format!("the head's ingress was not provisioned: {reason}"),
             )
         })?;
@@ -1117,11 +1142,15 @@ async fn launch_all(
                         )
                         .map_err(|e| e.to_string())
                 });
-                return Err((rank, format!("group_member_uncertain: {reason}")));
+                return Err((
+                    rank,
+                    MemberUncertain,
+                    format!("its Launch went unanswered: {reason}"),
+                ));
             }
         };
         if !result.refused.is_empty() {
-            return Err((rank, result.refused.clone()));
+            return Err((rank, MemberFailed, result.refused.clone()));
         }
         let reported: Vec<ProcessIdentity> = result.processes.iter().map(process).collect();
         if result.state == "launched" && result.claim_retained && !reported.is_empty() {
@@ -1136,14 +1165,20 @@ async fn launch_all(
                     )
                     .map_err(|e| e.to_string())
             })
-            .map_err(|error| (rank, format!("identities not recorded: {error}")))?;
+            .map_err(|error| {
+                (
+                    rank,
+                    MemberFailed,
+                    format!("identities not recorded: {error}"),
+                )
+            })?;
         }
         let identities = alive(&result);
         if crate::agent_sessions::launch_ended_before_readiness(&result) || identities.is_empty() {
-            return Err((rank, "group_member_failed: the member exited".into()));
+            return Err((rank, MemberFailed, "the member exited".into()));
         }
         if rank == 0 && !result.model_usable {
-            return Err((0, "the head did not prove readiness".into()));
+            return Err((0, MemberFailed, "the head did not prove readiness".into()));
         }
         Ok((rank == 0).then_some((result, identities)))
     };
@@ -1164,12 +1199,13 @@ async fn launch_all(
                 Err(failed) => return Err(failed),
             }
         }
-        head.ok_or((0, "the head did not answer".to_owned()))
+        head.ok_or((0, MemberFailed, "the head did not answer".to_owned()))
     })
     .await
     .unwrap_or_else(|_| {
         Err((
             0,
+            MemberFailed,
             "the head did not become ready within timeouts.initialize".to_owned(),
         ))
     });
@@ -1203,6 +1239,7 @@ async fn ready(
     let failed = |reason: String| GroupActivation::Failed {
         plan: plan.clone(),
         failed_rank: 0,
+        failure: LaunchFailure::MemberFailed,
         reason,
     };
     let head = HeadLaunch {

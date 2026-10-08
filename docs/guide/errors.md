@@ -10,16 +10,34 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `not_found` | The deployment, instance or host named does not exist. | Check the name with `capyctl list deployments` or `capyctl list hosts`. |
 | 2 | `device_policy_mismatch` | A host's file describes a card that does not match the GPU it found. | Fix the `gpuN` entries of `resource_policy` to match `nvidia-smi -L`. |
 | 2 | `missing_system_allocation` | A deployment that lists its own `resources` on a discrete card leaves out host RAM (`system`). | Add the `system` entry, or leave `resources` out and let CapyCTL size it. |
+| 2 | `group_placement_required` | A deployment with a `topology` does not list its machines in `placement.hosts`, or also sets `host`, `selector`, `strategy` or `max_per_host`, or runs on a single-machine (standalone) role. | List the machines in `placement.hosts`, head first, and remove the other placement fields ([One model across machines](several-machines.md#one-model-across-machines)). |
+| 2 | `group_topology_invalid` | `placement.hosts` repeats a machine, a dimension of `topology` is zero, or the number of machines does not divide `tensor_parallel` × `pipeline_parallel`. | Fix `topology` or `placement.hosts`. |
+| 2 | `group_profile_mismatch` | The engine profile does not exist on one of the machines, or its build differs between them. | Register the same engine build under the same name on every machine. |
+| 2 | `group_checkpoint_mismatch` | The model's files differ between the machines; the message lists each machine's digest. | Make the copies identical, or let CapyCTL download the model on each machine. |
+| 2 | `group_model_path_mismatch` | A SGLang group with `residency: deep` has the model at different paths on its machines; the message names both. | Put the model at the same path on every machine, or use `residency: restart_only`. |
+| 2 | `peer_address_missing` | A machine named in `placement.hosts` declares no peer address. | Set `resource_policy.groups.peer_address` (or `--peer-address`) on that machine and restart CapyCTL there. |
+| 2 | `peer_address_not_local` | The declared peer address is not on any network interface of that machine. | Declare an address the machine holds on its direct link. |
+| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`). | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
+| 2 | `engine_env_not_approved:<name>` | A deployment sets an engine variable the engine profile does not approve (on some machine of a group). | Approve it with `capyctl engine add ... --approve-env <name>` on every machine, or remove it ([Engine variables](engines.md#engine-variables)). |
+| 2 | `engine_env_conflict:<name>` | The same variable is in the file and on the command line. | Give it one way only. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
 | 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. |
 | 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. | Use a smaller or quantized checkpoint, a smaller KV cache, or free the card. vLLM needs a card of about 10 GiB or more. |
 | 4 | `device_unobserved` | `nvidia-smi` gave no fresh reading for that GPU, so nothing new starts on it. | Check that `nvidia-smi` works on that machine, then retry. |
+| 4 | `rendezvous_ports_exhausted` | Every rendezvous port of the head machine's range is held by another group. | Stop a group on that machine, or widen `--rendezvous-ports`. |
+| 4 | `rendezvous_port_in_use:<port>` | Another program holds the rendezvous port on the head machine. CapyCTL picks another port on the next start. | Retry; if it persists, find the program holding the port. |
+| 4 | `service_port_in_use:<port>` | Another program holds the head's engine port, or a SGLang worker's local port. | Retry; if it persists, find the program holding the port. |
+| 4 | `host_tuning_missing:<item>` | With `require_rdma: true`, a machine lacks `memlock` (unlimited locked memory) or `infiniband` (read-write `/dev/infiniband/uverbs*`). | Fix the item as root on that machine, or set `require_rdma: false`. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
 | 5 | `store_from_newer_version` | The state directory was written by a newer CapyCTL. | Run the newer binary, or restore a backup taken before the upgrade. |
-| 5 | `multi_gpu_unsupported` | The deployment names two GPUs or asks for tensor parallelism. | Use one GPU per model. |
+| 5 | `multi_gpu_unsupported` | The deployment names two GPUs on one machine. | Use one GPU per machine; to spread one model over machines, give it a `topology` and `placement.hosts`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
 | 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold), or a deployment asking such an engine to park. | Leave `--deep-park` out; use `residency: restart_only`. |
+| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)). |
+| 5 | `group_instances_unsupported` | `instances` above 1 with a `topology`. | Deploy one group per deployment. |
+| 5 | `group_drift:<field>` | The engine changed a multi-machine setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
+| 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
 | 7 | `device_conflict` | Another deployment holds the GPU exclusively. | Stop that deployment or choose another device. |
 | 8 | `category_limit` | A host limit on how many models of this kind may run was reached. | Stop one, or raise the limit in the host document. |
@@ -43,6 +61,23 @@ With `--format json` the error is a JSON object with `code` and `message`.
 
 The systemd units restart CapyCTL when it fails, except on exits a restart cannot
 fix: 2, 3 and 5, and 14 for a host.
+
+A group running across machines can also show these codes in
+`capyctl status deployment <name>` (the instance's `LAST ERROR` and the
+member's row). They describe what happened to a running group; no command
+exits with them:
+
+- `group_member_failed`: a member exited or failed; its row shows `failed`.
+  CapyCTL stops the whole group.
+- `group_member_uncertain`: a member's machine cannot be reached. The member
+  keeps its memory charged until that machine proves it gone.
+- `group_wake_mismatch`: after a wake, the model answered a fixed prompt
+  differently than before the park. CapyCTL stops the group.
+- `group_stalled`: a request got no first token within
+  `groups.stall_timeout` and a check through the head failed too. CapyCTL
+  stops the group.
+- `host_tuning_warning:<item>`: a machine's check found a gap (`compaction`,
+  `memlock` or `infiniband`); the group still runs.
 
 ## Troubleshooting
 

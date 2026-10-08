@@ -34,11 +34,19 @@ name that profile instead.
 
 ## Deployment on several hosts
 
+<!-- include: ../examples/deployment-spread.yaml -->
+
+## One model across two hosts
+
 <!-- include: ../examples/deployment-multinode.yaml -->
 
 ## Host with unified memory
 
 <!-- include: ../examples/host.yaml -->
+
+## Second host of a group
+
+<!-- include: ../examples/host-b.yaml -->
 
 ## Host with a discrete GPU
 

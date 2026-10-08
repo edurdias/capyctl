@@ -307,3 +307,108 @@ fn toolchain_missing_exits_26() {
     assert_eq!(error.exit_code(), ExitCode(26));
     assert_eq!(ExitCode::TOOLCHAIN_MISSING, ExitCode(26));
 }
+
+// T14 (ADR 0028 §16): every closed group code exits with its class, whether
+// it is the code itself or travels as a detail inside a refusal's message (a
+// management `invalid_config`, a configuration refusal, a failed start). A
+// code with a `:<detail>` form (`group_drift:<field>`, a port, an engine, an
+// environment name) matches by its prefix. No new exit number.
+#[test]
+fn group_codes_map_to_exits() {
+    let cases = [
+        ("group_placement_required", 2),
+        ("group_topology_invalid", 2),
+        ("group_profile_mismatch", 2),
+        ("group_checkpoint_mismatch", 2),
+        ("group_model_path_mismatch", 2),
+        ("peer_address_missing", 2),
+        ("peer_address_not_local", 2),
+        ("engine_env_reserved:NCCL_DEBUG", 2),
+        ("engine_env_not_approved:X", 2),
+        ("engine_env_conflict:SGLANG_ENABLE_X", 2),
+        ("rendezvous_ports_exhausted", 4),
+        ("rendezvous_port_in_use:25000", 4),
+        ("service_port_in_use:8100", 4),
+        ("host_tuning_missing:memlock", 4),
+        ("host_tuning_missing:infiniband", 4),
+        ("group_shape_unsupported", 5),
+        ("group_shape_unsupported:tensorfold", 5),
+        ("group_instances_unsupported", 5),
+        ("group_drift:node_rank", 5),
+        ("host_capability_missing:engine_groups", 5),
+        // ADR 0023 §2, ADR 0028 §16: an existing code keeps its exit when a
+        // configuration refusal carries it (it was classed invalid_config).
+        ("capability_missing:deep_park", 5),
+    ];
+    for (code, exit) in cases {
+        let direct = StructuredError {
+            code,
+            message: "refused".into(),
+        };
+        assert_eq!(direct.exit_code(), ExitCode(exit), "{code}");
+        for carrier in [
+            "invalid_config",
+            "command_rejected",
+            "operation_failed",
+            "internal",
+            "unsupported",
+        ] {
+            for message in [
+                format!(
+                    "invalid_config: Invalid deployment configuration: unsupported combination \
+                     at `topology`: {code}: the detail"
+                ),
+                format!("Operation 01J failed: {code}"),
+            ] {
+                let wrapped = StructuredError {
+                    code: carrier,
+                    message,
+                };
+                assert_eq!(wrapped.exit_code(), ExitCode(exit), "{carrier} {code}");
+                assert_eq!(wrapped.closed_code(), code, "{carrier} {code}");
+            }
+        }
+    }
+    // An engine's name and a bare code are told apart by what follows the colon.
+    let bare = StructuredError {
+        code: "invalid_config",
+        message: "group_shape_unsupported: more than one local rank per host".into(),
+    };
+    assert_eq!(bare.closed_code(), "group_shape_unsupported");
+    // Prose that names a code, or a longer word holding one, is not the code.
+    for prose in [
+        "see group_drift docs",
+        "xgroup_drift:node_rank: no",
+        "rendezvous_port_in_use: no port named",
+        "the host_capability_missing:other gate",
+    ] {
+        let error = StructuredError {
+            code: "invalid_config",
+            message: prose.into(),
+        };
+        assert_eq!(error.exit_code(), ExitCode(2), "{prose}");
+        assert_eq!(error.closed_code(), "invalid_config", "{prose}");
+    }
+}
+
+// T14 (ADR 0028 §16): the group codes with no exit appear only in status and
+// `last_error`; a refusal that carries one keeps its own class's exit.
+#[test]
+fn group_status_codes_have_no_exit() {
+    for code in [
+        "host_tuning_warning:compaction",
+        "group_member_failed",
+        "group_member_uncertain",
+        "group_wake_mismatch",
+        "group_stalled",
+    ] {
+        for (carrier, exit) in [("operation_failed", 13), ("invalid_config", 2)] {
+            let error = StructuredError {
+                code: carrier,
+                message: format!("Operation 01J failed: {code}: rank 1: the member exited"),
+            };
+            assert_eq!(error.exit_code(), ExitCode(exit), "{carrier} {code}");
+            assert_eq!(error.closed_code(), carrier, "{carrier} {code}");
+        }
+    }
+}

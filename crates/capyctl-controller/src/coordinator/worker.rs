@@ -2435,7 +2435,7 @@ async fn drive_group(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), CoordinatorError> {
     use crate::group_activation::{
-        activate_group, GroupActivation, GroupActivationError, GroupCtx,
+        activate_group, GroupActivation, GroupActivationError, GroupCtx, LaunchFailure,
     };
     let shape = work
         .group()
@@ -2472,6 +2472,7 @@ async fn drive_group(
         Ok(GroupActivation::Failed {
             plan,
             failed_rank,
+            failure,
             reason,
         }) => {
             // ADR 0028 §11 (decided 2026-10-06: a failed readiness probe is a
@@ -2481,7 +2482,7 @@ async fn drive_group(
             // the group settles.
             let deployment = work.fence().deployment_id.clone();
             let instance = work.instance_index();
-            let uncertain = reason.starts_with("group_member_uncertain");
+            let uncertain = failure == LaunchFailure::MemberUncertain;
             let _ = shared
                 .with_owner(move |owner| {
                     let store = owner.store();
@@ -2489,11 +2490,7 @@ async fn drive_group(
                         .record_group_failure(&deployment, instance, plan.generation(), failed_rank)
                         .and_then(|()| {
                             if uncertain {
-                                store.record_group_status(
-                                    &deployment,
-                                    instance,
-                                    "group_member_uncertain",
-                                )
+                                store.record_group_status(&deployment, instance, failure.code())
                             } else {
                                 Ok(())
                             }
@@ -2501,13 +2498,9 @@ async fn drive_group(
                         .map_err(|error| CoordinatorError::Service(error.to_string()))
                 })
                 .await;
-            let code = if uncertain {
-                "group_member_uncertain"
-            } else {
-                "group_member_failed"
-            };
             Err(CoordinatorError::Service(format!(
-                "{code}: rank {failed_rank}: {reason}"
+                "{}: rank {failed_rank}: {reason}",
+                failure.code()
             )))
         }
         // SPEC §13.2: a closed refusal before any effect is a host refusal.

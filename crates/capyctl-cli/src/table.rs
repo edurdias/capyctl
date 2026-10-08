@@ -85,6 +85,11 @@ pub fn render(view: View, value: &Value, names: &HostNames) -> String {
 /// Columns left-aligned, separated by three spaces, upper-case headers, no
 /// trailing blanks. An empty result prints the header line only.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    columns(headers, rows, "   ", "")
+}
+
+/// [`table`] with its own column gap, every line led by `indent`.
+fn columns(headers: &[&str], rows: &[Vec<String>], gap: &str, indent: &str) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -95,10 +100,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     }
     let mut out = String::new();
     let mut line = |cells: &mut dyn Iterator<Item = &str>| {
-        let mut text = String::new();
+        let mut text = String::from(indent);
         for (i, cell) in cells.enumerate() {
             if i > 0 {
-                text.push_str("   ");
+                text.push_str(gap);
             }
             text.push_str(cell);
             let pad = widths[i].saturating_sub(cell.chars().count());
@@ -256,12 +261,28 @@ fn hosts(value: &Value) -> String {
     )
 }
 
+/// The hosts an instance runs on, by name: its placed host, or every member
+/// host of a group (ADR 0028 §15: a group records no placed host).
+fn hosts_of(instance: &Value, names: &HostNames) -> Vec<String> {
+    match instance["members"].as_array() {
+        Some(members) => members
+            .iter()
+            .filter_map(|m| m["host"].as_str())
+            .map(|id| host_label(id, names))
+            .collect(),
+        None => instance["host_id"]
+            .as_str()
+            .map(|id| host_label(id, names))
+            .into_iter()
+            .collect(),
+    }
+}
+
 /// The distinct hosts a deployment's instances are placed on, by name.
 pub(crate) fn instance_hosts(deployment: &Value, names: &HostNames) -> String {
     let mut seen: Vec<String> = Vec::new();
     for instance in deployment["instances"].as_array().into_iter().flatten() {
-        if let Some(id) = instance["host_id"].as_str() {
-            let label = host_label(id, names);
+        for label in hosts_of(instance, names) {
             if !seen.contains(&label) {
                 seen.push(label);
             }
@@ -353,6 +374,103 @@ fn last_error(instance: &Value) -> String {
     }
 }
 
+/// ADR 0028 §15: a group instance's block: its engine and shape, the head's
+/// rendezvous address, the peer transport (ADR 0028 §13: unauthenticated),
+/// one row per member in rank order, each member host's check warnings, and
+/// a line for each member that still holds its charge on a host that has not
+/// proven it gone. `None` for a single-host instance.
+fn group(instance: &Value, names: &HostNames) -> Option<String> {
+    let members = instance["members"].as_array()?;
+    let hosts = members.len();
+    let mut out = format!(
+        "Group of instance {}: {}, TP {} x PP {} on {hosts} host{}\n",
+        text(&instance["index"]),
+        text(&instance["engine"]),
+        text(&instance["topology"]["tensor_parallel"]),
+        text(&instance["topology"]["pipeline_parallel"]),
+        if hosts == 1 { "" } else { "s" },
+    );
+    out.push_str(&format!(
+        "  {:<14} {}\n",
+        "rendezvous",
+        text(&instance["rendezvous"])
+    ));
+    out.push_str(&format!(
+        "  {:<14} {} (keep group hosts on a private link)\n",
+        "peer transport",
+        text(&instance["peer_transport"])
+    ));
+    let charge = |m: &Value| match number(&m["reservation"]["bytes"]) {
+        Some(bytes) => format!("{} {}", gib(bytes), text(&m["reservation"]["phase"])),
+        None => "-".into(),
+    };
+    let label = |m: &Value| host_label(m["host"].as_str().unwrap_or("-"), names);
+    let rows: Vec<Vec<String>> = members
+        .iter()
+        .map(|m| {
+            vec![
+                text(&m["node_rank"]),
+                label(m),
+                text(&m["role"]),
+                text(&m["state"]),
+                text(&m["processes"]),
+                charge(m),
+                text(&m["residency"]),
+                text(&m["last_error"]),
+            ]
+        })
+        .collect();
+    out.push('\n');
+    out.push_str(&columns(
+        &[
+            "RANK",
+            "HOST",
+            "ROLE",
+            "STATE",
+            "PROCESSES",
+            "CHARGED",
+            "RESIDENCY",
+            "LAST ERROR",
+        ],
+        &rows,
+        "  ",
+        "  ",
+    ));
+    let mut notes = Vec::new();
+    for m in members {
+        let warnings: Vec<String> = m["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(clean)
+            .collect();
+        if !warnings.is_empty() {
+            notes.push(("warnings", format!("{}: {}", label(m), warnings.join(", "))));
+        }
+    }
+    // ADR 0028 §11 (Task 8 concern): why capacity is held. An uncertain
+    // member is never released on time alone.
+    for m in members.iter().filter(|m| m["state"] == "uncertain") {
+        let held = number(&m["reservation"]["bytes"]).map_or_else(|| "its share".into(), gib);
+        notes.push((
+            "held",
+            format!(
+                "rank {} on {} keeps {held} charged until its host proves it gone",
+                text(&m["node_rank"]),
+                label(m),
+            ),
+        ));
+    }
+    if !notes.is_empty() {
+        out.push('\n');
+        for (name, note) in notes {
+            out.push_str(&format!("  {name:<8}  {note}\n"));
+        }
+    }
+    Some(out)
+}
+
 fn status(value: &Value, names: &HostNames) -> String {
     let d = value;
     let startup = startup(&d["startup"]);
@@ -433,9 +551,8 @@ fn status(value: &Value, names: &HostNames) -> String {
         .into_iter()
         .flatten()
         .map(|i| {
-            let host = i["host_id"]
-                .as_str()
-                .map(|id| host_label(id, names))
+            let host = Some(hosts_of(i, names).join(","))
+                .filter(|hosts| !hosts.is_empty())
                 .unwrap_or_else(|| "-".into());
             let devices = match &i["devices"] {
                 Value::Object(o) if o.is_empty() => "-".into(),
@@ -464,6 +581,14 @@ fn status(value: &Value, names: &HostNames) -> String {
         ],
         &instances,
     ));
+    // ADR 0028 §13, §15: each group instance's plan, its members on their
+    // own hosts, and the peer transport, which nothing authenticates.
+    for instance in d["instances"].as_array().into_iter().flatten() {
+        if let Some(block) = group(instance, names) {
+            out.push('\n');
+            out.push_str(&block);
+        }
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -1100,5 +1225,111 @@ mod tests {
             .nth(1)
             .unwrap()
             .ends_with("yes      -           published   -"));
+    }
+
+    /// `status deployment --format json` of a Ready two-host vLLM group as
+    /// the server's snapshot shapes it (ADR 0028 §15), with each member's
+    /// host check warnings as the CLI adds them from the host inventory.
+    fn two_member_group_status() -> Value {
+        let member = |rank: u32, host: &str, role: &str, processes: u32| {
+            json!({"host": host, "node_rank": rank, "role": role, "state": "launched",
+                "processes": processes,
+                "reservation": {"phase": "ready", "bytes": (40_i64 << 30).to_string()},
+                "residency": "deep", "last_error": null, "warnings": []})
+        };
+        let mut worker = member(1, "01HOSTB", "worker", 1);
+        worker["warnings"] = json!(["host_tuning_warning:compaction"]);
+        json!({"name": "qwen3-30b-tp2", "kind": "model", "desired_state": "ready",
+            "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+            "revision": "1", "startup": {"bytes": 40_i64 << 30, "provenance": "declared"},
+            "timeouts": {"initialize_ms": 1_800_000},
+            "latest_operation": {"id": "01J", "kind": "start", "state": "succeeded"},
+            "instances": [{"index": 0, "host_id": null, "devices": null, "generation": "1",
+                "observed_state": "ready", "revision": "1", "lifecycle": "active",
+                "operator_stopped": false, "reservation_owner": null,
+                "engine": "vllm", "topology": {"tensor_parallel": 2, "pipeline_parallel": 1},
+                "rendezvous": "192.0.2.10:25000", "peer_transport": "unauthenticated",
+                "plan_generation": "1",
+                "members": [member(0, "01HOSTA", "head", 2), worker]}]})
+    }
+
+    fn group_names() -> HostNames {
+        host_names(&json!({"hosts": [
+            {"host_id": "01HOSTA", "name": "host-a"},
+            {"host_id": "01HOSTB", "name": "host-b"},
+        ]}))
+    }
+
+    // T21 T03 (ADR 0028 §13, §15): a group instance is marked unauthenticated
+    // and lists every member by host name, with what each holds; the
+    // instance's hosts are its members' (a group records no placed host).
+    // docs/guide/several-machines.md shows exactly this view.
+    #[test]
+    fn status_marks_peer_transport_and_members() {
+        let s = two_member_group_status();
+        assert_eq!(s["instances"][0]["peer_transport"], "unauthenticated");
+        assert_eq!(s["instances"][0]["members"].as_array().unwrap().len(), 2);
+        assert_eq!(s["instances"][0]["members"][1]["role"], "worker");
+        let text = render(View::Status, &s, &group_names());
+        assert!(text.contains("peer transport unauthenticated"), "{text}");
+        assert!(text.contains("RANK  HOST"), "{text}");
+        assert_eq!(
+            text,
+            "\
+NAME            STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+qwen3-30b-tp2   ready   1/1     1          40.0 GiB   1800s        start succeeded
+
+INSTANCE   HOST            STATE   LIFECYCLE   DEVICES   LAST ERROR
+0          host-a,host-b   ready   active      -         -
+
+Group of instance 0: vllm, TP 2 x PP 1 on 2 hosts
+  rendezvous     192.0.2.10:25000
+  peer transport unauthenticated (keep group hosts on a private link)
+
+  RANK  HOST    ROLE    STATE     PROCESSES  CHARGED         RESIDENCY  LAST ERROR
+  0     host-a  head    launched  2          40.0 GiB ready  deep       -
+  1     host-b  worker  launched  1          40.0 GiB ready  deep       -
+
+  warnings  host-b: host_tuning_warning:compaction
+"
+        );
+        let list = render(View::Deployments, &json!([s]), &group_names());
+        assert!(
+            list.lines().nth(1).unwrap().ends_with("host-a,host-b"),
+            "{list}"
+        );
+    }
+
+    // T32 (ADR 0028 §11, §15; Task 8 concern): a member whose host is
+    // unreachable shows its host, rank and the charge it keeps, so the
+    // operator sees why capacity is held; a parked member shows its parked
+    // charge on its own host.
+    #[test]
+    fn status_shows_why_an_uncertain_member_holds_capacity() {
+        let mut s = two_member_group_status();
+        let member = &mut s["instances"][0]["members"][1];
+        member["state"] = json!("uncertain");
+        member["last_error"] = json!("group_member_uncertain");
+        member["warnings"] = json!([]);
+        s["instances"][0]["members"][0]["reservation"] =
+            json!({"phase": "parked", "bytes": (2_i64 << 30).to_string()});
+        let text = render(View::Status, &s, &group_names());
+        assert!(
+            text.contains("  0     host-a  head    launched   2          2.0 GiB parked  "),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  1     host-b  worker  uncertain  1          40.0 GiB ready  deep       group_member_uncertain\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "\n  held      rank 1 on host-b keeps 40.0 GiB charged until its host proves it gone\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("warnings"), "{text}");
     }
 }
