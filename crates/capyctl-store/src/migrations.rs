@@ -9,8 +9,8 @@ use crate::schema::{
     SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
-    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V5,
-    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
+    SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -64,6 +64,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V43,
     // ADR 0014 amendment A19: each launch's first and latest parked residue.
     SCHEMA_V44,
+    // SPEC §6.5, §10: explicit activation, per revision and per host.
+    SCHEMA_V45,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -159,6 +161,10 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
         if version == 43 {
             // ADR 0028 §12: wake canary references and group failure codes.
             crate::groups::migrate_v43(&tx)?;
+        }
+        if version == 45 {
+            // SPEC §6.5, §10: explicit activation, per revision and per host.
+            crate::switch_state::migrate_v45(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -491,6 +497,58 @@ mod tests {
             conn.execute("UPDATE group_plans SET failure_code=?1", [code])
                 .unwrap();
         }
+    }
+
+    /// SPEC §6.5, §10 (v45): a revision accepted before explicit activation
+    /// existed reads `on_demand`; the column takes only the two policies; the
+    /// host table lists only `explicit`; reapplying changes nothing.
+    // T10 T33
+    #[test]
+    fn v45_adds_activation_on_demand_for_existing_revisions_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The revision row stands alone as a fixture, without its effective
+        // revision.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 44).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json) VALUES('a',1,1,'{"hosts":null,"selector":{},"strategy":"spread","max_per_host":null}');"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::switch_state::migrate_v45(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        let activation: String = conn
+            .query_row(
+                "SELECT activation FROM deployment_revision_instances WHERE deployment_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(activation, "on_demand");
+        assert!(!crate::switch_state::is_explicit_activation(&conn, "a").unwrap());
+        assert!(conn
+            .execute(
+                "UPDATE deployment_revision_instances SET activation='manual'",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO host_activation_policies(host_id,activation) VALUES('h','on_demand')",
+                []
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE deployment_revision_instances SET activation='explicit'",
+            [],
+        )
+        .unwrap();
+        assert!(crate::switch_state::is_explicit_activation(&conn, "a").unwrap());
     }
 
     /// ADR 0028 §6 (v41): every measured digest is carried into the per-host

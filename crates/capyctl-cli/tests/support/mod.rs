@@ -254,6 +254,31 @@ pub async fn boot_deep_parking(
     .expect("standalone boots")
 }
 
+/// As [`boot_deep_parking`], with this run's generic overrides (`--set`,
+/// `CAPYCTL_SET__…`).
+pub async fn boot_deep_parking_with_overrides(
+    state_dir: &std::path::Path,
+    members: Vec<capyctl_domain::completion::ProcessIdentity>,
+    overrides: &capyctl_cli::roles::SettingOverrides,
+) -> capyctl_cli::roles::App {
+    capyctl_cli::roles::start_standalone_configured_with_overrides(
+        state_dir,
+        None,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: true,
+            members: Some(members),
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        overrides,
+    )
+    .await
+    .expect("standalone boots")
+}
+
 /// As [`boot`], with the role document named by `--config`; the result is
 /// returned so a test can assert a refusal.
 pub async fn boot_configured(

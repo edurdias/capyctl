@@ -519,10 +519,12 @@ impl CoordinatorLifecycle {
     }
 
     /// One on-demand activation attempt (owner decision Q5): refuse an
-    /// operator's stop, wake a parked instance in place, else start one
-    /// instance cold. Capacity refusal is reported apart, for W10.
+    /// operator's stop and an explicit activation, wake a parked instance in
+    /// place, else start one instance cold. Capacity refusal is reported
+    /// apart, for W10.
     fn activate_once(&self, deployment: &str) -> Result<Activation, LifecycleFault> {
         let row = self.refuse_operator_stop(deployment)?;
+        self.refuse_explicit_activation(deployment)?;
         // Commands fence on the effective revision, which is not the row's schema
         // version; confusing them yields a revision conflict rather than a clear
         // failure.
@@ -562,6 +564,22 @@ impl CoordinatorLifecycle {
             return Err(crate::fault::operator_stopped(deployment, true));
         }
         Ok(row)
+    }
+
+    /// SPEC §6.5, §10: a deployment whose activation is explicit (its own
+    /// `lifecycle.activation` or a host's) is started and woken only by an
+    /// operator. A request that finds it not serving is refused at once,
+    /// before anything is measured, planned or switched; an operator's stop
+    /// keeps its own, more specific answer.
+    fn refuse_explicit_activation(&self, deployment: &str) -> Result<(), LifecycleFault> {
+        if !self
+            .commands
+            .read(|store| store.explicit_activation(deployment))?
+        {
+            return Ok(());
+        }
+        self.refuse_operator_stop(deployment)?;
+        Err(crate::fault::explicit_activation(deployment))
     }
 
     fn activate_revision(
@@ -732,6 +750,23 @@ impl LifecyclePort for CoordinatorLifecycle {
             self.commands.note_activity(&deployment, Some(generation));
         }
         closed
+    }
+
+    /// SPEC §6.3, §6.5, §10: with nothing running or moving, an operator's
+    /// stop or an explicit activation refuses the request; a transition in
+    /// progress or a serving instance does not.
+    fn refuse_inactive(&self, deployment: &str) -> Result<(), LifecycleFault> {
+        use capyctl_store::ordinary_lifecycle::switching::RequestView;
+        if !matches!(
+            self.commands
+                .request_view(deployment)
+                .map_err(LifecycleFault::from)?,
+            RequestView::Idle
+        ) {
+            return Ok(());
+        }
+        self.refuse_operator_stop(deployment)?;
+        self.refuse_explicit_activation(deployment)
     }
 
     /// ADR 0013 §10 (I3): every instance holding a runtime, with its gate,
@@ -955,6 +990,9 @@ impl LifecyclePort for CoordinatorLifecycle {
                 }
                 RequestView::Idle => {}
             }
+            // SPEC §6.5, §10: nothing a request may do starts or wakes an
+            // explicit activation; refused before any measuring or switching.
+            self.refuse_explicit_activation(deployment)?;
             // Final review M11 (found live on the discrete-GPU laptop host): a
             // revision sized from a checkpoint not yet measured cannot be
             // placed or started until its digest is recorded (ADR 0014 §7).

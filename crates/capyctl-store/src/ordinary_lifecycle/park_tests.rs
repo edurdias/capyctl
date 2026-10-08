@@ -631,6 +631,38 @@ fn a_full_parked_set_reclaims_the_least_recently_parked_instance() {
     assert_eq!(lab.phase(&b.deployment_id), ResourcePhase::Parked);
 }
 
+// SPEC §6.5, §10, T10 T26: a parked deployment whose activation is explicit
+// is never reclaimed by capacity. A park that needs its room is refused
+// `parked_capacity` (that deployment serves again), and the explicit one
+// stays parked with no stop accepted for it.
+#[test]
+fn a_full_parked_set_never_reclaims_an_explicit_activation() {
+    let lab = Lab::new(|host| {
+        host["resource_policy"]["max_parked"] = json!(1);
+    });
+    let a = lab.deploy("a", |config| {
+        config["lifecycle"] = json!({"activation": "explicit"});
+    });
+    let b = lab.deploy("b", |_| {});
+    lab.ready(&a, 1_000, 10);
+    lab.ready(&b, 1_000, 20);
+    let park_a = lab.park(&a, "pa", 1_100);
+    let context = new_context(lab.arm(&park_a.step_id, 1_200));
+    lab.complete(&context, ResidencyKind::Park, 10, 1_300);
+    let park_b = lab.park(&b, "pb", 1_400);
+    assert_eq!(
+        lab.arm(&park_b.step_id, 1_500),
+        ResidencyArm::Refused("parked_capacity")
+    );
+    assert!(lab.instance(&b.deployment_id).1, "B serves again");
+    let stops: i64 = lab.scalar(
+        "SELECT COUNT(*) FROM operations WHERE deployment_id=?1 AND kind='stop'",
+        &a.deployment_id,
+    );
+    assert_eq!(stops, 0);
+    assert_eq!(lab.phase(&a.deployment_id), ResourcePhase::Parked);
+}
+
 // SPEC §6.5, T23: a cold start that does not fit reclaims the least recently
 // parked instance on its host first; a start that fits reclaims nothing.
 #[test]

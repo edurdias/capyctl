@@ -150,6 +150,10 @@ impl Store {
         // listed stays, so the profile stays out of placement across a host
         // restart. A retirement still in progress is left to its deadline.
         clear_unlisted_confirmed(&tx, &publication.host_id, &config.document)?;
+        // SPEC §6.5, §10: the host's activation policy is whatever this
+        // approved publication states, so a host restarted without it is on
+        // demand again.
+        crate::switch_state::record_host_activation(&tx, &publication.host_id, config.activation)?;
         if let Some(claims) = claims {
             let mode = match claims {
                 LaunchClaims::PerLaunch => "per_launch",

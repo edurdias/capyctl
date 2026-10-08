@@ -268,6 +268,19 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
+| Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
+
+`lifecycle.activation` follows the server's lifecycle settings: the document,
+`--set lifecycle.activation=explicit` on `capyctl start host` (or
+`--set host.lifecycle.activation=explicit` on `capyctl start standalone`), or
+`CAPYCTL_SET__LIFECYCLE__ACTIVATION=explicit`
+(`CAPYCTL_SET__HOST__LIFECYCLE__ACTIVATION` for standalone); any other value
+refuses the start. A host publishes it with its document, so a change takes a
+restart. A deployment states the same policy for itself as
+`lifecycle.activation` in its own document; deployment fields are document-only,
+like `lifecycle.warm`. A deployment is explicit when it or any host it may run
+on says so. What that changes, and how it combines with `lifecycle.warm` and an
+operator's stop: [Only on your command](../guide/parking.md#only-on-your-command).
 
 ## Any setting by its path
 

@@ -90,6 +90,35 @@ fn host_publication_survives_reopen_and_revocation_blocks_updates() {
     assert!(store.host_publication("spark").unwrap().is_none());
 }
 
+// T10 T33 (SPEC §6.5, §10): a host's activation policy is whatever its latest
+// approved publication states (`lifecycle.activation`), and survives reopen;
+// a publication that does not state it makes the host on demand again.
+#[test]
+fn a_hosts_activation_policy_follows_its_latest_publication() {
+    use capyctl_config::instances::Activation;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let host = enrolled(&store);
+    let mut document = base_document();
+    store
+        .publish_host_configuration(&publication(&host, &document))
+        .unwrap();
+    assert_eq!(store.host_activation(&host).unwrap(), Activation::OnDemand);
+    document["lifecycle"] = serde_json::json!({"activation": "explicit"});
+    store
+        .publish_host_configuration(&publication(&host, &document))
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.host_activation(&host).unwrap(), Activation::Explicit);
+    document.as_object_mut().unwrap().remove("lifecycle");
+    store
+        .publish_host_configuration(&publication(&host, &document))
+        .unwrap();
+    assert_eq!(store.host_activation(&host).unwrap(), Activation::OnDemand);
+}
+
 fn enrolled(store: &Store) -> String {
     store
         .create_host_invitation(&"e".repeat(64), "spark-r", 100, 0)

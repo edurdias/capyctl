@@ -901,6 +901,8 @@ pub fn defaults(
             ("resource_policy.endpoint_port_range.end", Value::from(end)),
             // ADR 0014 amendment A19: growth up to the first parked charge.
             ("resource_policy.parked_growth_limit", Value::from("auto")),
+            // SPEC §6.5, §10: the host's activation policy.
+            ("lifecycle.activation", Value::from("on_demand")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((

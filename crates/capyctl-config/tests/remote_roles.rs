@@ -99,6 +99,42 @@ fn host_load_report_interval_defaults_and_is_bounded() {
     }
 }
 
+// T10 T14 (SPEC §6.5): the host's activation policy, `lifecycle.activation`:
+// `on_demand` when omitted, `explicit` makes every deployment that may run
+// on the host move only on an operator's action. It is controller policy,
+// never part of the document deployments are resolved against, so their
+// recipes do not change; any other value is refused by name.
+#[test]
+fn host_activation_defaults_to_on_demand_and_never_enters_resolution() {
+    use capyctl_config::instances::Activation;
+    let root = Path::new("/home/operator/host");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&HostConfig::template(root)).unwrap();
+    let config = HostConfig::parse(&document.to_string()).unwrap();
+    assert_eq!(config.activation, Activation::OnDemand);
+    let unset = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+    for (text, expected) in [
+        ("on_demand", Activation::OnDemand),
+        ("explicit", Activation::Explicit),
+    ] {
+        document["lifecycle"] = serde_json::json!({ "activation": text });
+        let config = HostConfig::parse(&document.to_string()).unwrap();
+        assert_eq!(config.activation, expected, "{text}");
+        assert_eq!(
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap(),
+            unset,
+            "{text}"
+        );
+    }
+    for refused in [serde_json::json!("manual"), serde_json::json!(false)] {
+        document["lifecycle"] = serde_json::json!({ "activation": refused });
+        let error = HostConfig::parse(&document.to_string()).unwrap_err();
+        assert_eq!(error.path, "lifecycle.activation", "{refused}: {error}");
+    }
+    document["lifecycle"] = serde_json::json!({ "warm": true });
+    assert!(HostConfig::parse(&document.to_string()).is_err());
+}
+
 // T03 T17: the shutdown drain bound is role configuration,
 // `shutdown.drain_timeout`, in server, host and standalone documents: 30 s when
 // omitted, 0 s to 600 s when set, refused outside that range.

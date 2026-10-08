@@ -243,6 +243,16 @@ pub trait LifecyclePort: Send + Sync {
         self.wait_terminal(&op).await.map(|_| ())
     }
 
+    /// SPEC §6.3, §6.5, §10: the refusal a request gets when nothing runs or
+    /// moves for `deployment` and no request may start it (an operator's stop,
+    /// an explicit activation), checked without starting anything. The router
+    /// asks this before refusing a request it may not hold (a waiting bound of
+    /// 0), so such a request answers 409 rather than a retryable 429. The
+    /// default is an authority with neither: nothing to refuse.
+    fn refuse_inactive(&self, _deployment: &str) -> Result<(), LifecycleFault> {
+        Ok(())
+    }
+
     /// ADR 0028 §11 (decided 2026-10-06): how long a request forwarded to a
     /// group's head may go without a first token before the router reports
     /// it (`groups.stall_timeout`, 120 s unless the server states another).

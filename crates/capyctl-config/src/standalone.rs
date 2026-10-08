@@ -450,6 +450,10 @@ pub fn check_honoured(
     // refused before any side effect. Every other resource value is `auto`.
     crate::engine_settings::EngineOverrides::from_document(host)
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
+    // SPEC §6.5, §10: the embedded host's activation policy is honoured as on
+    // a host; a malformed value is refused before any side effect.
+    crate::remote_roles::host_activation(host)
+        .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     if let Some(policy) = host.get("resource_policy") {
         let mut policy = policy.clone();
         if let Some(map) = policy.as_object_mut() {

@@ -1,7 +1,7 @@
 //! ADR 0013 §1–3: instance count and placement constraints in the deployment
 //! document. Validation only; placement itself is the scheduler's (I2).
 use capyctl_config::effective::{deployment_command_fingerprint, resolve_effective};
-use capyctl_config::instances::{parse_instance_spec, InstanceSpec, PlacementStrategy};
+use capyctl_config::instances::{parse_instance_spec, Activation, InstanceSpec, PlacementStrategy};
 use capyctl_config::{parse_strict, ConfigErrorCode, ConfigKind};
 use serde_json::json;
 
@@ -168,6 +168,63 @@ fn lifecycle_warm_parses_and_leaves_the_recipe_unchanged() {
         ConfigErrorCode::UnknownField
     );
     assert!(parse_strict(ConfigKind::Deployment, &warm.to_string()).is_err());
+}
+
+// T08 T10 T14 (SPEC §6.5): `lifecycle.activation: explicit` makes CapyCTL
+// start, stop, park and wake the deployment only on an operator's action.
+// Omitted, or stated as the default `on_demand`, it changes neither the
+// spec's command identity nor the per-host recipe; `explicit` joins the
+// command identity but never the recipe. Any other value is refused by name,
+// and it composes with `warm` in one block.
+#[test]
+fn lifecycle_activation_parses_and_leaves_digests_unchanged_when_unset() {
+    let (deployment, host) = fixture();
+    assert_eq!(
+        parse_instance_spec(&deployment).unwrap().activation,
+        Activation::OnDemand
+    );
+    let base = deployment_command_fingerprint(&deployment, 30_000).unwrap();
+    let recipe = resolve_effective(&deployment, &host)
+        .unwrap()
+        .recipe_fingerprint;
+    let mut on_demand = deployment.clone();
+    on_demand["lifecycle"] = json!({"activation": "on_demand"});
+    assert_eq!(
+        parse_instance_spec(&on_demand).unwrap(),
+        InstanceSpec::default()
+    );
+    assert_eq!(
+        deployment_command_fingerprint(&on_demand, 30_000).unwrap(),
+        base
+    );
+    let mut explicit = deployment.clone();
+    explicit["lifecycle"] = json!({"activation": "explicit", "warm": true});
+    assert!(parse_strict(ConfigKind::Deployment, &explicit.to_string()).is_ok());
+    let spec = parse_instance_spec(&explicit).unwrap();
+    assert_eq!(spec.activation, Activation::Explicit);
+    assert!(spec.warm);
+    assert_eq!(
+        spec.command_identity().unwrap()["activation"],
+        json!("explicit")
+    );
+    assert_ne!(
+        deployment_command_fingerprint(&explicit, 30_000).unwrap(),
+        base
+    );
+    assert_eq!(
+        resolve_effective(&explicit, &host)
+            .unwrap()
+            .recipe_fingerprint,
+        recipe
+    );
+    for refused in [json!("manual"), json!(true), json!(null)] {
+        explicit["lifecycle"] = json!({ "activation": refused });
+        assert_eq!(
+            parse_instance_spec(&explicit).unwrap_err().path,
+            "lifecycle.activation",
+            "{refused}"
+        );
+    }
 }
 
 // T03 T14 (ADR 0013 §2): an unnamed device claim takes one of the host's

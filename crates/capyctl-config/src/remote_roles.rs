@@ -309,6 +309,9 @@ pub struct HostConfig {
     pub load_report_interval: Duration,
     /// `shutdown.drain_timeout`: how long a signalled role lets admitted work finish.
     pub drain_timeout: Duration,
+    /// SPEC §6.5, §10: `lifecycle.activation`, the activation policy of every
+    /// deployment that may run on this host ([`host_activation`]).
+    pub activation: crate::instances::Activation,
     pub document: Value,
     /// Owner decision 2026-09-25: the generic overrides (`--set`,
     /// `CAPYCTL_SET__…`) the host started with. A live reload of the document
@@ -342,6 +345,16 @@ pub fn drain_timeout(document: &Value) -> Result<Duration, ConfigError> {
                     "must be a duration from 0s to 600s",
                 )
             }),
+    }
+}
+/// SPEC §6.5, §10: the activation policy of a host document (or of a
+/// standalone document's `host:` block), `lifecycle.activation`. Omitted, it
+/// is `on_demand`; `explicit` makes every deployment that may run on the host
+/// move only on an operator's action. Any other value is refused by name.
+pub fn host_activation(document: &Value) -> Result<crate::instances::Activation, ConfigError> {
+    match document.get("lifecycle").and_then(|l| l.get("activation")) {
+        None => Ok(crate::instances::Activation::OnDemand),
+        Some(value) => crate::instances::Activation::parse(value, "lifecycle.activation"),
     }
 }
 /// The load-report period when a host document names none.
@@ -635,6 +648,7 @@ impl HostConfig {
             profiles,
             load_report_interval,
             drain_timeout: drain_timeout(&document)?,
+            activation: host_activation(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })

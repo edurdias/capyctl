@@ -1305,6 +1305,97 @@ fn a_warm_residency_commitment_is_never_a_victim_nor_idled() {
     );
 }
 
+/// SPEC §6.5, §10: a deployment whose activation is explicit
+/// (`lifecycle.activation: explicit`, or a host it may run on stating it) is
+/// never chosen as a switch victim and never idled, and status reports it.
+/// An explicit stop still stops it. A deployment that is not explicit is
+/// unaffected by another deployment's or another host's policy.
+// T10 T16 T27 T33
+#[test]
+fn an_explicit_activation_is_never_a_victim_nor_idled() {
+    use capyctl_config::instances::Activation;
+    use capyctl_store::ordinary_lifecycle::park::IdlePolicy;
+    use capyctl_store::ordinary_lifecycle::switching::SwitchPlan;
+    let idle = IdlePolicy {
+        ready_idle_ms: Some(1),
+        parked_idle_ms: Some(1),
+    };
+    let none = |_: &str, _: i64| None;
+    let single_claim = |t: &TwoHosts| {
+        t.sql
+            .execute(
+                "INSERT OR REPLACE INTO host_launch_claims VALUES('host-a','per_instance',1)",
+                [],
+            )
+            .unwrap();
+    };
+    // Deployment-level: 10 GiB cold, 8 GiB Ready each, two never fit in 15.
+    let t = two_hosts("15GiB");
+    single_claim(&t);
+    let explicit = only_a(
+        &t,
+        "explicit",
+        json!({"lifecycle": {"activation": "explicit"}}),
+    );
+    all_ready(&t, &explicit, "start-explicit");
+    assert_eq!(t.status(&explicit).activation, Activation::Explicit);
+    assert!(t.store.explicit_activation(&explicit).unwrap());
+    let waiting = only_a(&t, "waiting", json!({}));
+    assert!(!t.store.explicit_activation(&waiting).unwrap());
+    assert_eq!(t.status(&waiting).activation, Activation::OnDemand);
+    assert_eq!(
+        plan(&t, &waiting),
+        SwitchPlan::Impossible("insufficient_capacity".into())
+    );
+    assert!(t
+        .store
+        .apply_idle_policy(&t.session, NOW + 1_000_000, idle, &none, 0)
+        .unwrap()
+        .is_empty());
+    assert!(dispatch_open(&t, &explicit), "still serving");
+
+    // Host-level: host-a's policy makes every deployment it may run
+    // explicit; host-b's policy does not reach a deployment pinned to a.
+    let t = two_hosts("15GiB");
+    single_claim(&t);
+    let pinned = only_a(&t, "pinned", json!({}));
+    all_ready(&t, &pinned, "start-pinned");
+    t.store
+        .record_host_activation("host-b", Activation::Explicit)
+        .unwrap();
+    assert!(!t.store.explicit_activation(&pinned).unwrap());
+    let waiting = only_a(&t, "waiting", json!({}));
+    assert!(matches!(plan(&t, &waiting), SwitchPlan::Evict { .. }));
+    t.store
+        .record_host_activation("host-a", Activation::Explicit)
+        .unwrap();
+    assert!(t.store.explicit_activation(&pinned).unwrap());
+    assert_eq!(t.status(&pinned).activation, Activation::Explicit);
+    assert_eq!(
+        plan(&t, &waiting),
+        SwitchPlan::Impossible("insufficient_capacity".into())
+    );
+    assert!(t
+        .store
+        .apply_idle_policy(&t.session, NOW + 1_000_000, idle, &none, 0)
+        .unwrap()
+        .is_empty());
+    assert!(dispatch_open(&t, &pinned), "still serving");
+    // The host's policy withdrawn (it published without it): on demand again.
+    t.store
+        .record_host_activation("host-a", Activation::OnDemand)
+        .unwrap();
+    assert!(!t.store.explicit_activation(&pinned).unwrap());
+    assert!(matches!(plan(&t, &waiting), SwitchPlan::Evict { .. }));
+    assert_eq!(
+        t.store
+            .apply_idle_policy(&t.session, NOW + 1_000_000, idle, &none, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// W10 gap (a), SPEC §§10, 13.2: a switch reopens only a gate it closed that
 /// nothing else has closed since. An engine exit recorded during the drain
 /// window keeps it closed; without one the failed switch reopens it; and a

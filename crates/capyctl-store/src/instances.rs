@@ -506,9 +506,18 @@ pub(crate) fn record_accepted_revision(
         }
         _ => None,
     };
+    // SPEC §6.5, §10: the revision's activation policy beside its warm flag.
     tx.execute(
-        "INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json,runtime_revision,warm) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![deployment_id, revision, spec.instances, placement, shares, spec.warm],
+        "INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json,runtime_revision,warm,activation) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            deployment_id,
+            revision,
+            spec.instances,
+            placement,
+            shares,
+            spec.warm,
+            crate::switch_state::activation_text(spec.activation)
+        ],
     )?;
     for host in resolved {
         tx.execute(
@@ -699,21 +708,31 @@ impl crate::Store {
         deployment_id: &str,
         revision: i64,
     ) -> Result<Option<InstanceSpec>, InstanceError> {
-        let row: Option<(u32, String, bool)> = self
+        let row: Option<(u32, String, bool, String)> = self
             .conn
             .query_row(
-                "SELECT instances,placement_json,warm FROM deployment_revision_instances WHERE deployment_id=?1 AND revision=?2",
+                "SELECT instances,placement_json,warm,activation FROM deployment_revision_instances WHERE deployment_id=?1 AND revision=?2",
                 params![deployment_id, revision],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        row.map(|(instances, placement, warm)| {
+        row.map(|(instances, placement, warm, activation)| {
             let placement: Placement = serde_json::from_str(&placement)
                 .map_err(|_| InstanceError::Invalid("stored placement is unreadable".into()))?;
+            let activation = match activation.as_str() {
+                "on_demand" => capyctl_config::instances::Activation::OnDemand,
+                "explicit" => capyctl_config::instances::Activation::Explicit,
+                _ => {
+                    return Err(InstanceError::Invalid(
+                        "stored activation is unreadable".into(),
+                    ))
+                }
+            };
             Ok(InstanceSpec {
                 instances,
                 placement,
                 warm,
+                activation,
                 // ADR 0028 §2: a group is read from the revision's config_json,
                 // never from these rows, so it is `None` here by design.
                 group: None,

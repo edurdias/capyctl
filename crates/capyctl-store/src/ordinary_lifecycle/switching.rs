@@ -942,8 +942,9 @@ fn offer_victims(
                 AND NOT {}
               ORDER BY i.deployment_id,i.instance_index",
             open_runs_clause("i"),
-            // SPEC §6.5: a warm-residency commitment is never a victim.
-            crate::switch_state::warm_clause("i")
+            // SPEC §6.5, §10: a warm-residency commitment, or a deployment
+            // whose activation is explicit, is never a victim.
+            crate::switch_state::exempt_clause("i")
         ))?
         .query_map(params![c.host_id, target], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
