@@ -30,6 +30,9 @@ Owner decisions:
 3. **Peer exposure.** Trust the network. CapyCTL does no firewall check. Rendezvous,
    broadcast, gloo and NCCL ports are open on all interfaces during a run. CapyCTL binds to the
    direct link where the engine allows it. Recorded as a known risk.
+   Reaffirmed by the owner on 2026-10-08: decision 3 stands, now documented per engine
+   listener (address, port, authentication) with firewall guidance in the user guide
+   ([Ports a group opens](../../guide/several-machines.md#ports-a-group-opens)).
 4. **NCCL.** CapyCTL sets no NCCL setting; NCCL chooses the transport.
 5. **Readiness.** Head health only. Other hosts record their rank's process
    identities for ownership and stop evidence.

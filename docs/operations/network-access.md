@@ -182,7 +182,8 @@ wireless or overlay network such as a tailnet.
 CapyCTL checks no firewall. Keep group machines on a private direct link, and
 block the ports above on every other interface. Status marks every group
 `peer transport unauthenticated` (`"peer_transport": "unauthenticated"` in
-JSON).
+JSON). Each listener, the address it binds and example firewall rules:
+[Ports a group opens](../guide/several-machines.md#ports-a-group-opens).
 
 ## Upgrading from an earlier release
 
