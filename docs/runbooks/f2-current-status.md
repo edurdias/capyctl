@@ -1,5 +1,9 @@
 # Current implementation and launch status
 
+## Streamed delta fields audited — 2026-10-08 (branch `fix/relay-delta-allowlist`)
+
+The SSE relay's delta allowlist (`STREAM_DELTA_FIELDS`, capyctl-adapters forward.rs) was checked against every `DeltaMessage` field vLLM 0.29.0, SGLang 0.5.20 and TensorFold 0.6.0/0.6.3 serialize on `/v1/chat/completions`: `role`, `content`, `reasoning` (vLLM), `reasoning_content` (SGLang, TensorFold), `tool_calls` — already all listed, so no new key; SGLang `hidden_states` stays excluded (only for the refused `return_hidden_states`), vLLM `citations` is Cohere-endpoint only. Choice fields (`logprobs`, `stop_reason`, `token_ids`, `matched_stop`) and usage details were never key-checked and survive. CPU tests replay real-shaped chunks per engine. Not run live; vLLM 0.30, SGLang 0.5.18/0.5.19/0.5.21 sources were not on hand, so a live stream on each (reasoning parser, tool parser, `include_usage`, cache report) is still needed. Table: docs/guide/requests.md "Streamed fields".
+
 ## A launch whose parked charge keeps growing stops instead of parking — 2026-10-07 (branch `park-growth-guard`)
 
 Owner decision 2026-10-07 (catalog finding 2, ADR 0014 amendment A19). On the catalog run
