@@ -322,6 +322,10 @@ those arguments are no longer needed for the families above. Naming a parser
 in the block and passing the same option in `extra_args` is refused.
 TensorFold handles tool calls itself and has no parser setting.
 
+[Engine options](engine-flags.md) lists, for each engine, which options are
+typed fields, which pass in `extra_args`, which need host approval and which
+CapyCTL reserves.
+
 ## vLLM weight loading while parking
 
 A vLLM deployment that parks `deep` reloads its weights on every wake. By
