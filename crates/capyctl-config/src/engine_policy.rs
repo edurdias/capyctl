@@ -937,7 +937,9 @@ pub fn reserved_families(engine: Engine) -> &'static [&'static str] {
     }
 }
 
-fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] {
+/// ADR 0014 §2, ADR 0023 §4: each typed field's native spelling for `engine`,
+/// as `(option, field)`.
+pub fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] {
     match engine {
         Engine::Vllm => VLLM_TYPED_OPTIONS,
         Engine::Sglang => SGLANG_TYPED_OPTIONS,

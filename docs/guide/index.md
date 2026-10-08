@@ -28,7 +28,7 @@ Tasks:
   two apps, two models, one GPU.
 
 Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
-[settings](../operations/configuration.md),
+[settings](../operations/configuration.md), [engine options](engine-flags.md),
 [network access](../operations/network-access.md),
 [installer options](installer.md), [exit codes and errors](errors.md).
 

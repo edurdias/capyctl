@@ -24,7 +24,7 @@ export default defineConfig({
       sidebar: [
         { label: 'Start', items: ['docs', 'docs/how-it-works', 'docs/install', 'docs/one-machine', 'docs/several-machines'] },
         { label: 'Tasks', items: ['docs/install-engines', 'docs/engines', 'docs/deploy', 'docs/requests', 'docs/parking'] },
-        { label: 'Reference', items: ['docs/reference/cli', 'docs/reference/configuration', 'docs/reference/settings', 'docs/reference/network-access', 'docs/reference/installer', 'docs/reference/errors'] },
+        { label: 'Reference', items: ['docs/reference/cli', 'docs/reference/configuration', 'docs/reference/settings', 'docs/reference/engine-flags', 'docs/reference/network-access', 'docs/reference/installer', 'docs/reference/errors'] },
       ],
       // Website spec, Quality checks: no broken internal links.
       plugins: [starlightLinksValidator()],
