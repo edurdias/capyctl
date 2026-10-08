@@ -145,6 +145,34 @@ Hello! How can I help you today?
 Any OpenAI-compatible client works the same way: set its base URL to the
 endpoint and its API key to `$KEY`.
 
+## Keep tenants' prompt caches apart
+
+vLLM and SGLang reuse the cached start of an earlier prompt when a new one
+begins the same way. When several tenants share one model, give each its own
+`cache_salt`: a request then reuses cached prefixes only from requests that
+carry the same salt.
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "my-model", "cache_salt": "tenant-a",
+       "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+CapyCTL passes the salt to vLLM and SGLang unchanged. It must be a non-empty
+string of at most 1024 bytes; anything else is refused with
+`400 invalid_request`.
+
+TensorFold ignores the field, so a request with a `cache_salt` for a model that
+runs on TensorFold is refused rather than served without the isolation it asks
+for. The answer is `400` with code `cache_salt_unsupported` (on a stream, an
+error event with that code), and nothing reaches the engine. The same request
+without `cache_salt` is served.
+
+```text
+{"code":"cache_salt_unsupported","message":"this deployment's engine does not partition its prefix cache by cache_salt"}
+```
+
 ## When the model is parked
 
 A request for a parked model waits while CapyCTL wakes it, then answers. It

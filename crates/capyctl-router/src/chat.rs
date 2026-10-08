@@ -445,6 +445,7 @@ pub(crate) fn refused_before_sending(error: &AdapterError) -> bool {
         AdapterError::PolicyDenied
             | AdapterError::UnsupportedCapability
             | AdapterError::UnsupportedCombination
+            | AdapterError::CacheSaltUnsupported
     )
 }
 
@@ -455,6 +456,9 @@ pub(crate) fn adapter_refusal(error: &AdapterError) -> (StatusCode, Json<serde_j
             "invalid_request",
             "the request carries a field that is not accepted",
         ),
+        // SPEC §10: the request asks for a prefix-cache partition this
+        // deployment's engine would ignore; isolation is never silently absent.
+        AdapterError::CacheSaltUnsupported => err("cache_salt_unsupported", &format!("{error}")),
         _ => err("unsupported", &format!("{error}")),
     }
 }
@@ -515,7 +519,9 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
         match code {
             "unknown_model" => StatusCode::NOT_FOUND,
             // SPEC §14: a request that can never be forwarded is the client's.
-            "invalid_request" | "unsupported_parameter" => StatusCode::BAD_REQUEST,
+            "invalid_request" | "unsupported_parameter" | "cache_salt_unsupported" => {
+                StatusCode::BAD_REQUEST
+            }
             // SPEC §10 (T19): a full queue is transient; 413 is for body size.
             "queue_full" => StatusCode::TOO_MANY_REQUESTS,
             "unsupported" => StatusCode::NOT_IMPLEMENTED,

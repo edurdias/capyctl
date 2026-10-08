@@ -132,6 +132,7 @@ async fn stack(seen: Arc<Mutex<Vec<Value>>>) -> SocketAddr {
         format!("http://{ingress_address}").parse().unwrap(),
         "served".into(),
         Some(hex(GATE)),
+        true,
     );
     let deps = RouterDeps {
         controller: controller.clone(),

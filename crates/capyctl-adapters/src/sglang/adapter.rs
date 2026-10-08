@@ -224,6 +224,7 @@ impl SglangAdapter {
                 base.clone(),
                 metadata.served_name.clone(),
                 None,
+                true,
             ),
             http: None,
             base,
@@ -327,6 +328,7 @@ impl SglangAdapter {
             self.base.clone(),
             self.served_name.clone(),
             Some(inference.clone()),
+            true,
         );
         self.inference_key = Some(inference);
         self.admin_key = Some(admin);

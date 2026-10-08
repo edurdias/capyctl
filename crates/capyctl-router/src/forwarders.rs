@@ -132,6 +132,8 @@ impl LiveForwarders {
             base,
             runtime.served_model.clone(),
             runtime.engine_key.clone(),
+            // SPEC §10: a `cache_salt` reaches only an engine that honours it.
+            capyctl_adapters::forward::engine_honours_cache_salt(runtime.engine.as_deref()),
         );
         cache.retain(|(cached, cached_generation, _), _| {
             cached != deployment || *cached_generation != generation

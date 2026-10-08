@@ -25,7 +25,13 @@ impl TensorfoldAdapter {
         Self {
             http: Http::new(endpoint.clone()),
             // ADR 0023 §3: TensorFold has no key; nothing is presented.
-            forward: crate::forward::engine_forwarder(endpoint.clone(), model_id.clone(), None),
+            forward: crate::forward::engine_forwarder(
+                endpoint.clone(),
+                model_id.clone(),
+                None,
+                // SPEC §10: TensorFold ignores `cache_salt`, so it is refused.
+                false,
+            ),
             endpoint,
             fingerprint,
             model_id,

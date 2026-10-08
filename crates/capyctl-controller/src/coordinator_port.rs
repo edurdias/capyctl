@@ -277,11 +277,17 @@ impl CoordinatorLifecycle {
                 })?
                 .to_string(),
         };
+        // SPEC §10 (`cache_salt`): the engine this launch's revision froze, so
+        // the forwarder refuses a partition the engine would silently ignore.
+        let engine = owner
+            .store()
+            .revision_engine(deployment, binding.revision)?;
         Ok(RuntimeEndpoint {
             endpoint,
             served_model,
             engine_key,
             incarnation: binding.incarnation,
+            engine,
         })
     }
 

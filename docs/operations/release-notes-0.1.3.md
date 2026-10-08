@@ -204,6 +204,17 @@ rented machines.
   model that is not loaded (which still starts loading). The default stays
   64. See [no waiting](../guide/parking.md#no-waiting).
 
+## Requests
+
+- **`cache_salt` keeps tenants' prompt caches apart.** A chat request may
+  carry `cache_salt`, a non-empty string of at most 1024 bytes; CapyCTL passes
+  it unchanged to vLLM and SGLang, which then reuse cached prefixes only
+  between requests with the same salt. It was refused as an unknown field
+  before. TensorFold ignores the field, so a request carrying it to a
+  TensorFold model is refused with `400 cache_salt_unsupported` instead of
+  being served without the isolation it asks for. See
+  [Make a request](../guide/requests.md#keep-tenants-prompt-caches-apart).
+
 ## Fixes
 
 - **The streamed fields CapyCTL relays are documented.** The
