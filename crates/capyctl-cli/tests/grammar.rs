@@ -753,6 +753,9 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             "/data/downloads",
             "--hf-endpoint",
             "https://mirror.example",
+            // T14 T37 (ADR 0008 amendment 2026-10-08).
+            "--model-sources-plain-http",
+            "allowed",
         ])
         .unwrap();
         assert_eq!(
@@ -787,6 +790,10 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             i.model_overrides.hf_endpoint.as_deref(),
             Some("https://mirror.example")
         );
+        assert_eq!(
+            i.model_overrides.plain_http,
+            Some(capyctl_config::model_source::SourceSwitch::Allowed)
+        );
         for (flag, bad) in [
             ("--deep-park", "disabled"),
             ("--trust-remote-code", "yes"),
@@ -797,6 +804,7 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             ("--rendezvous-ports", "26009-26000"),
             ("--require-rdma", "maybe"),
             ("--hf-endpoint", "http://mirror.example"),
+            ("--model-sources-plain-http", "yes"),
         ] {
             assert!(
                 parse_invocation(["capyctl", "start", role, flag, bad]).is_err(),

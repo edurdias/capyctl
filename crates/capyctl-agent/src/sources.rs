@@ -31,7 +31,16 @@
 //!
 //! Secrets: a `token_ref` is resolved from the host's secret directory at the
 //! moment of use, sent only as an `Authorization` header marked sensitive, and
-//! never written to a file, an error, a status or a log line.
+//! never written to a file, an error, a status or a log line. A `url_ref`
+//! (ADR 0008 amendment 2026-10-08) is resolved the same way: the URL, which
+//! may be a presigned one whose query is its credential, lives only in this
+//! process's memory for the fetch. Failures carry closed categories only, and
+//! every log line passes through [`capyctl_domain::redact::redact_urls`].
+//!
+//! Plain `http://` (amendment 2026-10-08) is fetched only for an `http`
+//! source on a host whose policy allows it (`model_sources.plain_http`). A
+//! fetch that starts on HTTPS never follows a redirect down to plain HTTP,
+//! so a Hugging Face token is never sent in the clear.
 
 mod tar;
 
@@ -180,6 +189,28 @@ fn io_failure(_: io::Error) -> SourceFailure {
     SourceFailure::new(reason::IO_ERROR)
 }
 
+/// SPEC §13.3: a secret file's contents, trimmed. A credential is private
+/// state: a regular file with no group or other access, owned by the account
+/// this agent runs as, holding one printable value without spaces.
+fn read_secret(path: &Path) -> Result<Secret, SourceFailure> {
+    let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
+    let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.mode() & 0o077 != 0 || metadata.uid() != euid {
+        return Err(unavailable());
+    }
+    let mut text = String::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(8192).read_to_string(&mut text))
+        .map_err(|_| unavailable())?;
+    let value = text.trim().to_owned();
+    if value.is_empty() || value.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(unavailable());
+    }
+    Ok(Secret(value))
+}
+
 impl SourceStore {
     /// A store for `model_store` under `policy`. Secrets are read from
     /// `secrets_dir/<name>` (owner-only files).
@@ -215,17 +246,28 @@ impl SourceStore {
         loopback_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
         let loopback = loopback_origin.is_some();
+        // ADR 0008 amendment 2026-10-08: plain HTTP only on a host that
+        // approves it.
+        let plain_http = policy.plain_http == capyctl_config::model_source::SourceSwitch::Allowed;
         // SPEC §13.3: redirects stay on HTTPS (a CDN host is fine; the
         // content is verified against its pin either way). reqwest drops the
-        // Authorization header when a redirect leaves the origin host.
+        // Authorization header when a redirect leaves the origin host. A
+        // plain-HTTP fetch the host approved may stay on plain HTTP, but a
+        // fetch that started on HTTPS is never downgraded.
         let redirect = reqwest::redirect::Policy::custom(move |attempt| {
             let url = attempt.url();
             let loopback_url = loopback
                 && url.scheme() == "http"
                 && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
+            let plain_chain = plain_http
+                && url.scheme() == "http"
+                && attempt
+                    .previous()
+                    .iter()
+                    .all(|seen| seen.scheme() == "http");
             if attempt.previous().len() >= 10 {
                 attempt.error("too many redirects")
-            } else if url.scheme() == "https" || loopback_url {
+            } else if url.scheme() == "https" || loopback_url || plain_chain {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -235,7 +277,7 @@ impl SourceStore {
             .redirect(redirect)
             .connect_timeout(std::time::Duration::from_secs(30))
             .read_timeout(std::time::Duration::from_secs(120))
-            .https_only(!loopback)
+            .https_only(!loopback && !plain_http)
             .build()
             .expect("the HTTP client configuration is static");
         Arc::new(Self {
@@ -291,7 +333,8 @@ impl SourceStore {
 
     fn log(&self, line: &str) {
         if let Ok(log) = self.log.lock() {
-            log(line);
+            // SPEC §13.3: no URL credential reaches a log line.
+            log(&capyctl_domain::redact::redact_urls(line));
         }
     }
 
@@ -619,13 +662,7 @@ impl SourceStore {
         };
         let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
         let path = match token_ref {
-            Some(reference) => {
-                let name = secret_name(reference).ok_or_else(unavailable)?;
-                self.secrets_dir
-                    .as_ref()
-                    .ok_or_else(unavailable)?
-                    .join(name)
-            }
+            Some(reference) => self.secret_path(reference)?,
             // Owner rule 2026-09-25: a source that names no token uses the
             // host's default one, `CAPYCTL_HF_TOKEN` (else `HF_TOKEN`) in its
             // environment, else `model_sources.huggingface_token_file`; with
@@ -652,23 +689,44 @@ impl SourceStore {
                 }
             }
         };
-        let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
-        // SPEC §13.3: a credential is private state; no group or other access,
-        // owned by the account this agent runs as.
-        // SAFETY: geteuid has no preconditions.
-        let euid = unsafe { libc::geteuid() };
-        if !metadata.is_file() || metadata.mode() & 0o077 != 0 || metadata.uid() != euid {
-            return Err(unavailable());
+        read_secret(&path).map(Some)
+    }
+
+    /// The file a `secret://<name>` reference names in this host's secrets
+    /// directory.
+    fn secret_path(&self, reference: &str) -> Result<PathBuf, SourceFailure> {
+        let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
+        let name = secret_name(reference).ok_or_else(unavailable)?;
+        Ok(self
+            .secrets_dir
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .join(name))
+    }
+
+    /// ADR 0008 (amendment 2026-10-08): the URL an `http` source fetches,
+    /// written in the declaration or read from the host secret its
+    /// `url_ref` names, checked against this host's policy (HTTPS, or plain
+    /// HTTP where approved; a listed origin where origins are listed). The
+    /// resolved URL is held as a [`Secret`] either way and never reported.
+    fn source_url(
+        &self,
+        url: Option<&str>,
+        url_ref: Option<&str>,
+    ) -> Result<Secret, SourceFailure> {
+        let url = match (url, url_ref) {
+            (Some(url), None) => Secret(url.to_owned()),
+            (None, Some(reference)) => read_secret(&self.secret_path(reference)?)?,
+            _ => return Err(SourceFailure::new(reason::DENIED)),
+        };
+        if capyctl_config::model_source::url_origin(&url.0).is_none() {
+            // What the secret holds is not a usable URL.
+            return Err(SourceFailure::new(reason::SECRET_UNAVAILABLE));
         }
-        let mut text = String::new();
-        fs::File::open(&path)
-            .and_then(|file| file.take(8192).read_to_string(&mut text))
-            .map_err(|_| unavailable())?;
-        let token = text.trim().to_owned();
-        if token.is_empty() || token.chars().any(|c| c.is_control() || c == ' ') {
-            return Err(unavailable());
-        }
-        Ok(Some(Secret(token)))
+        self.policy
+            .permits_url(&url.0)
+            .map_err(|_| SourceFailure::new(reason::DENIED))?;
+        Ok(url)
     }
 
     fn get(
@@ -720,10 +778,12 @@ impl SourceStore {
             }
             ModelSource::Http {
                 url,
+                url_ref,
                 sha256,
                 archive,
             } => {
-                self.fetch_http(key, id, url, sha256, *archive, &partial, job)
+                let url = self.source_url(url.as_deref(), url_ref.as_deref())?;
+                self.fetch_http(key, id, &url, sha256, *archive, &partial, job)
                     .await?
             }
             ModelSource::Local { .. } => return Err(SourceFailure::new(reason::NOT_REMOTE)),
@@ -970,7 +1030,7 @@ impl SourceStore {
         &self,
         key: &str,
         id: &str,
-        url: &str,
+        url: &Secret,
         sha256: &str,
         archive: Archive,
         partial: &Path,
@@ -978,13 +1038,13 @@ impl SourceStore {
     ) -> Result<(u64, u64), SourceFailure> {
         let tree = partial.join("tree");
         let name = match archive {
-            Archive::None => file_name(url),
+            Archive::None => file_name(&url.0),
             Archive::Tar => "archive.tar".to_string(),
         };
         let payload = partial.join(&name);
         let part = part_path(&payload);
         let expected = Expected::Sha256(sha256.into());
-        let origin = self.origin(url)?;
+        let origin = self.origin(&url.0)?;
         if !payload.is_file() {
             let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
             let response = self

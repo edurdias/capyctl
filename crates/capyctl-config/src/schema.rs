@@ -201,6 +201,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("token_ref", SCALAR),
         ("locked_commit", FieldSpec::Moved(LOCKED_COMMIT_MOVED)),
         ("url", SCALAR),
+        // ADR 0008 amendment 2026-10-08: the URL named by a host secret.
+        ("url_ref", SCALAR),
         ("sha256", SCALAR),
         ("archive", SCALAR),
         ("local", FieldSpec::Struct(&[("path", SCALAR)])),
@@ -216,7 +218,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         (
             "http",
-            FieldSpec::Struct(&[("url", SCALAR), ("sha256", SCALAR), ("archive", SCALAR)]),
+            FieldSpec::Struct(&[
+                ("url", SCALAR),
+                ("url_ref", SCALAR),
+                ("sha256", SCALAR),
+                ("archive", SCALAR),
+            ]),
         ),
     ]);
     // ADR 0008 (owner decision 2026-09-25): remote model sources are allowed
@@ -233,6 +240,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // Owner rule 2026-09-25: the protected file holding the host's
         // Hugging Face token (a secret is a file or a variable, never a flag).
         ("huggingface_token_file", SCALAR),
+        // ADR 0008 amendment 2026-10-08: plain `http://` sources, off unless
+        // the host approves them.
+        ("plain_http", SCALAR),
     ]);
     const MODEL: &[(&str, FieldSpec)] = &[
         // Spec §7: `path` predates `source` and still means a local source.

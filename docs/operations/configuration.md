@@ -125,6 +125,7 @@ the document (or with `--set`).
 | Cap on all downloaded models | `model_sources.max_bytes` | `--model-sources-max <size>` | `CAPYCTL_MODEL_SOURCES_MAX` | `500GiB` | host, standalone |
 | Where downloads are kept | `model_sources.path` | `--model-sources-path <dir>` | `CAPYCTL_MODEL_SOURCES_PATH` | the models directory (`~/models/sources`) | host, standalone |
 | Hugging Face endpoint for downloads | `model_sources.huggingface_endpoint` (`https://`) | `--hf-endpoint <url>` | `CAPYCTL_HF_ENDPOINT`, else `HF_ENDPOINT` | `https://huggingface.co` | host, standalone |
+| Plain `http://` URLs for HTTP downloads | `model_sources.plain_http` (`allowed` or `disabled`) | `--model-sources-plain-http allowed\|disabled` | `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP` | `denied` (HTTPS only) | host, standalone |
 | Hugging Face endpoint for pinning `hf:` references | the role document's `model_sources.huggingface_endpoint` | `--hf-endpoint <url>` on `deploy model` | `CAPYCTL_HF_ENDPOINT`, else `HF_ENDPOINT` | `https://huggingface.co` | `capyctl deploy model` |
 | Hosts downloads may come from | `model_sources.allowed_hosts` | (none) | (none) | any | host, standalone |
 
@@ -248,6 +249,7 @@ CapyCTL writes or reads, or environment variables.
 | Per-launch engine keys | written by CapyCTL for each launch | (none) | Never an operator setting. |
 | Hugging Face token for a source that names none | `model_sources.huggingface_token_file` (absolute path to an owner-only file) | `CAPYCTL_HF_TOKEN`, else `HF_TOKEN` | The variable wins over the file. The host that downloads reads it; `deploy model` also uses the variable to pin a private repository. |
 | Hugging Face token for one source | `model.source.token_ref: secret://<name>` in the deployment (`type: huggingface`), naming `<state dir>/secrets/<name>` on the host (owner-only) | (none) | Wins over the host's default token. |
+| A download URL for one source | `model.source.url_ref: secret://<name>` in the deployment (`type: http`, instead of `url`), naming `<state dir>/secrets/<name>` on the host (owner-only) | (none) | For a presigned or otherwise sensitive URL. The deployment, its revision, status and logs hold the reference only; the host reads the URL when it fetches, checks it against its own `model_sources` policy, and verifies the payload against `sha256`. Rotating the file's contents needs no new revision. |
 
 A token file readable by other users is refused, not used.
 
@@ -479,6 +481,7 @@ host.model_sources.http                            allowed                      
 host.model_sources.huggingface                     allowed                             default
 host.model_sources.huggingface_endpoint            https://huggingface.co              default
 host.model_sources.max_bytes                       500GiB                              default
+host.model_sources.plain_http                      denied                              default
 host.model_store.path                              /home/me/models                     default
 host.name                                          local                               yaml
 host.resource_policy.allowed_devices               auto                                yaml

@@ -161,6 +161,8 @@ fn config_show_names_each_values_source() {
     let env = [
         ("CAPYCTL_SET__SHUTDOWN__DRAIN_TIMEOUT", "45s"),
         ("CAPYCTL_DEEP_PARK", "off"),
+        // T14 T37 (ADR 0008 amendment 2026-10-08).
+        ("CAPYCTL_MODEL_SOURCES_PLAIN_HTTP", "allowed"),
     ];
     let mut with_json = args.to_vec();
     with_json.extend(["--format", "json"]);
@@ -180,6 +182,7 @@ fn config_show_names_each_values_source() {
             "default",
         ),
         ("host.model_sources.max_bytes", "500GiB", "default"),
+        ("host.model_sources.plain_http", "allowed", "env"),
     ] {
         let found = setting(&shown, path);
         assert_eq!(
