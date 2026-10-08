@@ -3,6 +3,11 @@
 # landing page's terminal output, so it needs the Rust toolchain as well as
 # Node. It runs only once the repository is public and Pages is enabled with
 # "GitHub Actions" as its source.
+#
+# The build runs only when something the site is made from changed (the
+# `changes` job). `build` is a required check, so it is skipped by its `if:`
+# rather than by an `on.paths` filter: a skipped job satisfies a required
+# check, while a workflow that never starts leaves the check waiting.
 name: site
 
 on:
@@ -20,8 +25,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  changes:
     if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      site: ${{ steps.diff.outputs.site }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: diff
+        name: Did a site input change?
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        # Keep this list in step with what site/ reads: site/scripts/pages.mjs
+        # (the synced docs pages), site/site.config.mjs (the workspace version
+        # in Cargo.toml) and site/scripts/gen-cli.mjs and gen-hero.mjs (the
+        # capyctl-cli examples).
+        run: |
+          inputs='^(site/|docs/guide/|docs/operations/configuration\.md$|docs/operations/network-access\.md$|crates/capyctl-cli/(src|examples)/|crates/capyctl-cli/Cargo\.toml$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/site\.yml$)'
+          case "$EVENT" in
+            pull_request) range="$PR_BASE...$PR_HEAD" ;;
+            push) range="$PUSH_BEFORE..$SHA" ;;
+            *) range="" ;;
+          esac
+          if [ -z "$range" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            site=true
+          elif git diff --name-only "$range" | grep -Eq "$inputs"; then
+            site=true
+          else
+            site=false
+          fi
+          echo "site=$site" >> "$GITHUB_OUTPUT"
+          echo "Site inputs changed: $site" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: changes
+    if: github.event.repository.private == false && needs.changes.outputs.site == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
