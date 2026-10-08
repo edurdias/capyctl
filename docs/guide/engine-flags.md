@@ -14,8 +14,7 @@ Engines take many options. CapyCTL treats each one in one of four ways:
   spelling, abbreviations included. The table names the setting to use
   instead.
 
-The rules come from `crates/capyctl-config/src/engine_policy.rs` (ADR 0014 §2,
-§3, §8 and ADR 0023 §3, §4) and the typed fields from the `engine_config`
+The rules come from `crates/capyctl-config/src/engine_policy.rs` and the typed fields from the `engine_config`
 schema (`crates/capyctl-config/src/schema.rs`). A test
 (`crates/capyctl-config/tests/engine_flag_table.rs`) runs every option in the
 tables below through CapyCTL's checks and fails if a row's class is wrong,
@@ -31,7 +30,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Need | Option | Class | CapyCTL |
 |---|---|---|---|
 | Speculative decoding: EAGLE, EAGLE3, MTP, n-gram, a draft model | `--speculative-config` | approval | A JSON object. Only the keys `method`, `model`, `num_speculative_tokens`, `draft_tensor_parallel_size`, `prompt_lookup_max`, `prompt_lookup_min`, `draft_sample_method` and `moe_backend` are accepted. `method` is one of vLLM's names (`eagle`, `eagle3`, `mtp`, `ngram`, `draft_model`, ...). `model`, the draft directory, must be inside `security.approved_paths`. |
-| Reasoning parser | `--reasoning-parser` | extra | Usually set with `engine_config.vllm.reasoning_parser` (`auto` picks one by model family, ADR 0024). Use the field or the option, not both. |
+| Reasoning parser | `--reasoning-parser` | extra | Usually set with `engine_config.vllm.reasoning_parser` (`auto` picks one by model family). Use the field or the option, not both. |
 | Tool-call parser | `--tool-call-parser`, `--enable-auto-tool-choice` | extra | Usually set with `engine_config.vllm.tool_call_parser`, which also adds `--enable-auto-tool-choice`. Use the field or the options, not both. |
 | Parser plugins | `--tool-parser-plugin`, `--reasoning-parser-plugin` | approval | They load code. |
 | Context length | `--max-model-len` | typed | `engine_config.context_length` |
@@ -40,7 +39,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Mamba / state cache | `--mamba-cache-dtype`, `--mamba-ssm-cache-dtype`, `--mamba-cache-mode`, `--mamba-block-size` | extra | vLLM has no state slot count; it takes the state from the KV cache budget (`memory.kv_cache`). |
 | GPU memory fraction | `--gpu-memory-utilization` | reserved | `engine_config.memory.request`. CapyCTL computes the fraction from it. |
 | KV cache size | `--kv-cache-memory-bytes` | reserved | `engine_config.memory.kv_cache` |
-| CPU weight offload, swap | `--cpu-offload-gb`, `--swap-space` | reserved | Not supported: CapyCTL owns where the weights live and counts them in `memory.request` (ADR 0014 §3). |
+| CPU weight offload, swap | `--cpu-offload-gb`, `--swap-space` | reserved | Not supported: CapyCTL owns where the weights live and counts them in `memory.request`. |
 | Sleep mode | `--enable-sleep-mode` | reserved | `residency` (parking) |
 | KV cache dtype | `--kv-cache-dtype` | typed | `engine_config.kv_cache_dtype` |
 | KV block size | `--block-size` | typed | `engine_config.vllm.block_size_tokens` |
@@ -65,7 +64,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Draft model | `--speculative-draft-model-path`, `--speculative-draft-model` | approval | The draft directory must be inside `security.approved_paths`. |
 | Draft steps and tokens | `--speculative-num-steps`, `--speculative-eagle-topk`, `--speculative-num-draft-tokens` | extra | |
 | Linear-attention spec verify | `--enable-linear-replayssm-spec` | extra | See the note below the table. |
-| Reasoning parser | `--reasoning-parser` | extra | Usually set with `engine_config.sglang.reasoning_parser` (`auto` picks one by model family, ADR 0024). Use the field or the option, not both. |
+| Reasoning parser | `--reasoning-parser` | extra | Usually set with `engine_config.sglang.reasoning_parser` (`auto` picks one by model family). Use the field or the option, not both. |
 | Tool-call parser | `--tool-call-parser` | extra | Usually set with `engine_config.sglang.tool_call_parser`. Use the field or the option, not both. |
 | Context length | `--context-length` | typed | `engine_config.context_length` |
 | Max running requests | `--max-running-requests` | typed | `engine_config.max_concurrent_requests` |
@@ -81,14 +80,14 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | CUDA graph batch size | `--cuda-graph-max-bs` | extra | |
 | Weight dtype | `--dtype` | typed | `engine_config.dtype` |
 | Quantization | `--quantization` | typed | `engine_config.quantization` |
-| Quantize at load | `--quantize-and-serve`, `--modelopt-quant` | reserved | Not supported (SPEC §1.2). Serve a quantized checkpoint instead. |
+| Quantize at load | `--quantize-and-serve`, `--modelopt-quant` | reserved | Not supported. Serve a quantized checkpoint instead. |
 | Tokenizer workers | `--tokenizer-worker-num` | typed | `engine_config.sglang.tokenizer_workers` |
 | Text only | `--language-model-only` | typed | `engine_config.language_model_only` |
 | Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
 | Log level | `--log-level`, `--log-level-http` | reserved | CapyCTL sets them and reads the engine's log. |
 | Request logging | `--log-requests`, `--log-requests-target` | reserved | CapyCTL logs requests itself. |
 | Metrics | `--enable-metrics` | reserved | Always on: CapyCTL reads them for load reports. |
-| KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting (SPEC §12). Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
+| KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
 | Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |
 
@@ -143,12 +142,12 @@ checkpoint.
 | Max running requests | `--parallel` | extra | Or `engine_config.max_concurrent_requests`, which renders it. Not both. |
 | KV cache dtype | `--kv-dtype` | typed | `engine_config.kv_cache_dtype` |
 | Prefix caches | `--prompt-cache-gib`, `--checkpoint-slots`, `--spill-gib`, `--max-snapshots` | extra | `--spill-gib` writes to disk. Count the memory in the deployment's `resources`. |
-| Snapshot directory | `--snapshot-dir` | reserved | A directory outside CapyCTL's control (ADR 0023 §3). |
-| Memory limit | none | — | CapyCTL sets `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` to the declared Ready memory (`resources`, ADR 0025). The variable cannot be changed. |
+| Snapshot directory | `--snapshot-dir` | reserved | A directory outside CapyCTL's control. |
+| Memory limit | none | — | CapyCTL sets `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` to the declared Ready memory (`resources`). The variable cannot be changed. |
 | Prefill precision | `--prefill-fp8`, `--precision` | extra | |
 | Custom kernels | `--lane-kernels` | approval | It loads code. |
 | Vision from URLs | `--vision-urls` | approval | It reaches off the host. |
-| Two-GPU groups | `--tp`, `--rank`, `--master`, `--master-port` | reserved | `topology` (ADR 0028). CapyCTL renders them for each group member. |
+| Two-GPU groups | `--tp`, `--rank`, `--master`, `--master-port` | reserved | `topology`. CapyCTL renders them for each group member. |
 | Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. |
 
 ## Reaching an SGLang memory fraction
