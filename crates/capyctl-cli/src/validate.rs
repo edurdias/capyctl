@@ -333,15 +333,15 @@ fn resolve_on_host(
     // As the server resolves it: both documents scoped to the host's ledger
     // keys, and the host's resource policy composed as the current controls
     // (its first publication stores exactly these).
-    let scoped = scoped_resolution(name, deployment, host_document).map_err(&refused)?;
-    resolve_for_acceptance(&strip(scoped.0), &scoped.1).map_err(&refused)?;
+    let scoped = scoped_resolution(name, deployment, host_document).map_err(refused)?;
+    resolve_for_acceptance(&strip(scoped.0), &scoped.1).map_err(refused)?;
     // The host-local view the operator reads (device and domain names as the
     // host document writes them).
     let source = strip(
-        capyctl_config::instances::assign_devices(deployment, host_document).map_err(&refused)?,
+        capyctl_config::instances::assign_devices(deployment, host_document).map_err(refused)?,
     );
     let (effective, provisional) =
-        resolve_for_acceptance(&source, host_document).map_err(&refused)?;
+        resolve_for_acceptance(&source, host_document).map_err(refused)?;
     let mut out = json!({
         "valid": true,
         "kind": kind.as_str(),
