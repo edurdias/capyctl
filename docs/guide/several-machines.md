@@ -398,3 +398,128 @@ Group of instance 0: vllm, TP 2 x PP 1 on 2 hosts
 Group members talk to each other over unauthenticated ports. Anyone who can
 reach them can likely run code on those machines. Keep group machines on a
 private direct link ([Network access](../operations/network-access.md#multi-node-groups)).
+
+### Ports a group opens
+
+CapyCTL trusts the network between group machines (ADR 0028 decision 3): it
+checks no firewall, and it passes each engine the member's address on the
+direct link wherever the engine takes one. The engines open the listeners
+below. **None of them is authenticated.** The rendezvous store, vLLM's
+broadcast queues, SGLang's DP-attention sockets and gloo's object
+collectives carry pickled Python objects, and unpickling data from the network
+runs code: anyone who can connect can likely run code as the engine's user and
+read its per-launch keys (ADR 0028 §13).
+
+`P` is the group's rendezvous port, from the head's `--rendezvous-ports`
+range (default `25000-25099`). "Ephemeral" means a port the kernel picks from
+`net.ipv4.ip_local_port_range` (Ubuntu default `32768-60999`). "Link address"
+is the member's `peer_address`. Entries marked *inferred* come from compiled
+code (torch, NCCL) or from a different engine version than the one supported,
+and are confirmed only by the live check (`ss -ltnp` on both machines).
+
+#### All three engines
+
+| Listener | Where | Port | Binds | Notes |
+|---|---|---|---|---|
+| Engine API | head | `endpoint_port_range` | `127.0.0.1` | CapyCTL renders `--host 127.0.0.1`; per-launch key; reached only through host ingress and the server. Not reachable from the link. |
+| Rendezvous (torch TCP store) | head | `P` | every interface, IPv4 and IPv6 | CapyCTL renders `P` and the head's link address (vLLM `--master-addr/--master-port`, SGLang `--dist-init-addr`, TensorFold `--master/--master-port`). The address tells the other ranks where to connect; the store itself listens on all interfaces (*inferred*: torch c10d is compiled; CapyCTL's `Prepare` probes `P` on `0.0.0.0` and `::` for this reason). |
+| NCCL bootstrap and socket transport | every member | ephemeral | an interface NCCL chooses | CapyCTL sets no `NCCL_*` (decision 4). Without `NCCL_SOCKET_IFNAME`, NCCL picks the interface itself (InfiniBand-named first, otherwise the first that is not loopback or a container bridge), which need not be the direct link (*inferred* from NCCL's documented behavior). Over RDMA, data moves over queue pairs, not TCP listeners, and `ss` does not show it. |
+
+#### vLLM 0.30
+
+| Listener | Where | Port | Binds | Source |
+|---|---|---|---|---|
+| gloo CPU process groups | every member | ephemeral | the link address, through `GLOO_SOCKET_IFNAME` | CapyCTL renders `GLOO_SOCKET_IFNAME` as the interface holding the peer address. |
+| Scheduler broadcast queue (ZeroMQ, "shm broadcast" over the network) | head | ephemeral | `VLLM_HOST_IP`, the link address | CapyCTL renders `VLLM_HOST_IP=<peer address>`. vLLM binds `tcp://<VLLM_HOST_IP>:0` for remote readers (`v1/executor/multiproc_executor.py`, `distributed/device_communicators/shm_broadcast.py` in 0.29). |
+| Response queues back to rank 0 (ZeroMQ) | every worker | ephemeral | `VLLM_HOST_IP`, the link address | One queue per rank with remote readers, same code path. |
+
+A headless worker opens no API port.
+
+#### SGLang 0.5.21
+
+| Listener | Where | Port | Binds | Source |
+|---|---|---|---|---|
+| gloo CPU process groups | every member | ephemeral | the link address, through `gloo_socket_ifname` | CapyCTL renders it from the peer address. |
+| Broadcast queue to remote readers (ZeroMQ) | the writing rank | ephemeral | `SGLANG_HOST_IP`, the link address | CapyCTL renders `SGLANG_HOST_IP=<peer address>`; without it SGLang guesses the default-route address (`srt/utils/network.py`, `shm_broadcast.py` in 0.5.20). |
+| Worker health server | every worker | worker loopback port | `127.0.0.1` | CapyCTL renders `--host 127.0.0.1 --port <worker port>`. |
+| `nccl_port` | every member | ephemeral | not bound | Chosen but unused: with `--dist-init-addr` the store is on `P`. |
+
+With DP attention enabled, the head also binds, on the head's link address
+(the host in `--dist-init-addr`), as SGLang 0.5.20 computes them in
+`PortArgs.init_new` and `data_parallel_controller.py`:
+
+| Listener | Port | Binds |
+|---|---|---|
+| Tokenizer, detokenizer, RPC, metrics, scheduler input, load collector (ZeroMQ) | `P+1` to `P+6`, or `P-7` to `P-2` when `P+7` passes 65535 | the head's link address |
+| Worker-port handshake (ZeroMQ REP; replies with a pickled port list) | `P+13` | the head's link address |
+| One scheduler input socket per DP rank (ZeroMQ PUSH) | ephemeral | the head's link address |
+
+CapyCTL's `Prepare` checks `P+1` to `P+6` on the head (ADR 0028 §7); it does
+not check `P+13` or the ephemeral DP sockets.
+
+#### TensorFold 0.6.5
+
+| Listener | Where | Port | Binds | Source |
+|---|---|---|---|---|
+| Rank exchange (torch TCP store) | head | `P` | every interface (*inferred*, as above) | CapyCTL renders `--master <head> --master-port P`. TensorFold puts NCCL's unique id and readiness keys in this store (`cuda/comm.py` in 0.6.3). |
+| NCCL | both | ephemeral | an interface NCCL chooses | TensorFold drives NCCL directly and opens no gloo group. |
+| Extra port under `--parallel` | head | ephemeral | not established | Recorded in ADR 0028 §13 for 0.6.5 Flash Next; 0.6.3 refuses `--parallel` with `--tp 2`, so this was not read from source (*inferred*). |
+
+Rank 1 opens no API port.
+
+#### Firewall on the direct link
+
+Apply on every group machine:
+
+1. On the direct-link interface, allow new TCP connections to `P`'s range,
+   `P+13`, and the ephemeral range **only from the other machines of the
+   group**.
+2. On every other interface (LAN, Wi-Fi, a tailnet, IPv6), drop new TCP
+   connections to those ports.
+3. Leave loopback, SSH, and CapyCTL's own ports (host ingress, the server's
+   listeners) as they are; they are outside these ranges unless you moved them
+   there.
+
+The ephemeral range covers every engine-chosen port above; check yours with
+`sysctl net.ipv4.ip_local_port_range`. Any other service on the machine that
+accepts connections on an ephemeral port is blocked from other networks too.
+
+**Example only.** nftables on host A (`192.0.2.10`), with host B
+(`192.0.2.11`) on the direct link `enp1s0f0np0`, rendezvous range
+`25000-25099` (so `P+13` reaches `25112`). Adjust the addresses, the interface
+and the ranges to yours; on host B, list host A:
+
+```text title="/etc/nftables.d/capyctl-group.nft (example)"
+table inet capyctl_group {
+  set group_peers {
+    type ipv4_addr
+    elements = { 192.0.2.11 }
+  }
+  chain input {
+    type filter hook input priority filter - 1; policy accept;
+    iifname "lo" accept
+    iifname "enp1s0f0np0" ip saddr @group_peers tcp dport { 25000-25112, 32768-60999 } accept
+    tcp dport { 25000-25112, 32768-60999 } ct state new drop
+  }
+}
+```
+
+**Example only.** The same with ufw (default incoming policy `deny`; rules
+match in order):
+
+```bash
+sudo ufw allow in on enp1s0f0np0 from 192.0.2.11 to any port 25000:25112 proto tcp
+sudo ufw allow in on enp1s0f0np0 from 192.0.2.11 to any port 32768:60999 proto tcp
+sudo ufw deny proto tcp to any port 25000:25112
+sudo ufw deny proto tcp to any port 32768:60999
+```
+
+Replies to connections the machine makes itself are not new connections, so
+these rules do not break outgoing traffic. RDMA traffic bypasses the kernel's
+firewall; keep the link itself private.
+
+To see what a running group actually opened, on each machine:
+
+```bash
+sudo ss -ltnp
+```
