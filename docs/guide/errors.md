@@ -84,7 +84,8 @@ A deployment on one machine can show this code the same way:
 - `wake_mismatch`: after a wake, the model answered a fixed prompt
   differently than when it first became ready, so its weights did not come
   back intact. The wake fails and CapyCTL stops the instance;
-  `capyctl status deployment <name>` shows the code as its last error. The next request or `capyctl start` loads it fresh.
+  `capyctl status deployment <name>` shows the code as its last error. The
+  next request or `capyctl start deployment <name>` loads it fresh.
 
 ## Troubleshooting
 
