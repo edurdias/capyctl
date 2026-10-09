@@ -102,6 +102,19 @@ fn first_pid(child: &mut std::process::Child) -> u32 {
     line.trim().parse().unwrap()
 }
 
+/// Kill a child started in the background of a [`shell`]. The fixture's
+/// children exit only this way, once their shell can no longer reap them: a
+/// shell reaps a background child that has already exited when it next
+/// finishes a command, built-ins included (`echo $!`), so a child that exits
+/// on its own can be gone before it is handed here or seen as a zombie.
+fn kill(pid: u32) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+}
+
 fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -121,7 +134,7 @@ fn subreaper_fixture() {
 
     // An engine that exits and leaves a child behind: the child is handed to
     // this subreaper, exits in turn, and is reaped here, so it reads gone.
-    let mut engine = shell("/bin/sleep 0.5 & echo $!");
+    let mut engine = shell("/bin/sleep 30 & echo $!");
     let orphan = first_pid(&mut engine);
     let identity = crate::exec::process_identity(orphan, "helper-0").unwrap();
     assert!(
@@ -133,6 +146,7 @@ fn subreaper_fixture() {
         me,
         "the orphan is handed here"
     );
+    kill(orphan);
     until("the orphan is reaped", || {
         presence(&identity) == Presence::Gone
     });
@@ -143,11 +157,16 @@ fn subreaper_fixture() {
     );
 
     // A zombie whose parent is another live process that never waits: it
-    // cannot be reaped here, and it is reported, neither alive nor gone.
-    let mut parent = shell("/bin/true & echo $!; exec /bin/sleep 30");
+    // cannot be reaped here, and it is reported, neither alive nor gone. The
+    // child exits only once its parent runs `sleep`, which never waits.
+    let mut parent = shell("/bin/sleep 30 & echo $!; exec /bin/sleep 30");
     let zombie = first_pid(&mut parent);
-    // The stat of an exited, unreaped child is still readable.
     let identity = crate::exec::process_identity(zombie, "helper-0").unwrap();
+    until("the parent no longer runs the shell", || {
+        std::fs::read_to_string(format!("/proc/{}/comm", parent.id()))
+            .is_ok_and(|comm| comm.trim_end() == "sleep")
+    });
+    kill(zombie);
     until("the child exits", || {
         proc_stat(zombie).is_some_and(|stat| stat.exited())
     });
