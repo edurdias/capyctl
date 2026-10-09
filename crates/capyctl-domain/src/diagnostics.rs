@@ -75,6 +75,18 @@ const HINTS: &[(&str, &str)] = &[
         "port_conflict",
         "another program listens on the engine port capyctl leased for this launch; start again (the next start leases a free port), or give capyctl another range with --engine-ports",
     ),
+    // ADR 0029 §6: llama-server fills every option CapyCTL leaves unset from
+    // the machine-wide file.
+    (
+        "engine_config_file",
+        "/etc/llama.cpp/config.ini exists on the host, and llama.cpp would take settings CapyCTL cannot see from it; remove the file to run llama.cpp there",
+    ),
+    // ADR 0029 §10, SPEC §8.2: the slot settings llama-server reported after
+    // parsing its command line are not the rendered ones.
+    (
+        "effective_args_mismatch",
+        "the engine reported other slot settings than capyctl rendered (slot count, context window, or its metrics and slots endpoints); check the engine version and the end of the instance's engine log",
+    ),
 ];
 
 /// Text a status reader must not see quoted (lower-cased comparison).

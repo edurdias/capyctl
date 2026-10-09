@@ -2036,6 +2036,8 @@ mod tests {
         assert!(engine_honours_cache_salt(Some("vllm")));
         assert!(engine_honours_cache_salt(Some("sglang")));
         assert!(!engine_honours_cache_salt(Some("tensorfold")));
+        // T42 T37 (ADR 0029 §11): llama-server never reads the field.
+        assert!(!engine_honours_cache_salt(Some("llamacpp")));
         assert!(!engine_honours_cache_salt(None));
         let forward = crate::forward::engine_forwarder(
             "http://127.0.0.1:9".parse().unwrap(),

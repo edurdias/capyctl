@@ -598,6 +598,72 @@ fn a_tensorfold_profile_builds_a_tensorfold_spec() {
     );
 }
 
+/// A llama.cpp deployment on the lab fixture, its checkpoint `checkpoint`.
+fn llamacpp_work(checkpoint: &std::path::Path) -> InitializeWork {
+    let all: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .expect("fixture JSON parses");
+    let (mut deployment, mut host) = (all["deployment"].clone(), all["host"].clone());
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("llamacpp");
+    profile["executable"] = json!("/opt/llama.cpp/bin/llama-server");
+    profile["build_fingerprint"] = json!("0.6.0+d812350");
+    profile["args"] = json!([]);
+    profile["security"]["deep_park"] = json!("disabled");
+    deployment["residency"] = json!("restart_only");
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment["engine_config"] = json!({"context_length": 8000});
+    admit(&deployment, &host)
+}
+
+// T42 T16 (ADR 0029 §6, §10): the embedded path builds the plan the host
+// agent builds, with the private configuration and cache directories and no
+// key; every start of the revision (a wake is a fresh launch) renders the
+// same pinned command. Without a private cache root nothing launches.
+#[test]
+fn a_llamacpp_profile_builds_a_llamacpp_spec() {
+    use std::os::unix::fs::PermissionsExt;
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(checkpoint.path().join("toy-Q4_K_M.gguf"), "GGUF").unwrap();
+    let work = llamacpp_work(checkpoint.path());
+    let dir = tempfile::tempdir().unwrap();
+    let engines = dir.path().join("engines");
+    std::fs::create_dir(&engines).unwrap();
+    std::fs::set_permissions(&engines, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bindings = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"))
+        .with_engine_cache_root(engines);
+    let render = || {
+        let AdapterSpec::Llamacpp {
+            launch: Some(launch),
+            model_id,
+            fingerprint,
+            ..
+        } = bindings.spec(&work).unwrap()
+        else {
+            panic!("a llama.cpp spec");
+        };
+        assert_eq!(model_id, launch.served_model_name);
+        assert_eq!(fingerprint, "0.6.0+d812350");
+        assert!(launch.config_dir.ends_with("engines/llamacpp/config"));
+        capyctl_adapters::llamacpp::render_command(&launch).unwrap()
+    };
+    let first = render();
+    assert!(first.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
+    assert!(!first.env.keys().any(|name| name.contains("KEY")));
+    let again = render();
+    assert_eq!(
+        (again.argv, again.env),
+        (first.argv, first.env),
+        "a fresh launch renders the pinned command"
+    );
+    let without = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"));
+    assert!(
+        without.spec(&work).is_err(),
+        "no private cache root, no launch"
+    );
+}
+
 /// This test process: certainly alive while the test runs.
 fn own_identity() -> capyctl_domain::completion::ProcessIdentity {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();

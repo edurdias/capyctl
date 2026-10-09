@@ -104,3 +104,23 @@ fn a_tensorfold_spec_resolves_only_as_tensorfold() {
         Err(RuntimeError::Unsupported)
     ));
 }
+
+fn llamacpp() -> AdapterSpec {
+    AdapterSpec::Llamacpp {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "0.6.0+d812350".into(),
+        model_id: "m".into(),
+        launch: None,
+    }
+}
+
+// T42: llama.cpp resolves for its own family only.
+#[test]
+fn a_llamacpp_spec_resolves_only_as_llamacpp() {
+    assert_eq!(llamacpp().engine(), Engine::Llamacpp);
+    assert!(resolve(Engine::Llamacpp, llamacpp(), None).is_ok());
+    assert!(matches!(
+        resolve(Engine::Tensorfold, llamacpp(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}

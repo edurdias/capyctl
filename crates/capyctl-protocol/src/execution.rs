@@ -1167,7 +1167,9 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// an interface every launch needs. Discrete GPU design §4:
 /// `insufficient_device_memory`: a GPU's own memory domain cannot hold the
 /// launch's allocation there with its free reserve kept, now or beside every
-/// claimed launch.
+/// claimed launch. ADR 0029 §6: `engine_config_file`: a llama.cpp launch on a
+/// host where `/etc/llama.cpp/config.ini` exists (llama-server would fill
+/// every option the command leaves unset from it).
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
@@ -1181,6 +1183,7 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "installation_drift",
     "capability_missing:deep_park",
     "capability_missing:core",
+    "engine_config_file",
 ];
 
 /// Whether `reason` is one of the closed [`POLICY_REFUSALS`].
