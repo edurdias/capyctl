@@ -61,8 +61,10 @@ jobs:
       - name: Runtime CPU tests
         run: python3 -m unittest discover -s runtime/tests -p 'test_*.py' -v
       - name: Packaging shell checks
-        run: shellcheck packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh
+        run: shellcheck packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh scripts/assemble-changes.sh scripts/test-assemble-changes.sh
       - name: Installer fixtures
         run: scripts/test-install.sh
+      - name: Change file assembly
+        run: scripts/test-assemble-changes.sh
       - name: Record scope
         run: echo 'CPU and Fake-engine tests are not native engine recipe qualification.' >> "$GITHUB_STEP_SUMMARY"

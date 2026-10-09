@@ -28,6 +28,8 @@ Read these in order when orienting. Lower entries never override higher ones.
    ahead of their plans live in `docs/specs/`.
 5. `docs/runbooks/f2-current-status.md` — **the single status authority.**
    What is done, what remains, what needs owner attention, what is queued next.
+   Changes merged since the last release wait in `docs/changes/` and are folded
+   into it when a release is cut; read both.
 
 If a summary disagrees with `docs/SPEC.md`, the spec wins.
 
@@ -42,13 +44,23 @@ These exist because process artifacts once grew to 376 files and 7.4 MB and
 became harder to audit than the code they described.
 
 - **One status document.** `docs/runbooks/f2-current-status.md` only. Do not create
-  `progress.md`, `continuation-*.md`, or per-slice status narratives. Update the
-  runbook in place.
+  `progress.md`, `continuation-*.md`, or per-slice status narratives.
+- **A pull request adds a change file; it does not edit the runbook or the
+  release notes.** It records its status entry and its release note (with the
+  release notes section it belongs under, or `none`) in one new file,
+  `docs/changes/<short-slug>.md`, in the format `docs/changes/README.md`
+  gives. Entries at the top of those two files made every merge conflict with
+  every open pull request. When a release is cut,
+  `scripts/assemble-changes.sh <version>` folds the change files into the
+  runbook (top, newest first) and the release's notes (under their sections)
+  and removes them (`docs/operations/releasing.md`). Existing runbook entries
+  stay where they are; correcting one in place is still an edit to the
+  runbook.
 - **Never persist regenerable output.** No `review-*.diff` files — a diff is
   `git diff <base>..<head>`. No saved reviewer/agent prompt files. Record the
   commit range, not the bytes.
 - **A per-unit report lives only while its unit is uncommitted.** Once the unit
-  commits, its evidence belongs in the commit message and the status runbook;
+  commits, its evidence belongs in the commit message and its change file;
   move the report to the slice's `archive/` directory.
 - **Prose is normal English**, in documents and commit messages, regardless of
   chat style settings.
@@ -61,9 +73,9 @@ CI "CPU checks" is a fast gate on a 4-core runner. Its steps, in order: fmt
 check, `scripts/check-name.sh`, workspace clippy (`cargo clippy --workspace
 --all-targets --locked -- -D warnings`), unit tests (`cargo test --workspace
 --lib --bins --locked --no-fail-fast`), runtime Python tests with the pinned
-`torch_memory_saver` fixture, pinned shellcheck v0.11.0, and
-`scripts/test-install.sh`. The integration suites are too heavy for that runner
-and run locally.
+`torch_memory_saver` fixture, pinned shellcheck v0.11.0,
+`scripts/test-install.sh` and `scripts/test-assemble-changes.sh`. The
+integration suites are too heavy for that runner and run locally.
 
 - `scripts/ci-local.sh` (fast) runs exactly the CI steps in order under CI's
   limits (4 cores via `taskset`, 16 GB via `systemd-run --user --scope` when
