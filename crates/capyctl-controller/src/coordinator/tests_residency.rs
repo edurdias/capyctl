@@ -4,6 +4,7 @@
 //! probe; an embedded vLLM-shaped one answers each persisted step separately.
 //! CPU only: nothing here qualifies an engine or a host.
 use super::*;
+use capyctl_adapters::completion_probe::ProbeAnswer;
 use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milestone};
 use capyctl_store::ordinary_lifecycle::park::{IdlePolicy, WakeScope};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
@@ -30,6 +31,11 @@ struct Residency {
     /// What the host samples the engine's processes holding (none unless a
     /// test scripts it).
     residents: Mutex<Vec<capyctl_domain::resources::ProcessResident>>,
+    /// Owner decision 2026-10-09: what the engine generates for the wake
+    /// canary; `None` is an engine without one.
+    canary: Mutex<Option<ProbeAnswer>>,
+    /// (incarnation, generation) of every wake canary asked.
+    canaries: Mutex<Vec<(String, i64)>>,
 }
 
 impl Residency {
@@ -45,10 +51,18 @@ impl Residency {
             calls: Mutex::new(vec![]),
             cleanups: AtomicUsize::new(0),
             residents: Mutex::new(vec![]),
+            canary: Mutex::new(None),
+            canaries: Mutex::new(vec![]),
         })
     }
     fn actions(&self) -> Vec<RuntimeAction> {
         self.calls.lock().unwrap().iter().map(|c| c.0).collect()
+    }
+    fn generates(&self, tokens: &[u32]) {
+        *self.canary.lock().unwrap() = Some(ProbeAnswer {
+            tokens: tokens.to_vec(),
+            text: "Ready.".into(),
+        });
     }
 }
 
@@ -144,6 +158,23 @@ impl EngineAdapter for Residency {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    async fn wake_canary(
+        &self,
+        context: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        _: Duration,
+    ) -> Result<ProbeAnswer, RuntimeError> {
+        assert_eq!(max_tokens, crate::wake_canary::CANARY_TOKENS);
+        self.canaries
+            .lock()
+            .unwrap()
+            .push((context.incarnation.clone(), context.token.generation));
+        self.canary
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RuntimeError::Unsupported)
+    }
 }
 
 /// Observations sampled at the test clock, so they stay fresh as it moves,
@@ -183,6 +214,24 @@ fn residency_worker(
     clock: Arc<AtomicI64>,
     idle: IdlePolicy,
 ) -> OwnedCoordinator {
+    residency_worker_with(
+        owner,
+        observations,
+        Arc::new(Mutex::new(engine)),
+        clock,
+        idle,
+    )
+}
+
+/// As [`residency_worker`], each new launch bound to the engine `slot` holds
+/// when it starts.
+fn residency_worker_with(
+    owner: SharedCoordinatorState,
+    observations: Vec<MemoryObservation>,
+    slot: Arc<Mutex<Arc<Residency>>>,
+    clock: Arc<AtomicI64>,
+    idle: IdlePolicy,
+) -> OwnedCoordinator {
     let now = clock.clone();
     OwnedCoordinator::spawn_with_execution_bindings(
         owner,
@@ -201,7 +250,7 @@ fn residency_worker(
             let observed = clock.clone();
             let terminated = engine.clone();
             Ok(ExecutionBinding::remote(
-                engine.clone(),
+                slot.lock().unwrap().clone(),
                 Arc::new(move |context: CleanupExecutionContext| {
                     let at = observed.load(Ordering::SeqCst);
                     terminated.cleanups.fetch_add(1, Ordering::SeqCst);
@@ -845,4 +894,210 @@ async fn a_park_the_growth_bound_turns_into_a_stop_runs_the_stop() {
     assert_eq!(instance(&dir, &fence.deployment_id).0, "stopped");
     assert_eq!(phase(&owner, &fence.deployment_id), None);
     w.shutdown().await.unwrap();
+}
+
+/// The instance's recorded `last_error`.
+fn last_error(dir: &tempfile::TempDir, deployment: &str) -> Option<String> {
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    sql.query_row(
+        "SELECT last_error FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0",
+        [deployment],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// The wake canary reference of instance 0's current launch.
+fn reference(
+    owner: &SharedCoordinatorState,
+    dir: &tempfile::TempDir,
+    engine: &Residency,
+    deployment: &str,
+) -> Option<capyctl_store::wake_canary::StoredWakeCanary> {
+    let generation = instance(dir, deployment).2;
+    let incarnation = engine
+        .canaries
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|c| c.1 == generation)
+        .map(|c| c.0.clone())?;
+    let o = owner.lock().unwrap();
+    o.store()
+        .wake_canary(deployment, 0, generation, &incarnation)
+        .unwrap()
+}
+
+async fn park_and_wake(
+    w: &OwnedCoordinator,
+    dir: &tempfile::TempDir,
+    fence: &DeploymentFence,
+) -> String {
+    w.commands()
+        .park(
+            "operator",
+            &fence.deployment_id,
+            fence.revision,
+            &ulid::Ulid::new().to_string(),
+            100_000,
+        )
+        .unwrap();
+    until("parked", || {
+        instance(dir, &fence.deployment_id).0 == "parked"
+    })
+    .await;
+    w.commands()
+        .wake(
+            "operator",
+            &fence.deployment_id,
+            WakeScope::All,
+            fence.revision,
+            &ulid::Ulid::new().to_string(),
+            100_000,
+        )
+        .unwrap()
+        .unwrap()
+        .operation_id
+}
+
+// T20 (owner decision 2026-10-09): the first readiness records the canary
+// reference; a wake whose canary matches it completes and serves.
+#[tokio::test]
+async fn a_matching_wake_canary_completes_the_wake() {
+    for compound in [true, false] {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::new(compound, clock.clone());
+        engine.generates(&[1, 2, 3]);
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        ready(&w, &fence).await;
+        assert_eq!(
+            reference(&owner, &dir, &engine, &fence.deployment_id).map(|r| r.tokens),
+            Some(vec![1, 2, 3])
+        );
+        for _ in 0..3 {
+            let wake = park_and_wake(&w, &dir, &fence).await;
+            until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+            let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+            assert_eq!((state.as_str(), open), ("ready", true));
+        }
+        assert_eq!(
+            engine.canaries.lock().unwrap().len(),
+            4,
+            "readiness and three wakes"
+        );
+        assert_eq!(last_error(&dir, &fence.deployment_id), None);
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T20 (owner decision 2026-10-09): a wake whose canary differs fails with
+// `wake_mismatch`, is never completed, and the instance is stopped on the
+// host's gone evidence, its status naming the code.
+#[tokio::test]
+async fn a_differing_wake_canary_fails_the_wake_and_stops_the_instance() {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(true, clock.clone());
+    engine.generates(&[1, 2, 3]);
+    let w = residency_worker(
+        owner.clone(),
+        observations,
+        engine.clone(),
+        clock,
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let generation = instance(&dir, &fence.deployment_id).2;
+    engine.generates(&[9, 9, 9]);
+    let wake = park_and_wake(&w, &dir, &fence).await;
+    until("released", || phase(&owner, &fence.deployment_id).is_none()).await;
+    let (state, open, now_generation, _) = instance(&dir, &fence.deployment_id);
+    assert!(!open);
+    assert_eq!(state, "stopped");
+    assert!(
+        now_generation > generation,
+        "the stop drew a new generation"
+    );
+    assert_eq!(
+        last_error(&dir, &fence.deployment_id).as_deref(),
+        Some("wake_mismatch")
+    );
+    assert_ne!(operation(&owner, &wake).0, "succeeded");
+    w.shutdown().await.unwrap();
+}
+
+// T20 (owner decision 2026-10-09): a new launch records its own reference;
+// the earlier launch's answer never judges it.
+#[tokio::test]
+async fn a_new_launch_records_a_new_reference() {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(true, clock.clone());
+    engine.generates(&[1, 2, 3]);
+    let slot = Arc::new(Mutex::new(engine.clone()));
+    let w = residency_worker_with(
+        owner.clone(),
+        observations,
+        slot.clone(),
+        clock.clone(),
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let stop = w.stop("owner", &fence, "stop", 100_000).unwrap();
+    let next = DeploymentFence {
+        generation: stop.receipt().generation,
+        ..fence.clone()
+    };
+    until("stopped", || phase(&owner, &fence.deployment_id).is_none()).await;
+    // The next launch's engine generates something else.
+    let engine = Residency::new(true, clock.clone());
+    engine.generates(&[4, 5]);
+    *slot.lock().unwrap() = engine.clone();
+    ready(&w, &next).await;
+    assert_eq!(
+        reference(&owner, &dir, &engine, &fence.deployment_id).map(|r| r.tokens),
+        Some(vec![4, 5])
+    );
+    let wake = park_and_wake(&w, &dir, &next).await;
+    until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+    w.shutdown().await.unwrap();
+}
+
+// T20 (owner decision 2026-10-09): a controller restart between the first
+// readiness and a wake keeps the reference: a fresh coordinator over the same
+// store still fails a differing wake.
+#[tokio::test]
+async fn a_controller_restart_keeps_the_reference() {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(true, clock.clone());
+    engine.generates(&[1, 2, 3]);
+    let w = residency_worker(
+        owner.clone(),
+        observations.clone(),
+        engine.clone(),
+        clock.clone(),
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let recorded = reference(&owner, &dir, &engine, &fence.deployment_id).unwrap();
+    w.shutdown().await.unwrap();
+    // The store, reopened from disk, still holds it.
+    let generation = instance(&dir, &fence.deployment_id).2;
+    let incarnation = engine.canaries.lock().unwrap()[0].0.clone();
+    let reopened = capyctl_store::Store::open(&dir.path().join("srv.sqlite3")).unwrap();
+    assert_eq!(
+        reopened
+            .wake_canary(&fence.deployment_id, 0, generation, &incarnation)
+            .unwrap(),
+        Some(recorded)
+    );
 }

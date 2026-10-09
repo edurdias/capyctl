@@ -263,6 +263,7 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
     ("group_member_failed", Named::Bare, None),
     ("group_member_uncertain", Named::Bare, None),
     ("group_wake_mismatch", Named::Bare, None),
+    ("wake_mismatch", Named::Bare, None),
     ("group_stalled", Named::Bare, None),
 ];
 

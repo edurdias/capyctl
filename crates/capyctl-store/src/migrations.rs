@@ -10,7 +10,7 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V46, SCHEMA_V47, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -70,6 +70,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V46,
     // ADR 0008 amendment 2026-10-08: one source row per key (a drafter's too).
     SCHEMA_V47,
+    // Owner decision 2026-10-09: each single launch's wake canary reference.
+    SCHEMA_V48,
 ];
 
 /// The newest schema version this binary knows how to read and write.

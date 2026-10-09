@@ -854,6 +854,14 @@ impl EngineAdapter for CheckpointGate {
     async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
         self.inner.engine_quiescent(member, after_ms).await
     }
+    async fn wake_canary(
+        &self,
+        context: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, RuntimeError> {
+        self.inner.wake_canary(context, max_tokens, bound).await
+    }
 }
 
 #[cfg(test)]

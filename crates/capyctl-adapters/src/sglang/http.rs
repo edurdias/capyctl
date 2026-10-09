@@ -191,12 +191,12 @@ impl ControlHttp {
     /// ADR 0028 §9 (decided 2026-10-06): the completion probe in SGLang's
     /// form, its native `POST /generate`, on this engine's loopback endpoint
     /// with its inference key (an inference route, not an admin one).
-    /// Answers `output_ids`.
-    pub(super) async fn complete_token_ids(
+    /// Answers `output_ids` and `text`.
+    pub(super) async fn complete_probe(
         &self,
         max_tokens: u32,
         bound: Duration,
-    ) -> Result<Vec<u32>, AdapterError> {
+    ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
         use crate::completion_probe as probe;
         let url = self
             .base
@@ -210,7 +210,7 @@ impl ControlHttp {
             bound,
         )
         .await?;
-        probe::sglang_token_ids(&answer)
+        probe::sglang_answer(&answer)
     }
 
     /// Served model ids from `/v1/models`, guarded by the inference key the

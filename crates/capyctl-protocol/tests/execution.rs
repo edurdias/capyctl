@@ -295,6 +295,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         escalated: false,
         probe_tokens: Vec::new(),
         engine_log: None,
+        probe_text: String::new(),
     }
 }
 

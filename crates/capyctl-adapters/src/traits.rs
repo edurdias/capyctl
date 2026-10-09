@@ -343,6 +343,19 @@ pub trait EngineAdapter: Send + Sync {
     async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
         false
     }
+    /// Owner decision 2026-10-09: the single-launch wake canary. One
+    /// completion probe ([`ChatForward::complete_probe`]) of at most
+    /// `max_tokens` tokens against the retained launch `context` names, bounded
+    /// by `bound`. `Unsupported` means this engine has no canary and nothing
+    /// was sent; any other error is a probe that was not answered.
+    async fn wake_canary(
+        &self,
+        _context: &capyctl_domain::completion::StepExecutionContext,
+        _max_tokens: u32,
+        _bound: Duration,
+    ) -> Result<crate::completion_probe::ProbeAnswer, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
 }
 
 /// A boot-unique handle to a spawned engine process.
@@ -524,14 +537,16 @@ pub trait ChatForward: Send + Sync {
     /// non-streaming completion of a fixed prompt at temperature 0 of at most
     /// `max_tokens` tokens, through this engine's own loopback endpoint and
     /// launch key, in the engine's own request form, answering the generated
-    /// token ids. Bounded by `bound`. A reply without token ids is an error.
-    /// The host agent calls it for a retained launch only, never the router.
-    async fn complete_token_ids(
+    /// token ids and text (owner decision 2026-10-09: the text, for an engine
+    /// that answers no token ids). Bounded by `bound`. A reply with neither is
+    /// an error. The host agent calls it for a retained launch only, never
+    /// the router.
+    async fn complete_probe(
         &self,
         _served: &str,
         _max_tokens: u32,
         _bound: std::time::Duration,
-    ) -> Result<Vec<u32>, AdapterError> {
+    ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
 }

@@ -778,4 +778,20 @@ impl EngineAdapter for SglangAdapter {
     ) -> Result<CancellationOutcome, AdapterError> {
         Ok(CancellationOutcome::Uncertain)
     }
+    /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
+    /// completion probe on this engine's own loopback endpoint and key.
+    async fn wake_canary(
+        &self,
+        _context: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<crate::completion_probe::ProbeAnswer, RuntimeError> {
+        match ChatForward::complete_probe(self, "", max_tokens, bound).await {
+            Ok(answer) => Ok(answer),
+            Err(AdapterError::UnsupportedCapability) => Err(RuntimeError::Unsupported),
+            Err(e) => Err(RuntimeError::Uncertain(format!(
+                "SGLang did not answer the wake canary: {e}"
+            ))),
+        }
+    }
 }

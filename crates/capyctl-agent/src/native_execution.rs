@@ -1543,15 +1543,17 @@ impl NativeHostExecution {
     /// recorded; the engine is then asked for one completion at temperature 0
     /// of at most `max_tokens` tokens, on its loopback endpoint with the
     /// launch's own inference key (ADR 0012), never through ingress or the
-    /// router. The answer is the generated token ids; nothing is recorded and
-    /// no gate moves. Any failure, or an answer with no token ids or more than
-    /// were asked for, is an error, which the result reports as no tokens.
+    /// router. The answer is the generated token ids and text (owner decision
+    /// 2026-10-09: the text serves a single launch's wake canary when the
+    /// engine answers no token ids); nothing is recorded and no gate moves.
+    /// Any failure, or an answer with more token ids than were asked for, is
+    /// an error, which the result reports as no answer.
     async fn complete(
         &self,
         command: &MemberCommand,
         owned_handle: &str,
         max_tokens: u32,
-    ) -> Result<Vec<u32>, SessionError> {
+    ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, SessionError> {
         let owned = self
             .journal
             .retained_command(owned_handle)
@@ -1577,17 +1579,17 @@ impl NativeHostExecution {
             )
             .unwrap_or(0),
         );
-        let tokens = tokio::time::timeout(
-            bound,
-            adapter.complete_token_ids(&served, max_tokens, bound),
-        )
-        .await
-        .map_err(|_| SessionError)?
-        .map_err(|_| SessionError)?;
-        if tokens.is_empty() || tokens.len() > max_tokens as usize {
+        let answer =
+            tokio::time::timeout(bound, adapter.complete_probe(&served, max_tokens, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|_| SessionError)?;
+        if answer.tokens.len() > max_tokens as usize
+            || answer.text.len() > capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES
+        {
             return Err(SessionError);
         }
-        Ok(tokens)
+        Ok(answer)
     }
 
     /// SPEC §13 / §13.3: the terminal refusal of a command, and for a launch
@@ -1720,7 +1722,7 @@ impl NativeHostExecution {
         // before readiness; only its bounded summary leaves the host.
         let mut launch_failed: Option<String> = None;
         // ADR 0028 §9 (decided 2026-10-06): what a completion probe generated.
-        let mut probe_tokens: Vec<u32> = Vec::new();
+        let mut probe = capyctl_adapters::completion_probe::ProbeAnswer::default();
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -1751,7 +1753,7 @@ impl NativeHostExecution {
                     max_tokens: Some(max_tokens),
                 } = &command.action
                 {
-                    probe_tokens = self
+                    probe = self
                         .complete(&command, owned_handle, *max_tokens)
                         .await
                         .unwrap_or_default();
@@ -1813,7 +1815,7 @@ impl NativeHostExecution {
                         // carries none, which the controller reads as a
                         // failed probe. Readiness and the gate are untouched.
                         Some(max_tokens) => {
-                            probe_tokens = self
+                            probe = self
                                 .complete(&command, owned_handle, *max_tokens)
                                 .await
                                 .unwrap_or_default();
@@ -1846,7 +1848,8 @@ impl NativeHostExecution {
             result.observed_at_unix_ms = now;
         }
         if result.state == "completed" {
-            result.probe_tokens = probe_tokens;
+            result.probe_tokens = probe.tokens;
+            result.probe_text = probe.text;
         }
         if command.action.launch_plan().is_some()
             && result.state == "launched"

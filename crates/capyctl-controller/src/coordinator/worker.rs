@@ -2402,6 +2402,10 @@ async fn drive(
             Ok(())
         })
         .await?;
+    // Owner decision 2026-10-09: the launch's wake canary reference, recorded
+    // at its first readiness. A probe that fails records nothing and the
+    // launch stays Ready; its first wake records the reference instead.
+    record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
     // Owner decision 2026-09-23: a peak measured while nothing else changed
     // the host's memory (no other activation or cleanup on it) is recorded
     // for later starts of this revision there. A failure to record it costs
@@ -3099,6 +3103,7 @@ async fn execute_residency(
     let bound =
         Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
             .min(shared.options.initialize_timeout);
+    let canary_context = context.clone();
     let outcome = tokio::select! {
         biased;
         _ = stop.changed() => None,
@@ -3133,6 +3138,30 @@ async fn execute_residency(
         }
         Some(Err(_)) => uncertain(format!("the {verb} outlived its deadline")).await?,
         Some(Ok(Ok(observation))) => {
+            // Owner decision 2026-10-09: a wake proves the model answers as
+            // it did at the launch's first readiness before it completes.
+            if work.kind == ResidencyKind::Restore {
+                match wake_canary_check(shared, driver, work, &canary_context).await {
+                    CanaryCheck::Passed => {}
+                    CanaryCheck::Unanswered(reason) => {
+                        uncertain(reason).await?;
+                        return Ok(());
+                    }
+                    CanaryCheck::Differs => {
+                        // Recorded before the step reads uncertain, so the
+                        // scheduler's retry of the stop never misses it.
+                        record_wake_mismatch(shared, work, &canary_context).await?;
+                        uncertain(format!(
+                            "{}: the model answered the wake canary differently than at its \
+                             first readiness",
+                            crate::wake_canary::WAKE_MISMATCH
+                        ))
+                        .await?;
+                        retry_wake_mismatch_stops(shared).await?;
+                        return Ok(());
+                    }
+                }
+            }
             let step = step.clone();
             let completed = shared
                 .read(move |owner, now| {
@@ -3173,6 +3202,190 @@ async fn execute_residency(
         }
     }
     Ok(())
+}
+
+/// Owner decision 2026-10-09: what a wake's canary proved.
+enum CanaryCheck {
+    /// It matched the launch's reference, recorded one, or the engine has no
+    /// canary (TensorFold, an older host).
+    Passed,
+    /// The probe was not answered, or the reference could not be read: the
+    /// wake's outcome is unknown, as after a failed fresh probe.
+    Unanswered(String),
+    /// The model answered differently than at its first readiness.
+    Differs,
+}
+
+fn service(error: impl std::fmt::Display) -> CoordinatorError {
+    CoordinatorError::Service(error.to_string())
+}
+
+/// Owner decision 2026-10-09: record the launch `context` names' wake canary
+/// reference at its first readiness. Nothing is recorded when the engine has
+/// no canary or its probe fails.
+async fn record_wake_canary(
+    shared: &Arc<Shared>,
+    driver: &Arc<Driver>,
+    instance: u32,
+    context: &capyctl_domain::completion::StepExecutionContext,
+) {
+    use crate::wake_canary::{CANARY_DEADLINE, CANARY_TOKENS};
+    if let Ok(answer) = driver
+        .engine
+        .wake_canary(context, CANARY_TOKENS, CANARY_DEADLINE)
+        .await
+    {
+        store_wake_canary(shared, instance, context, &answer).await;
+    }
+}
+
+async fn store_wake_canary(
+    shared: &Arc<Shared>,
+    instance: u32,
+    context: &capyctl_domain::completion::StepExecutionContext,
+    answer: &capyctl_adapters::completion_probe::ProbeAnswer,
+) {
+    let reference = crate::wake_canary::reference(answer);
+    let (deployment, generation, incarnation) = (
+        context.token.deployment_id.clone(),
+        context.token.generation,
+        context.incarnation.clone(),
+    );
+    let _ = shared
+        .with_owner(move |owner| {
+            let now = capyctl_protocol::now_unix_ms();
+            owner
+                .store()
+                .record_wake_canary(
+                    &deployment,
+                    instance,
+                    generation,
+                    &incarnation,
+                    &reference,
+                    now,
+                )
+                .map_err(service)
+        })
+        .await;
+}
+
+/// Owner decision 2026-10-09: after a wake's own steps succeeded, the same
+/// probe as at first readiness, compared with the launch's reference. Bounded
+/// by the wake's own deadline and the canary's bound.
+async fn wake_canary_check(
+    shared: &Arc<Shared>,
+    driver: &Arc<Driver>,
+    work: &ResidencyWork,
+    context: &capyctl_domain::completion::StepExecutionContext,
+) -> CanaryCheck {
+    use crate::wake_canary::{verdict, Verdict, CANARY_DEADLINE, CANARY_TOKENS};
+    let now = (shared.clock)().unwrap_or(context.deadline_ms);
+    let bound =
+        Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
+            .min(CANARY_DEADLINE);
+    let answer = match driver
+        .engine
+        .wake_canary(context, CANARY_TOKENS, bound)
+        .await
+    {
+        Ok(answer) => answer,
+        Err(RuntimeError::Unsupported) => return CanaryCheck::Passed,
+        Err(error) => {
+            return CanaryCheck::Unanswered(format!("the wake canary was not answered: {error}"))
+        }
+    };
+    let (deployment, instance, generation, incarnation) = (
+        context.token.deployment_id.clone(),
+        work.instance,
+        context.token.generation,
+        context.incarnation.clone(),
+    );
+    let stored = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .wake_canary(&deployment, instance, generation, &incarnation)
+                .map_err(service)
+        })
+        .await;
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(error) => {
+            return CanaryCheck::Unanswered(format!(
+                "the wake canary's reference could not be read: {error}"
+            ))
+        }
+    };
+    match verdict(stored.as_ref(), &answer) {
+        Verdict::Matches => CanaryCheck::Passed,
+        Verdict::Differs => CanaryCheck::Differs,
+        // The first readiness recorded none: this wake's answer becomes the
+        // reference, as at first readiness (ADR 0028 §12's rule for groups).
+        Verdict::Unreferenced => {
+            store_wake_canary(shared, work.instance, context, &answer).await;
+            CanaryCheck::Passed
+        }
+    }
+}
+
+/// Owner decision 2026-10-09: the wake `work` failed `wake_mismatch`; record
+/// it, which names the code in the instance's status and owes its stop.
+async fn record_wake_mismatch(
+    shared: &Arc<Shared>,
+    work: &ResidencyWork,
+    context: &capyctl_domain::completion::StepExecutionContext,
+) -> Result<(), CoordinatorError> {
+    let (deployment, instance, generation, operation) = (
+        work.deployment_id.clone(),
+        work.instance,
+        context.token.generation,
+        work.operation_id.clone(),
+    );
+    shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .record_wake_mismatch(&deployment, instance, generation, &operation)
+                .map_err(service)
+        })
+        .await
+}
+
+/// Owner decision 2026-10-09 (R42 pattern): one scheduler pass's retry of
+/// every stop a `wake_mismatch` still owes, read from the store (so a
+/// controller restart retries it too). It is an ordinary stop of the
+/// instance under the engine-exit principal: the host terminates the
+/// recorded engine and everything is released only on its gone evidence;
+/// the status names the code as its last error. Until one is accepted the
+/// instance's dispatch stays closed and its memory charged. Returns whether
+/// any stop was accepted.
+async fn retry_wake_mismatch_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    let owed = shared
+        .with_owner(|owner| owner.store().wake_mismatch_stops_due().map_err(service))
+        .await?;
+    if owed.is_empty() {
+        return Ok(false);
+    }
+    let commands = CoordinatorCommands {
+        shared: shared.clone(),
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        owed.iter()
+            .filter(|owed| {
+                crate::engine_exit::accept_instance_stop(
+                    &commands,
+                    &owed.deployment_id,
+                    owed.instance_index,
+                    crate::engine_exit::EXIT_PRINCIPAL,
+                    &format!("wake-mismatch:{}:{}", owed.operation_id, owed.generation),
+                )
+                .is_ok()
+            })
+            .count()
+            > 0
+    })
+    .await
+    .unwrap_or(false))
 }
 
 /// The engine effect of one park or restore. A remote host runs the whole

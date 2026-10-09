@@ -239,14 +239,12 @@ impl ChatForward for TensorfoldAdapter {
         self.forward.forward_chat_stream(body, on_chunk).await
     }
 
-    async fn complete_token_ids(
+    async fn complete_probe(
         &self,
         served: &str,
         max_tokens: u32,
         bound: std::time::Duration,
-    ) -> Result<Vec<u32>, AdapterError> {
-        self.http
-            .complete_token_ids(served, max_tokens, bound)
-            .await
+    ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
+        self.http.complete_probe(served, max_tokens, bound).await
     }
 }
