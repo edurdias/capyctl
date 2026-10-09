@@ -567,6 +567,7 @@ impl crate::Store {
             None,
             DigestProvenance::Measured,
             None,
+            None,
             now_ms,
         )
     }
@@ -577,13 +578,14 @@ impl crate::Store {
     /// provisional revision is re-resolved with too: a group member's share
     /// of the weights is taken with the layout, and with the checkpoint's
     /// tables (ADR 0014 amendment A20), which an engine that keeps them on
-    /// disk is sized without. Once recorded, a measurement naming another
-    /// state slot is a mismatch, as for the weights; one naming none (an
-    /// older host) is not. `provenance` is where the host's file hashes came
-    /// from (ADR 0014 §7, amendment of 2026-10-08), kept with the digest it
-    /// records. A host can only trust a declaration the revision makes, so
-    /// `declared_trusted` for any other digest is refused as invalid and
-    /// records nothing.
+    /// disk is sized without, and with a llama.cpp launch's GGUF facts (ADR
+    /// 0029 §9), which its request is derived from. Once recorded, a
+    /// measurement naming another state slot is a mismatch, as for the
+    /// weights; one naming none (an older host) is not. `provenance` is where
+    /// the host's file hashes came from (ADR 0014 §7, amendment of
+    /// 2026-10-08), kept with the digest it records. A host can only trust a
+    /// declaration the revision makes, so `declared_trusted` for any other
+    /// digest is refused as invalid and records nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_measurement(
         &self,
@@ -597,6 +599,7 @@ impl crate::Store {
         layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
         provenance: DigestProvenance,
         tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
+        gguf: Option<capyctl_domain::gguf::GgufFacts>,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
         if !is_checkpoint_digest(digest)
@@ -604,6 +607,7 @@ impl crate::Store {
             || state_slot_bytes.is_some_and(|bytes| bytes <= 0)
             || layout.is_some_and(|layout| !layout.is_valid())
             || tables.is_some_and(|tables| !tables.is_valid() || tables.bytes > weights_bytes)
+            || gguf.is_some_and(|gguf| !gguf.is_valid())
             || now_ms < 0
             || host_id.is_empty()
         {
@@ -685,6 +689,7 @@ impl crate::Store {
                 state_slot_bytes,
                 layout,
                 disk_tables: tables,
+                gguf,
                 ..Default::default()
             };
             // Final review I7 (design §7): each GPU of a multi-GPU host is

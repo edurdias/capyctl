@@ -24,6 +24,7 @@ use capyctl_config::registration::{
     ENVIRONMENT_PROFILES,
 };
 use capyctl_config::ConfigErrorCode;
+use capyctl_domain::gguf::{GgufFacts, GgufKv, GgufKvShape};
 use capyctl_domain::launch::{LaunchSettings, LlamacppGpuLayers, SettingSource};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -559,12 +560,41 @@ fn llamacpp(
 
 const GIB: i64 = 1 << 30;
 
+/// ADR 0029 §9: what a host measured beside `weights` bytes of a 32-layer,
+/// 8-KV-head, 128-wide model trained at 32768 tokens.
+fn measured(weights: i64) -> CheckpointFacts {
+    let values = 32 * 8 * 128;
+    CheckpointFacts {
+        weights_bytes: Some(weights),
+        gguf: Some(GgufFacts {
+            weights_bytes: weights,
+            training_context: Some(32768),
+            kv: GgufKv::Attention(GgufKvShape {
+                layers: 32,
+                k_values: values,
+                v_values: values,
+                v_values_padded: values,
+            }),
+        }),
+        ..CheckpointFacts::default()
+    }
+}
+
+/// ADR 0029 §9 (ADR 0014 §7): a llama.cpp deployment resolves once a host
+/// has measured its checkpoint.
+fn resolve(
+    deployment: &Value,
+    host: &Value,
+) -> Result<capyctl_config::effective::EffectiveDeployment, capyctl_config::ConfigError> {
+    resolve_effective_with_checkpoint(deployment, host, measured(0))
+}
+
 // T42 T14 (ADR 0029 §1, §5): a deployment resolves restart-only with
 // CapyCTL's defaults named as such, and its snapshot re-resolves to itself.
 #[test]
 fn a_llamacpp_deployment_resolves_with_its_defaults() {
     let (mut deployment, mut host) = fixture();
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve(&deployment, &host).unwrap();
     let settings = llamacpp(&effective);
     assert_eq!(settings.common.context_length, Some(8192));
     assert_eq!(settings.common.kv_cache_dtype.as_deref(), Some("f16"));
@@ -577,8 +607,8 @@ fn a_llamacpp_deployment_resolves_with_its_defaults() {
             "{field}"
         );
     }
-    // ADR 0029 §9: until the KV is derived from the GGUF header, the declared
-    // reservation bounds it.
+    // ADR 0029 §9: beside declared resources, the reservation less the
+    // weights bounds the KV.
     assert_eq!(settings.memory.kv_cache_bytes, 8 * GIB);
     let text = serde_json::to_string(&effective).unwrap();
     assert!(text.contains("\"engine\":\"llamacpp\""), "{text}");
@@ -587,7 +617,7 @@ fn a_llamacpp_deployment_resolves_with_its_defaults() {
     deployment["engine_config"] = json!({"context_length": 15000, "max_concurrent_requests": 2,
         "kv_cache_dtype": "q8_0", "llamacpp": {"n_gpu_layers": 20,
         "gguf_file": "Q4_K_M/model-00001-of-00002.gguf", "mmproj_file": "mmproj-F16.gguf"}});
-    let declared = resolve_effective(&deployment, &host).unwrap();
+    let declared = resolve(&deployment, &host).unwrap();
     let settings = llamacpp(&declared);
     assert_eq!(settings.n_gpu_layers, LlamacppGpuLayers::Count(20));
     assert_eq!(settings.slots(), 2);
@@ -600,7 +630,7 @@ fn a_llamacpp_deployment_resolves_with_its_defaults() {
     // a llama.cpp deployment to restart_only.
     host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
     deployment.as_object_mut().unwrap().remove("residency");
-    let defaulted = resolve_effective(&deployment, &host).unwrap();
+    let defaulted = resolve(&deployment, &host).unwrap();
     assert_eq!(
         defaulted.residency,
         capyctl_config::effective::Residency::RestartOnly
@@ -626,7 +656,7 @@ fn the_slots_are_shown_with_their_source() {
         if let Some(declared) = declared {
             deployment["engine_config"]["max_concurrent_requests"] = json!(declared);
         }
-        let effective = resolve_effective(&deployment, &host).unwrap();
+        let effective = resolve(&deployment, &host).unwrap();
         for (fit, remote) in [
             (fit_for_effective(&effective), false),
             (fit_on_remote_host(&effective), true),
@@ -677,7 +707,7 @@ fn llamacpp_resolution_refuses_what_llama_cpp_cannot_do() {
     }
     deployment["engine_config"] = json!({"context_length": 8192, "language_model_only": false,
         "trust_remote_code": false});
-    resolve_effective(&deployment, &host).unwrap();
+    resolve(&deployment, &host).unwrap();
     for residency in ["deep", "host_backed"] {
         deployment["residency"] = residency.into();
         let error = resolve_effective(&deployment, &host).unwrap_err();
@@ -705,30 +735,23 @@ fn llamacpp_resolution_refuses_what_llama_cpp_cannot_do() {
     assert!(resolve_effective(&deployment, &host).is_err());
 }
 
-// T42 (ADR 0029 §9, plan slice L4): until the request is derived from the
-// GGUF header, `resources` are required, offline too; the measured weights
-// are taken from the declared reservation, which must hold them.
+// T42 (ADR 0029 §9): declared resources need nothing derived, offline too;
+// the measured GGUF weights are taken from the declared reservation, which
+// must hold them. Unmeasured, the revision is provisional.
 #[test]
-fn a_llamacpp_deployment_states_its_resources() {
+fn declared_llamacpp_resources_bound_the_kv_cache() {
     let (mut deployment, host) = fixture();
-    let mut bare = deployment.clone();
-    bare.as_object_mut().unwrap().remove("resources");
-    let error = resolve_effective(&bare, &host).unwrap_err();
+    let error = resolve_effective(&deployment, &host).unwrap_err();
     assert_eq!(
         (error.code, error.path.as_str()),
-        (ConfigErrorCode::MissingRequired, "resources")
+        (ConfigErrorCode::NotMaterializable, "engine_config.memory")
     );
     for offline in [
         json!({"runtime_profile": "llamacpp"}),
         json!({"engine_config": {"llamacpp": {}}}),
     ] {
-        let error = validate_declared_resources(&offline).unwrap_err();
-        assert_eq!(error.path, "resources");
+        validate_declared_resources(&offline).unwrap();
     }
-    let measured = |weights| CheckpointFacts {
-        weights_bytes: Some(weights),
-        ..CheckpointFacts::default()
-    };
     let effective =
         resolve_effective_with_checkpoint(&deployment, &host, measured(2 * GIB)).unwrap();
     assert_eq!(llamacpp(&effective).memory.kv_cache_bytes, 6 * GIB);
@@ -737,7 +760,7 @@ fn a_llamacpp_deployment_states_its_resources() {
     assert_eq!(error.path, "resources");
     // A declared KV cache is kept as declared.
     deployment["engine_config"]["memory"] = json!({"kv_cache": "1GiB"});
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve(&deployment, &host).unwrap();
     assert_eq!(llamacpp(&effective).memory.kv_cache_bytes, GIB);
 }
 
@@ -821,7 +844,7 @@ fn listener_device_and_router_overrides_in_the_environment_are_refused() {
     let (mut deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["security"]["approved_env"] = json!(["GGML_*"]);
     deployment["engine_config"]["env"] = json!({"GGML_CUDA_NO_PINNED": "1"});
-    resolve_effective(&deployment, &host).unwrap();
+    resolve(&deployment, &host).unwrap();
 }
 
 // T42 (ADR 0029 §9): `gguf_file` and `mmproj_file` are relative `.gguf`

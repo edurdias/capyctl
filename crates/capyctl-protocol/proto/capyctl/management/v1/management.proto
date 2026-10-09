@@ -446,6 +446,9 @@ message SingleLaunchPlan {
   // tables the server resolved with when the engine keeps them on disk.
   // Absent whenever the engine option is off.
   CheckpointTables checkpoint_tables = 16;
+  // ADR 0029 §9: the GGUF facts the server resolved a llama.cpp revision
+  // with. Absent for any other engine.
+  CheckpointGguf checkpoint_gguf = 17;
 }
 // ADR 0028 §5 (amendment of 2026-10-07): how a checkpoint's weights split
 // across a group's ranks, read from its safetensors headers.
@@ -461,6 +464,17 @@ message CheckpointTables {
   uint32 count = 2;                        // distinct tables
   int64 sharded_bytes = 3;                 // of bytes, what the layout splits
   int64 resident_largest_layer_bytes = 4;  // the largest layer without them
+}
+// ADR 0029 §9: what a llama.cpp launch loads beside its checkpoint and its
+// GGUF header's cache shape, measured by the host.
+message CheckpointGguf {
+  int64 weights_bytes = 1;     // the GGUF and its shards, projector, draft model
+  uint32 training_context = 2; // `<arch>.context_length`; 0 = not stated
+  string kv = 3;               // `attention`, or a refusal code
+  uint32 layers = 4;           // attention only: layers with a cache
+  uint64 k_values = 5;         // attention only: K elements per token
+  uint64 v_values = 6;         // attention only: V elements per token
+  uint64 v_values_padded = 7;  // attention only: V padded to the widest layer
 }
 // ADR 0014 §7 (WE3): measure one deployment's checkpoint on this host. The host
 // locates it from its own approved document and the deployment's model block;
@@ -692,6 +706,9 @@ message CheckpointDigestEvidence {
   // ADR 0014 amendment A20: the checkpoint's tables, when it has any and its
   // safetensors headers could be read; computed and mismatch only.
   CheckpointTables tables = 11;
+  // ADR 0029 §9: a llama.cpp deployment's GGUF facts; computed and mismatch
+  // only. Empty from an older host, which reads no GGUF header.
+  CheckpointGguf gguf = 12;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown

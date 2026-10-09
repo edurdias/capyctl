@@ -5,7 +5,9 @@ use capyctl_adapters::llamacpp::{
     engine_environment, plan_from_effective, recheck_rendered, render_command, LlamacppArgsError,
     LlamacppDirs, LlamacppPlanError, PlanInputLlamacpp,
 };
-use capyctl_config::effective::resolve_effective;
+use capyctl_config::effective::{
+    resolve_effective_with_checkpoint, CheckpointFacts, EffectiveDeployment,
+};
 use capyctl_domain::launch::LlamacppGpuLayers;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -317,6 +319,17 @@ fn touch(root: &Path, files: &[&str]) {
     }
 }
 
+/// Resolves as a host that measured the checkpoint does: an unmeasured
+/// llama.cpp revision does not resolve (ADR 0029 §9). The fixture states
+/// `resources`, so the request is not derived from the header.
+fn resolve_measured(deployment: &Value, host: &Value) -> EffectiveDeployment {
+    let facts = CheckpointFacts {
+        weights_bytes: Some(4),
+        ..CheckpointFacts::default()
+    };
+    resolve_effective_with_checkpoint(deployment, host, facts).unwrap()
+}
+
 fn dirs() -> LlamacppDirs {
     LlamacppDirs {
         config: "/var/lib/capyctl/engines/llamacpp/config".into(),
@@ -332,7 +345,7 @@ fn the_builder_renders_the_checkpoint_gguf() {
     let checkpoint = tempfile::tempdir().unwrap();
     touch(checkpoint.path(), &["qwen-Q4_K_M.gguf", "mmproj-F16.gguf"]);
     let (mut deployment, host) = fixture(checkpoint.path());
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve_measured(&deployment, &host);
     let plan = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs()).unwrap();
     assert_eq!(
         PathBuf::from(&plan.model_file),
@@ -347,7 +360,7 @@ fn the_builder_renders_the_checkpoint_gguf() {
     let argv = render_command(&plan).unwrap().argv;
     assert!(argv.windows(2).any(|w| w == ["--ctx-size", "60416"]));
     deployment["engine_config"]["llamacpp"] = json!({"mmproj_file": "mmproj-F16.gguf"});
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve_measured(&deployment, &host);
     let plan = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs()).unwrap();
     assert_eq!(
         plan.mmproj_file.map(PathBuf::from),
@@ -362,7 +375,7 @@ fn several_quantizations_need_gguf_file_at_launch() {
     let checkpoint = tempfile::tempdir().unwrap();
     touch(checkpoint.path(), &["m-Q4_K_M.gguf", "m-Q8_0.gguf"]);
     let (mut deployment, host) = fixture(checkpoint.path());
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve_measured(&deployment, &host);
     let error = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs()).unwrap_err();
     assert!(matches!(error, LlamacppPlanError::Checkpoint(_)), "{error}");
     let text = error.to_string();
@@ -371,7 +384,7 @@ fn several_quantizations_need_gguf_file_at_launch() {
         "{text}"
     );
     deployment["engine_config"]["llamacpp"] = json!({"gguf_file": "m-Q8_0.gguf"});
-    let effective = resolve_effective(&deployment, &host).unwrap();
+    let effective = resolve_measured(&deployment, &host);
     let plan = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs()).unwrap();
     assert!(
         plan.model_file.ends_with("/m-Q8_0.gguf"),
@@ -402,7 +415,7 @@ fn a_draft_model_outside_the_approved_paths_is_refused_at_launch() {
     for (draft, admitted) in [("inside.gguf", true), ("d.gguf", false)] {
         deployment["engine_config"] = json!({"context_length": 8192, "accept_extra_args": true,
             "extra_args": ["--model-draft", approved.path().join(draft)]});
-        let effective = resolve_effective(&deployment, &host).unwrap();
+        let effective = resolve_measured(&deployment, &host);
         let plan = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs());
         assert_eq!(plan.is_ok(), admitted, "{draft}: {plan:?}");
         if !admitted {

@@ -359,6 +359,23 @@ pub(super) fn declared_engine_config(
             )
         }
     };
+    // ADR 0029 §9: a llama.cpp revision records the whole checkpoint and its
+    // GGUF facts; `weights_bytes` is what the launch loads, re-derived from
+    // them.
+    let (weights_bytes, gguf) = match memory.get("gguf") {
+        None => (weights_bytes, None),
+        Some(recorded) => {
+            let sizing: capyctl_domain::gguf::GgufSizing = serde_json::from_value(recorded.clone())
+                .ok()
+                .filter(|sizing: &capyctl_domain::gguf::GgufSizing| {
+                    sizing.checkpoint_weights_bytes >= 0
+                        && (sizing.facts == capyctl_domain::gguf::GgufFacts::PENDING
+                            || sizing.facts.is_valid())
+                })
+                .ok_or_else(|| invalid("snapshot.engine_config", "gguf invalid"))?;
+            (Some(sizing.checkpoint_weights_bytes), Some(sizing.facts))
+        }
+    };
     Ok((
         Value::Object(block),
         provenance.contains_key("resources"),
@@ -368,6 +385,7 @@ pub(super) fn declared_engine_config(
             layout,
             member_of,
             disk_tables,
+            gguf,
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),

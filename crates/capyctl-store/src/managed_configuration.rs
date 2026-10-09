@@ -724,14 +724,10 @@ fn resolve_for_acceptance(
             if error.code == capyctl_config::ConfigErrorCode::NotMaterializable
                 && error.path.starts_with("engine_config.memory") =>
         {
-            let placeholder = capyctl_config::effective::CheckpointFacts {
-                weights_bytes: Some(0),
-                ..Default::default()
-            };
             capyctl_config::effective::resolve_effective_with_checkpoint(
                 config,
                 trusted_host,
-                placeholder,
+                capyctl_config::effective::CheckpointFacts::provisional(),
             )
             .map(|effective| (effective, true))
             .map_err(ManagedConfigurationError::Rejected)

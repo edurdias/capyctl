@@ -214,17 +214,24 @@ pub struct MemoryRequest {
     /// memory. Absent whenever the engine option is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_tables: Option<crate::disk_tables::DiskTables>,
+    /// ADR 0029 §9: a llama.cpp revision's GGUF facts and the whole
+    /// checkpoint they were measured beside; `weights_bytes` is then what the
+    /// launch loads (the rendered GGUF, its projector and draft model).
+    /// Absent for any other engine and before a host read the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gguf: Option<crate::gguf::GgufSizing>,
 }
 
 impl MemoryRequest {
     /// The whole checkpoint's measured weights: what a launch plan names and
-    /// the host verifies, whatever share of them this member holds and
-    /// whatever tables stay on disk.
+    /// the host verifies, whatever share of them this member holds, whatever
+    /// tables stay on disk and whichever GGUF files a llama.cpp launch loads.
     pub fn checkpoint_weights_bytes(&self) -> Option<i64> {
-        match (&self.member, &self.disk_tables) {
-            (Some(member), _) => member.checkpoint_weights_bytes,
-            (None, Some(tables)) => Some(tables.checkpoint_weights_bytes),
-            (None, None) => self.weights_bytes,
+        match (&self.member, &self.disk_tables, &self.gguf) {
+            (Some(member), _, _) => member.checkpoint_weights_bytes,
+            (None, Some(tables), _) => Some(tables.checkpoint_weights_bytes),
+            (None, None, Some(gguf)) => Some(gguf.checkpoint_weights_bytes),
+            (None, None, None) => self.weights_bytes,
         }
     }
 }
