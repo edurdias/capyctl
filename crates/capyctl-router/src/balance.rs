@@ -97,7 +97,13 @@ pub fn score(router_in_flight: u64, engine: Option<EngineGauges>) -> u64 {
 /// The engine gauges of a sample the score may use, with its age.
 pub fn usable_load(instance: &ServingInstance) -> Option<(EngineGauges, i64)> {
     let view = instance.load.as_ref()?;
-    let same_host = instance.remote_host.as_deref() == Some(view.host_id.as_str());
+    // A remote instance's sample comes from its host's session; an embedded
+    // one's from the role's own sampling, under the host it is placed on.
+    let serving_host = instance
+        .remote_host
+        .as_deref()
+        .or(instance.host_id.as_deref());
+    let same_host = serving_host == Some(view.host_id.as_str());
     let same_launch = instance.launch_command_id.as_deref() == Some(view.owned_handle.as_str());
     if !view.fresh || !same_host || !same_launch || view.generation != instance.generation {
         return None;

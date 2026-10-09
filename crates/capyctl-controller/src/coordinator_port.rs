@@ -80,8 +80,12 @@ pub struct CoordinatorLifecycle {
     leases: crate::request_leases::RequestLeaseWriter,
     /// ADR 0013 §10 (I3): host liveness and engine load for the router's
     /// instance choice. `None` for the embedded role, which has no host
-    /// sessions and no load reports: its choice rests on router in-flight.
+    /// sessions.
     routing: Option<RoutingSignals>,
+    /// SPEC §§10, 17 (D9): the load the embedded role samples from its own
+    /// engines (`crate::embedded_load`). Without it, or without a fresh
+    /// sample, an embedded instance's choice rests on router in-flight.
+    embedded_load: Option<std::sync::Arc<crate::load_table::LoadTable>>,
     /// SPEC §10, ADR 0013 §8 (W10): request-driven switching.
     switching: std::sync::Arc<crate::switching::Switcher>,
     /// ADR 0028 §11 (decided 2026-10-06): `groups.stall_timeout`, the router's
@@ -145,6 +149,7 @@ impl CoordinatorLifecycle {
             commands,
             leases: crate::request_leases::RequestLeaseWriter::spawn(backend),
             routing: None,
+            embedded_load: None,
             switching,
             group_stall_timeout: capyctl_config::remote_roles::DEFAULT_GROUP_STALL_TIMEOUT,
         }
@@ -195,6 +200,16 @@ impl CoordinatorLifecycle {
     /// ADR 0013 §10 (I3): route with host liveness and reported engine load.
     pub fn with_routing(mut self, routing: RoutingSignals) -> Self {
         self.routing = Some(routing);
+        self
+    }
+
+    /// SPEC §§10, 17 (D9): route embedded instances on the load the role
+    /// samples from its own engines.
+    pub fn with_embedded_load(
+        mut self,
+        load: std::sync::Arc<crate::load_table::LoadTable>,
+    ) -> Self {
+        self.embedded_load = Some(load);
         self
     }
 
@@ -786,6 +801,7 @@ impl LifecyclePort for CoordinatorLifecycle {
         Ok(Some(
             rows.into_iter()
                 .map(|row| {
+                    let key = crate::load_table::InstanceKey::new(deployment, row.generation);
                     let (host_live, host_unresponsive, load) =
                         match (&self.routing, &row.remote_host) {
                             // SPEC §13.2: a remote instance serves only while its
@@ -793,19 +809,21 @@ impl LifecyclePort for CoordinatorLifecycle {
                             (Some(routing), Some(host)) => (
                                 (routing.host_live)(host),
                                 (routing.host_unresponsive)(host),
-                                routing.load.fresh_at(
-                                    &crate::load_table::InstanceKey::new(
-                                        deployment,
-                                        row.generation,
-                                    ),
-                                    host,
-                                    now,
-                                ),
+                                routing.load.fresh_at(&key, host, now),
                             ),
-                            // An embedded engine has no session to lose and no
-                            // reported load; a server without routing signals
-                            // relies on the dispatch gate alone.
-                            _ => (true, false, None),
+                            // A server without routing signals relies on the
+                            // dispatch gate alone.
+                            (None, Some(_)) => (true, false, None),
+                            // An embedded engine has no session to lose; its load
+                            // is what the role sampled on the host it is placed on.
+                            (_, None) => (
+                                true,
+                                false,
+                                self.embedded_load
+                                    .as_ref()
+                                    .zip(row.host_id.as_deref())
+                                    .and_then(|(load, host)| load.fresh_at(&key, host, now)),
+                            ),
                         };
                     crate::port::ServingInstance {
                         instance_index: row.instance_index,

@@ -2109,8 +2109,8 @@ async fn start_standalone_in(
         },
     );
     // SPEC §17 (M80): the router's per-request latency distributions. The
-    // embedded engine has no host ingress or load report, so only the router
-    // tier is measured here.
+    // embedded engine has no host ingress, and the engine histograms its load
+    // samples carry are not read here, so only the router tier is measured.
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     inflight.latency.set_timing_header(timing_header);
     let latency_view = {
@@ -2123,15 +2123,30 @@ async fn start_standalone_in(
             }),
         )
     };
-    // SPEC §§10, 17 (owner decision 2026-10-08): live load. The embedded engine
-    // reports no load, so instances carry no sample; the router's figures and
-    // the derived running limits are live.
+    // SPEC §§10, 17 (D9, owner decision 2026-10-08): the embedded engines'
+    // load, sampled in process as a host agent samples its own (loopback
+    // `/metrics` each second, SGLang's running limit once per launch) under the
+    // embedded host's name. The management load read and the router's
+    // instance choice read it.
+    let embedded_load = {
+        let inflight = inflight.clone();
+        capyctl_controller::embedded_load::EmbeddedLoad::new(
+            load_owner.clone(),
+            declared_host.name.clone(),
+            Arc::new(move |deployment: &str, generation: i64| {
+                inflight.instance_in_flight(deployment, generation)
+            }),
+        )
+        .map_err(|error| StartError::Deploy(error.to_string()))?
+    };
+    let engine_load = embedded_load.table();
+    supervision.supervise(embedded_load.spawn_until(supervision.cancel_signal()));
     let load_view = crate::remote_roles::load_view(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
         load_owner,
         inflight.clone(),
-        None,
+        engine_load.clone(),
     );
     // ADR 0018 §4, §5: removal retires through the store, as a server does.
     let retirements = Arc::new(capyctl_management::engines::StoreRetirements::new(
@@ -2157,6 +2172,7 @@ async fn start_standalone_in(
     let controller = Arc::new(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
+            .with_embedded_load(engine_load)
             .with_group_stall_timeout(group_stall_timeout),
     );
     let deps = capyctl_router::RouterDeps {

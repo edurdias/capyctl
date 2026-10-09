@@ -288,9 +288,11 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   when no sample is held (the instance is not loaded, or the server restarted
   less than a second ago). Absent figures are unknown, never zero.
 
-Standalone reads no load from its own engine, so its instances always have
-`sample: null` and the `max_running` CapyCTL derives; the `router` figures
-are live.
+Standalone reads the same figures from its own engine, about once a second,
+so its instances carry a `sample` and, for SGLang, `max_running` with
+`source: engine`, exactly as on a server with hosts. `ingress_in_flight` is
+then the requests CapyCTL is forwarding to the instance, since standalone
+forwards to its engine directly.
 
 ### Tuning
 

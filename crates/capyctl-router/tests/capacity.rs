@@ -156,7 +156,7 @@ fn the_load_read_reports_fresh_then_stale_then_no_sample() {
 }
 
 // SPEC §10, §17: an engine scrape that failed is unknown load (`engine: null`),
-// and a role with no host load report (standalone) shows no sample at all.
+// and a read with no load table shows no sample at all.
 #[test]
 fn unknown_load_is_null_never_zero() {
     let inflight = InFlight::default();
@@ -181,9 +181,9 @@ fn unknown_load_is_null_never_zero() {
     assert_eq!(instance["max_running"]["source"], "default");
     assert_eq!(report["deployments"][0]["router"]["waiting_limit"], 64);
 
-    let standalone = capacity_report(&deployments, &inflight, 32, None, NOW);
+    let unsampled = capacity_report(&deployments, &inflight, 32, None, NOW);
     assert_eq!(
-        standalone["deployments"][0]["instances"][0]["sample"],
+        unsampled["deployments"][0]["instances"][0]["sample"],
         json!(null)
     );
     assert_eq!(

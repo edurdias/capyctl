@@ -130,9 +130,18 @@ fn unusable_samples_fall_back_to_router_in_flight() {
         assert_eq!(ranking.order[0].score, 2, "{view:?}");
         assert!(ranking.order[0].engine.is_none());
     }
-    // An embedded instance has no reporting host at all.
+    // SPEC §§10, 17 (D9): an embedded instance's sample is the role's own,
+    // taken under the host it is placed on; one under another host is not
+    // used, and neither is one for an instance with no placed host.
     let mut embedded = base.clone();
     embedded.remote_host = None;
+    embedded.load = Some(sample(&base, 9, 0, 0));
+    assert_eq!(usable_load(&embedded).map(|(g, _)| g.running), Some(9));
+    let mut elsewhere = sample(&base, 9, 0, 0);
+    elsewhere.host_id = "b".into();
+    embedded.load = Some(elsewhere);
+    assert!(usable_load(&embedded).is_none());
+    embedded.host_id = None;
     embedded.load = Some(sample(&base, 9, 0, 0));
     assert!(usable_load(&embedded).is_none());
 }
