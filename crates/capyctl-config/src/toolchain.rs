@@ -83,6 +83,9 @@ pub struct ToolchainSearch {
     /// `:`-separated directories, normally [`SYSTEM_PATH`].
     pub system: String,
     pub default_cuda_home: PathBuf,
+    /// ADR 0029 §2: the root llama.cpp's `/etc/llama.cpp/config.ini` is
+    /// looked for under, normally [`crate::llamacpp::SYSTEM_ROOT`].
+    pub system_root: PathBuf,
 }
 
 impl Default for ToolchainSearch {
@@ -90,6 +93,7 @@ impl Default for ToolchainSearch {
         Self {
             system: SYSTEM_PATH.into(),
             default_cuda_home: PathBuf::from(crate::registration::DEFAULT_CUDA_HOME),
+            system_root: PathBuf::from(crate::llamacpp::SYSTEM_ROOT),
         }
     }
 }

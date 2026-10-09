@@ -1245,6 +1245,9 @@ impl NativeHostExecution {
                         .map_err(|_| SessionError)?,
                 )))
             }
+            // ADR 0029 §1: no llama.cpp launch in this release; resolution
+            // refuses its deployments, so nothing reaches here.
+            Engine::Llamacpp => Err(SessionError),
         }
     }
 
@@ -1350,6 +1353,8 @@ impl NativeHostExecution {
             ),
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
+            // ADR 0029 §1: no llama.cpp launch in this release.
+            Engine::Llamacpp => return Err(SessionError),
         })
     }
 
@@ -2202,6 +2207,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
             // ADR 0023 §6: TensorFold never parks. ADR 0028 §2, §12 (OD3): a
             // TensorFold group is restart-only; its head refuses by its tier.
             Engine::Tensorfold => Err(JournalError::Unauthorized),
+            // ADR 0029 §1, §10: llama.cpp is restart-only and never parks.
+            Engine::Llamacpp => Err(JournalError::Unauthorized),
         }
     }
     fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {

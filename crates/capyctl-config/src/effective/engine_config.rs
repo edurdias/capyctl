@@ -19,6 +19,9 @@ pub const VLLM_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 pub const SGLANG_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 // ADR 0023 §4: a TensorFold deployment declares its resources, so nothing is derived from a margin.
 pub const TENSORFOLD_OVERHEAD_MARGIN_BYTES: i64 = 0;
+// ADR 0029 §9: a placeholder, as for vLLM and SGLang, until the live rows
+// measure llama-server's peak minus weights minus KV.
+pub const LLAMACPP_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 
 /// ADR 0014 §5: the parked phase is the engine's residual floor, also to be
 /// measured. Until then a parking deployment reserves this placeholder (or its
@@ -107,7 +110,7 @@ pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
         Engine::Vllm | Engine::Sglang => {
             STARTUP_GRAPH_ALLOWANCE_BYTES * if draft_model { 2 } else { 1 }
         }
-        Engine::Tensorfold => 0,
+        Engine::Tensorfold | Engine::Llamacpp => 0,
     }
 }
 
@@ -149,6 +152,7 @@ pub fn overhead_margin(engine: Engine) -> i64 {
         Engine::Vllm => VLLM_OVERHEAD_MARGIN_BYTES,
         Engine::Sglang => SGLANG_OVERHEAD_MARGIN_BYTES,
         Engine::Tensorfold => TENSORFOLD_OVERHEAD_MARGIN_BYTES,
+        Engine::Llamacpp => LLAMACPP_OVERHEAD_MARGIN_BYTES,
     }
 }
 
@@ -480,7 +484,7 @@ fn device_request_from_weights(
         .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
     let floor = match engine {
         Engine::Vllm => device.declared_total / 100 * 75,
-        Engine::Sglang | Engine::Tensorfold => 0,
+        Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp => 0,
     };
     let request = request.max(floor);
     let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
@@ -1235,7 +1239,8 @@ pub(super) fn normalize_engine_config(
             sglang.tool_call_parser.clone(),
             sglang.reasoning_parser.clone(),
         )),
-        Engine::Tensorfold => None,
+        // ADR 0029 §12: llama-server derives its parsers from the chat template.
+        Engine::Tensorfold | Engine::Llamacpp => None,
     };
     let (tool_call_parser, reasoning_parser) = match parser_fields {
         Some((block, tool, reasoning)) => (
@@ -1561,6 +1566,9 @@ pub(super) fn normalize_engine_config(
                 provenance,
             })
         }
+        // ADR 0029 §5: llama.cpp's launch settings are not in this release;
+        // resolution refuses its deployments before reaching here.
+        Engine::Llamacpp => return Err(crate::llamacpp::deployment_unsupported()),
     };
     Ok(settings)
 }

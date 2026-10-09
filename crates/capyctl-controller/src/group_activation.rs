@@ -370,13 +370,20 @@ struct Member {
     devices: Vec<String>,
 }
 
-fn engine_of(effective: &EffectiveDeployment) -> GroupEngine {
+fn engine_of(effective: &EffectiveDeployment) -> Result<GroupEngine, GroupActivationError> {
     use capyctl_config::engine_policy::Engine;
-    match effective.profile.engine {
+    Ok(match effective.profile.engine {
         Engine::Vllm => GroupEngine::Vllm,
         Engine::Sglang => GroupEngine::Sglang,
         Engine::Tensorfold => GroupEngine::Tensorfold,
-    }
+        // ADR 0029 §1: multi-rank groups are out of llama.cpp's scope.
+        Engine::Llamacpp => {
+            return Err(GroupActivationError::refused(
+                "group_shape_unsupported",
+                "llamacpp: no multi-node mode",
+            ))
+        }
+    })
 }
 
 fn locked<T>(
@@ -517,7 +524,7 @@ async fn activate(
     let head = members
         .first()
         .ok_or_else(|| GroupActivationError::Unavailable("a group has no head".into()))?;
-    let engine = engine_of(&head.resolution.effective);
+    let engine = engine_of(&head.resolution.effective)?;
     let residency = head.resolution.effective.residency;
     // ADR 0028 §6: the weights on every host at once, then digest agreement.
     let driver = RemoteGroupSources {

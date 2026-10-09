@@ -1,6 +1,7 @@
 //! ADR 0018 §1: engine installations the operator registers. Detection and
-//! resolution read package metadata only; nothing found here is executed
-//! until the operator names or picks it (ADR 0008 carve-out 2, SPEC §4.2).
+//! resolution read package metadata (and, ADR 0029 §2, a bare binary's file
+//! names) only; nothing found here is executed until the operator names or
+//! picks it (ADR 0008 carve-out 2, SPEC §4.2).
 use capyctl_config::engine_policy::Engine;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ fn engine_of(package: &str) -> Option<Engine> {
     // ADR 0018 §1, ADR 0023 §1: the package names of the engine kinds.
     Engine::ALL
         .into_iter()
-        .find(|engine| crate::installation::package_name(*engine) == package)
+        .find(|engine| crate::installation::package_name(*engine) == Some(package))
 }
 
 /// The environment's `lib/python3.*/site-packages` directories, sorted.

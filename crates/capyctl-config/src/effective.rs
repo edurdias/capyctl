@@ -1292,6 +1292,12 @@ pub fn resolve_effective_with_checkpoint(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
+    // ADR 0029 §1: a llama.cpp profile registers, but its deployments need the
+    // option policy, launch settings and sizing of ADR 0029 §5, §6 and §9,
+    // which are not in this release.
+    if raw_profile.engine == Engine::Llamacpp {
+        return Err(crate::llamacpp::deployment_unsupported());
+    }
     // ADR 0023 §4: TensorFold has no memory cap, so its reservation is the
     // operator's explicit statement.
     if raw_profile.engine == Engine::Tensorfold && d.resources.is_none() {

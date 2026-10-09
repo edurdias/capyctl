@@ -380,14 +380,52 @@ pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Tensorfold, "0.6.5"),
 ];
 
+/// ADR 0018 §1: whether `version` is in the verified set. ADR 0029 §2: a
+/// llama.cpp version is its `build_fingerprint` (`<v>+<commit>`, or `<v>`
+/// alone), read as the release it counts as, so `0.6.0-dev+d812350` is 0.6.0.
 pub fn is_verified(engine: Engine, version: &str) -> bool {
-    VERIFIED.iter().any(|(e, v)| *e == engine && *v == version)
+    is_verified_in(VERIFIED, engine, version)
+}
+
+/// [`is_verified`] against `table` (a test states its own verified set).
+pub fn is_verified_in(table: &[(Engine, &str)], engine: Engine, version: &str) -> bool {
+    let release = match engine {
+        Engine::Llamacpp => match crate::llamacpp::LlamacppBuild::from_fingerprint(version) {
+            Some(build) => build.release().to_owned(),
+            None => return false,
+        },
+        Engine::Vllm | Engine::Sglang | Engine::Tensorfold => version.to_owned(),
+    };
+    table.iter().any(|(e, v)| *e == engine && *v == release)
+}
+
+/// ADR 0018 §1: the version an engines listing shows and derives `custom`
+/// from: the one the host reports, else the profile's `build_fingerprint`.
+/// ADR 0029 §2: a llama.cpp host reports the version a `libllama.so.X.Y.Z`
+/// name gives, which cannot tell a `-dev` build or its commit, so its
+/// listing shows the fingerprint `engine add` read (`<v>+<commit>`).
+pub fn listed_version(
+    engine: Option<Engine>,
+    reported: Option<&str>,
+    build_fingerprint: Option<&str>,
+) -> String {
+    let reported = reported.filter(|v| !v.is_empty() && engine != Some(Engine::Llamacpp));
+    reported
+        .or(build_fingerprint)
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 /// ADR 0018 §5: the profile names standalone gives its environment-variable
-/// installations (`CAPYCTL_VLLM_BIN`, `CAPYCTL_SGLANG_BIN` and `CAPYCTL_TENSORFOLD_BIN`).
-pub const ENVIRONMENT_PROFILES: &[&str] =
-    &["local", "local-vllm", "local-sglang", "local-tensorfold"];
+/// installations (`CAPYCTL_VLLM_BIN`, `CAPYCTL_SGLANG_BIN`,
+/// `CAPYCTL_TENSORFOLD_BIN` and, ADR 0029 §2, `CAPYCTL_LLAMACPP_BIN`).
+pub const ENVIRONMENT_PROFILES: &[&str] = &[
+    "local",
+    "local-vllm",
+    "local-sglang",
+    "local-tensorfold",
+    "local-llamacpp",
+];
 
 /// ADR 0018 §1: short lowercase identifiers, safe in a JSON path and a
 /// status table.

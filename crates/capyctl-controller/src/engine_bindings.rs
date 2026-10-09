@@ -399,6 +399,11 @@ impl EngineBindings for ProfileBindings {
                     extensions_built,
                 })
             }
+            // ADR 0029 §1: no llama.cpp launch in this release; resolution
+            // refuses its deployments before an Initialize is built.
+            Engine::Llamacpp => Err(CoordinatorError::Service(
+                "llama.cpp launches are not supported by this release".into(),
+            )),
         }
     }
 }

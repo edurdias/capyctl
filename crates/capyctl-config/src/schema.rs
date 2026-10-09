@@ -266,6 +266,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("vllm", SCALAR),
         ("sglang", SCALAR),
         ("tensorfold", SCALAR),
+        // ADR 0029 §2: the role's own `llama-server`.
+        ("llamacpp", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),

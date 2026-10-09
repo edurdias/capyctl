@@ -195,16 +195,16 @@ fn pick() -> Result<PathBuf, StructuredError> {
 }
 
 struct Registration {
-    version: String,
+    reported: capyctl_agent::engines::ReportedVersion,
     fingerprint: Option<capyctl_agent::installation::InstallationFingerprint>,
     deep_park_missing: Option<bool>,
 }
 
 /// ADR 0018 §1 step 3: executed only now, because the operator named it.
 fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, StructuredError> {
-    let version = check_version(resolved, VERSION_CHECK_TIMEOUT).map_err(|e| {
+    let reported = check_version(resolved, VERSION_CHECK_TIMEOUT).map_err(|e| {
         error(
-            "engine_version_failed",
+            e.code(),
             format!(
                 "{}: {e}; nothing was written",
                 resolved.executable.display()
@@ -242,7 +242,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
         capyctl_agent::installation::PROBE_TIMEOUT,
     );
     Ok(Registration {
-        version,
+        reported,
         fingerprint,
         deep_park_missing: report.and_then(|r| r.available("deep_park")).map(|a| !a),
     })
@@ -409,7 +409,7 @@ async fn add(
     // Owner rule 2026-09-25: on a host as in standalone, these names are the
     // role's own installation (`local_engine`, `--vllm-bin`, `CAPYCTL_VLLM_BIN`).
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); use --name")));
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     let existing =
@@ -420,12 +420,18 @@ async fn add(
             format!("profile {name} exists; use --name, or remove it first"),
         ));
     }
-    // SPEC §13.3 amendment (owner decision 2026-09-25).
-    let cuda_home = capyctl_config::registration::detect_cuda_home_in(
-        toolchain.cuda_home_env.as_deref(),
-        &toolchain.search.default_cuda_home,
-        |nvcc| nvcc.is_file(),
-    );
+    // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
+    // compiles at run time for llama.cpp, so no toolkit is recorded for it.
+    let cuda_home = match resolved.engine {
+        Engine::Llamacpp => None,
+        Engine::Vllm | Engine::Sglang | Engine::Tensorfold => {
+            capyctl_config::registration::detect_cuda_home_in(
+                toolchain.cuda_home_env.as_deref(),
+                &toolchain.search.default_cuda_home,
+                |nvcc| nvcc.is_file(),
+            )
+        }
+    };
     if resolved.engine == Engine::Tensorfold {
         // ADR 0023 §2: TensorFold has no park path; refuse a request for one
         // before anything runs or is written.
@@ -445,6 +451,26 @@ async fn add(
                 )
             })?;
     }
+    if resolved.engine == Engine::Llamacpp {
+        // ADR 0029 §2: llama.cpp has no deep-park capability, and a
+        // machine-wide config.ini would set options CapyCTL cannot see; both
+        // are refused before anything runs or is written.
+        if deep_park == Some(DeepParkChoice::Enabled) {
+            return Err(error(
+                "capability_missing",
+                "llama.cpp has no on-demand sleep or wake; it runs restart_only, so \
+                 --deep-park enabled is refused and nothing was written",
+            ));
+        }
+        if let Some(refusal) =
+            capyctl_config::llamacpp::system_config_refusal(&toolchain.search.system_root)
+        {
+            return Err(error(
+                "engine_unsupported",
+                format!("{refusal}; nothing was written"),
+            ));
+        }
+    }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
     let registration = tokio::task::spawn_blocking(move || register(&r, &state))
         .await
@@ -458,15 +484,18 @@ async fn add(
     let deep = match deep_park {
         Some(DeepParkChoice::Enabled) => true,
         Some(DeepParkChoice::Disabled) => false,
-        // ADR 0023 §2: TensorFold is disabled even when the probe could not run.
+        // ADR 0023 §2, ADR 0029 §2: TensorFold and llama.cpp are disabled even
+        // when the probe could not run.
         None => {
-            resolved.engine != Engine::Tensorfold && registration.deep_park_missing != Some(true)
+            !matches!(resolved.engine, Engine::Tensorfold | Engine::Llamacpp)
+                && registration.deep_park_missing != Some(true)
         }
     };
     let spec = ProfileSpec {
         engine: resolved.engine,
         executable: resolved.executable.clone(),
-        build_fingerprint: registration.version.clone(),
+        // ADR 0029 §2: llama.cpp's is `<version>+<commit>`.
+        build_fingerprint: registration.reported.build_fingerprint.clone(),
         deep_park: deep,
         installation_drift: match drift {
             DriftChoice::Warn => InstallationDrift::Warn,
@@ -485,8 +514,11 @@ async fn add(
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
-        "profile": name, "engine": resolved.engine.name(), "version": registration.version,
-        "custom": resolved.custom(), "executable": resolved.executable,
+        "profile": name, "engine": resolved.engine.name(),
+        "version": registration.reported.version,
+        "build_fingerprint": spec.build_fingerprint,
+        "custom": !capyctl_config::registration::is_verified(resolved.engine, &spec.build_fingerprint),
+        "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
         "engines_file": target.engines, "revision": revision,
@@ -580,14 +612,18 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
     let rows: Vec<Value> = all
         .into_iter()
         .map(|(name, profile, source)| {
-            let engine = profile["engine"].as_str().and_then(Engine::from_name).unwrap_or(Engine::Vllm);
+            let kind = profile["engine"].as_str().and_then(Engine::from_name);
+            let engine = kind.unwrap_or(Engine::Vllm);
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
-            let version = accepted
+            let reported = accepted
                 .clone()
                 .flatten()
-                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned))
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| profile["build_fingerprint"].as_str().unwrap_or("unknown").to_owned());
+                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned));
+            let version = capyctl_config::registration::listed_version(
+                kind,
+                reported.as_deref(),
+                profile["build_fingerprint"].as_str(),
+            );
             json!({
                 "profile": name, "source": source, "engine": profile["engine"], "version": version,
                 "custom": !capyctl_config::registration::is_verified(engine, &version),
@@ -620,7 +656,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or local_engine); unset it and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     let engines =

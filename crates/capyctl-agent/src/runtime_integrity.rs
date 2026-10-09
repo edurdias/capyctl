@@ -58,6 +58,9 @@ pub fn required_files(engine: Engine, sleep_mode: bool) -> &'static [&'static st
         Engine::Sglang => SGLANG_RUNTIME_FILES,
         // ADR 0023 §2: TensorFold needs only the capability probe.
         Engine::Tensorfold => &[CAPABILITY_PROBE],
+        // ADR 0029 §2: llama-server imports nothing of CapyCTL's and is never
+        // probed.
+        Engine::Llamacpp => &[],
     }
 }
 

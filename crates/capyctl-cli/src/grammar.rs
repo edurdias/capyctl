@@ -449,7 +449,7 @@ enum CliCommand {
         #[command(subcommand)]
         resource: PruneArgs,
     },
-    /// Register, list or remove the vLLM, SGLang and TensorFold installations on this
+    /// Register, list or remove the vLLM, SGLang, TensorFold and llama.cpp installations on this
     /// machine. Each one becomes a runtime profile deployments can name.
     Engine {
         #[command(subcommand)]
@@ -459,7 +459,7 @@ enum CliCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum EngineArgs {
-    /// List vLLM, SGLang and TensorFold installations on this machine (reads
+    /// List vLLM, SGLang, TensorFold and llama.cpp installations on this machine (reads
     /// metadata only).
     Detect {
         /// Also scan this directory (repeatable).
@@ -468,7 +468,8 @@ enum EngineArgs {
     },
     /// Register an installation as a runtime profile and publish it.
     Add {
-        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3. Omit to pick interactively.
+        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3, or a llama-server
+        /// binary or the directory holding it. Omit to pick interactively.
         path: Option<PathBuf>,
         /// The profile name (default: the engine's name).
         #[arg(long)]
@@ -637,6 +638,10 @@ struct RoleSettingsArgs {
     /// local_engine.tensorfold.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     tensorfold_bin: Option<PathBuf>,
+    /// The llama.cpp `llama-server` binary this role runs as its `local`
+    /// profile. Wins over CAPYCTL_LLAMACPP_BIN and local_engine.llamacpp.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    llamacpp_bin: Option<PathBuf>,
     /// The build fingerprint the local engine publishes (default: what
     /// `<engine> --version` prints). Wins over CAPYCTL_ENGINE_FINGERPRINT and
     /// local_engine.build_fingerprint.
@@ -726,6 +731,7 @@ impl RoleSettingsArgs {
             vllm: self.vllm_bin.clone(),
             sglang: self.sglang_bin.clone(),
             tensorfold: self.tensorfold_bin.clone(),
+            llamacpp: self.llamacpp_bin.clone(),
             build_fingerprint: self.engine_fingerprint.clone(),
             args: self
                 .engine_args

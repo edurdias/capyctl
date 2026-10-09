@@ -696,6 +696,7 @@ fn an_environment_tensorfold_is_checked_and_never_parks() {
         .with_toolchain_search(capyctl_config::toolchain::ToolchainSearch {
             system: String::new(),
             default_cuda_home: dir.path().join("no-cuda"),
+            ..Default::default()
         })
         .installation()
         .expect_err("a missing build tool refuses the start")
@@ -705,6 +706,80 @@ fn an_environment_tensorfold_is_checked_and_never_parks() {
     assert!(message.contains("--cuda-home"), "{message}");
     for name in [
         "CAPYCTL_TENSORFOLD_BIN",
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// ADR 0029 §2: a role's own llama.cpp is declared by CAPYCTL_LLAMACPP_BIN,
+/// publishes `<version>+<commit>` read from `--version`'s standard error with
+/// deep park off, is `local-llamacpp` beside another engine, and is refused
+/// while the system config.ini exists, before it runs.
+// T42 T03
+#[test]
+fn an_environment_llamacpp_is_checked_and_never_parks() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) = isolated("an_environment_llamacpp_is_checked_and_never_parks") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+    let bin = dir.path().join("llama.cpp/build/bin/llama-server");
+    std::fs::create_dir_all(bin.parent().unwrap()).expect("a build directory");
+    let marker = dir.path().join("ran");
+    capyctl_config::test_support::write_executable(
+        &bin,
+        format!(
+            "#!/bin/sh\ntouch {}\necho 'version: 0.6.0 (build 1, commit d812350)' >&2\n",
+            marker.display()
+        ),
+        0o700,
+    )
+    .expect("the engine script");
+    std::env::set_var("CAPYCTL_LLAMACPP_BIN", &bin);
+    let root = tempfile::TempDir::new().expect("a system root");
+    let search = || capyctl_config::toolchain::ToolchainSearch {
+        system_root: root.path().to_path_buf(),
+        ..Default::default()
+    };
+    let named = crate::roles::EnvEngineProvider::new()
+        .with_toolchain_search(search())
+        .installations(&Default::default())
+        .expect("the environment declares an installation");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].profile, "local");
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::Llamacpp);
+    assert_eq!(installation.build_fingerprint, "0.6.0+d812350");
+    assert!(!installation.deep_park);
+
+    std::env::set_var("CAPYCTL_VLLM_BIN", fake_engine_bin(dir.path()));
+    let named = crate::roles::EnvEngineProvider::new()
+        .with_toolchain_search(search())
+        .installations(&Default::default())
+        .expect("two installations");
+    let profiles: Vec<&str> = named.iter().map(|n| n.profile.as_str()).collect();
+    assert_eq!(profiles, ["local-vllm", "local-llamacpp"]);
+    std::env::remove_var("CAPYCTL_VLLM_BIN");
+
+    std::fs::remove_file(&marker).expect("the probe ran");
+    let config = capyctl_config::llamacpp::system_config_file(root.path());
+    std::fs::create_dir_all(config.parent().unwrap()).expect("etc");
+    std::fs::write(&config, "[*]\n").expect("a config.ini");
+    let message = crate::roles::EnvEngineProvider::new()
+        .with_toolchain_search(search())
+        .installation()
+        .expect_err("a system config.ini refuses the start")
+        .to_string();
+    assert!(message.contains("engine_unsupported"), "{message}");
+    assert!(message.contains(&config.display().to_string()), "{message}");
+    assert!(!marker.exists(), "refused before the binary runs");
+    for name in [
+        "CAPYCTL_LLAMACPP_BIN",
         "CAPYCTL_MODELS_ROOT",
         "CAPYCTL_RUNTIME_DIR",
     ] {

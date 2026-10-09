@@ -1041,6 +1041,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
 | T41 | TensorFold conformance | Detection reads metadata only; `engine add` refuses a missing toolchain on the closed PATH; launch arguments and reserved flags; readiness from `/health` and the model list; drain waits for `requests_running: 0` and `busy: false`, signals an exited, not listening or unanswering engine, and leaves one still answering busy unsignalled; `restart_only` park and wake; `deep` refused; a drafter repository id refused; `local_engine.tensorfold` three ways (ADR 0023). |
+| T42 | llama.cpp conformance | Detection executes nothing; `engine add` reads the version from standard error and refuses a machine with `/etc/llama.cpp/config.ini`; launch arguments and reserved options in every alias, negative form and `_` spelling; the KV layout; readiness and the check of the rendered values; the `/metrics` idle gate; `restart_only` park and wake; `deep` refused; `cache_salt` refused; a draft model outside the approved paths refused; `local_engine.llamacpp` three ways (ADR 0029). |
 
 Multi-node live rows MN1–MN9 (ADR 0028) supplement T16, T20, T22, T30–T32 on two hosts.
 
@@ -1054,7 +1055,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
-- 2026-10-09, [ADR 0029](design/adr/0029-llamacpp-engine.md): llama.cpp's `llama-server` as the fourth engine, `restart_only`, one model per deployment (§1, §9.4).
+- 2026-10-09, [ADR 0029](design/adr/0029-llamacpp-engine.md): llama.cpp's `llama-server` as the fourth engine, `restart_only`, one model per deployment (§1, §9.4, T42).
 - 2026-10-05, [ADR 0028](design/adr/0028-multi-node-engine-groups.md): multi-node engine groups for vLLM, SGLang and TensorFold (§11, §15, §16.4, §20).
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 - 2026-10-01, [ADR 0023](design/adr/0023-tensorfold-engine.md): TensorFold as the third engine, `restart_only`, registered with `engine add` (§1, §9.3, §9.4, T41).
