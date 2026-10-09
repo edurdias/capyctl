@@ -1118,8 +1118,8 @@ async fn add_registers_llamacpp_from_its_standard_error() {
 
 // T42 T21 T37 (ADR 0029 §2): `--deep-park enabled` is refused
 // `capability_missing`, a version printed to standard output alone is
-// unparsable (`engine_unsupported`), and a host-fixed argument is refused
-// while the option policy fails closed; nothing is written for any of them.
+// unparsable (`engine_unsupported`), and a reserved host-fixed argument is
+// refused (ADR 0029 §6); nothing is written for any of them.
 #[tokio::test]
 async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
     let dir = private_dir();
@@ -1149,7 +1149,7 @@ async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
         name: None,
         deep_park: None,
         drift: DriftChoice::Warn,
-        args: vec!["--threads".into(), "8".into()],
+        args: vec!["--port".into(), "9000".into()],
         approved_options: vec![],
         approved_paths: vec![],
         env: vec![],
@@ -1159,7 +1159,7 @@ async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
         .await
         .unwrap_err();
     assert_eq!(error.code, "invalid_config", "{error:?}");
-    assert!(error.message.contains("--threads"), "{}", error.message);
+    assert!(error.message.contains("--port"), "{}", error.message);
     script(&binary, "echo 'version: 0.6.0 (build 1, commit d812350)'");
     let error = add_llamacpp(&add(&binary), &document, &root)
         .await
