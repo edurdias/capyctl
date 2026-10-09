@@ -10,7 +10,9 @@ pub mod capability_gate;
 // ADR 0014 §7 (WE3): checkpoint digests measured and recorded.
 pub mod checkpoint_digests;
 pub mod coordinator;
+// SPEC §§10, 17 (D9): the standalone role's engine load, sampled in process.
 pub mod coordinator_port;
+pub mod embedded_load;
 pub mod engine_bindings;
 // SPEC §13.2 (W13): an owned engine that exited is closed and settled.
 pub mod engine_exit;

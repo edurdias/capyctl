@@ -35,6 +35,8 @@ pub struct RetiredLocalLaunch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalReadyLaunch {
     pub fence: DeploymentFence,
+    /// ADR 0013 §5: the instance this launch realizes.
+    pub instance_index: u32,
     pub operation_id: String,
     pub step_id: String,
     pub binding_id: String,
@@ -239,6 +241,7 @@ impl crate::Store {
             )?;
             launches.push(LocalReadyLaunch {
                 fence: p.fence(),
+                instance_index: p.instance_index,
                 operation_id: p.operation_id.clone(),
                 step_id: p.step_id.clone(),
                 binding_id: p.binding_id.clone(),

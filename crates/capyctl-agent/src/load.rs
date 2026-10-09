@@ -4,7 +4,9 @@
 //! loopback, with that launch's native key, and reports the gauges with the
 //! ingress in-flight count over the control session as W3 `ReportLoad`. An
 //! SGLang launch's resolved running limit is read once from its loopback
-//! `/v1/loads` and carried on its samples (owner decision 2026-10-08).
+//! `/v1/loads` and carried on its samples (owner decision 2026-10-08). The
+//! standalone role samples its embedded engines with the same reporter over
+//! its own [`LoadSource`] (`capyctl_controller::embedded_load`).
 //!
 //! A sample is a routing hint, never readiness or admission evidence and never
 //! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
@@ -13,7 +15,7 @@
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
-use crate::ingress::{Ingress, LoadTarget};
+use crate::ingress::{Ingress, IngressScope, LoadTarget};
 use capyctl_adapters::tensorfold::http::HealthReport;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
 use capyctl_protocol::{
@@ -448,9 +450,32 @@ fn launch_key(target: &LoadTarget) -> LaunchKey {
     )
 }
 
+/// SPEC §10, D9: what a reporter samples: the Ready scopes of one host, each
+/// with its loopback engine target and launch key, and the forwarding
+/// timings recorded for a scope since the last tick.
+pub trait LoadSource: Send + Sync {
+    /// Every Ready scope to sample now. Empty when none is, or when the
+    /// source cannot be read.
+    fn targets(&self) -> Vec<LoadTarget>;
+    /// SPEC §17 (M80): the scope's forwarding timings since the last call.
+    fn drain_latency(&self, _scope: &IngressScope) -> Vec<(String, Histogram)> {
+        Vec::new()
+    }
+}
+
+/// A host agent samples the scopes its ingress holds open.
+impl LoadSource for Ingress {
+    fn targets(&self) -> Vec<LoadTarget> {
+        self.load_targets().unwrap_or_default()
+    }
+    fn drain_latency(&self, scope: &IngressScope) -> Vec<(String, Histogram)> {
+        Ingress::drain_latency(self, scope).unwrap_or_default()
+    }
+}
+
 /// Scrapes Ready scopes and builds bounded load reports for one host.
 pub struct LoadReporter {
-    ingress: Arc<Ingress>,
+    source: Arc<dyn LoadSource>,
     client: reqwest::Client,
     host_id: String,
     interval: Duration,
@@ -475,9 +500,9 @@ async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
 }
 
 impl LoadReporter {
-    pub fn new(ingress: Arc<Ingress>, host_id: String) -> Result<Self, LoadError> {
+    pub fn new(source: Arc<dyn LoadSource>, host_id: String) -> Result<Self, LoadError> {
         Ok(Self {
-            ingress,
+            source,
             // Loopback only: no proxy, no redirect can move the scrape elsewhere.
             client: reqwest::Client::builder()
                 .no_proxy()
@@ -623,10 +648,9 @@ impl LoadReporter {
     /// One tick: a sample per Ready scope, split into reports that each pass
     /// the W3 bounds. Empty when no scope is Ready.
     pub async fn reports(&self) -> Vec<pb::ReportLoad> {
-        let Ok(targets) = self.ingress.load_targets() else {
-            return vec![];
-        };
-        let targets: Vec<_> = targets
+        let targets: Vec<_> = self
+            .source
+            .targets()
             .into_iter()
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
@@ -714,10 +738,7 @@ impl LoadReporter {
         body: Option<&str>,
         baselines: &mut EngineBaselines,
     ) -> Option<SampleLatency> {
-        let mut histograms = self
-            .ingress
-            .drain_latency(&target.scope)
-            .unwrap_or_default();
+        let mut histograms = self.source.drain_latency(&target.scope);
         let mut engine = None;
         if let Some((family, current)) = body.and_then(parse_engine_histograms) {
             engine = Some(family.to_owned());
