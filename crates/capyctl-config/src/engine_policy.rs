@@ -914,6 +914,18 @@ pub enum ProfileArgError {
     Sensitive(String),
     #[error("option `{0}` names a path outside the host's security.approved_paths")]
     PathNotApproved(String),
+    /// ADR 0029 §5, §6: a reserved llama.cpp option a typed field renders.
+    #[error(
+        "reserved option `{option}` is rendered by capyctl from `engine_config.{field}`; \
+         set that field instead"
+    )]
+    ReservedField { option: String, field: String },
+    /// ADR 0029 §6: llama-server refuses `--name=value`.
+    #[error(
+        "option `{0}` is written `--name=value`, which llama.cpp refuses; pass the value \
+         as the next argument"
+    )]
+    EqualsSpelling(String),
 }
 
 /// Lowercase long-option name with `_` spelled `-`, without any `=value`.
@@ -951,9 +963,13 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        // ADR 0029 §6: llama.cpp's exact-name tables are not in this release;
-        // [`llamacpp_options_refused`] refuses every llama.cpp option instead.
-        Engine::Llamacpp => Vec::new(),
+        // ADR 0029 §6: every spelling of every reserved option, matched
+        // exactly ([`validate_llamacpp_args`]).
+        Engine::Llamacpp => crate::llamacpp::RESERVED_RENDERED
+            .iter()
+            .chain(crate::llamacpp::RESERVED_NEVER_RENDERED)
+            .flat_map(|row| row.iter().map(|name| (*name).to_owned()))
+            .collect(),
     }
 }
 
@@ -974,7 +990,7 @@ pub fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] 
         Engine::Vllm => VLLM_TYPED_OPTIONS,
         Engine::Sglang => SGLANG_TYPED_OPTIONS,
         Engine::Tensorfold => TENSORFOLD_TYPED_OPTIONS,
-        Engine::Llamacpp => &[],
+        Engine::Llamacpp => crate::llamacpp::TYPED_OPTIONS,
     }
 }
 
@@ -1080,7 +1096,20 @@ pub fn sensitivity(engine: Engine, name: &str) -> Option<Sensitivity> {
         Engine::Vllm => (VLLM_SENSITIVE, VLLM_SHAPED),
         Engine::Sglang => (SGLANG_SENSITIVE, SGLANG_SHAPED),
         Engine::Tensorfold => (TENSORFOLD_SENSITIVE, TENSORFOLD_SHAPED),
-        Engine::Llamacpp => (&[] as &[(&str, Sensitivity)], &[] as &[&str]),
+        // ADR 0029 §6: llama-server takes exact names only, so its own table
+        // and the name shapes apply to the name as written, never to a
+        // prefix or a folded negation.
+        Engine::Llamacpp => {
+            return crate::llamacpp::sensitive(name)
+                .map(|(_, kind)| kind)
+                .or_else(|| {
+                    if crate::llamacpp::ORDINARY_SHAPED.contains(&name) {
+                        None
+                    } else {
+                        shape(name)
+                    }
+                });
+        }
     };
     for candidate in candidate_names(name) {
         let abbreviation_ok = ORDINARY_EXACT.contains(&candidate.as_str());
@@ -1186,7 +1215,9 @@ pub fn validate_extra_args(
     args: &[String],
     context: &ExtraArgsContext<'_>,
 ) -> Result<(), ProfileArgError> {
-    llamacpp_options_refused(context.engine, args)?;
+    if context.engine == Engine::Llamacpp {
+        return validate_llamacpp_args(args, Some(context));
+    }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
         let name = option.name.clone();
@@ -1262,18 +1293,87 @@ pub fn option_names(args: &[String]) -> Result<BTreeSet<String>, ProfileArgError
         .collect())
 }
 
-/// ADR 0029 §6: llama.cpp's parser takes exact names, `_` for `-`, every long
-/// alias and negative form, and refuses `--name=value`; the prefix tables above
-/// would misjudge it, and its own exact-name tables are not in this release.
-/// Until they are, every llama.cpp option is refused, in host-fixed, extra and
-/// rendered arguments alike: the policy fails closed.
-fn llamacpp_options_refused(engine: Engine, args: &[String]) -> Result<(), ProfileArgError> {
-    if engine != Engine::Llamacpp {
-        return Ok(());
+/// ADR 0029 §6: llama-server's parser takes exact names only (no
+/// abbreviation), spells `_` as `-` in `--` options, refuses `--name=value`
+/// and accepts every long alias and negative form of an option, so the
+/// prefix rules above would misjudge it (they would flag `--cache-reuse`
+/// beside the reserved `--cache-ram`). The names here are compared exactly,
+/// after the same `_` to `-` folding, against every spelling in
+/// `llamacpp.rs`'s tables. With `context`, the deploy-time checks of a
+/// deployment's extra arguments apply too (duplicates of host-fixed
+/// options, host approval of sensitive options and their paths); without it,
+/// this is the check of host-fixed and rendered pass-through arguments.
+fn validate_llamacpp_args(
+    args: &[String],
+    context: Option<&ExtraArgsContext<'_>>,
+) -> Result<(), ProfileArgError> {
+    use crate::llamacpp;
+    if let Some(token) = args
+        .iter()
+        .find(|token| token.starts_with("--") && token.contains('='))
+    {
+        return Err(ProfileArgError::EqualsSpelling(normalize_option_name(
+            token,
+        )));
     }
-    args.first().map_or(Ok(()), |arg| {
-        Err(ProfileArgError::Unsupported(normalize_option_name(arg)))
-    })
+    let mut seen = BTreeSet::new();
+    for option in parse_options(args)? {
+        let name = option.name;
+        if let Some(field) = llamacpp::typed_field(&name) {
+            return Err(ProfileArgError::ReservedField {
+                option: name,
+                field: field.to_owned(),
+            });
+        }
+        if llamacpp::is_reserved(&name) {
+            return Err(ProfileArgError::Reserved(name));
+        }
+        let key = llamacpp::option_key(&name);
+        let Some(context) = context else {
+            if !seen.insert(key) {
+                return Err(ProfileArgError::Duplicate(name));
+            }
+            continue;
+        };
+        // ADR 0014 §2: host-fixed names are folded by `option_names`.
+        let folded = candidate_names(&name).pop().unwrap_or_else(|| name.clone());
+        if !seen.insert(key.clone())
+            || context.host_fixed.contains(&key)
+            || context.host_fixed.contains(&folded)
+        {
+            return Err(ProfileArgError::Duplicate(name));
+        }
+        let Some(kind) = sensitivity(Engine::Llamacpp, &name) else {
+            continue;
+        };
+        // ADR 0014 §8: an approval of any spelling approves the option.
+        let spellings = llamacpp::sensitive(&name).map_or(&[][..], |(row, _)| row);
+        let approved = context.approved_options.contains(&name)
+            || spellings
+                .iter()
+                .any(|spelling| context.approved_options.contains(*spelling));
+        if !approved {
+            return Err(ProfileArgError::Sensitive(name));
+        }
+        if let Sensitivity::Path { .. } = kind {
+            // ADR 0029 §8: every path the value names, as llama-server
+            // splits it, lies inside an approved directory (lexically here,
+            // through symlinks before launch).
+            let value = option.value.as_deref().unwrap_or_default();
+            let inside = llamacpp::path_values(&name, value).is_some_and(|paths| {
+                paths.iter().all(|path| {
+                    context
+                        .approved_paths
+                        .iter()
+                        .any(|root| path_within(path, root))
+                })
+            });
+            if !inside {
+                return Err(ProfileArgError::PathNotApproved(name));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Host-fixed profile arguments (ADR 0014 §1). The host operator writes these,
@@ -1301,7 +1401,9 @@ pub fn validate_rendered_args(
     args: &[String],
     sleep_mode: bool,
 ) -> Result<(), ProfileArgError> {
-    llamacpp_options_refused(engine, args)?;
+    if engine == Engine::Llamacpp {
+        return validate_llamacpp_args(args, None);
+    }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
         let name = option.name;

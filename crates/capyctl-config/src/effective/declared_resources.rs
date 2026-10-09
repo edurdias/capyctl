@@ -5,22 +5,30 @@ use serde_json::{json, Value};
 
 /// Decode a declared `resources` block with the types resolution uses and run
 /// the intrinsic recipe and device-claim checks against the declared
-/// `devices`. A TensorFold deployment must declare one (ADR 0023 §4); offline
-/// the family is known from `runtime_profile: tensorfold` or an
-/// `engine_config.tensorfold` block.
+/// `devices`. A TensorFold deployment must declare one (ADR 0023 §4), and so
+/// must a llama.cpp one until its request is derived from the GGUF header
+/// (ADR 0029 §9); offline the family is known from `runtime_profile:
+/// tensorfold` (or `llamacpp`) or the engine's `engine_config` block.
 pub fn validate_declared_resources(deployment: &Value) -> Result<(), ConfigError> {
     // `resources: null` is absent, as the server decodes it.
     let Some(resources) = deployment.get("resources").filter(|r| !r.is_null()) else {
-        let tensorfold = ["runtime_profile", "engine"]
-            .iter()
-            .any(|key| deployment[*key].as_str() == Some("tensorfold"))
-            || deployment["engine_config"].get("tensorfold").is_some();
-        if tensorfold {
-            return Err(ConfigError::new(
-                ConfigErrorCode::MissingRequired,
-                "resources",
-                TENSORFOLD_NEEDS_RESOURCES,
-            ));
+        let names = |family: &str| {
+            ["runtime_profile", "engine"]
+                .iter()
+                .any(|key| deployment[*key].as_str() == Some(family))
+                || deployment["engine_config"].get(family).is_some()
+        };
+        for (family, detail) in [
+            ("tensorfold", TENSORFOLD_NEEDS_RESOURCES),
+            ("llamacpp", crate::llamacpp::NEEDS_RESOURCES),
+        ] {
+            if names(family) {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::MissingRequired,
+                    "resources",
+                    detail,
+                ));
+            }
         }
         return Ok(());
     };

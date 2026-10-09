@@ -179,7 +179,9 @@ pub fn for_effective(effective: &EffectiveDeployment) -> DevelopmentControls {
     let profile = &effective.profile;
     let sleep = match &effective.engine_config {
         LaunchSettings::Vllm(settings) => Some(settings.enable_sleep_mode),
-        LaunchSettings::Sglang(_) | LaunchSettings::Tensorfold(_) => None,
+        LaunchSettings::Sglang(_) | LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => {
+            None
+        }
     };
     classify(
         profile.engine,

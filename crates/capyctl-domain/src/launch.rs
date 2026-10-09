@@ -36,12 +36,20 @@ pub const TENSORFOLD_DEFAULT_PARALLEL: u32 = 8;
 /// queue. A dense model keeps the router's bound.
 pub const SGLANG_HYBRID_DEFAULT_RUNNING: u32 = TENSORFOLD_DEFAULT_PARALLEL;
 
+/// ADR 0029 §5 (plan ruling 3): llama.cpp's slot count (`--parallel`) unless
+/// the deployment sets `max_concurrent_requests`: llama-server's own
+/// automatic count. Every slot's KV cache is allocated at start, so the
+/// count sizes memory; the router's other requests wait in llama-server's
+/// queue.
+pub const LLAMACPP_DEFAULT_PARALLEL: u32 = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "engine", rename_all = "lowercase")]
 pub enum LaunchSettings {
     Vllm(VllmLaunchSettings),
     Sglang(SglangLaunchSettings),
     Tensorfold(TensorfoldLaunchSettings),
+    Llamacpp(LlamacppLaunchSettings),
 }
 
 impl LaunchSettings {
@@ -50,6 +58,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &settings.common,
             Self::Sglang(settings) => &settings.common,
             Self::Tensorfold(settings) => &settings.common,
+            Self::Llamacpp(settings) => &settings.common,
         }
     }
 
@@ -58,6 +67,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &settings.memory,
             Self::Sglang(settings) => &settings.memory,
             Self::Tensorfold(settings) => &settings.memory,
+            Self::Llamacpp(settings) => &settings.memory,
         }
     }
 
@@ -66,6 +76,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &mut settings.memory,
             Self::Sglang(settings) => &mut settings.memory,
             Self::Tensorfold(settings) => &mut settings.memory,
+            Self::Llamacpp(settings) => &mut settings.memory,
         }
     }
 
@@ -74,6 +85,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &settings.extra_args,
             Self::Sglang(settings) => &settings.extra_args,
             Self::Tensorfold(settings) => &settings.extra_args,
+            Self::Llamacpp(settings) => &settings.extra_args,
         }
     }
 
@@ -82,6 +94,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &mut settings.provenance,
             Self::Sglang(settings) => &mut settings.provenance,
             Self::Tensorfold(settings) => &mut settings.provenance,
+            Self::Llamacpp(settings) => &mut settings.provenance,
         }
     }
 
@@ -90,6 +103,7 @@ impl LaunchSettings {
             Self::Vllm(settings) => &settings.provenance,
             Self::Sglang(settings) => &settings.provenance,
             Self::Tensorfold(settings) => &settings.provenance,
+            Self::Llamacpp(settings) => &settings.provenance,
         }
     }
 }
@@ -344,6 +358,84 @@ pub struct TensorfoldLaunchSettings {
     pub thinking: Option<bool>,
     pub extra_args: Vec<String>,
     pub provenance: BTreeMap<String, SettingSource>,
+}
+
+/// ADR 0029 §5: a llama.cpp deployment's resolved settings. llama.cpp has no
+/// park strategy, so nothing here is derived from residency. The slot count
+/// is `common.max_concurrent_requests`, else [`LLAMACPP_DEFAULT_PARALLEL`]
+/// ([`Self::slots`]); `common.kv_cache_dtype` is one of llama.cpp's cache
+/// types (`f16` by default) and renders both `--cache-type-k` and
+/// `--cache-type-v`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LlamacppLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    /// `--gpu-layers`: a layer count or every layer (the default).
+    pub n_gpu_layers: LlamacppGpuLayers,
+    /// ADR 0029 §9: the GGUF to serve, relative to the checkpoint; `None`
+    /// when the checkpoint holds exactly one candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gguf_file: Option<String>,
+    /// ADR 0029 §9: a multimodal projector, relative to the checkpoint
+    /// (`--mmproj`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mmproj_file: Option<String>,
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
+}
+
+impl LlamacppLaunchSettings {
+    /// ADR 0029 §5: the slots (`--parallel`) a launch runs.
+    pub fn slots(&self) -> u32 {
+        self.common
+            .max_concurrent_requests
+            .unwrap_or(LLAMACPP_DEFAULT_PARALLEL)
+    }
+}
+
+/// ADR 0029 §5: llama.cpp's `--gpu-layers`, written `all` or as a count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlamacppGpuLayers {
+    #[default]
+    All,
+    Count(u32),
+}
+
+impl LlamacppGpuLayers {
+    /// The value llama-server takes.
+    pub fn argument(self) -> String {
+        match self {
+            Self::All => "all".into(),
+            Self::Count(count) => count.to_string(),
+        }
+    }
+}
+
+impl Serialize for LlamacppGpuLayers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All => serializer.serialize_str("all"),
+            Self::Count(count) => serializer.serialize_u32(*count),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LlamacppGpuLayers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Count(u32),
+            Word(String),
+        }
+        match Written::deserialize(deserializer)? {
+            Written::Count(count) => Ok(Self::Count(count)),
+            Written::Word(word) if word == "all" => Ok(Self::All),
+            Written::Word(_) => Err(serde::de::Error::custom(
+                "n_gpu_layers is a layer count or `all`",
+            )),
+        }
+    }
 }
 
 /// Reviewed logical placement, not an observed CUDA index or physical UUID.

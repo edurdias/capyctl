@@ -1292,12 +1292,6 @@ pub fn resolve_effective_with_checkpoint(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
-    // ADR 0029 §1: a llama.cpp profile registers, but its deployments need the
-    // option policy, launch settings and sizing of ADR 0029 §5, §6 and §9,
-    // which are not in this release.
-    if raw_profile.engine == Engine::Llamacpp {
-        return Err(crate::llamacpp::deployment_unsupported());
-    }
     // ADR 0023 §4: TensorFold has no memory cap, so its reservation is the
     // operator's explicit statement.
     if raw_profile.engine == Engine::Tensorfold && d.resources.is_none() {
@@ -1306,6 +1300,23 @@ pub fn resolve_effective_with_checkpoint(
             "resources",
             TENSORFOLD_NEEDS_RESOURCES,
         ));
+    }
+    // ADR 0029 §9 (plan slice L4): the request derived from the GGUF header
+    // is not in this release, so a llama.cpp deployment states its resources.
+    if raw_profile.engine == Engine::Llamacpp && d.resources.is_none() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::MissingRequired,
+            "resources",
+            crate::llamacpp::NEEDS_RESOURCES,
+        ));
+    }
+    // ADR 0029 §6: llama-server reads options and its configuration and
+    // cache directories from these names; a deployment may not set them,
+    // whatever the profile approves.
+    if raw_profile.engine == Engine::Llamacpp {
+        if let Some(reason) = crate::llamacpp::refused_env(d.engine_config.env().keys()) {
+            return Err(invalid("engine_config.env", reason));
+        }
     }
     let host = core::normalize_host(h)?;
     let devices = d.devices.take().unwrap_or_default();
@@ -1408,9 +1419,11 @@ pub fn resolve_effective_with_checkpoint(
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)
             .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6: TensorFold never parks, so its default is restart_only.
+        // ADR 0023 §6, ADR 0029 §1: TensorFold and llama.cpp never park, so
+        // their default is restart_only.
         crate::deployment_defaults::default_residency(
-            raw_profile.security.deep_park.is_enabled() && raw_profile.engine != Engine::Tensorfold,
+            raw_profile.security.deep_park.is_enabled()
+                && !matches!(raw_profile.engine, Engine::Tensorfold | Engine::Llamacpp),
             discrete,
         )
     });
