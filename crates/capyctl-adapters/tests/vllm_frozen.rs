@@ -163,10 +163,12 @@ fn the_load_strategy_follows_the_deployment_setting() {
 }
 
 /// ADR 0014 amendment A21 (owner decision 2026-10-09): absent a declared
-/// choice, the loader defaults to the host's own unified/discrete memory
-/// shape (ADR 0019 covers discrete GPUs): `lazy` on unified memory, `eager`
-/// on a discrete GPU. A declared choice wins on either shape, and the
-/// resolved value (declared or defaulted) always renders under sleep mode.
+/// choice, a parking deployment's loader defaults to the host's own
+/// unified/discrete memory shape (ADR 0019 covers discrete GPUs): `lazy` on
+/// unified memory, `eager` on a discrete GPU (the fixture parks: residency
+/// `deep`, deep park enabled). A declared choice wins on either shape, and
+/// the resolved value (declared or defaulted) always renders under sleep
+/// mode.
 // T14 T21
 #[test]
 fn the_default_load_strategy_follows_the_host_memory_shape() {
@@ -259,6 +261,62 @@ fn the_default_load_strategy_follows_the_host_memory_shape() {
         ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
     );
     assert_eq!(rendered, ["lazy"]);
+}
+
+/// ADR 0014 amendment A21: the host-shape default only applies to a parking
+/// deployment, because that is the only case CapyCTL actually renders it
+/// (`VllmLaunchSettings::renders_eager_loader`). An undeclared, non-parking
+/// deployment resolves no strategy at all, on unified memory or a discrete
+/// GPU alike: vLLM's own default (`None`) is already memory-mapped (`lazy`)
+/// loading (vLLM 0.30 `LoadConfig.safetensors_load_strategy`), so showing a
+/// capyctl default here would misstate what actually runs, and nothing is
+/// rendered either way (command identity unchanged from before this
+/// amendment).
+// T14 T21
+#[test]
+fn an_undeclared_strategy_stays_unset_without_parking() {
+    let render = |discrete: bool| {
+        let (mut deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = json!("disabled");
+        deployment["residency"] = json!("restart_only");
+        if discrete {
+            host["resource_policy"]["domains"] = json!({
+                "system": {"memory": "distinct", "managed_limit": "30GiB",
+                           "free_reserve": "12GiB", "parked_limit": "15GiB"},
+                "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                         "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+            });
+            host["resource_policy"]["devices"] =
+                json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+            let object = deployment.as_object_mut().unwrap();
+            object.remove("resources");
+            deployment["engine_config"]["memory"] =
+                json!({"request": "12GiB", "kv_cache": "4GiB", "startup": "12GiB"});
+        }
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+            panic!("vLLM settings");
+        };
+        assert_eq!(
+            settings.safetensors_load_strategy, None,
+            "discrete={discrete}"
+        );
+        assert!(
+            !settings
+                .provenance
+                .contains_key("vllm.safetensors_load_strategy"),
+            "discrete={discrete}: no default is shown for a setting with no effect"
+        );
+        let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+        assert!(plan.sleep_flags.is_empty(), "discrete={discrete}");
+        let argv = render_command(&plan).unwrap().argv;
+        assert!(
+            !argv.contains(&"--safetensors-load-strategy".to_string()),
+            "discrete={discrete}: {argv:?}"
+        );
+    };
+    render(false);
+    render(true);
 }
 
 /// SPEC §6.2: `restart_only` prohibits sleep calls, so an enabled host switch

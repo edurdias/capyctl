@@ -320,9 +320,10 @@ struct RawVllmFields {
     #[serde(default)]
     max_num_batched_tokens: Option<u32>,
     // ADR 0014 §4 (amended 2026-10-07); amendment A21 (owner decision
-    // 2026-10-09): `eager` or `lazy`; omitted keeps capyctl's default for the
-    // host's memory shape (`lazy` on unified memory, `eager` on a discrete
-    // GPU).
+    // 2026-10-09): `eager` or `lazy`; omitted, a parking deployment keeps
+    // capyctl's default for the host's memory shape (`lazy` on unified
+    // memory, `eager` on a discrete GPU), a non-parking one stays unset
+    // (vLLM's own default governs, already memory-mapped loading).
     #[serde(default)]
     safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
     // ADR 0024: `auto` (the default), `none`, or a parser name.
@@ -1129,26 +1130,35 @@ pub(super) fn normalize_engine_config(
     let parks = inputs.residency.parks();
     let sleep_mode = parks && inputs.security.deep_park.is_enabled();
 
-    // ADR 0014 amendment A21 (owner decision 2026-10-09): the deployment's
-    // safetensors loader defaults to the host's own unified/discrete memory
-    // shape (ADR 0019 covers discrete GPUs) absent a declared choice: lazy on
-    // unified memory, eager on a discrete GPU. Found live (catalog run,
-    // Qwen3.6-35B NVFP4, vLLM 0.30, host A, deep park): eager vs lazy start
-    // 98 s vs 180 s, loading peak 54.2 vs 34.5 GiB, ready footprint 43.95 vs
-    // 26.63 GiB, parked charge after three cycles 28.3 vs 8.3 GB, wake to
-    // first token about 51 s vs 81 s; eager also drove the parked-growth
-    // guard (amendment A19) into stops.
+    // ADR 0014 amendment A21 (owner decision 2026-10-09): a parking
+    // deployment's safetensors loader defaults to the host's own
+    // unified/discrete memory shape (ADR 0019 covers discrete GPUs) absent a
+    // declared choice: lazy on unified memory, eager on a discrete GPU.
+    // Found live (catalog run, Qwen3.6-35B NVFP4, vLLM 0.30, host A, deep
+    // park): eager vs lazy start 98 s vs 180 s, loading peak 54.2 vs 34.5
+    // GiB, ready footprint 43.95 vs 26.63 GiB, parked charge after three
+    // cycles 28.3 vs 8.3 GB, wake to first token about 51 s vs 81 s; eager
+    // also drove the parked-growth guard (amendment A19) into stops. Scoped
+    // to `sleep_mode`: vLLM's own default when nothing renders is already
+    // memory-mapped (lazy) loading (vLLM 0.30 `LoadConfig.safetensors_load_strategy`
+    // docstring), so a non-parking, undeclared deployment keeps showing no
+    // chosen strategy and no command-identity change, exactly as the note on
+    // §3 and §4 (2026-10-07) left it.
     let vllm_strategy_declared = vllm.safetensors_load_strategy;
-    let vllm_strategy_resolved = vllm_strategy_declared.unwrap_or(if inputs.device.is_some() {
-        SafetensorsLoadStrategy::Eager
-    } else {
-        SafetensorsLoadStrategy::Lazy
-    });
+    let vllm_strategy_resolved = match vllm_strategy_declared {
+        Some(strategy) => Some(strategy),
+        None if sleep_mode => Some(if inputs.device.is_some() {
+            SafetensorsLoadStrategy::Eager
+        } else {
+            SafetensorsLoadStrategy::Lazy
+        }),
+        None => None,
+    };
     // Mirrors `VllmLaunchSettings::renders_eager_loader`: whether CapyCTL
     // will actually pass `--safetensors-load-strategy eager` to vLLM, which
     // is what the startup placeholder below must size for.
     let vllm_renders_eager = engine == Engine::Vllm
-        && vllm_strategy_resolved == SafetensorsLoadStrategy::Eager
+        && vllm_strategy_resolved == Some(SafetensorsLoadStrategy::Eager)
         && (sleep_mode || vllm_strategy_declared.is_some());
 
     // ADR 0014 §6 (owner decision Q10).
@@ -1440,7 +1450,7 @@ pub(super) fn normalize_engine_config(
                 vllm.max_num_batched_tokens,
             )?;
             provenance.insert("enable_sleep_mode".into(), SettingSource::Derived);
-            if vllm_strategy_declared.is_none() {
+            if vllm_strategy_declared.is_none() && vllm_strategy_resolved.is_some() {
                 provenance.insert(
                     "vllm.safetensors_load_strategy".into(),
                     SettingSource::CapyctlDefault,
@@ -1451,7 +1461,7 @@ pub(super) fn normalize_engine_config(
                 memory,
                 block_size_tokens: vllm.block_size_tokens,
                 max_num_batched_tokens: vllm.max_num_batched_tokens,
-                safetensors_load_strategy: Some(vllm_strategy_resolved),
+                safetensors_load_strategy: vllm_strategy_resolved,
                 tool_call_parser,
                 reasoning_parser,
                 enable_sleep_mode: sleep_mode,

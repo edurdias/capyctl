@@ -12,12 +12,19 @@ about 51 s vs 81 s. `eager` also drove amendment A19's parked-growth guard into 
 Resolution now picks `lazy` on unified memory and keeps `eager` on a discrete GPU (ADR
 0019) absent a declared `engine_config.vllm.safetensors_load_strategy`, reusing the same
 device-domain detection the memory request and margin already derive on
-(`EngineInputs::device`). The resolved value is always present in the effective
-configuration (`VllmLaunchSettings::safetensors_load_strategy`), with
-`provenance["vllm.safetensors_load_strategy"]` naming a defaulted value `capyctl default`;
-a declared one still has no entry. Rendering is unchanged: under sleep mode the resolved
-value always renders beside `--enable-sleep-mode`, and outside it only a declared value
-renders, so an undeclared, non-parking launch keeps its command identity and fingerprint.
+(`EngineInputs::device`) — but only for a **parking** deployment, the only case CapyCTL
+ever renders the flag (§3: reserved to sleep mode unless declared). A review caught an
+earlier revision resolving the default for every deployment, so an undeclared, non-parking
+launch on a discrete GPU showed `eager` while rendering nothing; vLLM 0.30's own
+`LoadConfig.safetensors_load_strategy` default is already memory-mapped (`lazy`) loading
+(`vllm/config/load.py`), not eager, so that shown value did not match what ran. A
+non-parking, undeclared deployment now resolves and shows no strategy at all, on either
+memory shape, exactly as before this change. Where a default does apply, it is shown in the
+effective configuration (`VllmLaunchSettings::safetensors_load_strategy`), with
+`provenance["vllm.safetensors_load_strategy"]` naming it `capyctl default`; a declared value
+still has no entry. Rendering is unchanged: under sleep mode the resolved value always
+renders beside `--enable-sleep-mode`, and outside it only a declared value renders, so an
+undeclared, non-parking launch keeps its command identity and fingerprint.
 
 The startup placeholder (`STARTUP_WEIGHTS_FACTOR`, 2.25) was measured with no loader flag
 rendered at all (vLLM's own default, memory-mapped); it stays the factor for every
@@ -34,6 +41,9 @@ Tests, failing before and passing after:
   fixture resolves `lazy`, a discrete one resolves `eager`, a declared choice wins on either
   and carries no provenance entry, and the resolved value (declared or defaulted) renders in
   `sleep_flags` and the argv.
+- `an_undeclared_strategy_stays_unset_without_parking` (capyctl-adapters): a non-parking
+  deployment resolves no strategy, shows no provenance entry and renders nothing, on
+  unified memory or a discrete GPU alike (the review correction above).
 - `an_omitted_load_strategy_keeps_existing_identities` (capyctl-config): the unified
   fixture's omitted loader now resolves to `lazy` with a `capyctl default` provenance entry
   that round-trips through the effective snapshot; the command fingerprint stays pinned.

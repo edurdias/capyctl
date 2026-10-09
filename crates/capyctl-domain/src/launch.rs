@@ -224,12 +224,14 @@ pub struct VllmLaunchSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_batched_tokens: Option<u32>,
     /// ADR 0014 §4 (amended 2026-10-07; amendment A21, owner decision
-    /// 2026-10-09): vLLM's safetensors loader. Always resolved by
-    /// `resolve_effective` (never `None` from a fresh resolution): the
-    /// deployment's declared choice, or capyctl's default for the host's
-    /// memory shape (`lazy` on unified memory, `eager` on a discrete GPU,
-    /// ADR 0019). `provenance["vllm.safetensors_load_strategy"]` names a
-    /// defaulted value; a declared one has no entry. Only
+    /// 2026-10-09): vLLM's safetensors loader. `None` means CapyCTL applies
+    /// no choice: the deployment did not declare one and does not park
+    /// (vLLM's own default then governs, already memory-mapped/lazy
+    /// loading). A parking deployment that does not declare one always
+    /// resolves `Some`: capyctl's default for the host's memory shape
+    /// (`lazy` on unified memory, `eager` on a discrete GPU, ADR 0019).
+    /// `provenance["vllm.safetensors_load_strategy"]` names a defaulted
+    /// value; a declared one has no entry. Only
     /// `VllmLaunchSettings::renders_eager_loader` says whether CapyCTL
     /// actually passes it to vLLM.
     #[serde(skip_serializing_if = "Option::is_none")]
