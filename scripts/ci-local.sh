@@ -15,11 +15,11 @@ SHELLCHECK_SHA_AARCH64=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e
 TMS_URL=https://files.pythonhosted.org/packages/81/fd/42aad783d433fd69dc108b1b2ee5860fcf33e20e5440b899bc004ff97d70/torch_memory_saver-0.0.9.post1.tar.gz
 TMS_SHA=25fd4b691ed3242c3a18b2bef0dbe9de84d2e7068b96a37686a923d55c274f43
 
-CI_STEPS=(fmt name clippy unit runtime shellcheck installer)
+CI_STEPS=(fmt name clippy unit runtime shellcheck installer changes)
 DEEP_STEPS=(core workspace)
 STEPS=("${CI_STEPS[@]}")
 CORE_PKGS=(-p capyctl-adapters -p capyctl-store -p capyctl-controller -p capyctl-management -p harness)
-SHELL_FILES=(packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh)
+SHELL_FILES=(packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh scripts/assemble-changes.sh scripts/test-assemble-changes.sh)
 
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-ci"
 ORIG_TARGET_DIR="${CARGO_TARGET_DIR:-}"
@@ -130,6 +130,7 @@ step_shellcheck() {
   "$sc" "${SHELL_FILES[@]}"
 }
 step_installer() { scripts/test-install.sh; }
+step_changes() { scripts/test-assemble-changes.sh; }
 
 names=() results=() durations=()
 failed=""

@@ -103,8 +103,11 @@ Add a regression test when a behavior change needs one; documentation-only edits
 do not need artificial tests. Cite the governing specification requirement near
 spec-driven code and tag acceptance tests with their T01–T40 matrix ID.
 
-Update user documentation when behavior changes. Keep implementation status in
-`docs/runbooks/f2-current-status.md`; do not add another status report or commit
+Update user documentation when behavior changes. Implementation status lives in
+`docs/runbooks/f2-current-status.md`, but a pull request does not edit it or the
+release notes: it adds one change file, `docs/changes/<short-slug>.md`, holding
+its status entry and its release note ([format](docs/changes/README.md)), and
+the release folds those files in. Do not add another status report or commit
 regenerable logs, build outputs or diffs. Remove credentials, private model data,
 prompts, local machine identifiers and personal paths from examples and evidence.
 

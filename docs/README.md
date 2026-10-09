@@ -44,6 +44,7 @@ in what order.
 | [`design/adr/`](design/adr/) | Architecture decision records (ADR 0001 onwards). An ADR that amends the spec says so. |
 | [`design/milestones/`](design/milestones/) | Milestone designs and plans (F0 foundation, F1 vLLM path, F2 SGLang and the two-host program). |
 | [`runbooks/f2-current-status.md`](runbooks/f2-current-status.md) | The single status record: what is done, what remains and what is queued next. |
+| [`changes/`](changes/) | One file per change merged since the last release: its status entry and its release note, folded into the status record and the release notes when a release is cut. |
 | [`runbooks/`](runbooks/) | Operational records kept by the maintainers: live-run evidence, engine environment notes and the carried [vLLM development-mode warning](runbooks/vllm-development-mode-warning.md). |
 | [`plans/`](plans/) | Implementation plans, one per slice of work. |
 | [`specs/`](specs/) | Design notes for individual features written ahead of their plans. |
