@@ -89,6 +89,12 @@ pub struct HostSessionView {
     /// the findings beside the host's group members.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupInventoryView>,
+    /// SPEC §7.2 (found live 2026-10-09): the host's domains whose managed
+    /// limit plus free reserve exceeds the memory available when the host
+    /// published its policy, with the figures. A deployment near the limit
+    /// is refused there until memory is freed. A warning only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_warnings: Vec<String>,
 }
 /// ADR 0028 §3: a host's group facts as its inventory reports them.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -1378,7 +1384,7 @@ impl AgentSessions {
                             After::Publish(inventory) => {
                                 // SPEC §§4.2, 13: a refused publication ends the session with a
                                 // named reason instead of a generic denial.
-                                self.authority.publish_inventory(&host, &inventory).map_err(|refusal| Status::failed_precondition(match refusal.reason {
+                                let memory_warnings = self.authority.publish_inventory(&host, &inventory).map_err(|refusal| Status::failed_precondition(match refusal.reason {
                                     // ADR 0019: a changed hand-written policy says what to do.
                                     Some(reason) => format!("host inventory publication refused: {reason}"),
                                     None => "host inventory publication refused".to_owned(),
@@ -1390,6 +1396,7 @@ impl AgentSessions {
                                 s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.group = GroupInventoryView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
+                                s.view.memory_warnings = memory_warnings;
                                 // Only an inventory `publish` accepted reaches here.
                                 s.prepared = crate::host_publication::eligible(&inventory);
                                 s.device_domains_missing = !s.capabilities.contains(capabilities::DEVICE_MEMORY_DOMAINS)
@@ -1743,6 +1750,7 @@ impl AgentControl for AgentSessions {
                         profiles: vec![],
                         member_savers: vec![],
                         group: None,
+                        memory_warnings: vec![],
                     },
                     peer: peer.clone(),
                     outgoing: Some(outgoing.clone()),

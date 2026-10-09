@@ -2061,6 +2061,8 @@ async fn start_standalone_in(
     // SPEC §§10, 17 (owner decision 2026-10-08): the load read below reads the
     // same store.
     let load_owner = owner.clone();
+    // SPEC §7.2: set once the policy is published below.
+    let memory_warnings = Arc::new(std::sync::OnceLock::new());
     let hosts_view = capyctl_management::hosts::standalone_hosts_router(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
@@ -2111,6 +2113,7 @@ async fn start_standalone_in(
                     })
                 })
             },
+            memory_warnings: memory_warnings.clone(),
         },
     );
     // SPEC §17 (M80): the router's per-request latency distributions. The
@@ -2215,6 +2218,22 @@ async fn start_standalone_in(
         controller
             .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
+        // SPEC §7.2 (found live 2026-10-09): limits accepted because they fit
+        // the total may still exceed the memory available now; a deployment
+        // near the limit is then refused until memory is freed. Warned, with
+        // the figures, in the log and in status; never refused for.
+        let warnings = coordinator
+            .commands()
+            .read(|store| {
+                Ok(store
+                    .memory_headroom_warnings(&declared_host.name, &observations)
+                    .unwrap_or_default())
+            })
+            .unwrap_or_default();
+        for warning in &warnings {
+            capyctl_domain::role_log::notice(capyctl_domain::role_log::Level::Warning, warning);
+        }
+        let _ = memory_warnings.set(warnings);
     }
     // ADR 0018 §4, §5 (review decisions I2, I3): standalone keeps a removed
     // profile out of placement and never lets an abandoned retirement wedge a

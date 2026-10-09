@@ -24,8 +24,9 @@ use super::*;
 use crate::events::{append_event, EventMetadata, SwitchPhase};
 use crate::instances::instance_owner_id;
 use capyctl_config::instances::Placement;
+use capyctl_domain::resources::gib;
 use capyctl_scheduler::device_choice::choose_device_with_eviction_within;
-use capyctl_scheduler::placement::{candidate_fits, fits, gib};
+use capyctl_scheduler::placement::{candidate_fits, fits};
 use capyctl_scheduler::switching::{
     choose_victims_within, observed_room, order_victims, Release, Victim, VictimCandidate,
 };

@@ -169,7 +169,17 @@ fn cleanup_credits_only_qualified_floors_and_preserves_inputs() {
         forecast_actions(&initial, &actions, context).unwrap_err(),
         SequenceFailure {
             step: 1,
-            reason: ResourceError::Insufficient
+            // T29: without credited floors, the forecast is short of the
+            // memory available, and says by how much.
+            reason: ResourceError::InsufficientAvailable(Box::new(AvailableShortfall {
+                domain: "system".into(),
+                device: false,
+                available_bytes: 60,
+                charge_bytes: 70,
+                pending_bytes: 0,
+                free_reserve_bytes: 0,
+                short_bytes: 10,
+            }))
         }
     );
     assert_eq!(

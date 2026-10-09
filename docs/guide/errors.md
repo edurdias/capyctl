@@ -102,9 +102,12 @@ and no prompts, and the management API returns its end
 [engine logs](../operations/install.md#engine-logs-and-troubleshooting)).
 
 **A model stays queued.** `status deployment` shows why under its table, for
-example `Waiting     initialize pending: gave up: resource or evidence check failed: insufficient resources`:
-the GPU does not have the memory free now. Stop or park another model, or free
-the card from other programs.
+example `Waiting     initialize pending: gave up: resource or evidence check failed: insufficient_memory: needs 109.0 GiB of system memory, 118.0 GiB available and a 11.0 GiB free reserve to keep, 2.0 GiB short`:
+the machine does not have that much memory available now (on a GPU,
+`insufficient_device_memory`). Stop or park another model, free the memory from
+other programs, or lower the managed limit or free reserve
+([memory limits](../operations/configuration.md#standalone-memory-limits)).
+`start --wait` ends with `insufficient_resources` (exit 4).
 
 **The checkpoint could not be measured.** `status deployment` shows
 `Checkpoint  could not be measured (<reason>)` and `start --wait` stops at once.

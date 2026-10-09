@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ResourceError {
     #[error("invalid resource contract")]
     Invalid,
@@ -14,10 +14,131 @@ pub enum ResourceError {
     DeviceConflict,
     #[error("insufficient resources")]
     Insufficient,
+    /// SPEC §7.2 (found live 2026-10-09: a 109.25 GiB cold charge under a
+    /// 110 GiB managed limit was refused with no figures at all): the
+    /// charge fits the managed limit, but the memory the host has available
+    /// now, less the charge, would not leave the free reserve. Carries the
+    /// figures the operator needs.
+    #[error("{0}")]
+    InsufficientAvailable(Box<AvailableShortfall>),
     #[error("resource category limit exceeded")]
     CategoryLimit,
     #[error("stale ledger epoch")]
     StaleEpoch,
+}
+
+/// SPEC §7.2: why the free-memory check refused a charge on one domain, in
+/// bytes: what the host has available now, what the admission must find
+/// there (the candidate's own charge and the charges of other starts not
+/// yet resident), the free memory that must remain (the free reserve, less
+/// what a device domain's reserve already absorbs, ADR 0019 §2) and how much
+/// is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableShortfall {
+    /// The ledger key of the domain (a host-scoped key on an enrolled host).
+    pub domain: String,
+    /// Whether the domain is a GPU's memory (ADR 0019).
+    pub device: bool,
+    pub available_bytes: i64,
+    /// The candidate's own charge beyond what its processes already hold.
+    pub charge_bytes: i64,
+    /// Other owners' charges on the domain that are not resident yet.
+    pub pending_bytes: i64,
+    pub free_reserve_bytes: i64,
+    pub short_bytes: i64,
+}
+
+impl std::fmt::Display for AvailableShortfall {
+    /// In the closed code status classifies (`insufficient_memory` or
+    /// `insufficient_device_memory`) and capacity_blocked's wording: e.g.
+    /// `insufficient_memory: needs 109.2 GiB of system memory, 118.2 GiB
+    /// available and a 11.0 GiB free reserve to keep, 2.0 GiB short`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = if self.device {
+            "insufficient_device_memory"
+        } else {
+            "insufficient_memory"
+        };
+        write!(
+            f,
+            "{code}: needs {} of {} memory",
+            gib(self.charge_bytes),
+            local_domain(&self.domain)
+        )?;
+        if self.pending_bytes > 0 {
+            write!(
+                f,
+                " beside {} charged to starts not yet resident",
+                gib(self.pending_bytes)
+            )?;
+        }
+        write!(
+            f,
+            ", {} available and a {} free reserve to keep, {} short",
+            gib(self.available_bytes),
+            gib(self.free_reserve_bytes),
+            gib(self.short_bytes)
+        )
+    }
+}
+
+/// Bytes shown to the operator, in GiB with one decimal.
+pub fn gib(bytes: i64) -> String {
+    format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
+}
+
+/// A domain's own name: an enrolled host's ledger key
+/// (`host/<n>:<host>/domain/<id>`) shown as its local id.
+fn local_domain(key: &str) -> &str {
+    match key
+        .strip_prefix("host/")
+        .and_then(|k| k.rsplit_once("/domain/"))
+    {
+        Some((_, local)) => local,
+        None => key,
+    }
+}
+
+/// SPEC §7.2 (found live 2026-10-09): a deployment is admitted against the
+/// memory a host has available now, not its total, and must leave the free
+/// reserve. When the domain's managed limit plus that reserve exceeds what is
+/// available now (plus what deployments already charged there hold), a
+/// deployment sized near the limit is refused until memory is freed, though
+/// the limits fit the total. The warning that says so with its figures, or
+/// `None`. A warning only: nothing is refused for it.
+pub fn headroom_warning(
+    limit: &MemoryLimit,
+    observation: &MemoryObservation,
+    charged_bytes: i64,
+) -> Option<String> {
+    // ADR 0019 §2: a device domain keeps only the part of its reserve that
+    // unaccounted memory does not already take; nothing is credited as held.
+    let reserve = limit.required_free(observation.capacity_bytes, observation.available_bytes, 0);
+    let needed = limit.managed_bytes.saturating_add(reserve);
+    let covered = observation
+        .available_bytes
+        .saturating_add(charged_bytes.max(0));
+    if needed <= covered {
+        return None;
+    }
+    let held = if charged_bytes > 0 {
+        format!(
+            " (plus {} charged to deployments there)",
+            gib(charged_bytes)
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} memory has {} available{held}, less than its {} managed limit plus its {} free \
+         reserve ({}): a deployment near the limit cannot be admitted until {} more is free",
+        local_domain(&limit.domain),
+        gib(observation.available_bytes),
+        gib(limit.managed_bytes),
+        gib(reserve),
+        gib(needed),
+        gib(needed - covered)
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,4 +373,94 @@ pub fn validate_recipe(r: &RecipeFootprints) -> Result<(), ResourceError> {
 fn phase_names_include_transient_parking() {
     assert_ne!(ResourcePhase::Parking, ResourcePhase::Parked);
     assert_ne!(ResourcePhase::Cold, ResourcePhase::Wake);
+}
+
+// SPEC §7.2: the free-memory refusal names its figures in capacity_blocked's
+// wording, under the closed code status classifies.
+#[test]
+fn the_free_memory_refusal_names_its_figures() {
+    let refusal = ResourceError::InsufficientAvailable(Box::new(AvailableShortfall {
+        domain: "system".into(),
+        device: false,
+        available_bytes: 118 << 30,
+        charge_bytes: 109 << 30,
+        pending_bytes: 0,
+        free_reserve_bytes: 11 << 30,
+        short_bytes: 2 << 30,
+    }));
+    assert_eq!(
+        refusal.to_string(),
+        "insufficient_memory: needs 109.0 GiB of system memory, 118.0 GiB available and a \
+         11.0 GiB free reserve to keep, 2.0 GiB short"
+    );
+    let ResourceError::InsufficientAvailable(mut shortfall) = refusal else {
+        unreachable!()
+    };
+    shortfall.domain = "host/4:h-01/domain/gpu0".into();
+    shortfall.device = true;
+    shortfall.pending_bytes = 3 << 30;
+    assert_eq!(
+        shortfall.to_string(),
+        "insufficient_device_memory: needs 109.0 GiB of gpu0 memory beside 3.0 GiB charged to \
+         starts not yet resident, 118.0 GiB available and a 11.0 GiB free reserve to keep, \
+         2.0 GiB short"
+    );
+}
+
+// SPEC §7.2: the start-time warning appears only when the managed limit plus
+// the free reserve exceeds the memory available now (with what deployments
+// already charged there hold); the total alone never decides it.
+#[test]
+fn the_headroom_warning_appears_only_when_available_memory_falls_short() {
+    const GIB: i64 = 1 << 30;
+    let limit = MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 110 * GIB,
+        free_reserve_bytes: 11 * GIB,
+        reserve_absorbs_unmanaged: false,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    };
+    let observed = |available: i64| MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 122 * GIB,
+        available_bytes: available,
+        sampled_at_ms: 1,
+    };
+    let warning = headroom_warning(&limit, &observed(118 * GIB), 0).expect("short");
+    for figure in [
+        "118.0 GiB",
+        "110.0 GiB",
+        "11.0 GiB",
+        "121.0 GiB",
+        "3.0 GiB more",
+    ] {
+        assert!(warning.contains(figure), "{figure}: {warning}");
+    }
+    assert!(warning.starts_with("system memory"), "{warning}");
+    // Enough available, or the shortfall held by deployments already charged.
+    assert_eq!(headroom_warning(&limit, &observed(121 * GIB), 0), None);
+    assert_eq!(
+        headroom_warning(&limit, &observed(118 * GIB), 3 * GIB),
+        None
+    );
+    let held = headroom_warning(&limit, &observed(100 * GIB), 20 * GIB / 2).unwrap();
+    assert!(held.contains("plus 10.0 GiB charged"), "{held}");
+    assert!(held.contains("11.0 GiB more"), "{held}");
+    // ADR 0019 §2: a device domain at idle, the driver's own memory inside
+    // its reserve, can hold a deployment at its limit: no warning.
+    let device = MemoryLimit {
+        domain: "gpu0".into(),
+        managed_bytes: 14 * GIB,
+        free_reserve_bytes: 2 * GIB,
+        reserve_absorbs_unmanaged: true,
+        ..limit
+    };
+    let card = MemoryObservation {
+        domain: "gpu0".into(),
+        capacity_bytes: 16 * GIB,
+        available_bytes: 15 * GIB,
+        sampled_at_ms: 1,
+    };
+    assert_eq!(headroom_warning(&device, &card, 0), None);
 }

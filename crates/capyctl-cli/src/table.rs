@@ -247,7 +247,7 @@ fn hosts(value: &Value) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &[
             "NAME",
             "STATE",
@@ -258,7 +258,25 @@ fn hosts(value: &Value) -> String {
             "ENGINES",
         ],
         &rows,
-    )
+    );
+    // SPEC §7.2 (found live 2026-10-09): a host whose limits plus reserve
+    // exceed the memory it had available says so below the table.
+    for host in value["hosts"].as_array().into_iter().flatten() {
+        let id = host["host_id"].as_str().unwrap_or("-");
+        let name = host["name"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(id);
+        for warning in host["session"]["memory_warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            out.push_str(&format!("warning: {}: {}\n", clean(name), clean(warning)));
+        }
+    }
+    out
 }
 
 /// The hosts an instance runs on, by name: its placed host, or every member
@@ -945,6 +963,29 @@ mod tests {
             .nth(1)
             .unwrap()
             .starts_with("gpu-a   online   yes"));
+    }
+
+    // SPEC §7.2 (found live 2026-10-09): a host's memory headroom warning is
+    // shown below the hosts table, by host name; none without one.
+    #[test]
+    fn hosts_show_memory_warnings_below_the_table() {
+        let host = |warnings: Value| {
+            render(
+                View::Hosts,
+                &json!({"hosts": [{"host_id": "01HOSTA", "name": "gpu-a", "online": true,
+                    "session": {"reconciled": true, "memory_warnings": warnings}}]}),
+                &HostNames::new(),
+            )
+        };
+        const WARNING: &str = "system memory has 118.2 GiB available, less than its 110.0 GiB \
+             managed limit plus its 11.0 GiB free reserve (121.0 GiB): a deployment near the \
+             limit cannot be admitted until 2.8 GiB more is free";
+        let out = host(json!([WARNING]));
+        assert!(
+            out.ends_with(&format!("\nwarning: gpu-a: {WARNING}\n")),
+            "{out}"
+        );
+        assert!(!host(Value::Null).contains("warning"));
     }
 
     #[test]

@@ -417,6 +417,9 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
                         "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
                 })
             }),
+            memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
+                "system memory has 32.0 GiB available".to_owned(),
+            ])),
         },
     );
     let get = |uri: &str, token: Option<&str>| {
@@ -473,6 +476,12 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
     assert!(row["session"]["domains"][0]["observed_at_unix_ms"]
         .as_i64()
         .is_some_and(|t| t > 0));
+    // SPEC §7.2: the warnings the role logged at start, as a host's session
+    // shows them.
+    assert_eq!(
+        row["session"]["memory_warnings"],
+        json!(["system memory has 32.0 GiB available"])
+    );
 
     let (status, listing) = body(
         get("/management/v1/engines", Some(MANAGEMENT))

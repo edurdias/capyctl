@@ -398,11 +398,13 @@ fn reserve_in_transaction(
         // memory; its own charge is already in use and the host's published
         // free memory cannot cover it a second time. The limits it could
         // breach are the category ones, which admit_phase reports separately.
-        Err(capyctl_domain::resources::ResourceError::Insufficient)
-            if snapshot
-                .owners
-                .get(&request.owner_id)
-                .is_some_and(|current| !allocates_more(current, &request.next)) => {}
+        Err(
+            capyctl_domain::resources::ResourceError::Insufficient
+            | capyctl_domain::resources::ResourceError::InsufficientAvailable(_),
+        ) if snapshot
+            .owners
+            .get(&request.owner_id)
+            .is_some_and(|current| !allocates_more(current, &request.next)) => {}
         Err(error) => return Err(error.into()),
     }
     let epoch = i64::try_from(snapshot.epoch)

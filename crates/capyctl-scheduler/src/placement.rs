@@ -14,7 +14,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use capyctl_domain::resources::{
-    claims_conflict, validate_footprint, LedgerSnapshot, MemoryLimit, PhaseFootprint, ResourcePhase,
+    claims_conflict, gib, validate_footprint, LedgerSnapshot, MemoryLimit, PhaseFootprint,
+    ResourcePhase,
 };
 
 use crate::device_choice::{choose_device, DeviceOption};
@@ -396,11 +397,6 @@ pub fn plan_group_eviction_within(
         plan.insert(host.clone(), victims);
     }
     Some(plan)
-}
-
-/// Bytes shown to the operator, in GiB with one decimal.
-pub fn gib(bytes: i64) -> String {
-    format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
 }
 
 /// Why `candidate` cannot take the instance, in the operator's terms: on the

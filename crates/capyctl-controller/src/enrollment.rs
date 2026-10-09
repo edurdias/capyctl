@@ -58,11 +58,12 @@ fn now() -> i64 {
 }
 impl EnrollmentAuthority {
     /// Called only after AgentControl binds this report to its verified peer.
+    /// Returns the host's memory headroom warnings (SPEC §7.2).
     pub fn publish_inventory(
         &self,
         host: &str,
         inventory: &capyctl_protocol::pb::ReportInventory,
-    ) -> Result<(), crate::host_publication::PublicationError> {
+    ) -> Result<Vec<String>, crate::host_publication::PublicationError> {
         crate::host_publication::publish(&self.state, host, inventory)
     }
     /// ADR 0018 §3: a live re-publication from a reconciled session. `Err`

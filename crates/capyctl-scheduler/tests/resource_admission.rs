@@ -1,8 +1,29 @@
 use capyctl_domain::resources::{
-    Allocation, DeviceClaim, LedgerSnapshot, MemoryLimit, MemoryObservation, PhaseFootprint,
-    ResidentFloor, ResourcePhase, Sharing,
+    Allocation, AvailableShortfall, DeviceClaim, LedgerSnapshot, MemoryLimit, MemoryObservation,
+    PhaseFootprint, ResidentFloor, ResourcePhase, Sharing,
 };
 use capyctl_scheduler::residency::*;
+
+/// SPEC §7.2: the free-memory refusal on `domain` with its figures:
+/// available, the candidate's charge, other starts not yet resident, the free
+/// reserve to keep and the shortfall.
+fn short(
+    domain: &str,
+    device: bool,
+    [available, charge, pending, reserve, short]: [i64; 5],
+) -> Result<(), ResourceError> {
+    Err(ResourceError::InsufficientAvailable(Box::new(
+        AvailableShortfall {
+            domain: domain.into(),
+            device,
+            available_bytes: available,
+            charge_bytes: charge,
+            pending_bytes: pending,
+            free_reserve_bytes: reserve,
+            short_bytes: short,
+        },
+    )))
+}
 
 #[test]
 fn shared_claims_can_overlap() {
@@ -267,17 +288,24 @@ fn reservation_slack_is_not_physical_credit() {
         bytes: 8,
         sampled_at_ms: 100,
     }];
-    for context in [
-        AdmissionContext::new(&obs, &limits, 101, 60, 4),
-        AdmissionContext::new(&obs, &limits, 101, 60, 4).with_resident_floors(&floors),
+    // T29: 32 available; the candidate's own charge (48, or 40 beyond the
+    // 8-byte floor) leaves less than the 16 reserve; another's charge not yet
+    // resident counts against it too.
+    for (context, own, pending) in [
+        (AdmissionContext::new(&obs, &limits, 101, 60, 4), 48, 48),
+        (
+            AdmissionContext::new(&obs, &limits, 101, 60, 4).with_resident_floors(&floors),
+            40,
+            40,
+        ),
     ] {
         assert_eq!(
             admit_phase(&state, "a", &f(ResourcePhase::Wake, 48), context),
-            Err(ResourceError::Insufficient)
+            short("system", false, [32, own, 0, 16, own - 16])
         );
         assert_eq!(
             admit_phase(&state, "b", &f(ResourcePhase::Cold, 1), context),
-            Err(ResourceError::Insufficient)
+            short("system", false, [32, 1, pending, 16, pending - 15])
         );
     }
     for bad in [
@@ -345,6 +373,9 @@ fn installed_capacity_is_not_available_memory() {
         host_kv_bytes: None,
         parked_bytes: None,
     }];
+    // T29 (found live 2026-10-09): within the managed limit, refused on the
+    // memory available now, with the figures: 20 available, 30 needed, 12
+    // reserve to keep, 22 short.
     assert_eq!(
         admit_phase(
             &snapshot,
@@ -352,7 +383,7 @@ fn installed_capacity_is_not_available_memory() {
             &next,
             AdmissionContext::new(&obs, &limits, 101, 60, 4)
         ),
-        Err(ResourceError::Insufficient)
+        short("system", false, [20, 30, 0, 12, 22])
     );
     obs[0].sampled_at_ms = 0;
     assert_eq!(
@@ -471,10 +502,11 @@ fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
         admit_phase(&state, "a", &f(ResourcePhase::Wake, 12), context),
         Ok(())
     );
-    // One byte beyond its own floor is judged as before.
+    // One byte beyond its own floor is judged as before: 10 available, 1
+    // more for it and b's 30 not yet resident, 16 to keep.
     assert_eq!(
         admit_phase(&state, "a", &f(ResourcePhase::Wake, 21), context),
-        Err(ResourceError::Insufficient)
+        short("system", false, [10, 1, 30, 16, 37])
     );
     // Without the floor it is judged as before.
     assert_eq!(
@@ -484,7 +516,7 @@ fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
             &f(ResourcePhase::Wake, 12),
             AdmissionContext::new(&obs, &limits, 101, 60, 4)
         ),
-        Err(ResourceError::Insufficient)
+        short("system", false, [10, 12, 30, 16, 48])
     );
     // The managed limit still applies: 30 + 67 > 96.
     assert_eq!(
@@ -545,7 +577,7 @@ fn a_device_reserve_absorbs_unaccounted_memory() {
     let charged = 14828 * MIB;
     assert_eq!(
         admit(false, idle, charged),
-        Err(ResourceError::Insufficient)
+        short("gpu0", false, [idle, charged, 0, 1310 * MIB, 222 * MIB])
     );
     assert_eq!(admit(true, idle, charged), Ok(()));
     // Exactly the managed limit fits; beyond it the ledger refuses.
@@ -557,11 +589,14 @@ fn a_device_reserve_absorbs_unaccounted_memory() {
     // Another program holding 2 GiB more than the reserve absorbs: the card
     // must still physically hold the charge.
     let busy = idle - 2048 * MIB;
-    assert_eq!(admit(true, busy, charged), Err(ResourceError::Insufficient));
+    assert_eq!(
+        admit(true, busy, charged),
+        short("gpu0", true, [busy, charged, 0, 0, charged - busy])
+    );
     assert_eq!(admit(true, busy, busy), Ok(()));
     assert_eq!(
         admit(true, busy, busy + 1),
-        Err(ResourceError::Insufficient)
+        short("gpu0", true, [busy, busy + 1, 0, 0, 1])
     );
 }
 
