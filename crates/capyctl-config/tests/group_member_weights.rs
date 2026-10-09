@@ -219,9 +219,13 @@ fn a_single_host_deployment_is_unchanged() {
         resolve_effective_with_checkpoint(&tp1, &host, measured(60 * GIB, Some(l))).unwrap(),
         single
     );
+    // Pinned on main after the unified-memory margin (ADR 0014 A18) merged: a
+    // 60 GiB checkpoint is above its 26.7 GiB floor, so that change, not this
+    // one, moved the identity. The assertions above prove the group share
+    // leaves a single host untouched.
     assert_eq!(
         single.recipe_fingerprint,
-        "3f1f47904bd326890ef04a4d42fc16cfb00aac6a771823a036c563812b51d779"
+        "60c90d0996552741d09cd901e9c160f79615c18f775ec33e8196d7ce6c89a7ee"
     );
 }
 
