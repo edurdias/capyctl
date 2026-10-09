@@ -6,6 +6,7 @@
 use capyctl_adapters::vllm::{park_policy, plan_from_effective, render_command, VllmPlanError};
 use capyctl_adapters::ParkPolicy;
 use capyctl_config::effective::{resolve_effective, CudaNamespace, EffectiveDeployment};
+use capyctl_domain::launch::LaunchSettings;
 use serde_json::{json, Value};
 
 fn fixture() -> (Value, Value) {
@@ -88,13 +89,11 @@ fn sleep_mode_follows_the_host_deep_park_switch() {
 
     let enabled = effective("enabled");
     let plan = plan_from_effective(&enabled, 8123, "l".into(), "/r".into()).unwrap();
+    // ADR 0014 amendment A21 (owner decision 2026-10-09): the fixture's host
+    // is unified memory, so an undeclared loader now defaults to `lazy`.
     assert_eq!(
         plan.sleep_flags,
-        vec![
-            "--enable-sleep-mode",
-            "--safetensors-load-strategy",
-            "eager"
-        ]
+        vec!["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
     );
     assert_eq!(park_policy(&enabled), ParkPolicy::Enabled);
     let rendered = render_command(&plan).unwrap();
@@ -108,10 +107,12 @@ fn sleep_mode_follows_the_host_deep_park_switch() {
         .any(|w| w == ["--middleware", "capyctl_vllm_guard.RequireEngineKey"]));
 }
 
-/// ADR 0014 §4 (amended 2026-10-07, owner decision 1): under sleep mode the
-/// loader stays beside the switch, `eager` unless the deployment chose `lazy`;
-/// outside sleep mode a declared loader renders once as a typed field and an
-/// omitted one renders nothing (vLLM's own default).
+/// ADR 0014 §4 (amended 2026-10-07, owner decision 1; amendment A21, owner
+/// decision 2026-10-09): under sleep mode the loader stays beside the
+/// switch, resolved from the deployment's choice or capyctl's default for
+/// the host's memory shape; outside sleep mode a declared loader renders
+/// once as a typed field and a defaulted one renders nothing (vLLM's own
+/// default).
 // T14 T21
 #[test]
 fn the_load_strategy_follows_the_deployment_setting() {
@@ -136,16 +137,14 @@ fn the_load_strategy_follows_the_deployment_setting() {
         (plan.sleep_flags, strategy(&argv))
     };
 
+    // The fixture's host is unified memory, so an undeclared loader resolves
+    // to `lazy` (amendment A21).
     let (sleep, rendered) = render("enabled", None);
     assert_eq!(
         sleep,
-        [
-            "--enable-sleep-mode",
-            "--safetensors-load-strategy",
-            "eager"
-        ]
+        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
     );
-    assert_eq!(rendered, ["eager"]);
+    assert_eq!(rendered, ["lazy"]);
 
     let (sleep, rendered) = render("enabled", Some("lazy"));
     assert_eq!(
@@ -161,6 +160,105 @@ fn the_load_strategy_follows_the_deployment_setting() {
     let (sleep, rendered) = render("disabled", None);
     assert!(sleep.is_empty());
     assert!(rendered.is_empty());
+}
+
+/// ADR 0014 amendment A21 (owner decision 2026-10-09): absent a declared
+/// choice, the loader defaults to the host's own unified/discrete memory
+/// shape (ADR 0019 covers discrete GPUs): `lazy` on unified memory, `eager`
+/// on a discrete GPU. A declared choice wins on either shape, and the
+/// resolved value (declared or defaulted) always renders under sleep mode.
+// T14 T21
+#[test]
+fn the_default_load_strategy_follows_the_host_memory_shape() {
+    let strategy = |argv: &[String]| -> Vec<String> {
+        argv.windows(2)
+            .filter(|w| w[0] == "--safetensors-load-strategy")
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    let render = |discrete: bool, declared: Option<&str>| {
+        let (mut deployment, mut host) = fixture();
+        if discrete {
+            host["resource_policy"]["domains"] = json!({
+                "system": {"memory": "distinct", "managed_limit": "30GiB",
+                           "free_reserve": "12GiB", "parked_limit": "15GiB"},
+                "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                         "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+            });
+            host["resource_policy"]["devices"] =
+                json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+            let object = deployment.as_object_mut().unwrap();
+            object.remove("resources");
+            deployment["engine_config"]["memory"] =
+                json!({"request": "12GiB", "kv_cache": "4GiB", "startup": "12GiB"});
+        }
+        if let Some(declared) = declared {
+            deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": declared});
+        }
+        // The fixture already parks (residency `deep`, deep park enabled).
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+            panic!("vLLM settings");
+        };
+        let defaulted = settings
+            .provenance
+            .contains_key("vllm.safetensors_load_strategy");
+        let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+        let argv = render_command(&plan).unwrap().argv;
+        (
+            settings
+                .safetensors_load_strategy
+                .map(|s| s.as_str().to_owned()),
+            defaulted,
+            plan.sleep_flags,
+            strategy(&argv),
+        )
+    };
+
+    let (effective, defaulted, sleep, rendered) = render(false, None);
+    assert_eq!(effective.as_deref(), Some("lazy"));
+    assert!(defaulted, "an undeclared choice is a capyctl default");
+    assert_eq!(
+        sleep,
+        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+    );
+    assert_eq!(rendered, ["lazy"]);
+
+    let (effective, defaulted, sleep, rendered) = render(true, None);
+    assert_eq!(effective.as_deref(), Some("eager"));
+    assert!(defaulted, "an undeclared choice is a capyctl default");
+    assert_eq!(
+        sleep,
+        [
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
+    );
+    assert_eq!(rendered, ["eager"]);
+
+    // An explicit choice wins on either shape and carries no provenance entry.
+    let (effective, defaulted, sleep, rendered) = render(false, Some("eager"));
+    assert_eq!(effective.as_deref(), Some("eager"));
+    assert!(!defaulted, "a declared choice has no provenance entry");
+    assert_eq!(
+        sleep,
+        [
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
+    );
+    assert_eq!(rendered, ["eager"]);
+
+    let (effective, defaulted, sleep, rendered) = render(true, Some("lazy"));
+    assert_eq!(effective.as_deref(), Some("lazy"));
+    assert!(!defaulted, "a declared choice has no provenance entry");
+    assert_eq!(
+        sleep,
+        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+    );
+    assert_eq!(rendered, ["lazy"]);
 }
 
 /// SPEC §6.2: `restart_only` prohibits sleep calls, so an enabled host switch

@@ -76,6 +76,19 @@ pub const STARTUP_WEIGHTS_FACTOR: (i64, i64) = (9, 4);
 /// The factor of a revision frozen before amendment A8 (1.6), which it keeps.
 pub const LEGACY_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
 
+/// ADR 0014 amendment A21 (owner decision 2026-10-09): [`STARTUP_WEIGHTS_FACTOR`]
+/// was measured without a safetensors loader flag rendered (vLLM 0.30's own
+/// default, memory-mapped), which is what every launch still gets unless vLLM
+/// actually receives `--safetensors-load-strategy eager`
+/// (`VllmLaunchSettings::renders_eager_loader`). Eager reads each file into CPU
+/// memory before loading, a larger transient footprint. Found live (catalog
+/// run, Qwen3.6-35B-A3B NVFP4, vLLM 0.30, host A, deep park): eager's loading
+/// peak was 54.2 GiB against lazy's 34.5 GiB, 1.57× it. Applied to
+/// `STARTUP_WEIGHTS_FACTOR` (2.25) and rounded up for headroom, as that factor
+/// was itself rounded up over its own measured ratio. A placeholder, not a
+/// measurement.
+pub const VLLM_EAGER_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (18, 5);
+
 /// ADR 0014 amendment A8 (found live 2026-10-02): the first-start graph
 /// allowance, per model whose CUDA graphs the engine captures (the checkpoint,
 /// and the draft model of a speculative deployment). Graphs are captured after
@@ -100,21 +113,25 @@ pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
 
 /// Owner decision 2026-09-23: the placeholder startup peak for a request,
 /// the checkpoint's weights (when known), the family margin and (amendment
-/// A8) the graph allowance: `max(request + graphs, weights × 2.25 + margin)`.
-/// `graphs` is `None` for a revision frozen before amendment A8, which keeps
-/// `max(request, weights × 1.6 + margin)`.
+/// A8) the graph allowance: `max(request + graphs, weights × factor + margin)`.
+/// `factor` is `weights_factor` when given (amendment A21, owner decision
+/// 2026-10-09: vLLM's eager safetensors loader), else
+/// [`STARTUP_WEIGHTS_FACTOR`]. `graphs` is `None` for a revision frozen before
+/// amendment A8, which keeps `max(request, weights × 1.6 + margin)` whatever
+/// `weights_factor` says.
 pub fn default_startup_bytes(
     request: i64,
     weights: Option<i64>,
     margin: i64,
     graphs: Option<i64>,
+    weights_factor: Option<(i64, i64)>,
 ) -> Option<i64> {
     let floor = request.checked_add(graphs.unwrap_or(0))?;
     let Some(weights) = weights else {
         return Some(floor);
     };
     let (numerator, denominator) = if graphs.is_some() {
-        STARTUP_WEIGHTS_FACTOR
+        weights_factor.unwrap_or(STARTUP_WEIGHTS_FACTOR)
     } else {
         LEGACY_STARTUP_WEIGHTS_FACTOR
     };
@@ -302,8 +319,10 @@ struct RawVllmFields {
     block_size_tokens: Option<u32>,
     #[serde(default)]
     max_num_batched_tokens: Option<u32>,
-    // ADR 0014 §4 (amended 2026-10-07): `eager` or `lazy`; omitted keeps the
-    // capyctl default (`eager` while sleep mode is on).
+    // ADR 0014 §4 (amended 2026-10-07); amendment A21 (owner decision
+    // 2026-10-09): `eager` or `lazy`; omitted keeps capyctl's default for the
+    // host's memory shape (`lazy` on unified memory, `eager` on a discrete
+    // GPU).
     #[serde(default)]
     safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
     // ADR 0024: `auto` (the default), `none`, or a parser name.
@@ -661,6 +680,7 @@ pub fn resolve_startup(
     facts: CheckpointFacts,
     margin: i64,
     graphs: Option<i64>,
+    weights_factor: Option<(i64, i64)>,
 ) -> Result<(Option<i64>, Option<SettingSource>), ConfigError> {
     const PATH: &str = "engine_config.memory.startup";
     if let Some(peak) = declared {
@@ -685,8 +705,14 @@ pub fn resolve_startup(
     if resources_declared || facts.legacy_startup {
         return Ok((None, None));
     }
-    let peak = default_startup_bytes(memory.request_bytes, memory.weights_bytes, margin, graphs)
-        .ok_or_else(|| invalid(PATH, "memory arithmetic overflows"))?;
+    let peak = default_startup_bytes(
+        memory.request_bytes,
+        memory.weights_bytes,
+        margin,
+        graphs,
+        weights_factor,
+    )
+    .ok_or_else(|| invalid(PATH, "memory arithmetic overflows"))?;
     Ok((Some(peak), Some(SettingSource::Derived)))
 }
 
@@ -1103,6 +1129,28 @@ pub(super) fn normalize_engine_config(
     let parks = inputs.residency.parks();
     let sleep_mode = parks && inputs.security.deep_park.is_enabled();
 
+    // ADR 0014 amendment A21 (owner decision 2026-10-09): the deployment's
+    // safetensors loader defaults to the host's own unified/discrete memory
+    // shape (ADR 0019 covers discrete GPUs) absent a declared choice: lazy on
+    // unified memory, eager on a discrete GPU. Found live (catalog run,
+    // Qwen3.6-35B NVFP4, vLLM 0.30, host A, deep park): eager vs lazy start
+    // 98 s vs 180 s, loading peak 54.2 vs 34.5 GiB, ready footprint 43.95 vs
+    // 26.63 GiB, parked charge after three cycles 28.3 vs 8.3 GB, wake to
+    // first token about 51 s vs 81 s; eager also drove the parked-growth
+    // guard (amendment A19) into stops.
+    let vllm_strategy_declared = vllm.safetensors_load_strategy;
+    let vllm_strategy_resolved = vllm_strategy_declared.unwrap_or(if inputs.device.is_some() {
+        SafetensorsLoadStrategy::Eager
+    } else {
+        SafetensorsLoadStrategy::Lazy
+    });
+    // Mirrors `VllmLaunchSettings::renders_eager_loader`: whether CapyCTL
+    // will actually pass `--safetensors-load-strategy eager` to vLLM, which
+    // is what the startup placeholder below must size for.
+    let vllm_renders_eager = engine == Engine::Vllm
+        && vllm_strategy_resolved == SafetensorsLoadStrategy::Eager
+        && (sleep_mode || vllm_strategy_declared.is_some());
+
     // ADR 0014 §6 (owner decision Q10).
     let extra_args = raw.extra_args.clone().unwrap_or_default();
     if !extra_args.is_empty() {
@@ -1361,6 +1409,7 @@ pub(super) fn normalize_engine_config(
         inputs.facts,
         overhead_margin(engine),
         graphs,
+        vllm_renders_eager.then_some(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
     )?;
     memory.startup_bytes = startup;
     if let Some(source) = startup_source {
@@ -1391,12 +1440,18 @@ pub(super) fn normalize_engine_config(
                 vllm.max_num_batched_tokens,
             )?;
             provenance.insert("enable_sleep_mode".into(), SettingSource::Derived);
+            if vllm_strategy_declared.is_none() {
+                provenance.insert(
+                    "vllm.safetensors_load_strategy".into(),
+                    SettingSource::CapyctlDefault,
+                );
+            }
             LaunchSettings::Vllm(VllmLaunchSettings {
                 common,
                 memory,
                 block_size_tokens: vllm.block_size_tokens,
                 max_num_batched_tokens: vllm.max_num_batched_tokens,
-                safetensors_load_strategy: vllm.safetensors_load_strategy,
+                safetensors_load_strategy: Some(vllm_strategy_resolved),
                 tool_call_parser,
                 reasoning_parser,
                 enable_sleep_mode: sleep_mode,

@@ -328,22 +328,32 @@ CapyCTL reserves.
 
 ## vLLM weight loading while parking
 
-A vLLM deployment that parks `deep` reloads its weights on every wake. By
-default CapyCTL starts it with vLLM's `eager` loader, which reads each weight
-file into memory first; on vLLM 0.29 and Qwen3-4B this cut a wake from 57 s to
-7.5 s. On vLLM 0.30 with NVFP4 models it instead held about 15–17 GiB more
-memory once loaded, and the wake still took about 55 s. Choose the loader in
-the deployment:
+A vLLM deployment that parks `deep` reloads its weights on every wake. CapyCTL
+picks a default loader from the machine's memory, unless you set one:
+`lazy` on a machine with unified memory (GPU and system memory share one
+pool, like a GB10), `eager` on a discrete GPU.
+
+`eager` reads each weight file into memory before loading. On a discrete GPU
+(vLLM 0.29, Qwen3-4B) this cut a wake from 57 s to 7.5 s. On a unified-memory
+machine (vLLM 0.30, an NVFP4 model) the trade runs the other way: `eager`
+held around 54 GiB while loading against `lazy`'s 34 GiB, about 44 GiB
+against 27 GiB once running, and around 28 GB still held after parking and
+waking three times in a row against `lazy`'s 8 GB — holding onto that much
+memory can also trip the stop that CapyCTL uses instead of a park once the
+parked memory keeps growing run after run. `eager`'s wake (about 51 s) is
+still faster than `lazy`'s (about 81 s), so pick `eager` by hand if the wake
+time matters more than the memory. `lazy` maps the weight files instead of
+reading them up front. Choose it either way in the deployment:
 
 ```yaml
 engine_config:
   vllm:
-    safetensors_load_strategy: lazy   # eager (default while parking) or lazy
+    safetensors_load_strategy: eager   # eager or lazy; default follows the machine's memory
 ```
 
-`lazy` maps the weight files instead of reading them up front. A deployment
-that does not park renders the loader only when you set it. Passing
-`--safetensors-load-strategy` in `extra_args` is refused; use the field.
+A deployment that does not park renders the loader only when you set it.
+Passing `--safetensors-load-strategy` in `extra_args` is refused; use the
+field.
 
 ## First model on each engine
 

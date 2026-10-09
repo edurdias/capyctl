@@ -7,7 +7,7 @@
 use capyctl_config::effective::{
     decode_effective_snapshot, default_startup_bytes, deployment_command_fingerprint,
     resolve_effective, resolve_effective_with_checkpoint, startup_budget, CheckpointFacts,
-    StartupProvenance, VLLM_OVERHEAD_MARGIN_BYTES,
+    StartupProvenance, VLLM_EAGER_STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 use capyctl_config::{parse_strict, ConfigKind};
 use capyctl_domain::launch::SettingSource;
@@ -156,12 +156,50 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     let unknown = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(cold(&unknown), 40 * GIB + GRAPHS + OVERHEAD);
     assert_eq!(
-        default_startup_bytes(40 * GIB, None, 8 * GIB, Some(GRAPHS)),
+        default_startup_bytes(40 * GIB, None, 8 * GIB, Some(GRAPHS), None),
         Some(40 * GIB + GRAPHS)
     );
     assert_eq!(
-        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB, Some(GRAPHS)),
+        default_startup_bytes(40 * GIB, Some(i64::MAX), 8 * GIB, Some(GRAPHS), None),
         None
+    );
+}
+
+/// ADR 0014 amendment A21 (owner decision 2026-10-09): the startup
+/// placeholder scales with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` exactly when
+/// CapyCTL will actually pass `--safetensors-load-strategy eager` to vLLM,
+/// never with a defaulted or declared `lazy` loader on the same (unified)
+/// host.
+// T14 T26
+#[test]
+fn the_startup_placeholder_follows_the_effective_loader() {
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
+    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "eager"});
+    let eager = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
+    let expected = 30 * GIB / 5 * 18 + VLLM_OVERHEAD_MARGIN_BYTES;
+    assert_eq!(expected, 116 * GIB);
+    assert_eq!(cold(&eager), expected + OVERHEAD);
+    assert_eq!(
+        default_startup_bytes(
+            40 * GIB,
+            Some(30 * GIB),
+            VLLM_OVERHEAD_MARGIN_BYTES,
+            Some(GRAPHS),
+            Some(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
+        ),
+        Some(expected)
+    );
+
+    // Declared `lazy` on the same unified host keeps the lighter factor
+    // (amendment A8's 2.25), the same as the fixture's undeclared default.
+    let mut lazy = deployment.clone();
+    lazy["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
+    let lazy_effective =
+        resolve_effective_with_checkpoint(&lazy, &host, weights(30 * GIB)).unwrap();
+    assert_eq!(
+        cold(&lazy_effective),
+        30 * GIB * 9 / 4 + VLLM_OVERHEAD_MARGIN_BYTES + OVERHEAD
     );
 }
 
@@ -346,7 +384,7 @@ fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
         old
     );
     assert_eq!(
-        default_startup_bytes(40 * GIB, Some(30 * GIB), 8 * GIB, None),
+        default_startup_bytes(40 * GIB, Some(30 * GIB), 8 * GIB, None, None),
         Some(56 * GIB)
     );
 }

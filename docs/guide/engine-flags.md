@@ -47,7 +47,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | CUDA graphs | `--enforce-eager` | typed | `engine_config.cuda_graphs` |
 | Weight dtype | `--dtype` | typed | `engine_config.dtype` |
 | Quantization | `--quantization` | typed | `engine_config.quantization` |
-| Weight loading | `--safetensors-load-strategy` | typed | `engine_config.vllm.safetensors_load_strategy` (`eager` or `lazy`; `eager` by default while parking) |
+| Weight loading | `--safetensors-load-strategy` | typed | `engine_config.vllm.safetensors_load_strategy` (`eager` or `lazy`; default while parking follows the machine's memory: `lazy` on unified memory, `eager` on a discrete GPU) |
 | Text only | `--language-model-only` | typed | `engine_config.language_model_only` |
 | Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
 | Log level | `--uvicorn-log-level` | reserved | CapyCTL owns the server's logging. vLLM's own level is the `VLLM_LOGGING_LEVEL` variable: set it in `engine_config.env` once the installation lists it in `security.approved_env`. |

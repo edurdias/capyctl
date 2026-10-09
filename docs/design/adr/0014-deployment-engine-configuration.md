@@ -144,10 +144,10 @@ accept abbreviations), and at launch by the engine's own parser (§6).
 Some of today's pins encode live findings rather than a checkpoint. They become defaults
 the deployment may override, shown with provenance `mllm default` in the effective
 configuration (T14): SGLang CUDA graphs off while the memory saver is on (until A13), SGLang
-tokenizer and detokenizer workers 1, vLLM
-`--safetensors-load-strategy eager` whenever sleep mode is on (reserved there; the
-deployment chooses it with the typed `vllm.safetensors_load_strategy`, see the note on
-§4 of 2026-10-07). Every other `_FIXED` value is dropped and the engine's own default
+tokenizer and detokenizer workers 1, vLLM's safetensors loader whenever sleep mode is on
+(reserved there; the deployment chooses it with the typed `vllm.safetensors_load_strategy`,
+see the note on §4 of 2026-10-07 and amendment A21 of 2026-10-09: `lazy` on unified memory,
+`eager` on a discrete GPU). Every other `_FIXED` value is dropped and the engine's own default
 applies.
 
 ### 5. Memory request (P2)
@@ -1528,3 +1528,46 @@ Decision:
 Open: SGLang's file backend writes its own sparse copy of the table under
 `--ple-offload-dir` (default `$SGLANG_CACHE_DIR/ple/<model path>`), outside the model store and
 not counted against the models disk.
+
+## Amendment A21: the safetensors loader defaults to the host's memory shape (owner decision 2026-10-09)
+
+The note on §3 and §4 (2026-10-07) left an omitted loader rendering `eager` under sleep mode
+on every host, because that is what the Qwen3-4B qualification measured on a discrete GPU
+(vLLM 0.29, `785b887`: wake 57 s to 7.5 s). The catalog's own vLLM 0.30 NVFP4 runs already
+noted the opposite trade on unified memory, but left `eager` as the default pending a
+controlled comparison.
+
+Evidence (host A, Qwen3.6-35B NVFP4, vLLM 0.30, deep park, `eager` vs `lazy`): start 98 s vs
+180 s, loading peak 54.2 vs 34.5 GiB, ready footprint 43.95 vs 26.63 GiB, parked charge after
+three cycles 28.3 vs 8.3 GB, wake to first token about 51 s vs 81 s. `eager` also drove
+amendment A19's parked-growth guard into stops.
+
+Decision:
+
+1. Absent a declared `vllm.safetensors_load_strategy`, resolution picks `lazy` when the
+   deployment's phases derive on unified memory (`EngineInputs::device` is `None`) and `eager`
+   on a discrete GPU (`Some`, ADR 0019). The resolved value is always present in the effective
+   configuration (`VllmLaunchSettings::safetensors_load_strategy`, never `None` once resolved)
+   with `provenance["vllm.safetensors_load_strategy"]` naming it `capyctl default`; a declared
+   value still has no entry (SPEC §7, T14). Rendering is unchanged by this amendment: under
+   sleep mode the resolved value always renders beside `--enable-sleep-mode`; outside it, only
+   a declared value renders, so an undeclared, non-parking launch keeps its command identity
+   (`VllmLaunchSettings::renders_eager_loader`).
+2. [`STARTUP_WEIGHTS_FACTOR`](../../../crates/capyctl-config/src/effective/engine_config.rs)
+   (2.25) was measured without the flag rendered at all (vLLM 0.30's own default, memory-mapped),
+   which is what every non-eager launch still gets. A new constant,
+   `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6), applies to the startup placeholder exactly when
+   `renders_eager_loader` is true: scaled from `STARTUP_WEIGHTS_FACTOR` by the evidence's
+   loading-peak ratio (54.2 / 34.5 ≈ 1.57×) and rounded up for headroom, the same way
+   `STARTUP_WEIGHTS_FACTOR` itself was rounded up over its own measured ratio (amendment A8).
+   A placeholder, not a measurement.
+3. The command fingerprint (`deployment_command_fingerprint`, which hashes only what the
+   deployment declared) is unaffected: it never saw the capyctl default before this amendment
+   and does not see it now.
+
+Evidence: CPU tests cover the default by host shape, the provenance entry, the startup
+placeholder's two factors, and that a declared choice still wins and keeps its command
+identity (`the_default_load_strategy_follows_the_host_memory_shape`,
+`an_omitted_load_strategy_keeps_existing_identities`,
+`the_startup_placeholder_follows_the_effective_loader`). No live park has run with the new
+unified default yet.

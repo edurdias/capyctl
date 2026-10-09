@@ -41,12 +41,18 @@ pub enum VllmPlanError {
 /// profile asks for sleep mode and the host has not opted out of deep park
 /// (Spec §3).
 ///
-/// ADR 0014 §4 (amended 2026-10-07, owner decision 1): the loader defaults to
-/// `eager`, which this project qualified on Spark with vLLM 0.29 (mmap-backed
-/// tensor copies during weight restoration are what it avoids; deep wake 57 s
-/// to 7.5 s on Qwen3-4B). A deployment may choose `lazy` through
-/// `engine_config.vllm.safetensors_load_strategy`: on vLLM 0.30 NVFP4
-/// checkpoints eager keeps more memory once loaded and no longer wakes faster.
+/// ADR 0014 §4 (amended 2026-10-07; amendment A21, owner decision
+/// 2026-10-09): the loader is `settings.safetensors_load_strategy`, already
+/// resolved at config time to the deployment's choice or capyctl's default
+/// for the host's memory shape (`lazy` on unified memory, `eager` on a
+/// discrete GPU, ADR 0019). `unwrap_or(Eager)` only guards a `VllmLaunchSettings`
+/// built outside normal resolution (e.g. test fixtures). The eager default
+/// came from 785b887 (vLLM 0.29, Qwen3-4B, wake 57 s to 7.5 s); the catalog on
+/// vLLM 0.30 NVFP4 found the opposite trade on unified memory (host A,
+/// Qwen3.6-35B, deep park: start 98 s vs 180 s, loading peak 54.2 vs 34.5 GiB,
+/// ready footprint 43.95 vs 26.63 GiB, parked charge after three cycles 28.3
+/// vs 8.3 GB, wake to first token about 51 s vs 81 s), so unified hosts now
+/// default to `lazy`; a discrete GPU keeps `eager`.
 pub fn sleep_flags(settings: &VllmLaunchSettings, deep_park_enabled: bool) -> Vec<String> {
     // ADR 0014 §3: sleep mode is reserved and derived at resolution from the
     // host's deep-park switch and the deployment's residency; the host switch is
@@ -197,10 +203,17 @@ pub fn plan_from_effective(
             )
         }),
         max_num_batched_tokens: settings.max_num_batched_tokens,
-        // ADR 0014 §4 (amended 2026-10-07): outside sleep mode a declared
-        // loader renders as a typed field; under sleep mode `sleep_flags`
-        // renders it, declared or defaulted, beside the switch it belongs to.
-        safetensors_load_strategy: if sleep.is_empty() {
+        // ADR 0014 §4 (amended 2026-10-07; amendment A21, 2026-10-09):
+        // outside sleep mode a declared loader renders as a typed field and a
+        // defaulted one stays silent (vLLM's own default applies, and an
+        // undeclared, non-parking launch keeps its command identity); under
+        // sleep mode `sleep_flags` renders the resolved value, declared or
+        // defaulted, beside the switch it belongs to.
+        safetensors_load_strategy: if sleep.is_empty()
+            && !settings
+                .provenance
+                .contains_key("vllm.safetensors_load_strategy")
+        {
             settings
                 .safetensors_load_strategy
                 .map(|strategy| strategy.as_str().to_owned())

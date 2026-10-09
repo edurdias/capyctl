@@ -83,15 +83,18 @@ pub(super) fn frozen_startup(
 }
 
 /// Owner decision 2026-09-23 (solo first start): the placeholder startup peak
-/// `max(request + graphs, weights × 2.25 + margin)` recomputed with the weights recorded
-/// for the revision since it was frozen, when it was frozen without them and
-/// the recomputed value is larger. Found live 2026-09-23: a revision accepted
-/// while its checkpoint digest was pending was frozen with the request as its
-/// placeholder, so its startup estimate never exceeded the managed limit and
-/// the solo first start never triggered. The weights are sized by a stat walk
-/// within seconds of the deploy (`DigestCheckpoint` size-only), long before
-/// the full digest. Never lowers a frozen estimate and never touches a
-/// declared or measured peak.
+/// `max(request + graphs, weights × factor + margin)` recomputed with the
+/// weights recorded for the revision since it was frozen, when it was frozen
+/// without them and the recomputed value is larger. `factor` follows ADR 0014
+/// amendment A21 (owner decision 2026-10-09) exactly as the original
+/// resolution picked it: higher while vLLM actually gets
+/// `--safetensors-load-strategy eager`. Found live 2026-09-23: a revision
+/// accepted while its checkpoint digest was pending was frozen with the
+/// request as its placeholder, so its startup estimate never exceeded the
+/// managed limit and the solo first start never triggered. The weights are
+/// sized by a stat walk within seconds of the deploy (`DigestCheckpoint`
+/// size-only), long before the full digest. Never lowers a frozen estimate
+/// and never touches a declared or measured peak.
 fn weighed_placeholder(
     tx: &rusqlite::Connection,
     deployment_id: &str,
@@ -119,6 +122,14 @@ fn weighed_placeholder(
     // The derived cold phase carries the engine's CUDA context and graphs
     // beside the startup peak (re-review parity rule), so the recomputed
     // estimate does too.
+    let weights_factor = match &e.engine_config {
+        capyctl_domain::launch::LaunchSettings::Vllm(settings)
+            if settings.renders_eager_loader() =>
+        {
+            Some(capyctl_config::effective::VLLM_EAGER_STARTUP_WEIGHTS_FACTOR)
+        }
+        _ => None,
+    };
     let Some(estimate) = weights
         .and_then(|weights| {
             capyctl_config::effective::default_startup_bytes(
@@ -126,6 +137,7 @@ fn weighed_placeholder(
                 Some(weights),
                 memory.margin_bytes,
                 memory.startup_graphs_bytes,
+                weights_factor,
             )
         })
         .and_then(|estimate| {

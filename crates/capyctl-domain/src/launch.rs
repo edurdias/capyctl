@@ -223,9 +223,15 @@ pub struct VllmLaunchSettings {
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_batched_tokens: Option<u32>,
-    /// ADR 0014 §4 (amended 2026-10-07, owner decision 1): vLLM's safetensors
-    /// loader. `None` keeps the capyctl default: `eager` while sleep mode is
-    /// on, nothing rendered otherwise (the engine's own default).
+    /// ADR 0014 §4 (amended 2026-10-07; amendment A21, owner decision
+    /// 2026-10-09): vLLM's safetensors loader. Always resolved by
+    /// `resolve_effective` (never `None` from a fresh resolution): the
+    /// deployment's declared choice, or capyctl's default for the host's
+    /// memory shape (`lazy` on unified memory, `eager` on a discrete GPU,
+    /// ADR 0019). `provenance["vllm.safetensors_load_strategy"]` names a
+    /// defaulted value; a declared one has no entry. Only
+    /// `VllmLaunchSettings::renders_eager_loader` says whether CapyCTL
+    /// actually passes it to vLLM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
     /// ADR 0024: the deployment's tool-call and reasoning parser choice:
@@ -244,15 +250,37 @@ pub struct VllmLaunchSettings {
     pub provenance: BTreeMap<String, SettingSource>,
 }
 
+impl VllmLaunchSettings {
+    /// ADR 0014 amendment A21 (owner decision 2026-10-09): true exactly when
+    /// `--safetensors-load-strategy eager` is the flag CapyCTL will render to
+    /// vLLM: under sleep mode, where the resolved value (declared or
+    /// defaulted) always renders beside `--enable-sleep-mode`; outside it,
+    /// only when the deployment declared it (note on §3 and §4, 2026-10-07: a
+    /// declared loader renders with or without sleep mode, a defaulted one
+    /// stays silent so an undeclared, non-parking launch keeps vLLM's own
+    /// default and its command identity).
+    pub fn renders_eager_loader(&self) -> bool {
+        let declared = !self
+            .provenance
+            .contains_key("vllm.safetensors_load_strategy");
+        matches!(
+            self.safetensors_load_strategy,
+            Some(SafetensorsLoadStrategy::Eager)
+        ) && (self.enable_sleep_mode || declared)
+    }
+}
+
 /// ADR 0014 §4 (amended 2026-10-07): the vLLM safetensors loaders a deployment
 /// may choose, spelled as vLLM 0.29 and 0.30 spell them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SafetensorsLoadStrategy {
-    /// Read each file into CPU memory before loading (capyctl's sleep-mode
-    /// default: the fast deep wake measured on vLLM 0.29).
+    /// Read each file into CPU memory before loading (capyctl's default on a
+    /// discrete GPU, ADR 0019: the fast deep wake measured on vLLM 0.29).
     Eager,
-    /// Memory-map each file and load on demand.
+    /// Memory-map each file and load on demand (capyctl's default on unified
+    /// memory, amendment A21: on vLLM 0.30 NVFP4 it held far less memory
+    /// loading and parked, at a slower deep wake).
     Lazy,
 }
 
