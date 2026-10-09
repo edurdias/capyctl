@@ -102,6 +102,7 @@ pub fn legacy_engine_config(
     let mut block = Map::new();
     match engine {
         Engine::Tensorfold => return Err(refuse("TensorFold has no legacy launch settings")),
+        Engine::Llamacpp => return Err(refuse("llama.cpp has no legacy launch settings")),
         Engine::Vllm => {
             for field in ["tensor_parallel_size", "pipeline_parallel_size"] {
                 let size = count(settings, field)?;

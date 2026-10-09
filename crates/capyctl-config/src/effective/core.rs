@@ -109,6 +109,14 @@ pub(super) fn normalize_profile(
             "capability_missing: TensorFold supports restart_only only",
         ));
     }
+    // ADR 0029 §1, §2: llama.cpp has no deep-park capability either.
+    if raw_profile.engine == Engine::Llamacpp && residency.parks() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "residency",
+            "capability_missing: llama.cpp supports restart_only only",
+        ));
+    }
     // SPEC §9.1 / T21 / ADR 0012: deep park is on unless the host opts out. A
     // deployment that asks to park on an opted-out profile is refused here rather
     // than launched and then found unable to park, which would surface only under

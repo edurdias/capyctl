@@ -55,6 +55,7 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 const ENGINE_BIN: &str = capyctl_config::engine_settings::VLLM_BIN_ENV;
 const SGLANG_BIN: &str = capyctl_config::engine_settings::SGLANG_BIN_ENV;
 const TENSORFOLD_BIN: &str = capyctl_config::engine_settings::TENSORFOLD_BIN_ENV;
+const LLAMACPP_BIN: &str = capyctl_config::engine_settings::LLAMACPP_BIN_ENV;
 /// The directory model weights live under (Spec §7). Optional (owner decision
 /// 2026-09-25): `~/models` unless `--models-root`, this variable or
 /// `host.model_store.path` names another.
@@ -934,6 +935,19 @@ impl EnvEngineProvider {
                 })?;
             }
         }
+        // ADR 0029 §2: llama.cpp never parks, and an environment install is
+        // refused while the machine-wide config.ini exists, as `engine add`
+        // refuses it, before anything is run.
+        if engine == Engine::Llamacpp {
+            deep_park = false;
+            if fingerprint.is_none() {
+                if let Some(refusal) =
+                    capyctl_config::llamacpp::system_config_refusal(&self.toolchain.system_root)
+                {
+                    return Err(no_installation(format!("engine_unsupported: {refusal}")));
+                }
+            }
+        }
         let trust_remote_code = settings.trust_remote_code;
         let installation_drift = settings.installation_drift;
         let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
@@ -951,7 +965,7 @@ impl EnvEngineProvider {
         // default; an undeclared context is fitted to the KV grant at launch.
         // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm | Engine::Tensorfold => settings.args,
+            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args,
             Engine::Sglang => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
@@ -986,9 +1000,9 @@ impl EngineProvider for EnvEngineProvider {
             Some((_, engine, executable)) => self.role_installation(engine, executable),
             None => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang, {TENSORFOLD_BIN} for TensorFold, or --vllm-bin / \
-                 --sglang-bin / --tensorfold-bin, or host.local_engine) to the \
-                 engine's executable"
+                 for SGLang, {TENSORFOLD_BIN} for TensorFold, {LLAMACPP_BIN} for \
+                 llama.cpp, or --vllm-bin / --sglang-bin / --tensorfold-bin / \
+                 --llamacpp-bin, or host.local_engine) to the engine's executable"
             ))),
         }
     }
@@ -1216,11 +1230,18 @@ pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String
 /// A probe that fails or hangs is a refusal: an engine that cannot print its own
 /// version is not one this host should publish.
 fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, ProviderError> {
+    // ADR 0029 §2: `llama-server --version` writes to standard error.
+    let reads_stderr = engine == Engine::Llamacpp;
+    let (stdout, stderr) = if reads_stderr {
+        (Stdio::null(), Stdio::piped())
+    } else {
+        (Stdio::piped(), Stdio::null())
+    };
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .map_err(|error| {
             no_installation(format!(
@@ -1252,22 +1273,29 @@ fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, Provid
         }
     };
     let mut printed = String::new();
+    // The child has exited, so this reads what it left in the pipe and returns.
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut printed);
+    }
     if let Some(mut stdout) = child.stdout.take() {
-        // The child has exited, so this reads what it left in the pipe and returns.
         let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
     }
     // ADR 0023 §2: `tensorfold 0.6.0` publishes `0.6.0`, as `engine add`
-    // records it. vLLM and SGLang publish what they print, as before.
+    // records it. ADR 0029 §2: llama.cpp publishes `<v>+<commit>`, as
+    // `engine add` records it. vLLM and SGLang publish what they print.
     let fingerprint = match engine {
         Engine::Tensorfold => printed
             .lines()
             .map(str::trim)
             .rfind(|line| !line.is_empty())
             .and_then(|line| line.split_whitespace().last())
+            .unwrap_or_default()
+            .to_owned(),
+        Engine::Llamacpp => capyctl_config::llamacpp::LlamacppBuild::parse_version_output(&printed)
+            .map(|build| build.fingerprint())
             .unwrap_or_default(),
-        Engine::Vllm | Engine::Sglang => printed.trim(),
-    }
-    .to_owned();
+        Engine::Vllm | Engine::Sglang => printed.trim().to_owned(),
+    };
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
             "{} printed no version, so there is nothing to pin this recipe to; set \

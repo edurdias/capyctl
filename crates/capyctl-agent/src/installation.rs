@@ -64,15 +64,19 @@ pub fn capability_names(engine: Engine) -> &'static [&'static str] {
         Engine::Sglang => &["core", "deep_park", "metrics", "observation"],
         Engine::Vllm => &["core", "deep_park", "metrics"],
         Engine::Tensorfold => &["core", "deep_park", "metrics"],
+        // ADR 0029 §2: nothing is probed; deep parking is reported missing.
+        Engine::Llamacpp => &["deep_park"],
     }
 }
 
-/// The installed Python package that is the engine.
-pub fn package_name(engine: Engine) -> &'static str {
+/// The installed Python package that is the engine; none for llama.cpp, a
+/// bare binary (ADR 0029 §2).
+pub fn package_name(engine: Engine) -> Option<&'static str> {
     match engine {
-        Engine::Sglang => "sglang",
-        Engine::Vllm => "vllm",
-        Engine::Tensorfold => "tensorfold",
+        Engine::Sglang => Some("sglang"),
+        Engine::Vllm => Some("vllm"),
+        Engine::Tensorfold => Some("tensorfold"),
+        Engine::Llamacpp => None,
     }
 }
 
@@ -120,6 +124,7 @@ pub fn interpreter(executable: &Path) -> Option<PathBuf> {
 /// `<prefix>` is the interpreter's environment (never resolved through links,
 /// so a virtual environment keeps its own tree). Exactly one must hold it.
 pub fn site_packages(engine: Engine, executable: &Path) -> Result<PathBuf, FingerprintError> {
+    let package = package_name(engine).ok_or(FingerprintError::NotFound)?;
     let interpreter = interpreter(executable).ok_or(FingerprintError::NotFound)?;
     let prefix = interpreter
         .parent()
@@ -138,9 +143,7 @@ pub fn site_packages(engine: Engine, executable: &Path) -> Result<PathBuf, Finge
             continue;
         }
         let site = lib.join(&name).join("site-packages");
-        if std::fs::symlink_metadata(site.join(package_name(engine)))
-            .is_ok_and(|metadata| metadata.is_dir())
-        {
+        if std::fs::symlink_metadata(site.join(package)).is_ok_and(|metadata| metadata.is_dir()) {
             found.push(site);
         }
     }
@@ -232,8 +235,10 @@ impl InstallationMeasurer {
         engine: Engine,
         executable: &Path,
     ) -> Result<InstallationFingerprint, FingerprintError> {
+        let Some(package) = package_name(engine) else {
+            return self.measure_binary(executable);
+        };
         let site = site_packages(engine, executable)?;
-        let package = package_name(engine);
         let root = site.join(package);
         let mut entries: Vec<(Vec<u8>, u64, [u8; 32])> = Vec::new();
         let mut total: u64 = 0;
@@ -271,13 +276,7 @@ impl InstallationMeasurer {
                     return Err(FingerprintError::TooLarge);
                 }
                 let (size, digest) = if kind.is_symlink() {
-                    // The link's own target text, never what it points at.
-                    let target =
-                        std::fs::read_link(&path).map_err(|_| FingerprintError::Changed)?;
-                    let mut hasher = Sha256::new();
-                    hasher.update(b"symlink:");
-                    hasher.update(target.as_os_str().as_bytes());
-                    (target.as_os_str().len() as u64, hasher.finalize().into())
+                    link_digest(&path)?
                 } else if kind.is_file() {
                     (metadata.size(), self.hash(&path, &metadata)?)
                 } else {
@@ -295,23 +294,91 @@ impl InstallationMeasurer {
         if let Ok(mut cache) = self.cache.lock() {
             cache.retain(|path, _| !path.starts_with(&root) || seen.contains(path));
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut manifest = Sha256::new();
-        manifest.update(MANIFEST_DOMAIN);
-        for (path, size, digest) in &entries {
-            if path.iter().any(|&b| b == b'\n' || b == 0) {
-                return Err(FingerprintError::UnsafeFile);
-            }
-            manifest.update(path);
-            manifest.update([0]);
-            manifest.update(size.to_string().as_bytes());
-            manifest.update([0]);
-            manifest.update(hex::encode(digest).as_bytes());
-            manifest.update(b"\n");
-        }
+        let digest = manifest_digest(&mut entries)?;
         Ok(InstallationFingerprint {
             version: version(&site, package),
-            digest: format!("{DIGEST_PREFIX}{}", hex::encode(manifest.finalize())),
+            digest,
+            files: entries.len(),
+            bytes: total,
+        })
+    }
+
+    /// ADR 0029 §2, ADR 0008: a bare-binary installation (llama.cpp's
+    /// `llama-server`) is the binary and every `lib*.so*` entry in its
+    /// directory and, for the CMake install layout `<prefix>/bin/<binary>`,
+    /// in `<prefix>/lib`: llama.cpp's own libraries, the backends a
+    /// `GGML_BACKEND_DL` build loads, and runtime libraries unpacked beside a
+    /// prebuilt binary. A link counts by its target text, as in a package
+    /// tree. The version is the one a `libllama.so.X.Y.Z` name gives, else
+    /// `unknown`; the build `--version` reports is the profile's fingerprint.
+    fn measure_binary(
+        &self,
+        executable: &Path,
+    ) -> Result<InstallationFingerprint, FingerprintError> {
+        let metadata =
+            std::fs::symlink_metadata(executable).map_err(|_| FingerprintError::NotFound)?;
+        if !metadata.is_file() {
+            return Err(FingerprintError::UnsafeFile);
+        }
+        let dir = executable.parent().ok_or(FingerprintError::NotFound)?;
+        let name = executable.file_name().ok_or(FingerprintError::NotFound)?;
+        let mut dirs: Vec<(&[u8], PathBuf)> = vec![(b"", dir.to_path_buf())];
+        if let Some(lib) = install_layout_lib(dir) {
+            dirs = vec![(b"bin/", dir.to_path_buf()), (b"lib/", lib)];
+        }
+        let mut entries = vec![(
+            [dirs[0].0, name.as_bytes()].concat(),
+            metadata.size(),
+            self.hash(executable, &metadata)?,
+        )];
+        let mut total = metadata.size();
+        let mut seen = std::collections::BTreeSet::from([executable.to_path_buf()]);
+        for (prefix, dir) in &dirs {
+            let listing = std::fs::read_dir(dir).map_err(|_| FingerprintError::Io)?;
+            for entry in listing {
+                let entry = entry.map_err(|_| FingerprintError::Io)?;
+                let file = entry.file_name();
+                if !shared_library(file.as_bytes()) {
+                    continue;
+                }
+                let path = entry.path();
+                let metadata =
+                    std::fs::symlink_metadata(&path).map_err(|_| FingerprintError::Changed)?;
+                let kind = metadata.file_type();
+                if kind.is_dir() {
+                    continue;
+                }
+                if entries.len() >= MAX_FILES {
+                    return Err(FingerprintError::TooLarge);
+                }
+                let (size, digest) = if kind.is_symlink() {
+                    link_digest(&path)?
+                } else if kind.is_file() {
+                    (metadata.size(), self.hash(&path, &metadata)?)
+                } else {
+                    return Err(FingerprintError::UnsafeFile);
+                };
+                total = total.checked_add(size).ok_or(FingerprintError::TooLarge)?;
+                if total > MAX_BYTES {
+                    return Err(FingerprintError::TooLarge);
+                }
+                seen.insert(path);
+                entries.push(([*prefix, file.as_bytes()].concat(), size, digest));
+            }
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| {
+                !dirs
+                    .iter()
+                    .any(|(_, dir)| path.parent() == Some(dir.as_path()))
+                    || seen.contains(path)
+            });
+        }
+        let digest = manifest_digest(&mut entries)?;
+        let lib_dirs: Vec<&Path> = dirs.iter().map(|(_, dir)| dir.as_path()).collect();
+        Ok(InstallationFingerprint {
+            version: library_version(&lib_dirs).unwrap_or_else(|| "unknown".into()),
+            digest,
             files: entries.len(),
             bytes: total,
         })
@@ -348,6 +415,92 @@ impl InstallationMeasurer {
     }
 }
 
+/// ADR 0008: the canonical manifest over `entries` (relative path, size and
+/// SHA-256), sorted by path.
+fn manifest_digest(entries: &mut [(Vec<u8>, u64, [u8; 32])]) -> Result<String, FingerprintError> {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut manifest = Sha256::new();
+    manifest.update(MANIFEST_DOMAIN);
+    for (path, size, digest) in entries.iter() {
+        if path.iter().any(|&b| b == b'\n' || b == 0) {
+            return Err(FingerprintError::UnsafeFile);
+        }
+        manifest.update(path);
+        manifest.update([0]);
+        manifest.update(size.to_string().as_bytes());
+        manifest.update([0]);
+        manifest.update(hex::encode(digest).as_bytes());
+        manifest.update(b"\n");
+    }
+    Ok(format!(
+        "{DIGEST_PREFIX}{}",
+        hex::encode(manifest.finalize())
+    ))
+}
+
+/// A symbolic link's own target text, never what it points at.
+fn link_digest(path: &Path) -> Result<(u64, [u8; 32]), FingerprintError> {
+    let target = std::fs::read_link(path).map_err(|_| FingerprintError::Changed)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"symlink:");
+    hasher.update(target.as_os_str().as_bytes());
+    Ok((target.as_os_str().len() as u64, hasher.finalize().into()))
+}
+
+/// ADR 0029 §2: `lib*.so` or `lib*.so.*`.
+fn shared_library(name: &[u8]) -> bool {
+    name.starts_with(b"lib")
+        && name
+            .windows(3)
+            .enumerate()
+            .any(|(at, window)| window == b".so" && matches!(name.get(at + 3), None | Some(b'.')))
+}
+
+/// ADR 0029 §2: `<prefix>/lib` when `bin` is `<prefix>/bin` and that
+/// directory exists (not a link), the CMake install layout.
+pub(crate) fn install_layout_lib(bin: &Path) -> Option<PathBuf> {
+    let lib = bin
+        .file_name()
+        .filter(|name| *name == "bin")
+        .and(bin.parent())?
+        .join("lib");
+    std::fs::symlink_metadata(&lib)
+        .is_ok_and(|metadata| metadata.is_dir())
+        .then_some(lib)
+}
+
+/// ADR 0029 §2: the version a `libllama.so.<major>.<minor>.<patch>` name in
+/// `dirs` gives, read from directory entries only. `None` when there is no
+/// such name, or names disagree.
+pub fn library_version(dirs: &[&Path]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten().take(MAX_SITE_ENTRIES) {
+            let name = entry.file_name();
+            let Some(version) = name.to_str().and_then(|n| n.strip_prefix("libllama.so.")) else {
+                continue;
+            };
+            let parts: Vec<&str> = version.split('.').collect();
+            if parts.len() != 3
+                || version.len() > MAX_VERSION
+                || parts
+                    .iter()
+                    .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+            {
+                continue;
+            }
+            match &found {
+                Some(seen) if seen != version => return None,
+                _ => found = Some(version.to_owned()),
+            }
+        }
+    }
+    found
+}
+
 /// Host policy for a launch that finds its installation drifted
 /// (`runtime_profiles.<name>.security.installation_drift`).
 pub use capyctl_config::effective::InstallationDrift;
@@ -376,7 +529,8 @@ impl CapabilityReport {
     /// Parse the probe's one-line JSON report for `engine`, strictly.
     pub fn parse(engine: Engine, output: &[u8]) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_slice(output).ok()?;
-        if value["schema"] != PROBE_SCHEMA || value["engine"] != package_name(engine) {
+        let package = package_name(engine)?;
+        if value["schema"] != PROBE_SCHEMA || value["engine"] != package {
             return None;
         }
         let names = capability_names(engine);
@@ -412,13 +566,22 @@ impl CapabilityReport {
 /// Run the capability probe for one installation, or `None` when it cannot be
 /// run or answered (no probe helper in the runtime directory, no interpreter,
 /// no package, a timeout, a malformed report). `None` is unknown: it refuses
-/// nothing and grants nothing.
+/// nothing and grants nothing. ADR 0029 §2: a llama.cpp binary has no deep-park
+/// capability and nothing is run for it; its report says so.
 pub fn probe_capabilities(
     engine: Engine,
     executable: &Path,
     runtime_dir: &Path,
     timeout: Duration,
 ) -> Option<CapabilityReport> {
+    let Some(package) = package_name(engine) else {
+        return Some(CapabilityReport {
+            missing: capability_names(engine)
+                .iter()
+                .map(|name| ((*name).to_owned(), vec!["unsupported".to_owned()]))
+                .collect(),
+        });
+    };
     let script = runtime_dir.join(PROBE_SCRIPT);
     if !std::fs::symlink_metadata(&script).is_ok_and(|m| m.is_file()) {
         return None;
@@ -442,7 +605,7 @@ pub fn probe_capabilities(
         .arg("-S")
         .arg("-B")
         .arg(&script)
-        .arg(package_name(engine))
+        .arg(package)
         .arg(&site)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -675,7 +838,8 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("python3"), "").unwrap();
         let site = dir.path().join("lib/python3.12/site-packages");
-        let package = site.join(package_name(engine));
+        let name = package_name(engine).unwrap();
+        let package = site.join(name);
         std::fs::create_dir_all(package.join("srt/__pycache__")).unwrap();
         std::fs::write(package.join("__init__.py"), "# custom build\n").unwrap();
         std::fs::write(
@@ -688,7 +852,7 @@ mod tests {
             "x",
         )
         .unwrap();
-        let dist = site.join(format!("{}-{version}.dist-info", package_name(engine)));
+        let dist = site.join(format!("{name}-{version}.dist-info"));
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(
             dist.join("METADATA"),
@@ -954,6 +1118,80 @@ mod tests {
             ),
             None,
             "a probe that does not answer in time is unknown"
+        );
+    }
+
+    /// A llama.cpp binary in `bin` with a shared library beside it.
+    fn llama_server(bin: &Path) -> PathBuf {
+        std::fs::create_dir_all(bin).unwrap();
+        let binary = bin.join("llama-server");
+        std::fs::write(&binary, "elf").unwrap();
+        std::fs::write(bin.join("libllama.so.0.6.0"), "llama").unwrap();
+        std::os::unix::fs::symlink("libllama.so.0.6.0", bin.join("libllama.so.0")).unwrap();
+        binary
+    }
+
+    // T42 T22 (ADR 0029 §2, ADR 0008): a bare binary's digest covers it and
+    // every `lib*.so*` beside it, and nothing else in the directory; its
+    // version is the library's.
+    #[test]
+    fn a_llama_server_digest_covers_the_libraries_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = llama_server(&dir.path().join("build/bin"));
+        let bin = binary.parent().unwrap();
+        let measurer = InstallationMeasurer::new();
+        let first = measurer.measure(Engine::Llamacpp, &binary).unwrap();
+        assert_eq!(first.version, "0.6.0");
+        assert_eq!(first.files, 3, "the binary, the library and its link");
+        std::fs::write(bin.join("llama-bench"), "another tool").unwrap();
+        std::fs::write(bin.join("libnotes.sources"), "not a library").unwrap();
+        assert_eq!(
+            measurer.measure(Engine::Llamacpp, &binary).unwrap(),
+            first,
+            "other files are not the installation"
+        );
+        std::fs::write(bin.join("libggml-cuda.so"), "backend").unwrap();
+        let added = measurer.measure(Engine::Llamacpp, &binary).unwrap();
+        assert_ne!(added.digest, first.digest, "a new backend library");
+        std::fs::write(bin.join("libggml-cuda.so"), "rebuilt backend").unwrap();
+        assert_ne!(
+            measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
+            added.digest,
+            "a rebuilt library"
+        );
+        std::fs::write(bin.join("libllama.so.0.6.0"), "rebuilt").unwrap();
+        assert_ne!(
+            measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
+            added.digest
+        );
+        // Nothing to probe: deep parking is reported missing, nothing runs.
+        let report =
+            probe_capabilities(Engine::Llamacpp, &binary, dir.path(), PROBE_TIMEOUT).unwrap();
+        assert_eq!(report.available("deep_park"), Some(false));
+        assert_eq!(report.missing_capabilities(), vec!["deep_park"]);
+    }
+
+    // T42 (ADR 0029 §2): for the install layout `<prefix>/bin/llama-server`,
+    // `<prefix>/lib` is covered too.
+    #[test]
+    fn a_llama_server_digest_covers_the_install_prefix_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let binary = prefix.join("bin/llama-server");
+        std::fs::write(&binary, "elf").unwrap();
+        let measurer = InstallationMeasurer::new();
+        let alone = measurer.measure(Engine::Llamacpp, &binary).unwrap();
+        assert_eq!((alone.files, alone.version.as_str()), (1, "unknown"));
+        std::fs::create_dir_all(prefix.join("lib")).unwrap();
+        std::fs::write(prefix.join("lib/libllama.so.0.6.0"), "llama").unwrap();
+        let installed = measurer.measure(Engine::Llamacpp, &binary).unwrap();
+        assert_eq!((installed.files, installed.version.as_str()), (2, "0.6.0"));
+        assert_ne!(installed.digest, alone.digest);
+        std::fs::write(prefix.join("lib/libggml-base.so.0.26.0"), "ggml").unwrap();
+        assert_ne!(
+            measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
+            installed.digest
         );
     }
 }

@@ -18,11 +18,19 @@ pub enum Engine {
     Sglang,
     /// ADR 0023: TensorFold, restart-only, registered with `engine add`.
     Tensorfold,
+    /// ADR 0029: llama.cpp's `llama-server`, restart-only, one GGUF model per
+    /// deployment, registered as a bare binary with `engine add`.
+    Llamacpp,
 }
 
 impl Engine {
     /// Every engine kind, in the order lists show them.
-    pub const ALL: [Engine; 3] = [Engine::Vllm, Engine::Sglang, Engine::Tensorfold];
+    pub const ALL: [Engine; 4] = [
+        Engine::Vllm,
+        Engine::Sglang,
+        Engine::Tensorfold,
+        Engine::Llamacpp,
+    ];
 
     /// The serde, CLI and profile name of the kind.
     pub fn name(self) -> &'static str {
@@ -30,6 +38,7 @@ impl Engine {
             Engine::Vllm => "vllm",
             Engine::Sglang => "sglang",
             Engine::Tensorfold => "tensorfold",
+            Engine::Llamacpp => "llamacpp",
         }
     }
 
@@ -392,6 +401,9 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
         Engine::Vllm => "--speculative-config",
         Engine::Sglang => "--speculative-draft-model-path",
         Engine::Tensorfold => "--drafter",
+        // ADR 0029 §8: llama.cpp's draft model is a GGUF file
+        // (`--model-draft`), never a draft directory.
+        Engine::Llamacpp => return None,
     };
     let mut named = None;
     for parsed in parse_options(args).ok()? {
@@ -405,7 +417,7 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
             Engine::Vllm => serde_json::from_str::<serde_json::Value>(&value)
                 .ok()
                 .and_then(|config| config["model"].as_str().map(str::to_owned)),
-            Engine::Sglang | Engine::Tensorfold => Some(value),
+            Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp => Some(value),
         };
     }
     named.filter(|path| Path::new(path).is_absolute())
@@ -441,6 +453,10 @@ pub const DRAFT_PATH_CONFLICT: &str = "the engine arguments already name a draft
 /// drafter, so the arguments may neither name one nor turn drafts off.
 pub const TENSORFOLD_DECLARED_DRAFTER_CONFLICT: &str = "`model.draft` names TensorFold's \
      drafter, so the engine arguments may state neither `--drafter` nor `--no-drafts`";
+/// ADR 0029 §8: a llama.cpp draft model is an engine argument, not `model.draft`.
+pub const LLAMACPP_DECLARED_DRAFTER: &str = "llama.cpp takes its draft model as \
+     `--model-draft <file>` in the engine arguments, inside security.approved_paths; \
+     `model.draft` is not supported for llama.cpp";
 
 /// Whether `args` set `option` (abbreviations and the `=` spelling included).
 fn names_option(args: &[String], option: &str) -> Result<bool, ProfileArgError> {
@@ -483,6 +499,9 @@ pub fn declared_draft_admitted(engine: Engine, args: &[String]) -> Result<(), St
                 return Err(TENSORFOLD_DECLARED_DRAFTER_CONFLICT.into());
             }
         }
+        // ADR 0029 §8: llama.cpp names its draft model with `--model-draft
+        // <file>`, an approved path option; there is no declared drafter.
+        Engine::Llamacpp => return Err(LLAMACPP_DECLARED_DRAFTER.into()),
     }
     Ok(())
 }
@@ -572,7 +591,7 @@ pub fn disk_table_cache_bytes(engine: Engine, args: &[String]) -> Option<i64> {
             .iter()
             .any(|parsed| matches_name(&parsed.name, "--ple-on-ssd"))
             .then_some(TENSORFOLD_TABLE_CACHE_BYTES),
-        Engine::Vllm => None,
+        Engine::Vllm | Engine::Llamacpp => None,
     }
 }
 
@@ -932,6 +951,9 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
+        // ADR 0029 §6: llama.cpp's exact-name tables are not in this release;
+        // [`llamacpp_options_refused`] refuses every llama.cpp option instead.
+        Engine::Llamacpp => Vec::new(),
     }
 }
 
@@ -941,6 +963,7 @@ pub fn reserved_families(engine: Engine) -> &'static [&'static str] {
         Engine::Vllm => VLLM_RESERVED_FAMILIES,
         Engine::Sglang => SGLANG_RESERVED_FAMILIES,
         Engine::Tensorfold => TENSORFOLD_RESERVED_FAMILIES,
+        Engine::Llamacpp => &[],
     }
 }
 
@@ -951,6 +974,7 @@ pub fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] 
         Engine::Vllm => VLLM_TYPED_OPTIONS,
         Engine::Sglang => SGLANG_TYPED_OPTIONS,
         Engine::Tensorfold => TENSORFOLD_TYPED_OPTIONS,
+        Engine::Llamacpp => &[],
     }
 }
 
@@ -1056,6 +1080,7 @@ pub fn sensitivity(engine: Engine, name: &str) -> Option<Sensitivity> {
         Engine::Vllm => (VLLM_SENSITIVE, VLLM_SHAPED),
         Engine::Sglang => (SGLANG_SENSITIVE, SGLANG_SHAPED),
         Engine::Tensorfold => (TENSORFOLD_SENSITIVE, TENSORFOLD_SHAPED),
+        Engine::Llamacpp => (&[] as &[(&str, Sensitivity)], &[] as &[&str]),
     };
     for candidate in candidate_names(name) {
         let abbreviation_ok = ORDINARY_EXACT.contains(&candidate.as_str());
@@ -1161,6 +1186,7 @@ pub fn validate_extra_args(
     args: &[String],
     context: &ExtraArgsContext<'_>,
 ) -> Result<(), ProfileArgError> {
+    llamacpp_options_refused(context.engine, args)?;
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
         let name = option.name.clone();
@@ -1236,6 +1262,20 @@ pub fn option_names(args: &[String]) -> Result<BTreeSet<String>, ProfileArgError
         .collect())
 }
 
+/// ADR 0029 §6: llama.cpp's parser takes exact names, `_` for `-`, every long
+/// alias and negative form, and refuses `--name=value`; the prefix tables above
+/// would misjudge it, and its own exact-name tables are not in this release.
+/// Until they are, every llama.cpp option is refused, in host-fixed, extra and
+/// rendered arguments alike: the policy fails closed.
+fn llamacpp_options_refused(engine: Engine, args: &[String]) -> Result<(), ProfileArgError> {
+    if engine != Engine::Llamacpp {
+        return Ok(());
+    }
+    args.first().map_or(Ok(()), |arg| {
+        Err(ProfileArgError::Unsupported(normalize_option_name(arg)))
+    })
+}
+
 /// Host-fixed profile arguments (ADR 0014 §1). The host operator writes these,
 /// so sensitive options are theirs to pass; reserved names, configuration files
 /// and malformed lists are still refused. SGLang's protected entry takes no
@@ -1261,6 +1301,7 @@ pub fn validate_rendered_args(
     args: &[String],
     sleep_mode: bool,
 ) -> Result<(), ProfileArgError> {
+    llamacpp_options_refused(engine, args)?;
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
         let name = option.name;

@@ -1018,6 +1018,7 @@ async fn add_refuses_tensorfold_without_its_toolchain() {
     let search = capyctl_config::toolchain::ToolchainSearch {
         system: String::new(),
         default_cuda_home: dir.path().join("no-cuda"),
+        ..Default::default()
     };
     let process_env = |key: &str| {
         (key != "CUDA_HOME")
@@ -1039,6 +1040,165 @@ async fn add_refuses_tensorfold_without_its_toolchain() {
     assert!(error
         .message
         .contains(&env.join("bin").display().to_string()));
+    assert!(!engines_beside(&document).exists());
+}
+
+/// A llama.cpp build directory: `llama-server --version` runs `body`, and
+/// the shared libraries a default build leaves beside it.
+fn llamacpp_build(dir: &Path, body: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    script(&dir.join("llama-server"), body);
+    std::fs::write(dir.join("libllama.so.0.6.0"), "elf").unwrap();
+    std::fs::write(dir.join("libggml-base.so.0.26.0"), "elf").unwrap();
+    dir.join("llama-server")
+}
+
+/// What `llama-server --version` writes, to standard error, at the v0.6.0 tag.
+const LLAMACPP_VERSION: &str = "echo 'version: 0.6.0 (build 1, commit d812350)' >&2; \
+     echo 'built with GNU 15.2.0 for Linux x86_64' >&2";
+
+/// `engine add` with a system root of the test's own (ADR 0029 §2: where
+/// `/etc/llama.cpp/config.ini` is looked for), so the machine running the
+/// tests decides nothing.
+async fn add_llamacpp(
+    command: &Command,
+    document: &Path,
+    root: &Path,
+) -> Result<Value, capyctl_cli::output::StructuredError> {
+    let search = capyctl_config::toolchain::ToolchainSearch {
+        system_root: root.to_path_buf(),
+        ..Default::default()
+    };
+    let process_env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    execute_with(
+        command,
+        Some(document),
+        document.parent().unwrap(),
+        &process_env,
+        &search,
+    )
+    .await
+}
+
+// T42 T07 T21 (ADR 0029 §2): `engine add` reads the version from standard
+// error, drops the build number, writes `<version>+<commit>` with deep park
+// disabled, and records no CUDA toolkit; nothing is probed.
+#[tokio::test]
+async fn add_registers_llamacpp_from_its_standard_error() {
+    let dir = private_dir();
+    let binary = llamacpp_build(&dir.path().join("llama.cpp/build/bin"), LLAMACPP_VERSION);
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let root = dir.path().join("root");
+    let out = add_llamacpp(&add(binary.parent().unwrap()), &document, &root)
+        .await
+        .unwrap();
+    assert_eq!(out["profile"], "llamacpp");
+    assert_eq!(out["engine"], "llamacpp");
+    assert_eq!(out["version"], "0.6.0");
+    assert_eq!(out["build_fingerprint"], "0.6.0+d812350");
+    // ADR 0029 §3: custom until the live rows pin 0.6.0.
+    assert_eq!(out["custom"], true);
+    assert_eq!(out["deep_park"], "disabled");
+    assert_eq!(out["deep_park_probe"], "capability_missing");
+    assert!(out["fingerprint"]["digest"]
+        .as_str()
+        .is_some_and(|d| d.starts_with("sha256:")));
+    assert_eq!(out["cuda_home"], Value::Null);
+    let profile = &engines_of(&document).profiles["llamacpp"];
+    assert_eq!(
+        profile["executable"],
+        binary.to_string_lossy().as_ref(),
+        "{profile}"
+    );
+    assert_eq!(profile["build_fingerprint"], "0.6.0+d812350");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert!(profile.get("cuda_home").is_none(), "{profile}");
+}
+
+// T42 T21 T37 (ADR 0029 §2): `--deep-park enabled` is refused
+// `capability_missing`, a version printed to standard output alone is
+// unparsable (`engine_unsupported`), and a host-fixed argument is refused
+// while the option policy fails closed; nothing is written for any of them.
+#[tokio::test]
+async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let root = dir.path().join("root");
+    let marker = dir.path().join("ran");
+    let binary = llamacpp_build(
+        &dir.path().join("bin"),
+        &format!("touch {}; {LLAMACPP_VERSION}", marker.display()),
+    );
+    let deep = Command::EngineAdd {
+        path: Some(binary.clone()),
+        name: None,
+        deep_park: Some(DeepParkChoice::Enabled),
+        drift: DriftChoice::Warn,
+        args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
+    };
+    let error = add_llamacpp(&deep, &document, &root).await.unwrap_err();
+    assert_eq!(error.code, "capability_missing", "{error:?}");
+    assert!(!marker.exists(), "refused before anything runs");
+    let with_args = Command::EngineAdd {
+        path: Some(binary.clone()),
+        name: None,
+        deep_park: None,
+        drift: DriftChoice::Warn,
+        args: vec!["--threads".into(), "8".into()],
+        approved_options: vec![],
+        approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
+    };
+    let error = add_llamacpp(&with_args, &document, &root)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_config", "{error:?}");
+    assert!(error.message.contains("--threads"), "{}", error.message);
+    script(&binary, "echo 'version: 0.6.0 (build 1, commit d812350)'");
+    let error = add_llamacpp(&add(&binary), &document, &root)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "engine_unsupported", "{error:?}");
+    assert!(
+        error.message.contains("standard error"),
+        "{}",
+        error.message
+    );
+    assert!(!engines_beside(&document).exists());
+}
+
+// T42 T37 (ADR 0029 §2): a machine with `/etc/llama.cpp/config.ini` refuses
+// `engine add` with `engine_unsupported` naming the file, before the binary
+// runs; nothing is written.
+#[tokio::test]
+async fn add_refuses_llamacpp_beside_a_system_config_file() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let root = dir.path().join("root");
+    let config = capyctl_config::llamacpp::system_config_file(&root);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[*]\nctx-size = 4096\n").unwrap();
+    let marker = dir.path().join("ran");
+    let binary = llamacpp_build(
+        &dir.path().join("bin"),
+        &format!("touch {}; {LLAMACPP_VERSION}", marker.display()),
+    );
+    let error = add_llamacpp(&add(&binary), &document, &root)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "engine_unsupported", "{error:?}");
+    assert!(
+        error.message.contains(&config.display().to_string()),
+        "{}",
+        error.message
+    );
+    assert!(!marker.exists(), "the binary never ran");
     assert!(!engines_beside(&document).exists());
 }
 

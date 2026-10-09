@@ -110,7 +110,9 @@ fn the_version_check_is_bounded_and_must_agree() {
     script(&env.join("bin/vllm"), "echo 0.29.0");
     let resolved = resolve(&env).unwrap();
     assert_eq!(
-        check_version(&resolved, Duration::from_secs(5)).unwrap(),
+        check_version(&resolved, Duration::from_secs(5))
+            .unwrap()
+            .version,
         "0.29.0"
     );
 
@@ -120,7 +122,9 @@ fn the_version_check_is_bounded_and_must_agree() {
         "echo \"${CAPYCTL_TEST_LEAK:-0.29.0}\"",
     );
     assert_eq!(
-        check_version(&resolved, Duration::from_secs(5)).unwrap(),
+        check_version(&resolved, Duration::from_secs(5))
+            .unwrap()
+            .version,
         "0.29.0"
     );
 
@@ -156,6 +160,7 @@ fn empty_roots(home: &Path) -> ScanRoots {
         pipx_home: None,
         conda_roots: vec![home.join("miniconda3")],
         opt: None,
+        system_bins: vec![],
         extra: vec![],
     }
 }
@@ -275,7 +280,9 @@ fn a_tensorfold_environment_resolves_to_its_entry_point() {
     }
     let resolved = resolve(&env).unwrap();
     assert_eq!(
-        check_version(&resolved, Duration::from_secs(10)).unwrap(),
+        check_version(&resolved, Duration::from_secs(10))
+            .unwrap()
+            .version,
         "0.6.0"
     );
 }
@@ -347,4 +354,152 @@ fn the_scan_is_bounded() {
     let found = detect(&roots, &bounds);
     assert!(found.len() <= 10, "{}", found.len());
     assert!(found.iter().all(|c| c.env != deep), "depth bound exceeded");
+}
+
+/// A llama.cpp build directory: `llama-server` running `body`, and the shared
+/// libraries a default (shared) build leaves beside it.
+fn llamacpp_build(dir: &Path, body: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    script(&dir.join("llama-server"), body);
+    std::fs::write(dir.join("libllama.so.0.6.0"), "elf").unwrap();
+    std::os::unix::fs::symlink("libllama.so.0.6.0", dir.join("libllama.so.0")).unwrap();
+    std::fs::write(dir.join("libggml-base.so.0.26.0"), "elf").unwrap();
+    dir.join("llama-server")
+}
+
+/// What `llama-server --version` writes to standard error at the v0.6.0 tag.
+const LLAMACPP_VERSION: &str = "echo 'version: 0.6.0 (build 1, commit d812350)' >&2; \
+     echo 'built with GNU 15.2.0 for Linux x86_64' >&2";
+
+// T42 T07 (ADR 0029 §2): detection finds `llama-server` in llama.cpp's build
+// directories, on PATH and under --path, reads its version from the
+// `libllama.so.X.Y.Z` name beside it, and runs nothing.
+#[test]
+fn detection_lists_a_llama_server_by_its_library_and_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let marker = dir.path().join("ran");
+    let run = format!("touch {}", marker.display());
+    let built = llamacpp_build(&home.join("llama.cpp/build-cuda/bin"), &run);
+    let on_path = llamacpp_build(&dir.path().join("tools/bin"), &run);
+    let named = llamacpp_build(&dir.path().join("src/llama.cpp/build/bin"), &run);
+    // No library beside it: the version is unknown until `engine add`.
+    let bare = dir.path().join("bare/bin");
+    std::fs::create_dir_all(&bare).unwrap();
+    script(&bare.join("llama-server"), &run);
+    let mut roots = empty_roots(&home);
+    roots.path_dirs = vec![dir.path().join("tools/bin"), bare.clone()];
+    roots.extra = vec![dir.path().join("src")];
+    let found = detect(&roots, &ScanBounds::default());
+    for (entry, source, version) in [
+        (&built, "home", "0.6.0"),
+        (&on_path, "PATH", "0.6.0"),
+        (&named, "path", "0.6.0"),
+        (&bare.join("llama-server"), "PATH", "unknown"),
+    ] {
+        let candidate = found
+            .iter()
+            .find(|c| &c.entry == entry)
+            .unwrap_or_else(|| panic!("{} missing from {found:?}", entry.display()));
+        assert_eq!(candidate.engine, Engine::Llamacpp);
+        assert_eq!(candidate.source, source);
+        assert_eq!(candidate.version, version);
+        assert_eq!(&candidate.env, entry.parent().unwrap());
+        // ADR 0029 §3: no llama.cpp build is verified before its live rows.
+        assert!(candidate.custom);
+    }
+    assert!(!marker.exists(), "detection executes nothing");
+}
+
+// T42 T07 T37 (ADR 0029 §2): a `llama-server` link that leaves the scanned
+// root is not followed; one inside it is listed once, as its target.
+#[test]
+fn a_llama_server_link_out_of_its_root_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = llamacpp_build(&dir.path().join("outside/bin"), "exit 0");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(root.join("escape")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("escape/llama-server")).unwrap();
+    let inside = llamacpp_build(&root.join("real"), "exit 0");
+    std::fs::create_dir_all(root.join("alias")).unwrap();
+    std::os::unix::fs::symlink(&inside, root.join("alias/llama-server")).unwrap();
+    let mut roots = empty_roots(&dir.path().join("nohome"));
+    roots.extra = vec![root.clone()];
+    let found = detect(&roots, &ScanBounds::default());
+    let llama: Vec<_> = found
+        .iter()
+        .filter(|c| c.engine == Engine::Llamacpp)
+        .collect();
+    assert_eq!(llama.len(), 1, "{found:?}");
+    assert_eq!(llama[0].entry, inside.canonicalize().unwrap());
+}
+
+// T42 (ADR 0029 §2): the binary or its directory resolves; a link is named
+// by what it points to; nothing runs until the version check.
+#[test]
+fn a_llama_server_binary_or_its_directory_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = llamacpp_build(&dir.path().join("build/bin"), LLAMACPP_VERSION);
+    for named in [binary.clone(), dir.path().join("build/bin")] {
+        let resolved = resolve(&named).unwrap();
+        assert_eq!(resolved.engine, Engine::Llamacpp);
+        assert_eq!(resolved.executable, binary);
+        assert_eq!(resolved.env, dir.path().join("build/bin"));
+        assert_eq!(resolved.version, "0.6.0");
+    }
+    let link = dir.path().join("llama-server");
+    std::os::unix::fs::symlink(&binary, &link).unwrap();
+    let error = resolve(&link).unwrap_err();
+    assert_eq!(error.code(), "engine_unsupported");
+    assert!(
+        error.to_string().contains(&binary.display().to_string()),
+        "{error}"
+    );
+    assert_eq!(
+        resolve(&dir.path().join("none/llama-server"))
+            .unwrap_err()
+            .code(),
+        "engine_not_found"
+    );
+}
+
+// T42 T37 (ADR 0029 §2): the version is read from standard error; the build
+// number is not kept; the fingerprint is `<version>+<commit>`; a version on
+// standard output alone does not parse.
+#[test]
+fn the_llama_server_version_is_read_from_standard_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = llamacpp_build(&dir.path().join("bin"), LLAMACPP_VERSION);
+    let resolved = resolve(&binary).unwrap();
+    let reported = check_version(&resolved, Duration::from_secs(5)).unwrap();
+    assert_eq!(reported.version, "0.6.0");
+    assert_eq!(reported.build_fingerprint, "0.6.0+d812350");
+    script(
+        &binary,
+        "echo 'version: 0.6.0-dev (build 9137, commit d812350)' >&2",
+    );
+    let reported = check_version(&resolved, Duration::from_secs(5)).unwrap();
+    assert_eq!(reported.version, "0.6.0-dev");
+    assert_eq!(reported.build_fingerprint, "0.6.0-dev+d812350");
+    script(&binary, "echo 'version: 0.6.0 (build 1, commit d812350)'");
+    let error = check_version(&resolved, Duration::from_secs(5)).unwrap_err();
+    assert_eq!(error, VersionCheckError::Unparsable);
+    assert_eq!(error.code(), "engine_unsupported");
+    std::env::set_var("CAPYCTL_TEST_LLAMA_LEAK", "9.9.9");
+    script(
+        &binary,
+        "echo \"version: ${CAPYCTL_TEST_LLAMA_LEAK:-0.6.0} (build 1, commit d812350)\" >&2",
+    );
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(5))
+            .unwrap()
+            .version,
+        "0.6.0",
+        "the check sees no inherited environment"
+    );
+    script(&binary, "yes x >&2");
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(5)).unwrap_err(),
+        VersionCheckError::Output
+    );
 }

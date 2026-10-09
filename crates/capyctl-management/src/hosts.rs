@@ -233,18 +233,19 @@ struct EngineRow<'a> {
 fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
     let profile = row.profile;
     let engine = profile["engine"].as_str().unwrap_or("unknown").to_owned();
-    let version = row
-        .reported_version
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            profile["build_fingerprint"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_owned()
-        });
+    use capyctl_config::{
+        engine_policy::Engine,
+        registration::{is_verified, listed_version},
+    };
+    let kind = Engine::from_name(&engine);
+    // ADR 0029 §2: a llama.cpp row shows its `<version>+<commit>` fingerprint.
+    let version = listed_version(
+        kind,
+        row.reported_version.as_deref(),
+        profile["build_fingerprint"].as_str(),
+    );
     // ADR 0018 §1: `custom` is derived, never declared.
-    use capyctl_config::{engine_policy::Engine, registration::is_verified};
-    let custom = Engine::from_name(&engine).is_none_or(|e| !is_verified(e, &version));
+    let custom = kind.is_none_or(|e| !is_verified(e, &version));
     serde_json::json!({
         "host_id": row.host_id, "host": row.host_name,
         "online": row.online,

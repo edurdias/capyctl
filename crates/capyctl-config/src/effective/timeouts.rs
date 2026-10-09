@@ -207,7 +207,9 @@ pub(super) fn resolve_timeouts(
     };
     let derived_initialize = match engine {
         Engine::Tensorfold => TENSORFOLD_FIRST_BUILD_MS,
-        Engine::Vllm | Engine::Sglang => match weights {
+        // ADR 0029 §9: llama.cpp follows ADR 0014 A1 and A7 until its live
+        // rows measure its start.
+        Engine::Vllm | Engine::Sglang | Engine::Llamacpp => match weights {
             None => derived_initialize_ms(None),
             Some(_) => derived_initialize_ms(weights)
                 .saturating_add(STARTUP_WARMUP_MS)

@@ -205,6 +205,7 @@ fn spec(engine: Engine) -> ProfileSpec {
             Engine::Vllm => "/home/u/venv/bin/vllm".into(),
             Engine::Sglang => "/home/u/venv/bin/python3".into(),
             Engine::Tensorfold => "/home/u/venv/bin/tensorfold".into(),
+            Engine::Llamacpp => "/home/u/llama.cpp/build/bin/llama-server".into(),
         },
         build_fingerprint: "0.29.0".into(),
         deep_park: true,
@@ -491,7 +492,8 @@ fn approvals_are_written_and_reach_the_host_document() {
 }
 
 /// A profile a newer release wrote for an engine kind this release does not
-/// know (for example `tensorfold` read by 0.1.0).
+/// know (for example `tensorfold` read by 0.1.0, or `llamacpp` read by a
+/// release before ADR 0029).
 fn future_profile() -> serde_json::Value {
     let mut future = profile();
     future["engine"] = "futureengine".into();
@@ -501,7 +503,9 @@ fn future_profile() -> serde_json::Value {
 // T03 T04 (ADR 0018 §2 amendment A3): engines.yaml shared with a newer release
 // may hold a profile for an engine kind this release does not know. That
 // profile is skipped, with its name and kind reported, and the rest loads;
-// the file itself keeps it.
+// the file itself keeps it. T42 (ADR 0029 §2): a release before llama.cpp
+// reads a `llamacpp` profile as this one reads `futureengine`; this release
+// knows the kind and loads it.
 #[test]
 fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -510,6 +514,12 @@ fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert("vllm".into(), profile());
     engines.profiles.insert("future".into(), future_profile());
+    let llamacpp = profile_document(&ProfileSpec {
+        build_fingerprint: "0.6.0+d812350".into(),
+        deep_park: false,
+        ..spec(Engine::Llamacpp)
+    });
+    engines.profiles.insert("llamacpp".into(), llamacpp);
     let lock = lock_engines(&path).unwrap();
     write_engines(&engines, &lock, Some(&host_value(&host))).unwrap();
     drop(lock);
@@ -517,7 +527,10 @@ fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
     let loaded = EnginesFile::load(&path).unwrap();
     assert!(loaded.profiles.contains_key("future"), "the file keeps it");
     let (runnable, skipped) = loaded.runnable();
-    assert_eq!(runnable.keys().collect::<Vec<_>>(), vec!["vllm"]);
+    assert_eq!(
+        runnable.keys().collect::<Vec<_>>(),
+        vec!["llamacpp", "vllm"]
+    );
     assert_eq!(
         skipped,
         vec![UnknownEngineProfile {
@@ -533,6 +546,7 @@ fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
 
     let config = HostConfig::load(&host).expect("the host starts");
     assert!(config.profiles.contains_key("vllm"));
+    assert!(config.profiles.contains_key("llamacpp"));
     assert!(!config.profiles.contains_key("future"));
 }
 

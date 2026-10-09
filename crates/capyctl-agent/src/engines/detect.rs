@@ -1,9 +1,13 @@
 //! ADR 0018 §1: `capyctl engine detect`. Reads package metadata only, executes
 //! nothing, never follows a symlink that resolves outside the root being
 //! scanned, and is bounded in environments, depth and directory entries.
-use super::{packages, resolve::entry, site_packages};
+//! ADR 0029 §2: llama.cpp's bare `llama-server` binary is a second source,
+//! found by file name, its version read from a `libllama.so.X.Y.Z` name.
+use super::{packages, resolve::entry, resolve::library_dirs, site_packages};
 use capyctl_config::engine_policy::Engine;
+use capyctl_config::llamacpp::EXECUTABLE;
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +16,9 @@ pub struct Candidate {
     pub version: String,
     pub env: PathBuf,
     pub entry: PathBuf,
-    /// Where it was found: `PATH`, `conda`, `home`, `venv`, `uv`, `pipx`, `opt` or `path`.
+    /// Where it was found: `PATH`, `conda`, `home`, `venv`, `uv`, `pipx`,
+    /// `opt`, `system` (ADR 0029 §2: `/usr/local/bin`) or `path`. For a bare
+    /// binary, `env` is the directory holding it.
     pub source: &'static str,
     pub custom: bool,
 }
@@ -44,6 +50,8 @@ pub struct ScanRoots {
     pub pipx_home: Option<PathBuf>,
     pub conda_roots: Vec<PathBuf>,
     pub opt: Option<PathBuf>,
+    /// ADR 0029 §2: fixed binary directories (`/usr/local/bin`).
+    pub system_bins: Vec<PathBuf>,
     pub extra: Vec<PathBuf>,
 }
 
@@ -90,6 +98,7 @@ impl ScanRoots {
             pipx_home,
             conda_roots,
             opt: Some("/opt".into()),
+            system_bins: vec!["/usr/local/bin".into()],
             extra,
         }
     }
@@ -130,6 +139,50 @@ impl Scan<'_> {
         }
     }
 
+    /// ADR 0029 §2: an executable regular file named `llama-server` in `dir`.
+    /// A link is followed only to a file inside `root`; the version is a
+    /// `libllama.so.X.Y.Z` name beside it, else `unknown`. Metadata only.
+    fn binary(&mut self, dir: &Path, root: &Path, source: &'static str) {
+        if self.examined >= self.bounds.max_envs {
+            return;
+        }
+        let named = dir.join(EXECUTABLE);
+        let Ok(meta) = std::fs::symlink_metadata(&named) else {
+            return;
+        };
+        let file = if meta.file_type().is_symlink() {
+            match (named.canonicalize(), root.canonicalize()) {
+                (Ok(target), Ok(root)) if target.starts_with(&root) => target,
+                _ => return,
+            }
+        } else {
+            named
+        };
+        let regular_executable = std::fs::symlink_metadata(&file)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        let Ok(key) = file.canonicalize() else { return };
+        if !regular_executable || !self.seen.insert(key) {
+            return;
+        }
+        self.examined += 1;
+        let Some(bin) = file.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let dirs = library_dirs(&bin);
+        let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let version =
+            crate::installation::library_version(&dirs).unwrap_or_else(|| "unknown".into());
+        let custom = !capyctl_config::registration::is_verified(Engine::Llamacpp, &version);
+        self.found.push(Candidate {
+            engine: Engine::Llamacpp,
+            version,
+            env: bin,
+            entry: file,
+            source,
+            custom,
+        });
+    }
+
     /// The directories directly under `root`; a symlink is kept only if it
     /// resolves inside `root` (spec: never follow one out of the root).
     fn children(&self, root: &Path) -> Vec<PathBuf> {
@@ -157,8 +210,10 @@ impl Scan<'_> {
         children
     }
 
-    /// `--path`: the directory itself, or environments below it, to `depth`.
-    fn tree(&mut self, root: &Path, depth: usize) {
+    /// `--path`: the directory itself, or environments and `llama-server`
+    /// binaries below it, to `depth`. A link leads nowhere outside `top`.
+    fn tree(&mut self, root: &Path, top: &Path, depth: usize) {
+        self.binary(root, top, "path");
         if !site_packages(root).is_empty() {
             self.env(root, "path");
             return;
@@ -167,13 +222,13 @@ impl Scan<'_> {
             return;
         }
         for child in self.children(root) {
-            self.tree(&child, depth - 1);
+            self.tree(&child, top, depth - 1);
         }
     }
 }
 
 /// ADR 0018 §1: candidates in the documented locations, deduplicated by
-/// canonical environment, in scan order.
+/// canonical environment (or, ADR 0029 §2, canonical binary), in scan order.
 pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
     let mut scan = Scan {
         bounds,
@@ -187,6 +242,8 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
                 scan.env(env, "PATH");
             }
         }
+        // ADR 0029 §2: a `llama-server` in any PATH entry.
+        scan.binary(dir, dir, "PATH");
     }
     if let Some(home) = &roots.home {
         let listed = home.join(".conda/environments.txt");
@@ -224,6 +281,16 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
         for env in scan.children(&home.join(".local/share/pipx/venvs")) {
             scan.env(&env, "pipx");
         }
+        // ADR 0029 §2: llama.cpp's own build directories.
+        let source = home.join("llama.cpp");
+        for build in scan.children(&source) {
+            if build
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("build"))
+            {
+                scan.binary(&build.join("bin"), &source, "home");
+            }
+        }
     }
     if let Some(data) = &roots.xdg_data {
         for env in scan.children(&data.join("uv/tools")) {
@@ -240,10 +307,15 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
             scan.env(&child, "opt");
             scan.env(&child.join("venv"), "opt");
             scan.env(&child.join(".venv"), "opt");
+            // ADR 0029 §2: `/opt/*/bin/llama-server`.
+            scan.binary(&child.join("bin"), &child, "opt");
         }
     }
+    for dir in &roots.system_bins {
+        scan.binary(dir, dir, "system");
+    }
     for extra in &roots.extra {
-        scan.tree(extra, bounds.max_depth);
+        scan.tree(extra, extra, bounds.max_depth);
     }
     scan.found
 }

@@ -844,6 +844,8 @@ impl NativeHostExecution {
             }
             // ADR 0023 §6: TensorFold never parks.
             Engine::Tensorfold => return Err(SessionError),
+            // ADR 0029 §1, §10: llama.cpp never parks.
+            Engine::Llamacpp => return Err(SessionError),
         })
     }
 

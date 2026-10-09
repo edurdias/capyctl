@@ -413,7 +413,7 @@ impl StandaloneControl {
         if ENVIRONMENT_PROFILES.contains(&profile) {
             return refused(
                 "invalid_config",
-                format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN or host.local_engine); unset it and restart the role"),
+                format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or host.local_engine); unset it and restart the role"),
             );
         }
         // What remains must still publish: refused before anything is retired.
