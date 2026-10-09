@@ -296,9 +296,11 @@ fn the_load_strategy_is_a_typed_vllm_field() {
 }
 
 /// ADR 0014 §4 (amended 2026-10-07): an omitted loader leaves every existing
-/// deployment's identity and resolved configuration as it was; declaring one
-/// changes the command identity. The pinned fingerprint is the one `main`
-/// computed before the field existed.
+/// deployment's command identity as it was; declaring one changes it. The
+/// pinned fingerprint is the one `main` computed before the field existed.
+/// Amendment A21 (owner decision 2026-10-09) changed what an omitted loader
+/// resolves to in the *effective* configuration (shown with its source), but
+/// not the command identity, which is unaffected here either way.
 // T09
 #[test]
 fn an_omitted_load_strategy_keeps_existing_identities() {
@@ -311,9 +313,28 @@ fn an_omitted_load_strategy_keeps_existing_identities() {
     );
     let effective = resolve_effective(&deployment, &host).unwrap();
     let snapshot = serde_json::to_value(&effective).unwrap();
-    assert!(snapshot["engine_config"]
-        .get("safetensors_load_strategy")
-        .is_none());
+    let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+        panic!("vLLM settings");
+    };
+    // The fixture's host is unified memory (amendment A21): an omitted
+    // loader resolves to `lazy`, shown with its source.
+    assert_eq!(
+        settings.safetensors_load_strategy,
+        Some(SafetensorsLoadStrategy::Lazy)
+    );
+    assert_eq!(
+        snapshot["engine_config"]["safetensors_load_strategy"],
+        json!("lazy")
+    );
+    assert_eq!(
+        snapshot["engine_config"]["provenance"]["vllm.safetensors_load_strategy"],
+        json!("capyctl default")
+    );
+    assert_eq!(
+        decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+        effective,
+        "a defaulted loader round-trips through the snapshot"
+    );
 
     let mut declared = deployment.clone();
     declared["engine_config"]["vllm"]["safetensors_load_strategy"] = "eager".into();
