@@ -808,8 +808,11 @@ async fn scoped_start_cancelled_caller_cannot_cancel_committed_execution() {
 }
 
 // ADR 0015: the scheduler keeps polling the store while an Initialize is in
-// flight, so its own failed read also waits on the command's owner lock. A
-// second runtime thread keeps the test itself running meanwhile.
+// flight, so its own failed read also waits on the command's owner lock, and
+// blocks the runtime worker it runs on. The test body runs on its own thread
+// and awaits no runtime timer while that lock is held: a worker parked
+// without the timer driver is never woken for one, so a timer could wait as
+// long as the blocked worker does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scoped_start_store_queue_failure_waits_for_in_progress_admission() {
     let (dir, owner, fence, observations) = setup().await;
@@ -855,11 +858,30 @@ async fn scoped_start_store_queue_failure_waits_for_in_progress_admission() {
     let runtime = tokio::runtime::Handle::current();
     let (failing_tx, failing_rx) = tokio::sync::oneshot::channel();
     let failed_read = tokio::task::spawn_blocking(move || {
-        failing_tx.send(()).unwrap();
+        failing_tx
+            .send(std::fs::read_link("/proc/thread-self").unwrap())
+            .unwrap();
         runtime.block_on(shared.read(|_, _| Ok(())))
     });
-    failing_rx.await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The closed queue refuses the read at once; its fault then waits for the
+    // owner lock the command holds, and nothing else on that path sleeps.
+    // Admission is read once the thread sleeps there, while the fault's
+    // closure is pending rather than before it has started.
+    let stat = std::path::Path::new("/proc")
+        .join(failing_rx.await.unwrap())
+        .join("stat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&stat)
+        .expect("the failing read is still waiting")
+        .rsplit_once(')')
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with('S'))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failing read never waited for the owner lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let still_accepting = w.shared.accepting.load(Ordering::Acquire);
     release_tx.send(()).unwrap();
     let receipt = command_thread.join().unwrap().unwrap();

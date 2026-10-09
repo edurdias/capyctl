@@ -328,6 +328,7 @@ dependencies = [
  "capyctl-launchers",
  "capyctl-protocol",
  "capyctl-scheduler",
+ "capyctl-testkit",
  "futures",
  "hex",
  "libc",

@@ -44,3 +44,4 @@ subtle = "2"
 sha2 = { workspace = true }
 
 [dev-dependencies]
+capyctl-testkit = { workspace = true }

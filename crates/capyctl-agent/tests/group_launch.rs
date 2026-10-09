@@ -299,27 +299,6 @@ fn now_ms() -> i64 {
     capyctl_protocol::now_unix_ms()
 }
 
-/// `count` consecutive loopback ports that are free now.
-fn free_ports(count: u16) -> u16 {
-    for _ in 0..200 {
-        let base = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if base.checked_add(count).is_none() {
-            continue;
-        }
-        let held: Vec<_> = (base..base + count)
-            .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)))
-            .collect();
-        if held.iter().all(Result::is_ok) {
-            return base;
-        }
-    }
-    panic!("no run of free loopback ports");
-}
-
 fn golden(engine: &str) -> Value {
     serde_json::from_str(
         &std::fs::read_to_string(format!(
@@ -546,7 +525,11 @@ impl FakeHost {
     fn build(&self) -> Built {
         let root = directory();
         let path = root.path();
-        let base_port = free_ports(3);
+        // A port learned from `127.0.0.1:0` and released sits in the ephemeral
+        // range, where a concurrent test's outbound connection can take it
+        // before the Launch checks it (`service_port_in_use`); the testkit
+        // pool hands out ports below that range, never twice.
+        let base_port = capyctl_testkit::ports::free_ports(3, true)[0];
         let bin = path.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink(python3(), bin.join("python3")).unwrap();
