@@ -1544,11 +1544,12 @@ amendment A19's parked-growth guard into stops.
 
 Decision:
 
-1. Absent a declared `vllm.safetensors_load_strategy`, resolution picks `lazy` when the
-   deployment's phases derive on unified memory (`EngineInputs::device` is `None`) and `eager`
-   on a discrete GPU (`Some`, ADR 0019). The resolved value is always present in the effective
-   configuration (`VllmLaunchSettings::safetensors_load_strategy`, never `None` once resolved)
-   with `provenance["vllm.safetensors_load_strategy"]` naming it `capyctl default`; a declared
+1. Absent a declared `vllm.safetensors_load_strategy`, a **parking** deployment's resolution
+   picks `lazy` when its phases derive on unified memory (`EngineInputs::device` is `None`)
+   and `eager` on a discrete GPU (`Some`, ADR 0019); a non-parking deployment resolves no
+   default (see the review correction below). A default is shown in the effective
+   configuration (`VllmLaunchSettings::safetensors_load_strategy: Some(..)`) with
+   `provenance["vllm.safetensors_load_strategy"]` naming it `capyctl default`; a declared
    value still has no entry (SPEC §7, T14). Rendering is unchanged by this amendment: under
    sleep mode the resolved value always renders beside `--enable-sleep-mode`; outside it, only
    a declared value renders, so an undeclared, non-parking launch keeps its command identity
@@ -1565,9 +1566,21 @@ Decision:
    deployment declared) is unaffected: it never saw the capyctl default before this amendment
    and does not see it now.
 
-Evidence: CPU tests cover the default by host shape, the provenance entry, the startup
-placeholder's two factors, and that a declared choice still wins and keeps its command
-identity (`the_default_load_strategy_follows_the_host_memory_shape`,
+Review correction (2026-10-09): an earlier revision of this amendment resolved the host-shape
+default for every deployment, parking or not, so an undeclared, non-parking launch on a
+discrete GPU showed `eager` in its effective configuration while rendering nothing (§3: the
+flag is reserved to sleep mode unless declared). vLLM 0.30's `LoadConfig.safetensors_load_strategy`
+(`vllm/config/load.py`) confirms its own unrendered default is memory-mapped loading ("None
+(default): Uses memory-mapped (lazy) loading[, with] prefetching... enabled automatically" on
+NFS), not eager, so the shown value did not match what ran. The default now applies only while
+`sleep_mode` is true (the only case it is ever rendered); a non-parking, undeclared deployment
+resolves no strategy and shows none, on either memory shape, exactly as before this amendment.
+
+Evidence: CPU tests cover the default by host shape while parking, the provenance entry, the
+startup placeholder's two factors, that a declared choice still wins and keeps its command
+identity, and that a non-parking, undeclared deployment resolves and renders nothing on either
+memory shape (`the_default_load_strategy_follows_the_host_memory_shape`,
+`an_undeclared_strategy_stays_unset_without_parking`,
 `an_omitted_load_strategy_keeps_existing_identities`,
 `the_startup_placeholder_follows_the_effective_loader`). No live park has run with the new
 unified default yet.
