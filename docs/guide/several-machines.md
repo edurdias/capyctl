@@ -445,17 +445,23 @@ A headless worker opens no API port.
 | `nccl_port` | every member | ephemeral | not bound | Chosen but unused: with `--dist-init-addr` the store is on `P`. |
 
 With DP attention enabled, the head also binds, on the head's link address
-(the host in `--dist-init-addr`), as SGLang 0.5.20 computes them in
+(the host in `--dist-init-addr`), as SGLang 0.5.21 computes them in
 `PortArgs.init_new` and `data_parallel_controller.py`:
 
 | Listener | Port | Binds |
 |---|---|---|
-| Tokenizer, detokenizer, RPC, metrics, scheduler input, load collector (ZeroMQ) | `P+1` to `P+6`, or `P-7` to `P-2` when `P+7` passes 65535 | the head's link address |
+| Tokenizer, detokenizer, RPC, metrics, scheduler input, load collector (ZeroMQ) | `P+1` to `P+6` | the head's link address |
 | Worker-port handshake (ZeroMQ REP; replies with a pickled port list) | `P+13` | the head's link address |
 | One scheduler input socket per DP rank (ZeroMQ PUSH) | ephemeral | the head's link address |
 
-CapyCTL's `Prepare` checks `P+1` to `P+6` on the head; it does
-not check `P+13` or the ephemeral DP sockets.
+Before it starts the head, CapyCTL checks that `P+1` to `P+6` and `P+13`
+are free on the head's link address. SGLang moves the first six down to
+`P-7` to `P-2` when `P+6` would pass 65535, but it never moves `P+13`, so a
+head whose rendezvous port is above 65522 cannot start with DP attention, and
+CapyCTL refuses it. Keep `--rendezvous-ports` at or below 65522 if you use
+DP attention. The per-rank sockets take a port the kernel picks as the engine
+starts, so nothing can check them beforehand; a conflict there shows only as
+an engine start failure.
 
 #### TensorFold 0.6.5
 
