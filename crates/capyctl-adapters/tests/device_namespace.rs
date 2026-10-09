@@ -181,3 +181,31 @@ fn only_a_choice_or_a_discrete_gpu_pins() {
         Ok(Some(CudaNamespace::PciIndex(0)))
     );
 }
+
+// T21 T26, SPEC §7.2 (found live 2026-10-09 on a GB10): an SGLang launch on
+// unified memory carries its Ready charge, which the compile-job count leaves
+// out; on a discrete GPU's own domain it carries none.
+#[test]
+fn the_sglang_launch_carries_the_ready_charge_on_unified_memory_only() {
+    let one = json!({"gpu0": {"domain": "unified", "sharing": "shared"}});
+    let frozen = |effective: &EffectiveDeployment| {
+        frozen_from_effective(
+            effective,
+            "binding",
+            "incarnation",
+            "127.0.0.1:8123",
+            "toy".into(),
+            "inference".into(),
+            "admin".into(),
+        )
+        .unwrap()
+    };
+    let unified = on("sglang", one.clone(), "gpu0");
+    // The golden deployment's Ready phase charges 8 GiB on `unified`.
+    assert_eq!(frozen(&unified).unified_ready_bytes(), 8 << 30);
+
+    let mut discrete = on("sglang", one, "gpu0");
+    discrete.host.domains.get_mut("unified").unwrap().memory = DomainMemory::Device;
+    discrete.host.domains.get_mut("unified").unwrap().device = Some("gpu0".into());
+    assert_eq!(frozen(&discrete).unified_ready_bytes(), 0);
+}

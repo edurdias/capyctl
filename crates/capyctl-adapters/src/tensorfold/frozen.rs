@@ -95,6 +95,7 @@ pub fn plan_from_effective(
             .map(|parent| parent.to_string_lossy().into_owned()),
         cuda_home: profile.cuda_home.clone(),
         build_env: effective.engine_env.values(),
+        unified_ready_bytes: crate::engine_env::unified_ready_bytes(effective),
         model_path,
         served_model_name,
         port,

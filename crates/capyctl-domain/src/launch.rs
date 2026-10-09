@@ -408,6 +408,7 @@ pub struct NativeLaunch {
     settings: SglangLaunchSettings,
     cuda_home: Option<String>,
     build_env: std::collections::BTreeMap<String, String>,
+    unified_ready_bytes: u64,
     group: Option<crate::group::GroupMemberArgs>,
     draft_model_path: Option<String>,
 }
@@ -432,6 +433,7 @@ impl NativeLaunch {
             settings,
             cuda_home: None,
             build_env: std::collections::BTreeMap::new(),
+            unified_ready_bytes: 0,
             group: None,
             draft_model_path: None,
         }
@@ -449,6 +451,20 @@ impl NativeLaunch {
         self.cuda_home = cuda_home;
         self.build_env = build_env;
         self
+    }
+    /// SPEC §7.2: what the deployment's Ready phase charges on unified-memory
+    /// domains. The engine holds it from the pool the JIT compilers also use
+    /// by the time they run, so the compile-job count is sized from what it
+    /// leaves (`capyctl_adapters::engine_env::build_job_cap`). Zero on a
+    /// discrete GPU.
+    #[doc(hidden)]
+    pub fn with_unified_ready_bytes(mut self, bytes: u64) -> Self {
+        self.unified_ready_bytes = bytes;
+        self
+    }
+    #[doc(hidden)]
+    pub fn unified_ready_bytes(&self) -> u64 {
+        self.unified_ready_bytes
     }
     /// ADR 0028 §10: this member's multi-node arguments. A launch without one
     /// is a single-rank launch and renders exactly as before (T39). HOLD #10:

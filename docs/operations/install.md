@@ -737,10 +737,15 @@ detected for it. The engine then gets `<cuda_home>/bin` on its PATH and
 directories.
 
 Each compile job can take several GB. CapyCTL sets `MAX_JOBS` to the free memory
-at launch divided by 8 GiB, at most the CPU count, and
-`FLASHINFER_NVCC_THREADS=1`. The host log prints the chosen value at every
-launch. To choose other limits, put `MAX_JOBS` or `FLASHINFER_NVCC_THREADS`
-(positive integers) in the profile's `env`.
+at launch divided by 8 GiB, at most the CPU count and at least 1, and
+`FLASHINFER_NVCC_THREADS=1`. The engines compile once the model is loaded, so on
+a unified-memory machine (a GB10) the memory the deployment is charged once
+Ready comes off the free memory first: with 117 GiB free and a 95 GiB Ready
+charge, `MAX_JOBS` is 2, not 14. On a discrete GPU the model sits in the card's
+memory, so the free system memory alone sets it. The host log prints the chosen
+value and the figures behind it at every launch. To choose other limits, put
+`MAX_JOBS` or `FLASHINFER_NVCC_THREADS` (positive integers) in the profile's
+`env` or the deployment's `engine_config.env`; that value is used as written.
 
 **With the system units, run `capyctl engine` as root with the unit's
 `--config`.** The host unit reads `/etc/capyctl/host.yaml`, so its `engines.yaml`
@@ -963,8 +968,9 @@ the role document instead (see
 [configuration](configuration.md#standalone-memory-limits)).
 `meminfo:cgroup_v2_unreadable` means the role is in a v2 cgroup whose limits it
 could not read under `/sys/fs/cgroup`. The JIT compile-job count (`MAX_JOBS`)
-is still sized from the machine's `MemAvailable`; in a tightly limited container,
-set `MAX_JOBS` in the engine env.
+is still sized from the machine's `MemAvailable` (less the deployment's Ready
+charge on unified memory); in a tightly limited container, set `MAX_JOBS` in
+the engine env.
 
 A standalone role on a GB10, as an example:
 

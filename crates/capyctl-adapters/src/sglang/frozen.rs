@@ -168,5 +168,6 @@ pub fn frozen_from_effective(
         settings.clone(),
     )
     .with_toolchain(profile.cuda_home.clone(), effective.engine_env.values())
+    .with_unified_ready_bytes(crate::engine_env::unified_ready_bytes(effective))
     .with_draft_model(draft_root))
 }

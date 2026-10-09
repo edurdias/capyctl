@@ -45,6 +45,7 @@ pub(super) async fn initialize(
         Some(&plan.engine_bin),
         plan.cuda_home.as_deref(),
         crate::engine_env::mem_available_bytes(),
+        plan.unified_ready_bytes,
         crate::engine_env::cpu_count(),
     );
     capyctl_domain::role_log::notice(

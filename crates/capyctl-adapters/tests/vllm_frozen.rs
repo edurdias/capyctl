@@ -535,6 +535,28 @@ fn a_discrete_plan_sizes_utilization_from_the_device_request() {
     assert_eq!(same.engine_config.memory().device_total_bytes, None);
 }
 
+/// SPEC §7.2 (found live 2026-10-09 on a GB10): a unified launch carries its
+/// Ready charge, which the compile-job count leaves out; a discrete launch
+/// carries none, so its count is sized from free memory as before.
+// T21 T26
+#[test]
+fn the_plan_carries_the_ready_charge_on_unified_memory_only() {
+    let unified = effective_with_deep_park_disabled();
+    let charged: i64 = unified
+        .resources
+        .ready
+        .allocations
+        .iter()
+        .map(|allocation| allocation.bytes)
+        .sum();
+    assert!(charged > 0);
+    let plan = plan_from_effective(&unified, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(plan.unified_ready_bytes, charged as u64);
+    let discrete = discrete_effective();
+    let plan = plan_from_effective(&discrete, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(plan.unified_ready_bytes, 0);
+}
+
 fn effective_with_deep_park_disabled() -> EffectiveDeployment {
     effective("disabled")
 }
