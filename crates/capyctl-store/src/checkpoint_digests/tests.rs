@@ -679,7 +679,9 @@ fn a_recorded_digest_keeps_its_provenance() {
     config["routes"] = json!(["declared"]);
     let declared = deploy(&store, &session, "declared", &config, &host);
     let record = |id: &str, digest: &str, provenance| {
-        store.record_checkpoint_measurement(&session, id, 1, "lab", digest, 7, None, provenance, 2)
+        store.record_checkpoint_measurement(
+            &session, id, 1, "lab", digest, 7, None, None, provenance, 2,
+        )
     };
     for (id, digest) in [
         (&plain.deployment_id, DIGEST),
