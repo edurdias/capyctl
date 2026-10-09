@@ -329,11 +329,15 @@ process effect. Each host checks: the profile resolves with the recorded fingerp
 the model path holds the recorded digest; the peer address is local; on the head, the
 rendezvous port is free under a wildcard bind (`0.0.0.0` and `::`, since the torch
 store binds every interface) and the service port on loopback; on the head of a
-SGLang group whose deployment enables DP attention, also the six ports SGLang derives
-from the rendezvous port `P` and binds there (`P+1` to `P+6`, or `P-7` to `P-2` when
-`P+7` exceeds 65535, as SGLang 0.5.21 computes them; checked when the `Launch` re-runs
-these checks, because only the `Launch` carries the deployment document); on a SGLang
-worker, its loopback port is free; and host tuning:
+SGLang group whose deployment enables DP attention, also the seven fixed ports SGLang
+derives from the rendezvous port `P` and binds there (`P+1` to `P+6` from
+`PortArgs.init_new` and the worker-port handshake at `P+13` from
+`data_parallel_controller.py`, as SGLang 0.5.21 computes them; SGLang moves the six to
+`P-7` to `P-2` when `P+6` exceeds 65535 but never moves `P+13`, so any `P` above 65522
+is refused `rendezvous_port_in_use:<P>`; checked when the `Launch` re-runs these checks,
+because only the `Launch` carries the deployment document; the head's one ephemeral
+PUSH socket per DP rank is chosen by the kernel at launch and is not checked); on a
+SGLang worker, its loopback port is free; and host tuning:
 
 | Check | How | Default | `require_rdma: true` |
 |---|---|---|---|
@@ -495,8 +499,9 @@ loopback control endpoint. Workers never receive a sleep call.
 - Engines also open listeners CapyCTL does not choose: the torch TCP store on the
   rendezvous port binds every interface; vLLM's broadcast queue binds an ephemeral
   port on `VLLM_HOST_IP`; TensorFold Flash Next under `--parallel` opens one extra
-  ephemeral port on rank 0; SGLang with DP attention binds six ports derived from the
-  rendezvous port on the head (§7); NCCL uses dynamic ports; gloo opens ephemeral CPU-group
+  ephemeral port on rank 0; SGLang with DP attention binds seven fixed ports derived from
+  the rendezvous port and one ephemeral port per DP rank on the head (§7); NCCL uses
+  dynamic ports; gloo opens ephemeral CPU-group
   ports on each rank. None is authenticated.
 - CapyCTL narrows what it can: it renders the direct-link addresses where the engine
   takes them, keeps every API and control endpoint on loopback, and exposes nothing

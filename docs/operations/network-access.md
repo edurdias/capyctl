@@ -170,8 +170,9 @@ members also talk to each other on ports that have no authentication:
   `25000-25099`), on every interface;
 - the engine's own ports, which CapyCTL does not choose: the gloo ports of the
   CPU process group on each member, vLLM's broadcast queue port, an extra port
-  TensorFold opens on rank 0, six ports next to the rendezvous port for SGLang
-  with DP attention, and NCCL's dynamic ports.
+  TensorFold opens on rank 0, for SGLang with DP attention `P+1` to `P+6` and
+  `P+13` from the rendezvous port `P` plus one kernel-picked port per DP rank,
+  and NCCL's dynamic ports.
 
 The engines exchange pickled Python objects over these ports. Anyone who can
 reach them can likely run code as the user the engine runs as, and read the

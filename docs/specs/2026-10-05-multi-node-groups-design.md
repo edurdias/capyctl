@@ -290,8 +290,10 @@ process effect. Each host checks: the profile resolves with the recorded
 fingerprint; the model path holds the recorded digest; the peer address is local; on
 the head, the rendezvous port is free on the peer address and the service port on
 loopback; on the head of a SGLang group whose deployment enables DP attention, also
-the six ports SGLang derives from the rendezvous port `P` and binds there (`P+1` to
-`P+6`, or `P-7` to `P-2` when `P+7` exceeds 65535, as SGLang 0.5.21 computes them;
+the seven fixed ports SGLang derives from the rendezvous port `P` and binds there
+(`P+1` to `P+6` and the handshake at `P+13`, as SGLang 0.5.21 computes them; SGLang
+moves the six to `P-7` to `P-2` when `P+6` exceeds 65535 but never moves `P+13`, so
+any `P` above 65522 is refused; the per-rank ephemeral PUSH sockets are not checked;
 checked when the `Launch` re-runs these checks, because only the `Launch` carries the
 deployment document); on a SGLang worker, its loopback port is free; and the host
 tuning:

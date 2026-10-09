@@ -201,17 +201,29 @@ impl HostProbes {
     }
 }
 
-/// R33 (ADR 0028 §5, §13): the ports SGLang 0.5.21 derives from its
-/// rendezvous port `port` on the head when DP attention is on: six from
-/// `port + 1`, or from `port - 7` when `port + 7` would pass 65535. `None`
-/// when no such run of ports exists (no `u16` wrap).
-pub fn dp_attention_ports(port: u16) -> Option<std::ops::RangeInclusive<u16>> {
-    let base = if port.checked_add(7).is_none() {
-        port.checked_sub(7)?
-    } else {
-        port.checked_add(1)?
-    };
-    Some(base..=base.checked_add(5)?)
+/// R33 (ADR 0028 §5, §7, §13): the fixed ports SGLang 0.5.21 derives from its
+/// rendezvous port `port` on the head when DP attention is on, in probe order:
+/// six from `port + 1` (`PortArgs.init_new`, `server_args.py`: `port_base` to
+/// `port_base + 5`), then the worker-port handshake at `port + 13`
+/// (`DP_ATTENTION_HANDSHAKE_PORT_DELTA`, `data_parallel_controller.py`).
+///
+/// SGLang moves the six to `port - 7` when `port + 6` would pass 65535, but
+/// gives the handshake no such fallback, so every port that needs the move
+/// (above 65529) already has no handshake port. `None` for any `port` above
+/// 65522: the head cannot start there. The per-rank PUSH sockets bind
+/// ephemeral ports chosen at launch and cannot be checked beforehand.
+pub fn dp_attention_ports(port: u16) -> Option<[u16; 7]> {
+    let handshake = port.checked_add(13)?;
+    let base = port + 1;
+    Some([
+        base,
+        base + 1,
+        base + 2,
+        base + 3,
+        base + 4,
+        base + 5,
+        handshake,
+    ])
 }
 
 /// R33: on a SGLang head with DP attention, the first derived port held
@@ -790,18 +802,23 @@ mod tests {
         .unwrap()
     }
 
-    // R33 (ADR 0028 §5, §13), Review Focus 2: with DP attention a SGLang head
-    // also needs the six ports SGLang 0.5.21 derives from the rendezvous port:
-    // from P+1, or from P-7 when P+7 passes 65535. The first one held refuses,
-    // named; nothing is probed on a worker, on another engine, or without DP
-    // attention.
+    // R33 (ADR 0028 §5, §7, §13), Review Focus 2: with DP attention a SGLang
+    // head also needs the ports SGLang 0.5.21 derives from the rendezvous
+    // port: P+1 to P+6 and the handshake at P+13. SGLang's own move of the six
+    // to P-7 (when P+6 passes 65535) leaves the handshake past 65535, so any P
+    // above 65522 is refused. The first one held refuses, named; nothing is
+    // probed on a worker, on another engine, or without DP attention.
     #[test]
     fn dp_attention_probes_the_derived_head_ports() {
-        assert_eq!(dp_attention_ports(25000), Some(25001..=25006));
-        assert_eq!(dp_attention_ports(65528), Some(65529..=65534));
-        assert_eq!(dp_attention_ports(65529), Some(65522..=65527));
-        assert_eq!(dp_attention_ports(65535), Some(65528..=65533));
-        assert_eq!(dp_attention_ports(3), Some(4..=9));
+        let fixed = |p: u16| [p + 1, p + 2, p + 3, p + 4, p + 5, p + 6, p + 13];
+        assert_eq!(dp_attention_ports(25000), Some(fixed(25000)));
+        assert_eq!(dp_attention_ports(3), Some(fixed(3)));
+        assert_eq!(dp_attention_ports(65522), Some(fixed(65522)));
+        // Past 65522 the handshake has no port, including every P where SGLang
+        // would move the six down (65530 to 65535).
+        for port in [65523, 65529, 65530, 65535] {
+            assert_eq!(dp_attention_ports(port), None, "P={port}");
+        }
         let sglang = sample_plan(GroupEngine::Sglang);
         let probed = std::cell::RefCell::new(Vec::new());
         let held = |held: u16| {
@@ -819,16 +836,22 @@ mod tests {
         assert_eq!(*probed.borrow(), [25001, 25002, 25003]);
         probed.borrow_mut().clear();
         assert_eq!(
-            derived_ports_held(&on_port(&sglang, 65530), "host-a", true, held(65525)),
-            Err("rendezvous_port_in_use:65525".into())
+            derived_ports_held(&sglang, "host-a", true, held(25013)),
+            Err("rendezvous_port_in_use:25013".into())
         );
-        assert_eq!(*probed.borrow(), [65523, 65524, 65525]);
+        assert_eq!(*probed.borrow(), fixed(25000));
+        probed.borrow_mut().clear();
+        assert_eq!(
+            derived_ports_held(&on_port(&sglang, 65522), "host-a", true, held(1)),
+            Ok(())
+        );
+        assert_eq!(*probed.borrow(), fixed(65522));
         probed.borrow_mut().clear();
         assert_eq!(
             derived_ports_held(&on_port(&sglang, 65530), "host-a", true, held(1)),
-            Ok(())
+            Err("rendezvous_port_in_use:65530".into())
         );
-        assert_eq!(*probed.borrow(), (65523..=65528).collect::<Vec<_>>());
+        assert!(probed.borrow().is_empty(), "no port exists to probe");
         probed.borrow_mut().clear();
         for (plan, host, dp) in [
             (&sglang, "host-a", false),
