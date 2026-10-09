@@ -11,6 +11,10 @@ never rewritten).
 **Amended by:** ADR 0023 (2026-10-01): detection also reads `tensorfold-*.dist-info`,
 the entry point `<env>/bin/tensorfold`, and the verified set gains TensorFold 0.6.0,
 0.6.1, 0.6.2, 0.6.3 and 0.6.5.
+ADR 0029 (2026-10-09, not yet implemented): a llama.cpp installation is a bare
+`llama-server` binary; detection finds the file and executes nothing, the version
+check reads its standard error, and the fingerprint covers the shared libraries beside
+it.
 
 ## Context
 
