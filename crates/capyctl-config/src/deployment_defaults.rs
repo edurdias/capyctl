@@ -56,13 +56,17 @@ pub fn split_hf(text: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The `hf:` shorthand of a raw deployment document that is not pinned to a
-/// commit yet: `(repository, reference)`, the reference `main` when none is
-/// written. `capyctl deploy model --file` pins it before the document is
-/// parsed; `capyctl validate config`, which never contacts the network, refuses
-/// it.
-pub fn unpinned_hf(document: &Value) -> Option<(String, String)> {
-    let text = document.get("model")?.get("hf")?.as_str()?;
+/// Where a `hf:` shorthand may be written, as JSON pointers: the model, and
+/// (ADR 0008 amendment 2026-10-08) its drafter.
+pub const HF_SHORTHANDS: [&str; 2] = ["/model", "/model/draft"];
+
+/// The `hf:` shorthand at `at` (one of [`HF_SHORTHANDS`]) of a raw
+/// deployment document that is not pinned to a commit yet: `(repository,
+/// reference)`, the reference `main` when none is written. `capyctl deploy
+/// model --file` pins it before the document is parsed; `capyctl validate
+/// config`, which never contacts the network, refuses it.
+pub fn unpinned_hf(document: &Value, at: &str) -> Option<(String, String)> {
+    let text = document.pointer(at)?.get("hf")?.as_str()?;
     let (repo, revision) = split_hf(text);
     match revision {
         Some(revision) if is_commit_sha(revision) => None,
@@ -71,33 +75,42 @@ pub fn unpinned_hf(document: &Value) -> Option<(String, String)> {
     }
 }
 
-/// Replace the `hf:` shorthand's reference with the commit it resolved to.
-pub fn pin_hf(document: &mut Value, repo: &str, commit: &str) {
-    if let Some(model) = document.get_mut("model").and_then(Value::as_object_mut) {
-        model.insert("hf".into(), Value::String(format!("{repo}@{commit}")));
+/// Replace the `hf:` shorthand's reference at `at` with the commit it
+/// resolved to.
+pub fn pin_hf(document: &mut Value, at: &str, repo: &str, commit: &str) {
+    if let Some(block) = document.pointer_mut(at).and_then(Value::as_object_mut) {
+        block.insert("hf".into(), Value::String(format!("{repo}@{commit}")));
     }
 }
 
-/// Expand a leading `~/` in a `model:` path shorthand (or `model.path`)
-/// against `home`, as a shell would. The capyctl CLI calls it on the file it
-/// reads; `home` is its own home directory.
+/// Expand a leading `~/` in a `model:` path shorthand (or `model.path`), and
+/// in the drafter's (`model.draft`, or its `path`), against `home`, as a
+/// shell would. The capyctl CLI calls it on the file it reads; `home` is its
+/// own home directory.
 pub fn expand_home(document: &mut Value, home: Option<&std::path::Path>) {
     let Some(home) = home.filter(|home| home.is_absolute()) else {
         return;
     };
-    let Some(model) = document.get_mut("model") else {
-        return;
-    };
-    let slot = if model.is_string() {
-        Some(model)
-    } else {
-        model.get_mut("path")
-    };
-    if let Some(slot) = slot {
+    fn slot(block: &mut Value) -> Option<&mut Value> {
+        if block.is_string() {
+            Some(block)
+        } else {
+            block.get_mut("path")
+        }
+    }
+    let expand = |slot: Option<&mut Value>| {
+        let Some(slot) = slot else {
+            return;
+        };
         if let Some(rest) = slot.as_str().and_then(|path| path.strip_prefix("~/")) {
             *slot = Value::String(home.join(rest).to_string_lossy().into_owned());
         }
-    }
+    };
+    let Some(model) = document.get_mut("model") else {
+        return;
+    };
+    expand(model.get_mut("draft").and_then(slot));
+    expand(slot(model));
 }
 
 /// Fill the defaults the document alone decides. Idempotent: a full document
@@ -150,24 +163,10 @@ pub fn expand(document: &mut Value) -> Result<(), ConfigError> {
 
 /// SPEC §7: `model: <path>` is a local path (absolute, or relative to the
 /// models directory); `model: {hf: owner/repo@<commit>}` is a pinned Hugging
-/// Face source (ADR 0008).
+/// Face source (ADR 0008). The drafter (`model.draft`) takes the same two.
 fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
     if let Some(path) = model.as_str() {
-        if path.is_empty() {
-            return Err(invalid("model", "must not be empty"));
-        }
-        // A home-relative path means the home of whoever wrote it; the capyctl
-        // CLI expands it ([`expand_home`]) before the document leaves the
-        // machine, so a document that still has one came from elsewhere.
-        if path.starts_with('~') {
-            return Err(invalid(
-                "model",
-                format!(
-                    "`{path}`: a path starting with `~` is expanded by the capyctl CLI; \
-                     send an absolute path, or one relative to the models directory"
-                ),
-            ));
-        }
+        path_shorthand(path, "model")?;
         *model = json!({"path": path});
     }
     let Some(block) = model.as_object_mut() else {
@@ -177,35 +176,7 @@ fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
         if block.contains_key("path") || block.contains_key("source") {
             return Err(invalid("model.hf", "state one of `hf`, `path` or `source`"));
         }
-        let text = hf
-            .as_str()
-            .ok_or_else(|| invalid("model.hf", "must be `owner/repo` or `owner/repo@<commit>`"))?;
-        let (repo, revision) = split_hf(text);
-        let revision = revision
-            .filter(|revision| is_commit_sha(revision))
-            .ok_or_else(|| {
-                invalid(
-                    "model.hf",
-                    format!(
-                        "`{text}` is not pinned to a commit: `capyctl deploy model --file` pins it \
-                     to the commit it names now, or write `{repo}@<40-character commit>` \
-                     (so the same document always means the same bytes)"
-                    ),
-                )
-            })?;
-        let source = ModelSource::HuggingFace {
-            repo: repo.to_owned(),
-            revision: revision.to_owned(),
-            files: Vec::new(),
-            token_ref: None,
-        };
-        source
-            .validate()
-            .map_err(|error| ConfigError::new(error.code, "model.hf", error.detail))?;
-        block.insert(
-            "source".into(),
-            serde_json::to_value(&source).expect("a model source serializes"),
-        );
+        block.insert("source".into(), hf_source(&hf, "model.hf")?);
     }
     if block
         .get("path")
@@ -218,6 +189,9 @@ fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
              or one relative to the models directory",
         ));
     }
+    if let Some(draft) = block.get_mut("draft") {
+        expand_draft(draft)?;
+    }
     block
         .entry("content_fingerprint")
         .or_insert(json!(MEASURED_FINGERPRINT));
@@ -225,6 +199,80 @@ fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
         .entry("revision")
         .or_insert(json!(DEFAULT_MODEL_REVISION));
     Ok(())
+}
+
+/// ADR 0008 amendment 2026-10-08: `model.draft: <path>` is a local drafter
+/// and `model.draft: {hf: owner/repo@<commit>}` a pinned Hugging Face one;
+/// a written source is kept as written for the strict parse.
+fn expand_draft(draft: &mut Value) -> Result<(), ConfigError> {
+    if let Some(path) = draft.as_str() {
+        path_shorthand(path, "model.draft")?;
+        *draft = json!({"type": "local", "path": path});
+        return Ok(());
+    }
+    let Some(block) = draft.as_object() else {
+        return Ok(());
+    };
+    if let Some(hf) = block.get("hf") {
+        if block.len() != 1 {
+            return Err(invalid(
+                "model.draft.hf",
+                "state `hf` alone, or the drafter's source written out",
+            ));
+        }
+        *draft = hf_source(hf, "model.draft.hf")?;
+    }
+    Ok(())
+}
+
+/// A path shorthand at `at`: not empty, and not home-relative.
+fn path_shorthand(path: &str, at: &str) -> Result<(), ConfigError> {
+    if path.is_empty() {
+        return Err(invalid(at, "must not be empty"));
+    }
+    // A home-relative path means the home of whoever wrote it; the capyctl
+    // CLI expands it ([`expand_home`]) before the document leaves the
+    // machine, so a document that still has one came from elsewhere.
+    if path.starts_with('~') {
+        return Err(invalid(
+            at,
+            format!(
+                "`{path}`: a path starting with `~` is expanded by the capyctl CLI; \
+                 send an absolute path, or one relative to the models directory"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The pinned Hugging Face source an `hf:` shorthand at `at` names.
+fn hf_source(hf: &Value, at: &str) -> Result<Value, ConfigError> {
+    let text = hf
+        .as_str()
+        .ok_or_else(|| invalid(at, "must be `owner/repo` or `owner/repo@<commit>`"))?;
+    let (repo, revision) = split_hf(text);
+    let revision = revision
+        .filter(|revision| is_commit_sha(revision))
+        .ok_or_else(|| {
+            invalid(
+                at,
+                format!(
+                    "`{text}` is not pinned to a commit: `capyctl deploy model --file` pins it \
+                     to the commit it names now, or write `{repo}@<40-character commit>` \
+                     (so the same document always means the same bytes)"
+                ),
+            )
+        })?;
+    let source = ModelSource::HuggingFace {
+        repo: repo.to_owned(),
+        revision: revision.to_owned(),
+        files: Vec::new(),
+        token_ref: None,
+    };
+    source
+        .validate()
+        .map_err(|error| ConfigError::new(error.code, at, error.detail))?;
+    Ok(serde_json::to_value(&source).expect("a model source serializes"))
 }
 
 /// The runtime profile `requested` names on the host document `host`: the
@@ -479,20 +527,23 @@ mod tests {
             );
         }
         assert_eq!(
-            unpinned_hf(&json!({"model": {"hf": "Qwen/Qwen3-4B"}})),
+            unpinned_hf(&json!({"model": {"hf": "Qwen/Qwen3-4B"}}), "/model"),
             Some(("Qwen/Qwen3-4B".into(), "main".into()))
         );
         assert_eq!(
-            unpinned_hf(&json!({"model": {"hf": "Qwen/Qwen3-4B@v1"}})),
+            unpinned_hf(&json!({"model": {"hf": "Qwen/Qwen3-4B@v1"}}), "/model"),
             Some(("Qwen/Qwen3-4B".into(), "v1".into()))
         );
         assert_eq!(
-            unpinned_hf(&json!({"model": {"hf": format!("Qwen/Qwen3-4B@{SHA}")}})),
+            unpinned_hf(
+                &json!({"model": {"hf": format!("Qwen/Qwen3-4B@{SHA}")}}),
+                "/model"
+            ),
             None
         );
         let mut pinned = json!({"model": {"hf": "Qwen/Qwen3-4B"}});
-        pin_hf(&mut pinned, "Qwen/Qwen3-4B", SHA);
-        assert_eq!(unpinned_hf(&pinned), None);
+        pin_hf(&mut pinned, "/model", "Qwen/Qwen3-4B", SHA);
+        assert_eq!(unpinned_hf(&pinned, "/model"), None);
         let error =
             expanded(json!({"name": "m", "model": {"hf": format!("a/b@{SHA}"), "path": "x"}}))
                 .unwrap_err();
@@ -500,6 +551,68 @@ mod tests {
         let error =
             expanded(json!({"name": "m", "model": {"hf": format!("../b@{SHA}")}})).unwrap_err();
         assert_eq!(error.path, "model.hf");
+    }
+
+    // T14 (ADR 0008 amendment 2026-10-08): a drafter takes the model's
+    // shorthands, a path or a pinned `hf:` reference, which the CLI pins
+    // where it pins the model's own; `model.draft` is refused under its name.
+    #[test]
+    fn a_drafter_takes_the_models_shorthands() {
+        let document = expanded(json!({
+            "name": "m", "engine": "sglang", "model": {"path": "m", "draft": "drafts/d"}
+        }))
+        .unwrap();
+        assert_eq!(
+            document["model"]["draft"],
+            json!({"type": "local", "path": "drafts/d"})
+        );
+        let document = expanded(json!({
+            "name": "m", "model": {"path": "m", "draft": {"hf": format!("acme/draft-1b@{SHA}")}}
+        }))
+        .unwrap();
+        assert_eq!(
+            document["model"]["draft"],
+            json!({"type": "huggingface", "repo": "acme/draft-1b", "revision": SHA})
+        );
+        // A written source is kept as written.
+        let written = json!({"http": {"url": "https://d.example/d", "sha256": "a".repeat(64)}});
+        let document =
+            expanded(json!({"name": "m", "model": {"path": "m", "draft": written.clone()}}))
+                .unwrap();
+        assert_eq!(document["model"]["draft"], written);
+        for (draft, path) in [
+            (json!({"hf": "acme/draft-1b@main"}), "model.draft.hf"),
+            (
+                json!({"hf": "acme/draft-1b", "repo": "x"}),
+                "model.draft.hf",
+            ),
+            (json!("~/drafts/d"), "model.draft"),
+            (json!(""), "model.draft"),
+        ] {
+            let error =
+                expanded(json!({"name": "m", "model": {"path": "m", "draft": draft}})).unwrap_err();
+            assert_eq!(error.path, path, "{error}");
+        }
+        let unpinned = json!({"model": {"hf": format!("a/b@{SHA}"), "draft": {"hf": "acme/d"}}});
+        assert_eq!(unpinned_hf(&unpinned, "/model"), None);
+        assert_eq!(
+            unpinned_hf(&unpinned, "/model/draft"),
+            Some(("acme/d".into(), "main".into()))
+        );
+        let mut pinned = unpinned.clone();
+        pin_hf(&mut pinned, "/model/draft", "acme/d", SHA);
+        assert_eq!(
+            pinned["model"]["draft"]["hf"],
+            json!(format!("acme/d@{SHA}"))
+        );
+        assert_eq!(HF_SHORTHANDS, ["/model", "/model/draft"]);
+        // The CLI expands a home-relative drafter path as it does the model's.
+        let mut document = json!({"model": {"path": "~/m", "draft": "~/d"}});
+        expand_home(&mut document, Some(std::path::Path::new("/home/u")));
+        assert_eq!(
+            document["model"],
+            json!({"path": "/home/u/m", "draft": "/home/u/d"})
+        );
     }
 
     // T14 (ADR 0018 §5): an engine family names the host's one profile of

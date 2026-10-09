@@ -250,6 +250,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("source", MODEL_SOURCE),
         ("content_fingerprint", SCALAR),
         ("revision", SCALAR),
+        // ADR 0008 amendment 2026-10-08: the speculative drafter's own source.
+        ("draft", MODEL_SOURCE),
     ];
     // Spec §7: the directory a host keeps model weights under. A host states it
     // once; a deployment's relative local path is resolved against it.

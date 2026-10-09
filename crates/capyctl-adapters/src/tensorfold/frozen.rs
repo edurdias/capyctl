@@ -76,6 +76,17 @@ pub fn plan_from_effective(
             }
         }
     }
+    // ADR 0008 amendment 2026-10-08, ADR 0023 §5: a declared drafter is
+    // `--drafter <dir>` with the host-fixed arguments, replacing the default
+    // `--drafter none`; resolution refused arguments naming another drafter
+    // or `--no-drafts`. CapyCTL chose the directory, so it needs no approval.
+    let mut engine_args = profile.args.clone();
+    if let Some(draft) = &effective.model.draft {
+        let dir = draft.resolved_path.clone().ok_or_else(|| {
+            TensorfoldPlanError::Unresolved("the drafter resolves to no directory".into())
+        })?;
+        engine_args.extend(["--drafter".to_owned(), dir]);
+    }
     Ok(PlanInputTensorfold {
         engine_bin: profile.executable.clone(),
         engine_path_extra: Path::new(&profile.executable)
@@ -101,7 +112,7 @@ pub fn plan_from_effective(
             &effective.engine_config,
             &profile.args,
         ),
-        engine_args: profile.args.clone(),
+        engine_args,
         extra_args: settings.extra_args.clone(),
         extensions_dir,
         engine_log: Some(engine_log),

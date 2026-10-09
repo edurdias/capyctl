@@ -109,6 +109,73 @@ fn materialize_source_round_trips_and_names_remote_sources_only() {
     }
 }
 
+// T34 T14 (ADR 0008 amendment 2026-10-08): a deployment's remote drafter is
+// materialized by the same action as its weights, one plan per source. Each
+// plan's document names its one source as `model.source` and carries no
+// drafter, so it decodes on any host that executes MaterializeSource, and
+// its key is that source's.
+#[test]
+fn a_drafter_is_materialized_by_a_plan_of_its_own() {
+    let draft = serde_json::json!({"http": {"url": "https://d.example.test/d",
+        "sha256": "b".repeat(64)}});
+    let with_draft = |source: serde_json::Value| {
+        let mut document: serde_json::Value = serde_json::from_str(&deployment(source)).unwrap();
+        document["model"]["draft"] = draft.clone();
+        document.to_string()
+    };
+    let policy = "a".repeat(64);
+    let text = with_draft(hf());
+    let plans = MaterializeSourcePlan::all(&text, &policy);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|p| p.source_key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            format!("sources/huggingface/Qwen--Qwen3-4B@{SHA}"),
+            format!("sources/http/{}", "b".repeat(64))
+        ]
+    );
+    assert_eq!(
+        MaterializeSourcePlan::new(&text, &policy).as_ref(),
+        Some(&plans[0])
+    );
+    assert_eq!(
+        MaterializeSourcePlan::for_draft(&text, &policy).as_ref(),
+        Some(&plans[1])
+    );
+    for plan in &plans {
+        let document: serde_json::Value = serde_json::from_str(&plan.deployment_config).unwrap();
+        assert!(document["model"].get("draft").is_none(), "{document}");
+        let decoded = decode(plan.deployment_config.clone()).expect("decodes");
+        assert_eq!(
+            decoded.action,
+            MemberAction::MaterializeSource(plan.clone())
+        );
+    }
+    assert_eq!(
+        plans[1].source(),
+        serde_json::from_value(draft.clone()).ok()
+    );
+    // Local weights with a remote drafter: the drafter's plan alone.
+    let text = with_draft(serde_json::json!({"type": "local", "path": "toy"}));
+    assert!(MaterializeSourcePlan::new(&text, &policy).is_none());
+    let plans = MaterializeSourcePlan::all(&text, &policy);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        plans[0].source_key,
+        format!("sources/http/{}", "b".repeat(64))
+    );
+    // A local drafter needs no plan.
+    let mut document: serde_json::Value = serde_json::from_str(&deployment(hf())).unwrap();
+    document["model"]["draft"] = serde_json::json!({"local": {"path": "drafts/d"}});
+    assert!(MaterializeSourcePlan::for_draft(&document.to_string(), &policy).is_none());
+    assert_eq!(
+        MaterializeSourcePlan::all(&document.to_string(), &policy).len(),
+        1
+    );
+}
+
 // T34 (ADR 0008): a result carries only source evidence of the plan's key,
 // in a shape its state allows.
 #[test]

@@ -286,3 +286,33 @@ internal mirror or a short-lived presigned link:
 CPU tests serve both forms from a loopback origin; they are not qualification.
 A live fetch from a plain-HTTP mirror and from a presigned URL has not been
 run.
+
+## Amendment 2026-10-08: draft model source
+
+Owner approval 2026-10-08. A deployment may declare its speculative
+drafter's weights as a model source of their own, `model.draft`, in any
+spelling `model.source` takes. It is validated exactly like `model.source`
+(pinned commits and digests, HTTPS, `secret://` references), permitted by the
+host's `model_sources` policy like the weights, and refused under
+`model.draft`. A remote drafter is a second materialized source of the
+revision: one `model_sources` row per store key (schema 47), requested by a
+`MaterializeSource` plan whose document names the drafter as its
+`model.source` and carries no `model.draft`, so it is fetched and verified
+(Hugging Face per-file LFS SHA-256 or git blob, HTTP SHA-256) exactly as
+weights are. Activation, the checkpoint digest and every launch wait for
+both sources on a host. A local drafter resolves like a local `model.source`.
+
+The pinned declaration is part of the revision's identity (the command and
+recipe fingerprints); a deployment without one keeps its encoding and
+fingerprints. The drafter's weights are counted with the checkpoint's (ADR
+0014 §5 amendment A6) inside the store its source resolved into, with no
+`approved_paths` or `approved_options`: CapyCTL chose the path, no argument
+names it. CapyCTL renders it as SGLang's `speculative_draft_model_path`,
+vLLM's `--speculative-config` `model` (merged into the operator's, which
+states the method and `num_speculative_tokens`) and TensorFold's `--drafter`;
+engine arguments naming another draft path, SGLang arguments without
+`--speculative-algorithm`, and TensorFold's `--no-drafts` are refused. No
+separate drafter digest is recorded beside the WE3 checkpoint digest: a
+remote drafter's bytes are verified against their pin when materialized, and
+its weight bytes are re-sized at every launch with the checkpoint's; a local
+drafter, like an approved-path one, is not digested.

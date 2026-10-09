@@ -228,6 +228,12 @@ impl DigestCheckpointPlan {
 /// deployment document, never a path or a secret; the host checks its own
 /// model-source policy. `source_key` is derived from the document, never
 /// taken from the wire, and binds the result to the source it answers for.
+///
+/// Amendment 2026-10-08: a plan's document names exactly one source, as its
+/// `model.source`, and carries no `model.draft`; a deployment's drafter is
+/// requested by a plan of its own ([`Self::for_draft`]). A host of any
+/// version that executes MaterializeSource therefore fetches and verifies
+/// either source unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializeSourcePlan {
     pub deployment_config: String,
@@ -235,11 +241,39 @@ pub struct MaterializeSourcePlan {
     pub source_key: String,
 }
 impl MaterializeSourcePlan {
-    /// A plan for `deployment_config`, whose `model` must name a valid remote
-    /// source. `None` otherwise.
+    /// A plan for the weights `deployment_config` names, which must be a
+    /// valid remote source. `None` otherwise.
     pub fn new(deployment_config: &str, host_policy_fingerprint: &str) -> Option<Self> {
+        Self::naming(deployment_config, host_policy_fingerprint, false)
+    }
+    /// ADR 0008 amendment 2026-10-08: a plan for the drafter
+    /// `deployment_config` declares (`model.draft`), which must be a valid
+    /// remote source. `None` otherwise.
+    pub fn for_draft(deployment_config: &str, host_policy_fingerprint: &str) -> Option<Self> {
+        Self::naming(deployment_config, host_policy_fingerprint, true)
+    }
+    /// Every plan a deployment needs before a launch: its weights', then its
+    /// drafter's, each when remote.
+    pub fn all(deployment_config: &str, host_policy_fingerprint: &str) -> Vec<Self> {
+        [false, true]
+            .into_iter()
+            .filter_map(|draft| Self::naming(deployment_config, host_policy_fingerprint, draft))
+            .collect()
+    }
+    /// The plan whose document names the weights, or the drafter in their
+    /// place, without the drafter's declaration.
+    fn naming(deployment_config: &str, host_policy_fingerprint: &str, draft: bool) -> Option<Self> {
+        let mut config =
+            capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, deployment_config)
+                .ok()?;
+        let model = config.get_mut("model")?.as_object_mut()?;
+        let declared = model.remove("draft");
+        if draft {
+            model.remove("path");
+            model.insert("source".into(), declared?);
+        }
         Self::try_from(pb::MaterializeSourceRequest {
-            deployment_config: deployment_config.into(),
+            deployment_config: serde_json::to_string(&config).ok()?,
             host_policy_fingerprint: host_policy_fingerprint.into(),
         })
         .ok()

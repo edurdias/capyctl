@@ -54,13 +54,19 @@ impl CheckpointLocation {
     }
 }
 
-/// ADR 0014 §5 amendment A6: a draft model directory and the approved root
-/// (`security.approved_paths`) it lies in. Containment is checked again by
-/// whoever opens it, on the opened descriptors.
+/// ADR 0014 §5 amendment A6: a draft model directory and the root it lies
+/// in: an approved root (`security.approved_paths`) for a drafter the
+/// arguments name, the model or sources store for a declared one.
+/// Containment is checked again by whoever opens it, on the opened
+/// descriptors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrafterLocation {
     pub root: PathBuf,
     pub path: PathBuf,
+    /// ADR 0008 amendment 2026-10-08: a declared local drafter may lie
+    /// outside `root`, inside its own root, exactly as a local
+    /// `model.source` may (found live 2026-10-03); any other drafter never.
+    pub outside_root_allowed: bool,
 }
 
 /// ADR 0014 §5 amendment A6: where the draft model the arguments name lies,
@@ -80,18 +86,47 @@ pub fn drafter_location(
     Some(DrafterLocation {
         root: root.into(),
         path: path.into(),
+        outside_root_allowed: false,
+    })
+}
+
+/// ADR 0008 amendment 2026-10-08: a declared drafter, in the store its
+/// source resolved into (`model_store` for a local source, `sources` for a
+/// remote one, which CapyCTL materialized and verified there). ADR 0014 §5
+/// amendment A6 counts its weights with the checkpoint's. No
+/// `approved_paths` or `approved_options` are involved: the operator named
+/// no path, CapyCTL chose the directory.
+fn declared_drafter(
+    draft: &DraftModel,
+    model_store: &Path,
+    sources: &Path,
+) -> Option<DrafterLocation> {
+    let local = matches!(draft.source, ModelSource::Local { .. });
+    Some(DrafterLocation {
+        root: if local { model_store } else { sources }.to_path_buf(),
+        path: PathBuf::from(draft.resolved_path.as_deref()?),
+        outside_root_allowed: local,
     })
 }
 
 impl EffectiveDeployment {
-    /// ADR 0014 §5 amendment A6: the draft model this launch loads, if any.
+    /// ADR 0014 §5 amendment A6: the draft model this launch loads, if any:
+    /// the declared drafter (ADR 0008 amendment 2026-10-08), else one the
+    /// arguments name inside an approved root. Resolution refuses both.
     pub fn drafter_location(&self) -> Option<DrafterLocation> {
-        drafter_location(
-            self.profile.engine,
-            &self.profile.args,
-            self.engine_config.extra_args(),
-            &self.profile.security.approved_paths,
-        )
+        match &self.model.draft {
+            Some(draft) => declared_drafter(
+                draft,
+                &self.host.model_store,
+                self.host.model_sources.root(&self.host.model_store),
+            ),
+            None => drafter_location(
+                self.profile.engine,
+                &self.profile.args,
+                self.engine_config.extra_args(),
+                &self.profile.security.approved_paths,
+            ),
+        }
     }
 
     /// ADR 0014 amendment A16: one request slot of the hybrid state an SGLang
@@ -148,18 +183,21 @@ pub fn checkpoint_location(
                 .collect()
         })
         .unwrap_or_default();
-    let drafter = profile.and_then(|profile| {
-        drafter_location(
-            profile.engine,
-            &profile.args,
-            &extra,
-            &profile.security.approved_paths,
-        )
-    });
     let sglang_args = profile
         .filter(|profile| profile.engine == Engine::Sglang)
         .map(|profile| profile.args.iter().chain(&extra).cloned().collect());
     let model = normalize_model(raw, Some(&store), Some(sources.root(&store)))?;
+    let drafter = match &model.draft {
+        Some(draft) => declared_drafter(draft, &store, sources.root(&store)),
+        None => profile.and_then(|profile| {
+            drafter_location(
+                profile.engine,
+                &profile.args,
+                &extra,
+                &profile.security.approved_paths,
+            )
+        }),
+    };
     let checkpoint = PathBuf::from(model.require_resolved_path()?);
     let root = match model.source {
         ModelSource::Local { .. } => store,

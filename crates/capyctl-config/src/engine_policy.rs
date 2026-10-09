@@ -416,6 +416,125 @@ pub fn sglang_speculative(args: &[String]) -> bool {
     })
 }
 
+/// ADR 0008 amendment 2026-10-08: SGLang loads a declared drafter only with
+/// speculation on, which is the operator's `--speculative-algorithm`.
+pub const DRAFT_NEEDS_SGLANG_ALGORITHM: &str = "`model.draft` is loaded only with speculative \
+     decoding on: add `--speculative-algorithm` to the engine arguments; capyctl passes the \
+     drafter's directory";
+/// ADR 0008 amendment 2026-10-08: vLLM takes its drafter in
+/// `--speculative-config`, whose method and token count are the operator's.
+pub const DRAFT_NEEDS_VLLM_CONFIG: &str = "`model.draft` needs a `--speculative-config` object \
+     in the engine arguments stating `num_speculative_tokens` (and the method); capyctl adds \
+     its draft `model`";
+/// Why arguments that name their own draft model contradict `model.draft`.
+pub const DRAFT_PATH_CONFLICT: &str = "the engine arguments already name a draft model \
+     (`--speculative-draft-model-path`, or a `--speculative-config` `model`) and `model.draft` \
+     names the drafter; keep one of them";
+/// ADR 0023 §5: TensorFold's `--drafter <dir>` is capyctl's for a declared
+/// drafter, so the arguments may neither name one nor turn drafts off.
+pub const TENSORFOLD_DECLARED_DRAFTER_CONFLICT: &str = "`model.draft` names TensorFold's \
+     drafter, so the engine arguments may state neither `--drafter` nor `--no-drafts`";
+
+/// Whether `args` set `option` (abbreviations and the `=` spelling included).
+fn names_option(args: &[String], option: &str) -> Result<bool, ProfileArgError> {
+    Ok(parse_options(args)?
+        .iter()
+        .any(|parsed| matches_name(&parsed.name, option)))
+}
+
+/// ADR 0008 amendment 2026-10-08: whether a launch's arguments (host-fixed
+/// then the deployment's) admit a declared drafter on `engine`, else why
+/// not. CapyCTL renders the drafter's directory itself, so arguments that
+/// name another draft model contradict the declaration (ADR 0014 §8: the
+/// declared path needs no approval because no argument names it); turning
+/// speculation on stays the operator's where the engine needs it.
+pub fn declared_draft_admitted(engine: Engine, args: &[String]) -> Result<(), String> {
+    let malformed = |error: ProfileArgError| error.to_string();
+    match engine {
+        Engine::Sglang => {
+            if names_option(args, "--speculative-draft-model-path").map_err(malformed)? {
+                return Err(DRAFT_PATH_CONFLICT.into());
+            }
+            if !sglang_speculative(args) {
+                return Err(DRAFT_NEEDS_SGLANG_ALGORITHM.into());
+            }
+        }
+        Engine::Vllm => {
+            let (_, config) = take_speculative_config(args)?;
+            let config = config.ok_or(DRAFT_NEEDS_VLLM_CONFIG)?;
+            if config.contains_key("model") {
+                return Err(DRAFT_PATH_CONFLICT.into());
+            }
+            if !config.contains_key("num_speculative_tokens") {
+                return Err(DRAFT_NEEDS_VLLM_CONFIG.into());
+            }
+        }
+        // ADR 0023 §5: `--drafter <dir>` alone turns TensorFold's drafts on.
+        Engine::Tensorfold => {
+            let drafts = tensorfold_drafts(args).map_err(malformed)?;
+            if drafts.names_drafter || drafts.drafts_off {
+                return Err(TENSORFOLD_DECLARED_DRAFTER_CONFLICT.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `--speculative-config` value: a JSON object.
+type SpeculativeConfig = serde_json::Map<String, serde_json::Value>;
+
+/// `args` without their `--speculative-config` (any spelling), and its value
+/// as a JSON object. Validation admits at most one across a launch's
+/// arguments; a value that is not an object is [`DRAFT_NEEDS_VLLM_CONFIG`].
+fn take_speculative_config(
+    args: &[String],
+) -> Result<(Vec<String>, Option<SpeculativeConfig>), String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut value = None;
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        let name = normalize_option_name(token);
+        if !token.starts_with("--") || !matches_name(&name, "--speculative-config") {
+            kept.push(token.clone());
+            continue;
+        }
+        let text = match token.split_once('=') {
+            Some((_, text)) => text,
+            None => tokens.next().ok_or(DRAFT_NEEDS_VLLM_CONFIG)?,
+        };
+        match serde_json::from_str(text) {
+            Ok(serde_json::Value::Object(map)) => value = Some(map),
+            _ => return Err(DRAFT_NEEDS_VLLM_CONFIG.into()),
+        }
+    }
+    Ok((kept, value))
+}
+
+/// ADR 0008 amendment 2026-10-08: vLLM's host-fixed and extra arguments for
+/// a launch whose declared drafter CapyCTL materialized at `dir`. The
+/// operator's `--speculative-config` leaves the vector it was written in
+/// and is rendered with the host-fixed arguments, its `model` set to `dir`:
+/// the merged value is CapyCTL's rendering, outside the extras the
+/// protected entry gates against `approved_paths` (ADR 0014 §8), because
+/// its path is the one CapyCTL chose. Refused as resolution refuses it.
+pub fn vllm_args_with_draft(
+    fixed: &[String],
+    extra: &[String],
+    dir: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let all: Vec<String> = fixed.iter().chain(extra).cloned().collect();
+    declared_draft_admitted(Engine::Vllm, &all)?;
+    let (mut fixed, from_fixed) = take_speculative_config(fixed)?;
+    let (extra, from_extra) = take_speculative_config(extra)?;
+    let mut config = from_extra.or(from_fixed).ok_or(DRAFT_NEEDS_VLLM_CONFIG)?;
+    config.insert("model".into(), serde_json::Value::String(dir.into()));
+    fixed.extend([
+        "--speculative-config".to_owned(),
+        serde_json::Value::Object(config).to_string(),
+    ]);
+    Ok((fixed, extra))
+}
+
 /// Whether a `--speculative-config` value is admissible under the host's
 /// approved directories (ADR 0014 §8).
 fn speculative_config_admitted(value: &str, approved_paths: &[PathBuf]) -> bool {

@@ -552,6 +552,7 @@ fn an_outside_root_others_may_write_or_a_drafter_outside_its_root_is_refused() {
     let drafter = capyctl_config::effective::DrafterLocation {
         root: store.root.clone(),
         path: checkpoint.clone(),
+        outside_root_allowed: false,
     };
     assert_eq!(
         verifier.drafter_weights(Some(&drafter)).unwrap_err(),
@@ -820,15 +821,24 @@ fn a_draft_models_weights_are_sized_inside_its_approved_root() {
     let location = capyctl_config::effective::DrafterLocation {
         root: store.root.clone(),
         path: drafter.clone(),
+        outside_root_allowed: false,
     };
     assert_eq!(verifier.drafter_weights(Some(&location)).unwrap(), 11 + 12);
     assert_eq!(verifier.drafter_weights(None).unwrap(), 0);
     let outside = Store::new();
     let escaping = capyctl_config::effective::DrafterLocation {
         root: outside.root.clone(),
-        path: drafter,
+        path: drafter.clone(),
+        outside_root_allowed: false,
     };
     assert!(verifier.drafter_weights(Some(&escaping)).is_err());
+    // ADR 0008 amendment 2026-10-08: a declared local drafter outside the
+    // model store is sized inside its own root, as a local model would be.
+    let declared = capyctl_config::effective::DrafterLocation {
+        outside_root_allowed: true,
+        ..escaping
+    };
+    assert_eq!(verifier.drafter_weights(Some(&declared)).unwrap(), 11 + 12);
 }
 
 /// The manifest digest a fresh verifier measures by reading every file.

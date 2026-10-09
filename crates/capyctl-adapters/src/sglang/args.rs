@@ -136,6 +136,15 @@ impl SglangLaunch {
             return Err(RuntimeError::Unsupported);
         }
         let mut settings = public_settings(s)?;
+        // ADR 0008 amendment 2026-10-08: the declared drafter's directory,
+        // which the entry renders as `speculative_draft_model_path`. Present
+        // only with a drafter, so every other descriptor is unchanged.
+        if let Some(draft) = frozen.draft_model_path() {
+            if !absolute_path(draft) {
+                return Err(RuntimeError::Unsupported);
+            }
+            settings["draft_model_path"] = json!(draft);
+        }
         // ADR 0028 §10: a group member's descriptor carries its group, and a
         // worker answers on its loopback worker port, never a peer address.
         let mut endpoint = m.endpoint.clone();

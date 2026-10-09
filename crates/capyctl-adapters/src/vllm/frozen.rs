@@ -128,7 +128,23 @@ pub fn plan_from_effective(
         .to_owned();
     // ADR 0014 §8: host-fixed arguments and the deployment's extras stay
     // apart, so the entry can gate exactly what the extras resolve to.
-    let engine_args = profile.args.clone();
+    // ADR 0008 amendment 2026-10-08: a declared drafter's directory joins the
+    // operator's `--speculative-config` as its `model`, rendered with the
+    // host-fixed arguments: CapyCTL chose that path, no extra names it.
+    let (engine_args, extra_args) = match &effective.model.draft {
+        Some(draft) => {
+            let dir = draft.resolved_path.as_deref().ok_or_else(|| {
+                VllmPlanError::Unresolved("the drafter resolves to no directory".into())
+            })?;
+            capyctl_config::engine_policy::vllm_args_with_draft(
+                &profile.args,
+                &settings.extra_args,
+                dir,
+            )
+            .map_err(VllmPlanError::Unresolved)?
+        }
+        None => (profile.args.clone(), settings.extra_args.clone()),
+    };
     // ADR 0024 (owner decision 2026-10-03): parsers chosen by model family
     // from the checkpoint read here, unless the deployment named or turned
     // them off, or its extras or the host-fixed args already pass them.
@@ -210,7 +226,7 @@ pub fn plan_from_effective(
             swap_space_bytes: None,
         },
         engine_args,
-        extra_args: settings.extra_args.clone(),
+        extra_args,
         // ADR 0014 §8, SPEC §8.2: the host's approvals, which the entry applies
         // to the destinations the extras resolve to.
         extra_approvals: Some(capyctl_config::engine_policy::extra_approvals_document(

@@ -464,6 +464,9 @@ message DigestCheckpointRequest {
 // checks its own model-source policy, resolves any token reference from its
 // own secrets, and answers at once with the source's state. A download it
 // starts keeps running after the answer; later requests report its progress.
+// Amendment 2026-10-08: the document names exactly one source, as its
+// `model.source`, and no `model.draft`; a deployment's drafter is requested
+// by a document naming the drafter's source there.
 message MaterializeSourceRequest {
   string deployment_config = 1;
   string host_policy_fingerprint = 2;

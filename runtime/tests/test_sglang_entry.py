@@ -390,6 +390,19 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
                 public["settings"]["max_mamba_cache_size"] = value
                 self.rejects(self.argv(public), self.payloads(public))
 
+    def test_a_drafter_path_is_an_optional_absolute_path(self):
+        # ADR 0008 amendment 2026-10-08: present only with a declared drafter,
+        # the directory capyctl materialized.
+        public = copy.deepcopy(self.public)
+        public["settings"]["draft_model_path"] = "/srv/models/sources/http/d"
+        self.build(self.argv(public), self.payloads(public))
+        for value in (None, "", "drafts/d", "/srv/../etc", "/srv/./d", 1, "/a\nb",
+                      "/" + "d" * 4096):
+            with self.subTest(value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["draft_model_path"] = value
+                self.rejects(self.argv(public), self.payloads(public))
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.

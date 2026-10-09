@@ -212,20 +212,50 @@ pub(super) fn normalize_model(
     };
     // SPEC §13.3, ADR 0008: pinned revisions and digests, HTTPS, secret refs.
     source.validate()?;
-    let resolved_path = match (&source, store) {
-        (ModelSource::Local { path }, Some(store)) => {
-            let candidate = Path::new(path);
+    let resolved_path = resolve_source(&source, store, sources, "model.source")?;
+    // ADR 0008 amendment 2026-10-08: a drafter source is validated and
+    // resolved exactly as the weights' own, and refused under its own path.
+    let draft = raw
+        .draft
+        .map(|source| {
+            source.validate().map_err(as_draft)?;
+            let resolved_path = resolve_source(&source, store, sources, "model.draft")?;
+            Ok::<_, ConfigError>(DraftModel {
+                source,
+                resolved_path,
+            })
+        })
+        .transpose()?;
+    Ok(ModelIdentity {
+        source,
+        resolved_path,
+        content_fingerprint: raw.content_fingerprint,
+        revision: raw.revision,
+        draft,
+    })
+}
+
+/// The local directory `source` resolves to on a host whose model store is
+/// `store`, or `None` where no host is in hand. `path` names the declaration
+/// in a refusal.
+fn resolve_source(
+    source: &ModelSource,
+    store: Option<&Path>,
+    sources: Option<&Path>,
+    path: &str,
+) -> Result<Option<String>, ConfigError> {
+    match (source, store) {
+        (ModelSource::Local { path: local }, Some(store)) => {
+            let candidate = Path::new(local);
             let resolved = if candidate.is_absolute() {
                 candidate.to_path_buf()
             } else {
                 store.join(candidate)
             };
-            Some(
-                resolved
-                    .to_str()
-                    .ok_or_else(|| invalid("model.source.path", "must be valid UTF-8"))?
-                    .to_owned(),
-            )
+            resolved
+                .to_str()
+                .map(|resolved| Some(resolved.to_owned()))
+                .ok_or_else(|| invalid(format!("{path}.path"), "must be valid UTF-8"))
         }
         // ADR 0008: a remote source resolves to its fixed directory in the
         // store; the host materializes it there before the first placement.
@@ -239,15 +269,18 @@ pub(super) fn normalize_model(
                     .map(str::to_owned)
                     .ok_or_else(|| invalid("host.model_store.path", "must be valid UTF-8"))
             })
-            .transpose()?,
-        (_, None) => None,
-    };
-    Ok(ModelIdentity {
-        source,
-        resolved_path,
-        content_fingerprint: raw.content_fingerprint,
-        revision: raw.revision,
-    })
+            .transpose(),
+        (_, None) => Ok(None),
+    }
+}
+
+/// ADR 0008 amendment 2026-10-08: a refusal of the drafter's source, which
+/// `ModelSource` reports under `model.source`, named under `model.draft`.
+pub(super) fn as_draft(mut error: ConfigError) -> ConfigError {
+    if let Some(rest) = error.path.strip_prefix("model.source") {
+        error.path = format!("model.draft{rest}");
+    }
+    error
 }
 
 pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {

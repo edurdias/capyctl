@@ -712,11 +712,13 @@ fn state_slots(running: u32) -> Option<u32> {
 }
 
 /// [`sglang_pool`] for a launch, reading the checkpoint (and the draft
-/// model) where the launch reads them.
+/// model: the declared drafter at `draft_root`, else one the arguments name)
+/// where the launch reads them.
 pub fn sglang_pool_for_launch(
     settings: &SglangLaunchSettings,
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
+    draft_root: Option<&Path>,
 ) -> Result<SglangPool, String> {
     let config = checkpoint_root
         .ok_or_else(|| "the deployment resolves to no checkpoint directory".to_owned())
@@ -726,11 +728,12 @@ pub fn sglang_pool_for_launch(
         .chain(&settings.extra_args)
         .cloned()
         .collect();
-    let draft_path =
-        checkpoint_root.and_then(|_| crate::engine_policy::draft_model_path(Engine::Sglang, &args));
-    let draft = draft_path
-        .as_ref()
-        .map(|path| read_model_config(Path::new(path)));
+    let draft_path = checkpoint_root.and_then(|_| {
+        draft_root.map(Path::to_path_buf).or_else(|| {
+            crate::engine_policy::draft_model_path(Engine::Sglang, &args).map(Into::into)
+        })
+    });
+    let draft = draft_path.as_deref().map(read_model_config);
     // A revision that declares its request and KV cache is not re-resolved
     // with the measured weights (found live 2026-10-03), so the launch sizes
     // them here, where it reads the checkpoint: the weight files of the
@@ -740,7 +743,7 @@ pub fn sglang_pool_for_launch(
     let settings = match (settings.memory.weights_bytes, checkpoint_root) {
         (None, Some(root)) => {
             measured = settings.clone();
-            let whole = [Some(root), draft_path.as_deref().map(Path::new)]
+            let whole = [Some(root), draft_path.as_deref()]
                 .into_iter()
                 .flatten()
                 .map(weight_file_bytes)
@@ -808,6 +811,7 @@ pub fn sglang_pool_for_effective(
             settings,
             &effective.profile.args,
             effective.model.resolved_path.as_deref().map(Path::new),
+            super::draft_root(effective),
         )),
         _ => None,
     }

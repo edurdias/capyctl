@@ -487,16 +487,24 @@ impl CheckpointVerifier {
 
     /// ADR 0014 §5 amendment A6 (found live 2026-10-02): the weight bytes of the
     /// draft model a launch loads beside its checkpoint, sized with the same
-    /// confined walk inside its approved root. Zero when there is none. They
-    /// are counted into the weights a revision is sized with, so its memory
+    /// confined walk inside its root (an approved root, or the store a
+    /// declared drafter resolved into). Zero when there is none. They are
+    /// counted into the weights a revision is sized with, so its memory
     /// request and startup peak cover the draft model too.
     pub fn drafter_weights(
         &self,
         drafter: Option<&capyctl_config::effective::DrafterLocation>,
     ) -> Result<i64, CheckpointError> {
         drafter.map_or(Ok(0), |drafter| {
-            // ADR 0014 amendment A6: a draft model stays inside its approved root.
-            self.size_within(&drafter.root, &drafter.path, Confinement::Store)
+            // ADR 0014 amendment A6: a draft model stays inside its root; ADR
+            // 0008 amendment 2026-10-08: a declared local drafter may lie
+            // outside the model store inside its own root, as a local model.
+            let confinement = if drafter.outside_root_allowed {
+                Confinement::OwnRootOutside
+            } else {
+                Confinement::Store
+            };
+            self.size_within(&drafter.root, &drafter.path, confinement)
                 .map(|size| size.weights_bytes)
         })
     }

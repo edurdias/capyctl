@@ -473,6 +473,7 @@ fn the_streams_a_launch_decodes_together_are_shown_with_their_source() {
         &effective.engine_config,
         &effective.profile.args,
         Some(tmp.path()),
+        None,
     );
     let streams = fit.streams.unwrap();
     assert_eq!(streams.count, Some(1));

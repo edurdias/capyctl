@@ -820,7 +820,7 @@ impl Store {
             )?;
         }
         // ADR 0008: the current revision's source records.
-        let sources = budget.read(&tx, "SELECT s.deployment_id,s.host_id,s.source_key,s.state,s.bytes_done,s.bytes_total,s.reason,s.terminal FROM model_sources s JOIN deployments d ON d.id=s.deployment_id AND d.revision=s.revision ORDER BY s.deployment_id,s.host_id", |r| {
+        let sources = budget.read(&tx, "SELECT s.deployment_id,s.host_id,s.source_key,s.state,s.bytes_done,s.bytes_total,s.reason,s.terminal FROM model_sources s JOIN deployments d ON d.id=s.deployment_id AND d.revision=s.revision ORDER BY s.deployment_id,s.host_id,s.source_key", |r| {
             use crate::model_sources::{ModelSourceRecord, SourceState};
             let state = match r.get::<_, String>(3)?.as_str() {
                 "pending" => SourceState::Pending,

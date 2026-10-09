@@ -381,7 +381,8 @@ fn sglang_state_reserve(
     };
     let graphs = startup_graph_allowance(
         Engine::Sglang,
-        crate::engine_policy::draft_model_path(Engine::Sglang, &args).is_some(),
+        inputs.draft_declared
+            || crate::engine_policy::draft_model_path(Engine::Sglang, &args).is_some(),
     );
     let fits = |state: u64| {
         let Ok(state) = i64::try_from(state) else {
@@ -489,6 +490,9 @@ pub(super) struct EngineInputs<'a> {
     /// the phases derive on, which a derived request's state must leave room
     /// in. `None` when the devices name no single domain.
     pub(super) domain_limit: Option<i64>,
+    /// ADR 0008 amendment 2026-10-08: the deployment declares its drafter's
+    /// source (`model.draft`), which CapyCTL renders to the engine.
+    pub(super) draft_declared: bool,
 }
 
 /// ADR 0014 §5 (P2) inputs, all in bytes.
@@ -1206,6 +1210,19 @@ pub(super) fn normalize_engine_config(
             ));
         }
     }
+    // ADR 0008 amendment 2026-10-08: a declared drafter's path is CapyCTL's
+    // to render, so the arguments may name no other draft model, and they
+    // turn speculation on where the engine needs it (host-fixed or extra).
+    if inputs.draft_declared {
+        let all: Vec<String> = inputs
+            .profile_args
+            .iter()
+            .chain(&extra_args)
+            .cloned()
+            .collect();
+        crate::engine_policy::declared_draft_admitted(engine, &all)
+            .map_err(|reason| invalid("model.draft", reason))?;
+    }
 
     let raw_memory = raw.memory.clone().unwrap_or_default();
     let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;
@@ -1328,7 +1345,7 @@ pub(super) fn normalize_engine_config(
             .collect();
         Some(startup_graph_allowance(
             engine,
-            crate::engine_policy::draft_model_path(engine, &all).is_some(),
+            inputs.draft_declared || crate::engine_policy::draft_model_path(engine, &all).is_some(),
         ))
     };
     let (startup, startup_source) = resolve_startup(

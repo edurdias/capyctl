@@ -137,6 +137,32 @@ the standalone document under the state root. A loopback `http://` mirror is
 accepted there; a host downloads over `https://` only. `allowed_hosts` is a
 list, which has no flag or variable form: state it in the document.
 
+A deployment may declare its speculative drafter's weights as a source of
+their own, `model.draft`, in the deployment document only (deployment fields
+are YAML-only, as every other deployment field). It takes every spelling
+`model.source` takes (`{type: huggingface, ...}`, `{http: {url, sha256}}`,
+`{local: {path}}`) and the model's shorthands (`draft: drafts/d` for a local
+path relative to the models directory, `draft: {hf: owner/repo@<commit>}`,
+which `deploy model` pins like the model's). It is validated like
+`model.source` (pinned commit or SHA-256, HTTPS, `secret://` token
+references) and needs the host's `model_sources` policy like the weights. A
+remote drafter is downloaded and verified into the sources store beside them
+and the deployment activates once both copies are verified; its weights are
+counted with the checkpoint's. CapyCTL passes the drafter's directory itself,
+so no `approved_paths` entry is needed for it:
+
+| Engine | What CapyCTL passes | What the deployment's engine arguments still say |
+|---|---|---|
+| SGLang | `--speculative-draft-model-path <dir>` | `--speculative-algorithm` (required); no draft path of their own |
+| vLLM | `model: <dir>` merged into the deployment's `--speculative-config` | a `--speculative-config` with `num_speculative_tokens` (and the method), approved as before; no `model` of its own |
+| TensorFold | `--drafter <dir>` instead of `--drafter none` | neither `--drafter` nor `--no-drafts` |
+
+```yaml
+model:
+  source: {huggingface: {repo: org/model, revision: <40-character commit>}}
+  draft: {http: {url: https://example.com/draft.tar, sha256: <64 hex>, archive: tar}}
+```
+
 ## Engine installation
 
 These describe the role's own engine installation. One executable is published

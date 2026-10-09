@@ -161,6 +161,7 @@ fn a_checkpoint_location_names_the_draft_model_it_loads_beside() {
     let expected = Some(DrafterLocation {
         root: "/srv/drafters".into(),
         path: "/srv/drafters/d".into(),
+        outside_root_allowed: false,
     });
     assert_eq!(
         located(

@@ -38,6 +38,18 @@ pub fn frozen_from_effective(
     // SGLang's KV pool, in tokens, and a hybrid model's recurrent state is
     // sized for its running requests beside it; a state that does not fit
     // the memory request is refused here, before anything starts.
+    // ADR 0008 amendment 2026-10-08: a declared drafter is read where the
+    // launch reads it, the directory CapyCTL materialized.
+    let draft_root = effective
+        .model
+        .draft
+        .as_ref()
+        .map(|draft| {
+            draft.resolved_path.clone().ok_or_else(|| {
+                RuntimeError::Uncertain("initialize work resolves to no drafter directory".into())
+            })
+        })
+        .transpose()?;
     let pool = capyctl_config::context_fit::sglang_pool_for_launch(
         &settings,
         &profile.args,
@@ -46,6 +58,7 @@ pub fn frozen_from_effective(
             .resolved_path
             .as_deref()
             .map(std::path::Path::new),
+        draft_root.as_deref().map(std::path::Path::new),
     )
     .map_err(RuntimeError::Refused)?;
     settings.max_total_tokens = settings.max_total_tokens.or(pool.max_total_tokens);
@@ -109,10 +122,17 @@ pub fn frozen_from_effective(
             RuntimeError::Uncertain("initialize work resolves to no checkpoint root".into())
         })?
         .to_owned();
-    let digest = hex::encode(Sha256::digest(
+    // The digest covers the drafter's directory too, when there is one.
+    let mut digest = Sha256::new();
+    digest.update(
         serde_json::to_vec(settings)
             .map_err(|_| RuntimeError::Uncertain("settings encoding failed".into()))?,
-    ));
+    );
+    if let Some(draft) = &draft_root {
+        digest.update(b"\n");
+        digest.update(draft.as_bytes());
+    }
+    let digest = hex::encode(digest.finalize());
     let metadata = NativeLaunchMetadata {
         engine: "sglang".into(),
         // ADR 0014 §9: no checkpoint recipe pin. The contract names the
@@ -147,5 +167,6 @@ pub fn frozen_from_effective(
         admin_ref,
         settings.clone(),
     )
-    .with_toolchain(profile.cuda_home.clone(), effective.engine_env.values()))
+    .with_toolchain(profile.cuda_home.clone(), effective.engine_env.values())
+    .with_draft_model(draft_root))
 }

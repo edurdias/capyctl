@@ -140,7 +140,11 @@ fn a_remote_source_gates_activation_and_the_digest_until_verified() {
         )
         .unwrap();
     assert_eq!(
-        store.model_source(&id, 1, "lab").unwrap().unwrap().state,
+        store
+            .model_source(&id, 1, "lab", &key())
+            .unwrap()
+            .unwrap()
+            .state,
         SourceState::Verified
     );
     assert!(store.pending_model_sources().unwrap().is_empty());
@@ -174,7 +178,7 @@ fn a_copy_verified_on_the_host_is_reused_by_a_new_deployment() {
     let second = deploy(&store, &session, "k2", &second_config, &host);
     assert_eq!(
         store
-            .model_source(&second.deployment_id, 1, "lab")
+            .model_source(&second.deployment_id, 1, "lab", &key())
             .unwrap()
             .unwrap()
             .state,
@@ -199,7 +203,7 @@ fn a_copy_verified_on_the_host_is_reused_by_a_new_deployment() {
     }
     let third = deploy(&store, &session, "k3", &third_config, &host);
     let record = store
-        .model_source(&third.deployment_id, 1, "lab")
+        .model_source(&third.deployment_id, 1, "lab", &key())
         .unwrap()
         .unwrap();
     assert_eq!(record.state, SourceState::Verified);
@@ -251,7 +255,7 @@ fn a_terminal_failure_refuses_activation() {
         store.accept_start(&session, &fence(&receipt), 100, 100_100),
         Err(LifecycleError::ModelSourceFailed)
     ));
-    let record = store.model_source(&id, 1, "lab").unwrap().unwrap();
+    let record = store.model_source(&id, 1, "lab", &key()).unwrap().unwrap();
     assert!(record.terminal);
     assert_eq!(record.reason.as_deref(), Some("hash_mismatch"));
     for bad in [
@@ -321,4 +325,126 @@ fn a_local_source_has_no_record() {
     store
         .accept_start(&session2, &fence(&receipt), 100, 100_100)
         .unwrap();
+}
+
+fn draft_key(fill: char) -> String {
+    format!("sources/http/{}", fill.to_string().repeat(64))
+}
+
+/// The setup deployment with an http drafter beside its weights, and the
+/// operator's vLLM speculation switch the drafter needs.
+fn with_drafter(config: &Value, host: &Value, name: &str, fill: char) -> (Value, Value) {
+    let (mut config, mut host) = (config.clone(), host.clone());
+    config["name"] = json!(name);
+    config["routes"] = json!([name]);
+    config["model"]["draft"] = json!({"http": {
+        "url": "https://drafts.example.test/d", "sha256": fill.to_string().repeat(64)}});
+    config["engine_config"]["accept_extra_args"] = json!(true);
+    config["engine_config"]["extra_args"] = json!([
+        "--speculative-config",
+        json!({"method": "draft_model", "num_speculative_tokens": 4}).to_string()
+    ]);
+    host["runtime_profiles"]["local"]["security"]["approved_options"] =
+        json!(["--speculative-config"]);
+    (config, host)
+}
+
+// T14 (ADR 0008 amendment 2026-10-08): a remote drafter is a second source
+// of the revision on its host, recorded under its own key. Activation and the
+// checkpoint digest wait until both copies are verified on one host; a
+// terminal failure of the drafter refuses activation like the weights'; both
+// copies count as referenced.
+#[test]
+fn a_remote_drafter_is_a_second_source_that_gates_activation() {
+    let (store, session, config, host) = setup();
+    let (config, host) = with_drafter(&config, &host, "drafted", 'a');
+    let receipt = deploy(&store, &session, "k", &config, &host);
+    let id = receipt.deployment_id.clone();
+    let records = store.model_sources(&id, 1).unwrap();
+    let keys: Vec<_> = records.iter().map(|r| r.source_key.clone()).collect();
+    assert_eq!(keys, [draft_key('a'), key()]);
+    assert!(records.iter().all(|r| r.state == SourceState::Pending));
+    assert_eq!(store.pending_model_sources().unwrap().len(), 2);
+    let verified = report(SourceState::Verified, 100, 100, None);
+    store
+        .record_model_source(&session, &id, 1, "lab", &key(), &verified, 2)
+        .unwrap();
+    assert!(matches!(
+        store.accept_start(&session, &fence(&receipt), 100, 100_100),
+        Err(LifecycleError::ModelSourcePending)
+    ));
+    assert!(
+        store.pending_checkpoint_digests().unwrap().is_empty(),
+        "the drafter's weights are sized with the checkpoint's"
+    );
+    store
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &draft_key('a'),
+            &report(SourceState::Downloading, 5, 10, None),
+            3,
+        )
+        .unwrap();
+    let status = serde_json::to_value(&store.snapshot().unwrap().deployments[0]).unwrap();
+    assert_eq!(
+        status["model_sources"].as_array().unwrap().len(),
+        2,
+        "{status}"
+    );
+    store
+        .record_model_source(&session, &id, 1, "lab", &draft_key('a'), &verified, 4)
+        .unwrap();
+    assert_eq!(
+        store
+            .model_source(&id, 1, "lab", &draft_key('a'))
+            .unwrap()
+            .unwrap()
+            .state,
+        SourceState::Verified
+    );
+    assert!(store.pending_model_sources().unwrap().is_empty());
+    assert_eq!(store.pending_checkpoint_digests().unwrap().len(), 1);
+    store
+        .accept_start(&session, &fence(&receipt), 100, 100_100)
+        .unwrap();
+    assert_eq!(
+        store.referenced_model_sources().unwrap(),
+        vec![draft_key('a'), key()]
+    );
+    // A key the revision does not name records nothing.
+    assert!(store
+        .record_model_source(&session, &id, 1, "lab", &draft_key('c'), &verified, 5)
+        .is_err());
+
+    // A drafter whose bytes do not match its pin refuses activation even
+    // with the weights verified (here reused from the first deployment).
+    let (config, host) = with_drafter(&config, &host, "mismatched", 'b');
+    let receipt = deploy(&store, &session, "k2", &config, &host);
+    let id = receipt.deployment_id.clone();
+    assert_eq!(
+        store
+            .model_source(&id, 1, "lab", &key())
+            .unwrap()
+            .unwrap()
+            .state,
+        SourceState::Verified
+    );
+    store
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &draft_key('b'),
+            &report(SourceState::Failed, 0, 0, Some("hash_mismatch")),
+            6,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.accept_start(&session, &fence(&receipt), 100, 100_100),
+        Err(LifecycleError::ModelSourceFailed)
+    ));
 }
