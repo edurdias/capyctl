@@ -233,6 +233,7 @@ fn residency_worker_with(
     idle: IdlePolicy,
 ) -> OwnedCoordinator {
     let now = clock.clone();
+    let engine = slot.lock().unwrap().clone();
     OwnedCoordinator::spawn_with_execution_bindings(
         owner,
         Arc::new(Fresh {
@@ -248,9 +249,10 @@ fn residency_worker_with(
         },
         Arc::new(move |_: &InitializeWork| {
             let observed = clock.clone();
-            let terminated = engine.clone();
+            let bound = slot.lock().unwrap().clone();
+            let terminated = bound.clone();
             Ok(ExecutionBinding::remote(
-                slot.lock().unwrap().clone(),
+                bound,
                 Arc::new(move |context: CleanupExecutionContext| {
                     let at = observed.load(Ordering::SeqCst);
                     terminated.cleanups.fetch_add(1, Ordering::SeqCst);
