@@ -98,8 +98,9 @@ pub struct ContextFit {
     /// CapyCTL's in-flight bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_limit: Option<u32>,
-    /// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch
-    /// decodes together (`--parallel`) and where the count came from.
+    /// ADR 0023 §4 (amended 2026-10-03), ADR 0029 §5: the requests a
+    /// TensorFold launch decodes together (`--parallel`), or a llama.cpp
+    /// launch's slots, and where the count came from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streams: Option<Streams>,
 }
@@ -504,6 +505,7 @@ pub fn fit_for_launch(
         ),
         LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Tensorfold(s) => (&s.common, &s.memory, None, 0),
+        LaunchSettings::Llamacpp(s) => (&s.common, &s.memory, None, 0),
     };
     if common.context_length.is_none() {
         if let Some(option) = typed_field_option(engine, "context_length") {
@@ -587,7 +589,7 @@ pub fn fit_for_launch(
             Err(refusal) => fit.warning = Some(refusal),
         }
     }
-    fit.streams = tensorfold_streams(settings, profile_args, config.as_ref().ok());
+    fit.streams = launch_streams(settings, profile_args, config.as_ref().ok());
     fit
 }
 
@@ -632,6 +634,33 @@ pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -
 /// The model families whose CUDA engine TensorFold 0.6.3 to 0.6.5 runs one request at
 /// a time whatever `--parallel` says (`families/nemotron_h`).
 const TENSORFOLD_ONE_AT_A_TIME: &[&str] = &["nemotron_h"];
+
+/// The streams a launch decodes together, for status: TensorFold's
+/// `--parallel` and llama.cpp's slots; `None` for the other engines.
+fn launch_streams(
+    settings: &LaunchSettings,
+    profile_args: &[String],
+    config: Option<&Value>,
+) -> Option<Streams> {
+    match settings {
+        LaunchSettings::Llamacpp(s) => Some(llamacpp_streams(s)),
+        _ => tensorfold_streams(settings, profile_args, config),
+    }
+}
+
+/// ADR 0029 §5 (plan ruling 3): llama.cpp's slots. `--parallel` is reserved
+/// in every argument list, so the count is the deployment's or CapyCTL's.
+fn llamacpp_streams(settings: &capyctl_domain::launch::LlamacppLaunchSettings) -> Streams {
+    Streams {
+        count: Some(settings.slots()),
+        source: if settings.common.max_concurrent_requests.is_some() {
+            StreamsSource::Declared
+        } else {
+            StreamsSource::Default
+        },
+        reason: None,
+    }
+}
 
 /// ADR 0023 §4 (amended 2026-10-03): the streams a TensorFold launch decodes
 /// together, for status. `config` is the checkpoint's configuration when
@@ -785,6 +814,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
         LaunchSettings::Vllm(s) => s.common.context_length,
         LaunchSettings::Sglang(s) => s.common.context_length,
         LaunchSettings::Tensorfold(s) => s.common.context_length,
+        LaunchSettings::Llamacpp(s) => s.common.context_length,
     };
     let fit = fit_for_launch(
         effective.profile.engine,
@@ -803,7 +833,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
             ),
             warning: None,
             running_limit: None,
-            streams: tensorfold_streams(&effective.engine_config, &effective.profile.args, None),
+            streams: launch_streams(&effective.engine_config, &effective.profile.args, None),
         },
     }
 }
@@ -905,7 +935,7 @@ pub fn max_running_for_effective(
             (None, None) if remote => MaxRunning::of(None, MaxRunningSource::OnHost),
             (None, None) => MaxRunning::of(None, MaxRunningSource::EngineDefault),
         },
-        LaunchSettings::Tensorfold(_) => match &fit.streams {
+        LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => match &fit.streams {
             Some(streams) => MaxRunning {
                 count: streams.count,
                 source: match streams.source {

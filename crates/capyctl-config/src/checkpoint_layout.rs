@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use capyctl_domain::disk_tables::CheckpointTables;
 pub use capyctl_domain::member_weights::CheckpointLayout;
@@ -185,6 +185,200 @@ pub fn sharded_layer(name: &str, dims: usize) -> Option<String> {
             && pair[1].bytes().all(|b| b.is_ascii_digit()))
         .then(|| parts[..at + 2].join("."))
     })
+}
+
+/// ADR 0029 §9: the GGUF model a llama.cpp launch renders as `--model`,
+/// picked from the checkpoint directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufPick {
+    /// Relative to the checkpoint: the single file, or the first shard of a
+    /// split model (`<name>-00001-of-0000N.gguf`), which llama-server loads
+    /// the others from.
+    pub file: PathBuf,
+    /// Every file the model loads, relative to the checkpoint.
+    pub files: Vec<PathBuf>,
+}
+
+/// One GGUF model in a checkpoint: a single file or a split set.
+#[derive(Debug)]
+struct GgufCandidate {
+    first: PathBuf,
+    files: Vec<PathBuf>,
+    complete: bool,
+}
+
+/// The most candidates a refusal names.
+const NAMED_CANDIDATES: usize = 8;
+
+/// ADR 0029 §9: the GGUF to render from the checkpoint at `root`. With
+/// `gguf_file` (`engine_config.llamacpp.gguf_file`) it is that file, a
+/// single model or the first shard of a split one; without, the checkpoint
+/// must hold exactly one model: one `.gguf` that is not a multimodal
+/// projector (`mmproj` in its name), or one complete split set. Files are
+/// looked for in the checkpoint and one directory level below it, as the
+/// checkpoint's layout is read. Refusals name the candidates, relative to
+/// the checkpoint.
+pub fn pick_gguf(root: &Path, gguf_file: Option<&str>) -> Result<GgufPick, String> {
+    let candidates = gguf_candidates(root)?;
+    let chosen = match gguf_file {
+        Some(value) => {
+            let wanted = crate::llamacpp::checkpoint_file(value)?;
+            if is_projector(&wanted) {
+                return Err(format!(
+                    "`{value}` is a multimodal projector; name it in \
+                     engine_config.llamacpp.mmproj_file"
+                ));
+            }
+            if let Some(found) = candidates.iter().find(|c| c.first == wanted) {
+                found
+            } else if let Some(split) = candidates.iter().find(|c| c.files.contains(&wanted)) {
+                return Err(format!(
+                    "`{value}` is one shard of a split model; name its first shard `{}`",
+                    split.first.display()
+                ));
+            } else {
+                return Err(format!(
+                    "`{value}` is not a GGUF model file in the checkpoint"
+                ));
+            }
+        }
+        None => match candidates.as_slice() {
+            [] => {
+                return Err(
+                    "the checkpoint holds no GGUF model file (a `.gguf` that is not a \
+                     multimodal projector)"
+                        .into(),
+                )
+            }
+            [one] => one,
+            several => {
+                let mut names: Vec<String> = several
+                    .iter()
+                    .take(NAMED_CANDIDATES)
+                    .map(|c| format!("`{}`", c.first.display()))
+                    .collect();
+                if several.len() > NAMED_CANDIDATES {
+                    names.push(format!("and {} more", several.len() - NAMED_CANDIDATES));
+                }
+                return Err(format!(
+                    "the checkpoint holds several GGUF models ({}); name one in \
+                     engine_config.llamacpp.gguf_file",
+                    names.join(", ")
+                ));
+            }
+        },
+    };
+    if !chosen.complete {
+        return Err(format!(
+            "the split model `{}` is missing shards in the checkpoint",
+            chosen.first.display()
+        ));
+    }
+    Ok(GgufPick {
+        file: chosen.first.clone(),
+        files: chosen.files.clone(),
+    })
+}
+
+/// ADR 0029 §9: the multimodal projector `engine_config.llamacpp.mmproj_file`
+/// names, a regular file inside the checkpoint at `root`, relative to it.
+pub fn projector_file(root: &Path, mmproj_file: &str) -> Result<PathBuf, String> {
+    let relative = crate::llamacpp::checkpoint_file(mmproj_file)?;
+    if std::fs::metadata(root.join(&relative)).is_ok_and(|metadata| metadata.is_file()) {
+        Ok(relative)
+    } else {
+        Err(format!("`{mmproj_file}` is not a file in the checkpoint"))
+    }
+}
+
+fn is_projector(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("mmproj"))
+}
+
+/// `<prefix>-<index>-of-<total>.gguf`, llama.cpp's split naming
+/// (`llama_split_path`: five digits each, the index from 1).
+fn shard_of(name: &str) -> Option<(&str, u32, u32)> {
+    let stem = name.get(..name.len().checked_sub(".gguf".len())?)?;
+    let (rest, total) = stem.rsplit_once("-of-")?;
+    let (prefix, index) = rest.rsplit_once('-')?;
+    let number = |digits: &str| {
+        (digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse::<u32>().ok())
+            .flatten()
+    };
+    let (index, total) = (number(index)?, number(total)?);
+    (index >= 1 && index <= total).then_some((prefix, index, total))
+}
+
+fn gguf_candidates(root: &Path) -> Result<Vec<GgufCandidate>, String> {
+    let mut files = Vec::new();
+    collect_gguf(root, Path::new(""), 1, &mut files)
+        .ok_or("the checkpoint directory cannot be read")?;
+    files.sort();
+    let mut candidates = Vec::new();
+    let mut splits: BTreeMap<(PathBuf, String, u32), BTreeMap<u32, PathBuf>> = BTreeMap::new();
+    for file in files.into_iter().filter(|file| !is_projector(file)) {
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        match shard_of(name) {
+            Some((prefix, index, total)) => {
+                let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+                splits
+                    .entry((dir, prefix.to_owned(), total))
+                    .or_default()
+                    .insert(index, file.clone());
+            }
+            None => candidates.push(GgufCandidate {
+                first: file.clone(),
+                files: vec![file],
+                complete: true,
+            }),
+        }
+    }
+    for ((dir, prefix, total), shards) in splits {
+        let complete = (1..=total).all(|index| shards.contains_key(&index));
+        let first = shards
+            .get(&1)
+            .cloned()
+            .unwrap_or_else(|| dir.join(format!("{prefix}-00001-of-{total:05}.gguf")));
+        candidates.push(GgufCandidate {
+            first,
+            files: shards.into_values().collect(),
+            complete,
+        });
+    }
+    candidates.sort_by(|a, b| a.first.cmp(&b.first));
+    Ok(candidates)
+}
+
+/// The `.gguf` regular files under `root.join(relative)`, `depth` levels
+/// down, relative to `root`. Symlinks are followed as the layout reader
+/// follows them; an entry that cannot be read is not a candidate.
+fn collect_gguf(root: &Path, relative: &Path, depth: u8, files: &mut Vec<PathBuf>) -> Option<()> {
+    for entry in std::fs::read_dir(root.join(relative)).ok()? {
+        let Ok(entry) = entry else { continue };
+        let path = relative.join(entry.file_name());
+        let Ok(metadata) = std::fs::metadata(root.join(&path)) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if depth > 0 {
+                collect_gguf(root, &path, depth - 1, files);
+            }
+        } else if metadata.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".gguf"))
+        {
+            files.push(path);
+        }
+    }
+    Some(())
 }
 
 #[cfg(test)]

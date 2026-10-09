@@ -85,6 +85,13 @@ pub(super) fn normalize_profile(
     // malformed entries are refused with the closed reason.
     validate_profile_env(&raw_profile.env)
         .map_err(|reason| invalid("runtime_profiles.env", reason))?;
+    // ADR 0029 §6: llama-server reads options and its configuration and cache
+    // directories from these names, so a llama.cpp profile may not set them.
+    if raw_profile.engine == Engine::Llamacpp {
+        if let Some(reason) = crate::llamacpp::refused_env(raw_profile.env.keys()) {
+            return Err(invalid("runtime_profiles.env", reason));
+        }
+    }
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
     // with the checkpoint. There are models that need it, but a profile may only
     // pass it where the host has said so in as many words.

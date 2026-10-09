@@ -3,6 +3,8 @@
 //! write that directory can run code in the engine. Each version gets its own
 //! directory under the role's private state, owned by the service user, mode
 //! 0700 at every level capyctl creates; anything else found there is refused.
+//! ADR 0029 §6: llama.cpp's configuration and cache directories live here too,
+//! under the same rule.
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,9 @@ pub enum EngineCacheError {
     NotPrivate(PathBuf),
     #[error("{0} could not be created")]
     Create(PathBuf),
+    /// ADR 0029 §6: llama-server would read a `config.ini` found here.
+    #[error("{0} is not empty")]
+    NotEmpty(PathBuf),
 }
 
 /// The role's private engine cache root (`<state>/engines`, 0700).
@@ -68,6 +73,31 @@ impl EngineCacheRoot {
             ensure(&path)?;
         }
         Ok(path)
+    }
+
+    /// ADR 0029 §6: `<root>/llamacpp/config` and `<root>/llamacpp/cache`,
+    /// created private, for llama-server's `XDG_CONFIG_HOME` and
+    /// `LLAMA_CACHE`. The configuration directory must be empty: llama-server
+    /// reads `llama.cpp/config.ini` under it for every option the command
+    /// line leaves unset. Nothing writes the cache with CapyCTL's options
+    /// (model sources are reserved), so it is only kept private.
+    pub fn llamacpp_dirs(
+        &self,
+    ) -> Result<capyctl_adapters::llamacpp::LlamacppDirs, EngineCacheError> {
+        ensure(&self.dir)?;
+        let engine = self.dir.join("llamacpp");
+        ensure(&engine)?;
+        let (config, cache) = (engine.join("config"), engine.join("cache"));
+        for dir in [&config, &cache] {
+            ensure(dir)?;
+        }
+        let empty = std::fs::read_dir(&config)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            return Err(EngineCacheError::NotEmpty(config));
+        }
+        Ok(capyctl_adapters::llamacpp::LlamacppDirs { config, cache })
     }
 }
 
@@ -147,6 +177,35 @@ mod tests {
         }
         assert_eq!(root.torch_extensions("0.6.0").unwrap(), path);
         assert!(!has_build(&path));
+    }
+
+    // T42 T37 (ADR 0029 §6): llama.cpp's configuration and cache directories
+    // are private on every level and reused; a configuration directory that
+    // holds anything, or one opened to others, is refused.
+    #[test]
+    fn the_llamacpp_directories_are_private_and_the_config_one_empty() {
+        let (_dir, root) = root();
+        let dirs = root.llamacpp_dirs().unwrap();
+        assert!(dirs.config.ends_with("engines/llamacpp/config"));
+        assert!(dirs.cache.ends_with("engines/llamacpp/cache"));
+        for level in [dirs.config.parent().unwrap(), &dirs.config, &dirs.cache] {
+            let meta = std::fs::symlink_metadata(level).unwrap();
+            assert_eq!(meta.mode() & 0o7777, 0o700, "{}", level.display());
+            assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        }
+        assert_eq!(root.llamacpp_dirs().unwrap(), dirs);
+        std::fs::create_dir(dirs.config.join("llama.cpp")).unwrap();
+        std::fs::write(dirs.config.join("llama.cpp/config.ini"), "[*]\n").unwrap();
+        assert_eq!(
+            root.llamacpp_dirs(),
+            Err(EngineCacheError::NotEmpty(dirs.config.clone()))
+        );
+        std::fs::remove_dir_all(dirs.config.join("llama.cpp")).unwrap();
+        std::fs::set_permissions(&dirs.cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            root.llamacpp_dirs(),
+            Err(EngineCacheError::NotPrivate(dirs.cache.clone()))
+        );
     }
 
     // T41 (ADR 0023 §4): only a finished build counts. torch's

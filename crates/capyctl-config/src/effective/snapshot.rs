@@ -296,6 +296,7 @@ pub(super) fn declared_engine_config(
             "reasoning_parser",
         ],
         Some("tensorfold") => &["max_tokens", "thinking"],
+        Some("llamacpp") => &["n_gpu_layers", "gguf_file", "mmproj_file"],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),
     };
     let prefix = engine.expect("engine checked above");

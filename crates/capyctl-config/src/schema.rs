@@ -387,6 +387,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             "tensorfold",
             FieldSpec::Struct(&[("max_tokens", SCALAR), ("thinking", SCALAR)]),
         ),
+        // ADR 0029 §5, §9: llama.cpp's own typed fields.
+        (
+            "llamacpp",
+            FieldSpec::Struct(&[
+                ("n_gpu_layers", SCALAR),
+                ("gguf_file", SCALAR),
+                ("mmproj_file", SCALAR),
+            ]),
+        ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
         // ADR 0028 §2.1: engine environment, names approved by the profile.

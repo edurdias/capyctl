@@ -579,6 +579,8 @@ impl NativeHostExecution {
         // `local_ranks` of them; a single launch on exactly one.
         let group = group_member(command);
         let devices = group.map_or(1, |(plan, _)| plan.topology().local_ranks as usize);
+        // ADR 0029 §1 (plan slice L3): a llama.cpp deployment resolves, but
+        // its launch is not in this release and is refused here.
         if !matches!(
             effective.profile.engine,
             Engine::Sglang | Engine::Vllm | Engine::Tensorfold
@@ -1245,8 +1247,8 @@ impl NativeHostExecution {
                         .map_err(|_| SessionError)?,
                 )))
             }
-            // ADR 0029 §1: no llama.cpp launch in this release; resolution
-            // refuses its deployments, so nothing reaches here.
+            // ADR 0029 §1 (plan slice L3): no llama.cpp launch in this
+            // release; `resolve_as` refuses it before anything durable.
             Engine::Llamacpp => Err(SessionError),
         }
     }

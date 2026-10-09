@@ -169,7 +169,8 @@ fn declared(settings: &LaunchSettings, kind: Kind) -> Option<Option<&str>> {
     let (tool, reasoning) = match settings {
         LaunchSettings::Vllm(s) => (&s.tool_call_parser, &s.reasoning_parser),
         LaunchSettings::Sglang(s) => (&s.tool_call_parser, &s.reasoning_parser),
-        LaunchSettings::Tensorfold(_) => return None,
+        // ADR 0029 §12: llama-server derives its parsers from the chat template.
+        LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => return None,
     };
     Some(match kind {
         Kind::ToolCall => tool.as_deref(),

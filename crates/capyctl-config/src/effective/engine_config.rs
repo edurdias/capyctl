@@ -9,8 +9,9 @@ use crate::engine_policy::{
     option_names, typed_field_option, validate_extra_args, ExtraArgsContext, ExtraArgsPolicy,
 };
 use capyctl_domain::launch::{
-    CommonEngineSettings, LaunchSettings, MemoryRequest, SafetensorsLoadStrategy, SettingSource,
-    SglangLaunchSettings, TensorfoldLaunchSettings, VllmLaunchSettings,
+    CommonEngineSettings, LaunchSettings, LlamacppGpuLayers, LlamacppLaunchSettings, MemoryRequest,
+    SafetensorsLoadStrategy, SettingSource, SglangLaunchSettings, TensorfoldLaunchSettings,
+    VllmLaunchSettings,
 };
 
 /// ADR 0014 §5: conservative placeholder overhead margins, per engine family,
@@ -272,6 +273,8 @@ pub(super) struct RawEngineConfig {
     #[serde(default)]
     tensorfold: Option<RawTensorfoldFields>,
     #[serde(default)]
+    llamacpp: Option<RawLlamacppFields>,
+    #[serde(default)]
     accept_extra_args: Option<bool>,
     #[serde(default)]
     extra_args: Option<Vec<String>>,
@@ -360,6 +363,18 @@ struct RawTensorfoldFields {
     max_tokens: Option<u32>,
     #[serde(default)]
     thinking: Option<bool>,
+}
+
+/// ADR 0029 §5, §9: `engine_config.llamacpp`.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlamacppFields {
+    #[serde(default)]
+    n_gpu_layers: Option<LlamacppGpuLayers>,
+    #[serde(default)]
+    gguf_file: Option<String>,
+    #[serde(default)]
+    mmproj_file: Option<String>,
 }
 
 /// Review decision (discrete GPU design §3): how a memory request derived from
@@ -1017,26 +1032,32 @@ pub(super) fn normalize_engine_config(
         ("vllm", raw.vllm.is_some()),
         ("sglang", raw.sglang.is_some()),
         ("tensorfold", raw.tensorfold.is_some()),
+        ("llamacpp", raw.llamacpp.is_some()),
     ];
     for (block, present) in foreign {
         if *present && *block != engine.name() {
             return Err(family_mismatch(block));
         }
     }
-    // ADR 0023 §4: TensorFold has no flag for these common fields.
-    if engine == Engine::Tensorfold {
+    // ADR 0023 §4, ADR 0029 §5: TensorFold and llama.cpp have no flag for
+    // these common fields (llama.cpp's quantization is in the GGUF file).
+    if let Some(family) = match engine {
+        Engine::Tensorfold => Some("TensorFold"),
+        Engine::Llamacpp => Some("llama.cpp"),
+        Engine::Vllm | Engine::Sglang => None,
+    } {
         for (field, set) in [
             ("dtype", raw.dtype.is_some()),
             ("quantization", raw.quantization.is_some()),
             ("cuda_graphs", raw.cuda_graphs.is_some()),
-            // `false` is what TensorFold does, and what a snapshot restates.
+            // `false` is what the engine does, and what a snapshot restates.
             ("language_model_only", raw.language_model_only == Some(true)),
             ("trust_remote_code", raw.trust_remote_code == Some(true)),
         ] {
             if set {
                 return Err(invalid(
                     format!("engine_config.{field}"),
-                    "TensorFold has no option for this field; remove it",
+                    format!("{family} has no option for this field; remove it"),
                 ));
             }
         }
@@ -1044,9 +1065,31 @@ pub(super) fn normalize_engine_config(
             return Err(ConfigError::new(
                 ConfigErrorCode::MissingRequired,
                 "engine_config.context_length",
-                "a TensorFold deployment states context_length: it fixes the window \
-                 TensorFold serves",
+                match engine {
+                    Engine::Llamacpp => {
+                        "a llama.cpp deployment states context_length: it is each request's \
+                         window, and every slot's KV cache is allocated for it at start"
+                    }
+                    _ => {
+                        "a TensorFold deployment states context_length: it fixes the window \
+                         TensorFold serves"
+                    }
+                },
             ));
+        }
+    }
+    // ADR 0029 §5: one of llama.cpp's cache types, for keys and values both.
+    if engine == Engine::Llamacpp {
+        if let Some(kind) = &raw.kv_cache_dtype {
+            if !crate::llamacpp::CACHE_TYPES.contains(&kind.as_str()) {
+                return Err(invalid(
+                    "engine_config.kv_cache_dtype",
+                    format!(
+                        "llama.cpp's cache types are {}",
+                        crate::llamacpp::CACHE_TYPES.join(", ")
+                    ),
+                ));
+            }
         }
     }
     if let Some(dtype) = &raw.dtype {
@@ -1303,11 +1346,25 @@ pub(super) fn normalize_engine_config(
     let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
     // ADR 0023 §4: TensorFold is told no KV size; `--context` fixes it inside
     // the declared reservation, which is all an undeclared KV cache is bounded by.
-    let tensorfold_kv = engine == Engine::Tensorfold && kv_cache.is_none();
-    let kv_cache = if tensorfold_kv {
-        inputs.declared_ready_total
-    } else {
-        kv_cache
+    // ADR 0029 §5, §9: llama.cpp's KV is fixed by the rendered context and
+    // slots; until its size is derived from the GGUF header (plan slice L4)
+    // the declared reservation less the weights bounds it.
+    let declared_kv_bound =
+        matches!(engine, Engine::Tensorfold | Engine::Llamacpp) && kv_cache.is_none();
+    let kv_cache = match (declared_kv_bound, engine) {
+        (true, Engine::Llamacpp) => match (inputs.declared_ready_total, inputs.facts.weights_bytes)
+        {
+            (Some(total), Some(weights)) if weights >= total => {
+                return Err(invalid(
+                    "resources",
+                    "the checkpoint's weights fill the declared Ready allocation; raise it",
+                ));
+            }
+            (Some(total), weights) => Some(total - weights.unwrap_or(0)),
+            (None, _) => None,
+        },
+        (true, _) => inputs.declared_ready_total,
+        (false, _) => kv_cache,
     };
     // Review decision (discrete GPU design §3): a request derived from the
     // weights on a device domain is sized for the card, not with the unified
@@ -1385,7 +1442,7 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
-    if tensorfold_kv {
+    if declared_kv_bound {
         provenance.insert("memory.kv_cache".into(), SettingSource::Derived);
     }
     if provenance_startup_derived {
@@ -1566,9 +1623,62 @@ pub(super) fn normalize_engine_config(
                 provenance,
             })
         }
-        // ADR 0029 §5: llama.cpp's launch settings are not in this release;
-        // resolution refuses its deployments before reaching here.
-        Engine::Llamacpp => return Err(crate::llamacpp::deployment_unsupported()),
+        Engine::Llamacpp => {
+            let llamacpp = raw.llamacpp.clone().unwrap_or_default();
+            // ADR 0029 §5: each slot's window, padded, times the slots is
+            // llama-server's `--ctx-size`, which must fit its `int`.
+            let context_length = common.context_length.unwrap_or_default();
+            let slots = common
+                .max_concurrent_requests
+                .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL);
+            if crate::llamacpp::slot_pool_tokens(context_length, slots).is_none() {
+                return Err(invalid(
+                    "engine_config.context_length",
+                    format!(
+                        "context_length {context_length} padded to a multiple of {} for each \
+                         of {slots} slots exceeds llama.cpp's largest context",
+                        crate::llamacpp::SLOT_ALIGNMENT
+                    ),
+                ));
+            }
+            // ADR 0029 §9: the GGUF and the projector are named inside the
+            // checkpoint; the files are found where it is read, at launch.
+            for (field, value) in [
+                ("gguf_file", &llamacpp.gguf_file),
+                ("mmproj_file", &llamacpp.mmproj_file),
+            ] {
+                if let Some(value) = value {
+                    crate::llamacpp::checkpoint_file(value).map_err(|reason| {
+                        invalid(format!("engine_config.llamacpp.{field}"), reason)
+                    })?;
+                }
+            }
+            // ADR 0029 §5: CapyCTL's defaults, named so a snapshot
+            // re-resolution chooses them again.
+            if common.kv_cache_dtype.is_none() {
+                common.kv_cache_dtype = Some(crate::llamacpp::DEFAULT_CACHE_TYPE.into());
+                provenance.insert("kv_cache_dtype".into(), SettingSource::CapyctlDefault);
+            }
+            let n_gpu_layers = match llamacpp.n_gpu_layers {
+                Some(layers) => layers,
+                None => {
+                    provenance.insert(
+                        "llamacpp.n_gpu_layers".into(),
+                        SettingSource::CapyctlDefault,
+                    );
+                    LlamacppGpuLayers::All
+                }
+            };
+            LaunchSettings::Llamacpp(LlamacppLaunchSettings {
+                common,
+                memory,
+                n_gpu_layers,
+                gguf_file: llamacpp.gguf_file,
+                mmproj_file: llamacpp.mmproj_file,
+                extra_args,
+                provenance,
+            })
+        }
     };
     Ok(settings)
 }
@@ -1604,14 +1714,21 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
         "tensorfold": raw.tensorfold.as_ref().map(|t| serde_json::json!({
             "max_tokens": t.max_tokens, "thinking": t.thinking,
         })),
+        "llamacpp": raw.llamacpp.as_ref().map(|l| serde_json::json!({
+            "n_gpu_layers": l.n_gpu_layers, "gguf_file": l.gguf_file,
+            "mmproj_file": l.mmproj_file,
+        })),
         "accept_extra_args": raw.accept_extra_args,
         "extra_args": raw.extra_args,
     });
-    // ADR 0023 §4: the key appears only when declared, so every vLLM and
-    // SGLang command fingerprint keeps its identity.
-    if raw.tensorfold.is_none() {
-        if let Some(object) = declared.as_object_mut() {
+    // ADR 0023 §4, ADR 0029 §5: the keys appear only when declared, so every
+    // earlier command fingerprint keeps its identity.
+    if let Some(object) = declared.as_object_mut() {
+        if raw.tensorfold.is_none() {
             object.remove("tensorfold");
+        }
+        if raw.llamacpp.is_none() {
+            object.remove("llamacpp");
         }
     }
     // ADR 0028 §2.1: likewise the environment, only when declared.
