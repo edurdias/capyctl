@@ -216,6 +216,11 @@ pub struct CheckpointFacts {
     /// for (its `memory.member`), which the document rebuilt from the
     /// snapshot no longer states. Never set for a resolution from source.
     pub member_of: Option<crate::topology::Topology>,
+    /// ADR 0014 amendment A20 (owner decision 2026-10-09): the tables the
+    /// host found in the checkpoint's safetensors headers. Used only when the
+    /// engine's arguments keep them on disk
+    /// (`engine_policy::disk_table_cache_bytes`).
+    pub disk_tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -634,6 +639,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             state_slot_bytes: None,
             state_bytes: None,
             member: None,
+            disk_tables: None,
         },
         derived,
     ))

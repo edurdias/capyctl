@@ -557,6 +557,9 @@ impl NativeHostExecution {
             // ADR 0028 §5: a group member's share is taken with the layout
             // the server resolved it with.
             layout: plan.checkpoint_layout,
+            // ADR 0014 amendment A20: and the tables the server resolved an
+            // engine that keeps them on disk with.
+            disk_tables: plan.checkpoint_tables,
             ..Default::default()
         };
         let mut effective =
@@ -736,6 +739,13 @@ impl NativeHostExecution {
         {
             return Err(CheckpointError::Mismatch);
         }
+        // ADR 0014 amendment A20: and the tables an engine that keeps them on
+        // disk was sized without.
+        if plan.checkpoint_tables.is_some()
+            && plan.checkpoint_tables != effective.checkpoint_tables()
+        {
+            return Err(CheckpointError::Mismatch);
+        }
         Ok(())
     }
 
@@ -797,21 +807,23 @@ impl NativeHostExecution {
                     // ADR 0014 amendment A16: the hybrid state slot, beside
                     // the weights, from the checkpoint's configuration. ADR
                     // 0028 §5: the layout a group member's share is taken
-                    // with, from its safetensors headers.
-                    let layout = location
-                        .layout()
-                        .filter(|layout| layout.sharded_bytes <= weights);
+                    // with, and ADR 0014 amendment A20: the tables an engine
+                    // option can keep on disk, from its safetensors headers.
+                    let (layout, tables) = location.header_facts();
+                    let layout = layout.filter(|layout| layout.sharded_bytes <= weights);
+                    let tables = tables.filter(|tables| tables.bytes <= weights);
                     Ok::<_, CheckpointError>((
                         verified,
                         weights,
                         location.state_slot_bytes(),
                         layout,
+                        tables,
                     ))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok((verified, weights_bytes, state_slot_bytes, layout)) => {
+                    Ok((verified, weights_bytes, state_slot_bytes, layout, tables)) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -830,6 +842,9 @@ impl NativeHostExecution {
                                 .as_ref()
                                 .map(capyctl_protocol::execution::layout_to_wire),
                             provenance: verified.provenance.code().into(),
+                            tables: tables
+                                .as_ref()
+                                .map(capyctl_protocol::execution::tables_to_wire),
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -2721,6 +2736,7 @@ mod tests {
                 checkpoint_weights_bytes: None,
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
+                checkpoint_tables: None,
                 startup_bytes: None,
             }),
         };
@@ -2867,6 +2883,7 @@ mod tests {
             checkpoint_weights_bytes: None,
             checkpoint_state_slot_bytes: None,
             checkpoint_layout: None,
+            checkpoint_tables: None,
             startup_bytes: None,
         };
         let command = MemberCommand {
@@ -2932,6 +2949,20 @@ mod tests {
         };
         assert_eq!(
             executor.verify_checkpoint(&effective, &stated).unwrap_err(),
+            CheckpointError::Mismatch
+        );
+        // ADR 0014 amendment A20: and so are tables its headers do not hold.
+        let tabled = SingleLaunchPlan {
+            checkpoint_tables: Some(capyctl_domain::disk_tables::CheckpointTables {
+                bytes: 1,
+                count: 1,
+                sharded_bytes: 0,
+                resident_largest_layer_bytes: 0,
+            }),
+            ..plan.clone()
+        };
+        assert_eq!(
+            executor.verify_checkpoint(&effective, &tabled).unwrap_err(),
             CheckpointError::Mismatch
         );
         // Pre-WE3 plan: adoptable, never launched, and woken only against the

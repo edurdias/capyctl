@@ -534,6 +534,45 @@ pub fn vllm_args_with_draft(
     ]);
     Ok((fixed, extra))
 }
+/// ADR 0014 amendment A20 (owner decision 2026-10-09): the in-memory cache of
+/// one table an engine keeps when its arguments (host-fixed then the
+/// deployment's) leave the checkpoint's tables on disk; `None` when they do
+/// not. The last spelling of an option wins, as in the engines' parsers.
+///
+/// - SGLang 0.5.21: `--ple-offload-backend file`, unless
+///   `--no-ple-offload-embedding` turns the offload off (SGLang then refuses
+///   to start: the file backend is the offloaded table);
+/// - TensorFold 0.6.5: `--ple-on-ssd`;
+/// - vLLM 0.30 has no such option.
+pub fn disk_table_cache_bytes(engine: Engine, args: &[String]) -> Option<i64> {
+    use capyctl_domain::disk_tables::{SGLANG_TABLE_CACHE_BYTES, TENSORFOLD_TABLE_CACHE_BYTES};
+    let options = parse_options(args).ok()?;
+    match engine {
+        Engine::Sglang => {
+            let (mut file, mut offload) = (false, true);
+            for parsed in &options {
+                if matches_name(&parsed.name, "--ple-offload-backend") {
+                    file = parsed.value.as_deref() == Some("file");
+                } else if matches_name(&parsed.name, "--ple-offload-embedding") {
+                    offload = true;
+                } else if matches_name(&parsed.name, "--no-ple-offload-embedding") {
+                    offload = false;
+                }
+            }
+            (file && offload).then_some(SGLANG_TABLE_CACHE_BYTES)
+        }
+        Engine::Tensorfold => options
+            .iter()
+            .any(|parsed| matches_name(&parsed.name, "--ple-on-ssd"))
+            .then_some(TENSORFOLD_TABLE_CACHE_BYTES),
+        Engine::Vllm => None,
+    }
+}
+
+/// ADR 0014 amendment A20: SGLang's budget for the resident part of a
+/// file-backed table, which the allowance charged for it assumes at its
+/// default.
+pub const SGLANG_TABLE_BUDGET_ENV: &str = "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB";
 
 /// Whether a `--speculative-config` value is admissible under the host's
 /// approved directories (ADR 0014 §8).

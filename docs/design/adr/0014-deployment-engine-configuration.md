@@ -1481,3 +1481,50 @@ Evidence: CPU tests only (`a_fetched_checkpoint_digest_needs_no_second_read`,
 `the_embedded_host_trusts_a_declared_digest_only_by_policy`,
 `a_recorded_digest_keeps_where_it_came_from`, `a_recorded_digest_keeps_its_provenance`).
 No live download or launch has run with it.
+
+## Amendment A20: tables an engine keeps on disk count against the models disk (owner decision 2026-10-09)
+
+Qwen3.8-Flash-Next carries one n-gram (per-layer embedding) table of 47.7 GiB beside 78.3 GiB
+of other weights. Every safetensors byte counted as memory weights, so the 126 GiB checkpoint
+never fit a 121.7 GiB GB10. Two engines can leave the table on disk:
+
+- SGLang 0.5.21 `--ple-offload-backend file` (with `--ple-offload-embedding`, its default for a
+  BF16 model on CUDA): the table is a shared mapping of a sparse file under
+  `--ple-offload-dir`, and a trimmer keeps each table's resident set under
+  `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB` (8 GiB by default, checked every 30 s)
+  (`sglang/srt/models/qwen4_exp_ple_table.py`, `arg_groups/fields/exec_.py`);
+- TensorFold 0.6.5 `--ple-on-ssd`: each lookup reads its rows from the checkpoint's own files
+  with `pread` and readahead off, holding no table in memory
+  (`tensorfold/families/qwen4_exp/ssd_table.py`).
+
+vLLM 0.30 has no such option. Both engines read the same tensors, the shards of each layer's
+`ple_embedding.ngram_embedding` (`.shard_<n>.weight`, and `.scales` and `.biases` of a 4-bit
+table); the `weight_scale` stays in memory.
+
+Decision:
+
+1. The host reads the tables from the safetensors headers in the same pass as the group layout
+   (`checkpoint_layout::read_header_facts`): their bytes, how many there are, what of them the
+   layout splits across ranks, and the largest layer without them. They travel as
+   `CheckpointDigestEvidence.tables` and are re-resolved with like the layout.
+2. When the deployment's engine arguments (host-fixed then accepted extras;
+   `engine_policy::disk_table_cache_bytes`) turn the option on, the memory weights are
+   `resident + min(tables, count x cache)`: the weights less the tables (a group member: its
+   share of that, over the layout without the tables) plus the engine's cache of each table,
+   8 GiB for SGLang (its default budget) and 1 GiB for TensorFold (its read buffers and the page
+   cache the reads leave). Every rule sized from the weights (margin, request, startup
+   placeholder, state reserve, host copy) uses them; the timeouts keep the whole checkpoint.
+   The disk accounting is unchanged: the model store already holds the files.
+3. The resolution records `engine_config.memory.disk_tables` (whole checkpoint, tables, cache)
+   so a snapshot re-derives identically, and a launch plan names the tables
+   (`SingleLaunchPlan.checkpoint_tables`, capability `checkpoint_tables`), which the host checks
+   against its own headers. Without the option, or without tables, nothing is recorded and the
+   sizing and fingerprint are unchanged.
+4. The option is recognised in the arguments rather than given a typed field: it exists for one
+   model family on two engines.
+5. A SGLang deployment that sets `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB` beside the file backend is
+   refused, since the charged cache assumes the default budget.
+
+Open: SGLang's file backend writes its own sparse copy of the table under
+`--ple-offload-dir` (default `$SGLANG_CACHE_DIR/ple/<model path>`), outside the model store and
+not counted against the models disk.

@@ -231,6 +231,7 @@ fn a_measured_group_charges_each_member_its_share_of_the_weights() {
             None,
             Some(layout),
             capyctl_config::effective::DigestProvenance::Measured,
+            None,
             NOW,
         )
         .unwrap();

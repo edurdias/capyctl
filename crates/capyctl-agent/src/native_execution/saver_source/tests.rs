@@ -187,6 +187,7 @@ fn frozen_with(endpoint: String, weight_restore: &str) -> NativeLaunch {
                 state_slot_bytes: None,
                 state_bytes: None,
                 member: None,
+                disk_tables: None,
             },
             max_total_tokens: None,
             max_mamba_cache_size: None,

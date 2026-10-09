@@ -201,6 +201,7 @@ fn group_member_launch(
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
+        checkpoint_tables: None,
         startup_bytes: None,
     }
 }
@@ -238,6 +239,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
+        checkpoint_tables: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
@@ -399,6 +401,7 @@ fn launch_single() -> MemberCommand {
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
+        checkpoint_tables: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();

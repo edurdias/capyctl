@@ -3,6 +3,7 @@
 //! must recompute the canonical payload digest, fence generations and deduplicate
 //! command identities before acknowledging or performing any effect.
 use crate::pb;
+use capyctl_domain::disk_tables::CheckpointTables;
 use capyctl_domain::group::{
     CommandIdentity, GroupEngine, GroupIdentityError, GroupPlan, GroupTopology, MemberKey,
     MemberPlan, MemberRole,
@@ -41,6 +42,9 @@ pub struct SingleLaunchPlan {
     /// ADR 0028 §5 (amendment of 2026-10-07): the checkpoint layout the
     /// server resolved a group member's share of the weights with.
     pub checkpoint_layout: Option<CheckpointLayout>,
+    /// ADR 0014 amendment A20 (owner decision 2026-10-09): the checkpoint's
+    /// tables the server resolved with when the engine keeps them on disk.
+    pub checkpoint_tables: Option<CheckpointTables>,
 }
 /// ADR 0014 §7: an empty digest (pre-WE3 journal) or a canonical one; weights
 /// only alongside a digest, and never negative.
@@ -65,6 +69,28 @@ pub fn layout_to_wire(layout: &CheckpointLayout) -> pb::CheckpointLayout {
         sharded_bytes: layout.sharded_bytes,
         layer_count: layout.layer_count,
         largest_layer_bytes: layout.largest_layer_bytes,
+    }
+}
+
+/// ADR 0014 amendment A20: checkpoint tables from the wire, if every field is
+/// in range.
+pub fn tables_from_wire(tables: &pb::CheckpointTables) -> Option<CheckpointTables> {
+    let tables = CheckpointTables {
+        bytes: tables.bytes,
+        count: tables.count,
+        sharded_bytes: tables.sharded_bytes,
+        resident_largest_layer_bytes: tables.resident_largest_layer_bytes,
+    };
+    tables.is_valid().then_some(tables)
+}
+
+/// ADR 0014 amendment A20: checkpoint tables on the wire.
+pub fn tables_to_wire(tables: &CheckpointTables) -> pb::CheckpointTables {
+    pb::CheckpointTables {
+        bytes: tables.bytes,
+        count: tables.count,
+        sharded_bytes: tables.sharded_bytes,
+        resident_largest_layer_bytes: tables.resident_largest_layer_bytes,
     }
 }
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
@@ -110,6 +136,10 @@ impl SingleLaunchPlan {
             || plan.checkpoint_layout.as_ref().is_some_and(|layout| {
                 layout_from_wire(layout).is_none() || plan.checkpoint_weights_bytes.is_none()
             })
+            // ADR 0014 amendment A20: tables likewise.
+            || plan.checkpoint_tables.as_ref().is_some_and(|tables| {
+                tables_from_wire(tables).is_none() || plan.checkpoint_weights_bytes.is_none()
+            })
         {
             return Err(GroupIdentityError);
         }
@@ -137,6 +167,7 @@ impl SingleLaunchPlan {
             startup_bytes: plan.startup_bytes,
             checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
             checkpoint_layout: plan.checkpoint_layout.as_ref().and_then(layout_from_wire),
+            checkpoint_tables: plan.checkpoint_tables.as_ref().and_then(tables_from_wire),
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -162,6 +193,7 @@ impl SingleLaunchPlan {
             startup_bytes: self.startup_bytes,
             checkpoint_state_slot_bytes: self.checkpoint_state_slot_bytes,
             checkpoint_layout: self.checkpoint_layout.as_ref().map(layout_to_wire),
+            checkpoint_tables: self.checkpoint_tables.as_ref().map(tables_to_wire),
         }
     }
 }
@@ -1306,7 +1338,11 @@ fn validate_checkpoint(
                 !evidence.full_rehash
             }
             None => false,
-        };
+        }
+        // ADR 0014 amendment A20: tables no larger than the weights measured.
+        && evidence.tables.as_ref().is_none_or(|tables| {
+            tables_from_wire(tables).is_some_and(|t| t.bytes <= evidence.weights_bytes)
+        });
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
@@ -1321,6 +1357,7 @@ fn validate_checkpoint(
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
                 && evidence.provenance.is_empty()
+                && evidence.tables.is_none()
         }
         "computed" => {
             measured
@@ -1345,6 +1382,7 @@ fn validate_checkpoint(
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
                 && evidence.provenance.is_empty()
+                && evidence.tables.is_none()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

@@ -87,6 +87,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
+        checkpoint_tables: None,
         startup_bytes: None,
     }
 }
@@ -103,6 +104,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         state_slot_bytes: None,
         layout: None,
         provenance: String::new(),
+        tables: None,
     }
 }
 
@@ -453,6 +455,99 @@ fn the_checkpoint_layout_rides_beside_the_weights() {
         },
     ];
     for plan in refused {
+        assert!(decode(pb::execute_member::Action::LaunchSingle(plan)).is_err());
+    }
+}
+
+// T03 (ADR 0014 amendment A20, owner decision 2026-10-09): the checkpoint's
+// tables ride beside the weights, no larger than them, on the evidence and on
+// a launch plan, and a plan naming them needs `checkpoint_tables`.
+#[test]
+fn the_checkpoint_tables_ride_beside_the_weights() {
+    let tables = pb::CheckpointTables {
+        bytes: 6,
+        count: 1,
+        sharded_bytes: 6,
+        resident_largest_layer_bytes: 2,
+    };
+    let open = digest_command("");
+    let with_tables = pb::CheckpointDigestEvidence {
+        tables: Some(tables),
+        ..evidence("computed", DIGEST)
+    };
+    validate_result(&open, &result(&open, with_tables)).unwrap();
+    for bad in [
+        pb::CheckpointTables {
+            bytes: 11,
+            sharded_bytes: 0,
+            ..tables
+        },
+        pb::CheckpointTables { count: 0, ..tables },
+        pb::CheckpointTables {
+            sharded_bytes: 7,
+            ..tables
+        },
+        pb::CheckpointTables {
+            bytes: 0,
+            sharded_bytes: 0,
+            ..tables
+        },
+    ] {
+        let evidence = pb::CheckpointDigestEvidence {
+            tables: Some(bad),
+            ..evidence("computed", DIGEST)
+        };
+        assert!(validate_result(&open, &result(&open, evidence)).is_err());
+    }
+    let refusal = pb::CheckpointDigestEvidence {
+        state: "refused".into(),
+        reason: "unsafe_file".into(),
+        tables: Some(tables),
+        ..Default::default()
+    };
+    assert!(validate_result(&open, &result(&open, refusal)).is_err());
+
+    let plan = pb::SingleLaunchPlan {
+        checkpoint_digest: DIGEST.into(),
+        checkpoint_weights_bytes: Some(10),
+        checkpoint_tables: Some(tables),
+        ..launch_plan()
+    };
+    let command = decode(pb::execute_member::Action::LaunchSingle(plan.clone())).unwrap();
+    let MemberAction::LaunchSingle(typed) = &command.action else {
+        panic!("not a launch");
+    };
+    assert_eq!(
+        typed.checkpoint_tables,
+        Some(capyctl_domain::disk_tables::CheckpointTables {
+            bytes: 6,
+            count: 1,
+            sharded_bytes: 6,
+            resident_largest_layer_bytes: 2,
+        })
+    );
+    assert!(capyctl_protocol::capabilities::required(&command.to_wire())
+        .contains(&capyctl_protocol::capabilities::CHECKPOINT_TABLES));
+    // A launch without them needs nothing new.
+    let plain = decode(pb::execute_member::Action::LaunchSingle(
+        pb::SingleLaunchPlan {
+            checkpoint_tables: None,
+            ..plan.clone()
+        },
+    ))
+    .unwrap();
+    assert!(!capyctl_protocol::capabilities::required(&plain.to_wire())
+        .contains(&capyctl_protocol::capabilities::CHECKPOINT_TABLES));
+    for plan in [
+        pb::SingleLaunchPlan {
+            checkpoint_weights_bytes: None,
+            ..plan.clone()
+        },
+        pb::SingleLaunchPlan {
+            checkpoint_tables: Some(pb::CheckpointTables { count: 0, ..tables }),
+            ..plan.clone()
+        },
+    ] {
         assert!(decode(pb::execute_member::Action::LaunchSingle(plan)).is_err());
     }
 }

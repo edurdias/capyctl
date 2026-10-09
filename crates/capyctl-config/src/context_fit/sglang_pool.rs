@@ -738,7 +738,9 @@ pub fn sglang_pool_for_launch(
     // with the measured weights (found live 2026-10-03), so the launch sizes
     // them here, where it reads the checkpoint: the weight files of the
     // checkpoint and of the draft model (amendment A6). A group member's
-    // static pool holds its own share of them (ADR 0028 §5).
+    // static pool holds its own share of them (ADR 0028 §5), and tables the
+    // arguments keep on disk stay out of it but for SGLang's cache of them
+    // (amendment A20).
     let mut measured;
     let settings = match (settings.memory.weights_bytes, checkpoint_root) {
         (None, Some(root)) => {
@@ -750,17 +752,33 @@ pub fn sglang_pool_for_launch(
                 .sum::<Option<u64>>()
                 .and_then(|bytes| i64::try_from(bytes).ok())
                 .filter(|bytes| *bytes > 0);
-            measured.memory.weights_bytes = match settings.memory.member {
-                Some(member) => whole.and_then(|weights| {
-                    capyctl_domain::member_weights::member_weights_bytes(
-                        weights,
-                        crate::checkpoint_layout::read_checkpoint_layout(root).as_ref(),
-                        member.tensor_parallel,
-                        member.pipeline_parallel,
-                    )
-                }),
-                None => whole,
+            let cache = crate::engine_policy::disk_table_cache_bytes(Engine::Sglang, &args);
+            let (tensor_parallel, pipeline_parallel) =
+                settings.memory.member.map_or((1, 1), |member| {
+                    (member.tensor_parallel, member.pipeline_parallel)
+                });
+            let (layout, tables) = if cache.is_some() || settings.memory.member.is_some() {
+                crate::checkpoint_layout::read_header_facts(root)
+            } else {
+                (None, None)
             };
+            measured.memory.weights_bytes = whole.and_then(|weights| match cache.zip(tables) {
+                Some((cache, tables)) => capyctl_domain::disk_tables::disk_table_weights_bytes(
+                    weights,
+                    layout.as_ref(),
+                    &tables,
+                    tensor_parallel,
+                    pipeline_parallel,
+                    cache,
+                )
+                .map(|(memory, _)| memory),
+                None => capyctl_domain::member_weights::member_weights_bytes(
+                    weights,
+                    layout.as_ref(),
+                    tensor_parallel,
+                    pipeline_parallel,
+                ),
+            });
             &measured
         }
         _ => settings,

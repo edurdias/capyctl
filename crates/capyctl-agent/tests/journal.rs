@@ -164,6 +164,7 @@ fn launch(id: &str) -> MemberCommand {
             checkpoint_weights_bytes: None,
             checkpoint_state_slot_bytes: None,
             checkpoint_layout: None,
+            checkpoint_tables: None,
             startup_bytes: None,
         },
         plan: GroupPlan::new(
@@ -715,6 +716,7 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
         checkpoint_weights_bytes: None,
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
+        checkpoint_tables: None,
         startup_bytes: None,
     });
     let c = sign(c);

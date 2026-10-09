@@ -194,15 +194,23 @@ pub struct MemoryRequest {
     /// are declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member: Option<crate::member_weights::MemberWeights>,
+    /// ADR 0014 amendment A20 (owner decision 2026-10-09): the whole
+    /// checkpoint, its tables and the cache charged back when the engine
+    /// keeps the tables on disk; `weights_bytes` is then what stays in
+    /// memory. Absent whenever the engine option is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_tables: Option<crate::disk_tables::DiskTables>,
 }
 
 impl MemoryRequest {
     /// The whole checkpoint's measured weights: what a launch plan names and
-    /// the host verifies, whatever share of them this member holds.
+    /// the host verifies, whatever share of them this member holds and
+    /// whatever tables stay on disk.
     pub fn checkpoint_weights_bytes(&self) -> Option<i64> {
-        match &self.member {
-            Some(member) => member.checkpoint_weights_bytes,
-            None => self.weights_bytes,
+        match (&self.member, &self.disk_tables) {
+            (Some(member), _) => member.checkpoint_weights_bytes,
+            (None, Some(tables)) => Some(tables.checkpoint_weights_bytes),
+            (None, None) => self.weights_bytes,
         }
     }
 }
