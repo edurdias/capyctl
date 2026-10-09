@@ -583,6 +583,7 @@ async fn activate(
                 measured.weights_bytes,
                 measured.state_slot_bytes,
                 measured.layout,
+                measured.provenance,
                 capyctl_protocol::now_unix_ms(),
             )
             .map_err(|e| e.to_string())

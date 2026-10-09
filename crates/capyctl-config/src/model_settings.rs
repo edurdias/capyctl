@@ -29,6 +29,10 @@
 //!   `--model-sources-plain-http allowed|disabled`,
 //!   `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP`, or `model_sources.plain_http`;
 //!   default `denied`.
+//! - ADR 0014 §7 (amendment of 2026-10-08): whether the host trusts a local
+//!   checkpoint's declared canonical `content_fingerprint` without a full
+//!   read, default off: `--trust-declared-digest true|false`,
+//!   `CAPYCTL_TRUST_DECLARED_DIGEST`, or `checkpoints.trust_declared_digest`.
 //!
 //! Precedence, for every setting: CLI flag > environment > YAML > default.
 //! The resolved values are written into the host document before it is
@@ -59,6 +63,9 @@ pub const HF_ENDPOINT_ENV: &str = "CAPYCTL_HF_ENDPOINT";
 /// The Hugging Face tools' own endpoint variable, read after
 /// [`HF_ENDPOINT_ENV`].
 pub const HF_TOOLS_ENDPOINT_ENV: &str = "HF_ENDPOINT";
+/// The variable allowing the host to trust a local checkpoint's declared
+/// digest (`checkpoints.trust_declared_digest`): `true` or `false`.
+pub const TRUST_DECLARED_DIGEST_ENV: &str = "CAPYCTL_TRUST_DECLARED_DIGEST";
 /// The models directory under the home directory when nothing names one.
 pub const DEFAULT_MODELS_DIR: &str = "models";
 fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
@@ -80,6 +87,26 @@ pub struct ModelOverrides {
     pub hf_endpoint: Option<String>,
     /// `--model-sources-plain-http` / `CAPYCTL_MODEL_SOURCES_PLAIN_HTTP`.
     pub plain_http: Option<SourceSwitch>,
+    /// `--trust-declared-digest` / `CAPYCTL_TRUST_DECLARED_DIGEST`.
+    pub trust_declared_digest: Option<bool>,
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): a host document's `checkpoints`
+/// block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCheckpoints {
+    /// Trust a local checkpoint's declared canonical digest without a full
+    /// read. Off unless stated `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_declared_digest: Option<bool>,
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): whether a resolved host `document`
+/// (or a standalone document's `host:` block) allows trusting a declared
+/// digest. Only an explicit `true` does.
+pub fn trusts_declared_digest(document: &Value) -> bool {
+    document["checkpoints"]["trust_declared_digest"] == Value::Bool(true)
 }
 
 impl ModelOverrides {
@@ -108,6 +135,9 @@ impl ModelOverrides {
             },
             plain_http: get(MODEL_SOURCES_PLAIN_HTTP_ENV)
                 .map(|value| switch(MODEL_SOURCES_PLAIN_HTTP_ENV, &value))
+                .transpose()?,
+            trust_declared_digest: get(TRUST_DECLARED_DIGEST_ENV)
+                .map(|value| crate::engine_settings::boolean(TRUST_DECLARED_DIGEST_ENV, &value))
                 .transpose()?,
         })
     }
@@ -182,6 +212,9 @@ pub struct ModelSettings {
     pub sources: RawModelSources,
     /// Its normalized form.
     pub policy: ModelSourcePolicy,
+    /// ADR 0014 §7 (amendment of 2026-10-08): whether this host trusts a
+    /// local checkpoint's declared canonical digest without a full read.
+    pub trust_declared_digest: bool,
 }
 
 /// Resolve both settings for a host whose document block is `stated` (the
@@ -253,11 +286,23 @@ pub fn resolve(
     // earlier release used, so an existing verified copy is reused rather
     // than downloaded again.
     let policy = ModelSourcePolicy::from_raw(Some(sources.clone()))?;
+    // ADR 0014 §7 (amendment of 2026-10-08): off unless a layer says `true`.
+    let stated_checkpoints: RawCheckpoints = match stated.get("checkpoints") {
+        None | Some(Value::Null) => RawCheckpoints::default(),
+        Some(block) => serde_json::from_value(block.clone())
+            .map_err(|error| refuse("checkpoints", format!("not a checkpoints block: {error}")))?,
+    };
+    let trust_declared_digest = flag
+        .trust_declared_digest
+        .or(env.trust_declared_digest)
+        .or(stated_checkpoints.trust_declared_digest)
+        .unwrap_or(false);
     Ok(ModelSettings {
         models_root,
         root_source,
         sources,
         policy,
+        trust_declared_digest,
     })
 }
 
@@ -267,6 +312,14 @@ impl ModelSettings {
         document["model_store"] = json!({"path": self.models_root});
         document["model_sources"] =
             serde_json::to_value(&self.sources).expect("a model_sources block serializes");
+        // Stated only when on, so a host that never opts in publishes the
+        // document it published before the setting existed.
+        match document.as_object_mut() {
+            Some(object) if !self.trust_declared_digest => {
+                object.remove("checkpoints");
+            }
+            _ => document["checkpoints"] = json!({"trust_declared_digest": true}),
+        }
     }
 }
 
@@ -525,6 +578,7 @@ mod tests {
             (MODEL_SOURCES_MAX_ENV, "0GiB"),
             (HF_ENDPOINT_ENV, "http://mirror.example"),
             (HF_TOOLS_ENDPOINT_ENV, "not a url"),
+            (TRUST_DECLARED_DIGEST_ENV, "maybe"),
         ] {
             let error = env_layer(&[(key, value)]).unwrap_err();
             assert_eq!(error.path, key);
@@ -536,5 +590,51 @@ mod tests {
             Some(SourceSwitch::Denied)
         );
         assert_eq!(env_layer(&[(MODEL_SOURCES_ENV, "")]).unwrap().sources, None);
+    }
+
+    // T03 T34 (ADR 0014 §7, amendment of 2026-10-08; every setting three
+    // ways): trusting a declared digest is off by default and follows flag >
+    // environment > YAML > default. Only an explicit `true` is written into
+    // the published document, so a host that never opts in publishes what it
+    // published before.
+    #[test]
+    fn declared_digest_trust_follows_flag_env_document_default() {
+        let yaml_on = json!({"checkpoints": {"trust_declared_digest": true}});
+        let env_off = env_layer(&[(TRUST_DECLARED_DIGEST_ENV, "false")]).unwrap();
+        let env_on = env_layer(&[(TRUST_DECLARED_DIGEST_ENV, "true")]).unwrap();
+        let flag_on = ModelOverrides {
+            trust_declared_digest: Some(true),
+            ..Default::default()
+        };
+        let none = ModelOverrides::default();
+        let trusts = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
+            resolve(document, flag, env, home().as_deref())
+                .unwrap()
+                .trust_declared_digest
+        };
+        assert!(!trusts(&none, &none, &json!({})), "off by default");
+        assert!(trusts(&none, &none, &yaml_on));
+        assert!(!trusts(&none, &env_off, &yaml_on), "env over YAML");
+        assert!(trusts(&none, &env_on, &json!({})));
+        assert!(trusts(&flag_on, &env_off, &json!({})), "flag over env");
+        assert!(resolve(
+            &json!({"checkpoints": {"trust_declared_digest": true, "other": 1}}),
+            &none,
+            &none,
+            home().as_deref()
+        )
+        .is_err());
+
+        let mut document = yaml_on.clone();
+        resolve(&yaml_on, &none, &env_off, home().as_deref())
+            .unwrap()
+            .write_into(&mut document);
+        assert!(document.get("checkpoints").is_none(), "{document}");
+        assert!(!trusts_declared_digest(&document));
+        let mut document = json!({});
+        resolve(&json!({}), &flag_on, &none, home().as_deref())
+            .unwrap()
+            .write_into(&mut document);
+        assert!(trusts_declared_digest(&document), "{document}");
     }
 }

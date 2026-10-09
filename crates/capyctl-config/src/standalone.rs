@@ -435,7 +435,10 @@ pub fn check_honoured(
     // policy are honoured here exactly as on a host
     // (`crate::model_settings`); a malformed value is refused before any
     // side effect.
-    if host.get("model_store").is_some() || host.get("model_sources").is_some() {
+    if host.get("model_store").is_some()
+        || host.get("model_sources").is_some()
+        || host.get("checkpoints").is_some()
+    {
         crate::model_settings::resolve(
             host,
             &Default::default(),

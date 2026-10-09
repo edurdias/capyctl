@@ -33,7 +33,22 @@
 //!
 //! Open issue (ADR 0014 §7, 3): a file can still change between this check and
 //! the engine's read. The mitigation is a model store other users cannot write.
+//!
+//! ADR 0014 §7 (amendment of 2026-10-08): two first placements need no second
+//! full read. A checkpoint CapyCTL downloaded itself had every file verified
+//! against its pin as it was written (`crate::sources`); while every file still
+//! has the stat identity it had then, the manifest is built from those
+//! verified hashes ([`DigestProvenance::Fetched`]): the same canonical
+//! encoding, so the same digest a full read gives. And a host whose policy
+//! allows it ([`CheckpointVerifier::set_declared_trust`]) takes a local
+//! checkpoint's declared canonical digest the first time it sees that
+//! checkpoint, reading only the small files
+//! ([`DigestProvenance::DeclaredTrusted`]). Either way the stat cache is seeded,
+//! so any later change of a file's stat identity forces a full rehash, and a
+//! trusted declaration is trusted only once: never again after a change, and
+//! never once the policy is off.
 
+use capyctl_config::effective::DigestProvenance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,7 +62,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -143,6 +158,21 @@ impl FileIdentity {
             ctime_nsec: st.st_ctime_nsec as i64,
         }
     }
+
+    /// The same identity from a file's metadata (`lstat`), as the source
+    /// store records each file it verified.
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
 }
 
 /// One manifest line.
@@ -151,15 +181,18 @@ pub struct ManifestEntry {
     /// Relative path with `/` separators, as UTF-8.
     pub path: String,
     pub size: u64,
-    /// Lowercase hexadecimal SHA-256 of the file's bytes.
-    pub sha256: String,
+    /// Lowercase hexadecimal SHA-256 of the file's bytes. `None` only in a
+    /// trusted declaration's manifest, for a file larger than
+    /// [`SMALL_FILE_LIMIT`] that was not read.
+    pub sha256: Option<String>,
 }
 
 /// A measured checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointManifest {
     pub entries: Vec<ManifestEntry>,
-    /// `sha256:<64 hex>` over the canonical encoding.
+    /// `sha256:<64 hex>` over the canonical encoding (or, for a trusted
+    /// declaration, the declared digest).
     pub digest: String,
     /// ADR 0014 §5: the sum of the weight files' sizes.
     pub weights_bytes: i64,
@@ -167,21 +200,16 @@ pub struct CheckpointManifest {
 }
 
 impl CheckpointManifest {
-    /// Build the manifest (and its digest) from entries in any order.
+    /// Build the manifest (and its digest) from entries in any order. Every
+    /// entry must carry its hash.
     pub fn from_entries(mut entries: Vec<ManifestEntry>) -> Result<Self, CheckpointError> {
-        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-        if entries.windows(2).any(|w| w[0].path == w[1].path) {
-            return Err(CheckpointError::UnsafeFile);
-        }
+        sort_unique(&mut entries)?;
         let mut digest = Sha256::new();
         digest.update(MANIFEST_DOMAIN);
-        let mut weights: i64 = 0;
-        let mut total: u64 = 0;
         for entry in &entries {
-            if !encodable(&entry.path)
-                || entry.sha256.len() != 64
-                || !entry
-                    .sha256
+            let sha256 = entry.sha256.as_deref().unwrap_or_default();
+            if sha256.len() != 64
+                || !sha256
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             {
@@ -191,18 +219,10 @@ impl CheckpointManifest {
             digest.update([0]);
             digest.update(entry.size.to_string().as_bytes());
             digest.update([0]);
-            digest.update(entry.sha256.as_bytes());
+            digest.update(sha256.as_bytes());
             digest.update(b"\n");
-            total = total
-                .checked_add(entry.size)
-                .ok_or(CheckpointError::TooLarge)?;
-            if is_weight(&entry.path) {
-                weights = i64::try_from(entry.size)
-                    .ok()
-                    .and_then(|size| weights.checked_add(size))
-                    .ok_or(CheckpointError::TooLarge)?;
-            }
         }
+        let (weights_bytes, total_bytes) = totals(&entries)?;
         Ok(Self {
             digest: format!(
                 "{}{}",
@@ -210,10 +230,57 @@ impl CheckpointManifest {
                 hex::encode(digest.finalize())
             ),
             entries,
-            weights_bytes: weights,
-            total_bytes: total,
+            weights_bytes,
+            total_bytes,
         })
     }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): a trusted declaration's
+    /// manifest. The digest is the declared one, never computed; the sizes
+    /// are the walked files' own, so the weights are what a measurement
+    /// would count.
+    fn declared(digest: &str, mut entries: Vec<ManifestEntry>) -> Result<Self, CheckpointError> {
+        if !capyctl_config::effective::is_checkpoint_digest(digest) {
+            return Err(CheckpointError::Mismatch);
+        }
+        sort_unique(&mut entries)?;
+        let (weights_bytes, total_bytes) = totals(&entries)?;
+        Ok(Self {
+            digest: digest.to_owned(),
+            entries,
+            weights_bytes,
+            total_bytes,
+        })
+    }
+}
+
+/// Sort entries by path bytes; a duplicate or unencodable path is unsafe.
+fn sort_unique(entries: &mut [ManifestEntry]) -> Result<(), CheckpointError> {
+    entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    if entries.windows(2).any(|w| w[0].path == w[1].path)
+        || entries.iter().any(|entry| !encodable(&entry.path))
+    {
+        return Err(CheckpointError::UnsafeFile);
+    }
+    Ok(())
+}
+
+/// ADR 0014 §5: the weight files' sizes, and all files' sizes.
+fn totals(entries: &[ManifestEntry]) -> Result<(i64, u64), CheckpointError> {
+    let mut weights: i64 = 0;
+    let mut total: u64 = 0;
+    for entry in entries {
+        total = total
+            .checked_add(entry.size)
+            .ok_or(CheckpointError::TooLarge)?;
+        if is_weight(&entry.path) {
+            weights = i64::try_from(entry.size)
+                .ok()
+                .and_then(|size| weights.checked_add(size))
+                .ok_or(CheckpointError::TooLarge)?;
+        }
+    }
+    Ok((weights, total))
 }
 
 fn encodable(path: &str) -> bool {
@@ -239,19 +306,23 @@ pub struct CheckpointSize {
     pub total_bytes: u64,
 }
 
-/// The result of one verification: the manifest, and whether every file had to
-/// be hashed (first placement on this host, or a changed file).
+/// The result of one verification: the manifest, whether every file had to
+/// be hashed (first placement on this host, or a changed file), and where its
+/// file hashes came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verification {
     pub manifest: CheckpointManifest,
     pub full_rehash: bool,
+    pub provenance: DigestProvenance,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CachedFile {
     path: String,
     identity: FileIdentity,
-    sha256: String,
+    /// `None` only in a trusted declaration's record, for a file larger than
+    /// [`SMALL_FILE_LIMIT`] that was never read.
+    sha256: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -261,6 +332,13 @@ struct CacheRecord {
     checkpoint: String,
     root: (u64, u64),
     files: Vec<CachedFile>,
+    /// Where the hashes came from; a record written before provenance
+    /// existed was measured.
+    #[serde(default)]
+    provenance: DigestProvenance,
+    /// The trusted declaration ([`DigestProvenance::DeclaredTrusted`] only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared: Option<String>,
 }
 
 /// The largest cache record read back (a manifest of many files is small).
@@ -276,6 +354,15 @@ pub struct CheckpointVerifier {
     /// Serializes measurements of the same checkpoint so a concurrent second
     /// caller reuses the first one's full hash.
     locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// ADR 0014 §7 (amendment of 2026-10-08): the host's
+    /// `checkpoints.trust_declared_digest`. Off unless the host turns it on.
+    trust_declared: AtomicBool,
+    /// Every byte this verifier has hashed, for tests counting reads.
+    hashed: AtomicU64,
+    /// Files up to this size are rehashed on every reuse
+    /// ([`SMALL_FILE_LIMIT`]; tests lower it to tell small from large files
+    /// without writing 64 MiB).
+    small_file_limit: u64,
 }
 
 impl CheckpointVerifier {
@@ -283,8 +370,7 @@ impl CheckpointVerifier {
     pub fn with_cache_dir(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir: Some(cache_dir),
-            memory: Mutex::default(),
-            locks: Mutex::default(),
+            ..Self::in_memory()
         }
     }
 
@@ -294,7 +380,39 @@ impl CheckpointVerifier {
             cache_dir: None,
             memory: Mutex::default(),
             locks: Mutex::default(),
+            trust_declared: AtomicBool::new(false),
+            hashed: AtomicU64::new(0),
+            small_file_limit: SMALL_FILE_LIMIT,
         }
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): apply the host's policy on
+    /// declared digests (`checkpoints.trust_declared_digest`). When on, a
+    /// local checkpoint's declared canonical digest is taken the first time
+    /// this host sees the checkpoint, without reading its large files; when
+    /// off (the default), every declaration is only an expectation and a
+    /// digest trusted earlier is measured in full again.
+    pub fn set_declared_trust(&self, allowed: bool) {
+        self.trust_declared.store(allowed, Ordering::Release);
+    }
+
+    /// Whether this host's policy allows trusting declared digests.
+    pub fn trusts_declared(&self) -> bool {
+        self.trust_declared.load(Ordering::Acquire)
+    }
+
+    /// The bytes this verifier has read to hash files since it was made.
+    #[doc(hidden)]
+    pub fn bytes_hashed(&self) -> u64 {
+        self.hashed.load(Ordering::Acquire)
+    }
+
+    /// Test seam: treat files up to `limit` bytes as small (rehashed on every
+    /// reuse) instead of [`SMALL_FILE_LIMIT`].
+    #[doc(hidden)]
+    pub fn with_small_file_limit(mut self, limit: u64) -> Self {
+        self.small_file_limit = limit;
+        self
     }
 
     /// Measure the checkpoint and require `expected` (ADR 0014 §7). A mismatch
@@ -305,10 +423,22 @@ impl CheckpointVerifier {
         checkpoint: &Path,
         expected: &str,
     ) -> Result<Verification, CheckpointError> {
+        self.verify_declared(model_store, checkpoint, expected, None)
+    }
+
+    /// [`Self::verify`] for a deployment declaring `declared`
+    /// ([`Self::measure_declared`]).
+    pub fn verify_declared(
+        &self,
+        model_store: &Path,
+        checkpoint: &Path,
+        expected: &str,
+        declared: Option<&str>,
+    ) -> Result<Verification, CheckpointError> {
         if !capyctl_config::effective::is_checkpoint_digest(expected) {
             return Err(CheckpointError::Mismatch);
         }
-        let verification = self.measure(model_store, checkpoint)?;
+        let verification = self.measure_declared(model_store, checkpoint, declared)?;
         if verification.manifest.digest != expected {
             return Err(CheckpointError::Mismatch);
         }
@@ -379,6 +509,31 @@ impl CheckpointVerifier {
         model_store: &Path,
         checkpoint: &Path,
     ) -> Result<Verification, CheckpointError> {
+        self.measure_declared(model_store, checkpoint, None)
+    }
+
+    /// [`Self::measure`] for a deployment declaring `declared`
+    /// (`ModelIdentity::trustable_declaration`: a local source's canonical
+    /// `content_fingerprint`, else `None`). In order:
+    ///
+    /// 1. the cache, exactly as [`Self::measure`] reuses it (a trusted
+    ///    declaration's record only while the policy still allows it and the
+    ///    deployment still declares it);
+    /// 2. ADR 0014 §7 (amendment of 2026-10-08): the hashes CapyCTL verified
+    ///    while it downloaded this checkpoint, while every file keeps the
+    ///    stat identity it had then (`fetched`, nothing read);
+    /// 3. the declaration, when this host's policy allows it and this host has
+    ///    no record of the checkpoint at all (`declared_trusted`, only the
+    ///    small files read). A checkpoint this host has seen before (any
+    ///    record, now stale) is never trusted again: a changed file is
+    ///    measured;
+    /// 4. a full hash of every file (`measured`).
+    pub fn measure_declared(
+        &self,
+        model_store: &Path,
+        checkpoint: &Path,
+        declared: Option<&str>,
+    ) -> Result<Verification, CheckpointError> {
         let opened = open_checkpoint(model_store, checkpoint, Confinement::OwnRootOutside)?;
         let key = opened.checkpoint.to_string_lossy().into_owned();
         let lock = {
@@ -387,16 +542,32 @@ impl CheckpointVerifier {
         };
         let _serialized = lock.lock().map_err(|_| CheckpointError::Io)?;
         let walked = walk(&opened)?;
-        if let Some(cached) = self.cached(&key) {
-            if let Some(manifest) = reuse(&opened, &walked, &cached)? {
-                return Ok(Verification {
-                    manifest,
-                    full_rehash: false,
-                });
+        // SPEC §13: never trust silently. Only the host's policy and a
+        // canonical declaration together make one trustable.
+        let trusted = declared.filter(|declared| {
+            self.trusts_declared() && capyctl_config::effective::is_checkpoint_digest(declared)
+        });
+        let cached = self.cached(&key);
+        if let Some(cached) = &cached {
+            if let Some(verification) = reuse(
+                &opened,
+                &walked,
+                cached,
+                trusted,
+                self.small_file_limit,
+                &self.hashed,
+            )? {
+                return Ok(verification);
             }
         }
+        if let Some(verification) = self.adopt_fetched(&opened, &key, &walked)? {
+            return Ok(verification);
+        }
+        if let (None, Some(declared)) = (&cached, trusted) {
+            return self.trust_declaration(&opened, &key, &walked, declared);
+        }
         let files: Vec<&Walked> = walked.iter().collect();
-        let hashes = hash_files(&files)?;
+        let hashes = hash_files(&files, &self.hashed)?;
         let record = CacheRecord {
             version: CACHE_VERSION,
             store: opened.store.to_string_lossy().into_owned(),
@@ -408,25 +579,124 @@ impl CheckpointVerifier {
                 .map(|(file, hash)| CachedFile {
                     path: file.path.clone(),
                     identity: file.identity,
-                    sha256: hex::encode(hash),
+                    sha256: Some(hex::encode(hash)),
                 })
                 .collect(),
+            provenance: DigestProvenance::Measured,
+            declared: None,
         };
-        let manifest = CheckpointManifest::from_entries(
-            record
-                .files
-                .iter()
-                .map(|file| ManifestEntry {
-                    path: file.path.clone(),
-                    size: file.identity.size,
-                    sha256: file.sha256.clone(),
-                })
-                .collect(),
-        )?;
+        let manifest = CheckpointManifest::from_entries(entries(&record))?;
         self.remember(&key, record);
         Ok(Verification {
             manifest,
             full_rehash: true,
+            provenance: DigestProvenance::Measured,
+        })
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): the manifest of a checkpoint
+    /// CapyCTL downloaded, from the hashes each file was verified with as it
+    /// was written (`crate::sources::fetched_manifest`). That record is
+    /// checked exactly as a cache record is reused: the walked files must be
+    /// exactly the downloaded ones (hidden tool files aside, as a walk skips
+    /// them), each with the stat identity recorded right after it was
+    /// verified, and every small file must still hash to its verified value.
+    /// Otherwise `None`, and the checkpoint is measured. No large file is
+    /// read, and the manifest is built by the same canonical encoding as a
+    /// measurement, so the digest is the one a full read gives.
+    fn adopt_fetched(
+        &self,
+        opened: &Opened,
+        key: &str,
+        walked: &[Walked],
+    ) -> Result<Option<Verification>, CheckpointError> {
+        let Some(relative) = opened
+            .checkpoint
+            .strip_prefix(&opened.store)
+            .ok()
+            .and_then(Path::to_str)
+        else {
+            return Ok(None);
+        };
+        let Some(fetched) = crate::sources::fetched_manifest(&opened.store, relative) else {
+            return Ok(None);
+        };
+        let mut files: Vec<CachedFile> = fetched
+            .into_iter()
+            .filter(|(path, _)| !hidden(path))
+            .map(|(path, verified)| CachedFile {
+                path,
+                identity: verified.identity,
+                sha256: Some(verified.sha256),
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let record = CacheRecord {
+            version: CACHE_VERSION,
+            store: opened.store.to_string_lossy().into_owned(),
+            checkpoint: key.to_owned(),
+            root: opened.root,
+            files,
+            provenance: DigestProvenance::Fetched,
+            declared: None,
+        };
+        let adopted = reuse(
+            opened,
+            walked,
+            &record,
+            None,
+            self.small_file_limit,
+            &self.hashed,
+        )?;
+        if adopted.is_some() {
+            self.remember(key, record);
+        }
+        Ok(adopted)
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): take `declared` as this
+    /// checkpoint's digest, as the host's policy allows. Only the small files
+    /// are hashed, so a later change to one is caught as on every launch; the
+    /// stat identity of every file is recorded, so any later change forces a
+    /// full measurement.
+    fn trust_declaration(
+        &self,
+        opened: &Opened,
+        key: &str,
+        walked: &[Walked],
+        declared: &str,
+    ) -> Result<Verification, CheckpointError> {
+        let limit = self.small_file_limit;
+        let small: Vec<&Walked> = walked
+            .iter()
+            .filter(|file| file.identity.size <= limit)
+            .collect();
+        let mut hashes = hash_files(&small, &self.hashed)?.into_iter();
+        let files = walked
+            .iter()
+            .map(|file| CachedFile {
+                path: file.path.clone(),
+                identity: file.identity,
+                sha256: (file.identity.size <= limit)
+                    .then(|| hashes.next().map(hex::encode))
+                    .flatten(),
+            })
+            .collect();
+        let record = CacheRecord {
+            version: CACHE_VERSION,
+            store: opened.store.to_string_lossy().into_owned(),
+            checkpoint: key.to_owned(),
+            root: opened.root,
+            files,
+            provenance: DigestProvenance::DeclaredTrusted,
+            declared: Some(declared.to_owned()),
+        };
+        let manifest = CheckpointManifest::declared(declared, entries(&record))?;
+        self.remember(key, record);
+        Ok(Verification {
+            manifest,
+            full_rehash: false,
+            provenance: DigestProvenance::DeclaredTrusted,
         })
     }
 
@@ -434,7 +704,9 @@ impl CheckpointVerifier {
     /// checked exactly as `measure` reuses it (every stat identity unchanged,
     /// every small file rehashed), and `None` whenever `measure` would have to
     /// hash in full or cannot open it. It never hashes a large file, so a group
-    /// Prepare stays cheap; the full measurement is DigestCheckpoint's.
+    /// Prepare stays cheap; the full measurement is DigestCheckpoint's. A
+    /// trusted declaration's digest is known only while the host's policy
+    /// still allows trusting it.
     pub fn known_digest(&self, model_store: &Path, checkpoint: &Path) -> Option<String> {
         let opened = open_checkpoint(model_store, checkpoint, Confinement::OwnRootOutside).ok()?;
         let key = opened.checkpoint.to_string_lossy().into_owned();
@@ -448,10 +720,21 @@ impl CheckpointVerifier {
         let _serialized = lock.lock().ok()?;
         let cached = self.cached(&key)?;
         let walked = walk(&opened).ok()?;
-        reuse(&opened, &walked, &cached)
-            .ok()
-            .flatten()
-            .map(|manifest| manifest.digest)
+        let trusted = cached
+            .declared
+            .as_deref()
+            .filter(|_| self.trusts_declared());
+        reuse(
+            &opened,
+            &walked,
+            &cached,
+            trusted,
+            self.small_file_limit,
+            &self.hashed,
+        )
+        .ok()
+        .flatten()
+        .map(|verification| verification.manifest.digest)
     }
 
     fn cache_file(&self, key: &str) -> Option<PathBuf> {
@@ -980,13 +1263,18 @@ impl Walker<'_> {
 }
 
 /// Reuse the cached hashes when the store, the checkpoint directory, the file
-/// set and every file's identity are unchanged and every small file still
-/// hashes to its cached value. `None` means a full rehash is required.
+/// set and every file's identity are unchanged and every small file (up to
+/// `small_limit` bytes) still hashes to its cached value. A trusted
+/// declaration's record is reused only for `trusted`, the declaration the host
+/// may trust right now. `None` means a full rehash is required.
 fn reuse(
     opened: &Opened,
     walked: &[Walked],
     cached: &CacheRecord,
-) -> Result<Option<CheckpointManifest>, CheckpointError> {
+    trusted: Option<&str>,
+    small_limit: u64,
+    hashed: &AtomicU64,
+) -> Result<Option<Verification>, CheckpointError> {
     if cached.store != opened.store.to_string_lossy()
         || cached.root != opened.root
         || cached.files.len() != walked.len()
@@ -998,43 +1286,72 @@ fn reuse(
     {
         return Ok(None);
     }
+    // ADR 0014 §7 (amendment of 2026-10-08): never trust silently. A digest
+    // trusted earlier stands only while the host still allows it and the
+    // deployment still declares it; otherwise it is measured.
+    if cached.provenance == DigestProvenance::DeclaredTrusted
+        && (trusted.is_none() || trusted != cached.declared.as_deref())
+    {
+        return Ok(None);
+    }
     let small: Vec<usize> = walked
         .iter()
         .enumerate()
-        .filter(|(_, file)| file.identity.size <= SMALL_FILE_LIMIT)
+        .filter(|(_, file)| file.identity.size <= small_limit)
         .map(|(index, _)| index)
         .collect();
     let files: Vec<&Walked> = small.iter().map(|index| &walked[*index]).collect();
-    let hashes = match hash_files(&files) {
+    let hashes = match hash_files(&files, hashed) {
         Ok(hashes) => hashes,
         // A file that changed under the check is not reusable; hash in full.
         Err(CheckpointError::Changed) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if small
-        .iter()
-        .zip(&hashes)
-        .any(|(index, hash)| cached.files[*index].sha256 != hex::encode(hash))
-    {
+    if small.iter().zip(&hashes).any(|(index, hash)| {
+        cached.files[*index].sha256.as_deref() != Some(hex::encode(hash).as_str())
+    }) {
         return Ok(None);
     }
-    Ok(Some(CheckpointManifest::from_entries(
-        cached
-            .files
-            .iter()
-            .map(|file| ManifestEntry {
-                path: file.path.clone(),
-                size: file.identity.size,
-                sha256: file.sha256.clone(),
-            })
-            .collect(),
-    )?))
+    let manifest = match (cached.provenance, cached.declared.as_deref()) {
+        (DigestProvenance::DeclaredTrusted, Some(declared)) => {
+            CheckpointManifest::declared(declared, entries(cached))?
+        }
+        (DigestProvenance::DeclaredTrusted, None) => return Ok(None),
+        // A record missing any file's hash cannot name the digest.
+        _ if cached.files.iter().any(|file| file.sha256.is_none()) => return Ok(None),
+        _ => CheckpointManifest::from_entries(entries(cached))?,
+    };
+    Ok(Some(Verification {
+        manifest,
+        full_rehash: false,
+        provenance: cached.provenance,
+    }))
+}
+
+/// The manifest entries a cache record holds.
+fn entries(record: &CacheRecord) -> Vec<ManifestEntry> {
+    record
+        .files
+        .iter()
+        .map(|file| ManifestEntry {
+            path: file.path.clone(),
+            size: file.identity.size,
+            sha256: file.sha256.clone(),
+        })
+        .collect()
+}
+
+/// Whether a relative path has a component a walk skips (a name starting
+/// with `.`: tool metadata, never part of a checkpoint).
+fn hidden(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
 }
 
 /// Hash files in parallel, largest first. Each file is opened from its
 /// parent's descriptor without following links, and must keep exactly the
 /// identity it was walked with from before the first read to after the last.
-fn hash_files(files: &[&Walked]) -> Result<Vec<[u8; 32]>, CheckpointError> {
+/// Every byte read is added to `hashed`.
+fn hash_files(files: &[&Walked], hashed: &AtomicU64) -> Result<Vec<[u8; 32]>, CheckpointError> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by_key(|index| std::cmp::Reverse(files[*index].identity.size));
     let results: Vec<Mutex<Option<[u8; 32]>>> = files.iter().map(|_| Mutex::new(None)).collect();
@@ -1056,7 +1373,7 @@ fn hash_files(files: &[&Walked]) -> Result<Vec<[u8; 32]>, CheckpointError> {
                 let Some(index) = order.get(slot).copied() else {
                     return;
                 };
-                match hash_one(files[index]) {
+                match hash_one(files[index], hashed) {
                     Ok(hash) => {
                         if let Ok(mut result) = results[index].lock() {
                             *result = Some(hash);
@@ -1082,7 +1399,7 @@ fn hash_files(files: &[&Walked]) -> Result<Vec<[u8; 32]>, CheckpointError> {
         .collect()
 }
 
-fn hash_one(file: &Walked) -> Result<[u8; 32], CheckpointError> {
+fn hash_one(file: &Walked, hashed: &AtomicU64) -> Result<[u8; 32], CheckpointError> {
     let fd = open_at(
         file.parent.as_raw_fd(),
         &file.name,
@@ -1107,6 +1424,7 @@ fn hash_one(file: &Walked) -> Result<[u8; 32], CheckpointError> {
             return Err(CheckpointError::Changed);
         }
         digest.update(&buffer[..read]);
+        hashed.fetch_add(read as u64, Ordering::Relaxed);
         remaining -= read as u64;
     }
     let after = fstat(reader.as_raw_fd()).map_err(os_error)?;

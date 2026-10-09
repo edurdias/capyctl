@@ -102,6 +102,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         full_rehash: true,
         state_slot_bytes: None,
         layout: None,
+        provenance: String::new(),
     }
 }
 
@@ -245,6 +246,16 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
         ..evidence("computed", DIGEST)
     };
     validate_result(&open, &result(&open, with_state)).unwrap();
+    // ADR 0014 §7 (amendment of 2026-10-08): a measurement names where its
+    // file hashes came from; only a full measurement hashed every file.
+    for provenance in ["measured", "fetched", "declared_trusted"] {
+        let named = pb::CheckpointDigestEvidence {
+            provenance: provenance.into(),
+            full_rehash: provenance == "measured",
+            ..evidence("computed", DIGEST)
+        };
+        validate_result(&open, &result(&open, named)).unwrap();
+    }
     let refusal = pb::CheckpointDigestEvidence {
         state: "refused".into(),
         reason: "unsafe_file".into(),
@@ -303,6 +314,28 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
             &open,
             pb::CheckpointDigestEvidence {
                 digest: DIGEST.into(),
+                ..refusal.clone()
+            },
+        ),
+        (
+            &open,
+            pb::CheckpointDigestEvidence {
+                provenance: "guessed".into(),
+                ..evidence("computed", DIGEST)
+            },
+        ),
+        (
+            &open,
+            pb::CheckpointDigestEvidence {
+                provenance: "fetched".into(),
+                full_rehash: true,
+                ..evidence("computed", DIGEST)
+            },
+        ),
+        (
+            &open,
+            pb::CheckpointDigestEvidence {
+                provenance: "measured".into(),
                 ..refusal.clone()
             },
         ),

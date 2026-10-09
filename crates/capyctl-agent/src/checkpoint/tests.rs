@@ -155,7 +155,7 @@ fn a_changed_file_forces_a_full_rehash_and_the_stale_digest_is_refused() {
             .iter_mut()
             .find(|f| f.path == "config.json")
             .unwrap();
-        config.sha256 = sha(b"a forged cached hash");
+        config.sha256 = Some(sha(b"a forged cached hash"));
     }
     let rehashed = verifier.verify(&store.root, &checkpoint, &current).unwrap();
     assert!(rehashed.full_rehash);
@@ -829,4 +829,120 @@ fn a_draft_models_weights_are_sized_inside_its_approved_root() {
         path: drafter,
     };
     assert!(verifier.drafter_weights(Some(&escaping)).is_err());
+}
+
+/// The manifest digest a fresh verifier measures by reading every file.
+fn measured_in_full(store: &Store, checkpoint: &Path) -> String {
+    let measured = CheckpointVerifier::in_memory()
+        .measure(&store.root, checkpoint)
+        .unwrap();
+    assert!(measured.full_rehash);
+    measured.manifest.digest
+}
+
+/// Files up to 5 bytes count as small here: `tokenizer.json` (2) and
+/// `nested/extra.txt` (5), 7 bytes in all. The rest (61 bytes) are large.
+const SMALL: u64 = 5;
+const SMALL_BYTES: u64 = 7;
+
+// T34 (ADR 0014 §7, amendment of 2026-10-08): a local checkpoint's declared
+// canonical digest is trusted only when the host's policy allows it, and then
+// only the small files are read. Without the policy, or for a declaration
+// that is not a canonical digest, the checkpoint is measured in full.
+#[test]
+fn a_declared_digest_is_trusted_only_when_the_host_allows_it() {
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    let declared = measured_in_full(&store, &checkpoint);
+    let total: u64 = FILES.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+
+    let refusing = CheckpointVerifier::in_memory().with_small_file_limit(SMALL);
+    let measured = refusing
+        .measure_declared(&store.root, &checkpoint, Some(&declared))
+        .unwrap();
+    assert_eq!(measured.provenance, DigestProvenance::Measured);
+    assert!(measured.full_rehash);
+    assert_eq!(refusing.bytes_hashed(), total, "every file was read");
+
+    let trusting = CheckpointVerifier::in_memory().with_small_file_limit(SMALL);
+    trusting.set_declared_trust(true);
+    let trusted = trusting
+        .measure_declared(&store.root, &checkpoint, Some(&declared))
+        .unwrap();
+    assert_eq!(trusted.provenance, DigestProvenance::DeclaredTrusted);
+    assert!(!trusted.full_rehash);
+    assert_eq!(trusted.manifest.digest, declared);
+    assert_eq!(trusted.manifest.weights_bytes, 11 + 12);
+    assert_eq!(
+        trusting.bytes_hashed(),
+        SMALL_BYTES,
+        "only small files read"
+    );
+    // A launch verifies it from the cache, still reading only small files.
+    let launch = trusting
+        .verify_declared(&store.root, &checkpoint, &declared, Some(&declared))
+        .unwrap();
+    assert_eq!(launch.provenance, DigestProvenance::DeclaredTrusted);
+    assert_eq!(trusting.bytes_hashed(), 2 * SMALL_BYTES);
+    assert_eq!(
+        trusting.known_digest(&store.root, &checkpoint),
+        Some(declared.clone())
+    );
+
+    // A label is not a digest: nothing to trust, so it is measured.
+    let other = store.checkpoint("other", FILES);
+    let labelled = trusting
+        .measure_declared(&store.root, &other, Some("sha256:toy"))
+        .unwrap();
+    assert_eq!(labelled.provenance, DigestProvenance::Measured);
+    assert!(labelled.full_rehash);
+
+    // The host turns the policy off: the trusted digest no longer stands and
+    // the checkpoint is measured in full.
+    trusting.set_declared_trust(false);
+    assert_eq!(trusting.known_digest(&store.root, &checkpoint), None);
+    let off = trusting
+        .measure_declared(&store.root, &checkpoint, Some(&declared))
+        .unwrap();
+    assert_eq!(off.provenance, DigestProvenance::Measured);
+    assert!(off.full_rehash);
+    assert_eq!(off.manifest.digest, declared);
+}
+
+// T34 (ADR 0014 §7, amendment of 2026-10-08): a trusted declaration seeds the
+// stat cache, so a file changed afterwards forces a full measurement and the
+// recorded digest is refused; the declaration is never trusted again for the
+// changed checkpoint.
+#[test]
+fn a_trusted_declaration_still_catches_a_changed_file() {
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    let declared = measured_in_full(&store, &checkpoint);
+    let verifier = CheckpointVerifier::in_memory().with_small_file_limit(SMALL);
+    verifier.set_declared_trust(true);
+    let trusted = verifier
+        .measure_declared(&store.root, &checkpoint, Some(&declared))
+        .unwrap();
+    assert_eq!(trusted.provenance, DigestProvenance::DeclaredTrusted);
+    // Same size, modification time set back: only the change time moves.
+    let shard = checkpoint.join("model-00001-of-00002.safetensors");
+    let before = std::fs::metadata(&shard).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&shard, b"WEIGHTS-ONE").unwrap();
+    restore_mtime(&shard, &before);
+    assert_eq!(
+        verifier
+            .verify_declared(&store.root, &checkpoint, &declared, Some(&declared))
+            .unwrap_err(),
+        CheckpointError::Mismatch
+    );
+    let measured = verifier
+        .measure_declared(&store.root, &checkpoint, Some(&declared))
+        .unwrap();
+    assert_eq!(measured.provenance, DigestProvenance::Measured);
+    assert_ne!(measured.manifest.digest, declared);
+    assert_eq!(
+        measured.manifest.digest,
+        measured_in_full(&store, &checkpoint)
+    );
 }

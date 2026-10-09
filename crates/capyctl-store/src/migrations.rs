@@ -10,7 +10,7 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -66,6 +66,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V44,
     // SPEC §6.5, §10: explicit activation, per revision and per host.
     SCHEMA_V45,
+    // ADR 0014 §7 (amendment of 2026-10-08): checkpoint digest provenance.
+    SCHEMA_V46,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -165,6 +167,10 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
         if version == 45 {
             // SPEC §6.5, §10: explicit activation, per revision and per host.
             crate::switch_state::migrate_v45(&tx)?;
+        }
+        if version == 46 {
+            // ADR 0014 §7 (amendment of 2026-10-08): digest provenance.
+            crate::checkpoint_digests::migrate_v46(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -549,6 +555,52 @@ mod tests {
         )
         .unwrap();
         assert!(crate::switch_state::is_explicit_activation(&conn, "a").unwrap());
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08, v46): a digest recorded before
+    /// provenance was kept was measured; a pending one has none. The column
+    /// takes only the closed names, and applying v46 again changes nothing.
+    // T34
+    #[test]
+    fn v46_marks_earlier_digests_measured_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 45).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','h',NULL,?1,1,0,NULL,1),('b',1,'pending','h',NULL,NULL,NULL,0,NULL,1)",
+            [&digest],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::checkpoint_digests::migrate_v46(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        let provenance = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT provenance FROM checkpoint_digests WHERE deployment_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(provenance("a").as_deref(), Some("measured"));
+        assert_eq!(provenance("b"), None);
+        for name in ["measured", "fetched", "declared_trusted"] {
+            conn.execute(
+                "UPDATE checkpoint_digests SET provenance=?1 WHERE deployment_id='a'",
+                [name],
+            )
+            .unwrap();
+        }
+        assert!(conn
+            .execute(
+                "UPDATE checkpoint_digests SET provenance='guessed' WHERE deployment_id='a'",
+                []
+            )
+            .is_err());
     }
 
     /// ADR 0028 §6 (v41): every measured digest is carried into the per-host

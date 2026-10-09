@@ -657,6 +657,13 @@ message CheckpointDigestEvidence {
   // ADR 0028 §5 (amendment of 2026-10-07): the checkpoint's layout, when its
   // safetensors headers could be read; computed and mismatch only.
   CheckpointLayout layout = 9;
+  // ADR 0014 §7 (amendment of 2026-10-08, additive): computed and mismatch
+  // only, where the file hashes behind the digest came from: `measured`
+  // (every file hashed), `fetched` (verified against their pins while
+  // CapyCTL downloaded them) or `declared_trusted` (the deployment's declared
+  // digest, trusted by host policy). Empty from an older host, which only
+  // measures; `fetched` and `declared_trusted` never set full_rehash.
+  string provenance = 10;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown

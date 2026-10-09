@@ -41,7 +41,7 @@ pub use timeouts::{
 // ADR 0014 §7 (WE3): checkpoint identity.
 pub use checkpoint::{
     checkpoint_location, declared_checkpoint_digest, drafter_location, is_checkpoint_digest,
-    resolve_snapshot_with_checkpoint, CheckpointLocation, DrafterLocation,
+    resolve_snapshot_with_checkpoint, CheckpointLocation, DigestProvenance, DrafterLocation,
     CHECKPOINT_DIGEST_PREFIX,
 };
 
@@ -228,6 +228,18 @@ impl ModelIdentity {
                  resolves to its directory in a host's model store",
             )
         })
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): the declared digest a host may
+    /// trust without a full read when its policy allows it
+    /// (`checkpoints.trust_declared_digest`). Only a local source's, and only
+    /// a canonical digest: a remote source is verified file by file as it is
+    /// fetched, and a label expects nothing.
+    pub fn trustable_declaration(&self) -> Option<&str> {
+        match self.source {
+            ModelSource::Local { .. } => declared_checkpoint_digest(&self.content_fingerprint),
+            _ => None,
+        }
     }
 }
 
@@ -928,6 +940,13 @@ struct HostInput {
     /// ADR 0008: remote model sources are denied unless stated here.
     #[serde(default)]
     model_sources: Option<crate::model_source::RawModelSources>,
+    /// ADR 0014 §7 (amendment of 2026-10-08): the host's checkpoint trust
+    /// policy. Validated here; the host applies it to its own verifier at
+    /// start (`model_settings::trusts_declared_digest`), so it never enters
+    /// a resolved revision.
+    #[serde(default)]
+    #[allow(dead_code)]
+    checkpoints: Option<crate::model_settings::RawCheckpoints>,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
 }

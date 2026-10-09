@@ -1,5 +1,6 @@
 use super::*;
 use crate::ownership::OwnedCoordinatorState;
+use capyctl_config::effective::DigestProvenance;
 use capyctl_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
 use capyctl_store::checkpoint_digests::DigestState;
 use capyctl_store::lifecycle::DeploymentFence;
@@ -150,6 +151,7 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
             weights_bytes: 7,
             state_slot_bytes: None,
             layout: None,
+            provenance: DigestProvenance::Measured,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -160,6 +162,93 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
     // Nothing is pending any more.
     run(&CheckpointDigests::new(f.owner.clone(), measuring.clone())).await;
     assert_eq!(measuring.calls.load(Ordering::SeqCst), 1);
+}
+
+// T34 (ADR 0014 §7, amendment of 2026-10-08): a digest built from a download's
+// verified hashes reaches Recorded like a measurement and keeps its
+// provenance, which status shows; one the host says it trusted from a
+// declaration the revision does not make is never recorded.
+#[tokio::test]
+async fn a_recorded_digest_keeps_where_it_came_from() {
+    let f = fixture(|_| {});
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let claiming = Arc::new(Scripted {
+        reachable: true,
+        answer: Ok(Measured {
+            digest: digest.clone(),
+            weights_bytes: 7,
+            state_slot_bytes: None,
+            provenance: DigestProvenance::DeclaredTrusted,
+        }),
+        calls: AtomicUsize::new(0),
+    });
+    run(&CheckpointDigests::new(f.owner.clone(), claiming.clone())).await;
+    assert_eq!(claiming.calls.load(Ordering::SeqCst), 1);
+    let record = record_of(&f);
+    assert_eq!(record.state, DigestState::Pending, "no such declaration");
+    assert_eq!(record.provenance, None);
+
+    let fetched = Arc::new(Scripted {
+        reachable: true,
+        answer: Ok(Measured {
+            digest: digest.clone(),
+            weights_bytes: 7,
+            state_slot_bytes: None,
+            provenance: DigestProvenance::Fetched,
+        }),
+        calls: AtomicUsize::new(0),
+    });
+    run(&CheckpointDigests::new(f.owner.clone(), fetched)).await;
+    let record = record_of(&f);
+    assert_eq!(record.state, DigestState::Recorded);
+    assert_eq!(record.provenance, Some(DigestProvenance::Fetched));
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["provenance"],
+        "fetched"
+    );
+}
+
+// T34 (ADR 0014 §7, amendment of 2026-10-08): the embedded host trusts a
+// local checkpoint's declared canonical digest only when its policy allows
+// it; without the policy the declaration stays an expectation and the
+// checkpoint is measured. Either way the same digest is recorded, with where
+// it came from.
+#[tokio::test]
+async fn the_embedded_host_trusts_a_declared_digest_only_by_policy() {
+    for trusted in [false, true] {
+        let declared = {
+            let models = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(models.path().join("toy")).unwrap();
+            std::fs::write(models.path().join("toy/config.json"), "{}").unwrap();
+            std::fs::write(models.path().join("toy/model.safetensors"), "weights").unwrap();
+            CheckpointVerifier::in_memory()
+                .measure(models.path(), &models.path().join("toy"))
+                .unwrap()
+                .manifest
+                .digest
+        };
+        let f = fixture(|deployment| {
+            deployment["model"]["content_fingerprint"] = json!(declared);
+        });
+        // `model.safetensors` (7 bytes) is a large file here.
+        let checkpoints = Arc::new(CheckpointVerifier::in_memory().with_small_file_limit(2));
+        checkpoints.set_declared_trust(trusted);
+        run(&CheckpointDigests::new(
+            f.owner.clone(),
+            LocalDigests::new(checkpoints.clone()),
+        ))
+        .await;
+        let record = record_of(&f);
+        assert_eq!(record.state, DigestState::Recorded, "trusted: {trusted}");
+        assert_eq!(record.digest.as_deref(), Some(declared.as_str()));
+        if trusted {
+            assert_eq!(record.provenance, Some(DigestProvenance::DeclaredTrusted));
+            assert_eq!(checkpoints.bytes_hashed(), 2, "only config.json was read");
+        } else {
+            assert_eq!(record.provenance, Some(DigestProvenance::Measured));
+            assert_eq!(checkpoints.bytes_hashed(), 2 + 7);
+        }
+    }
 }
 
 // T22: the embedded host measures with the same verifier a remote agent uses.
@@ -579,6 +668,7 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
                 weights_bytes: 7,
                 state_slot_bytes: None,
                 layout: None,
+                provenance: DigestProvenance::Measured,
             })
         }
     };
@@ -641,6 +731,7 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
                 weights_bytes: 7,
                 state_slot_bytes: None,
                 layout: None,
+                provenance: DigestProvenance::Measured,
             })
         },
     )
@@ -672,6 +763,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                 weights_bytes: 7,
                 state_slot_bytes: None,
                 layout: None,
+                provenance: DigestProvenance::Measured,
             })
         },
     )
@@ -712,6 +804,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                     weights_bytes: 7,
                     state_slot_bytes: None,
                     layout: None,
+                    provenance: DigestProvenance::Measured,
                 })
             }
         },

@@ -1425,3 +1425,59 @@ Evidence: `crates/capyctl-store/src/ordinary_lifecycle/parked_charge_tests.rs`
 `status_says_when_parked_growth_turns_a_park_into_a_stop` (CLI). CPU and Fake tests only; not
 qualification. Live check outstanding: the catalog deployment through three park and wake
 cycles on a GB10 with the default bound.
+
+## Amendment of 2026-10-08: faster checkpoint readiness (owner decision 2026-10-08)
+
+Problem: §7 and open issue 1 make the first placement on a host hash every file in full.
+For a checkpoint CapyCTL just downloaded, every byte had already been hashed once, against
+its pin, while it was written (ADR 0008); the first placement read it all a second time
+before the revision could start (up to `PENDING_INITIALIZE_MS`, 900 s, while the digest was
+pending). And a host whose operator already knows a local checkpoint's digest had no way to
+skip the read. The owner chose option (a) now and option (b) only with host approval.
+
+Decision:
+
+- **(a) Fetched checkpoints.** While a Hugging Face or plain `http` source downloads, each
+  file's SHA-256 is computed as it streams (beside its git blob id where that is the pin) and
+  noted, with the file's stat identity right after it took its name. At commit the notes
+  become an owner-only `<id>.manifest` beside the copy's marker. When a host first digests
+  that copy, the verifier takes the per-file hashes from it, provided the walked files are
+  exactly the downloaded ones (hidden tool files aside, as a walk skips them), every file
+  still has the recorded stat identity, and every small file still hashes to its noted value.
+  The manifest is built by the same canonical encoding, so the digest equals what a full read
+  gives; no weight file is read again. The stat cache is seeded from it, so the usual
+  re-verification applies at every launch and wake. A tar archive's extracted files, verified
+  only as one archive, and a file without a note (a crash between verify and note) leave no
+  manifest: the copy is measured in full as before. A file changed after the download no
+  longer matches its identity and is measured.
+- **(b) Trusted declarations, by host policy only.** A host setting,
+  `checkpoints.trust_declared_digest` (`--trust-declared-digest`,
+  `CAPYCTL_TRUST_DECLARED_DIGEST`; flag over environment over YAML; default off), lets the host
+  take a local source's declared canonical `model.content_fingerprint` as the checkpoint's
+  digest the first time it sees that checkpoint, reading only the small files. The stat cache
+  is seeded from file stats, so any later change of a file's stat identity forces a full
+  measurement, whose digest then no longer matches the recorded one and the launch is refused
+  `checkpoint_mismatch`. A checkpoint the host has a record of is never trusted again, a
+  remote source's declaration is never trusted (its files are verified as fetched), a label
+  that is not a canonical digest expects nothing, and with the policy off every declaration is
+  an expectation as before and a digest trusted earlier is measured in full again. The server
+  records a trusted digest only when it is the revision's own declaration.
+- **Provenance.** Every recorded digest keeps where its file hashes came from: `measured`,
+  `fetched` or `declared_trusted` (`DigestCheckpoint` evidence field `provenance`, additive;
+  store v46, digests stored before it are `measured`). `capyctl status deployment` shows it
+  in its JSON, and in text says when a digest was fetched or trusted from a declaration.
+
+Consequences: a trusted declaration is the operator's statement, not a measurement. A wrong
+one is served until a file changes or the policy is turned off; that is the risk the host
+accepts by turning it on, and why it is off by default and shown in status. Open issue 3
+(the time-of-check gap) is unchanged and applies to the fetched manifest too: its mitigation
+is a sources store other users cannot write, and the manifest is used only when it is a
+regular file this account owns that no other account may write.
+
+Evidence: CPU tests only (`a_fetched_checkpoint_digest_needs_no_second_read`,
+`a_changed_or_unpinned_download_is_measured`,
+`a_declared_digest_is_trusted_only_when_the_host_allows_it`,
+`a_trusted_declaration_still_catches_a_changed_file`,
+`the_embedded_host_trusts_a_declared_digest_only_by_policy`,
+`a_recorded_digest_keeps_where_it_came_from`, `a_recorded_digest_keeps_its_provenance`).
+No live download or launch has run with it.

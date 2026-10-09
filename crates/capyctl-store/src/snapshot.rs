@@ -774,7 +774,7 @@ impl Store {
             })
         })?;
         let mut deployments = deployments;
-        let digests = budget.read(&tx, "SELECT c.deployment_id,c.state,c.host_id,c.expected,c.digest,c.weights_bytes,c.provisional,c.diagnostic,c.state_slot_bytes FROM checkpoint_digests c JOIN deployments d ON d.id=c.deployment_id AND d.revision=c.revision ORDER BY c.deployment_id", |r| {
+        let digests = budget.read(&tx, "SELECT c.deployment_id,c.state,c.host_id,c.expected,c.digest,c.weights_bytes,c.provisional,c.diagnostic,c.state_slot_bytes,c.provenance FROM checkpoint_digests c JOIN deployments d ON d.id=c.deployment_id AND d.revision=c.revision ORDER BY c.deployment_id", |r| {
             use crate::checkpoint_digests::{CheckpointDigest, DigestState};
             let state = match r.get::<_, String>(1)?.as_str() {
                 "pending" => DigestState::Pending,
@@ -787,9 +787,19 @@ impl Store {
             if weights.is_some_and(|w| w < 0) { return Err(SnapshotError::CorruptData); }
             let state_slot: Option<i64> = r.get(8)?;
             if state_slot.is_some_and(|s| s <= 0) { return Err(SnapshotError::CorruptData); }
+            // ADR 0014 §7 (amendment of 2026-10-08): where the digest came from.
+            let provenance = match r.get::<_, Option<String>>(9)? {
+                None => None,
+                Some(text) => Some(
+                    capyctl_config::effective::DigestProvenance::parse(&text)
+                        .filter(|_| !text.is_empty())
+                        .ok_or(SnapshotError::CorruptData)?,
+                ),
+            };
             Ok((r.get::<_, String>(0)?, CheckpointDigest {
                 state, host_id: r.get(2)?, expected: r.get(3)?, digest: r.get(4)?, weights_bytes: weights,
                 state_slot_bytes: state_slot, provisional: boolean(r, 6)?, diagnostic: r.get(7)?,
+                provenance,
             }))
         })?;
         // ADR 0014 amendment A1: read per deployment in this transaction.

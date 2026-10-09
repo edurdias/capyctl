@@ -24,6 +24,11 @@ pub struct CheckpointLocation {
     pub checkpoint: PathBuf,
     /// The deployment's declared `model.content_fingerprint`.
     pub content_fingerprint: String,
+    /// ADR 0014 §7 (amendment of 2026-10-08): the declaration a host may
+    /// trust without a full read when its own policy allows it
+    /// ([`ModelIdentity::trustable_declaration`]): a local source's canonical
+    /// `content_fingerprint`, else `None`.
+    pub trustable_declaration: Option<String>,
     /// ADR 0014 §5 amendment A6: the draft model the launch loads beside the
     /// checkpoint, whose weights are counted with the checkpoint's.
     pub drafter: Option<DrafterLocation>,
@@ -163,6 +168,7 @@ pub fn checkpoint_location(
     Ok(CheckpointLocation {
         model_store: root,
         checkpoint,
+        trustable_declaration: model.trustable_declaration().map(str::to_owned),
         content_fingerprint: model.content_fingerprint,
         drafter,
         sglang_args,
@@ -191,6 +197,48 @@ pub fn is_checkpoint_digest(value: &str) -> bool {
 /// which expects nothing; the digest a host computes is then recorded as is.
 pub fn declared_checkpoint_digest(content_fingerprint: &str) -> Option<&str> {
     is_checkpoint_digest(content_fingerprint).then_some(content_fingerprint)
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): where the per-file hashes behind a
+/// recorded checkpoint digest came from. Every form names the same canonical
+/// manifest digest; only how much of it the host read differs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestProvenance {
+    /// The host hashed every file (the WE3 first placement).
+    #[default]
+    Measured,
+    /// CapyCTL downloaded the checkpoint and verified every file against its
+    /// pin as it was written; the manifest was built from those verified
+    /// hashes, with nothing read a second time.
+    Fetched,
+    /// The deployment's declared `content_fingerprint`, trusted without a full
+    /// read because the host's policy allows it
+    /// (`checkpoints.trust_declared_digest`). Its bytes were never measured.
+    DeclaredTrusted,
+}
+
+impl DigestProvenance {
+    /// The closed wire and status name.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Fetched => "fetched",
+            Self::DeclaredTrusted => "declared_trusted",
+        }
+    }
+
+    /// The provenance a wire or stored name names. An empty name (a host
+    /// from before provenance was reported) is `measured`, the only form it
+    /// could produce.
+    pub fn parse(code: &str) -> Option<Self> {
+        match code {
+            "" | "measured" => Some(Self::Measured),
+            "fetched" => Some(Self::Fetched),
+            "declared_trusted" => Some(Self::DeclaredTrusted),
+            _ => None,
+        }
+    }
 }
 
 /// ADR 0014 §5, §7: re-resolve a frozen, exact snapshot with checkpoint facts

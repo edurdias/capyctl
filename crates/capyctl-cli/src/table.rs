@@ -565,6 +565,25 @@ fn status(value: &Value, names: &HostNames) -> String {
             gib(last),
         ));
     }
+    // ADR 0014 §7 (amendment of 2026-10-08): a recorded digest that was not
+    // measured in full says where it came from; never trusted silently. The
+    // JSON carries `provenance` for every stored digest, `measured` included.
+    if digest["state"] == "recorded" {
+        match digest["provenance"].as_str() {
+            Some("fetched") => notes.push(
+                "Checkpoint  digest fetched: built from the file hashes verified while \
+                 CapyCTL downloaded it, not read again"
+                    .into(),
+            ),
+            Some("declared_trusted") => notes.push(
+                "Checkpoint  digest declared and trusted by this host's policy \
+                 (checkpoints.trust_declared_digest), not measured; a changed file is \
+                 measured in full"
+                    .into(),
+            ),
+            _ => {}
+        }
+    }
     if !notes.is_empty() {
         out.push('\n');
         for note in notes {
@@ -1188,6 +1207,34 @@ mod tests {
         );
         assert!(status("stopped").contains("stopped instead of parked (parked_growth)"));
         assert!(!status("within_limit").contains("Parked "));
+    }
+
+    // T34 (ADR 0014 §7, amendment of 2026-10-08): a recorded digest says when
+    // it was not measured in full: fetched, or declared and trusted by the
+    // host's policy. A measured one adds nothing.
+    #[test]
+    fn status_shows_how_a_digest_was_recorded() {
+        let status = |provenance: &str| {
+            render(
+                View::Status,
+                &json!({"name": "fv", "kind": "model", "desired_state": "running",
+                    "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+                    "revision": "1",
+                    "checkpoint_digest": {"state": "recorded", "provisional": false,
+                        "digest": format!("sha256:{}", "b".repeat(64)),
+                        "provenance": provenance},
+                    "instances": []}),
+                &names(),
+            )
+        };
+        assert!(status("fetched").contains("Checkpoint  digest fetched"));
+        let trusted = status("declared_trusted");
+        assert!(
+            trusted.contains("declared and trusted by this host's policy"),
+            "{trusted}"
+        );
+        assert!(trusted.contains("not measured"), "{trusted}");
+        assert!(!status("measured").contains("Checkpoint"));
     }
 
     // T14 T26 (found live on a 16 GB card): an unusable checkpoint shows the

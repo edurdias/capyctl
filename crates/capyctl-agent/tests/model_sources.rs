@@ -7,8 +7,9 @@
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
+use capyctl_agent::checkpoint::CheckpointVerifier;
 use capyctl_agent::sources::{prune, reason, SourceStatus, SourceStore, FREE_SPACE_RESERVE};
-use capyctl_config::effective::{ModelSourcePolicy, SourceSwitch};
+use capyctl_config::effective::{DigestProvenance, ModelSourcePolicy, SourceSwitch};
 use capyctl_config::model_source::{Archive, ModelSource};
 use sha1::Digest as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1036,11 +1037,133 @@ async fn prune_removes_only_unreferenced_sources() {
     assert_eq!(applied.kept[0].key, kept.store_key().unwrap());
     assert!(!f.store.join(unreferenced.store_key().unwrap()).exists());
     assert!(f.store.join(kept.store_key().unwrap()).is_dir());
+    // Its fetched manifest goes with it; the kept copy keeps its own.
+    assert_eq!(f.state_files(".manifest").len(), 1);
     assert_eq!(store.status(&unreferenced), SourceStatus::Pending);
     // Something outside `sources/` is never touched.
     std::fs::create_dir_all(f.store.join("toy")).unwrap();
     prune(&f.store, &BTreeSet::new(), true).unwrap();
     assert!(f.store.join("toy").is_dir());
+}
+
+/// A copy of `from` at `to`, made by reading every file: a checkpoint no
+/// download describes, which a verifier must measure in full.
+fn copy_tree(from: &Path, to: &Path) {
+    let mut files = Vec::new();
+    walk(from, &mut files);
+    for file in files {
+        let target = to.join(file.strip_prefix(from).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(&file, &target).unwrap();
+    }
+}
+
+// T14 T34 (ADR 0014 §7, amendment of 2026-10-08): a checkpoint CapyCTL
+// downloaded and verified file by file gets its digest from those verified
+// hashes: the first placement reads no weight file again (only the small
+// files every launch rehashes), and the digest is exactly the one a full read
+// of the same bytes gives. A hidden tool file in the repository is left out,
+// as a walk leaves it out.
+#[tokio::test]
+async fn a_fetched_checkpoint_digest_needs_no_second_read() {
+    let f = fixture().await;
+    f.hub
+        .lock()
+        .unwrap()
+        .repos
+        .get_mut("org/model")
+        .unwrap()
+        .1
+        .push((
+            ".gitattributes".into(),
+            b"*.safetensors lfs".to_vec(),
+            false,
+        ));
+    let store = f.source_store(1 << 30);
+    let source = hf(vec![], false);
+    store.materialize(&source).await.unwrap();
+    let dir = f.store.join(source.store_key().unwrap());
+    assert_eq!(f.state_files(".manifest").len(), 1);
+
+    // A fresh verifier, as an agent after a restart; the 200 kB weight file
+    // counts as large.
+    let limit = 1024;
+    let small: u64 = weights()
+        .iter()
+        .map(|(_, bytes, _)| bytes.len() as u64)
+        .filter(|size| *size <= limit)
+        .sum();
+    let verifier = CheckpointVerifier::in_memory().with_small_file_limit(limit);
+    let fetched = verifier.measure(&f.store, &dir).unwrap();
+    assert_eq!(fetched.provenance, DigestProvenance::Fetched);
+    assert!(!fetched.full_rehash);
+    assert_eq!(verifier.bytes_hashed(), small, "no weight file was read");
+
+    // The same canonical manifest a full read gives.
+    let copy = f.store.join("copy");
+    copy_tree(&dir, &copy);
+    let full = CheckpointVerifier::in_memory()
+        .measure(&f.store, &copy)
+        .unwrap();
+    assert_eq!(full.provenance, DigestProvenance::Measured);
+    assert!(full.full_rehash);
+    assert_eq!(fetched.manifest, full.manifest);
+
+    // Later launches reuse it from the stat cache.
+    let again = verifier
+        .verify(&f.store, &dir, &full.manifest.digest)
+        .unwrap();
+    assert_eq!(again.provenance, DigestProvenance::Fetched);
+    assert_eq!(verifier.bytes_hashed(), 2 * small);
+}
+
+// T14 T34 (ADR 0014 §7, amendment of 2026-10-08): a downloaded file changed
+// after its verification is never described by the download: the checkpoint
+// is measured in full and its digest is the changed bytes'. An http payload
+// gets its fetched manifest the same way; a tar archive's extracted files,
+// verified only as one archive, are measured.
+#[tokio::test]
+async fn a_changed_or_unpinned_download_is_measured() {
+    let f = fixture().await;
+    let store = f.source_store(1 << 30);
+    let source = hf(vec![], false);
+    store.materialize(&source).await.unwrap();
+    let dir = f.store.join(source.store_key().unwrap());
+    let weight = dir.join("model.safetensors");
+    let mut bytes = std::fs::read(&weight).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&weight, &bytes).unwrap();
+    let measured = CheckpointVerifier::in_memory()
+        .measure(&f.store, &dir)
+        .unwrap();
+    assert_eq!(measured.provenance, DigestProvenance::Measured);
+    assert!(measured.full_rehash);
+
+    let payload = vec![7_u8; 3000];
+    let archive = ustar(&[("weights.bin", &payload)]);
+    for (name, bytes) in [("w.bin", &payload), ("w.tar", &archive)] {
+        f.hub.lock().unwrap().payloads.insert(
+            name.into(),
+            Payload {
+                bytes: bytes.clone(),
+                cut_after_once: None,
+                chunked: false,
+                delay: None,
+            },
+        );
+    }
+    let plain = http("w.bin", &payload, Archive::None);
+    store.materialize(&plain).await.unwrap();
+    let fetched = CheckpointVerifier::in_memory()
+        .measure(&f.store, &f.store.join(plain.store_key().unwrap()))
+        .unwrap();
+    assert_eq!(fetched.provenance, DigestProvenance::Fetched);
+    let tar = http("w.tar", &archive, Archive::Tar);
+    store.materialize(&tar).await.unwrap();
+    let extracted = CheckpointVerifier::in_memory()
+        .measure(&f.store, &f.store.join(tar.store_key().unwrap()))
+        .unwrap();
+    assert_eq!(extracted.provenance, DigestProvenance::Measured);
 }
 
 fn ustar(entries: &[(&str, &[u8])]) -> Vec<u8> {

@@ -1916,6 +1916,9 @@ async fn start_standalone_in(
     // with the verifier its launches use, so they share one stat cache.
     let mut supervision = crate::shutdown::Supervision::new();
     if let Some(checkpoints) = bindings.checkpoint_verifier() {
+        // ADR 0014 §7 (amendment of 2026-10-08): the embedded host's own
+        // policy on trusting a declared digest (flag > env > YAML > default).
+        checkpoints.set_declared_trust(models.trust_declared_digest);
         supervision.supervise(
             capyctl_controller::checkpoint_digests::CheckpointDigests::new(
                 owner.clone(),

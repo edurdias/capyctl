@@ -222,6 +222,13 @@ impl NativeHostExecution {
                     Some(config.state_dir.join("secrets")),
                 )
             });
+        // ADR 0014 §7 (amendment of 2026-10-08): this host's own policy on
+        // trusting a declared digest, from its approved document (flag > env >
+        // YAML > default, resolved at start; off unless stated).
+        let checkpoints = CheckpointVerifier::in_memory();
+        checkpoints.set_declared_trust(capyctl_config::model_settings::trusts_declared_digest(
+            &config.document,
+        ));
         let this = Arc::new(Self {
             sources,
             load,
@@ -235,7 +242,7 @@ impl NativeHostExecution {
             profiles,
             authority: Arc::new(Mutex::new(SessionAuthority::default())),
             saver: None,
-            checkpoints: Arc::new(CheckpointVerifier::in_memory()),
+            checkpoints: Arc::new(checkpoints),
             residency: None,
             rendezvous: None,
             engine_cache: None,
@@ -422,7 +429,9 @@ impl NativeHostExecution {
     /// in this private directory, so a restarted agent verifies an unchanged
     /// checkpoint without hashing it in full again.
     pub fn with_checkpoint_cache(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
-        Arc::make_mut(&mut self).checkpoints = Arc::new(CheckpointVerifier::with_cache_dir(dir));
+        let checkpoints = CheckpointVerifier::with_cache_dir(dir);
+        checkpoints.set_declared_trust(self.checkpoints.trusts_declared());
+        Arc::make_mut(&mut self).checkpoints = Arc::new(checkpoints);
         self
     }
     /// ADR 0008: materialize model sources through this store instead of the
@@ -668,10 +677,13 @@ impl NativeHostExecution {
             .model
             .require_resolved_path()
             .map_err(|_| CheckpointError::InvalidRoot)?;
-        let verified = self.checkpoints.verify(
+        // ADR 0014 §7 (amendment of 2026-10-08): a local source's declared
+        // digest stands in for a full read only as this host's policy allows.
+        let verified = self.checkpoints.verify_declared(
             effective.checkpoint_store(),
             std::path::Path::new(checkpoint),
             &plan.checkpoint_digest,
+            effective.model.trustable_declaration(),
         )?;
         // The same manifest yields the same weights; a plan naming others was
         // resolved against something else. ADR 0014 §5 amendment A6: the
@@ -751,8 +763,11 @@ impl NativeHostExecution {
             Ok(location) => {
                 let checkpoints = self.checkpoints.clone();
                 let measured = tokio::task::spawn_blocking(move || {
-                    let verified =
-                        checkpoints.measure(&location.model_store, &location.checkpoint)?;
+                    let verified = checkpoints.measure_declared(
+                        &location.model_store,
+                        &location.checkpoint,
+                        location.trustable_declaration.as_deref(),
+                    )?;
                     let weights =
                         with_drafter(&checkpoints, &location, verified.manifest.weights_bytes)?;
                     // ADR 0014 amendment A16: the hybrid state slot, beside
@@ -790,6 +805,7 @@ impl NativeHostExecution {
                             layout: layout
                                 .as_ref()
                                 .map(capyctl_protocol::execution::layout_to_wire),
+                            provenance: verified.provenance.code().into(),
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -3138,6 +3154,9 @@ mod tests {
         assert_eq!(computed.weights_bytes, 7);
         assert_eq!(computed.file_count, 2);
         assert!(computed.full_rehash);
+        // ADR 0014 §7 (amendment of 2026-10-08): a local checkpoint with no
+        // trusted declaration is measured, and says so.
+        assert_eq!(computed.provenance, "measured");
         // ADR 0014 amendment A16: no hybrid state slot for a vLLM launch.
         assert_eq!(computed.state_slot_bytes, None);
         // ADR 0028 §5: weights that are not a safetensors file have no layout.
@@ -3153,6 +3172,7 @@ mod tests {
         assert_eq!(sized.state, "sized");
         assert_eq!((sized.weights_bytes, sized.file_count), (7, 2));
         assert!(sized.digest.is_empty() && !sized.full_rehash);
+        assert!(sized.provenance.is_empty());
         let again = run(digest(&deployment, &policy, Some(&computed.digest))).await;
         assert_eq!(
             (again.state.as_str(), again.full_rehash),
@@ -3224,6 +3244,57 @@ mod tests {
                 largest_layer_bytes: 8,
             })
         );
+    }
+
+    /// ADR 0014 §7 (amendment of 2026-10-08): a host whose own document turns
+    /// on `checkpoints.trust_declared_digest` answers DigestCheckpoint with a
+    /// local checkpoint's declared digest, `declared_trusted`, without a full
+    /// read; the stat cache it then moves to keeps the policy. Without the
+    /// setting the same declaration is measured.
+    // T34
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digest_checkpoint_trusts_a_declaration_only_by_host_policy() {
+        for trusted in [false, true] {
+            let root = directory();
+            let identity_dir = directory();
+            let (executor, mut deployment, policy) =
+                checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                    if trusted {
+                        document["checkpoints"] =
+                            serde_json::json!({"trust_declared_digest": true});
+                    }
+                });
+            let executor = executor.with_checkpoint_cache(root.path().join("checkpoints"));
+            let declared = crate::checkpoint::CheckpointVerifier::in_memory()
+                .measure(&root.path().join("models"), &root.path().join("models/toy"))
+                .unwrap()
+                .manifest
+                .digest;
+            deployment["model"]["content_fingerprint"] = serde_json::json!(declared);
+            let mut command = MemberCommand {
+                identity: checkpoint_identity("digest", "checkpoint"),
+                action: MemberAction::DigestCheckpoint(DigestCheckpointPlan {
+                    size_only: false,
+                    deployment_config: deployment.to_string(),
+                    host_policy_fingerprint: policy,
+                    expected_digest: None,
+                }),
+            };
+            command.identity.payload_digest = command.canonical_digest();
+            let result = executor.execute(1, command.clone()).await.unwrap();
+            capyctl_protocol::execution::validate_result(&command, &result).unwrap();
+            let evidence = result.checkpoint.unwrap();
+            assert_eq!(evidence.state, "computed");
+            assert_eq!(evidence.digest, declared);
+            assert_eq!(evidence.weights_bytes, 7);
+            if trusted {
+                assert_eq!(evidence.provenance, "declared_trusted");
+                assert!(!evidence.full_rehash);
+            } else {
+                assert_eq!(evidence.provenance, "measured");
+                assert!(evidence.full_rehash);
+            }
+        }
     }
 
     /// ADR 0008: MaterializeSource answers from this host's own policy and

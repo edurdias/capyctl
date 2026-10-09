@@ -981,6 +981,12 @@ CREATE TABLE IF NOT EXISTS parked_launch_residues(
 /// `switch_state::migrate_v45` only when missing.
 pub const SCHEMA_V45: &str = "-- explicit activation (switch_state::migrate_v45)";
 
+/// v46 (ADR 0014 §7, amendment of 2026-10-08): where each recorded checkpoint
+/// digest's file hashes came from (`measured`, `fetched` or
+/// `declared_trusted`). Every digest stored before v46 was measured. The
+/// column is added by `checkpoint_digests::migrate_v46` only when missing.
+pub const SCHEMA_V46: &str = "-- checkpoint digest provenance (migrate_v46)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
