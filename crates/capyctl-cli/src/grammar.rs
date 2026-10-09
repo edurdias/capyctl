@@ -619,6 +619,11 @@ struct RoleSettingsArgs {
         value_parser = parse_model_sources_plain_http
     )]
     model_sources_plain_http: Option<capyctl_config::model_source::SourceSwitch>,
+    /// Trust a local checkpoint's declared canonical content_fingerprint
+    /// without hashing it in full, `true` or `false` (default). Wins over
+    /// CAPYCTL_TRUST_DECLARED_DIGEST and checkpoints.trust_declared_digest.
+    #[arg(long, value_name = "true|false", value_parser = parse_trust_declared_digest)]
+    trust_declared_digest: Option<bool>,
     /// The vLLM executable this role runs as its `local` profile. Wins over
     /// CAPYCTL_VLLM_BIN and local_engine.vllm.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
@@ -709,6 +714,7 @@ impl RoleSettingsArgs {
             sources_path: self.model_sources_path.clone(),
             hf_endpoint: self.hf_endpoint.clone(),
             plain_http: self.model_sources_plain_http,
+            trust_declared_digest: self.trust_declared_digest,
         }
     }
 
@@ -1526,6 +1532,12 @@ pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
 /// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
 fn parse_hf_endpoint(text: &str) -> Result<String, String> {
     capyctl_config::model_settings::hf_endpoint("--hf-endpoint", text).map_err(|error| error.detail)
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): `--trust-declared-digest true|false`.
+fn parse_trust_declared_digest(text: &str) -> Result<bool, String> {
+    capyctl_config::engine_settings::boolean("--trust-declared-digest", text)
+        .map_err(|error| error.detail)
 }
 
 /// Owner rule 2026-09-25: an executable or directory named by a flag, made

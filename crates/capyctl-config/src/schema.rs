@@ -254,6 +254,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     // Spec §7: the directory a host keeps model weights under. A host states it
     // once; a deployment's relative local path is resolved against it.
     const MODEL_STORE: FieldSpec = FieldSpec::RequiredStruct(&[("path", SCALAR)]);
+    // ADR 0014 §7 (amendment of 2026-10-08): whether this host trusts a local
+    // checkpoint's declared canonical digest without a full read (default off).
+    const CHECKPOINTS: FieldSpec = FieldSpec::Struct(&[("trust_declared_digest", SCALAR)]);
     // Owner rule 2026-09-25 (`crate::engine_settings`): the role's own engine
     // installation, the YAML form of `--vllm-bin` / `CAPYCTL_VLLM_BIN` and the
     // rest; published as the runtime profile `local`.
@@ -444,6 +447,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // `~/models`) and the model-source policy, as on a host.
         ("model_store", MODEL_STORE),
         ("model_sources", MODEL_SOURCES),
+        ("checkpoints", CHECKPOINTS),
         // Owner rule 2026-09-25: the engine installation and the runtime
         // directory, as on a host.
         ("local_engine", LOCAL_ENGINE),
@@ -508,6 +512,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("name", SCALAR),
                 ("model_store", MODEL_STORE),
                 ("model_sources", MODEL_SOURCES),
+                ("checkpoints", CHECKPOINTS),
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
                 ("runtime_dir", SCALAR),

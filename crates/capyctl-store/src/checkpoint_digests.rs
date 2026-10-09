@@ -25,7 +25,7 @@ use crate::dispatch::{check_session, CoordinatorSession};
 use crate::lifecycle::LifecycleError;
 use capyctl_config::effective::{
     declared_checkpoint_digest, is_checkpoint_digest, resolve_snapshot_with_checkpoint,
-    CheckpointFacts, EffectiveDeployment,
+    CheckpointFacts, DigestProvenance, EffectiveDeployment,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -100,6 +100,11 @@ pub struct CheckpointDigest {
     pub provisional: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// ADR 0014 §7 (amendment of 2026-10-08): where the digest's file hashes
+    /// came from (`measured`, `fetched` or `declared_trusted`), whenever a
+    /// digest is stored. Status shows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DigestProvenance>,
 }
 
 /// A current revision whose digest a host must still measure.
@@ -169,6 +174,25 @@ pub(crate) fn migrate_v40(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v46 (ADR 0014 §7, amendment of 2026-10-08): add
+/// `checkpoint_digests.provenance` unless a store rolled back from v46 or
+/// later still has it. Every digest stored before v46 was measured in full.
+pub(crate) fn migrate_v46(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('checkpoint_digests') WHERE name='provenance')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE checkpoint_digests ADD COLUMN provenance TEXT
+               CHECK(provenance IS NULL OR provenance IN ('measured','fetched','declared_trusted'));
+             UPDATE checkpoint_digests SET provenance='measured' WHERE digest IS NOT NULL;",
+        )?;
+    }
+    Ok(())
+}
+
 /// SPEC §6, ADR 0014 §7: activation of a revision waits while its frozen
 /// resources depend on a digest still pending, is refused while its
 /// checkpoint is known not to be the declared or recorded one, and is refused
@@ -221,7 +245,7 @@ fn closed_refusal(text: &str) -> bool {
 }
 
 /// One stored row: state, host, expected, digest, weights, provisional,
-/// diagnostic, state slot.
+/// diagnostic, state slot, provenance.
 type StoredRow = (
     String,
     String,
@@ -231,14 +255,15 @@ type StoredRow = (
     bool,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 
 fn read(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Option<CheckpointDigest>> {
     let row: Option<StoredRow> = tx
         .query_row(
-            "SELECT state,host_id,expected,digest,weights_bytes,provisional,diagnostic,state_slot_bytes FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
+            "SELECT state,host_id,expected,digest,weights_bytes,provisional,diagnostic,state_slot_bytes,provenance FROM checkpoint_digests WHERE deployment_id=?1 AND revision=?2",
             params![deployment, revision],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
         )
         .optional()?;
     row.map(
@@ -251,6 +276,7 @@ fn read(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Option<
             provisional,
             diagnostic,
             state_slot_bytes,
+            provenance,
         )| {
             Ok(CheckpointDigest {
                 state: DigestState::parse(&state)?,
@@ -261,6 +287,13 @@ fn read(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Option<
                 state_slot_bytes,
                 provisional,
                 diagnostic,
+                provenance: provenance
+                    .map(|text| {
+                        DigestProvenance::parse(&text)
+                            .filter(|_| !text.is_empty())
+                            .ok_or(CheckpointDigestError::CorruptStoredData)
+                    })
+                    .transpose()?,
             })
         },
     )
@@ -532,6 +565,7 @@ impl crate::Store {
             weights_bytes,
             None,
             None,
+            DigestProvenance::Measured,
             now_ms,
         )
     }
@@ -542,7 +576,11 @@ impl crate::Store {
     /// provisional revision is re-resolved with too: a group member's share
     /// of the weights is taken with the layout. Once recorded, a measurement
     /// naming another state slot is a mismatch, as for the weights; one naming
-    /// none (an older host) is not.
+    /// none (an older host) is not. `provenance` is where the host's file
+    /// hashes came from (ADR 0014 §7, amendment of 2026-10-08), kept with the
+    /// digest it records. A host can only trust a declaration the revision
+    /// makes, so `declared_trusted` for any other digest is refused as invalid
+    /// and records nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_measurement(
         &self,
@@ -554,6 +592,7 @@ impl crate::Store {
         weights_bytes: i64,
         state_slot_bytes: Option<i64>,
         layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
+        provenance: DigestProvenance,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
         if !is_checkpoint_digest(digest)
@@ -583,6 +622,11 @@ impl crate::Store {
                 read(&tx, deployment, revision)?.ok_or(CheckpointDigestError::CorruptStoredData)?
             }
         };
+        if provenance == DigestProvenance::DeclaredTrusted
+            && existing.expected.as_deref() != Some(digest)
+        {
+            return Err(CheckpointDigestError::Invalid);
+        }
         match existing.state {
             DigestState::Recorded => {
                 let same = existing.digest.as_deref() == Some(digest)
@@ -616,8 +660,8 @@ impl crate::Store {
             .is_some_and(|expected| expected != digest)
         {
             tx.execute(
-                "UPDATE checkpoint_digests SET state='mismatch',digest=?3,weights_bytes=?4,host_id=?5,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7 WHERE deployment_id=?1 AND revision=?2",
-                params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes],
+                "UPDATE checkpoint_digests SET state='mismatch',digest=?3,weights_bytes=?4,host_id=?5,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8 WHERE deployment_id=?1 AND revision=?2",
+                params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code()],
             )?;
             tx.commit()?;
             return Ok(RecordOutcome::Mismatch);
@@ -790,8 +834,8 @@ impl crate::Store {
                     };
                     let diagnostic = reason.chars().take(512).collect::<String>();
                     tx.execute(
-                        "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5 WHERE deployment_id=?1 AND revision=?2",
-                        params![deployment, revision, digest, host_id, now_ms, diagnostic],
+                        "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5,provenance=?7 WHERE deployment_id=?1 AND revision=?2",
+                        params![deployment, revision, digest, host_id, now_ms, diagnostic, provenance.code()],
                     )?;
                     tx.commit()?;
                     return Ok(RecordOutcome::Unusable);
@@ -799,8 +843,8 @@ impl crate::Store {
             }
         }
         tx.execute(
-            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7 WHERE deployment_id=?1 AND revision=?2",
-            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes],
+            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8 WHERE deployment_id=?1 AND revision=?2",
+            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code()],
         )?;
         tx.commit()?;
         Ok(RecordOutcome::Recorded {

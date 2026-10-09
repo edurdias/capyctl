@@ -1229,11 +1229,15 @@ fn validate_launch_failure(
 /// ADR 0014 §7: `computed` carries a canonical digest and its weights;
 /// `mismatch` additionally differs from a stated expectation; `refused` carries
 /// only a closed reason; `sized` (a size-only request) carries the weights and
-/// no digest. File counts and bytes are bounded by the host's walk.
+/// no digest. File counts and bytes are bounded by the host's walk. Only a
+/// measurement names its provenance (amendment of 2026-10-08), from the closed
+/// set; one that hashed every file is `measured` (or unnamed, an older host).
 fn validate_checkpoint(
     plan: &DigestCheckpointPlan,
     evidence: &pb::CheckpointDigestEvidence,
 ) -> Result<(), GroupIdentityError> {
+    use capyctl_config::effective::DigestProvenance;
+    let provenance = DigestProvenance::parse(&evidence.provenance);
     let measured = capyctl_config::effective::is_checkpoint_digest(&evidence.digest)
         && evidence.weights_bytes >= 0
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
@@ -1243,7 +1247,14 @@ fn validate_checkpoint(
         // ADR 0028 §5: a layout splits no more than the weights measured.
         && evidence.layout.as_ref().is_none_or(|layout| {
             layout_from_wire(layout).is_some_and(|l| l.sharded_bytes <= evidence.weights_bytes)
-        });
+        })
+        && match provenance {
+            Some(DigestProvenance::Measured) => true,
+            Some(DigestProvenance::Fetched | DigestProvenance::DeclaredTrusted) => {
+                !evidence.full_rehash
+            }
+            None => false,
+        };
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
@@ -1257,6 +1268,7 @@ fn validate_checkpoint(
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
+                && evidence.provenance.is_empty()
         }
         "computed" => {
             measured
@@ -1280,6 +1292,7 @@ fn validate_checkpoint(
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
+                && evidence.provenance.is_empty()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

@@ -601,6 +601,12 @@ const NAMED_FORMS: &[(&str, Scope, &str, &str)] = &[
         "CAPYCTL_MODEL_SOURCES_PLAIN_HTTP",
     ),
     (
+        "checkpoints.trust_declared_digest",
+        Scope::Host,
+        "--trust-declared-digest",
+        "CAPYCTL_TRUST_DECLARED_DIGEST",
+    ),
+    (
         "local_engine.vllm",
         Scope::Host,
         "--vllm-bin",
@@ -784,6 +790,10 @@ impl NamedLayer {
                 "model_sources.plain_http",
                 self.models.plain_http.map(switch_text),
             ),
+            (
+                "checkpoints.trust_declared_digest",
+                self.models.trust_declared_digest.map(Value::Bool),
+            ),
             ("local_engine.vllm", path_text(&engines.vllm)),
             ("local_engine.sglang", path_text(&engines.sglang)),
             (
@@ -906,6 +916,7 @@ pub fn defaults(
             ("model_sources.plain_http", Value::from("denied")),
             ("local_engine.deep_park", Value::from("on")),
             ("local_engine.trust_remote_code", Value::from(false)),
+            ("checkpoints.trust_declared_digest", Value::from(false)),
             ("local_engine.installation_drift", Value::from("warn")),
             (
                 "resource_policy.endpoint_port_range.start",

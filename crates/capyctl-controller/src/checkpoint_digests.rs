@@ -53,6 +53,9 @@ pub struct Measured {
     /// ADR 0028 §5 (amendment of 2026-10-07): the checkpoint's layout, which a
     /// group member's share of the weights is taken with.
     pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
+    /// ADR 0014 §7 (amendment of 2026-10-08): where the host's file hashes
+    /// came from; recorded with the digest and shown by status.
+    pub provenance: capyctl_config::effective::DigestProvenance,
 }
 
 /// Why a measurement produced no digest.
@@ -100,6 +103,8 @@ pub fn measured_from(result: &pb::MemberExecutionResult) -> Result<Measured, Mea
                 .layout
                 .as_ref()
                 .and_then(capyctl_protocol::execution::layout_from_wire),
+            provenance: capyctl_config::effective::DigestProvenance::parse(&evidence.provenance)
+                .ok_or(MeasureError::Unavailable)?,
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
@@ -141,6 +146,7 @@ pub fn record(
             measured.weights_bytes,
             measured.state_slot_bytes,
             measured.layout,
+            measured.provenance,
             capyctl_protocol::now_unix_ms(),
         )
         .map_err(|_| MeasureError::Unavailable)
@@ -430,7 +436,9 @@ type LocalMeasurement = (
 /// Measure an effective revision's checkpoint on this machine, with the
 /// weight bytes of the draft model it loads beside it (ADR 0014 §5 amendment
 /// A4) and the hybrid state slot (amendment A16). The digest is the
-/// checkpoint's own.
+/// checkpoint's own; a local source's declaration stands in for a full read
+/// only as the embedded host's policy allows (ADR 0014 §7, amendment of
+/// 2026-10-08).
 async fn measure_locally(
     checkpoints: Arc<CheckpointVerifier>,
     effective: &capyctl_config::effective::EffectiveDeployment,
@@ -444,7 +452,11 @@ async fn measure_locally(
     let drafter = effective.drafter_location();
     let effective = effective.clone();
     tokio::task::spawn_blocking(move || {
-        let verified = checkpoints.measure(&store, Path::new(&checkpoint))?;
+        let verified = checkpoints.measure_declared(
+            &store,
+            Path::new(&checkpoint),
+            effective.model.trustable_declaration(),
+        )?;
         let weights = checkpoints
             .drafter_weights(drafter.as_ref())?
             .checked_add(verified.manifest.weights_bytes)
@@ -477,6 +489,7 @@ impl DigestSource for LocalDigests {
                 weights_bytes,
                 state_slot_bytes,
                 layout,
+                provenance: verified.provenance,
             })
         })
     }
@@ -752,6 +765,7 @@ impl CheckpointGate {
                         weights_bytes,
                         state_slot_bytes,
                         layout,
+                        provenance: measured.provenance,
                     },
                 )
                 .map_err(|_| unrecorded())?;

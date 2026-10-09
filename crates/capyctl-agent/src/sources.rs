@@ -22,7 +22,17 @@
 //! the SHA-256 in their pointer, other repository files by their git blob id,
 //! an `http` payload by its declared SHA-256. The verified tree is renamed
 //! into place atomically; the WE3 checkpoint digest (ADR 0014 §7) is then
-//! measured over it as over any local checkpoint.
+//! recorded over it as over any local checkpoint.
+//!
+//! ADR 0014 §7 (amendment of 2026-10-08): each file's SHA-256 is computed as
+//! it streams (beside its git blob id where that is the pin), and noted with
+//! the file's stat identity right after it took its name. At commit the notes
+//! become `<id>.manifest` beside the copy's marker, owner-only; the checkpoint
+//! verifier builds the copy's digest from it ([`fetched_manifest`]) while every
+//! file keeps that identity, so the first placement reads the weights once,
+//! here, instead of twice. A file verified with no note (an extracted tar
+//! archive's, or one a crash left unnoted) leaves no manifest: the copy is
+//! measured in full as before.
 //!
 //! Downloads are idempotent and resumable: a second request for the same
 //! source shares the running download, a request after an agent restart
@@ -153,6 +163,30 @@ enum Expected {
     /// A git blob id: SHA-1 over `blob <size>\0` and the contents.
     GitBlob(String),
 }
+
+/// ADR 0014 §7 (amendment of 2026-10-08): one file verified against its pin
+/// as it was written: its path in the copy, the SHA-256 of its bytes and its
+/// stat identity right after it took its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FetchedFile {
+    pub path: String,
+    pub sha256: String,
+    pub identity: crate::checkpoint::FileIdentity,
+}
+
+/// The verified files of one committed copy (`<id>.manifest`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FetchedManifest {
+    key: String,
+    files: Vec<FetchedFile>,
+}
+
+/// Where a download notes each file it verified, in its partial directory.
+const VERIFIED_NOTES: &str = "verified.jsonl";
+/// The largest fetched manifest read back.
+const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 
 /// Host-side materialization of declared model sources into one model store.
 pub struct SourceStore {
@@ -759,7 +793,7 @@ impl SourceStore {
         let partial = self.partial_dir(id);
         let tree = partial.join("tree");
         fs::create_dir_all(&tree).map_err(io_failure)?;
-        let (bytes, files) = match source {
+        let (bytes, files, fetched) = match source {
             ModelSource::HuggingFace {
                 repo,
                 revision,
@@ -774,7 +808,8 @@ impl SourceStore {
                 for file in &plan {
                     self.fetch_file(file, &tree, token.as_ref(), job).await?;
                 }
-                (total, plan.len() as u64)
+                let paths = plan.iter().map(|file| file.path.clone()).collect();
+                (total, plan.len() as u64, Some(paths))
             }
             ModelSource::Http {
                 url,
@@ -788,7 +823,7 @@ impl SourceStore {
             }
             ModelSource::Local { .. } => return Err(SourceFailure::new(reason::NOT_REMOTE)),
         };
-        self.commit(key, id, &tree, bytes, files)?;
+        self.commit(key, id, &tree, bytes, files, fetched.as_deref())?;
         self.log(&format!(
             "model source {key}: verified ({bytes} bytes, {files} files)"
         ));
@@ -937,7 +972,9 @@ impl SourceStore {
         if !hasher.matches(&file.expected) {
             return Err(SourceFailure::new(reason::HASH_MISMATCH));
         }
-        fs::rename(&part, &destination).map_err(io_failure)
+        fs::rename(&part, &destination).map_err(io_failure)?;
+        note_verified(tree, &file.path, &destination, hasher.sha256_hex());
+        Ok(())
     }
 
     /// Feed an existing partial file into `hasher`; its length is the offset
@@ -1035,7 +1072,7 @@ impl SourceStore {
         archive: Archive,
         partial: &Path,
         job: &Job,
-    ) -> Result<(u64, u64), SourceFailure> {
+    ) -> Result<(u64, u64, Option<Vec<String>>), SourceFailure> {
         let tree = partial.join("tree");
         let name = match archive {
             Archive::None => file_name(&url.0),
@@ -1045,6 +1082,9 @@ impl SourceStore {
         let part = part_path(&payload);
         let expected = Expected::Sha256(sha256.into());
         let origin = self.origin(&url.0)?;
+        // ADR 0014 §7 (amendment of 2026-10-08): the payload's SHA-256 is its
+        // pin, noted only when it was verified by this attempt.
+        let mut verified_now = None;
         if !payload.is_file() {
             let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
             let response = self
@@ -1085,12 +1125,17 @@ impl SourceStore {
                 return Err(SourceFailure::new(reason::HASH_MISMATCH));
             }
             fs::rename(&part, &payload).map_err(io_failure)?;
+            verified_now = Some(hasher.sha256_hex());
         }
         match archive {
             Archive::None => {
                 let bytes = fs::metadata(&payload).map_err(io_failure)?.len();
-                fs::rename(&payload, tree.join(&name)).map_err(io_failure)?;
-                Ok((bytes, 1))
+                let placed = tree.join(&name);
+                fs::rename(&payload, &placed).map_err(io_failure)?;
+                if let Some(sha256) = verified_now {
+                    note_verified(&tree, &name, &placed, sha256);
+                }
+                Ok((bytes, 1, Some(vec![name])))
             }
             Archive::Tar => {
                 let limit = fs::metadata(&payload).map_err(io_failure)?.len();
@@ -1100,13 +1145,18 @@ impl SourceStore {
                     tar::TarError::Io(_) => SourceFailure::new(reason::IO_ERROR),
                 })?;
                 fs::remove_file(&payload).map_err(io_failure)?;
-                Ok((bytes, count_files(&tree)))
+                // The archive was verified, not each file it held: the copy
+                // is measured.
+                Ok((bytes, count_files(&tree), None))
             }
         }
     }
 
     /// Put a verified tree in place: record `committing`, rename atomically,
     /// record `verified`, then release the reservation and the partial dir.
+    /// ADR 0014 §7 (amendment of 2026-10-08): first, when every one of
+    /// `fetched` was noted as verified, write the copy's fetched manifest
+    /// (owner-only) for the checkpoint verifier; otherwise remove any stale one.
     fn commit(
         &self,
         key: &str,
@@ -1114,12 +1164,29 @@ impl SourceStore {
         tree: &Path,
         bytes: u64,
         files: u64,
+        fetched: Option<&[String]>,
     ) -> Result<(), SourceFailure> {
         let target = self.store.join(key);
         let parent = target
             .parent()
             .ok_or(SourceFailure::new(reason::IO_ERROR))?;
         fs::create_dir_all(parent).map_err(io_failure)?;
+        let manifest_path = self.state_dir().join(format!("{id}.manifest"));
+        match fs::remove_file(&manifest_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_failure(error)),
+        }
+        if let Some(files) = fetched.and_then(|paths| noted_files(tree, paths)) {
+            let manifest = FetchedManifest {
+                key: key.into(),
+                files,
+            };
+            // Best effort: without it the copy is measured in full.
+            if write_private_json(&manifest_path, &manifest).is_err() {
+                let _ = fs::remove_file(&manifest_path);
+            }
+        }
         let marker_path = self.state_dir().join(format!("{id}.verified"));
         let marker = Marker {
             key: key.into(),
@@ -1147,10 +1214,11 @@ impl SourceStore {
     }
 }
 
-/// Which pin a file is checked against, computed while it streams.
+/// Which pin a file is checked against, computed while it streams, beside
+/// the SHA-256 a checkpoint manifest names (ADR 0014 §7).
 enum Hasher {
     Sha256(sha2::Sha256),
-    GitBlob(sha1::Sha1),
+    GitBlob(sha1::Sha1, sha2::Sha256),
 }
 
 impl Hasher {
@@ -1160,7 +1228,7 @@ impl Hasher {
             Expected::GitBlob(_) => {
                 let mut hasher = sha1::Sha1::new();
                 hasher.update(format!("blob {size}\0").as_bytes());
-                Self::GitBlob(hasher)
+                Self::GitBlob(hasher, sha2::Sha256::new())
             }
         }
     }
@@ -1168,17 +1236,20 @@ impl Hasher {
     fn restart(&self, size: u64) -> Self {
         match self {
             Self::Sha256(_) => Self::Sha256(sha2::Sha256::new()),
-            Self::GitBlob(_) => {
+            Self::GitBlob(..) => {
                 let mut hasher = sha1::Sha1::new();
                 hasher.update(format!("blob {size}\0").as_bytes());
-                Self::GitBlob(hasher)
+                Self::GitBlob(hasher, sha2::Sha256::new())
             }
         }
     }
     fn update(&mut self, bytes: &[u8]) {
         match self {
             Self::Sha256(hasher) => hasher.update(bytes),
-            Self::GitBlob(hasher) => hasher.update(bytes),
+            Self::GitBlob(hasher, sha256) => {
+                hasher.update(bytes);
+                sha256.update(bytes);
+            }
         }
     }
     fn matches(&self, expected: &Expected) -> bool {
@@ -1186,12 +1257,139 @@ impl Hasher {
             (Self::Sha256(hasher), Expected::Sha256(want)) => {
                 hex::encode(hasher.clone().finalize()) == *want
             }
-            (Self::GitBlob(hasher), Expected::GitBlob(want)) => {
+            (Self::GitBlob(hasher, _), Expected::GitBlob(want)) => {
                 hex::encode(hasher.clone().finalize()) == *want
             }
             _ => false,
         }
     }
+    /// The lowercase SHA-256 of the bytes seen.
+    fn sha256_hex(&self) -> String {
+        match self {
+            Self::Sha256(sha256) | Self::GitBlob(_, sha256) => {
+                hex::encode(sha256.clone().finalize())
+            }
+        }
+    }
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): note that `path` in the copy
+/// (placed at `file`) was verified against its pin and hashes to `sha256`,
+/// with its stat identity right after it took its name. The note goes beside
+/// `tree` in the partial directory, so a resumed download keeps the notes of
+/// the files an earlier attempt verified. Best effort: a file without a note
+/// leaves the copy measured in full.
+fn note_verified(tree: &Path, path: &str, file: &Path, sha256: String) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(metadata) = fs::symlink_metadata(file) else {
+        return;
+    };
+    let note = FetchedFile {
+        path: path.to_owned(),
+        sha256,
+        identity: crate::checkpoint::FileIdentity::from_metadata(&metadata),
+    };
+    let Ok(mut line) = serde_json::to_vec(&note) else {
+        return;
+    };
+    line.push(b'\n');
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(tree.with_file_name(VERIFIED_NOTES))
+        .and_then(|mut notes| {
+            notes.write_all(&line)?;
+            notes.sync_data()
+        });
+}
+
+/// The notes for exactly `paths`, in that order, or `None` when any is
+/// missing. A torn line (a crash mid-write) is skipped, so its file has none.
+fn noted_files(tree: &Path, paths: &[String]) -> Option<Vec<FetchedFile>> {
+    let text = fs::read(tree.with_file_name(VERIFIED_NOTES)).ok()?;
+    let mut notes: BTreeMap<String, FetchedFile> = BTreeMap::new();
+    for line in text.split(|byte| *byte == b'\n') {
+        if let Ok(note) = serde_json::from_slice::<FetchedFile>(line) {
+            notes.insert(note.path.clone(), note);
+        }
+    }
+    paths.iter().map(|path| notes.remove(path)).collect()
+}
+
+/// Write `value` to `path` as JSON through a new owner-only file renamed into
+/// place, never following a link.
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    let temporary = path.with_extension("manifest.tmp");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)
+}
+
+/// ADR 0014 §7 (amendment of 2026-10-08): the files the copy under `key` (a
+/// path relative to the sources store `store`, e.g.
+/// `sources/huggingface/<repo>@<revision>`) was verified with as CapyCTL
+/// downloaded it, by path. `None` for anything else, and unless the manifest
+/// is a regular file this account owns that no other account may write
+/// (SPEC §13.3: it stands in for reading the weights, so it is trusted
+/// evidence, like the checkpoint stat cache).
+pub(crate) fn fetched_manifest(store: &Path, key: &str) -> Option<BTreeMap<String, FetchedFile>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let prefix = format!("{}/", capyctl_config::model_source::SOURCES_DIR);
+    if !key.starts_with(&prefix) || key.split('/').any(|part| part == STATE_DIR) {
+        return None;
+    }
+    let path = store
+        .join(capyctl_config::model_source::SOURCES_DIR)
+        .join(STATE_DIR)
+        .join(format!("{}.manifest", SourceStore::id(key)));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != euid
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let manifest: FetchedManifest = serde_json::from_slice(&bytes).ok()?;
+    if manifest.key != key {
+        return None;
+    }
+    let mut files = BTreeMap::new();
+    for file in manifest.files {
+        if !capyctl_config::model_source::is_sha256_hex(&file.sha256)
+            || files.insert(file.path.clone(), file).is_some()
+        {
+            return None;
+        }
+    }
+    Some(files)
 }
 
 fn check_status(status: reqwest::StatusCode) -> Result<(), SourceFailure> {
@@ -1407,6 +1605,7 @@ pub fn prune(
         }
         fs::remove_file(state.join(format!("{id}.verified")))?;
         let _ = fs::remove_file(state.join(format!("{id}.reservation")));
+        let _ = fs::remove_file(state.join(format!("{id}.manifest")));
         drop(lock);
         let _ = fs::remove_file(state.join(format!("{id}.lock")));
         report.removed.push(entry);

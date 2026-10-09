@@ -252,12 +252,24 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             weights,
             Some(0),
             None,
+            DigestProvenance::Measured,
             2
         ),
         Err(CheckpointDigestError::Invalid)
     ));
     store
-        .record_checkpoint_measurement(&session, id, 1, "lab", DIGEST, weights, Some(slot), None, 2)
+        .record_checkpoint_measurement(
+            &session,
+            id,
+            1,
+            "lab",
+            DIGEST,
+            weights,
+            Some(slot),
+            None,
+            DigestProvenance::Measured,
+            2,
+        )
         .unwrap();
     let memory = frozen_memory(&store, &receipt);
     assert_eq!(memory["state_slot_bytes"], json!(slot));
@@ -284,6 +296,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
                 weights,
                 Some(slot + 1),
                 None,
+                DigestProvenance::Measured,
                 3
             )
             .unwrap(),
@@ -651,4 +664,61 @@ fn a_digest_from_a_host_the_revision_did_not_resolve_on_is_refused() {
             weights_bytes: 7
         }
     );
+}
+
+// T34 (ADR 0014 §7, amendment of 2026-10-08): a recorded digest keeps where
+// its file hashes came from, and status reads it. A host can only trust a
+// declaration the revision makes: `declared_trusted` for any other digest,
+// or for a revision that declares none, records nothing.
+#[test]
+fn a_recorded_digest_keeps_its_provenance() {
+    let (store, session, mut config, host) = setup();
+    let plain = deploy(&store, &session, "plain", &config, &host);
+    config["model"]["content_fingerprint"] = json!(DIGEST);
+    config["name"] = json!("declared");
+    config["routes"] = json!(["declared"]);
+    let declared = deploy(&store, &session, "declared", &config, &host);
+    let record = |id: &str, digest: &str, provenance| {
+        store.record_checkpoint_measurement(&session, id, 1, "lab", digest, 7, None, provenance, 2)
+    };
+    for (id, digest) in [
+        (&plain.deployment_id, DIGEST),
+        (&declared.deployment_id, OTHER),
+    ] {
+        assert!(matches!(
+            record(id, digest, DigestProvenance::DeclaredTrusted),
+            Err(CheckpointDigestError::Invalid)
+        ));
+        let pending = store.checkpoint_digest(id, 1).unwrap().unwrap();
+        assert_eq!(pending.state, DigestState::Pending);
+        assert_eq!(pending.provenance, None);
+    }
+    assert!(matches!(
+        record(
+            &declared.deployment_id,
+            DIGEST,
+            DigestProvenance::DeclaredTrusted
+        )
+        .unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    assert!(matches!(
+        record(&plain.deployment_id, DIGEST, DigestProvenance::Fetched).unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    for (id, provenance) in [
+        (&declared.deployment_id, DigestProvenance::DeclaredTrusted),
+        (&plain.deployment_id, DigestProvenance::Fetched),
+    ] {
+        let recorded = store.checkpoint_digest(id, 1).unwrap().unwrap();
+        assert_eq!(recorded.state, DigestState::Recorded);
+        assert_eq!(recorded.provenance, Some(provenance));
+    }
+    let snapshot = store.snapshot().unwrap();
+    let shown = serde_json::to_value(&snapshot).unwrap().to_string();
+    assert!(
+        shown.contains("\"provenance\":\"declared_trusted\""),
+        "{shown}"
+    );
+    assert!(shown.contains("\"provenance\":\"fetched\""), "{shown}");
 }
