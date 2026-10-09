@@ -958,11 +958,12 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     w.shutdown().await.unwrap();
 }
 
-/// A Fake engine whose idle check before a stop signal is TensorFold's own,
-/// read from a `/health` the test serves (or nothing listening).
+/// A Fake engine whose idle check before a stop signal is TensorFold's own
+/// (a `/health` the test serves) or llama.cpp's (a `/metrics`), or nothing
+/// listening.
 struct CountedIdle {
     inner: Arc<FakeEngine>,
-    counters: capyctl_adapters::tensorfold::TensorfoldAdapter,
+    counters: Box<dyn EngineAdapter>,
     reads: std::sync::atomic::AtomicUsize,
 }
 
@@ -1059,7 +1060,8 @@ fn idle_checked_worker(
     .unwrap()
 }
 
-/// What TensorFold's `/health` does in a standalone stop test.
+/// What TensorFold's `/health` or llama.cpp's `/metrics` does in a
+/// standalone stop test.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Health {
     Idle,
@@ -1072,56 +1074,81 @@ enum Health {
     Hung,
 }
 
-async fn tensorfold_counters(health: Health) -> capyctl_adapters::tensorfold::TensorfoldAdapter {
+/// TensorFold's counters (`llamacpp` false) or llama-server's (true) on a
+/// fresh port, answering as `health` says.
+async fn engine_counters(llamacpp: bool, health: Health) -> Box<dyn EngineAdapter> {
+    use axum::response::IntoResponse;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let app = axum::Router::new().route(
-        "/health",
-        axum::routing::get(move || async move {
-            use axum::response::IntoResponse;
-            let busy = match health {
-                Health::Loading => {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
-                }
-                Health::Hung => {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    true
-                }
-                other => other == Health::Busy,
-            };
+    let answer = move || async move {
+        let busy = match health {
+            Health::Loading => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Health::Hung => {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                true
+            }
+            other => other == Health::Busy,
+        };
+        if llamacpp {
+            // ADR 0029 §10: llama-server 0.6.0's two work gauges.
+            format!(
+                "llamacpp:requests_processing {}\nllamacpp:requests_deferred 0\n",
+                u64::from(busy)
+            )
+            .into_response()
+        } else {
             axum::Json(serde_json::json!({
                 "ok": true, "busy": busy, "requests_running": u64::from(busy)
             }))
             .into_response()
-        }),
-    );
+        }
+    };
+    let path = if llamacpp { "/metrics" } else { "/health" };
+    let app = axum::Router::new().route(path, axum::routing::get(answer));
     if health == Health::Gone {
         drop(listener);
     } else {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     }
-    let endpoint = format!("http://127.0.0.1:{port}").parse().unwrap();
-    capyctl_adapters::tensorfold::TensorfoldAdapter::new(endpoint, "0.6.0".into(), "toy".into())
+    let endpoint: reqwest::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
+    if llamacpp {
+        Box::new(capyctl_adapters::llamacpp::LlamacppAdapter::new(
+            endpoint,
+            "0.6.0+d812350".into(),
+            "toy".into(),
+        ))
+    } else {
+        Box::new(capyctl_adapters::tensorfold::TensorfoldAdapter::new(
+            endpoint,
+            "0.6.0".into(),
+            "toy".into(),
+        ))
+    }
 }
 
-// T41 (spec §5, ADR 0023 §6): after the drain, an
+// T41 T42 (spec §5, ADR 0023 §6, ADR 0029 §10): after the drain, an
 // engine that answers busy at the bound is not signalled; the cleanup does not
 // complete and its binding stays retained. One that reads idle, has exited,
-// has not loaded its model, or hangs on `/health` is terminated: the first
-// three at once, the hung one once the bound passes.
+// has not loaded its model, or hangs on `/health` (TensorFold) or `/metrics`
+// (llama.cpp) is terminated: the first three at once, the hung one once the
+// bound passes.
 #[tokio::test]
 async fn only_an_engine_answering_busy_is_not_signalled() {
-    for health in [
+    let healths = [
         Health::Idle,
         Health::Busy,
         Health::Gone,
         Health::Loading,
         Health::Hung,
-    ] {
+    ];
+    for (llamacpp, health) in [false, true]
+        .into_iter()
+        .flat_map(|llamacpp| healths.map(|health| (llamacpp, health)))
+    {
         let (_dir, owner, fence, observations) = setup().await;
         let engine = Arc::new(CountedIdle {
             inner: Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1900)))),
-            counters: tensorfold_counters(health).await,
+            counters: engine_counters(llamacpp, health).await,
             reads: Default::default(),
         });
         let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));

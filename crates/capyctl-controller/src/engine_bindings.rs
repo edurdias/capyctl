@@ -31,7 +31,9 @@ pub struct ProfileBindings {
     /// launches keep their file rendezvous in, as on a host. Without one the
     /// entry falls back to its own temporary directory.
     rendezvous: Option<capyctl_agent::rendezvous::RendezvousRoot>,
-    /// ADR 0023 §3: the private root TensorFold launches build extensions in.
+    /// ADR 0023 §3, ADR 0029 §6: the private root TensorFold launches build
+    /// extensions in and llama.cpp launches keep their configuration and
+    /// cache directories in.
     engine_cache: Option<capyctl_agent::engine_cache::EngineCacheRoot>,
     /// Discrete GPU design §6 (ADR 0019): the total memory of each discrete
     /// GPU on this host, by driver index, as sampled at boot. An engine on a
@@ -83,8 +85,9 @@ impl ProfileBindings {
     }
 
     /// ADR 0023 §3: TensorFold launches build their extensions under this
-    /// private root (`<dir>/tensorfold/<version>/torch_extensions`). Without
-    /// one a TensorFold launch is refused.
+    /// private root (`<dir>/tensorfold/<version>/torch_extensions`); ADR 0029
+    /// §6: llama.cpp launches point `XDG_CONFIG_HOME` and `LLAMA_CACHE` at
+    /// `<dir>/llamacpp/{config,cache}`. Without one either launch is refused.
     pub fn with_engine_cache_root(mut self, dir: PathBuf) -> Self {
         self.engine_cache = Some(capyctl_agent::engine_cache::EngineCacheRoot::new(dir));
         self
@@ -205,6 +208,44 @@ impl ProfileBindings {
         )
         .map_err(|error| refuse(error.to_string()))?;
         Ok((plan, built))
+    }
+
+    /// ADR 0029 §6: the embedded llama.cpp plan through the shared builder,
+    /// with the private `XDG_CONFIG_HOME` and `LLAMA_CACHE` directories.
+    fn llamacpp_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+    ) -> Result<capyctl_adapters::llamacpp::PlanInputLlamacpp, CoordinatorError> {
+        let refuse = |what: String| {
+            CoordinatorError::Service(format!("cannot build a llama.cpp launch plan: {what}"))
+        };
+        let endpoint = crate::port::engine_url(work.endpoint())
+            .ok_or_else(|| refuse(format!("endpoint names no address: {}", work.endpoint())))?;
+        let port = endpoint
+            .port()
+            .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
+        // ADR 0029 §6, SPEC §13.3: without a private root no user-level
+        // configuration could be shut out, so nothing is launched.
+        let dirs = self
+            .engine_cache
+            .as_ref()
+            .ok_or_else(|| refuse("no private engine cache".into()))?
+            .llamacpp_dirs()
+            .map_err(|error| refuse(error.to_string()))?;
+        capyctl_adapters::llamacpp::plan_from_effective(
+            effective,
+            port,
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+            &dirs,
+        )
+        .map_err(|error| refuse(error.to_string()))
     }
 }
 
@@ -399,11 +440,22 @@ impl EngineBindings for ProfileBindings {
                     extensions_built,
                 })
             }
-            // ADR 0029 §1 (plan slice L3): no llama.cpp launch in this
-            // release; the Initialize is refused before anything starts.
-            Engine::Llamacpp => Err(CoordinatorError::Service(
-                "llama.cpp launches are not supported by this release".into(),
-            )),
+            Engine::Llamacpp => {
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "frozen binding endpoint names no address: {}",
+                        work.endpoint()
+                    ))
+                })?;
+                let launch = self.llamacpp_plan(work, &self.sized(work)?)?;
+                Ok(AdapterSpec::Llamacpp {
+                    endpoint,
+                    fingerprint: profile.build_fingerprint.clone(),
+                    // Readiness waits for the route the deployment serves.
+                    model_id: launch.served_model_name.clone(),
+                    launch: Some(launch),
+                })
+            }
         }
     }
 }

@@ -67,6 +67,24 @@ pub const TENSORFOLD_UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces =
         access: "inference",
     };
 
+/// ADR 0029 §4: llama-server has no engine key either; its whole HTTP surface
+/// (the OpenAI routes and their unversioned aliases, `/props`, `/slots`
+/// without prompts, `/lora-adapters`) is unauthenticated on loopback, reached
+/// only through capyctl's routed path, which forwards chat alone.
+pub const LLAMACPP_UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces =
+    UnauthenticatedSurfaces {
+        surface: &[
+            "/v1",
+            "/health",
+            "/metrics",
+            "/props",
+            "/slots",
+            "/lora-adapters",
+        ],
+        listener: "loopback",
+        access: "inference",
+    };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureState {
@@ -153,6 +171,9 @@ fn classify(
     }
     if engine == Engine::Tensorfold {
         controls.unauthenticated_local_surfaces = Some(TENSORFOLD_UNAUTHENTICATED_LOCAL_SURFACES);
+    }
+    if engine == Engine::Llamacpp {
+        controls.unauthenticated_local_surfaces = Some(LLAMACPP_UNAUTHENTICATED_LOCAL_SURFACES);
     }
     if engine != Engine::Vllm {
         return controls;

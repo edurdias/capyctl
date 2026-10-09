@@ -100,6 +100,14 @@ pub enum AdapterSpec {
         /// prepared; decides the startup bound.
         extensions_built: bool,
     },
+    /// ADR 0029 §4: llama-server listens on loopback without a key; an owned
+    /// launch carries its plan.
+    Llamacpp {
+        endpoint: reqwest::Url,
+        fingerprint: String,
+        model_id: String,
+        launch: Option<crate::llamacpp::PlanInputLlamacpp>,
+    },
 }
 
 impl AdapterSpec {
@@ -110,6 +118,7 @@ impl AdapterSpec {
             Self::Vllm { .. } => Engine::Vllm,
             Self::Sglang { .. } => Engine::Sglang,
             Self::Tensorfold { .. } => Engine::Tensorfold,
+            Self::Llamacpp { .. } => Engine::Llamacpp,
         }
     }
 }
@@ -214,6 +223,22 @@ pub fn resolve(
             let mut adapter =
                 crate::tensorfold::TensorfoldAdapter::new(endpoint, fingerprint, model_id)
                     .with_extensions_built(extensions_built);
+            if let Some(launch) = launch {
+                adapter = adapter.with_launch(launch);
+            }
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            Box::new(adapter)
+        }
+        AdapterSpec::Llamacpp {
+            endpoint,
+            fingerprint,
+            model_id,
+            launch,
+        } => {
+            let mut adapter =
+                crate::llamacpp::LlamacppAdapter::new(endpoint, fingerprint, model_id);
             if let Some(launch) = launch {
                 adapter = adapter.with_launch(launch);
             }

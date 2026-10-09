@@ -158,6 +158,35 @@ pub fn tensorfold_launch_settings() -> LaunchSettings {
     })
 }
 
+/// ADR 0029 §5: llama.cpp settings with a fixed context and the default slots.
+pub fn llamacpp_launch_settings() -> LaunchSettings {
+    LaunchSettings::Llamacpp(capyctl_domain::launch::LlamacppLaunchSettings {
+        common: CommonEngineSettings {
+            context_length: Some(8192),
+            ..CommonEngineSettings::default()
+        },
+        memory: MemoryRequest {
+            request_bytes: 12 << 30,
+            kv_cache_bytes: 2 << 30,
+            margin_bytes: 0,
+            weights_bytes: None,
+            startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
+            startup_graphs_bytes: None,
+            state_slot_bytes: None,
+            state_bytes: None,
+            member: None,
+            disk_tables: None,
+        },
+        n_gpu_layers: capyctl_domain::launch::LlamacppGpuLayers::All,
+        gguf_file: None,
+        mmproj_file: None,
+        extra_args: Vec::new(),
+        provenance: Default::default(),
+    })
+}
+
 /// The `engine_config` block a test deployment carries (ADR 0014 §2): JSON,
 /// validated by the configuration layer rather than by a second parser here.
 pub fn vllm_engine_config_json() -> serde_json::Value {

@@ -104,8 +104,9 @@ pub(super) fn factory(
                     *admin = recorded(SecretRole::Admin)?;
                     *session = Some(owner.session().id().to_owned());
                 }
-                // ADR 0023 §3: TensorFold holds no key to recover.
-                AdapterSpec::Tensorfold { .. } => {}
+                // ADR 0023 §3, ADR 0029 §4: TensorFold and llama.cpp hold no
+                // key to recover.
+                AdapterSpec::Tensorfold { .. } | AdapterSpec::Llamacpp { .. } => {}
             }
         }
         let tools = tools_factory(Arc::new(NoLaunch));

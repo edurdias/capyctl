@@ -3699,8 +3699,9 @@ async fn drain_before_terminate(
     }
 }
 
-/// Spec §5, ADR 0023 §6: after the drain, an engine with its own work counters
-/// (TensorFold) is read before the stop signal. Idle, exited or not listening,
+/// Spec §5, ADR 0023 §6, ADR 0029 §10: after the drain, an engine with its own
+/// work counters (TensorFold's `/health`, llama.cpp's `/metrics`) is read
+/// before the stop signal. Idle, exited or not listening,
 /// it is signalled at once; hung, once the bound passes. Still answering busy
 /// at the bound, nothing is sent: the cleanup stays uncertain and keeps its
 /// accounting.

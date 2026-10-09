@@ -37,8 +37,9 @@ fn option_name(token: &str) -> Option<String> {
 }
 
 /// The option names the engine's own output says it refused: an argument
-/// parser's `argument --name: ...` and `unrecognized arguments: --name ...`.
-/// Values that follow them are never read.
+/// parser's `argument --name: ...` and `unrecognized arguments: --name ...`,
+/// and llama-server's `error: invalid argument: --name` (ADR 0029 §6,
+/// `common/arg.cpp`). Values that follow them are never read.
 pub fn rejected_options(engine_output: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
@@ -51,6 +52,13 @@ pub fn rejected_options(engine_output: &str) -> Vec<String> {
             rest.split_whitespace()
                 .filter_map(option_name)
                 .for_each(&mut push);
+        }
+        if let Some(name) = line
+            .split_once("invalid argument:")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(option_name)
+        {
+            push(name);
         }
         let mut rest = line;
         while let Some(at) = rest.find("argument ") {
@@ -197,6 +205,24 @@ mod tests {
         let text = summary(&long, Some(EngineExit::Code(i32::MIN)));
         assert!(text.len() <= MAX_SUMMARY_BYTES, "{text}");
         assert!(text.contains(&"a".repeat(64)));
+    }
+
+    // T42 T29 (ADR 0029 §6): llama-server's parser names the refused option
+    // after `invalid argument:`, or quoted after `error while handling
+    // argument`; never its value.
+    #[test]
+    fn llama_server_rejections_name_the_option() {
+        assert_eq!(
+            rejected_options("error: invalid argument: --bogus_flag"),
+            vec!["--bogus_flag"]
+        );
+        assert_eq!(
+            rejected_options(
+                "error while handling argument \"--spec-type\": unknown type secret-value"
+            ),
+            vec!["--spec-type"]
+        );
+        assert!(rejected_options("error: invalid argument: /etc/x").is_empty());
     }
 
     // T20 T29 (ADR 0023 §3): TensorFold's refusal to start a model that needs

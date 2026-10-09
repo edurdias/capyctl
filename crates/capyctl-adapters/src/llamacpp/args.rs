@@ -106,6 +106,8 @@ pub enum LlamacppArgsError {
         "the rendered command holds reserved option {0} other than once, where capyctl renders it"
     )]
     RenderedReserved(String),
+    #[error("llama-server splits --alias at commas and trims spaces, so it cannot serve the route {0:?}; name the route without them")]
+    ServedName(String),
 }
 
 /// ADR 0029 §4–§6: the options CapyCTL renders, in this order, before the
@@ -174,6 +176,13 @@ pub fn render_command(input: &PlanInputLlamacpp) -> Result<RenderedCommand, Llam
         slot_pool_tokens(input.context_length, input.slots).ok_or(LlamacppArgsError::NoContext)?;
     if !CACHE_TYPES.contains(&input.cache_type.as_str()) {
         return Err(LlamacppArgsError::CacheType(input.cache_type.clone()));
+    }
+    // ADR 0029 §10: readiness waits for `/v1/models` to list the served name
+    // as rendered; llama-server would split it at commas and trim it
+    // (`common/arg.cpp`, `--alias`), so such a name could never be listed.
+    let served = &input.served_model_name;
+    if served.is_empty() || served.contains(',') || served.trim() != served {
+        return Err(LlamacppArgsError::ServedName(served.clone()));
     }
     // ADR 0029 §6: no protected entry parses these, so the exact-name policy
     // is the check of the complete pass-through vector, again at render.

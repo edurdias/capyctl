@@ -259,6 +259,7 @@ impl NativeHostExecution {
         if self.pre_admitted(command) {
             let refused = LaunchVerdict::Refused;
             let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
+            self.admit_llamacpp_config(&effective)?;
             crate::runtime_integrity::verify(
                 &self.runtime_dir,
                 crate::runtime_integrity::launch_required_files(&effective),
@@ -279,6 +280,9 @@ impl NativeHostExecution {
     ) -> Result<(), LaunchVerdict> {
         let refused = LaunchVerdict::Refused;
         let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
+        // ADR 0029 §6: a machine-wide llama.cpp `config.ini` (one that
+        // appeared after registration) refuses the launch before any effect.
+        self.admit_llamacpp_config(&effective)?;
         // SPEC §9.1, §13.3 / T21 T37: the engine imports capyctl's modules from the
         // runtime directory; one another account could rewrite is refused.
         // ADR 0008: the capability probes are required where the launch's

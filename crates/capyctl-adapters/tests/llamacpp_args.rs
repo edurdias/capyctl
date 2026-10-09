@@ -189,6 +189,25 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
     );
 }
 
+// T42 (ADR 0029 §10): llama-server splits `--alias` at commas and trims it, so
+// readiness could never find such a served name listed; it is refused at
+// render instead of waiting out the Initialize window.
+#[test]
+fn a_served_name_llama_server_would_split_is_refused() {
+    for served in ["a,b", " qwen", "qwen\t", ""] {
+        let mut input = plan();
+        input.served_model_name = served.into();
+        assert_eq!(
+            render_command(&input).unwrap_err(),
+            LlamacppArgsError::ServedName(served.into()),
+            "{served:?}"
+        );
+    }
+    let mut input = plan();
+    input.served_model_name = "org/qwen-3:8b".into();
+    assert!(render_command(&input).is_ok());
+}
+
 // T42 T37 (ADR 0029 §6, SPEC §13.3): the closed environment holds CapyCTL's
 // XDG_CONFIG_HOME and LLAMA_CACHE, the closed PATH and the GPU pin, and no
 // LLAMA_* variable, HOME or XDG_CONFIG_HOME from the caller.

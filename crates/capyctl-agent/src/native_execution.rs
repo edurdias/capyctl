@@ -39,8 +39,12 @@ use std::{
 
 // SPEC §3: vLLM's recipe and guard live in their own module.
 mod vllm;
-// ADR 0023: TensorFold's plan, adapter and idle check before Terminate.
+// ADR 0023: TensorFold's plan and adapter.
 mod tensorfold;
+// ADR 0029: llama.cpp's plan and adapter.
+mod llamacpp;
+// ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
+mod idle_gate;
 // SPEC §§9.1, 10 (W4): remote Park and Restore of a retained launch.
 mod residency;
 pub use residency::{SaverMapped, SaverResidency, SaverScope, SaverUnavailable};
@@ -106,8 +110,12 @@ pub struct NativeHostExecution {
     /// rendezvous in, removed per launch on gone evidence. `None`: the entry
     /// uses its own temporary directory, removed only at interpreter exit.
     rendezvous: Option<crate::rendezvous::RendezvousRoot>,
-    /// ADR 0023 §3: the private root TensorFold launches build extensions in.
+    /// ADR 0023 §3: the private root TensorFold launches build extensions in;
+    /// ADR 0029 §6: llama.cpp's private configuration and cache directories.
     engine_cache: Option<crate::engine_cache::EngineCacheRoot>,
+    /// ADR 0029 §6: the root `/etc/llama.cpp/config.ini` is looked for under
+    /// before a llama.cpp launch (`/`; tests name their own).
+    llamacpp_system_root: PathBuf,
     /// SPEC §13.2: commands whose slow admission (checkpoint hashing, the
     /// installation measurement, the capability probe) passed just now,
     /// outside the journal's locks, keyed by their canonical digest. Under the
@@ -175,6 +183,7 @@ enum PreparedLaunch {
     Vllm(Box<capyctl_adapters::vllm::PlanInputVllm>),
     /// The plan and whether its extensions are already built.
     Tensorfold(Box<(capyctl_adapters::tensorfold::PlanInputTensorfold, bool)>),
+    Llamacpp(Box<capyctl_adapters::llamacpp::PlanInputLlamacpp>),
 }
 
 impl NativeHostExecution {
@@ -246,6 +255,7 @@ impl NativeHostExecution {
             residency: None,
             rendezvous: None,
             engine_cache: None,
+            llamacpp_system_root: PathBuf::from(capyctl_config::llamacpp::SYSTEM_ROOT),
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
             probes: Default::default(),
@@ -450,10 +460,19 @@ impl NativeHostExecution {
         Arc::make_mut(&mut self).rendezvous = Some(crate::rendezvous::RendezvousRoot::new(dir));
         self
     }
-    /// ADR 0023 §3: where TensorFold launches keep their extension builds.
+    /// ADR 0023 §3: where TensorFold launches keep their extension builds;
+    /// ADR 0029 §6: and llama.cpp launches their private configuration and
+    /// cache directories.
     pub fn with_engine_cache_root(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
         Arc::make_mut(&mut self).engine_cache =
             Some(crate::engine_cache::EngineCacheRoot::new(dir));
+        self
+    }
+    /// ADR 0029 §6: look for `etc/llama.cpp/config.ini` under `root` instead
+    /// of `/`. Tests only: the result must not depend on the machine.
+    #[doc(hidden)]
+    pub fn with_llamacpp_system_root(mut self: Arc<Self>, root: PathBuf) -> Arc<Self> {
+        Arc::make_mut(&mut self).llamacpp_system_root = root;
         self
     }
     /// ADR 0028 §7, §10: read interfaces and probe ports through `probes`
@@ -579,13 +598,7 @@ impl NativeHostExecution {
         // `local_ranks` of them; a single launch on exactly one.
         let group = group_member(command);
         let devices = group.map_or(1, |(plan, _)| plan.topology().local_ranks as usize);
-        // ADR 0029 §1 (plan slice L3): a llama.cpp deployment resolves, but
-        // its launch is not in this release and is refused here.
-        if !matches!(
-            effective.profile.engine,
-            Engine::Sglang | Engine::Vllm | Engine::Tensorfold
-        )
-            || effective.profile.build_fingerprint != command.identity.profile_fingerprint
+        if effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != devices
             // Discrete GPU design §7 (review decision): with a choice of
@@ -687,6 +700,12 @@ impl NativeHostExecution {
         // retained one is never blocked by it (a Terminate must still run).
         if effective.profile.engine == Engine::Tensorfold && !retained {
             self.tensorfold_plan(&effective, plan, args)?;
+        }
+        // ADR 0029 §6, §9: a new llama.cpp launch needs its private
+        // directories, its GGUF picked and its path options inside the
+        // approved paths; a retained one is never blocked by them.
+        if effective.profile.engine == Engine::Llamacpp && !retained {
+            self.llamacpp_plan(&effective, plan)?;
         }
         Ok(effective)
     }
@@ -1247,8 +1266,12 @@ impl NativeHostExecution {
                         .map_err(|_| SessionError)?,
                 )))
             }
-            // ADR 0029 §1 (plan slice L3): no llama.cpp launch in this
-            // release; `resolve_as` refuses it before anything durable.
+            // ADR 0029 §7: one single-model llama-server; a group member
+            // never resolves to llama.cpp (`resolve_as`), and none is built.
+            Engine::Llamacpp if group.is_none() => Ok(PreparedLaunch::Llamacpp(Box::new(
+                self.llamacpp_plan(effective, plan)
+                    .map_err(|_| SessionError)?,
+            ))),
             Engine::Llamacpp => Err(SessionError),
         }
     }
@@ -1332,6 +1355,11 @@ impl NativeHostExecution {
                         .with_tools(tools),
                 )
             }
+            PreparedLaunch::Llamacpp(input) => Box::new(
+                self.llamacpp_adapter(effective, plan, served)?
+                    .with_launch(*input)
+                    .with_tools(tools),
+            ),
         })
     }
 
@@ -1355,8 +1383,7 @@ impl NativeHostExecution {
             ),
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
-            // ADR 0029 §1: no llama.cpp launch in this release.
-            Engine::Llamacpp => return Err(SessionError),
+            Engine::Llamacpp => Box::new(self.llamacpp_adapter(effective, plan, served)?),
         })
     }
 
@@ -3905,11 +3932,7 @@ mod tests {
         let (executor, deployment, policy) = tensorfold_fixture(root.path(), identity_dir.path());
         let (launch, _) = tensorfold_launch(&deployment, &policy, port);
         let deadline = capyctl_protocol::now_unix_ms() + 10_000;
-        assert!(
-            executor
-                .tensorfold_idle_before_terminate(&launch, deadline)
-                .await
-        );
+        assert!(executor.idle_before_terminate(&launch, deadline).await);
         assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
         // Busy for good: the wait ends at the command's remaining time.
         let short = capyctl_protocol::now_unix_ms() + 1_200;
@@ -3923,11 +3946,7 @@ mod tests {
         let busy_port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (busy_launch, _) = tensorfold_launch(&deployment, &policy, busy_port);
-        assert!(
-            !executor
-                .tensorfold_idle_before_terminate(&busy_launch, short)
-                .await
-        );
+        assert!(!executor.idle_before_terminate(&busy_launch, short).await);
     }
 
     /// Renders a shell that stands in for the TensorFold process.
@@ -4121,6 +4140,186 @@ mod tests {
         }
         assert_eq!(presence_of(&api), Presence::Alive);
         assert!(executor.journal.retained_command("launch").is_ok());
+    }
+
+    /// A llama.cpp host document and deployment on the SGLang lab fixture,
+    /// its checkpoint holding one GGUF, with a private engine cache root.
+    fn llamacpp_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let (executor, mut deployment, policy) =
+            sglang_fixture_with(root, identity_dir, "restart_only", |document| {
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["engine"] = "llamacpp".into();
+                profile["executable"] = "/opt/llama.cpp/bin/llama-server".into();
+                profile["build_fingerprint"] = "0.6.0+d812350".into();
+                profile["args"] = serde_json::json!([]);
+                profile["security"]["deep_park"] = "disabled".into();
+                profile["security"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admin_credential_ref");
+            });
+        std::fs::write(root.join("models/toy/toy-Q4_K_M.gguf"), "GGUF").unwrap();
+        deployment["engine_config"] = serde_json::json!({"context_length": 8192});
+        let engines = root.join("engines");
+        std::fs::create_dir(&engines).unwrap();
+        std::fs::set_permissions(&engines, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // ADR 0029 §6: never the machine's own `/etc/llama.cpp`.
+        let system = root.join("system");
+        std::fs::create_dir(&system).unwrap();
+        let executor = executor
+            .with_engine_cache_root(engines)
+            .with_llamacpp_system_root(system);
+        (executor, deployment, policy)
+    }
+
+    /// A llama.cpp launch command for the fixture, on `port`.
+    fn llamacpp_launch(
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut launch, mut plan) = launch_with(deployment, policy, "");
+        plan.service_port = port;
+        launch.action = MemberAction::LaunchSingle(plan.clone());
+        launch.identity.profile_fingerprint = "0.6.0+d812350".into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (launch, plan)
+    }
+
+    // T42 (ADR 0029 §6, §9): the host resolves and prepares a llama.cpp
+    // launch from its own document: the checkpoint's one GGUF, the private
+    // configuration and cache directories, an adapter for any retained one.
+    #[test]
+    fn a_llamacpp_launch_prepares_from_local_policy() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
+        let (launch, plan) = llamacpp_launch(&deployment, &policy, closed_port());
+        let effective = executor.resolve(&launch).unwrap();
+        let input = executor.llamacpp_plan(&effective, &plan).unwrap();
+        assert!(input.model_file.ends_with("models/toy/toy-Q4_K_M.gguf"));
+        assert!(input.config_dir.ends_with("engines/llamacpp/config"));
+        assert!(input.cache_dir.ends_with("engines/llamacpp/cache"));
+        assert_eq!((input.context_length, input.slots), (8192, 4));
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Llamacpp(..))
+        ));
+        let args = capyctl_domain::group::GroupMemberArgs {
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            nnodes: 2,
+            node_rank: 1,
+            head_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            rendezvous_port: 29500,
+            own_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            worker_port: None,
+            own_interface: None,
+        };
+        assert!(
+            executor
+                .prepare(&effective, &plan, "toy", Some(args))
+                .is_err(),
+            "no llama.cpp group member"
+        );
+    }
+
+    // T42 T21 (ADR 0029 §10): a Park of a llama.cpp launch is refused by its
+    // tier before anything is journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_llamacpp_park_is_refused_unchanged() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
+        let (launch, _) = llamacpp_launch(&deployment, &policy, closed_port());
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let mut park = MemberCommand {
+            identity: checkpoint_identity("park", "ready"),
+            action: MemberAction::Park {
+                owned_handle: "launch".into(),
+            },
+        };
+        park.identity.payload_digest = park.canonical_digest();
+        let refused = executor.execute(session, park).await.unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
+    }
+
+    // T42 T37 (ADR 0029 §6): `/etc/llama.cpp/config.ini` appearing after
+    // registration refuses the launch `engine_config_file` before anything is
+    // journaled, keyed or started: a terminal refusal, no claim kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_system_config_file_refuses_a_llamacpp_launch() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
+        let file = capyctl_config::llamacpp::system_config_file(&root.path().join("system"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "[server]\nport = 1\n").unwrap();
+        let (launch, _) = llamacpp_launch(&deployment, &policy, closed_port());
+        assert_eq!(
+            executor.provision(launch.clone(), [7; 32]).await.unwrap(),
+            Provisioned::Refused("engine_config_file")
+        );
+        let scope = executor.scope(&launch).unwrap();
+        assert!(executor
+            .identities
+            .load(&scope, launch.identity.payload_digest)
+            .is_err());
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let result = executor.execute(session, launch.clone()).await.unwrap();
+        capyctl_protocol::execution::validate_result(&launch, &result).unwrap();
+        assert_eq!(result.refused, "engine_config_file");
+        assert_eq!(result.state, "completed");
+        assert!(!result.claim_retained && !result.model_usable);
+        assert!(result.processes.is_empty());
+        assert!(executor.journal.history(0, 100).unwrap().is_empty());
+    }
+
+    /// llama-server's `/metrics` on a fresh port, with `processing` requests.
+    async fn metrics_stub(processing: u64) -> u16 {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || async move {
+                format!("llamacpp:requests_processing {processing}\nllamacpp:requests_deferred 0\n")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    // T42 (ADR 0029 §10): before Terminate the host reads llama-server's
+    // `/metrics`; idle is signalled at once, busy at the bound is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_waits_for_llamacpp_to_be_idle() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
+        let (idle, _) = llamacpp_launch(&deployment, &policy, metrics_stub(0).await);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&idle, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let (busy, _) = llamacpp_launch(&deployment, &policy, metrics_stub(1).await);
+        assert!(
+            !executor
+                .idle_before_terminate(&busy, capyctl_protocol::now_unix_ms() + 1_200)
+                .await
+        );
     }
 
     /// A prepared host's runtime directory for SGLang: the agent user's
