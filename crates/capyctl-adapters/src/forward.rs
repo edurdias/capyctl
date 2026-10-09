@@ -367,6 +367,10 @@ const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 /// - TensorFold 0.6.0 and 0.6.3 (`tensorfold/server/app.py` `on_delta`,
 ///   `http.py` `stream_chunk`): `role`, `content`, `reasoning_content`,
 ///   `tool_calls`.
+/// - llama.cpp v0.6.0 (`tools/server/server-chat.cpp`
+///   `server_chat_msg_diff_to_json_oaicompat`, `server-task.cpp` opening
+///   delta): `role`, `content`, `reasoning_content`, `tool_calls` (ADR 0029
+///   §11). Its chunk-level `timings` (on the last chunk) is relayed unchanged.
 ///
 /// Deliberately absent: SGLang's `hidden_states` (protocol.py:1267) is sent only
 /// for `return_hidden_states`, a request field this relay refuses; vLLM's

@@ -896,3 +896,211 @@ async fn an_oversized_health_body_is_cut_at_the_bound() {
         load::SCRAPE_TIMEOUT
     );
 }
+
+/// llama.cpp v0.6.0 `/metrics` (`server_task_result_metrics::to_metrics`,
+/// `--metrics`): counters then gauges, unlabelled, in C++ stream formatting.
+const LLAMACPP_METRICS: &str = "\
+# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed, excluding cached tokens
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 412
+# HELP llamacpp:prompt_tokens_cached_total Number of prompt tokens reused from the cache
+# TYPE llamacpp:prompt_tokens_cached_total counter
+llamacpp:prompt_tokens_cached_total 96
+# HELP llamacpp:prompt_seconds_total Total time spent processing prompts
+# TYPE llamacpp:prompt_seconds_total counter
+llamacpp:prompt_seconds_total 0.512
+# HELP llamacpp:tokens_predicted_total Number of generation tokens processed
+# TYPE llamacpp:tokens_predicted_total counter
+llamacpp:tokens_predicted_total 1024
+# HELP llamacpp:tokens_predicted_seconds_total Total time spent generating tokens
+# TYPE llamacpp:tokens_predicted_seconds_total counter
+llamacpp:tokens_predicted_seconds_total 17.25
+# HELP llamacpp:n_decode_total Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding
+# TYPE llamacpp:n_decode_total counter
+llamacpp:n_decode_total 1031
+# HELP llamacpp:n_tokens_max Largest observed sequence length (prompt + generation)
+# TYPE llamacpp:n_tokens_max counter
+llamacpp:n_tokens_max 388
+# HELP llamacpp:spec_decode_num_draft_tokens_total Speculative: Total draft tokens generated
+# TYPE llamacpp:spec_decode_num_draft_tokens_total counter
+llamacpp:spec_decode_num_draft_tokens_total 0
+# HELP llamacpp:spec_decode_num_accepted_tokens_total Speculative: Total draft tokens accepted by the target model
+# TYPE llamacpp:spec_decode_num_accepted_tokens_total counter
+llamacpp:spec_decode_num_accepted_tokens_total 0
+# HELP llamacpp:spec_decode_num_drafts_total Speculative: Total speculative decoding verification steps
+# TYPE llamacpp:spec_decode_num_drafts_total counter
+llamacpp:spec_decode_num_drafts_total 0
+# HELP llamacpp:prompt_tokens_seconds Average prompt throughput in tokens/s
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 804.688
+# HELP llamacpp:predicted_tokens_seconds Average generation throughput in tokens/s
+# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 59.3623
+# HELP llamacpp:requests_processing Number of requests processing
+# TYPE llamacpp:requests_processing gauge
+llamacpp:requests_processing 2
+# HELP llamacpp:requests_deferred Number of requests deferred
+# TYPE llamacpp:requests_deferred gauge
+llamacpp:requests_deferred 3
+# HELP llamacpp:n_busy_slots_per_decode Average number of busy slots per llama_decode() call
+# TYPE llamacpp:n_busy_slots_per_decode gauge
+llamacpp:n_busy_slots_per_decode 1.5
+";
+
+/// llama.cpp v0.6.0 `/slots` (`server_slot::to_json`): two of four slots
+/// processing, one idle slot holding a finished request's cache, one never
+/// used. `params` and the prompt text are trimmed to what the host reads.
+const LLAMACPP_SLOTS: &str = r#"[
+  {"id": 0, "n_ctx": 4096, "speculative": false, "is_processing": true, "id_task": 7,
+   "n_prompt_tokens": 1024, "n_prompt_tokens_processed": 1000, "n_prompt_tokens_cache": 24,
+   "params": {}, "next_token": [{"has_next_token": true, "has_new_line": false,
+   "n_remain": 100, "n_decoded": 12}], "prompt": "...", "generated": "..."},
+  {"id": 1, "n_ctx": 4096, "speculative": false, "is_processing": true, "id_task": 8,
+   "n_prompt_tokens": 1024, "n_prompt_tokens_processed": 1024, "n_prompt_tokens_cache": 0,
+   "params": {}, "next_token": [{"has_next_token": true, "has_new_line": false,
+   "n_remain": 100, "n_decoded": 3}], "prompt": "...", "generated": "..."},
+  {"id": 2, "n_ctx": 4096, "speculative": false, "is_processing": false, "id_task": 5,
+   "n_prompt_tokens": 4000, "n_prompt_tokens_processed": 4000, "n_prompt_tokens_cache": 0,
+   "params": {}, "next_token": [{"has_next_token": false, "has_new_line": false,
+   "n_remain": 0, "n_decoded": 96}], "prompt": "...", "generated": "..."},
+  {"id": 3, "n_ctx": 4096, "speculative": false, "is_processing": false}
+]"#;
+
+// T42, ADR 0029 §11: the llama.cpp family is `requests_processing` and
+// `requests_deferred`; its throughput gauges are no latency series, and its
+// body alone is no whole sample (the KV usage comes from `/slots`).
+#[test]
+fn llamacpp_metrics_parse_with_the_slots_usage() {
+    assert!(load::parse_engine_load(LLAMACPP_METRICS).is_none());
+    assert!(load::parse_engine_histograms(LLAMACPP_METRICS).is_none());
+    let llama = load::parse_llamacpp_load(LLAMACPP_METRICS, Some(125_000)).unwrap();
+    assert_eq!(
+        (llama.running, llama.waiting, llama.kv_usage_ppm),
+        (2, 3, 125_000)
+    );
+    assert!(load::parse_llamacpp_load(LLAMACPP_METRICS, None).is_none());
+    // Another engine's body is never read as llama.cpp's, nor is a mixed one.
+    assert!(load::parse_llamacpp_load(VLLM_METRICS, Some(0)).is_none());
+    let mixed = format!("{VLLM_METRICS}{LLAMACPP_METRICS}");
+    assert!(load::parse_llamacpp_load(&mixed, Some(0)).is_none());
+    assert!(load::parse_engine_load(&mixed).is_none());
+    // Without `requests_deferred` the family is not whole.
+    let partial: String = LLAMACPP_METRICS
+        .lines()
+        .filter(|line| !line.starts_with("llamacpp:requests_deferred"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(load::parse_llamacpp_load(&partial, Some(0)).is_none());
+}
+
+// T42, ADR 0029 §11: the KV usage counts the tokens of processing slots only,
+// over every slot's `n_ctx`; a malformed list is unknown, never zero.
+#[test]
+fn llamacpp_slots_usage_counts_processing_slots_only() {
+    // (1024 + 1024) / (4 × 4096) = 0.125.
+    assert_eq!(
+        load::parse_llamacpp_slots(LLAMACPP_SLOTS.as_bytes()),
+        Some(125_000)
+    );
+    let idle = r#"[{"id":0,"n_ctx":4096,"is_processing":false,"n_prompt_tokens":4000}]"#;
+    assert_eq!(load::parse_llamacpp_slots(idle.as_bytes()), Some(0));
+    for bad in [
+        "[]",
+        "{}",
+        "not json",
+        r#"[{"id":0,"n_ctx":0,"is_processing":false}]"#,
+        r#"[{"id":0,"is_processing":false}]"#,
+        r#"[{"id":0,"n_ctx":4096}]"#,
+        r#"[{"id":0,"n_ctx":4096,"is_processing":true}]"#,
+        r#"{"error":{"code":501,"type":"not_supported_error"}}"#,
+    ] {
+        assert_eq!(load::parse_llamacpp_slots(bad.as_bytes()), None, "{bad}");
+    }
+}
+
+/// A fake llama-server: keyed `/metrics` and `/slots`, the latter answering
+/// `slots_status` with `slots`.
+async fn llamacpp(native: [u8; 32], slots_status: StatusCode, slots: &'static str) -> SocketAddr {
+    let expected = format!("Bearer {}", hex::encode(native));
+    let keyed = move |status: StatusCode, body: &'static str| {
+        let expected = expected.clone();
+        get(move |headers: HeaderMap| {
+            let expected = expected.clone();
+            async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&expected) {
+                    return (StatusCode::UNAUTHORIZED, String::new());
+                }
+                (status, body.to_owned())
+            }
+        })
+    };
+    let router = Router::new()
+        .route("/metrics", keyed(StatusCode::OK, LLAMACPP_METRICS))
+        .route("/slots", keyed(slots_status, slots));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+// T42, ADR 0029 §11: a llama.cpp sample carries its gauges and the `/slots`
+// KV usage and names no engine latency; a `/slots` read that fails leaves the
+// engine load out, as a failed scrape does.
+#[tokio::test]
+async fn a_llamacpp_scrape_reads_its_slots() {
+    let ingress = Ingress::new().unwrap();
+    let read = scope("read", 1);
+    let refused = scope("refused", 1);
+    let malformed = scope("malformed", 1);
+    register(
+        &ingress,
+        &read,
+        llamacpp([2; 32], StatusCode::OK, LLAMACPP_SLOTS).await,
+        1,
+        [2; 32],
+    );
+    register(
+        &ingress,
+        &refused,
+        llamacpp(
+            [4; 32],
+            StatusCode::NOT_IMPLEMENTED,
+            r#"{"error":{"code":501,"type":"not_supported_error"}}"#,
+        )
+        .await,
+        3,
+        [4; 32],
+    );
+    register(
+        &ingress,
+        &malformed,
+        llamacpp([6; 32], StatusCode::OK, "[]").await,
+        5,
+        [6; 32],
+    );
+    for (s, handle) in [
+        (&read, "launch-r"),
+        (&refused, "launch-x"),
+        (&malformed, "launch-m"),
+    ] {
+        ingress.bind_handle(s, handle).unwrap();
+        ingress.open(s).unwrap();
+    }
+    let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    let ids: Vec<_> = all.iter().map(|s| s.deployment_id.as_str()).collect();
+    assert_eq!(ids, ["malformed", "read", "refused"]);
+    let engine = all[1].engine.unwrap();
+    assert_eq!(
+        (engine.running, engine.waiting, engine.kv_usage_ppm),
+        (2, 3, 125_000)
+    );
+    for sample in &all {
+        assert!(sample
+            .latency
+            .as_ref()
+            .is_none_or(|latency| latency.engine.is_none()));
+    }
+    assert!(all[0].engine.is_none());
+    assert!(all[2].engine.is_none());
+}
