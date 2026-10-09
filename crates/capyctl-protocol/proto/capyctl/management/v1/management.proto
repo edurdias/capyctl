@@ -437,6 +437,10 @@ message SingleLaunchPlan {
   // resolved a group member's share of the weights with. Absent for a
   // single-host launch and when it resolved without one.
   CheckpointLayout checkpoint_layout = 15;
+  // ADR 0014 amendment A20 (owner decision 2026-10-09): the checkpoint's
+  // tables the server resolved with when the engine keeps them on disk.
+  // Absent whenever the engine option is off.
+  CheckpointTables checkpoint_tables = 16;
 }
 // ADR 0028 §5 (amendment of 2026-10-07): how a checkpoint's weights split
 // across a group's ranks, read from its safetensors headers.
@@ -444,6 +448,14 @@ message CheckpointLayout {
   int64 sharded_bytes = 1;        // the tensors the engines split across ranks
   uint32 layer_count = 2;         // numbered decoder layers
   int64 largest_layer_bytes = 3;  // the largest layer's sharded bytes
+}
+// ADR 0014 amendment A20: the tables an engine option can keep on disk, read
+// from the checkpoint's safetensors headers.
+message CheckpointTables {
+  int64 bytes = 1;                         // every table tensor
+  uint32 count = 2;                        // distinct tables
+  int64 sharded_bytes = 3;                 // of bytes, what the layout splits
+  int64 resident_largest_layer_bytes = 4;  // the largest layer without them
 }
 // ADR 0014 §7 (WE3): measure one deployment's checkpoint on this host. The host
 // locates it from its own approved document and the deployment's model block;
@@ -672,6 +684,9 @@ message CheckpointDigestEvidence {
   // digest, trusted by host policy). Empty from an older host, which only
   // measures; `fetched` and `declared_trusted` never set full_rehash.
   string provenance = 10;
+  // ADR 0014 amendment A20: the checkpoint's tables, when it has any and its
+  // safetensors headers could be read; computed and mismatch only.
+  CheckpointTables tables = 11;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown

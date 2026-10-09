@@ -40,6 +40,8 @@ pub struct Materialized {
     pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
     /// ADR 0014 §7 (amendment of 2026-10-08): where its file hashes came from.
     pub provenance: capyctl_config::effective::DigestProvenance,
+    /// ADR 0014 amendment A20: the tables read beside them.
+    pub tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
 }
 
 /// Why one host has no verified copy.
@@ -272,6 +274,7 @@ impl SourceDriver for RemoteGroupSources {
             state_slot_bytes: measured.state_slot_bytes,
             layout: measured.layout,
             provenance: measured.provenance,
+            tables: measured.tables,
         })
     }
 }
@@ -335,6 +338,7 @@ mod tests {
             state_slot_bytes: None,
             layout: None,
             provenance: Default::default(),
+            tables: None,
         }
     }
 

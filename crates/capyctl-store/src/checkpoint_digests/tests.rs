@@ -253,6 +253,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             Some(0),
             None,
             DigestProvenance::Measured,
+            None,
             2
         ),
         Err(CheckpointDigestError::Invalid)
@@ -268,6 +269,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             Some(slot),
             None,
             DigestProvenance::Measured,
+            None,
             2,
         )
         .unwrap();
@@ -297,6 +299,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
                 Some(slot + 1),
                 None,
                 DigestProvenance::Measured,
+                None,
                 3
             )
             .unwrap(),
@@ -308,6 +311,84 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             .unwrap(),
         RecordOutcome::Recorded { .. }
     ));
+    store
+        .accept_start(&session, &fence(&receipt), 100, 100_100)
+        .unwrap();
+}
+
+// T03 (ADR 0014 amendment A20, owner decision 2026-10-09): the tables a host
+// measures beside the weights re-resolve a provisional SGLang revision whose
+// arguments keep them on disk: its memory holds the rest of the weights and
+// SGLang's cache of the tables, recorded beside the whole checkpoint.
+// Tables larger than the weights are refused.
+#[test]
+fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
+    let (store, session, mut config, mut host) = setup();
+    host["runtime_profiles"]["local"]["engine"] = json!("sglang");
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+        json!("secret://admin-key");
+    host["runtime_profiles"]["local"]["args"] = json!([]);
+    config.as_object_mut().unwrap().remove("resources");
+    config["engine_config"] = json!({
+        "memory": {"kv_cache": "4GiB"},
+        "accept_extra_args": true,
+        "extra_args": ["--ple-offload-backend", "file"],
+    });
+    let receipt = deploy(&store, &session, "tables", &config, &host);
+    let id = &receipt.deployment_id;
+    let weights: i64 = 20 << 30;
+    let tables = capyctl_domain::disk_tables::CheckpointTables {
+        bytes: 12 << 30,
+        count: 1,
+        sharded_bytes: 12 << 30,
+        resident_largest_layer_bytes: 1 << 30,
+    };
+    let too_large = capyctl_domain::disk_tables::CheckpointTables {
+        bytes: weights + 1,
+        sharded_bytes: 0,
+        ..tables
+    };
+    assert!(matches!(
+        store.record_checkpoint_measurement(
+            &session,
+            id,
+            1,
+            "lab",
+            DIGEST,
+            weights,
+            None,
+            None,
+            Some(too_large),
+            2
+        ),
+        Err(CheckpointDigestError::Invalid)
+    ));
+    store
+        .record_checkpoint_measurement(
+            &session,
+            id,
+            1,
+            "lab",
+            DIGEST,
+            weights,
+            None,
+            None,
+            Some(tables),
+            2,
+        )
+        .unwrap();
+    let memory = frozen_memory(&store, &receipt);
+    let cache = capyctl_domain::disk_tables::SGLANG_TABLE_CACHE_BYTES;
+    assert_eq!(memory["weights_bytes"], json!(weights - (12 << 30) + cache));
+    assert_eq!(
+        memory["disk_tables"]["checkpoint_weights_bytes"],
+        json!(weights)
+    );
+    assert_eq!(
+        memory["disk_tables"]["tables"]["bytes"],
+        json!(12_i64 << 30)
+    );
+    assert_eq!(memory["disk_tables"]["cache_bytes"], json!(cache));
     store
         .accept_start(&session, &fence(&receipt), 100, 100_100)
         .unwrap();

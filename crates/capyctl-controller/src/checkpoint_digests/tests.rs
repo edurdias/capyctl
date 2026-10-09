@@ -152,6 +152,7 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
             state_slot_bytes: None,
             layout: None,
             provenance: DigestProvenance::Measured,
+            tables: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -671,6 +672,7 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
                 state_slot_bytes: None,
                 layout: None,
                 provenance: DigestProvenance::Measured,
+                tables: None,
             })
         }
     };
@@ -734,6 +736,7 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
                 state_slot_bytes: None,
                 layout: None,
                 provenance: DigestProvenance::Measured,
+                tables: None,
             })
         },
     )
@@ -766,6 +769,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                 state_slot_bytes: None,
                 layout: None,
                 provenance: DigestProvenance::Measured,
+                tables: None,
             })
         },
     )
@@ -807,6 +811,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                     state_slot_bytes: None,
                     layout: None,
                     provenance: DigestProvenance::Measured,
+                    tables: None,
                 })
             }
         },

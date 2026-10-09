@@ -325,6 +325,7 @@ impl Fixture {
                 checkpoint_weights_bytes: None,
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
+                checkpoint_tables: None,
                 startup_bytes: None,
             }),
         })

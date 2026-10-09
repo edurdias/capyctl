@@ -345,6 +345,19 @@ pub(super) fn declared_engine_config(
         None => (weights_bytes, None, None),
         Some(member) => member_facts(member)?,
     };
+    // ADR 0014 amendment A20: an engine that keeps the checkpoint's tables on
+    // disk records the whole checkpoint and its tables; `weights_bytes` is
+    // what stays in memory, re-derived from them.
+    let (weights_bytes, disk_tables) = match memory.get("disk_tables") {
+        None => (weights_bytes, None),
+        Some(recorded) => {
+            let (whole, tables) = disk_table_facts(recorded)?;
+            (
+                member_of.map_or(Some(whole), |_| weights_bytes),
+                Some(tables),
+            )
+        }
+    };
     Ok((
         Value::Object(block),
         provenance.contains_key("resources"),
@@ -353,6 +366,7 @@ pub(super) fn declared_engine_config(
             state_slot_bytes,
             layout,
             member_of,
+            disk_tables,
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),
@@ -422,6 +436,31 @@ fn member_facts(member: &Value) -> Result<MemberFacts, ConfigError> {
         }
     };
     Ok((weights, layout, Some(topology)))
+}
+
+/// ADR 0014 amendment A20: the whole checkpoint's weights and the tables a
+/// snapshot's `memory.disk_tables` records.
+fn disk_table_facts(
+    recorded: &Value,
+) -> Result<(i64, capyctl_domain::disk_tables::CheckpointTables), ConfigError> {
+    let bad = || invalid("snapshot.engine_config", "disk_tables invalid");
+    let bytes = |value: &Value, key: &str| value.get(key).and_then(Value::as_i64).ok_or_else(bad);
+    let whole = bytes(recorded, "checkpoint_weights_bytes")?;
+    let tables = recorded.get("tables").ok_or_else(bad)?;
+    let parsed = capyctl_domain::disk_tables::CheckpointTables {
+        bytes: bytes(tables, "bytes")?,
+        count: tables
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(bad)?,
+        sharded_bytes: bytes(tables, "sharded_bytes")?,
+        resident_largest_layer_bytes: bytes(tables, "resident_largest_layer_bytes")?,
+    };
+    if whole < 0 || !parsed.is_valid() {
+        return Err(bad());
+    }
+    Ok((whole, parsed))
 }
 
 fn quantity(value: &Value, suffix: &str) -> Result<String, ConfigError> {

@@ -23,11 +23,17 @@
 //! which shard them, and exact for TensorFold, which keeps the embeddings whole.
 //! When a model has fewer key-value heads than tensor-parallel ranks, vLLM and
 //! SGLang replicate its key and value projections; that case is not modeled.
+//!
+//! ADR 0014 amendment A20 (owner decision 2026-10-09): the same pass finds the
+//! tables an engine option can keep on disk (`disk_tables::is_table_tensor`),
+//! with their bytes, how many there are, what of them the layout splits, and
+//! the largest layer without them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
+pub use capyctl_domain::disk_tables::CheckpointTables;
 pub use capyctl_domain::member_weights::CheckpointLayout;
 use serde_json::Value;
 
@@ -38,6 +44,21 @@ const MAX_HEADER_BYTES: u64 = 100_000_000;
 /// directory level below (as the launch sizes its weights); `None` when it
 /// has none or one cannot be read.
 pub fn read_checkpoint_layout(root: &Path) -> Option<CheckpointLayout> {
+    read_header_facts(root).0
+}
+
+/// ADR 0014 amendment A20: the checkpoint's tables, from the same headers as
+/// its layout; `None` when it has none or a header cannot be read.
+pub fn read_checkpoint_tables(root: &Path) -> Option<CheckpointTables> {
+    read_header_facts(root).1
+}
+
+/// The layout and the tables from one read of the headers.
+pub fn read_header_facts(root: &Path) -> (Option<CheckpointLayout>, Option<CheckpointTables>) {
+    scan(root).unwrap_or((None, None))
+}
+
+fn scan(root: &Path) -> Option<(Option<CheckpointLayout>, Option<CheckpointTables>)> {
     let mut files = Vec::new();
     collect(root, 1, &mut files)?;
     if files.is_empty() {
@@ -45,12 +66,30 @@ pub fn read_checkpoint_layout(root: &Path) -> Option<CheckpointLayout> {
     }
     files.sort();
     let mut layers: BTreeMap<String, i64> = BTreeMap::new();
-    let mut sharded = 0i64;
+    let mut resident_layers: BTreeMap<String, i64> = BTreeMap::new();
+    let mut tables: BTreeSet<String> = BTreeSet::new();
+    let (mut sharded, mut table_bytes, mut table_sharded) = (0i64, 0i64, 0i64);
     for file in files {
-        for (name, bytes) in sharded_tensors(&read_header(&file)?)? {
+        for (name, bytes, dims) in tensors(&read_header(&file)?)? {
+            let table = capyctl_domain::disk_tables::table_of(name);
+            if let Some(table) = table {
+                table_bytes = table_bytes.checked_add(bytes)?;
+                if !tables.contains(table) {
+                    tables.insert(table.to_owned());
+                }
+            }
+            let Some(layer) = sharded_layer(name, dims) else {
+                continue;
+            };
             sharded = sharded.checked_add(bytes)?;
-            let total = layers.entry(name).or_default();
+            let total = layers.entry(layer.clone()).or_default();
             *total = total.checked_add(bytes)?;
+            let resident = resident_layers.entry(layer).or_default();
+            if table.is_some() {
+                table_sharded = table_sharded.checked_add(bytes)?;
+            } else {
+                *resident = resident.checked_add(bytes)?;
+            }
         }
     }
     let layout = CheckpointLayout {
@@ -58,7 +97,16 @@ pub fn read_checkpoint_layout(root: &Path) -> Option<CheckpointLayout> {
         layer_count: u32::try_from(layers.len()).ok()?,
         largest_layer_bytes: layers.values().copied().max().unwrap_or(0),
     };
-    layout.is_valid().then_some(layout)
+    let tables = CheckpointTables {
+        bytes: table_bytes,
+        count: u32::try_from(tables.len()).ok()?,
+        sharded_bytes: table_sharded,
+        resident_largest_layer_bytes: resident_layers.values().copied().max().unwrap_or(0),
+    };
+    Some((
+        layout.is_valid().then_some(layout),
+        tables.is_valid().then_some(tables),
+    ))
 }
 
 fn collect(dir: &Path, depth: u8, files: &mut Vec<std::path::PathBuf>) -> Option<()> {
@@ -92,9 +140,9 @@ fn read_header(path: &Path) -> Option<Value> {
     serde_json::from_slice(&header).ok()
 }
 
-/// Every sharded tensor of one header with its layer and its bytes; `None`
-/// for a header that is not a safetensors one.
-fn sharded_tensors(header: &Value) -> Option<Vec<(String, i64)>> {
+/// Every tensor of one header with its name, bytes and dimensions; `None` for
+/// a header that is not a safetensors one.
+fn tensors(header: &Value) -> Option<Vec<(&str, i64, usize)>> {
     let mut out = Vec::new();
     for (name, tensor) in header.as_object()? {
         if name == "__metadata__" {
@@ -106,9 +154,7 @@ fn sharded_tensors(header: &Value) -> Option<Vec<(String, i64)>> {
         };
         let bytes = end.checked_sub(start).filter(|bytes| *bytes >= 0)?;
         let dims = tensor.get("shape")?.as_array()?.len();
-        if let Some(layer) = sharded_layer(name, dims) {
-            out.push((layer, bytes));
-        }
+        out.push((name.as_str(), bytes, dims));
     }
     Some(out)
 }
@@ -203,6 +249,75 @@ mod tests {
                 largest_layer_bytes: 64,
             }
         );
+    }
+
+    // ADR 0014 amendment A20: the n-gram tables an engine option keeps on disk.
+    #[test]
+    fn tables_are_found_beside_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = "language_model.model.layers.0.ple.ple_embedding.ngram_embedding";
+        let (shard0, shard1, scale) = (
+            format!("{table}.shard_0.weight"),
+            format!("{table}.shard_1.weight"),
+            format!("{table}.weight_scale"),
+        );
+        write(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[
+                (
+                    "language_model.model.layers.0.self_attn.q_proj.weight",
+                    &[4, 4],
+                    32,
+                ),
+                (shard0.as_str(), &[8, 4], 200),
+                (shard1.as_str(), &[8, 4], 100),
+                (scale.as_str(), &[1], 2),
+            ],
+        );
+        write(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[
+                (
+                    "language_model.model.layers.1.self_attn.q_proj.weight",
+                    &[4, 4],
+                    48,
+                ),
+                (
+                    "ple.ple_embedding.ngram_embedding.shard_0.weight",
+                    &[8, 4],
+                    10,
+                ),
+            ],
+        );
+        let (layout, tables) = read_header_facts(dir.path());
+        assert_eq!(
+            layout,
+            Some(CheckpointLayout {
+                sharded_bytes: 32 + 300 + 48,
+                layer_count: 2,
+                largest_layer_bytes: 332,
+            })
+        );
+        assert_eq!(
+            tables,
+            Some(CheckpointTables {
+                bytes: 310,
+                count: 2,
+                sharded_bytes: 300,
+                resident_largest_layer_bytes: 48,
+            })
+        );
+        // A checkpoint without tables has none.
+        let plain = tempfile::tempdir().unwrap();
+        write(
+            plain.path(),
+            "model.safetensors",
+            &[("model.layers.0.mlp.up_proj.weight", &[4, 4], 32)],
+        );
+        assert_eq!(read_checkpoint_tables(plain.path()), None);
+        assert!(read_checkpoint_layout(plain.path()).is_some());
     }
 
     #[test]

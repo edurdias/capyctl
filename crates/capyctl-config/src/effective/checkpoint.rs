@@ -46,11 +46,17 @@ impl CheckpointLocation {
         crate::context_fit::sglang_state_slot_bytes(&self.checkpoint, self.sglang_args.as_ref()?)
     }
 
-    /// ADR 0028 §5 (amendment of 2026-10-07): how the checkpoint's weights
-    /// split across a group's ranks, from its safetensors headers; `None`
-    /// when it has none or one cannot be read.
-    pub fn layout(&self) -> Option<crate::checkpoint_layout::CheckpointLayout> {
-        crate::checkpoint_layout::read_checkpoint_layout(&self.checkpoint)
+    /// ADR 0028 §5 (amendment of 2026-10-07) and ADR 0014 amendment A20: how
+    /// the checkpoint's weights split across a group's ranks, and the tables
+    /// an engine option can keep on disk, from one read of its safetensors
+    /// headers; each `None` when it has none or a header cannot be read.
+    pub fn header_facts(
+        &self,
+    ) -> (
+        Option<crate::checkpoint_layout::CheckpointLayout>,
+        Option<crate::checkpoint_layout::CheckpointTables>,
+    ) {
+        crate::checkpoint_layout::read_header_facts(&self.checkpoint)
     }
 }
 
@@ -152,9 +158,26 @@ impl EffectiveDeployment {
     /// ADR 0028 §5 (amendment of 2026-10-07): the layout of this
     /// deployment's checkpoint, read on this machine.
     pub fn checkpoint_layout(&self) -> Option<crate::checkpoint_layout::CheckpointLayout> {
-        crate::checkpoint_layout::read_checkpoint_layout(Path::new(
-            self.model.resolved_path.as_deref()?,
-        ))
+        self.checkpoint_header_facts().0
+    }
+
+    /// ADR 0014 amendment A20: the tables of this deployment's checkpoint,
+    /// read on this machine.
+    pub fn checkpoint_tables(&self) -> Option<crate::checkpoint_layout::CheckpointTables> {
+        self.checkpoint_header_facts().1
+    }
+
+    /// The layout and the tables from one read of the checkpoint's headers.
+    pub fn checkpoint_header_facts(
+        &self,
+    ) -> (
+        Option<crate::checkpoint_layout::CheckpointLayout>,
+        Option<crate::checkpoint_layout::CheckpointTables>,
+    ) {
+        match self.model.resolved_path.as_deref() {
+            Some(path) => crate::checkpoint_layout::read_header_facts(Path::new(path)),
+            None => (None, None),
+        }
     }
 }
 

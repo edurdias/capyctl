@@ -584,6 +584,7 @@ async fn activate(
                 measured.state_slot_bytes,
                 measured.layout,
                 measured.provenance,
+                measured.tables,
                 capyctl_protocol::now_unix_ms(),
             )
             .map_err(|e| e.to_string())
@@ -1041,6 +1042,9 @@ fn launch_commands(
                 checkpoint_weights_bytes: memory.checkpoint_weights_bytes(),
                 checkpoint_state_slot_bytes: memory.state_slot_bytes,
                 checkpoint_layout: memory.member.and_then(|member| member.layout),
+                // ADR 0014 amendment A20: and the tables an engine that keeps
+                // them on disk was sized without.
+                checkpoint_tables: memory.disk_tables.map(|recorded| recorded.tables),
                 startup_bytes: None,
             };
             let command_id = if head {

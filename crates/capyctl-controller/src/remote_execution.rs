@@ -453,6 +453,9 @@ impl EngineAdapter for RemoteEngine {
         if plan.checkpoint_state_slot_bytes.is_some() {
             needs.push(capabilities::CHECKPOINT_STATE_SLOT);
         }
+        if plan.checkpoint_tables.is_some() {
+            needs.push(capabilities::CHECKPOINT_TABLES);
+        }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
@@ -1033,12 +1036,25 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             .unwrap_or_default();
         let plan = SingleLaunchPlan {
             // ADR 0014 §5: the host resolves with the facts this revision was
-            // frozen with, so both sides derive the same memory request.
-            checkpoint_weights_bytes: work.effective().engine_config.memory().weights_bytes,
+            // frozen with, so both sides derive the same memory request: the
+            // whole checkpoint's weights, which the host verifies.
+            checkpoint_weights_bytes: work
+                .effective()
+                .engine_config
+                .memory()
+                .checkpoint_weights_bytes(),
             // ADR 0014 amendment A16: and the hybrid state slot beside them.
             checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
             // ADR 0028 §5: a single-host launch holds the whole checkpoint.
             checkpoint_layout: None,
+            // ADR 0014 amendment A20: the tables an engine that keeps them on
+            // disk was sized without.
+            checkpoint_tables: work
+                .effective()
+                .engine_config
+                .memory()
+                .disk_tables
+                .map(|recorded| recorded.tables),
             // Owner decision 2026-09-23: the peak this launch reserved.
             startup_bytes: Some(work.startup_reservation().bytes),
             checkpoint_digest,
@@ -1296,6 +1312,7 @@ mod tests {
                 checkpoint_weights_bytes: None,
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
+                checkpoint_tables: None,
                 startup_bytes: None,
             },
             ingress_gate_key: [7; 32],

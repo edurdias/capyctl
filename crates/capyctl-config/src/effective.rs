@@ -1151,6 +1151,13 @@ const SGLANG_SPECULATIVE_HOST_BACKED: &str =
     host RAM and the draft model has no copy there; use deep (the weights stay resident) or \
     restart_only";
 
+/// ADR 0014 amendment A20: the memory charged for SGLang's file-backed table
+/// assumes SGLang's default budget for the part of it held in memory.
+const SGLANG_TABLE_BUDGET_SET: &str =
+    "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB changes how much of the on-disk table SGLang keeps in \
+    memory, and capyctl charges memory for its default of 8 GiB; remove the variable, or drop \
+    `--ple-offload-backend file` to keep the table in memory";
+
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
     path: &str,
@@ -1300,17 +1307,16 @@ pub fn resolve_effective_with_checkpoint(
     // is named in the provenance so a re-resolution with the measured weights
     // chooses again (ADR 0014 §7).
     let residency_defaulted = d.residency.is_none();
+    let engine_args: Vec<String> = raw_profile
+        .args
+        .iter()
+        .chain(d.engine_config.extra_args())
+        .cloned()
+        .collect();
     // ADR 0014 amendments A15 and A17: SGLang parks a speculative deployment
     // with its weights resident, never through the host-RAM tier.
     let sglang_speculative = raw_profile.engine == Engine::Sglang
-        && crate::engine_policy::sglang_speculative(
-            &raw_profile
-                .args
-                .iter()
-                .chain(d.engine_config.extra_args())
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        && crate::engine_policy::sglang_speculative(&engine_args);
     if sglang_speculative && d.residency == Some(Residency::HostBacked) {
         return Err(ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
@@ -1330,23 +1336,63 @@ pub fn resolve_effective_with_checkpoint(
         .map(|group| group.topology)
         .or(facts.member_of)
         .filter(|topology| topology.world_size() > 1 && d.resources.is_none());
-    let sizing = match member_of {
-        Some(topology) => CheckpointFacts {
-            weights_bytes: facts
-                .weights_bytes
-                .map(|weights| {
-                    capyctl_domain::member_weights::member_weights_bytes(
-                        weights,
-                        facts.layout.as_ref(),
-                        topology.tensor_parallel,
-                        topology.pipeline_parallel,
-                    )
-                    .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))
-                })
-                .transpose()?,
-            ..facts
-        },
-        None => facts,
+    let overflow = || invalid("engine_config.memory", "memory arithmetic overflows");
+    // ADR 0014 amendment A20 (owner decision 2026-10-09): an engine whose
+    // arguments keep the checkpoint's tables on disk holds the rest of the
+    // weights (a member: its share of them) and its cache of the tables. The
+    // tables count against the models disk, which already holds the files.
+    // Without the option, or without tables, nothing here changes.
+    let table_cache =
+        crate::engine_policy::disk_table_cache_bytes(raw_profile.engine, &engine_args);
+    if table_cache.is_some()
+        && raw_profile.engine == Engine::Sglang
+        && [&raw_profile.env, d.engine_config.env()]
+            .iter()
+            .any(|env| env.contains_key(crate::engine_policy::SGLANG_TABLE_BUDGET_ENV))
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "engine_config.env",
+            SGLANG_TABLE_BUDGET_SET,
+        ));
+    }
+    let (tensor_parallel, pipeline_parallel) = member_of.map_or((1, 1), |topology| {
+        (topology.tensor_parallel, topology.pipeline_parallel)
+    });
+    let mut disk_tables = None;
+    let weights_bytes = match (facts.weights_bytes, table_cache, facts.disk_tables) {
+        (Some(weights), Some(cache), Some(tables)) => {
+            let (memory, cache_bytes) = capyctl_domain::disk_tables::disk_table_weights_bytes(
+                weights,
+                facts.layout.as_ref(),
+                &tables,
+                tensor_parallel,
+                pipeline_parallel,
+                cache,
+            )
+            .ok_or_else(overflow)?;
+            disk_tables = Some(capyctl_domain::disk_tables::DiskTables {
+                checkpoint_weights_bytes: weights,
+                tables,
+                cache_bytes,
+            });
+            Some(memory)
+        }
+        (weights, ..) => weights
+            .map(|weights| {
+                capyctl_domain::member_weights::member_weights_bytes(
+                    weights,
+                    facts.layout.as_ref(),
+                    tensor_parallel,
+                    pipeline_parallel,
+                )
+                .ok_or_else(overflow)
+            })
+            .transpose()?,
+    };
+    let sizing = CheckpointFacts {
+        weights_bytes,
+        ..facts
     };
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
@@ -1458,6 +1504,7 @@ pub fn resolve_effective_with_checkpoint(
             layout: facts.layout.filter(|_| known),
         });
     }
+    engine_config.memory_mut().disk_tables = disk_tables;
     {
         // T14: what capyctl chose is named as its default, so a snapshot
         // re-resolution chooses it again rather than restating it.

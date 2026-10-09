@@ -226,6 +226,17 @@ For a group launch CapyCTL sets `GLOO_SOCKET_IFNAME` to the interface that
 holds the member's peer address. It sets no `NCCL_*` variable and passes none
 through, so there is no NCCL tuning setting.
 
+### Tables kept on disk
+
+Some engine options leave part of a model on disk instead of in memory. With SGLang's
+`--ple-offload-backend file` or TensorFold's `--ple-on-ssd` in `engine_config.extra_args`
+(with `accept_extra_args: true`) or in the engine's own arguments, CapyCTL charges the
+n-gram table of a model such as Qwen3.8-Flash-Next against the models disk, and only the
+engine's in-memory cache of it (8 GiB for SGLang, 1 GiB for TensorFold) against memory. vLLM
+has no such option. CapyCTL assumes SGLang's default cache size, so a deployment that also
+sets `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB` is refused. SGLang writes its own copy of the table
+under its cache directory, which CapyCTL does not count.
+
 ## Engine environment
 
 Engine variables come from two places: the engine profile (every launch with

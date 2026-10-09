@@ -82,6 +82,12 @@ pub const ENGINE_GROUPS: &str = "engine_groups";
 /// `engine_log` evidence. A host that did not declare it is refused
 /// `host_capability_missing:engine_log_tail` and sent nothing.
 pub const ENGINE_LOG_TAIL: &str = "engine_log_tail";
+/// ADR 0014 amendment A20 (owner decision 2026-10-09): a LaunchSingle plan's
+/// `checkpoint_tables` (and `CheckpointDigestEvidence.tables` from the host),
+/// sent only when the engine keeps the checkpoint's tables on disk. A host
+/// without it is refused `host_capability_missing:checkpoint_tables` for such
+/// a launch before anything is sent; every other launch needs nothing.
+pub const CHECKPOINT_TABLES: &str = "checkpoint_tables";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -123,6 +129,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_STATE_SLOT, Direction::ServerToHost),
     (ENGINE_GROUPS, Direction::ServerToHost),
     (ENGINE_LOG_TAIL, Direction::ServerToHost),
+    (CHECKPOINT_TABLES, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -192,6 +199,9 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             if plan.checkpoint_layout.is_some() {
                 needs.push(ENGINE_GROUPS);
             }
+            if plan.checkpoint_tables.is_some() {
+                needs.push(CHECKPOINT_TABLES);
+            }
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
         Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
@@ -222,6 +232,15 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     // completion probe's token bound and answer a readiness probe instead.
     if command.probe_max_tokens != 0 {
         needs.push(ENGINE_GROUPS);
+    }
+    // ADR 0014 amendment A20: a group member's own launch carries the tables
+    // as a single launch does.
+    if command
+        .group_member_launch
+        .as_ref()
+        .is_some_and(|plan| plan.checkpoint_tables.is_some())
+    {
+        needs.push(CHECKPOINT_TABLES);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
     needs

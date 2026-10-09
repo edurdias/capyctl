@@ -56,6 +56,9 @@ pub struct Measured {
     /// ADR 0014 §7 (amendment of 2026-10-08): where the host's file hashes
     /// came from; recorded with the digest and shown by status.
     pub provenance: capyctl_config::effective::DigestProvenance,
+    /// ADR 0014 amendment A20: the checkpoint's tables, which an engine that
+    /// keeps them on disk is sized without.
+    pub tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
 }
 
 /// Why a measurement produced no digest.
@@ -105,6 +108,10 @@ pub fn measured_from(result: &pb::MemberExecutionResult) -> Result<Measured, Mea
                 .and_then(capyctl_protocol::execution::layout_from_wire),
             provenance: capyctl_config::effective::DigestProvenance::parse(&evidence.provenance)
                 .ok_or(MeasureError::Unavailable)?,
+            tables: evidence
+                .tables
+                .as_ref()
+                .and_then(capyctl_protocol::execution::tables_from_wire),
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
@@ -147,6 +154,7 @@ pub fn record(
             measured.state_slot_bytes,
             measured.layout,
             measured.provenance,
+            measured.tables,
             capyctl_protocol::now_unix_ms(),
         )
         .map_err(|_| MeasureError::Unavailable)
@@ -425,12 +433,13 @@ impl LocalDigests {
 }
 
 /// The checkpoint's verification, its weights with the draft model's, its
-/// hybrid state slot and its layout.
+/// hybrid state slot, its layout and its tables.
 type LocalMeasurement = (
     capyctl_agent::checkpoint::Verification,
     i64,
     Option<i64>,
     Option<capyctl_domain::member_weights::CheckpointLayout>,
+    Option<capyctl_domain::disk_tables::CheckpointTables>,
 );
 
 /// Measure an effective revision's checkpoint on this machine, with the
@@ -461,11 +470,13 @@ async fn measure_locally(
             .drafter_weights(drafter.as_ref())?
             .checked_add(verified.manifest.weights_bytes)
             .ok_or(capyctl_agent::checkpoint::CheckpointError::TooLarge)?;
+        let (layout, tables) = effective.checkpoint_header_facts();
         Ok((
             verified,
             weights,
             effective.state_slot_bytes(),
-            effective.checkpoint_layout(),
+            layout,
+            tables.filter(|tables| tables.bytes <= weights),
         ))
     })
     .await
@@ -482,7 +493,7 @@ impl DigestSource for LocalDigests {
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {
         let checkpoints = self.checkpoints.clone();
         Box::pin(async move {
-            let (verified, weights_bytes, state_slot_bytes, layout) =
+            let (verified, weights_bytes, state_slot_bytes, layout, tables) =
                 measure_locally(checkpoints, &pending.effective).await?;
             Ok(Measured {
                 digest: verified.manifest.digest,
@@ -490,6 +501,7 @@ impl DigestSource for LocalDigests {
                 state_slot_bytes,
                 layout,
                 provenance: verified.provenance,
+                tables,
             })
         })
     }
@@ -744,7 +756,7 @@ impl CheckpointGate {
                 .recorded_checkpoint(&self.deployment_id, self.revision)
                 .map_err(|_| unrecorded())?
         };
-        let (measured, weights_bytes, state_slot_bytes, layout) =
+        let (measured, weights_bytes, state_slot_bytes, layout, tables) =
             measure_locally(self.checkpoints.clone(), &self.effective)
                 .await
                 .map_err(|error| match error {
@@ -766,6 +778,7 @@ impl CheckpointGate {
                         state_slot_bytes,
                         layout,
                         provenance: measured.provenance,
+                        tables,
                     },
                 )
                 .map_err(|_| unrecorded())?;
