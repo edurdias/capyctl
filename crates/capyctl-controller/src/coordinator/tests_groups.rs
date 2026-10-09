@@ -4087,13 +4087,20 @@ async fn a_resident_rank_is_never_charged_its_parked_budget() {
     let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
     let g = world.id("g");
     world.group.sleep_leaves_rank_resident(1);
-    let err = world.park("g").await.unwrap_err();
+    // The failed park has the group stop accepted before it reports, so a
+    // charge read after the report races that stop's release. The stop is
+    // refused while commands are held (R42 retries it): until then nothing
+    // can have proven rank 1 gone, and its charge is read in that window.
+    let before = world.issue_park("g");
+    let busy = world.hold_commands();
+    let err = world.park_concluded("g", before).await.unwrap_err();
     assert_eq!(err, GroupResidencyError::MemberResident { rank: 1 });
     assert_eq!(
         world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
         world.member_request()
     );
     assert_ne!(world.state("g").await, "parked");
+    drop(busy);
     world.wait_settled_generation("g", 1).await;
     world.assert_release_evidence_per_member("g");
     assert_eq!(

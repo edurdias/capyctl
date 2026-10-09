@@ -1013,11 +1013,18 @@ async fn stop_racing_completion_cannot_publish_ready() {
 async fn corrupt_store_after_effect_halts_later_increases_and_retains_arm() {
     let (dir, owner, fence, observations) = setup().await;
     let gate = Gate::new(false);
+    // ADR 0015: with one activation slot, `b` waits for `a`'s, so it is an
+    // increase that can only be sent after `a`'s failed write. With more
+    // slots `b` is armed and sent beside `a` whenever the scheduler reaches
+    // it before that write fails.
     let w = worker(
         owner.clone(),
         observations,
         gate.clone(),
-        CoordinatorOptions::default(),
+        CoordinatorOptions {
+            max_concurrent_effects: 1,
+            ..Default::default()
+        },
     );
     let a = w.start(&fence, 10000).unwrap();
     gate.entered().await;
