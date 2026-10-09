@@ -551,6 +551,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             escalated: false,
             probe_tokens: Vec::new(),
             engine_log: None,
+            probe_text: String::new(),
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }

@@ -41,6 +41,8 @@ pub mod serving;
 pub mod snapshot;
 // W10 gaps: dispatch closure reasons, switch in progress, warm residency.
 pub mod switch_state;
+// Owner decision 2026-10-09: single-launch wake canary references.
+pub mod wake_canary;
 // SPEC §6.3 (W6): `delete deployment` after verified cleanup, leaving a tombstone.
 pub mod delete;
 

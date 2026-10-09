@@ -25,6 +25,8 @@ pub mod group_activation;
 pub mod group_residency;
 // ADR 0028 §11: whole-group stop, per-host settlement, uncertain members.
 pub mod group_settlement;
+// Owner decision 2026-10-09: a single launch's wake canary.
+pub mod wake_canary;
 // ADR 0028 §6: a group's weights on every host and cross-host digest agreement.
 pub mod group_sources;
 // ADR 0028 §11 (decided 2026-10-06): a stalled group request probes the head once.

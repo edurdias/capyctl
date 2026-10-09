@@ -49,6 +49,12 @@ NAME       STATE   READY   REVISION   HOSTS
 my-model   ready   1/1     1          gpu-box
 ```
 
+Before a woken vLLM or SGLang model serves again, CapyCTL asks it a fixed
+prompt and compares the answer with the one it gave when it first became
+ready. A different answer means its weights did not come back intact: the
+wake fails with `wake_mismatch` and CapyCTL stops the model instead of serving
+wrong answers ([Errors](errors.md)).
+
 ## Switch between models
 
 When a model needs memory that another one holds, CapyCTL parks the idle one.

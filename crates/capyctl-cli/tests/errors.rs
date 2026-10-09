@@ -400,6 +400,7 @@ fn group_status_codes_have_no_exit() {
         "group_member_failed",
         "group_member_uncertain",
         "group_wake_mismatch",
+        "wake_mismatch",
         "group_stalled",
     ] {
         for (carrier, exit) in [("operation_failed", 13), ("invalid_config", 2)] {

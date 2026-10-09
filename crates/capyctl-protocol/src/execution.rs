@@ -852,6 +852,10 @@ pub const MAX_KERNEL_BUILDS: usize = 64;
 /// short, bounded request either way.
 pub const MAX_PROBE_TOKENS: u32 = 64;
 
+/// Owner decision 2026-10-09: the longest generated text a completion probe
+/// result may carry, in bytes (the adapters' `completion_probe::MAX_TEXT`).
+pub const PROBE_TEXT_MAX_BYTES: usize = 4096;
+
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
 pub fn validate_result(
@@ -915,6 +919,20 @@ pub fn validate_result(
         if result.probe_tokens.len() > asked {
             return Err(GroupIdentityError);
         }
+    }
+    // Owner decision 2026-10-09: generated text answers a completed
+    // completion probe only, bounded.
+    if !result.probe_text.is_empty()
+        && !(matches!(
+            command.action,
+            MemberAction::Probe {
+                max_tokens: Some(_),
+                ..
+            }
+        ) && result.state == "completed"
+            && result.probe_text.len() <= PROBE_TEXT_MAX_BYTES)
+    {
+        return Err(GroupIdentityError);
     }
     // A probe, park or restore reports on exactly the launch it names, whatever
     // the outcome.

@@ -625,6 +625,11 @@ message MemberExecutionResult {
   repeated uint32 probe_tokens = 17;
   // SPEC §13.3 / T21 (additive): EngineLogTail results only.
   EngineLogTailEvidence engine_log = 18;
+  // Owner decision 2026-10-09 (additive): a completed completion probe only,
+  // the text the engine generated, at most 4096 bytes. It lets a single
+  // launch's wake canary compare text when the engine answers no token ids.
+  // Empty otherwise, which encodes exactly as before.
+  string probe_text = 19;
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;

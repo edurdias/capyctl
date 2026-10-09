@@ -508,6 +508,15 @@ impl Scheduler {
         {
             shared.changed.notify_waiters();
         }
+        // Owner decision 2026-10-09: a single launch whose wake canary
+        // differed (`wake_mismatch`) owes a stop; one not accepted yet is
+        // retried every pass, its dispatch closed and its memory charged.
+        if super::retry_wake_mismatch_stops(&shared)
+            .await
+            .map_err(failed)?
+        {
+            shared.changed.notify_waiters();
+        }
         // Owner decision 2026-09-22: a drain Stop that expired, never armed,
         // while its host was offline is closed as expired and issued afresh
         // once the host is back. ADR 0015: that closes a planned cleanup, so it

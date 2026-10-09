@@ -641,6 +641,75 @@ impl EngineAdapter for RemoteEngine {
                 )
             })
     }
+    /// Owner decision 2026-10-09: the wake canary of a remote single launch.
+    /// One completion probe (ADR 0028 §9) of the launch this binding owns,
+    /// which the host's agent runs on loopback against its retained launch
+    /// with the launch's own key, never through ingress or the router. A host
+    /// whose session does not declare completion probes (`engine_groups`) is
+    /// sent nothing (`Unsupported`): it keeps the wake checks it had.
+    async fn wake_canary(
+        &self,
+        c: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, RuntimeError> {
+        let b = &self.binding;
+        if c.binding_id != b.plan.binding_id || c.incarnation != b.plan.incarnation {
+            return Err(RuntimeError::StaleRevision);
+        }
+        if !self
+            .sessions
+            .supports(&b.host_id, capabilities::ENGINE_GROUPS)
+        {
+            return Err(RuntimeError::Unsupported);
+        }
+        let id = ulid::Ulid::new().to_string();
+        let mut command = MemberCommand {
+            identity: CommandIdentity {
+                controller_id: b.controller_id.clone(),
+                member: MemberKey {
+                    host_id: b.host_id.clone(),
+                    member_id: b.member_id.clone(),
+                },
+                deployment_id: c.token.deployment_id.clone(),
+                operation_id: c.token.operation_id.clone(),
+                command_id: id.clone(),
+                step_id: id,
+                generation: c.token.generation,
+                revision: c.token.revision,
+                deadline_ms: capyctl_protocol::now_unix_ms()
+                    .saturating_add(i64::try_from(bound.as_millis()).unwrap_or(i64::MAX)),
+                payload_digest: [0; 32],
+                expected_state: "ready".into(),
+                profile_fingerprint: b.profile_fingerprint.clone(),
+                instance_index: b.instance_index,
+            },
+            action: MemberAction::Probe {
+                owned_handle: b.launch_command_id.clone(),
+                max_tokens: Some(max_tokens),
+            },
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        let result = tokio::time::timeout(bound, self.sessions.execute(command))
+            .await
+            .map_err(|_| {
+                RuntimeError::Uncertain("the wake canary was not answered in time".into())
+            })?
+            .map_err(|_| {
+                RuntimeError::Uncertain("the host did not answer the wake canary".into())
+            })?;
+        if result.state != "completed"
+            || (result.probe_tokens.is_empty() && result.probe_text.is_empty())
+        {
+            return Err(RuntimeError::Uncertain(
+                "the engine generated nothing for the wake canary".into(),
+            ));
+        }
+        Ok(capyctl_adapters::completion_probe::ProbeAnswer {
+            tokens: result.probe_tokens,
+            text: result.probe_text,
+        })
+    }
 }
 async fn cleanup(
     sessions: &AgentSessions,

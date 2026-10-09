@@ -226,6 +226,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         escalated: false,
         probe_tokens: Vec::new(),
         engine_log: None,
+        probe_text: String::new(),
     }
 }
 
@@ -809,4 +810,34 @@ fn probe_tokens_answer_a_completion_probe_only() {
     assert!(validate_result(&plain, &answer(&plain, vec![7])).is_err());
     let parked = park("launch");
     assert!(validate_result(&parked, &answer(&parked, vec![7])).is_err());
+}
+
+// T20 (owner decision 2026-10-09): generated text answers a completed
+// completion probe only, bounded.
+#[test]
+fn probe_text_answers_a_completion_probe_only() {
+    let answer = |command: &MemberCommand, text: String| pb::MemberExecutionResult {
+        identity: command.to_wire().identity,
+        state: "completed".into(),
+        owned_handle: "launch".into(),
+        observed_at_unix_ms: 1,
+        claim_retained: true,
+        binding_id: "binding".into(),
+        incarnation: "incarnation".into(),
+        probe_text: text,
+        ..Default::default()
+    };
+    let probe = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: Some(8),
+    });
+    validate_result(&probe, &answer(&probe, "Ready.".into())).unwrap();
+    let max = capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES;
+    validate_result(&probe, &answer(&probe, "x".repeat(max))).unwrap();
+    assert!(validate_result(&probe, &answer(&probe, "x".repeat(max + 1))).is_err());
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+    });
+    assert!(validate_result(&plain, &answer(&plain, "Ready.".into())).is_err());
 }

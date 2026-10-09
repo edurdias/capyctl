@@ -1010,6 +1010,29 @@ DROP TABLE model_sources;
 ALTER TABLE model_sources_v47 RENAME TO model_sources;
 "#;
 
+/// v48 (owner decision 2026-10-09): the wake canary reference of one single
+/// launch (an instance's generation and the launch's incarnation), recorded
+/// at its first readiness: the probe's fixed prompt, the token ids it
+/// generated (JSON, possibly empty) and its text (possibly empty).
+/// `mismatch_operation_id` names the wake whose canary differed
+/// (`wake_mismatch`), which owes the instance's stop. Only an instance's
+/// latest launch is kept. Additive and forward-only.
+pub const SCHEMA_V48: &str = r#"
+CREATE TABLE IF NOT EXISTS wake_canaries(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  incarnation TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  tokens_json TEXT NOT NULL,
+  text TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  mismatch_operation_id TEXT,
+  CHECK(tokens_json<>'[]' OR text<>''),
+  PRIMARY KEY(deployment_id,instance_index,generation)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

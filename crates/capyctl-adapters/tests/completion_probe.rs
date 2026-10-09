@@ -1,7 +1,8 @@
 //! ADR 0028 §9 (decided 2026-10-06): the completion probe, one per engine.
 //! Each adapter asks its engine for the generated token ids in its own request
-//! form, on the launch's own endpoint with its own key; an answer without them
-//! is a failed probe. Against local stand-ins only: nothing here shows that a
+//! form, on the launch's own endpoint with its own key, and answers them with
+//! the generated text (owner decision 2026-10-09); an answer with neither is
+//! a failed probe. Against local stand-ins only: nothing here shows that a
 //! native engine answers in this form (the live MN rows do).
 
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,7 @@ use axum::{
     response::IntoResponse,
     Router,
 };
-use capyctl_adapters::completion_probe::PROMPT;
+use capyctl_adapters::completion_probe::{ProbeAnswer, PROMPT};
 use capyctl_adapters::sglang::SglangAdapter;
 use capyctl_adapters::tensorfold::TensorfoldAdapter;
 use capyctl_adapters::traits::ChatForward;
@@ -105,8 +106,11 @@ async fn vllm_asks_for_token_ids_on_its_completions_route() {
         "toy".into(),
     );
     assert_eq!(
-        adapter.complete_token_ids("toy", 2, BOUND).await.unwrap(),
-        vec![7, 8]
+        adapter.complete_probe("toy", 2, BOUND).await.unwrap(),
+        ProbeAnswer {
+            tokens: vec![7, 8],
+            text: "ok".into()
+        }
     );
     let seen = seen.0.lock().unwrap().clone();
     let (path, key, body) = &seen[0];
@@ -117,8 +121,24 @@ async fn vllm_asks_for_token_ids_on_its_completions_route() {
         &json!({"model": "toy", "prompt": PROMPT, "max_tokens": 2, "temperature": 0,
                 "stream": false, "return_token_ids": true})
     );
-    // A completion without token ids is a failed probe.
+    // Owner decision 2026-10-09: a completion without token ids answers its
+    // text alone; one with neither is a failed probe.
     let (endpoint, _) = engine(json!({"choices": [{"text": "ok"}]})).await;
+    let textual = VllmAdapter::new(
+        endpoint.parse().unwrap(),
+        Some("inference-secret".into()),
+        "vllm-test-1".into(),
+        ParkPolicy::Disabled,
+        "toy".into(),
+    );
+    assert_eq!(
+        textual.complete_probe("toy", 2, BOUND).await.unwrap(),
+        ProbeAnswer {
+            tokens: vec![],
+            text: "ok".into()
+        }
+    );
+    let (endpoint, _) = engine(json!({"choices": [{"text": ""}]})).await;
     let silent = VllmAdapter::new(
         endpoint.parse().unwrap(),
         Some("inference-secret".into()),
@@ -126,7 +146,7 @@ async fn vllm_asks_for_token_ids_on_its_completions_route() {
         ParkPolicy::Disabled,
         "toy".into(),
     );
-    assert!(silent.complete_token_ids("toy", 2, BOUND).await.is_err());
+    assert!(silent.complete_probe("toy", 2, BOUND).await.is_err());
 }
 
 // T30 (decided 2026-10-06): SGLang is asked on its native `/generate` with
@@ -137,7 +157,11 @@ async fn sglang_asks_for_output_ids_on_generate() {
     let adapter =
         sglang(endpoint).with_credentials("inference-secret".into(), "admin-secret".into());
     assert_eq!(
-        adapter.complete_token_ids("toy", 1, BOUND).await.unwrap(),
+        adapter
+            .complete_probe("toy", 1, BOUND)
+            .await
+            .unwrap()
+            .tokens,
         vec![9]
     );
     let seen = seen.0.lock().unwrap().clone();
@@ -152,7 +176,7 @@ async fn sglang_asks_for_output_ids_on_generate() {
     // An adapter without the launch's credentials cannot probe at all.
     let (endpoint, seen) = engine(json!({"output_ids": [9]})).await;
     assert!(sglang(endpoint)
-        .complete_token_ids("toy", 1, BOUND)
+        .complete_probe("toy", 1, BOUND)
         .await
         .is_err());
     assert!(seen.0.lock().unwrap().is_empty());
@@ -165,7 +189,11 @@ async fn tensorfold_asks_for_token_ids_without_a_key() {
     let (endpoint, seen) = engine(json!({"choices": [{"token_ids": [3]}]})).await;
     let adapter = TensorfoldAdapter::new(endpoint.parse().unwrap(), "0.6.0".into(), "toy".into());
     assert_eq!(
-        adapter.complete_token_ids("toy", 1, BOUND).await.unwrap(),
+        adapter
+            .complete_probe("toy", 1, BOUND)
+            .await
+            .unwrap()
+            .tokens,
         vec![3]
     );
     let seen = seen.0.lock().unwrap().clone();

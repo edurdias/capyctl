@@ -1,11 +1,14 @@
 //! ADR 0028 §9 (decided 2026-10-06): the completion probe's request forms.
 //!
 //! One probe function serves a group's readiness (1 token), the wake canary
-//! (8 tokens) and the request-stall check: one non-streaming completion of a
-//! fixed prompt at temperature 0, sent by the host agent to the retained
-//! launch's own loopback endpoint with its own key (ADR 0012), never through
-//! ingress or the router. Each engine is asked for the generated token ids in
-//! its own request form; an answer without them is a failed probe.
+//! (8 tokens, groups and single launches alike) and the request-stall check:
+//! one non-streaming completion of a fixed prompt at temperature 0, sent by
+//! the host agent to the retained launch's own loopback endpoint with its own
+//! key (ADR 0012), never through ingress or the router. Each engine is asked
+//! for the generated token ids in its own request form. Owner decision
+//! 2026-10-09: the answer also carries the generated text, so a single
+//! launch's wake canary still compares something when an engine answers no
+//! token ids. A group probe still needs the token ids.
 use serde_json::{json, Value};
 
 use crate::traits::AdapterError;
@@ -16,6 +19,19 @@ pub const PROMPT: &str = "Say ready.";
 
 /// The largest probe answer read; a few token ids are a small body.
 pub(crate) const MAX_BODY: usize = 256 * 1024;
+
+/// The longest generated text a probe answer keeps, in bytes. A few tokens
+/// are far shorter; a longer answer is refused, never cut.
+pub const MAX_TEXT: usize = 4096;
+
+/// What one completion probe generated: the token ids when the engine
+/// answered them (else empty) and the generated text (possibly empty). At
+/// least one of the two is non-empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProbeAnswer {
+    pub tokens: Vec<u32>,
+    pub text: String,
+}
 
 /// vLLM and TensorFold: OpenAI `/v1/completions` asking for the token ids
 /// (`return_token_ids`), answered in `choices[0].token_ids`.
@@ -32,8 +48,9 @@ pub(crate) fn openai_request(served: &str, max_tokens: u32) -> Value {
     })
 }
 
-pub(crate) fn openai_token_ids(answer: &Value) -> Result<Vec<u32>, AdapterError> {
-    token_ids(&answer["choices"][0]["token_ids"])
+pub(crate) fn openai_answer(answer: &Value) -> Result<ProbeAnswer, AdapterError> {
+    let choice = &answer["choices"][0];
+    probe_answer(&choice["token_ids"], &choice["text"])
 }
 
 /// SGLang: its native `/generate`, answered in `output_ids`.
@@ -47,24 +64,35 @@ pub(crate) fn sglang_request(max_tokens: u32) -> Value {
     })
 }
 
-pub(crate) fn sglang_token_ids(answer: &Value) -> Result<Vec<u32>, AdapterError> {
-    token_ids(&answer["output_ids"])
+pub(crate) fn sglang_answer(answer: &Value) -> Result<ProbeAnswer, AdapterError> {
+    probe_answer(&answer["output_ids"], &answer["text"])
 }
 
-/// A non-empty array of token ids, each a `u32`.
-fn token_ids(value: &Value) -> Result<Vec<u32>, AdapterError> {
-    let missing = || AdapterError::Uncertain("the completion answered no token ids".into());
-    let ids = value
-        .as_array()
-        .ok_or_else(missing)?
-        .iter()
-        .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
-        .collect::<Option<Vec<u32>>>()
-        .ok_or_else(missing)?;
-    if ids.is_empty() {
-        return Err(missing());
+/// The token ids when present (a non-empty array of `u32`; present but
+/// malformed is an error), and the text when present. An answer with
+/// neither, or with a text longer than [`MAX_TEXT`], is an error.
+fn probe_answer(ids: &Value, text: &Value) -> Result<ProbeAnswer, AdapterError> {
+    let failed = |what: &str| AdapterError::Uncertain(format!("the completion answered {what}"));
+    let tokens = match ids {
+        Value::Null => Vec::new(),
+        Value::Array(ids) => ids
+            .iter()
+            .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+            .collect::<Option<Vec<u32>>>()
+            .ok_or_else(|| failed("malformed token ids"))?,
+        _ => return Err(failed("malformed token ids")),
+    };
+    let text = text.as_str().unwrap_or_default();
+    if text.len() > MAX_TEXT {
+        return Err(failed("too long a text"));
     }
-    Ok(ids)
+    if tokens.is_empty() && text.is_empty() {
+        return Err(failed("no token ids and no text"));
+    }
+    Ok(ProbeAnswer {
+        tokens,
+        text: text.to_owned(),
+    })
 }
 
 /// Post `body` to `url` with `key` (none for TensorFold, ADR 0023 §3),
@@ -106,8 +134,9 @@ pub(crate) fn bearer(key: &str) -> Option<reqwest::header::HeaderValue> {
 mod tests {
     use super::*;
 
-    // T30 (decided 2026-10-06): each request form asks for the token ids at
-    // temperature 0 and a bounded length; only an answer with ids passes.
+    // T30 (decided 2026-10-06; text fallback, owner decision 2026-10-09):
+    // each request form asks for the token ids at temperature 0 and a bounded
+    // length; an answer passes with its ids, or with its text alone.
     #[test]
     fn request_forms_and_answers_are_pinned() {
         let openai = openai_request("served", 1);
@@ -120,22 +149,37 @@ mod tests {
         assert_eq!(sglang["text"], PROMPT);
         assert_eq!(sglang["sampling_params"]["max_new_tokens"], 8);
         assert_eq!(sglang["sampling_params"]["temperature"], 0);
+        let answer = |tokens: Vec<u32>, text: &str| ProbeAnswer {
+            tokens,
+            text: text.into(),
+        };
         assert_eq!(
-            openai_token_ids(&json!({"choices": [{"text": "ok", "token_ids": [7, 8]}]})).unwrap(),
-            vec![7, 8]
+            openai_answer(&json!({"choices": [{"text": "ok", "token_ids": [7, 8]}]})).unwrap(),
+            answer(vec![7, 8], "ok")
         );
         assert_eq!(
-            sglang_token_ids(&json!({"text": "ok", "output_ids": [9]})).unwrap(),
-            vec![9]
+            sglang_answer(&json!({"text": "ok", "output_ids": [9]})).unwrap(),
+            answer(vec![9], "ok")
+        );
+        // An engine that answers no token ids still answers its text.
+        assert_eq!(
+            openai_answer(&json!({"choices": [{"text": "ok"}]})).unwrap(),
+            answer(vec![], "ok")
+        );
+        assert_eq!(
+            sglang_answer(&json!({"text": "ok"})).unwrap(),
+            answer(vec![], "ok")
         );
         for bad in [
-            json!({"choices": [{"text": "ok"}]}),
             json!({"choices": [{"token_ids": []}]}),
-            json!({"choices": [{"token_ids": [-1]}]}),
-            json!({"choices": [{"token_ids": ["7"]}]}),
+            json!({"choices": [{"text": "ok", "token_ids": [-1]}]}),
+            json!({"choices": [{"text": "ok", "token_ids": ["7"]}]}),
+            json!({"choices": [{"text": "ok", "token_ids": "7"}]}),
+            json!({"choices": [{"text": "x".repeat(MAX_TEXT + 1)}]}),
+            json!({}),
         ] {
-            assert!(openai_token_ids(&bad).is_err(), "{bad}");
+            assert!(openai_answer(&bad).is_err(), "{bad}");
         }
-        assert!(sglang_token_ids(&json!({"text": "ok"})).is_err());
+        assert!(sglang_answer(&json!({"output_ids": []})).is_err());
     }
 }

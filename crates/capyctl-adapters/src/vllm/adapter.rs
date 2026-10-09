@@ -542,6 +542,22 @@ impl EngineAdapter for VllmAdapter {
         let _ = require_ack;
         Ok(CancellationOutcome::Uncertain)
     }
+    /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
+    /// completion probe on this engine's own loopback endpoint and key.
+    async fn wake_canary(
+        &self,
+        _context: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        bound: std::time::Duration,
+    ) -> Result<crate::completion_probe::ProbeAnswer, RuntimeError> {
+        crate::traits::ChatForward::complete_probe(self, self.served_model(), max_tokens, bound)
+            .await
+            .map_err(|e| {
+                RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                    "vLLM did not answer the wake canary: {e}"
+                )))
+            })
+    }
 }
 #[async_trait]
 impl crate::traits::ChatForward for VllmAdapter {
@@ -572,14 +588,12 @@ impl crate::traits::ChatForward for VllmAdapter {
     ) -> Result<crate::traits::StreamEnded, AdapterError> {
         self.forward.stream(body, on_chunk).await
     }
-    async fn complete_token_ids(
+    async fn complete_probe(
         &self,
         served: &str,
         max_tokens: u32,
         bound: std::time::Duration,
-    ) -> Result<Vec<u32>, AdapterError> {
-        self.http
-            .complete_token_ids(served, max_tokens, bound)
-            .await
+    ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
+        self.http.complete_probe(served, max_tokens, bound).await
     }
 }
