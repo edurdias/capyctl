@@ -143,6 +143,28 @@ pub async fn try_boot_on(
     .await
 }
 
+/// As [`boot`], observing `memory` instead of [`test_memory`] (a host whose
+/// available memory is below its capacity).
+pub async fn boot_with_memory(
+    state_dir: &std::path::Path,
+    memory: capyctl_cli::host_observation::MemoryReader,
+) -> capyctl_cli::roles::App {
+    capyctl_cli::roles::start_standalone_with_memory(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
+        }),
+        memory,
+    )
+    .await
+    .expect("standalone boots")
+}
+
 /// As [`try_boot_on`], sampling the host's GPUs through `gpu` (design §1)
 /// instead of the machine's own `nvidia-smi`.
 pub async fn try_boot_with_gpu(

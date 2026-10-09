@@ -149,8 +149,56 @@ async fn wait_succeeds_once_every_replica_is_ready() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_ends_at_once_when_the_start_gave_up() {
     const REFUSAL: &str = "gave up: launch refused: SGLang keeps 1 bytes of recurrent state";
+    let (output, began) = wait_for_given_up(REFUSAL).await;
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(20),
+        "{said}"
+    );
+    assert!(!output.status.success(), "{said}");
+    assert!(said.contains(REFUSAL), "{said}");
+}
+
+// T29 (found live 2026-10-09): a start that gave up because the host's
+// available memory, less its charge, would not leave the free reserve ends
+// `insufficient_resources` (exit 4), as a capacity block does, and the JSON
+// error carries the four figures: available, the charge, the reserve and the
+// shortfall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_refused_on_available_memory_gives_its_figures() {
+    const REFUSAL: &str = "gave up: resource or evidence check failed: insufficient_memory: \
+        needs 109.2 GiB of system memory, 118.2 GiB available and a 11.0 GiB free reserve to \
+        keep, 2.1 GiB short";
+    let (output, _) = wait_for_given_up(REFUSAL).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(4), "{stdout}\n{stderr}");
+    let said = format!("{stdout}{stderr}");
+    let error: Value = said
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_else(|| panic!("no JSON error: {said}"));
+    assert_eq!(error["code"], "insufficient_resources", "{error}");
+    let message = error["message"].as_str().unwrap();
+    for figure in [
+        "needs 109.2 GiB",
+        "118.2 GiB available",
+        "11.0 GiB free reserve",
+        "2.1 GiB short",
+    ] {
+        assert!(message.contains(figure), "{figure}: {message}");
+    }
+}
+
+/// `start deployment pair --wait --format json` against a server whose start
+/// operation gave up with `reason`; the output and when the wait began.
+async fn wait_for_given_up(reason: &'static str) -> (std::process::Output, std::time::Instant) {
     let latest = json!({"id": OPERATION, "kind": "initialize", "state": "pending",
-        "reason": REFUSAL, "given_up": true});
+        "reason": reason, "given_up": true});
     let app = Router::new()
         .route(
             "/management/v1/snapshot",
@@ -197,15 +245,5 @@ async fn wait_ends_at_once_when_the_start_gave_up() {
     })
     .await
     .unwrap();
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        began.elapsed() < std::time::Duration::from_secs(20),
-        "{said}"
-    );
-    assert!(!output.status.success(), "{said}");
-    assert!(said.contains(REFUSAL), "{said}");
+    (output, began)
 }

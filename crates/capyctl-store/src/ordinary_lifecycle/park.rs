@@ -1758,7 +1758,9 @@ fn fit(
             .is_some_and(|current| !resource_ledger::allocates_more(current, target))
             && matches!(
                 capyctl_scheduler::residency::admit_phase(&state, owner, target, context),
-                Ok(()) | Err(capyctl_domain::resources::ResourceError::Insufficient)
+                Ok(())
+                    | Err(capyctl_domain::resources::ResourceError::Insufficient
+                        | capyctl_domain::resources::ResourceError::InsufficientAvailable(_))
             )
         {
             continue;
@@ -1982,6 +1984,7 @@ fn arm(
                 && matches!(
                     parking,
                     Err(capyctl_domain::resources::ResourceError::Insufficient
+                        | capyctl_domain::resources::ResourceError::InsufficientAvailable(_)
                         | capyctl_domain::resources::ResourceError::CategoryLimit)
                 );
             let parked_set = p.kind == ResidencyKind::Park && (switch_victim || parking.is_ok());

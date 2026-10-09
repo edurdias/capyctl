@@ -271,6 +271,11 @@ pub struct StandaloneHost {
     /// The host's memory domains as observed now: `domain_id`, `kind`,
     /// `capacity_bytes` and `available_bytes` each. Empty when unreadable.
     pub domains: DomainSampler,
+    /// SPEC §7.2 (found live 2026-10-09): the warnings the role logged at
+    /// start for domains whose managed limit plus free reserve exceeded the
+    /// memory available then, as an enrolled host's session shows them
+    /// (`memory_warnings`). Set once the role published its policy.
+    pub memory_warnings: Arc<std::sync::OnceLock<Vec<String>>>,
 }
 
 pub type DomainSampler = Arc<
@@ -366,13 +371,17 @@ async fn standalone_hosts(State(state): State<Arc<StandaloneState>>) -> Response
         })
         .collect();
     let id = &state.host.host_id;
+    let mut session = serde_json::json!({"profiles": profiles, "domains": domains,
+        "reconciled": true, "drain_pending": drain_pending});
+    if let Some(warnings) = state.host.memory_warnings.get().filter(|w| !w.is_empty()) {
+        session["memory_warnings"] = serde_json::json!(warnings);
+    }
     Json(serde_json::json!({
         "api_version": "1",
         "server_version": capyctl_controller::agent_sessions::SERVER_VERSION,
         "hosts": [{
             "host_id": id, "name": id, "revoked": false, "online": true, "eligible": !drain_pending,
-            "session": {"profiles": profiles, "domains": domains, "reconciled": true,
-                "drain_pending": drain_pending},
+            "session": session,
             "capabilities": capyctl_protocol::capabilities::agent_capabilities(),
             "binary_version": capyctl_controller::agent_sessions::SERVER_VERSION,
             "compatibility": "supported", "compatibility_reason": null,

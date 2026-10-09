@@ -444,6 +444,36 @@ async fn an_undeclared_republication_ends_the_session() {
     h.server.abort();
 }
 
+// T29 (SPEC §7.2, found live 2026-10-09): a host whose managed limit plus
+// free reserve exceeds the memory it reports available is still accepted,
+// and its publication returns the warning with the figures, by the domain's
+// own name; with room for both, none.
+#[tokio::test]
+async fn a_publication_warns_when_limits_exceed_available_memory() {
+    let h = enrolled().await;
+    let mut short = inventory(&h.host);
+    short.domains[0].available_bytes = 1 << 30;
+    short.domains[0].observed_bytes = 1 << 30;
+    let warnings = h.authority.publish_inventory(&h.host, &short).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for figure in [
+        "unified memory has 1.0 GiB available",
+        "managed limit plus its",
+        "free reserve",
+        "cannot be admitted until",
+    ] {
+        assert!(warnings[0].contains(figure), "{figure}: {warnings:?}");
+    }
+    h.server.abort();
+    let h = enrolled().await;
+    let roomy = inventory(&h.host);
+    assert_eq!(
+        h.authority.publish_inventory(&h.host, &roomy).unwrap(),
+        Vec::<String>::new()
+    );
+    h.server.abort();
+}
+
 // T07 T33 (ADR 0018 §3, §4): the controller's validation of a live
 // re-publication, called directly. An accepted one replaces the approved
 // document; each refusal says why and keeps the previous document.

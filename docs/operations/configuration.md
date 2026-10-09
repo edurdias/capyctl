@@ -396,6 +396,26 @@ in force to the stored policy, and `auto` returns to the default. A limit lowere
 below what running models already hold is refused until they stop. A higher limit
 leaves less memory for everything else on the machine.
 
+Fitting the total is not the whole check. A deployment starts only when the
+memory available at that moment (`MemAvailable`, not `MemTotal`) covers its
+startup charge plus the free reserve. On a 121.7 GiB machine, a 110 GiB managed
+limit and an 11 GiB free reserve are accepted, but with 118 GiB available a
+deployment that needs 109 GiB at startup is refused: 118 − 109 leaves 9 GiB,
+less than the 11 GiB reserve. The refusal gives the figures, and
+`capyctl start deployment --wait` exits with `insufficient_resources`:
+
+```text
+insufficient_memory: needs 109.0 GiB of system memory, 118.0 GiB available and a 11.0 GiB free reserve to keep, 2.0 GiB short
+```
+
+The deployment waits for memory, so free some (stop or park another deployment,
+or close other programs) or lower the managed limit or the free reserve. When the
+role starts, or a host connects, and its managed limit plus free reserve is more
+than the memory available then (beyond what running deployments already hold),
+the log and `capyctl list hosts` show a warning with the figures: a deployment
+near the limit will not start until that much memory is freed. It is a warning;
+the start goes ahead.
+
 How a value is read and checked:
 
 - A value is read exactly as the same text in the YAML document would be:

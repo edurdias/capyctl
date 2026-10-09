@@ -550,6 +550,52 @@ impl crate::Store {
         tx.commit()?;
         Ok(result)
     }
+    /// SPEC §7.2 (found live 2026-10-09): the warning for each of `host_id`'s
+    /// domains whose managed limit plus free reserve exceeds the memory
+    /// available now (`observations`, keyed as the policy's domains), counting
+    /// as available what deployments already charged there hold: a
+    /// deployment near the limit cannot be admitted there until memory is
+    /// freed. Accepted limits only need to fit the total, so this is a
+    /// warning; nothing is refused for it. Empty without a policy.
+    pub fn memory_headroom_warnings(
+        &self,
+        host_id: &str,
+        observations: &[MemoryObservation],
+    ) -> Result<Vec<String>, ResourcePolicyError> {
+        if !valid_id(host_id) {
+            return Err(ResourcePolicyError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let policy = read_selected_policy(&tx, host_id)?;
+        let ledger = read_snapshot(&tx).map_err(map_ledger)?;
+        tx.commit()?;
+        let Some(policy) = policy else {
+            return Ok(Vec::new());
+        };
+        Ok(policy
+            .controls
+            .domains
+            .iter()
+            .filter_map(|(id, d)| {
+                let observation = observations.iter().find(|o| &o.domain == id)?;
+                let charged = ledger
+                    .owners
+                    .values()
+                    .flat_map(|f| &f.allocations)
+                    .filter(|a| &a.domain == id)
+                    .fold(0_i64, |sum, a| sum.saturating_add(a.bytes));
+                let limit = capyctl_domain::resources::MemoryLimit {
+                    domain: id.clone(),
+                    managed_bytes: d.managed_limit,
+                    free_reserve_bytes: d.free_reserve,
+                    reserve_absorbs_unmanaged: d.memory == DomainMemory::Device,
+                    host_kv_bytes: d.host_kv_limit,
+                    parked_bytes: d.parked_limit,
+                };
+                capyctl_domain::resources::headroom_warning(&limit, observation, charged)
+            })
+            .collect())
+    }
     /// W10 gap (b): the tightest queue policy over every host with a selected
     /// resource policy (SPEC §16.2 `resource_policy.queue`), each bound the
     /// smallest any host sets. One router queue serves every host, so no host

@@ -54,15 +54,18 @@ pub fn declares_device_domains(inventory: &ReportInventory) -> bool {
                 .any(|d| d.memory == capyctl_config::effective::DomainMemory::Device)
         })
 }
+/// Publishes the host's approved preparation and resource policy. Returns the
+/// memory headroom warnings for the host's domains (SPEC §7.2, see
+/// `Store::memory_headroom_warnings`), already written to the role log.
 pub fn publish(
     state: &SharedCoordinatorState,
     host_id: &str,
     inventory: &ReportInventory,
-) -> Result<(), PublicationError> {
+) -> Result<Vec<String>, PublicationError> {
     if inventory.approved_host_config_json.is_empty() {
         // An unprepared connected host grants no executable/profile authority.
         return if inventory.profiles.is_empty() {
-            Ok(())
+            Ok(Vec::new())
         } else {
             Err(PublicationError::default())
         };
@@ -84,6 +87,7 @@ pub fn publish(
         received_at_ms: now,
     };
     let state = state.lock().map_err(|_| PublicationError::default())?;
+    let mut warnings = Vec::new();
     if config.document.get("resource_policy").is_some() {
         let local = capyctl_config::remote_resources::local_host_document(&config.document)
             .map_err(|_| PublicationError::default())?;
@@ -134,6 +138,20 @@ pub fn publish(
                 },
                 _ => PublicationError::default(),
             })?;
+        // SPEC §7.2 (found live 2026-10-09): limits that fit the total may
+        // still not fit the memory available now. Evidence for the operator
+        // only: a warning that cannot be computed never refuses the host.
+        let scoped: Vec<_> = observations
+            .iter()
+            .map(|o| capyctl_domain::resources::MemoryObservation {
+                domain: capyctl_config::remote_resources::ledger_key(host_id, "domain", &o.domain),
+                ..o.clone()
+            })
+            .collect();
+        warnings = state
+            .store()
+            .memory_headroom_warnings(host_id, &scoped)
+            .unwrap_or_default();
     }
     // Publish executable authority only after all resource observations validate.
     // A rejected policy import must not replace the previously approved snapshot.
@@ -150,7 +168,13 @@ pub fn publish(
         .store()
         .publish_host_configuration_with_launch_claims(&publication, claims)
         .map_err(|_| PublicationError::default())?;
-    Ok(())
+    for warning in &warnings {
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Warning,
+            &format!("Host {host_id}: {warning}"),
+        );
+    }
+    Ok(warnings)
 }
 
 /// ADR 0018 §3: a live re-publication, validated like a startup publication

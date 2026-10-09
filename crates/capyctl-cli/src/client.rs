@@ -517,10 +517,8 @@ impl Management {
             // its retries spent) stays pending until its deadline; nothing
             // more is attempted for it, so the wait ends now with its reason.
             if gave_up(&snapshot, operation) {
-                return Err(error(
-                    "operation_failed",
-                    failure_message(&snapshot, operation),
-                ));
+                let message = failure_message(&snapshot, operation);
+                return Err(error(failure_code(&message), message));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(error("activation_timeout", format!("Wait expired for operation {operation}; the accepted operation was not cancelled")));
@@ -573,7 +571,7 @@ fn replicas(deployment: &Value, seen: &mut std::collections::BTreeSet<u64>) -> R
                 let code = if last_error.starts_with("placement:") {
                     "insufficient_resources"
                 } else {
-                    "operation_failed"
+                    failure_code(reason)
                 };
                 let why = if reason.is_empty() {
                     "status shows no reason".to_owned()
@@ -595,6 +593,17 @@ fn replicas(deployment: &Value, seen: &mut std::collections::BTreeSet<u64>) -> R
         Replicas::Pending
     } else {
         Replicas::AllReady
+    }
+}
+
+/// SPEC §7.2 (found live 2026-10-09): a start refused because the host's
+/// memory cannot hold it now (`insufficient_memory`,
+/// `insufficient_device_memory`, with the figures) is a capacity block, as
+/// `capacity_blocked` is (exit 4); any other failure is `operation_failed`.
+fn failure_code(reason: &str) -> &'static str {
+    match capyctl_domain::diagnostics::classify(None, reason) {
+        Some("insufficient_memory" | "insufficient_device_memory") => "insufficient_resources",
+        _ => "operation_failed",
     }
 }
 

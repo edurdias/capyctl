@@ -4,7 +4,8 @@ pub use capyctl_domain::resources::{
     claims_conflict, validate_footprint, validate_recipe, ResourceError,
 };
 use capyctl_domain::resources::{
-    LedgerSnapshot, MemoryLimit, MemoryObservation, PhaseFootprint, ResidentFloor, ResourcePhase,
+    AvailableShortfall, LedgerSnapshot, MemoryLimit, MemoryObservation, PhaseFootprint,
+    ResidentFloor, ResourcePhase,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -273,13 +274,25 @@ pub fn admit_phase(
             .iter()
             .filter(|f| f.domain == l.domain)
             .try_fold(0, |sum, f| add(sum, f.bytes))?;
-        if own > 0
-            && o.available_bytes
-                .checked_sub(remaining)
-                .ok_or(ResourceError::Invalid)?
-                < l.required_free(o.capacity_bytes, o.available_bytes, held)
-        {
-            return Err(ResourceError::Insufficient);
+        let required = l.required_free(o.capacity_bytes, o.available_bytes, held);
+        let left = o
+            .available_bytes
+            .checked_sub(remaining)
+            .ok_or(ResourceError::Invalid)?;
+        if own > 0 && left < required {
+            // SPEC §7.2 (found live 2026-10-09): the refusal carries its
+            // figures; the rule itself is unchanged.
+            return Err(ResourceError::InsufficientAvailable(Box::new(
+                AvailableShortfall {
+                    domain: l.domain.clone(),
+                    device: l.reserve_absorbs_unmanaged,
+                    available_bytes: o.available_bytes,
+                    charge_bytes: own,
+                    pending_bytes: remaining.saturating_sub(own),
+                    free_reserve_bytes: required,
+                    short_bytes: required.saturating_sub(left),
+                },
+            )));
         }
     }
     Ok(())
