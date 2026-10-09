@@ -3,10 +3,12 @@
 //! binary in that mode exactly as a launcher does: engine output on standard
 //! input, the launch's credentials on descriptor 3, the log named by
 //! `CAPYCTL_ENGINE_LOG`.
+mod support;
+
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use capyctl_adapters::engine_log::LogRedactor;
 use capyctl_launchers::engine_log_relay::{LOG_VARIABLE, RELAY_ARG};
@@ -26,7 +28,7 @@ fn the_binary_relays_engine_output_redacted() {
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let read_fd = secrets_read.as_raw_fd();
     let write_fd = secrets_write.as_raw_fd();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_capyctl"));
+    let mut command = support::capyctl();
     command
         .arg(RELAY_ARG)
         .env_clear()
