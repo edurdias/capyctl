@@ -334,6 +334,7 @@ fn every_post_baseline_field_names_its_capability() {
             CHECKPOINT_STATE_SLOT,
             ENGINE_GROUPS,
             ENGINE_LOG_TAIL,
+            CHECKPOINT_TABLES,
         ]
         .contains(name)
         {
