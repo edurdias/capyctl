@@ -87,7 +87,8 @@ runtime_profiles:
     # nvcc there to use FlashInfer). Omit it to keep the minimal PATH.
     cuda_home: /usr/local/cuda
     # Optional overrides of the JIT build limits capyctl computes at launch
-    # (MAX_JOBS = free memory / 8 GiB, at most the CPU count).
+    # (MAX_JOBS = free memory, less the deployment's Ready charge on unified
+    # memory, / 8 GiB, at most the CPU count, at least 1).
     env: {}
     log_policy:
       max_file_bytes: "16MiB"

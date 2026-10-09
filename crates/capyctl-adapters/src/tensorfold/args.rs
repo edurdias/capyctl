@@ -37,6 +37,9 @@ pub struct PlanInputTensorfold {
     pub engine_path_extra: Option<String>,
     pub cuda_home: Option<String>,
     pub build_env: BTreeMap<String, String>,
+    /// SPEC §7.2: the deployment's Ready charge on unified-memory domains,
+    /// which sizes the JIT compile jobs (`engine_env::unified_ready_bytes`).
+    pub unified_ready_bytes: u64,
     pub model_path: String,
     pub served_model_name: String,
     pub port: u16,
@@ -74,6 +77,7 @@ impl std::fmt::Debug for PlanInputTensorfold {
             .field("engine_path_extra", &self.engine_path_extra)
             .field("cuda_home", &self.cuda_home)
             .field("build_env", &self.build_env.keys().collect::<Vec<_>>())
+            .field("unified_ready_bytes", &self.unified_ready_bytes)
             .field("model_path", &self.model_path)
             .field("served_model_name", &self.served_model_name)
             .field("port", &self.port)

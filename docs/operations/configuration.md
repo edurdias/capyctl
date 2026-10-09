@@ -277,6 +277,9 @@ whatever an approval says (`engine_env_reserved:<name>`):
 
 Names are compared upper-cased. `RUST_LOG`, `TOKENIZERS_PARALLELISM`,
 `PYTHONUNBUFFERED`, `MAX_JOBS` and `FLASHINFER_NVCC_THREADS` need no approval.
+`MAX_JOBS` and `FLASHINFER_NVCC_THREADS` must be positive integers; a value set
+here replaces the compile-job limits CapyCTL computes at launch (see
+[registering engines](install.md#registering-engines)).
 
 ## Secrets
 

@@ -167,11 +167,14 @@ pub(super) async fn initialize(
         cmd.env.entry(name.clone()).or_insert_with(|| value.clone());
     }
     cmd.env.insert("PATH".into(), tool_path);
-    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
+    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch,
+    // less what the engine will hold on unified memory once loaded (SGLang's
+    // FlashInfer JIT runs after the weights load; found live 2026-10-09).
     let (toolchain, limits) = crate::engine_env::toolchain_environment(
         launch.frozen.cuda_home(),
         launch.frozen.build_env(),
         crate::engine_env::mem_available_bytes(),
+        launch.frozen.unified_ready_bytes(),
         crate::engine_env::cpu_count(),
     );
     capyctl_domain::role_log::notice(

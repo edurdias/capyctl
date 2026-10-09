@@ -155,12 +155,15 @@ pub(super) async fn initialize(
     plan.api_key = None;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
+    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch,
+    // less what the engine will hold on unified memory once loaded (found
+    // live 2026-10-09, engine_env.rs).
     let (toolchain, limits) = crate::engine_env::launch_environment_noted(
         &plan.build_env,
         Some(&plan.engine_bin),
         plan.cuda_home.as_deref(),
         crate::engine_env::mem_available_bytes(),
+        plan.unified_ready_bytes,
         crate::engine_env::cpu_count(),
     );
     capyctl_domain::role_log::notice(

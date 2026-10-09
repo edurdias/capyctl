@@ -95,6 +95,9 @@ pub struct PlanInputVllm {
     /// The profile `env` build-limit overrides (`MAX_JOBS`,
     /// `FLASHINFER_NVCC_THREADS`; engine_env.rs).
     pub build_env: std::collections::BTreeMap<String, String>,
+    /// SPEC §7.2: the deployment's Ready charge on unified-memory domains,
+    /// which sizes the JIT compile jobs (`engine_env::unified_ready_bytes`).
+    pub unified_ready_bytes: u64,
     /// Where the launcher writes the engine's stdout/stderr (diagnosability
     /// + the runbook's evidence record).
     pub engine_log: Option<String>,
@@ -151,6 +154,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("cuda_home", &self.cuda_home)
             // ADR 0028 §2.1: values may hold tokens; names only.
             .field("build_env", &self.build_env.keys().collect::<Vec<_>>())
+            .field("unified_ready_bytes", &self.unified_ready_bytes)
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
             .field("cuda_namespace", &self.cuda_namespace)
