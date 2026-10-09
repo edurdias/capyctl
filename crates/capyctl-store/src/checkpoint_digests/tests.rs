@@ -358,6 +358,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             weights,
             None,
             None,
+            DigestProvenance::Measured,
             Some(too_large),
             2
         ),
@@ -373,6 +374,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             weights,
             None,
             None,
+            DigestProvenance::Measured,
             Some(tables),
             2,
         )
@@ -761,7 +763,7 @@ fn a_recorded_digest_keeps_its_provenance() {
     let declared = deploy(&store, &session, "declared", &config, &host);
     let record = |id: &str, digest: &str, provenance| {
         store.record_checkpoint_measurement(
-            &session, id, 1, "lab", digest, 7, None, None, provenance, 2,
+            &session, id, 1, "lab", digest, 7, None, None, provenance, None, 2,
         )
     };
     for (id, digest) in [
