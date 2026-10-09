@@ -230,6 +230,7 @@ fn a_measured_group_charges_each_member_its_share_of_the_weights() {
             20 * GIB,
             None,
             Some(layout),
+            capyctl_config::effective::DigestProvenance::Measured,
             NOW,
         )
         .unwrap();
