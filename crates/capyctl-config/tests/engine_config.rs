@@ -153,6 +153,9 @@ fn reserved_options_are_refused_in_every_spelling() {
         json!(["--ssl-keyfile", "/k"]),
         json!(["--data-parallel-size-local", "2"]),
         json!(["--disable-log-stats"]),
+        // SPEC §17 (owner decision 2026-10-09): always on.
+        json!(["--enable-per-request-metrics"]),
+        json!(["--no-enable-per-request-metrics"]),
         json!(["--middleware", "x"]),
         json!(["--revision", "main"]),
         json!(["--config", "/etc/vllm.yaml"]),
@@ -177,6 +180,7 @@ fn reserved_options_are_refused_in_every_spelling() {
         json!(["--tensor-parallel-size", "2"]),
         json!(["--model-path", "/m"]),
         json!(["--enable-metrics"]),
+        json!(["--enable-cache-report"]),
         json!(["--enable-memory-saver"]),
         json!(["--ssl-certfile", "/c"]),
         json!(["--modelopt-export-path", "/x"]),

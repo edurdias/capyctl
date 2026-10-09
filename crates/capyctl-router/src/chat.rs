@@ -313,7 +313,7 @@ pub async fn dispatch_timed(
             let generation = attempt.generation;
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
-            let mut observer = crate::stream::ProgressOnly(progress.clone());
+            let mut observer = crate::stream::ProgressOnly::new(progress.clone());
             // ADR 0028 §11: a request to a group's head is watched for its
             // first token; the watch holds nothing of the response.
             let stall = attempt.stall.take();
@@ -335,6 +335,9 @@ pub async fn dispatch_timed(
             });
             if result.is_ok() {
                 timing.response();
+                if let Some(at) = observer.generated {
+                    timing.generated_at(at);
+                }
             }
             let end = if cut {
                 LeaseEnd::Cancelling

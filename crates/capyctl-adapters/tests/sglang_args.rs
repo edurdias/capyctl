@@ -303,6 +303,8 @@ fn malformed_settings_and_reserved_extra_arguments_fail_before_rendering() {
         |s| s.extra_args = vec!["--port".into(), "1".into()],
         |s| s.extra_args = vec!["--mem-fraction".into(), "0.9".into()],
         |s| s.extra_args = vec!["--enable-metrics".into()],
+        // SPEC §17 (owner decision 2026-10-09): the cache report is always on.
+        |s| s.extra_args = vec!["--enable-cache-report".into()],
         |s| s.extra_args = vec!["--config".into(), "/tmp/c.yaml".into()],
         |s| s.extra_args = vec!["--x".into(); 257],
         |s| s.extra_args = vec!["--x\n".into()],

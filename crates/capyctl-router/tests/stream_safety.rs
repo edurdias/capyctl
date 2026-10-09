@@ -120,10 +120,12 @@ async fn slow_consumer_receives_all_chunks_before_success() {
     while let Some(bytes) = body.next().await {
         text.push_str(&String::from_utf8_lossy(&bytes.unwrap()));
     }
+    // The request's metrics comment (none measured: no chunk is JSON) comes
+    // after every chunk and before the terminal.
     let expected = (0..20)
         .map(|index| format!("data: {index}:xxxx\n\n"))
         .collect::<String>()
-        + "data: [DONE]\n\n";
+        + ": x-capyctl-metrics {}\n\ndata: [DONE]\n\n";
     assert_eq!(text, expected);
     assert_eq!(
         counts.current("d"),
@@ -171,7 +173,7 @@ async fn successful_bounded_delivery_is_ordered_and_releases_once() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert_eq!(
         text,
-        "data: 0:x\n\ndata: 1:x\n\ndata: 2:x\n\ndata: [DONE]\n\n"
+        "data: 0:x\n\ndata: 1:x\n\ndata: 2:x\n\n: x-capyctl-metrics {}\n\ndata: [DONE]\n\n"
     );
     assert_eq!(counts.current("d"), 0);
 }

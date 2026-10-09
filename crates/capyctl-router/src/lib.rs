@@ -13,6 +13,8 @@ pub mod forwarders;
 pub mod queue;
 pub mod stream;
 pub mod switch;
+// SPEC §17 (owner decision 2026-10-09): per-request engine metrics.
+pub mod engine_metrics;
 // SPEC §17 (M80): per-request timings and their bounded distributions.
 pub mod timing;
 
@@ -211,8 +213,10 @@ async fn chat_completions(
         }
         return Ok(response);
     }
-    let (json, timing) =
+    let (mut json, timing) =
         chat::dispatch_timed(&state.deps, &model, v, body_bytes, received, timing).await?;
+    // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
+    engine_metrics::attach(&mut json, &timing);
     let mut response = Json(json).into_response();
     if timing.header_enabled() {
         if let Ok(value) = timing.header_value().parse() {

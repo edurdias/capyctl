@@ -65,6 +65,9 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     "--enable-log-requests",
     // W8 reads the engine's metrics; turning them off would blind load reports.
     "--disable-log-stats",
+    // SPEC §17 (owner decision 2026-10-09): always on; the router reads the
+    // per-request `metrics` object it adds to each response.
+    "--enable-per-request-metrics",
     "--log-config-file",
     "--uvicorn-log-level",
     "--disable-uvicorn-access-log",
@@ -156,6 +159,9 @@ pub const SGLANG_RESERVED_FIELDS: &[&str] = &[
     "log_requests_target",
     "crash_dump_folder",
     "enable_metrics",
+    // SPEC §17 (owner decision 2026-10-09): always on; the router reads the
+    // cached-token count it adds to each response's usage.
+    "enable_cache_report",
     "skip_server_warmup",
     "disaggregation_mode",
     "enable_hierarchical_cache",
