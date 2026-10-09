@@ -129,8 +129,9 @@ pub fn admit_memory_with(
 /// SPEC §3.1: the leased loopback engine port must be free when a launch is
 /// admitted; a port another program listens on is `port_conflict` (the next
 /// start leases a free one: the server's lease skips a port it cannot bind).
+/// The probe never listens ([`crate::host_checks::probe_bind`]).
 pub(crate) fn engine_port_free(port: u16) -> Result<(), LaunchVerdict> {
-    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    crate::host_checks::probe_bind((std::net::Ipv4Addr::LOCALHOST, port).into())
         .map(drop)
         .map_err(|_| LaunchVerdict::Refused("port_conflict"))
 }
@@ -704,6 +705,15 @@ mod tests {
             Err(LaunchVerdict::Refused("port_conflict"))
         );
         drop(held);
+    }
+
+    // T37: the probe never listens, so a copy of it that a child forked
+    // meanwhile keeps until its `exec` is no conflict for the next probe.
+    #[test]
+    fn a_probe_left_open_is_no_port_conflict() {
+        let open =
+            crate::host_checks::probe_bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        assert_eq!(engine_port_free(open.local_addr().unwrap().port()), Ok(()));
     }
 
     // T26: the unified single-pool behaviour is unchanged.

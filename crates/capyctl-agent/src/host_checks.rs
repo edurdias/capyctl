@@ -8,7 +8,7 @@ use capyctl_config::groups_policy::GroupsPolicy;
 use capyctl_domain::group::{GroupPlan, MemberRole};
 use std::{
     ffi::{CStr, CString},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::ffi::OsStrExt,
     path::Path,
 };
@@ -395,9 +395,10 @@ pub fn prepare_member(
 /// ADR 0028 §5, §7 (R15): whether `port` is free for a listener on `address`.
 /// The torch store binds every interface, so the port must bind on `address`
 /// and on both wildcards (`0.0.0.0` and `::`, the latter skipped on a host
-/// without IPv6). Each probe binds and drops at once; nothing is held.
+/// without IPv6). Each probe ([`probe_bind`]) binds and closes at once;
+/// nothing is held.
 pub fn port_free(address: IpAddr, port: u16) -> bool {
-    let bind = |ip: IpAddr| TcpListener::bind(SocketAddr::new(ip, port)).map(drop);
+    let bind = |ip: IpAddr| probe_bind(SocketAddr::new(ip, port)).map(drop);
     if bind(address).is_err() || bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).is_err() {
         return false;
     }
@@ -408,6 +409,25 @@ pub fn port_free(address: IpAddr, port: u16) -> bool {
             Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)
         ),
     }
+}
+
+/// SPEC §3.1, ADR 0028 §7: a socket bound to `address` as a listener binds
+/// (`SO_REUSEADDR`: a closed connection in TIME_WAIT does not hold the port),
+/// refused while anything listens on `address` or on an address overlapping
+/// it. It never listens itself. The agent spawns processes from other
+/// threads, and a child forked while a probe is open keeps a copy of it until
+/// its `exec` closes it: a listening copy would refuse the next probe of the
+/// same port (a launch probes its port several times) as if another program
+/// held it, where a bound copy refuses no probe and no listener that sets
+/// `SO_REUSEADDR`.
+pub(crate) fn probe_bind(address: SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
+    let socket = match address {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    Ok(socket)
 }
 
 #[cfg(test)]
@@ -788,6 +808,29 @@ mod tests {
         assert!(port_free(loopback, port));
         // Bind and drop: the probe left nothing bound.
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    // Review Focus 2 (R15): a probe's socket still open elsewhere, as in a
+    // child the agent forked while the probe was open (until its `exec`),
+    // neither refuses a later probe of the port nor stops the engine's
+    // listener. A listening probe did both, so a group Launch was refused
+    // `service_port_in_use` for a free port while another launch spawned.
+    #[test]
+    fn a_probe_left_open_holds_nothing() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let first = probe_bind(SocketAddr::new(loopback, 0)).unwrap();
+        let port = first.local_addr().unwrap().port();
+        let wildcards = [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ];
+        let open: Vec<_> = wildcards
+            .into_iter()
+            .filter_map(|ip| probe_bind(SocketAddr::new(ip, port)).ok())
+            .collect();
+        assert!(!open.is_empty(), "0.0.0.0 binds beside it");
+        assert!(port_free(loopback, port));
+        assert!(std::net::TcpListener::bind((loopback, port)).is_ok());
     }
 
     /// `plan` on rendezvous port `port`.
