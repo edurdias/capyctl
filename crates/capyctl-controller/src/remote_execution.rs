@@ -456,6 +456,9 @@ impl EngineAdapter for RemoteEngine {
         if plan.checkpoint_tables.is_some() {
             needs.push(capabilities::CHECKPOINT_TABLES);
         }
+        if plan.checkpoint_gguf.is_some() {
+            needs.push(capabilities::CHECKPOINT_GGUF);
+        }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
@@ -1055,6 +1058,13 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 .memory()
                 .disk_tables
                 .map(|recorded| recorded.tables),
+            // ADR 0029 §9: the GGUF facts a llama.cpp revision was sized with.
+            checkpoint_gguf: work
+                .effective()
+                .engine_config
+                .memory()
+                .gguf
+                .map(|recorded| recorded.facts),
             // Owner decision 2026-09-23: the peak this launch reserved.
             startup_bytes: Some(work.startup_reservation().bytes),
             checkpoint_digest,
@@ -1313,6 +1323,7 @@ mod tests {
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
                 checkpoint_tables: None,
+                checkpoint_gguf: None,
                 startup_bytes: None,
             },
             ingress_gate_key: [7; 32],

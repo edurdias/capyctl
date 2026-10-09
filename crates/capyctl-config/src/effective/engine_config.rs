@@ -243,6 +243,24 @@ pub struct CheckpointFacts {
     /// engine's arguments keep them on disk
     /// (`engine_policy::disk_table_cache_bytes`).
     pub disk_tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
+    /// ADR 0029 §9: a llama.cpp launch's GGUF facts, measured by the host
+    /// beside the weights (`context_fit::llamacpp::measure`): the bytes it
+    /// loads and its header's cache shape. `None` for any other engine.
+    pub gguf: Option<capyctl_domain::gguf::GgufFacts>,
+}
+
+impl CheckpointFacts {
+    /// ADR 0014 §5, §7: the facts a revision is frozen `provisional` with
+    /// before any host measured its checkpoint: zero weights, and a GGUF
+    /// header still pending. Nothing may reserve such a revision; the digest
+    /// re-resolves it with the measured facts.
+    pub fn provisional() -> Self {
+        Self {
+            weights_bytes: Some(0),
+            gguf: Some(capyctl_domain::gguf::GgufFacts::PENDING),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -454,6 +472,77 @@ fn sglang_state_reserve(
     };
     crate::context_fit::derived_state_reserve(slot, &args, declared_running, fits)
         .and_then(|bytes| i64::try_from(bytes).ok())
+}
+
+/// ADR 0029 §9: the KV cache of a llama.cpp deployment that states no memory
+/// request, KV cache or resources, from the GGUF facts the host measured:
+/// `slots × pad256(context_length) × Σ_layers head_count_kv × (key_length ×
+/// bytes(K) + value_length × bytes(V))`. Refused, naming the fields to
+/// declare instead, where the header or the arguments lay the cache out
+/// otherwise or move weights or cache off the GPU, or where the host that
+/// measured the checkpoint read no header. A provisional revision's pending
+/// header (ADR 0014 §7) holds a placeholder of one byte per cached token,
+/// which nothing reserves.
+fn llamacpp_kv_cache(
+    raw: &RawEngineConfig,
+    inputs: &EngineInputs<'_>,
+    extra_args: &[String],
+) -> Result<i64, ConfigError> {
+    use capyctl_domain::gguf::GgufKv;
+    const PATH: &str = "engine_config.memory.kv_cache";
+    let declare = |reason: &str| {
+        ConfigError::new(
+            ConfigErrorCode::MissingRequired,
+            PATH,
+            format!(
+                "cannot derive this llama.cpp deployment's KV cache from its GGUF header: \
+                 {reason}; declare engine_config.memory.kv_cache, or resources"
+            ),
+        )
+    };
+    let Some(gguf) = inputs.facts.gguf else {
+        return Err(declare(
+            "the host that measured the checkpoint read no GGUF header",
+        ));
+    };
+    let context_length = raw.context_length.unwrap_or_default();
+    let slots = raw
+        .max_concurrent_requests
+        .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL);
+    let overflow = || invalid("engine_config.memory", "memory arithmetic overflows");
+    let shape = match gguf.kv {
+        GgufKv::Pending => {
+            return crate::llamacpp::slot_pool_tokens(context_length, slots)
+                .map(i64::from)
+                .ok_or_else(overflow)
+        }
+        GgufKv::Refused(refusal) => return Err(declare(refusal.reason())),
+        GgufKv::Attention(shape) => shape,
+    };
+    let args: Vec<String> = inputs
+        .profile_args
+        .iter()
+        .chain(extra_args)
+        .cloned()
+        .collect();
+    let n_gpu_layers = raw
+        .llamacpp
+        .as_ref()
+        .and_then(|llamacpp| llamacpp.n_gpu_layers)
+        .unwrap_or_default();
+    if let Some(reason) = crate::context_fit::llamacpp::derivation_refusal(n_gpu_layers, &args) {
+        return Err(declare(&reason));
+    }
+    crate::context_fit::llamacpp::kv_cache_bytes(
+        &shape,
+        context_length,
+        slots,
+        raw.kv_cache_dtype
+            .as_deref()
+            .unwrap_or(crate::llamacpp::DEFAULT_CACHE_TYPE),
+        crate::context_fit::llamacpp::flash_attention_on(&args),
+    )
+    .ok_or_else(overflow)
 }
 
 /// ADR 0014 amendment A18: the margin of a request on memory that is not a
@@ -679,6 +768,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             state_bytes: None,
             member: None,
             disk_tables: None,
+            gguf: None,
         },
         derived,
     ))
@@ -1091,6 +1181,52 @@ pub(super) fn normalize_engine_config(
                 ));
             }
         }
+        // ADR 0029 §5: each slot's window, padded, times the slots is
+        // llama-server's `--ctx-size`, which must fit its `int`.
+        let context_length = raw.context_length.unwrap_or_default();
+        let slots = raw
+            .max_concurrent_requests
+            .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL);
+        if crate::llamacpp::slot_pool_tokens(context_length, slots).is_none() {
+            return Err(invalid(
+                "engine_config.context_length",
+                format!(
+                    "context_length {context_length} padded to a multiple of {} for each \
+                     of {slots} slots exceeds llama.cpp's largest context",
+                    crate::llamacpp::SLOT_ALIGNMENT
+                ),
+            ));
+        }
+        // ADR 0029 §5: llama.cpp caps each slot at the model's training
+        // context while still allocating the larger cache, so a longer
+        // window is refused once the host has read the GGUF header.
+        if let Some(trained) = inputs
+            .facts
+            .gguf
+            .and_then(|gguf| gguf.training_context)
+            .filter(|trained| context_length > *trained)
+        {
+            return Err(invalid(
+                "engine_config.context_length",
+                format!(
+                    "context_length {context_length} is above the model's training context \
+                     ({trained} tokens, the GGUF's context_length): llama.cpp would cap each \
+                     slot at {trained} and still allocate the larger cache; lower it"
+                ),
+            ));
+        }
+        // ADR 0029 §9: the GGUF and the projector are named inside the
+        // checkpoint; the files are found where it is read.
+        let llamacpp = raw.llamacpp.clone().unwrap_or_default();
+        for (field, value) in [
+            ("gguf_file", &llamacpp.gguf_file),
+            ("mmproj_file", &llamacpp.mmproj_file),
+        ] {
+            if let Some(value) = value {
+                crate::llamacpp::checkpoint_file(value)
+                    .map_err(|reason| invalid(format!("engine_config.llamacpp.{field}"), reason))?;
+            }
+        }
     }
     if let Some(dtype) = &raw.dtype {
         if !DTYPES.contains(&dtype.as_str()) {
@@ -1336,6 +1472,21 @@ pub(super) fn normalize_engine_config(
             .map_err(|reason| invalid("model.draft", reason))?;
     }
 
+    // ADR 0029 §5, §9 (ADR 0014 §7): a llama.cpp window is checked and its
+    // request sized against the GGUF the host reads beside the weights, so
+    // until a host measured the checkpoint the revision is provisional,
+    // whatever it declares.
+    if engine == Engine::Llamacpp
+        && inputs.facts.gguf.is_none()
+        && inputs.facts.weights_bytes.is_none()
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::NotMaterializable,
+            "engine_config.memory",
+            "a llama.cpp deployment is sized once the host has measured its checkpoint and \
+             read its GGUF header",
+        ));
+    }
     let raw_memory = raw.memory.clone().unwrap_or_default();
     let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;
     let kv_cache = raw_memory
@@ -1344,11 +1495,22 @@ pub(super) fn normalize_engine_config(
         .map(parse_bytes)
         .transpose()?;
     let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    // ADR 0029 §9: a llama.cpp deployment that states no memory request, KV
+    // cache or resources has its KV cache derived from its GGUF header.
+    let kv_derived = engine == Engine::Llamacpp
+        && kv_cache.is_none()
+        && declared_request.is_none()
+        && inputs.declared_ready_total.is_none();
+    let kv_cache = if kv_derived {
+        Some(llamacpp_kv_cache(&raw, &inputs, &extra_args)?)
+    } else {
+        kv_cache
+    };
     // ADR 0023 §4: TensorFold is told no KV size; `--context` fixes it inside
     // the declared reservation, which is all an undeclared KV cache is bounded by.
     // ADR 0029 §5, §9: llama.cpp's KV is fixed by the rendered context and
-    // slots; until its size is derived from the GGUF header (plan slice L4)
-    // the declared reservation less the weights bounds it.
+    // slots; beside a declared request or `resources` the declared
+    // reservation less the weights bounds it.
     let declared_kv_bound =
         matches!(engine, Engine::Tensorfold | Engine::Llamacpp) && kv_cache.is_none();
     let kv_cache = match (declared_kv_bound, engine) {
@@ -1442,7 +1604,7 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
-    if declared_kv_bound {
+    if declared_kv_bound || kv_derived {
         provenance.insert("memory.kv_cache".into(), SettingSource::Derived);
     }
     if provenance_startup_derived {
@@ -1456,6 +1618,17 @@ pub(super) fn normalize_engine_config(
             declared_startup = Some(request);
             provenance.insert("memory.startup".into(), SettingSource::Derived);
         }
+    }
+    // ADR 0029 §9: llama-server allocates its whole KV cache at start
+    // (`--fit off`) and is charged no graph allowance, so the startup peak it
+    // is derived with is the request (cold equals Ready) until a first run
+    // measures one.
+    if engine == Engine::Llamacpp
+        && declared_startup.is_none()
+        && inputs.declared_ready_total.is_none()
+    {
+        declared_startup = Some(memory.request_bytes);
+        provenance.insert("memory.startup".into(), SettingSource::Derived);
     }
     // ADR 0014 amendment A8: a derived placeholder covers the CUDA graphs the
     // first start captures, the draft model's too; a revision frozen before
@@ -1625,34 +1798,6 @@ pub(super) fn normalize_engine_config(
         }
         Engine::Llamacpp => {
             let llamacpp = raw.llamacpp.clone().unwrap_or_default();
-            // ADR 0029 §5: each slot's window, padded, times the slots is
-            // llama-server's `--ctx-size`, which must fit its `int`.
-            let context_length = common.context_length.unwrap_or_default();
-            let slots = common
-                .max_concurrent_requests
-                .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL);
-            if crate::llamacpp::slot_pool_tokens(context_length, slots).is_none() {
-                return Err(invalid(
-                    "engine_config.context_length",
-                    format!(
-                        "context_length {context_length} padded to a multiple of {} for each \
-                         of {slots} slots exceeds llama.cpp's largest context",
-                        crate::llamacpp::SLOT_ALIGNMENT
-                    ),
-                ));
-            }
-            // ADR 0029 §9: the GGUF and the projector are named inside the
-            // checkpoint; the files are found where it is read, at launch.
-            for (field, value) in [
-                ("gguf_file", &llamacpp.gguf_file),
-                ("mmproj_file", &llamacpp.mmproj_file),
-            ] {
-                if let Some(value) = value {
-                    crate::llamacpp::checkpoint_file(value).map_err(|reason| {
-                        invalid(format!("engine_config.llamacpp.{field}"), reason)
-                    })?;
-                }
-            }
             // ADR 0029 §5: CapyCTL's defaults, named so a snapshot
             // re-resolution chooses them again.
             if common.kv_cache_dtype.is_none() {

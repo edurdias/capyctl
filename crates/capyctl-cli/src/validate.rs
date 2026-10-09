@@ -549,14 +549,10 @@ fn resolve_for_acceptance(
             if error.code == ConfigErrorCode::NotMaterializable
                 && error.path.starts_with("engine_config.memory") =>
         {
-            let placeholder = capyctl_config::effective::CheckpointFacts {
-                weights_bytes: Some(0),
-                ..Default::default()
-            };
             capyctl_config::effective::resolve_effective_with_checkpoint(
                 deployment,
                 host,
-                placeholder,
+                capyctl_config::effective::CheckpointFacts::provisional(),
             )
             .map(|effective| (effective, true))
         }

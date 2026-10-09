@@ -159,6 +159,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
         checkpoint_tables: None,
+        checkpoint_gguf: None,
         startup_bytes: None,
     });
     let launch = sign(launch);
@@ -318,6 +319,7 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
         checkpoint_tables: None,
+        checkpoint_gguf: None,
         startup_bytes: None,
     });
     let launch = sign(launch);

@@ -1,7 +1,9 @@
 use super::*;
 use capyctl_adapters::vllm::args::render_command;
 use capyctl_adapters::ParkPolicy;
-use capyctl_config::effective::resolve_effective;
+use capyctl_config::effective::{
+    resolve_effective, resolve_effective_with_checkpoint, CheckpointFacts,
+};
 use capyctl_domain::resources::MemoryObservation;
 use capyctl_store::Store;
 use serde_json::{json, Value};
@@ -70,15 +72,28 @@ fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
 }
 
 /// Admits `deployment` against `host` through the real store lifecycle and
-/// returns the Initialize work its accepted start plans.
+/// returns the Initialize work its accepted start plans. The host policy is
+/// resolved with the provisional facts the store accepts a revision with
+/// (ADR 0014 §7), as a llama.cpp revision resolves with nothing less.
 fn admit(deployment: &Value, host: &Value) -> InitializeWork {
+    admit_measured(deployment, host, None)
+}
+
+/// [`admit`], recording `measured` GGUF facts for the revision first, as the
+/// host that measured a llama.cpp checkpoint reports them (ADR 0029 §9).
+fn admit_measured(
+    deployment: &Value,
+    host: &Value,
+    measured: Option<capyctl_domain::gguf::GgufFacts>,
+) -> InitializeWork {
     let store = Store::open_in_memory().expect("open in-memory store");
     let session = store
         .begin_coordinator_session()
         .expect("begin coordinator session");
-    let policy = resolve_effective(deployment, host)
-        .expect("fixture resolves")
-        .host;
+    let policy =
+        resolve_effective_with_checkpoint(deployment, host, CheckpointFacts::provisional())
+            .expect("fixture resolves")
+            .host;
     let observations: Vec<_> = policy
         .domains
         .keys()
@@ -103,6 +118,24 @@ fn admit(deployment: &Value, host: &Value) -> InitializeWork {
             1700,
         )
         .expect("create managed configuration");
+    if let Some(gguf) = measured {
+        store
+            .record_checkpoint_measurement(
+                &session,
+                &receipt.deployment_id,
+                receipt.revision,
+                "lab",
+                &format!("sha256:{}", "1".repeat(64)),
+                gguf.weights_bytes,
+                None,
+                None,
+                capyctl_config::effective::DigestProvenance::Measured,
+                None,
+                Some(gguf),
+                1750,
+            )
+            .expect("record the checkpoint measurement");
+    }
     let fence = capyctl_store::lifecycle::DeploymentFence {
         deployment_id: receipt.deployment_id,
         revision: receipt.revision,
@@ -614,7 +647,19 @@ fn llamacpp_work(checkpoint: &std::path::Path) -> InitializeWork {
     deployment["residency"] = json!("restart_only");
     deployment["model"]["path"] = json!(checkpoint);
     deployment["engine_config"] = json!({"context_length": 8000});
-    admit(&deployment, &host)
+    // ADR 0029 §9: the facts the host reads beside the weights.
+    let gguf = resolve_effective_with_checkpoint(
+        &deployment,
+        &host,
+        CheckpointFacts {
+            weights_bytes: Some(0),
+            ..CheckpointFacts::default()
+        },
+    )
+    .expect("fixture resolves")
+    .gguf_facts()
+    .expect("a llama.cpp deployment reads its GGUF facts");
+    admit_measured(&deployment, &host, Some(gguf))
 }
 
 // T42 T16 (ADR 0029 §6, §10): the embedded path builds the plan the host

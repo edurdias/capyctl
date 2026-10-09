@@ -592,6 +592,8 @@ async fn activate(
                 measured.layout,
                 measured.provenance,
                 measured.tables,
+                // ADR 0029 §1: llama.cpp runs no groups.
+                None,
                 capyctl_protocol::now_unix_ms(),
             )
             .map_err(|e| e.to_string())
@@ -1052,6 +1054,8 @@ fn launch_commands(
                 // ADR 0014 amendment A20: and the tables an engine that keeps
                 // them on disk was sized without.
                 checkpoint_tables: memory.disk_tables.map(|recorded| recorded.tables),
+                // ADR 0029 §1: llama.cpp runs no groups.
+                checkpoint_gguf: None,
                 startup_bytes: None,
             };
             let command_id = if head {

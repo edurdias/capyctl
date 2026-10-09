@@ -579,6 +579,9 @@ impl NativeHostExecution {
             // ADR 0014 amendment A20: and the tables the server resolved an
             // engine that keeps them on disk with.
             disk_tables: plan.checkpoint_tables,
+            // ADR 0029 §9: and the GGUF facts a llama.cpp revision was sized
+            // with.
+            gguf: plan.checkpoint_gguf,
             ..Default::default()
         };
         let mut effective =
@@ -767,6 +770,11 @@ impl NativeHostExecution {
         {
             return Err(CheckpointError::Mismatch);
         }
+        // ADR 0029 §9: and the GGUF facts a llama.cpp request was derived
+        // from.
+        if plan.checkpoint_gguf.is_some() && plan.checkpoint_gguf != effective.gguf_facts() {
+            return Err(CheckpointError::Mismatch);
+        }
         Ok(())
     }
 
@@ -839,12 +847,15 @@ impl NativeHostExecution {
                         location.state_slot_bytes(),
                         layout,
                         tables,
+                        // ADR 0029 §9: what a llama.cpp launch loads, and
+                        // its GGUF header.
+                        location.gguf_facts(),
                     ))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok((verified, weights_bytes, state_slot_bytes, layout, tables)) => {
+                    Ok((verified, weights_bytes, state_slot_bytes, layout, tables, gguf)) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -866,6 +877,7 @@ impl NativeHostExecution {
                             tables: tables
                                 .as_ref()
                                 .map(capyctl_protocol::execution::tables_to_wire),
+                            gguf: gguf.as_ref().map(capyctl_protocol::execution::gguf_to_wire),
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -2777,6 +2789,7 @@ mod tests {
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
                 checkpoint_tables: None,
+                checkpoint_gguf: None,
                 startup_bytes: None,
             }),
         };
@@ -2924,6 +2937,7 @@ mod tests {
             checkpoint_state_slot_bytes: None,
             checkpoint_layout: None,
             checkpoint_tables: None,
+            checkpoint_gguf: None,
             startup_bytes: None,
         };
         let command = MemberCommand {
@@ -4175,14 +4189,22 @@ mod tests {
         (executor, deployment, policy)
     }
 
-    /// A llama.cpp launch command for the fixture, on `port`.
+    /// A llama.cpp launch command for the fixture under `root`, on `port`,
+    /// carrying the digest and weights the server recorded (ADR 0029 §9: an
+    /// unmeasured llama.cpp revision does not resolve).
     fn llamacpp_launch(
+        root: &std::path::Path,
         deployment: &serde_json::Value,
         policy: &str,
         port: u16,
     ) -> (MemberCommand, SingleLaunchPlan) {
-        let (mut launch, mut plan) = launch_with(deployment, policy, "");
+        let manifest = crate::checkpoint::CheckpointVerifier::in_memory()
+            .measure(&root.join("models"), &root.join("models/toy"))
+            .unwrap()
+            .manifest;
+        let (mut launch, mut plan) = launch_with(deployment, policy, &manifest.digest);
         plan.service_port = port;
+        plan.checkpoint_weights_bytes = Some(manifest.weights_bytes);
         launch.action = MemberAction::LaunchSingle(plan.clone());
         launch.identity.profile_fingerprint = "0.6.0+d812350".into();
         launch.identity.payload_digest = launch.canonical_digest();
@@ -4197,7 +4219,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
-        let (launch, plan) = llamacpp_launch(&deployment, &policy, closed_port());
+        let (launch, plan) = llamacpp_launch(root.path(), &deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
         let input = executor.llamacpp_plan(&effective, &plan).unwrap();
         assert!(input.model_file.ends_with("models/toy/toy-Q4_K_M.gguf"));
@@ -4234,7 +4256,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
-        let (launch, _) = llamacpp_launch(&deployment, &policy, closed_port());
+        let (launch, _) = llamacpp_launch(root.path(), &deployment, &policy, closed_port());
         let session = executor.journal.connect().unwrap();
         executor.connected(session).unwrap();
         executor
@@ -4264,7 +4286,7 @@ mod tests {
         let file = capyctl_config::llamacpp::system_config_file(&root.path().join("system"));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "[server]\nport = 1\n").unwrap();
-        let (launch, _) = llamacpp_launch(&deployment, &policy, closed_port());
+        let (launch, _) = llamacpp_launch(root.path(), &deployment, &policy, closed_port());
         assert_eq!(
             executor.provision(launch.clone(), [7; 32]).await.unwrap(),
             Provisioned::Refused("engine_config_file")
@@ -4306,7 +4328,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = llamacpp_fixture(root.path(), identity_dir.path());
-        let (idle, _) = llamacpp_launch(&deployment, &policy, metrics_stub(0).await);
+        let (idle, _) = llamacpp_launch(root.path(), &deployment, &policy, metrics_stub(0).await);
         let started = std::time::Instant::now();
         assert!(
             executor
@@ -4314,7 +4336,7 @@ mod tests {
                 .await
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        let (busy, _) = llamacpp_launch(&deployment, &policy, metrics_stub(1).await);
+        let (busy, _) = llamacpp_launch(root.path(), &deployment, &policy, metrics_stub(1).await);
         assert!(
             !executor
                 .idle_before_terminate(&busy, capyctl_protocol::now_unix_ms() + 1_200)

@@ -36,6 +36,10 @@ pub struct CheckpointLocation {
     /// installation's and the deployment's), which size the hybrid state slot
     /// measured beside the weights; `None` for another engine.
     pub sglang_args: Option<Vec<String>>,
+    /// ADR 0029 §9: what a llama.cpp launch loads beside the checkpoint (the
+    /// GGUF and projector it names, its draft model), whose sizes and header
+    /// are measured beside the weights; `None` for another engine.
+    pub llamacpp: Option<crate::context_fit::llamacpp::LlamacppFiles>,
 }
 
 impl CheckpointLocation {
@@ -57,6 +61,16 @@ impl CheckpointLocation {
         Option<crate::checkpoint_layout::CheckpointTables>,
     ) {
         crate::checkpoint_layout::read_header_facts(&self.checkpoint)
+    }
+
+    /// ADR 0029 §9: a llama.cpp launch's GGUF facts, from its files and
+    /// header; `None` for another engine.
+    pub fn gguf_facts(&self) -> Option<capyctl_domain::gguf::GgufFacts> {
+        let files = self.llamacpp.as_ref()?;
+        Some(crate::context_fit::llamacpp::measure(
+            &self.checkpoint,
+            files,
+        ))
     }
 }
 
@@ -179,6 +193,31 @@ impl EffectiveDeployment {
             None => (None, None),
         }
     }
+
+    /// ADR 0029 §9: the GGUF facts of this llama.cpp deployment's launch,
+    /// read on this machine; `None` for another engine.
+    pub fn gguf_facts(&self) -> Option<capyctl_domain::gguf::GgufFacts> {
+        let LaunchSettings::Llamacpp(settings) = &self.engine_config else {
+            return None;
+        };
+        let args: Vec<String> = self
+            .profile
+            .args
+            .iter()
+            .chain(&settings.extra_args)
+            .cloned()
+            .collect();
+        let files = crate::context_fit::llamacpp::LlamacppFiles::new(
+            settings.gguf_file.clone(),
+            settings.mmproj_file.clone(),
+            &args,
+            &self.profile.security.approved_paths,
+        );
+        Some(crate::context_fit::llamacpp::measure(
+            Path::new(self.model.resolved_path.as_deref()?),
+            &files,
+        ))
+    }
 }
 
 /// ADR 0014 §7: locate a deployment's checkpoint from its `model` block and the
@@ -209,6 +248,24 @@ pub fn checkpoint_location(
     let sglang_args = profile
         .filter(|profile| profile.engine == Engine::Sglang)
         .map(|profile| profile.args.iter().chain(&extra).cloned().collect());
+    // ADR 0029 §9: the files a llama.cpp deployment names, as written; the
+    // measurement confines them to the checkpoint and the approved paths.
+    let llamacpp = profile
+        .filter(|profile| profile.engine == Engine::Llamacpp)
+        .map(|profile| {
+            let named = |field: &str| {
+                deployment["engine_config"]["llamacpp"][field]
+                    .as_str()
+                    .map(str::to_owned)
+            };
+            let args: Vec<String> = profile.args.iter().chain(&extra).cloned().collect();
+            crate::context_fit::llamacpp::LlamacppFiles::new(
+                named("gguf_file"),
+                named("mmproj_file"),
+                &args,
+                &profile.security.approved_paths,
+            )
+        });
     let model = normalize_model(raw, Some(&store), Some(sources.root(&store)))?;
     let drafter = match &model.draft {
         Some(draft) => declared_drafter(draft, &store, sources.root(&store)),
@@ -233,6 +290,7 @@ pub fn checkpoint_location(
         content_fingerprint: model.content_fingerprint,
         drafter,
         sglang_args,
+        llamacpp,
     })
 }
 

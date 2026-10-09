@@ -2214,6 +2214,7 @@ fn launch(host: &str, rank: u32, plan: &GroupPlan, command_id: &str) -> MemberCo
                 checkpoint_state_slot_bytes: None,
                 checkpoint_layout: None,
                 checkpoint_tables: None,
+                checkpoint_gguf: None,
             },
         },
     )

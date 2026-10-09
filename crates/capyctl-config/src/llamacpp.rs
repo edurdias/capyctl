@@ -134,13 +134,6 @@ impl LlamacppBuild {
     }
 }
 
-/// ADR 0029 §9 (plan slice L4): until CapyCTL derives a llama.cpp
-/// deployment's memory request from its GGUF header, the deployment states
-/// it.
-pub const NEEDS_RESOURCES: &str = "a llama.cpp deployment states `resources` (the short \
-     form or its phases): deriving its memory request from the GGUF header is not in this \
-     release yet";
-
 /// ADR 0029 §6: options CapyCTL renders on every launch (`--mmproj` when the
 /// deployment names a projector). Each row is one llama-server 0.6.0 option
 /// with every long spelling its parser accepts: aliases and negative forms.

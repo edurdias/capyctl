@@ -35,6 +35,8 @@ use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
 
+// ADR 0029 §9: llama.cpp's KV cache and request from the GGUF header.
+pub mod llamacpp;
 mod sglang_pool;
 mod vllm_hybrid;
 pub(crate) use sglang_pool::{derived_request_bytes, derived_state_reserve};

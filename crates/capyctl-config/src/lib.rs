@@ -16,6 +16,8 @@ pub mod engine_policy;
 // ways (flag > environment > YAML > default), shared by host and standalone.
 pub mod engine_settings;
 pub mod error;
+// ADR 0029 §9: the bounded GGUF header reader llama.cpp sizing uses.
+pub mod gguf;
 pub mod group_support;
 // ADR 0028 §3: a host's group policy (peer address, rendezvous ports, require_rdma).
 pub mod groups_policy;

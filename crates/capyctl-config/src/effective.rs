@@ -1301,15 +1301,6 @@ pub fn resolve_effective_with_checkpoint(
             TENSORFOLD_NEEDS_RESOURCES,
         ));
     }
-    // ADR 0029 §9 (plan slice L4): the request derived from the GGUF header
-    // is not in this release, so a llama.cpp deployment states its resources.
-    if raw_profile.engine == Engine::Llamacpp && d.resources.is_none() {
-        return Err(ConfigError::new(
-            ConfigErrorCode::MissingRequired,
-            "resources",
-            crate::llamacpp::NEEDS_RESOURCES,
-        ));
-    }
     // ADR 0029 §6: llama-server reads options and its configuration and
     // cache directories from these names; a deployment may not set them,
     // whatever the profile approves.
@@ -1378,7 +1369,20 @@ pub fn resolve_effective_with_checkpoint(
         (topology.tensor_parallel, topology.pipeline_parallel)
     });
     let mut disk_tables = None;
+    // ADR 0029 §9: a llama.cpp launch loads the GGUF it renders (all its
+    // shards), its projector and its draft model, not every weight file of
+    // a checkpoint that may hold several quantizations: those bytes are its
+    // weights, and the whole checkpoint stays what a plan names and a host
+    // verifies.
+    let gguf_sizing = match (raw_profile.engine, facts.weights_bytes, facts.gguf) {
+        (Engine::Llamacpp, Some(whole), Some(gguf)) => Some(capyctl_domain::gguf::GgufSizing {
+            checkpoint_weights_bytes: whole,
+            facts: gguf,
+        }),
+        _ => None,
+    };
     let weights_bytes = match (facts.weights_bytes, table_cache, facts.disk_tables) {
+        _ if gguf_sizing.is_some() => gguf_sizing.map(|sizing| sizing.facts.weights_bytes),
         (Some(weights), Some(cache), Some(tables)) => {
             let (memory, cache_bytes) = capyctl_domain::disk_tables::disk_table_weights_bytes(
                 weights,
@@ -1410,6 +1414,9 @@ pub fn resolve_effective_with_checkpoint(
     };
     let sizing = CheckpointFacts {
         weights_bytes,
+        gguf: facts
+            .gguf
+            .filter(|_| raw_profile.engine == Engine::Llamacpp),
         ..facts
     };
     let device_sizing = core::derived_device_sizing(&devices, &host);
@@ -1438,9 +1445,14 @@ pub fn resolve_effective_with_checkpoint(
     }
     // Owner decision 2026-09-25: a deployment that states no memory (and no
     // resources) gets the default KV cache of the domain it runs in; its
-    // request derives from the checkpoint's weights (ADR 0014 §5).
+    // request derives from the checkpoint's weights (ADR 0014 §5). ADR 0029
+    // §9: llama.cpp's is derived from its GGUF header instead, since the
+    // rendered context and slots fix the cache it allocates.
     let mut kv_defaulted = false;
-    if d.resources.is_none() && !d.engine_config.states_memory() {
+    if d.resources.is_none()
+        && !d.engine_config.states_memory()
+        && raw_profile.engine != Engine::Llamacpp
+    {
         let managed = match device_sizing {
             Some(sizing) => Some(sizing.managed_limit),
             None => core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
@@ -1525,6 +1537,7 @@ pub fn resolve_effective_with_checkpoint(
         });
     }
     engine_config.memory_mut().disk_tables = disk_tables;
+    engine_config.memory_mut().gguf = gguf_sizing;
     {
         // T14: what capyctl chose is named as its default, so a snapshot
         // re-resolution chooses it again rather than restating it.

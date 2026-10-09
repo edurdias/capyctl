@@ -4,6 +4,7 @@
 //! command identities before acknowledging or performing any effect.
 use crate::pb;
 use capyctl_domain::disk_tables::CheckpointTables;
+use capyctl_domain::gguf::{GgufFacts, GgufKv, GgufKvRefusal, GgufKvShape};
 use capyctl_domain::group::{
     CommandIdentity, GroupEngine, GroupIdentityError, GroupPlan, GroupTopology, MemberKey,
     MemberPlan, MemberRole,
@@ -45,6 +46,9 @@ pub struct SingleLaunchPlan {
     /// ADR 0014 amendment A20 (owner decision 2026-10-09): the checkpoint's
     /// tables the server resolved with when the engine keeps them on disk.
     pub checkpoint_tables: Option<CheckpointTables>,
+    /// ADR 0029 §9: the GGUF facts the server resolved a llama.cpp revision
+    /// with.
+    pub checkpoint_gguf: Option<GgufFacts>,
 }
 /// ADR 0014 §7: an empty digest (pre-WE3 journal) or a canonical one; weights
 /// only alongside a digest, and never negative.
@@ -93,6 +97,56 @@ pub fn tables_to_wire(tables: &CheckpointTables) -> pb::CheckpointTables {
         resident_largest_layer_bytes: tables.resident_largest_layer_bytes,
     }
 }
+/// ADR 0029 §9: GGUF facts from the wire, if every field is in range. A
+/// pending header is never measured, so never on the wire.
+pub fn gguf_from_wire(gguf: &pb::CheckpointGguf) -> Option<GgufFacts> {
+    let kv = match gguf.kv.as_str() {
+        "attention" => GgufKv::Attention(GgufKvShape {
+            layers: gguf.layers,
+            k_values: gguf.k_values,
+            v_values: gguf.v_values,
+            v_values_padded: gguf.v_values_padded,
+        }),
+        code => {
+            if gguf.layers != 0
+                || gguf.k_values != 0
+                || gguf.v_values != 0
+                || gguf.v_values_padded != 0
+            {
+                return None;
+            }
+            GgufKv::Refused(GgufKvRefusal::from_code(code)?)
+        }
+    };
+    let facts = GgufFacts {
+        weights_bytes: gguf.weights_bytes,
+        training_context: (gguf.training_context > 0).then_some(gguf.training_context),
+        kv,
+    };
+    facts.is_valid().then_some(facts)
+}
+
+/// ADR 0029 §9: GGUF facts on the wire.
+pub fn gguf_to_wire(gguf: &GgufFacts) -> pb::CheckpointGguf {
+    let mut wire = pb::CheckpointGguf {
+        weights_bytes: gguf.weights_bytes,
+        training_context: gguf.training_context.unwrap_or(0),
+        ..Default::default()
+    };
+    match gguf.kv {
+        GgufKv::Attention(shape) => {
+            wire.kv = "attention".into();
+            wire.layers = shape.layers;
+            wire.k_values = shape.k_values;
+            wire.v_values = shape.v_values;
+            wire.v_values_padded = shape.v_values_padded;
+        }
+        GgufKv::Refused(refusal) => wire.kv = refusal.code().into(),
+        GgufKv::Pending => wire.kv = "pending".into(),
+    }
+    wire
+}
+
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
     fn try_from(plan: pb::SingleLaunchPlan) -> Result<Self, Self::Error> {
@@ -140,6 +194,10 @@ impl SingleLaunchPlan {
             || plan.checkpoint_tables.as_ref().is_some_and(|tables| {
                 tables_from_wire(tables).is_none() || plan.checkpoint_weights_bytes.is_none()
             })
+            // ADR 0029 §9: GGUF facts likewise.
+            || plan.checkpoint_gguf.as_ref().is_some_and(|gguf| {
+                gguf_from_wire(gguf).is_none() || plan.checkpoint_weights_bytes.is_none()
+            })
         {
             return Err(GroupIdentityError);
         }
@@ -168,6 +226,7 @@ impl SingleLaunchPlan {
             checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
             checkpoint_layout: plan.checkpoint_layout.as_ref().and_then(layout_from_wire),
             checkpoint_tables: plan.checkpoint_tables.as_ref().and_then(tables_from_wire),
+            checkpoint_gguf: plan.checkpoint_gguf.as_ref().and_then(gguf_from_wire),
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -194,6 +253,7 @@ impl SingleLaunchPlan {
             checkpoint_state_slot_bytes: self.checkpoint_state_slot_bytes,
             checkpoint_layout: self.checkpoint_layout.as_ref().map(layout_to_wire),
             checkpoint_tables: self.checkpoint_tables.as_ref().map(tables_to_wire),
+            checkpoint_gguf: self.checkpoint_gguf.as_ref().map(gguf_to_wire),
         }
     }
 }
@@ -1345,7 +1405,13 @@ fn validate_checkpoint(
         // ADR 0014 amendment A20: tables no larger than the weights measured.
         && evidence.tables.as_ref().is_none_or(|tables| {
             tables_from_wire(tables).is_some_and(|t| t.bytes <= evidence.weights_bytes)
-        });
+        })
+        // ADR 0029 §9: GGUF facts in range (a draft model outside the
+        // checkpoint may make them larger than its weights).
+        && evidence
+            .gguf
+            .as_ref()
+            .is_none_or(|gguf| gguf_from_wire(gguf).is_some());
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
@@ -1361,6 +1427,7 @@ fn validate_checkpoint(
                 && evidence.layout.is_none()
                 && evidence.provenance.is_empty()
                 && evidence.tables.is_none()
+                && evidence.gguf.is_none()
         }
         "computed" => {
             measured
@@ -1386,6 +1453,7 @@ fn validate_checkpoint(
                 && evidence.layout.is_none()
                 && evidence.provenance.is_empty()
                 && evidence.tables.is_none()
+                && evidence.gguf.is_none()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

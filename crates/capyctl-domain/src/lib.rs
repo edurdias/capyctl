@@ -2,6 +2,7 @@ pub mod completion;
 pub mod diagnostics;
 pub mod disk_tables;
 pub mod error;
+pub mod gguf;
 pub mod group;
 pub mod identity;
 pub mod latency;

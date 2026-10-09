@@ -88,6 +88,12 @@ pub const ENGINE_LOG_TAIL: &str = "engine_log_tail";
 /// without it is refused `host_capability_missing:checkpoint_tables` for such
 /// a launch before anything is sent; every other launch needs nothing.
 pub const CHECKPOINT_TABLES: &str = "checkpoint_tables";
+/// ADR 0029 §9: a LaunchSingle plan's `checkpoint_gguf` (and
+/// `CheckpointDigestEvidence.gguf` from the host), sent only for a llama.cpp
+/// revision. A host without it is refused
+/// `host_capability_missing:checkpoint_gguf` for such a launch before
+/// anything is sent; every other launch needs nothing.
+pub const CHECKPOINT_GGUF: &str = "checkpoint_gguf";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -130,6 +136,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (ENGINE_GROUPS, Direction::ServerToHost),
     (ENGINE_LOG_TAIL, Direction::ServerToHost),
     (CHECKPOINT_TABLES, Direction::ServerToHost),
+    (CHECKPOINT_GGUF, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -201,6 +208,9 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
             if plan.checkpoint_tables.is_some() {
                 needs.push(CHECKPOINT_TABLES);
+            }
+            if plan.checkpoint_gguf.is_some() {
+                needs.push(CHECKPOINT_GGUF);
             }
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.

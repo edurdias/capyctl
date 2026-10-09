@@ -88,6 +88,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
         checkpoint_tables: None,
+        checkpoint_gguf: None,
         startup_bytes: None,
     }
 }
@@ -105,6 +106,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         layout: None,
         provenance: String::new(),
         tables: None,
+        gguf: None,
     }
 }
 
@@ -663,4 +665,61 @@ fn a_size_only_request_is_answered_with_weights_and_no_digest() {
             "{evidence:?}"
         );
     }
+}
+
+// T42 (ADR 0029 §9): a llama.cpp launch plan carries the GGUF facts its
+// request was derived from, only beside the weights; they round-trip, a
+// pending or malformed one is refused, and the plan needs `checkpoint_gguf`.
+#[test]
+fn gguf_facts_ride_the_launch_plan_beside_the_weights() {
+    use capyctl_domain::gguf::{GgufFacts, GgufKv, GgufKvRefusal, GgufKvShape};
+    use capyctl_protocol::execution::{gguf_from_wire, gguf_to_wire};
+    let facts = GgufFacts {
+        weights_bytes: 9,
+        training_context: Some(32768),
+        kv: GgufKv::Attention(GgufKvShape {
+            layers: 48,
+            k_values: 24576,
+            v_values: 24576,
+            v_values_padded: 24576,
+        }),
+    };
+    let refused = GgufFacts {
+        training_context: None,
+        kv: GgufKv::Refused(GgufKvRefusal::SlidingWindow),
+        ..facts
+    };
+    for facts in [facts, refused] {
+        assert_eq!(gguf_from_wire(&gguf_to_wire(&facts)), Some(facts));
+    }
+    assert_eq!(gguf_from_wire(&gguf_to_wire(&GgufFacts::PENDING)), None);
+    let mut padded = gguf_to_wire(&facts);
+    padded.v_values_padded = 1;
+    assert_eq!(gguf_from_wire(&padded), None);
+
+    let plan = pb::SingleLaunchPlan {
+        checkpoint_digest: DIGEST.into(),
+        checkpoint_weights_bytes: Some(10),
+        checkpoint_gguf: Some(gguf_to_wire(&facts)),
+        ..launch_plan()
+    };
+    let command = decode(pb::execute_member::Action::LaunchSingle(plan.clone())).unwrap();
+    let MemberAction::LaunchSingle(typed) = &command.action else {
+        panic!("not a launch");
+    };
+    assert_eq!(typed.checkpoint_gguf, Some(facts));
+    let wire = pb::ExecuteMember {
+        action: Some(pb::execute_member::Action::LaunchSingle(plan.clone())),
+        ..Default::default()
+    };
+    assert!(capyctl_protocol::capabilities::required(&wire)
+        .contains(&capyctl_protocol::capabilities::CHECKPOINT_GGUF));
+    // Not without the weights it was measured beside.
+    assert!(decode(pb::execute_member::Action::LaunchSingle(
+        pb::SingleLaunchPlan {
+            checkpoint_weights_bytes: None,
+            ..plan
+        }
+    ))
+    .is_err());
 }

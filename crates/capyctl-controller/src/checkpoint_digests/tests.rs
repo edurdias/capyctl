@@ -153,6 +153,7 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
             layout: None,
             provenance: DigestProvenance::Measured,
             tables: None,
+            gguf: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -182,6 +183,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             layout: None,
             provenance: DigestProvenance::DeclaredTrusted,
             tables: None,
+            gguf: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -200,6 +202,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             layout: None,
             provenance: DigestProvenance::Fetched,
             tables: None,
+            gguf: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -675,6 +678,7 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
                 layout: None,
                 provenance: DigestProvenance::Measured,
                 tables: None,
+                gguf: None,
             })
         }
     };
@@ -739,6 +743,7 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
                 layout: None,
                 provenance: DigestProvenance::Measured,
                 tables: None,
+                gguf: None,
             })
         },
     )
@@ -772,6 +777,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                 layout: None,
                 provenance: DigestProvenance::Measured,
                 tables: None,
+                gguf: None,
             })
         },
     )
@@ -814,6 +820,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                     layout: None,
                     provenance: DigestProvenance::Measured,
                     tables: None,
+                    gguf: None,
                 })
             }
         },

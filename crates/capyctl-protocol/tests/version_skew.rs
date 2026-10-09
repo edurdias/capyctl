@@ -189,6 +189,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         checkpoint_state_slot_bytes: None,
         checkpoint_layout: None,
         checkpoint_tables: None,
+        checkpoint_gguf: None,
         startup_bytes: startup.then_some(2 << 30),
     })
 }
@@ -335,6 +336,7 @@ fn every_post_baseline_field_names_its_capability() {
             ENGINE_GROUPS,
             ENGINE_LOG_TAIL,
             CHECKPOINT_TABLES,
+            CHECKPOINT_GGUF,
         ]
         .contains(name)
         {
