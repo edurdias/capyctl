@@ -69,11 +69,29 @@ pub fn isolate(command: &mut std::process::Command) -> &mut std::process::Comman
 }
 
 /// The `capyctl` binary under test, isolated from the developer's home
-/// ([`isolate`]). Every test spawns the binary through this.
+/// ([`isolate`]) and observing the stated host memory ([`pin_host_memory`]).
+/// Every test spawns the binary through this.
 pub fn capyctl() -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_capyctl"));
     isolate(&mut command);
+    pin_host_memory(&mut command);
     command
+}
+
+/// Every role a spawned `capyctl` runs (standalone or host) observes
+/// [`TEST_CAPACITY_BYTES`], all of it free, instead of this machine's
+/// `/proc/meminfo`, through the test-only
+/// [`capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV`] (debug builds only).
+/// SPEC §7: standalone derives its limits from observed capacity and admits
+/// against observed free memory, so on a busy machine (found 2026-10-08:
+/// 14 GiB available of 61) every deploy the binary tests made failed
+/// `insufficient resources`. A test that clears the environment calls this
+/// again.
+pub fn pin_host_memory(command: &mut std::process::Command) -> &mut std::process::Command {
+    command.env(
+        capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV,
+        format!("{TEST_CAPACITY_BYTES}:{TEST_CAPACITY_BYTES}"),
+    )
 }
 
 use std::sync::Arc;
@@ -379,12 +397,9 @@ pub async fn boot_with_overrides_on(
 pub const TEST_CAPACITY_BYTES: i64 = 32 << 30;
 
 /// The capacity a test that drives the real `capyctl` binary sizes its
-/// deployment documents from. The binary observes this machine's own memory,
-/// which a test cannot state, so the deployment is sized from a small explicit
-/// capacity instead of from `/proc/meminfo`: its footprints then fit under the
-/// limits standalone derives from any real machine's capacity and under the
-/// memory free on a busy one (a document sized from the whole machine asked
-/// for a fifth of it at cold start).
+/// deployment documents from. The binary observes [`TEST_CAPACITY_BYTES`]
+/// ([`pin_host_memory`]); documents stay sized from a smaller capacity so
+/// several deployments fit its derived limits at once.
 pub const BINARY_TEST_CAPACITY_BYTES: i64 = 4 << 30;
 
 /// The template memory a test that drives the real `capyctl` binary sizes its

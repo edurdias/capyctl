@@ -65,6 +65,7 @@ fn capyctl(root: &Path, cwd: &Path, args: &[&str], extra: &[(&str, &str)]) -> Ou
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("CAPYCTL_STATE_DIR", root.join("state"));
+    support::pin_host_memory(&mut command);
     for (key, value) in extra {
         command.env(key, value);
     }
