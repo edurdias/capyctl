@@ -489,7 +489,7 @@ fn record(
 /// A residency command's receipt scope: the deployment's (or one instance's)
 /// action scope, qualified by the change so no other action's receipt under
 /// the same key is ever read as one of these.
-fn residency_scope(deployment: &str, instance: Option<u32>, verb: &str) -> String {
+pub(super) fn residency_scope(deployment: &str, instance: Option<u32>, verb: &str) -> String {
     let base = match instance {
         None => super::cleanup::scope(deployment),
         Some(k) => instance_scope(deployment, k),
@@ -900,9 +900,12 @@ fn declared(tx: &Transaction<'_>, deployment: &str) -> Result<EffectiveDeploymen
 /// park stops it instead (an ordinary stop, so it stays eligible for
 /// on-demand activation and its next activation starts a fresh engine), as a
 /// restart_only group parks by a stop (ADR 0028 §12). The stop releases
-/// nothing before its own cleanup evidence. `None` when the instance parks:
-/// it is within the bound, has work open (a park in flight is joined), or
-/// runs no completed launch.
+/// nothing before its own cleanup evidence. The park command's receipt names
+/// the stop too, so an exact retry replays it; the stop's own validation
+/// admits exactly that receipt beside its own (found live 2026-10-09: without
+/// that, every read of the stop failed as corrupt and it never ran). `None`
+/// when the instance parks: it is within the bound, has work open (a park in
+/// flight is joined), or runs no completed launch.
 #[allow(clippy::too_many_arguments)]
 fn growth_stop(
     tx: &Transaction<'_>,

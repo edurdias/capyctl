@@ -6,7 +6,7 @@
 use super::*;
 use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milestone};
 use capyctl_store::ordinary_lifecycle::park::{IdlePolicy, WakeScope};
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicUsize};
 
 /// How the scripted engine answers one residency action.
 #[derive(Clone, Debug)]
@@ -25,6 +25,11 @@ struct Residency {
     restore: Mutex<Answer>,
     /// (action, binding, generation, step id) of every call after Initialize.
     calls: Mutex<Vec<(RuntimeAction, String, i64, String)>>,
+    /// Cleanups the scripted host carried out (the engine terminated).
+    cleanups: AtomicUsize,
+    /// What the host samples the engine's processes holding (none unless a
+    /// test scripts it).
+    residents: Mutex<Vec<capyctl_domain::resources::ProcessResident>>,
 }
 
 impl Residency {
@@ -38,6 +43,8 @@ impl Residency {
             park: Mutex::new(Answer::Proven),
             restore: Mutex::new(Answer::Proven),
             calls: Mutex::new(vec![]),
+            cleanups: AtomicUsize::new(0),
+            residents: Mutex::new(vec![]),
         })
     }
     fn actions(&self) -> Vec<RuntimeAction> {
@@ -139,10 +146,12 @@ impl EngineAdapter for Residency {
     }
 }
 
-/// Observations sampled at the test clock, so they stay fresh as it moves.
+/// Observations sampled at the test clock, so they stay fresh as it moves,
+/// with the residents the scripted host reports for its engine's processes.
 struct Fresh {
     observations: Vec<MemoryObservation>,
     clock: Arc<AtomicI64>,
+    engine: Arc<Residency>,
 }
 impl ServiceObservation for Fresh {
     fn observe(&self, _: String) -> ObservationFuture {
@@ -157,6 +166,11 @@ impl ServiceObservation for Fresh {
             })
             .collect();
         Box::pin(async move { Ok(values) })
+    }
+    fn observe_with_residents(&self, host: String) -> ResidentObservationFuture {
+        let observed = self.observe(host);
+        let residents = self.engine.residents.lock().unwrap().clone();
+        Box::pin(async move { Ok((observed.await?, residents)) })
     }
 }
 
@@ -175,6 +189,7 @@ fn residency_worker(
         Arc::new(Fresh {
             observations,
             clock: clock.clone(),
+            engine: engine.clone(),
         }),
         Arc::new(move || Ok(now.load(Ordering::SeqCst))),
         CoordinatorOptions {
@@ -184,10 +199,12 @@ fn residency_worker(
         },
         Arc::new(move |_: &InitializeWork| {
             let observed = clock.clone();
+            let terminated = engine.clone();
             Ok(ExecutionBinding::remote(
                 engine.clone(),
                 Arc::new(move |context: CleanupExecutionContext| {
                     let at = observed.load(Ordering::SeqCst);
+                    terminated.cleanups.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async move {
                         Ok(CleanupEvidence {
                             binding_id: context.binding_id,
@@ -641,5 +658,191 @@ async fn idle_timers_park_then_stop_and_keep_on_demand_activation() {
         o.store().is_admin_stopped(&fence.deployment_id).unwrap()
     };
     assert!(!admin, "an idle stop leaves on-demand activation enabled");
+    w.shutdown().await.unwrap();
+}
+
+/// As `setup`, with one deployment whose resources CapyCTL derives, so a
+/// park's measured residue is recorded for its launch (ADR 0014 amendments
+/// A13, A19).
+async fn derived_setup() -> (
+    tempfile::TempDir,
+    SharedCoordinatorState,
+    DeploymentFence,
+    Vec<MemoryObservation>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture::fixture();
+    let fence = fixture::managed_edit(&f, "grows", |deployment, _| {
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["engine_config"]["memory"] =
+            serde_json::json!({"request": "8GiB", "kv_cache": "4GiB"});
+    });
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("srv.sqlite3");
+    f.sql
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = Arc::new(Mutex::new(
+        crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+    ));
+    (dir, owner, fence, f.observations.clone())
+}
+
+/// The deployment's parked-charge growth, as status reports it.
+fn growth(owner: &SharedCoordinatorState, deployment: &str) -> serde_json::Value {
+    let o = owner.lock().unwrap();
+    let snapshot = o.store().snapshot().unwrap();
+    let d = snapshot
+        .deployments
+        .iter()
+        .find(|d| d.id == deployment)
+        .unwrap();
+    serde_json::to_value(&d.parked).unwrap()["growth"][0].clone()
+}
+
+// T16 T20 (ADR 0014 amendment A19; found live 2026-10-09 on host A, vLLM
+// 0.30.0 deep): the launch's parked charge grows on every park (3, 5.5, then
+// 7 GiB against a 3 GiB first charge), so its fourth `park deployment` is a
+// stop. Live, that stop's every read failed as corrupt (the park's receipt
+// named it too), so the worker halted with it queued and the engine running.
+// Now it runs as any stop does: the engine is terminated once, the instance
+// is released on the host's gone evidence and reads stopped, the worker keeps
+// running, and an operator's Stop afterwards is accepted.
+#[tokio::test]
+async fn a_park_the_growth_bound_turns_into_a_stop_runs_the_stop() {
+    const GIB: i64 = 1 << 30;
+    let (dir, owner, fence, observations) = derived_setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(false, clock.clone());
+    let w = residency_worker(
+        owner.clone(),
+        observations,
+        engine.clone(),
+        clock,
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let generation = instance(&dir, &fence.deployment_id).2;
+    // What the parked engine's two processes hold after each park (testkit
+    // FakeEngine identities).
+    let hold = |bytes: i64| {
+        *engine.residents.lock().unwrap() = [(71, 100, bytes - GIB / 2), (72, 101, GIB / 2)]
+            .into_iter()
+            .map(
+                |(pid, start_ticks, bytes)| capyctl_domain::resources::ProcessResident {
+                    pid,
+                    boot_id: "fake-lifecycle-boot".into(),
+                    start_ticks,
+                    bytes,
+                    device_bytes: bytes,
+                    host_bytes: 0,
+                },
+            )
+            .collect();
+    };
+    for (n, (bytes, state)) in [
+        (3 * GIB, "within_limit"),
+        (11 * GIB / 2, "within_limit"),
+        (7 * GIB, "past_limit"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        hold(bytes);
+        w.commands()
+            .park(
+                "operator",
+                &fence.deployment_id,
+                fence.revision,
+                &format!("park-{n}"),
+                100_000,
+            )
+            .unwrap();
+        until("parked and measured", || {
+            instance(&dir, &fence.deployment_id).0 == "parked"
+                && growth(&owner, &fence.deployment_id)["last_bytes"] == bytes
+        })
+        .await;
+        assert_eq!(growth(&owner, &fence.deployment_id)["state"], state);
+        w.commands()
+            .wake(
+                "router",
+                &fence.deployment_id,
+                WakeScope::OnDemand,
+                fence.revision,
+                &format!("wake-{n}"),
+                100_000,
+            )
+            .unwrap()
+            .unwrap();
+        until("woken", || {
+            instance(&dir, &fence.deployment_id).0 == "ready"
+        })
+        .await;
+    }
+    assert_eq!(instance(&dir, &fence.deployment_id).2, generation);
+
+    let stop = w
+        .commands()
+        .park(
+            "operator",
+            &fence.deployment_id,
+            fence.revision,
+            "park-3",
+            100_000,
+        )
+        .unwrap();
+    assert_eq!(growth(&owner, &fence.deployment_id)["state"], "stopped");
+    assert_eq!(
+        growth(&owner, &fence.deployment_id)["stop_operation_id"],
+        stop.operation_id.as_str()
+    );
+    until("the growth stop settled", || {
+        operation(&owner, &stop.operation_id).0 == "succeeded"
+    })
+    .await;
+    assert_eq!(engine.cleanups.load(Ordering::SeqCst), 1, "terminated once");
+    assert_eq!(instance(&dir, &fence.deployment_id).0, "stopped");
+    assert_eq!(phase(&owner, &fence.deployment_id), None, "released");
+    let parks = engine
+        .actions()
+        .into_iter()
+        .filter(|a| *a == RuntimeAction::Park)
+        .count();
+    assert_eq!(parks, 3, "the fourth park was never sent");
+    assert!(
+        matches!(w.status(), WorkerStatus::Running),
+        "{:?}",
+        w.status()
+    );
+
+    // Live, the operator's Stop was refused (`lifecycle_conflict`) behind the
+    // stop that never ran. Now it is accepted and recorded, with nothing left
+    // to terminate.
+    let operator = w
+        .commands()
+        .administrative_stop(
+            "operator",
+            &fence.deployment_id,
+            fence.revision,
+            "stop",
+            100_000,
+        )
+        .unwrap();
+    until("operator stop settled", || {
+        operation(&owner, operator.operation_id()).0 == "succeeded"
+    })
+    .await;
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store()
+        .is_admin_stopped(&fence.deployment_id)
+        .unwrap());
+    assert_eq!(engine.cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(instance(&dir, &fence.deployment_id).0, "stopped");
+    assert_eq!(phase(&owner, &fence.deployment_id), None);
     w.shutdown().await.unwrap();
 }
