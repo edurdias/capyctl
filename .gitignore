@@ -11,3 +11,4 @@ __pycache__/
 /scripts/live/matrix/hosts.local.env
 /scripts/private-denylist.txt
 /target-ci
+/.worktrees/
