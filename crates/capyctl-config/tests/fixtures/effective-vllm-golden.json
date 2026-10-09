@@ -184,8 +184,10 @@
       },
       "provenance": {
         "enable_sleep_mode": "derived",
-        "memory.request": "derived"
-      }
+        "memory.request": "derived",
+        "vllm.safetensors_load_strategy": "capyctl default"
+      },
+      "safetensors_load_strategy": "lazy"
     },
     "host": {
       "device_sharing": "shared",
@@ -258,7 +260,7 @@
       }
     },
     "recipe": "standard",
-    "recipe_fingerprint": "e011aa21a8961a1cc894d17e5ea69f147ffc93f17b20b3ee5675643174fdba75",
+    "recipe_fingerprint": "95db2ad97a7c5754e87992568811fdffaa4609b2a987e2d729159faf0f8f2249",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
     "residency": "deep",
