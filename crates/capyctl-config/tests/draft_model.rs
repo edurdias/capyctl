@@ -113,7 +113,8 @@ fn a_drafter_source_resolves_in_every_spelling_beside_the_weights() {
         (
             http_draft('a'),
             ModelSource::Http {
-                url: "https://drafts.example.test/d.tar".into(),
+                url: Some("https://drafts.example.test/d.tar".into()),
+                url_ref: None,
                 sha256: digest('a'),
                 archive: capyctl_config::effective::Archive::Tar,
             },
