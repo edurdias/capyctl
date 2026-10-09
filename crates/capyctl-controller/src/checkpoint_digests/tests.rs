@@ -181,6 +181,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             state_slot_bytes: None,
             layout: None,
             provenance: DigestProvenance::DeclaredTrusted,
+            tables: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -198,6 +199,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             state_slot_bytes: None,
             layout: None,
             provenance: DigestProvenance::Fetched,
+            tables: None,
         }),
         calls: AtomicUsize::new(0),
     });
