@@ -89,22 +89,23 @@ CapyCTL relays each chunk unchanged except `model`, and checks it first: a
 field never reaches a client. Fields beside `delta` in a
 choice, and `usage` with its details, are relayed as the engine sent them.
 
-| Field | Where | vLLM 0.29, 0.30 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x |
-|---|---|---|---|---|
-| `role` | delta | yes | yes (may be `null`) | yes |
-| `content` | delta | yes | yes | yes |
-| `reasoning` | delta | yes | — | — |
-| `reasoning_content` | delta | — | yes | yes |
-| `tool_calls` | delta | yes | yes | yes |
-| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` |
-| `stop_reason`, `token_ids` | choice | yes | — | — |
-| `matched_stop` | choice | — | yes | — |
-| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes |
-| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes |
-| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes |
-| `reasoning_tokens` | usage | — | yes | — |
-| `metrics` | chunk | yes (usage chunk) | — | — |
-| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) |
+| Field | Where | vLLM 0.29, 0.30 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
+|---|---|---|---|---|---|
+| `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk) |
+| `content` | delta | yes | yes | yes | yes (`null` on the opening chunk) |
+| `reasoning` | delta | yes | — | — | — |
+| `reasoning_content` | delta | — | yes | yes | yes |
+| `tool_calls` | delta | yes | yes | yes | yes |
+| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` | yes |
+| `stop_reason`, `token_ids` | choice | yes | — | — | — |
+| `matched_stop` | choice | — | yes | — | — |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes | yes |
+| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes | yes |
+| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes | — |
+| `reasoning_tokens` | usage | — | yes | — | — |
+| `metrics` | chunk | yes (usage chunk) | — | — | — |
+| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) | — |
+| `system_fingerprint`, `timings` | chunk | — | — | — | yes (`timings` on the last chunk) |
 
 Not relayed: SGLang's `hidden_states` delta (sent only for
 `return_hidden_states`, a request field CapyCTL refuses) and vLLM's `citations`
@@ -151,19 +152,21 @@ the prompt. A router `decode_tokens_per_second` is the completion tokens
 after the first, over the time from that first text to the last chunk. A
 figure nobody measured is left out, never shown as zero.
 
-| Figure | vLLM 0.30 | SGLang 0.5.21 | TensorFold 0.6.x |
-|---|---|---|---|
-| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request |
-| `queue_ms` | engine | — | — |
-| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request |
-| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode |
-| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine |
+| Figure | vLLM 0.30 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
+|---|---|---|---|---|
+| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request | router |
+| `queue_ms` | engine | — | — | — |
+| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request | engine (`timings.prompt_ms`, from when a slot took the request) |
+| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode | engine (`timings.predicted_per_second`); router when it timed no decode |
+| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine |
 
 CapyCTL starts vLLM with `--enable-per-request-metrics` and SGLang with
 `--enable-cache-report`, and a deployment cannot turn either off (see
 [Engine options](engine-flags.md)). The engine's own fields stay as the
-engine sent them: vLLM's `metrics` object and TensorFold's `tensorfold`
-object reach you unchanged.
+engine sent them: vLLM's `metrics` object, TensorFold's `tensorfold` object
+and llama.cpp's `timings` object reach you unchanged. llama.cpp puts `timings`
+on a stream's last chunk: the usage chunk when the request asked for usage,
+else the finish chunk.
 
 For a non-streaming answer CapyCTL asks the engine for usage itself. A
 stream from vLLM or SGLang carries usage, vLLM's `metrics` and the cached

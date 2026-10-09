@@ -11,7 +11,9 @@
 //! A sample is a routing hint, never readiness or admission evidence and never
 //! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
 //! evidence after a restart or a hang-up. A TensorFold sample folds in the
-//! engine's unkeyed `/health`, so it reads idle only when both agree. Metric names are pinned to the recorded engine
+//! engine's unkeyed `/health`, so it reads idle only when both agree. A
+//! llama.cpp sample takes its KV usage from one bounded `/slots` read (ADR 0029
+//! §11), since llama.cpp exports no ratio. Metric names are pinned to the recorded engine
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
@@ -152,20 +154,57 @@ const TENSORFOLD: Family = Family {
     kv_usage: "tensorfold:kv_cache_usage_ratio",
 };
 
-fn family_load(text: &str, family: &Family) -> Option<EngineLoad> {
-    Some(EngineLoad {
+/// ADR 0029 §11: llama.cpp v0.6.0 `tools/server/server-task.cpp`
+/// (`server_task_result_metrics`, exported only with `--metrics`). It has no
+/// KV usage gauge; [`parse_llamacpp_slots`] derives one.
+const LLAMACPP_RUNNING: &str = "llamacpp:requests_processing";
+const LLAMACPP_WAITING: &str = "llamacpp:requests_deferred";
+/// ADR 0029 §11: llama.cpp exports no latency histograms; its
+/// `*_tokens_seconds` gauges are throughputs averaged between two scrapes (each
+/// scrape resets them), so no latency series is forwarded.
+const LLAMACPP_HISTOGRAMS: &[(&str, &str)] = &[];
+
+/// One family's gauges from `/metrics`. The KV usage is `None` only for a
+/// family that does not export it there (llama.cpp).
+#[derive(Clone, Copy)]
+struct Gauges {
+    running: u32,
+    waiting: u32,
+    kv_usage_ppm: Option<u32>,
+}
+
+impl Gauges {
+    fn with_kv(self, kv_usage_ppm: Option<u32>) -> Option<EngineLoad> {
+        Some(EngineLoad {
+            running: self.running,
+            waiting: self.waiting,
+            kv_usage_ppm: self.kv_usage_ppm.or(kv_usage_ppm)?,
+        })
+    }
+}
+
+fn family_load(text: &str, family: &Family) -> Option<Gauges> {
+    Some(Gauges {
         running: count(text, family.running)?,
         waiting: count(text, family.waiting)?,
-        kv_usage_ppm: usage_ppm(text, family.kv_usage)?,
+        kv_usage_ppm: Some(usage_ppm(text, family.kv_usage)?),
+    })
+}
+
+fn llamacpp_load(text: &str) -> Option<Gauges> {
+    Some(Gauges {
+        running: count(text, LLAMACPP_RUNNING)?,
+        waiting: count(text, LLAMACPP_WAITING)?,
+        kv_usage_ppm: None,
     })
 }
 
 type HistogramTable = &'static [(&'static str, &'static str)];
 
-/// The one family whose three gauges parse, with its name and histograms.
+/// The one family whose gauges parse, with its name and histograms.
 /// TensorFold 0.6.1 to 0.6.5 also mirror their values under vLLM names; their
 /// own `tensorfold:` families win so the mirrors are never read or double counted.
-fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
+fn family_of(text: &str) -> Option<(&'static str, Gauges, HistogramTable)> {
     if let Some(load) = family_load(text, &TENSORFOLD) {
         return Some(("tensorfold", load, TENSORFOLD_HISTOGRAMS));
     }
@@ -176,6 +215,7 @@ fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
     ]
     .into_iter()
     .filter_map(|(name, family, table)| family_load(text, family).map(|l| (name, l, table)))
+    .chain(llamacpp_load(text).map(|l| ("llamacpp", l, LLAMACPP_HISTOGRAMS)))
     .collect();
     match found.as_slice() {
         [one] => Some(*one),
@@ -184,9 +224,48 @@ fn family_of(text: &str) -> Option<(&'static str, EngineLoad, HistogramTable)> {
 }
 
 /// Engine gauges from one `/metrics` body. `None` unless exactly one engine
-/// family's three gauges are all present and well formed.
+/// family's three gauges are all present and well formed. A llama.cpp body
+/// alone is never a whole sample: its KV usage comes from `/slots`
+/// ([`parse_llamacpp_load`]).
 pub fn parse_engine_load(text: &str) -> Option<EngineLoad> {
-    family_of(text).map(|(_, load, _)| load)
+    family_of(text).and_then(|(_, gauges, _)| gauges.with_kv(None))
+}
+
+/// ADR 0029 §11: a llama.cpp sample from its `/metrics` body and the KV usage
+/// its `/slots` read gave ([`parse_llamacpp_slots`]). `None` unless the body is
+/// llama.cpp's alone and the usage is known.
+pub fn parse_llamacpp_load(text: &str, kv_usage_ppm: Option<u32>) -> Option<EngineLoad> {
+    match family_of(text)? {
+        ("llamacpp", gauges, _) => gauges.with_kv(kv_usage_ppm),
+        _ => None,
+    }
+}
+
+/// ADR 0029 §11: where llama.cpp lists its slots (on by default; CapyCTL never
+/// renders `--no-slots`).
+pub const LLAMACPP_SLOTS_PATH: &str = "/slots";
+
+/// ADR 0029 §11: the KV usage of one llama.cpp v0.6.0 `/slots` body
+/// (`server_slot::to_json`): the tokens held by processing slots
+/// (`n_prompt_tokens`, which grows with every generated token) over the sum of
+/// every slot's `n_ctx`, in parts per million. An idle slot's leftover cache is
+/// reusable, not pressure, so it does not count. `None` when the body is not a
+/// non-empty slot list with a positive `n_ctx` on each slot and a token count on
+/// each processing one: unknown, never zero.
+pub fn parse_llamacpp_slots(body: &[u8]) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let slots = value.as_array().filter(|slots| !slots.is_empty())?;
+    let mut held: u64 = 0;
+    let mut capacity: u64 = 0;
+    for slot in slots {
+        let n_ctx = slot.get("n_ctx")?.as_u64().filter(|n| *n > 0)?;
+        capacity = capacity.checked_add(n_ctx)?;
+        if slot.get("is_processing")?.as_bool()? {
+            held = held.checked_add(slot.get("n_prompt_tokens")?.as_u64()?)?;
+        }
+    }
+    let ppm = held as f64 / capacity as f64 * f64::from(KV_USAGE_PPM_FULL);
+    Some((ppm.round() as u32).min(KV_USAGE_PPM_FULL))
 }
 
 /// SPEC §17 (owner decision 2026-09-23, M80): the engine latency histograms a
@@ -378,9 +457,11 @@ pub fn parse_histogram(text: &str, metric: &str) -> Option<Histogram> {
 
 /// SPEC §17 (M80): the engine family of one `/metrics` body and its latency
 /// histograms (cumulative since the engine started). The family is the one
-/// whose load gauges parse; `None` when neither or both do.
+/// whose load gauges parse; `None` when neither or both do, and for a family
+/// that exports no latency histograms (llama.cpp, ADR 0029 §11), which names no
+/// engine in the sample.
 pub fn parse_engine_histograms(text: &str) -> Option<(&'static str, Vec<(String, Histogram)>)> {
-    let (engine, _, table) = family_of(text)?;
+    let (engine, _, table) = family_of(text).filter(|(_, _, table)| !table.is_empty())?;
     let histograms = table
         .iter()
         .filter_map(|(series, metric)| {
@@ -431,6 +512,15 @@ pub fn parse_sglang_max_running(body: &[u8]) -> Option<u32> {
     u32::try_from(total)
         .ok()
         .filter(|total| *total <= MAX_LOAD_GAUGE)
+}
+
+/// What one engine's sample needs beside its `/metrics` body.
+enum SideRead {
+    None,
+    /// TensorFold's `/health`, `None` when unreadable.
+    Health(Option<HealthReport>),
+    /// llama.cpp's KV usage from `/slots`, `None` when unreadable.
+    KvUsage(Option<u32>),
 }
 
 /// Previous cumulative engine histograms, keyed by scope and series, so each
@@ -577,6 +667,31 @@ impl LoadReporter {
             .flatten()
     }
 
+    /// ADR 0029 §11: llama.cpp's KV usage from its `/slots`, on the same
+    /// loopback target with the launch's key, within the scrape bound.
+    async fn llamacpp_kv_usage(&self, target: &LoadTarget) -> Option<u32> {
+        if !target.target.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = self
+                .client
+                .get(format!("http://{}{LLAMACPP_SLOTS_PATH}", target.target))
+                .bearer_auth(hex::encode(target.native))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
+            }
+            parse_llamacpp_slots(&bounded_body(response).await?)
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// SPEC §§10, 17 (owner decision 2026-10-08): SGLang's resolved running
     /// limit, on the same loopback target with the launch's key, within the
     /// scrape bound.
@@ -659,12 +774,14 @@ impl LoadReporter {
             .iter()
             .map(|body| body.as_deref().and_then(family_of).map(|(name, ..)| name))
             .collect();
-        // Only a TensorFold scrape is folded with its health.
-        let healths = futures::future::join_all(targets.iter().zip(&families).map(
+        // Only a TensorFold scrape is folded with its health, and only a
+        // llama.cpp scrape reads `/slots` for its KV usage.
+        let side_reads = futures::future::join_all(targets.iter().zip(&families).map(
             |(target, family)| async move {
                 match family {
-                    Some("tensorfold") => Some(self.health(target).await),
-                    _ => None,
+                    Some("tensorfold") => SideRead::Health(self.health(target).await),
+                    Some("llamacpp") => SideRead::KvUsage(self.llamacpp_kv_usage(target).await),
+                    _ => SideRead::None,
                 }
             },
         ))
@@ -682,16 +799,17 @@ impl LoadReporter {
         let mut samples: Vec<(u32, LoadSample)> = targets
             .into_iter()
             .zip(scraped)
-            .zip(healths)
+            .zip(side_reads)
             .zip(limits)
-            .map(|(((target, body), health), max_running)| {
-                let engine =
-                    body.as_deref()
-                        .and_then(parse_engine_load)
-                        .map(|load| match &health {
-                            Some(health) => fold_tensorfold_health(load, health.as_ref()),
-                            None => load,
-                        });
+            .map(|(((target, body), side_read), max_running)| {
+                // A failed `/slots` read leaves the engine load out, as a
+                // failed scrape does.
+                let engine = body.as_deref().and_then(|body| match side_read {
+                    SideRead::Health(health) => parse_engine_load(body)
+                        .map(|load| fold_tensorfold_health(load, health.as_ref())),
+                    SideRead::KvUsage(kv) => parse_llamacpp_load(body, kv),
+                    SideRead::None => parse_engine_load(body),
+                });
                 let latency = self.latency(&target, body.as_deref(), &mut baselines);
                 (
                     target.scope.instance_index,

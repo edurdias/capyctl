@@ -1,13 +1,18 @@
 //! SPEC §17 (owner decision 2026-10-09): every completed chat response carries
 //! one normalized set of per-request figures, each with its source.
 //!
-//! | figure | vLLM 0.30 (`metrics`) | TensorFold 0.6 (`tensorfold`) | SGLang 0.5.21 | router |
-//! |---|---|---|---|---|
-//! | `ttft_ms` | `queue_time_ms` + `time_to_first_token_ms` | `time_to_first_token` | — | forward start to first generated text |
-//! | `queue_ms` | `queue_time_ms` | — | — | — |
-//! | `prefill_ms` | `time_to_first_token_ms` | `prefill_seconds` | — | — |
-//! | `decode_tokens_per_second` | 1000 / `mean_itl_ms` | `tokens_per_second` (positive only) | — | (completion tokens − 1) / first generated text to last chunk |
-//! | `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` | the same | the same (`--enable-cache-report`) | — |
+//! | figure | vLLM 0.30 (`metrics`) | TensorFold 0.6 (`tensorfold`) | SGLang 0.5.21 | llama.cpp v0.6.0 (`timings`) | router |
+//! |---|---|---|---|---|---|
+//! | `ttft_ms` | `queue_time_ms` + `time_to_first_token_ms` | `time_to_first_token` | — | — | forward start to first generated text |
+//! | `queue_ms` | `queue_time_ms` | — | — | — | — |
+//! | `prefill_ms` | `time_to_first_token_ms` | `prefill_seconds` | — | `prompt_ms` | — |
+//! | `decode_tokens_per_second` | 1000 / `mean_itl_ms` | `tokens_per_second` (positive only) | — | `predicted_per_second` (positive only) | (completion tokens − 1) / first generated text to last chunk |
+//! | `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` | the same | the same (`--enable-cache-report`) | the same | — |
+//!
+//! llama.cpp (ADR 0029 §11) reports no time to first token and no queue time
+//! (`prompt_ms` excludes the wait for a slot), so its `ttft_ms` is the
+//! router's; the router's decode rate counts `usage.completion_tokens`, else
+//! `timings.predicted_n`.
 //!
 //! An engine figure wins; the router derives `ttft_ms` and
 //! `decode_tokens_per_second` from its own clock only when the engine sent
@@ -36,6 +41,9 @@ pub struct EngineReport {
     pub decode_tokens_per_second: Option<f64>,
     pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// llama.cpp's `timings.predicted_n`: the completion count when `usage`
+    /// carries none.
+    pub predicted_tokens: Option<u64>,
 }
 
 /// A finite, non-negative number at `key`, or nothing.
@@ -49,10 +57,12 @@ fn measured(object: &Value, key: &str) -> Option<f64> {
 impl EngineReport {
     /// Whether one streamed chunk may carry anything [`EngineReport::observe`]
     /// reads. SGLang sends `"usage":null` on every chunk, which carries
-    /// nothing, so most chunks are never parsed.
+    /// nothing, so most chunks are never parsed. llama.cpp v0.6.0 puts
+    /// `timings` on its last chunk (the usage chunk, else the finish chunk).
     pub fn may_carry(chunk: &str) -> bool {
         chunk.contains("\"tensorfold\"")
             || chunk.contains("\"metrics\"")
+            || chunk.contains("\"timings\"")
             || (chunk.contains("\"usage\"")
                 && !chunk.contains("\"usage\":null")
                 && !chunk.contains("\"usage\": null"))
@@ -106,6 +116,21 @@ impl EngineReport {
                 self.decode_tokens_per_second = Some(rate);
             }
         }
+        // ADR 0029 §11: llama.cpp v0.6.0 `timings`
+        // (`tools/server/server-common.cpp` `server_slot_stats::to_json`), in
+        // milliseconds. `predicted_per_second` is 0 or not finite when no
+        // decode was timed, which is unknown rather than zero.
+        if let Some(timings) = value.get("timings").filter(|t| t.is_object()) {
+            if let Some(prefill) = measured(timings, "prompt_ms") {
+                self.prefill_ms = Some(prefill);
+            }
+            if let Some(rate) = measured(timings, "predicted_per_second").filter(|r| *r > 0.0) {
+                self.decode_tokens_per_second = Some(rate);
+            }
+            if let Some(tokens) = timings.get("predicted_n").and_then(Value::as_u64) {
+                self.predicted_tokens = Some(tokens);
+            }
+        }
     }
 }
 
@@ -133,7 +158,8 @@ pub fn metrics(report: &EngineReport, timing: &RequestTiming) -> Value {
         .map(|took| took.as_secs_f64() * 1000.0);
     // The first token is the one that opened the span; the rest were decoded
     // within it.
-    let router_decode = match (report.completion_tokens, timing.generating_span()) {
+    let completion = report.completion_tokens.or(report.predicted_tokens);
+    let router_decode = match (completion, timing.generating_span()) {
         (Some(tokens), Some(span)) if tokens >= 2 && !span.is_zero() => {
             Some((tokens - 1) as f64 / span.as_secs_f64())
         }
@@ -277,6 +303,156 @@ mod tests {
         ));
         assert!(EngineReport::may_carry(r#"{"choices":[],"tensorfold":{}}"#));
         assert!(EngineReport::may_carry(r#"{"choices":[],"metrics":{}}"#));
+        assert!(EngineReport::may_carry(r#"{"choices":[],"timings":{}}"#));
+        assert!(!EngineReport::may_carry(
+            r#"{"choices":[{"index":0,"delta":{"content":"say \"timings\""}}]}"#
+        ));
+    }
+
+    /// llama.cpp v0.6.0 `server_slot_stats::to_json` as one answer carries it.
+    fn llamacpp_timings(predicted_per_second: f64) -> Value {
+        json!({"cache_n": 8, "prompt_n": 4, "prompt_ms": 12.5,
+            "prompt_per_token_ms": 3.125, "prompt_per_second": 320.0,
+            "predicted_n": 6, "predicted_ms": 100.0, "predicted_per_token_ms": 16.667,
+            "predicted_per_second": predicted_per_second})
+    }
+
+    fn llamacpp_usage() -> Value {
+        json!({"completion_tokens": 6, "prompt_tokens": 12, "total_tokens": 18,
+            "prompt_tokens_details": {"cached_tokens": 8}})
+    }
+
+    /// The router clock of a forward whose first text arrived after a pause.
+    fn router_clock() -> RequestTiming {
+        let mut timing = RequestTiming::untracked();
+        timing.forwarding(Some(0), Some(1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        timing.chunk(true);
+        timing
+    }
+
+    fn llamacpp_set(ttft: &Value) -> Value {
+        json!({
+            "ttft_ms": ttft,
+            "prefill_ms": {"value": 12.5, "source": "engine"},
+            "decode_tokens_per_second": {"value": 60.0, "source": "engine"},
+            "cached_tokens": {"value": 8, "source": "engine"},
+        })
+    }
+
+    // T40 T42, ADR 0029 §11: a llama-server v0.6.0 answer
+    // (`to_json_oaicompat_chat`): `prefill_ms` from `timings.prompt_ms`, the
+    // decode rate from `predicted_per_second`, cached tokens from `usage`, the
+    // router's `ttft_ms` and no `queue_ms`.
+    #[test]
+    fn llamacpp_answer_maps_timings_and_usage() {
+        let mut answer = json!({
+            "choices": [{"finish_reason": "stop", "index": 0,
+                "message": {"role": "assistant", "content": "hi"}}],
+            "created": 1, "model": "m", "system_fingerprint": "b1-abc",
+            "object": "chat.completion", "usage": llamacpp_usage(), "id": "chatcmpl-1",
+            "timings": llamacpp_timings(60.0)
+        });
+        let engine = answer.clone();
+        let timing = router_clock();
+        attach(&mut answer, &timing);
+        let figures = &answer["capyctl"]["metrics"];
+        assert_eq!(figures["ttft_ms"]["source"], "router");
+        assert_eq!(*figures, llamacpp_set(&figures["ttft_ms"]));
+        assert!(figures.get("queue_ms").is_none());
+        // The engine's own fields are relayed as it sent them.
+        for key in ["choices", "usage", "timings", "system_fingerprint"] {
+            assert_eq!(answer[key], engine[key]);
+        }
+        // A zero or missing decode rate is unknown, not zero.
+        let figures = engine_only(&json!({"timings": {"prompt_ms": 12.5,
+            "predicted_n": 0, "predicted_ms": 0.0, "predicted_per_second": 0.0}}));
+        assert_eq!(
+            figures,
+            json!({"prefill_ms": {"value": 12.5, "source": "engine"}})
+        );
+        let figures = engine_only(&json!({"timings": {"prompt_ms": null}}));
+        assert_eq!(figures, json!({}));
+    }
+
+    /// Fold a stream's chunks as the relay does: only those that may carry a
+    /// report are parsed.
+    fn streamed(chunks: &[Value]) -> (EngineReport, usize) {
+        let mut report = EngineReport::default();
+        let mut parsed = 0;
+        for chunk in chunks {
+            let text = chunk.to_string();
+            if EngineReport::may_carry(&text) {
+                parsed += 1;
+                report.observe(&serde_json::from_str(&text).unwrap());
+            }
+        }
+        (report, parsed)
+    }
+
+    fn llamacpp_chunk(delta: Value, finish: Value) -> Value {
+        json!({"choices": [{"finish_reason": finish, "index": 0, "delta": delta}],
+            "created": 1, "id": "chatcmpl-1", "model": "m", "system_fingerprint": "b1-abc",
+            "object": "chat.completion.chunk"})
+    }
+
+    // T40 T42, ADR 0029 §11: a llama-server v0.6.0 stream
+    // (`to_json_oaicompat_chat_stream`) puts `timings` on its last chunk: the
+    // empty-`choices` usage chunk with `include_usage`, else the finish chunk.
+    // Both yield the same set; chunks with neither are not parsed.
+    #[test]
+    fn llamacpp_stream_maps_the_last_chunk() {
+        let opening = llamacpp_chunk(json!({"role": "assistant", "content": null}), Value::Null);
+        let text = llamacpp_chunk(json!({"content": "hi"}), Value::Null);
+        let finish = llamacpp_chunk(json!({}), json!("stop"));
+        let mut usage = json!({"choices": [], "created": 1, "id": "chatcmpl-1", "model": "m",
+            "system_fingerprint": "b1-abc", "object": "chat.completion.chunk",
+            "usage": llamacpp_usage()});
+        usage["timings"] = llamacpp_timings(60.0);
+        let timing = router_clock();
+        let (report, parsed) = streamed(&[opening.clone(), text.clone(), finish.clone(), usage]);
+        assert_eq!(parsed, 1);
+        let with_usage = metrics(&report, &timing);
+        assert_eq!(with_usage["ttft_ms"]["source"], "router");
+        assert_eq!(with_usage, llamacpp_set(&with_usage["ttft_ms"]));
+
+        // Without `include_usage` the finish chunk carries `timings` alone:
+        // no `usage`, so no cached tokens, and `predicted_n` is the count.
+        let mut finish_timed = finish;
+        finish_timed["timings"] = llamacpp_timings(60.0);
+        let (report, parsed) = streamed(&[opening, text, finish_timed]);
+        assert_eq!(parsed, 1);
+        assert_eq!(report.completion_tokens, None);
+        assert_eq!(report.predicted_tokens, Some(6));
+        let figures = metrics(&report, &timing);
+        let mut expected = llamacpp_set(&figures["ttft_ms"]);
+        expected.as_object_mut().unwrap().remove("cached_tokens");
+        assert_eq!(figures, expected);
+    }
+
+    // T40 T42: with no engine rate, the router's decode rate counts llama.cpp's
+    // `predicted_n` when `usage` names no completion count.
+    #[test]
+    fn llamacpp_predicted_count_feeds_the_router_rate() {
+        let mut timing = router_clock();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        timing.chunk(false);
+        let report = EngineReport {
+            predicted_tokens: Some(6),
+            ..EngineReport::default()
+        };
+        assert_eq!(
+            metrics(&report, &timing)["decode_tokens_per_second"]["source"],
+            "router"
+        );
+        let report = EngineReport {
+            predicted_tokens: Some(6),
+            completion_tokens: Some(1),
+            ..EngineReport::default()
+        };
+        assert!(metrics(&report, &timing)
+            .get("decode_tokens_per_second")
+            .is_none());
     }
 
     // T40: a non-streaming answer keeps the engine's fields and gains
