@@ -270,6 +270,39 @@ fn render_emits_host_and_served_name() {
     assert_flag(&cmd, "--served-model-name", "gate-m");
 }
 
+/// SPEC §17 (owner decision 2026-10-09): per-request metrics render on by
+/// default, in the reserved block before the marker, and a deployment cannot
+/// state or reverse them.
+// T14 T40
+#[test]
+fn per_request_metrics_render_by_default_and_are_reserved() {
+    let argv = render_command(&plan()).unwrap().argv;
+    let flag = argv
+        .iter()
+        .position(|a| a == "--enable-per-request-metrics")
+        .unwrap_or_else(|| panic!("not rendered: {argv:?}"));
+    let marker = argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
+    assert!(flag < marker, "{argv:?}");
+    for argument in [
+        "--enable-per-request-metrics",
+        "--no-enable-per-request-metrics",
+        "--enable_per_request_metrics",
+    ] {
+        let mut input = plan();
+        input.engine_args = vec![argument.into()];
+        assert!(
+            matches!(render_command(&input), Err(ArgsError::ReservedConflict(_))),
+            "{argument}"
+        );
+        let mut input = plan();
+        input.extra_args = vec![argument.into()];
+        assert!(
+            matches!(render_command(&input), Err(ArgsError::ReservedConflict(_))),
+            "{argument}"
+        );
+    }
+}
+
 /// Spec §3: every validated launch setting reaches the engine.
 // T14
 #[test]

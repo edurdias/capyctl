@@ -103,6 +103,10 @@ _RESERVED_CONSTANT = {
     "log_requests_target": None, "crash_dump_folder": None,
     # W8: the host agent scrapes loopback /metrics for load reports.
     "enable_metrics": True,
+    # SPEC §17 (owner decision 2026-10-09): usage reports cached prompt tokens
+    # (`prompt_tokens_details.cached_tokens`, 0.5.20 and 0.5.21
+    # fields/serving.py), which the router adds to each response's metrics.
+    "enable_cache_report": True,
     "skip_server_warmup": True,
     "disaggregation_mode": "null",
     "enable_hierarchical_cache": False, "hicache_storage_backend": None,

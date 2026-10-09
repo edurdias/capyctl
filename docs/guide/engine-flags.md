@@ -52,6 +52,8 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
 | Log level | `--uvicorn-log-level` | reserved | CapyCTL owns the server's logging. vLLM's own level is the `VLLM_LOGGING_LEVEL` variable: set it in `engine_config.env` once the installation lists it in `security.approved_env`. |
 | Request and stats logging | `--enable-log-requests`, `--disable-log-requests`, `--disable-log-stats` | reserved | CapyCTL logs requests itself and reads the engine's stats for load reports. |
+| Per-request metrics | `--enable-per-request-metrics` | reserved | Always on: each answer carries vLLM's timings for the request, which CapyCTL adds to its [per-request metrics](requests.md#per-request-metrics). |
+| Cached-token count | `--enable-prompt-tokens-details` | extra | Off unless you pass it. With it, usage reports `prompt_tokens_details.cached_tokens` and the per-request metrics show `cached_tokens`. |
 | KV offload, LMCache | `--kv-transfer-config` | approval | vLLM's KV connectors (LMCache among them) are set here. It can reach off the host. |
 | CPU KV offload | `--kv-offloading-backend`, `--kv-offloading-size` | extra | Uses host memory that CapyCTL does not count. |
 | Plugins | `--io-processor-plugin`, `--worker-extension-cls`, `--logits-processors` | approval | They load code. `VLLM_PLUGINS` is set by CapyCTL and cannot be changed. |
@@ -88,6 +90,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Log level | `--log-level`, `--log-level-http` | reserved | CapyCTL sets them and reads the engine's log. |
 | Request logging | `--log-requests`, `--log-requests-target` | reserved | CapyCTL logs requests itself. |
 | Metrics | `--enable-metrics` | reserved | Always on: CapyCTL reads them for load reports. |
+| Cached-token report | `--enable-cache-report` | reserved | Always on: usage reports `prompt_tokens_details.cached_tokens`, which the [per-request metrics](requests.md#per-request-metrics) show. |
 | KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
 | Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |

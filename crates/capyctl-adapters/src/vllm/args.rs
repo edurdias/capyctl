@@ -307,6 +307,12 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             "--served-model-name",
             input.served_model_name.clone(),
         );
+        // SPEC §17 (owner decision 2026-10-09): every response carries the
+        // engine's per-request timings (`metrics`, vLLM 0.29 and 0.30
+        // `FrontendArgs.enable_per_request_metrics`), which the router
+        // normalizes. It needs stats logging, which `--disable-log-stats`
+        // (reserved) never turns off.
+        argv.push("--enable-per-request-metrics".into());
     }
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.

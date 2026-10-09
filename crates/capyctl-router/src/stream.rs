@@ -145,18 +145,37 @@ pub(crate) async fn bounded<F: Future>(
 }
 
 /// SPEC §10: a sink that only records backend progress, for a collected
-/// (non-streaming) response bounded like a stream.
-pub(crate) struct ProgressOnly(pub(crate) Progress);
+/// (non-streaming) response bounded like a stream. SPEC §17: it also notes
+/// when the first generated text arrived, for the per-request metrics.
+pub(crate) struct ProgressOnly {
+    progress: Progress,
+    pub(crate) generated: Option<std::time::Instant>,
+}
+
+impl ProgressOnly {
+    pub(crate) fn new(progress: Progress) -> Self {
+        Self {
+            progress,
+            generated: None,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl ChatSink for ProgressOnly {
     fn progressed(&mut self) {
-        self.0.mark();
+        self.progress.mark();
+    }
+
+    fn collected(&mut self, chunk: &str) {
+        if self.generated.is_none() && crate::timing::carries_content(chunk) {
+            self.generated = Some(std::time::Instant::now());
+        }
     }
 
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
         if !capyctl_adapters::forward::opens_reply_only(&chunk) {
-            self.0.mark();
+            self.progress.mark();
         }
         Ok(())
     }
@@ -169,6 +188,9 @@ struct ResponseSink {
     timing: crate::timing::RequestTiming,
     /// SPEC §10: backend progress, delivered or drained.
     progress: Progress,
+    /// SPEC §17 (owner decision 2026-10-09): what the engine reported about
+    /// this request, read from the chunks that carry it.
+    report: crate::engine_metrics::EngineReport,
 }
 
 #[async_trait::async_trait]
@@ -191,6 +213,11 @@ impl ChatSink for ResponseSink {
         let content = self.timing.phases().time_to_first_content.is_none()
             && crate::timing::carries_content(&chunk);
         self.timing.chunk(content);
+        if crate::engine_metrics::EngineReport::may_carry(&chunk) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&chunk) {
+                self.report.observe(&value);
+            }
+        }
         // Set failure before awaiting so cancellation by the adapter's delivery
         // deadline cannot later append a successful terminal to partial output.
         self.failed = true;
@@ -253,7 +280,9 @@ pub fn stream_planned(
 
 /// As [`stream_planned`], timing the request (SPEC §17, M80). With the timing
 /// header enabled, a completed stream carries its timings as one SSE comment
-/// line before `data: [DONE]`. The stream is bounded by `bounds` (SPEC §10).
+/// line before `data: [DONE]`; every completed stream carries its engine
+/// metrics as another ([`crate::engine_metrics`]). The stream is bounded by
+/// `bounds` (SPEC §10).
 pub fn stream_planned_timed(
     first: crate::balance::Attempt,
     mut plan: Option<crate::balance::Plan>,
@@ -277,6 +306,7 @@ pub fn stream_planned_timed(
             failed: false,
             timing,
             progress: progress.clone(),
+            report: Default::default(),
         };
         let mut attempt = first;
         let mut durable;
@@ -360,6 +390,20 @@ pub fn stream_planned_timed(
                     "{} {}",
                     crate::timing::TIMING_HEADER,
                     sink.timing.header_value()
+                );
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    sink.tx.send(Ok(Event::default().comment(line))),
+                )
+                .await;
+            }
+            if !sink.failed {
+                // SPEC §17 (owner decision 2026-10-09): the request's engine
+                // metrics, on every completed stream, as an SSE comment.
+                let line = format!(
+                    "{} {}",
+                    crate::engine_metrics::METRICS_COMMENT,
+                    crate::engine_metrics::metrics(&sink.report, &sink.timing)
                 );
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(10),

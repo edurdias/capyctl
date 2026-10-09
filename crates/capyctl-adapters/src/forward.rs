@@ -327,6 +327,7 @@ impl ChatSink for Collecting<'_> {
         self.observer.progressed();
     }
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
+        self.observer.collected(&chunk);
         self.chunks.push(chunk);
         Ok(())
     }
@@ -439,9 +440,13 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
             response["usage"] = chunk["usage"].clone();
         }
         // ADR 0023 §7: TensorFold's statistics ride the final chunk; a
-        // collected response carries them as the engine's own would.
-        if let Some(stats) = chunk.get("tensorfold").filter(|v| v.is_object()) {
-            response["tensorfold"] = stats.clone();
+        // collected response carries them as the engine's own would. vLLM's
+        // per-request `metrics` ride its final usage chunk the same way
+        // (0.30 `ChatCompletionStreamResponse.metrics`).
+        for field in ["tensorfold", "metrics"] {
+            if let Some(stats) = chunk.get(field).filter(|v| v.is_object()) {
+                response[field] = stats.clone();
+            }
         }
     }
     response["object"] = json!("chat.completion");
@@ -1150,6 +1155,25 @@ mod tests {
         assert_eq!(response["usage"]["total_tokens"], 4);
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
         assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    }
+
+    // T40 (owner decision 2026-10-09): vLLM 0.30 with `--enable-per-request-metrics`
+    // puts its `metrics` object on the final usage chunk (`serving.py`
+    // `final_usage_chunk`); a collected response carries it top-level, where
+    // its own non-streaming answer does.
+    #[test]
+    fn a_collected_response_keeps_the_vllm_metrics_object() {
+        let usage = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":12,"total_tokens":20,"completion_tokens":8},"metrics":{"time_to_first_token_ms":41.5,"generation_time_ms":70.0,"queue_time_ms":0.8,"mean_itl_ms":10.0,"tokens_per_second":71.2}}"#;
+        let response = assemble(vec![
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null}"#.to_owned(),
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"logprobs":null,"finish_reason":"stop","stop_reason":null}]}"#.to_owned(),
+            usage.to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(response["metrics"]["time_to_first_token_ms"], 41.5);
+        assert_eq!(response["metrics"]["mean_itl_ms"], 10.0);
+        assert_eq!(response["usage"]["completion_tokens"], 8);
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
     }
 
     // T41 T22 (ADR 0023 §6): reasoning alone answers the probe; nothing does not.

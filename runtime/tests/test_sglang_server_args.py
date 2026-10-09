@@ -48,6 +48,7 @@ class SyntheticArgs(SimpleNamespace):
                             type=int, default=1)
         parser.add_argument("--mem-fraction-static", type=float, default=None)
         parser.add_argument("--enable-metrics", action="store_true")
+        parser.add_argument("--enable-cache-report", action="store_true")
         parser.add_argument("--ssl-keyfile", default=None)
         parser.add_argument("--dtype", default="auto")
         parser.add_argument("--context-length", type=int, default=None)
@@ -68,6 +69,7 @@ class SyntheticArgs(SimpleNamespace):
 
 SyntheticArgs.__struct_fields__ = (
     "model_path", "host", "port", "tp_size", "mem_fraction_static", "enable_metrics",
+    "enable_cache_report",
     "ssl_keyfile", "dtype", "context_length", "reasoning_parser",
     "detokenizer_worker_num", "schedule_policy", "disable_cuda_graph",
     "engine_info_bootstrap_port", "decoupled_spec_bind_endpoint", "chat_template",
@@ -132,7 +134,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             "enable_flexkv": False, "grpc_port": None, "grpc_mode": False,
             "smg_grpc_mode": False, "sidecar": None, "use_ray": False,
             "skip_server_warmup": True, "log_requests": False,
-            "enable_metrics": True, "quantize_and_serve": False,
+            "enable_metrics": True, "enable_cache_report": True, "quantize_and_serve": False,
             "trust_remote_code": False, "tokenizer_worker_num": 1,
             "detokenizer_worker_num": 1,
             "disable_prefill_cuda_graph": True, "disable_decode_cuda_graph": True,
@@ -276,7 +278,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                       ["--mem-fraction-static", "0.9"], ["--mem-frac", "0.9"],
                       ["--host", "0.0.0.0"], ["--ssl-keyfile", "/k"],
                       ["--config", "/tmp/c.yaml"], ["--conf", "/tmp/c.yaml"],
-                      ["--enable-metrics"],
+                      ["--enable-metrics"], ["--enable-cache-report"],
                       # Typed fields have one spelling: the typed field.
                       ["--dtype", "float16"], ["--context-length", "8"],
                       ["--disable-cuda-graph"]):

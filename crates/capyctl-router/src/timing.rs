@@ -207,6 +207,10 @@ pub struct RequestTiming {
     pub(crate) instance: Option<u32>,
     pub(crate) generation: Option<i64>,
     forward_started: Option<Instant>,
+    /// `received` to the first upstream chunk carrying generated text, for
+    /// streaming and collected answers alike (the per-request metrics; the
+    /// timing header keeps `time_to_first_content` for streams only).
+    first_generated: Option<Duration>,
     phases: Phases,
 }
 
@@ -229,6 +233,7 @@ impl RequestTiming {
             instance: None,
             generation: None,
             forward_started: None,
+            first_generated: None,
             phases: Phases::default(),
         }
     }
@@ -264,6 +269,7 @@ impl RequestTiming {
         self.phases.time_to_first_byte = None;
         self.phases.time_to_first_content = None;
         self.phases.time_to_last_chunk = None;
+        self.first_generated = None;
     }
     /// One upstream chunk arrived; `content` when it carries generated text.
     pub(crate) fn chunk(&mut self, content: bool) {
@@ -274,12 +280,31 @@ impl RequestTiming {
         }
         if content && self.phases.time_to_first_content.is_none() {
             self.phases.time_to_first_content = Some(now - self.received);
+            self.first_generated.get_or_insert(now - self.received);
         }
         self.phases.time_to_last_chunk = Some(now - self.received);
     }
     /// A non-streaming upstream response arrived whole.
     pub(crate) fn response(&mut self) {
         self.phases.time_to_last_chunk = Some(self.received.elapsed());
+    }
+    /// A collected (non-streaming) answer's first generated text arrived at
+    /// `at`; only the first mark counts.
+    pub(crate) fn generated_at(&mut self, at: Instant) {
+        if self.first_generated.is_none() {
+            self.first_generated = Some(at.saturating_duration_since(self.received));
+        }
+    }
+    /// The accepted forward's start to its first generated text.
+    pub fn upstream_first_content(&self) -> Option<Duration> {
+        self.first_generated?.checked_sub(self.phases.pre_forward?)
+    }
+    /// The first generated text to the last upstream chunk (or the whole
+    /// collected answer).
+    pub fn generating_span(&self) -> Option<Duration> {
+        self.phases
+            .time_to_last_chunk?
+            .checked_sub(self.first_generated?)
     }
 
     /// The backend completed: stamp the total and record the request.

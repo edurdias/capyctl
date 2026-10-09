@@ -484,6 +484,10 @@ pub trait ChatSink: Send {
     /// No events are read after a failed delivery. The caller that bounds a
     /// stream measures idleness from these, never from wall time.
     fn progressed(&mut self) {}
+    /// SPEC §17 (owner decision 2026-10-09): one decoded chunk a collecting
+    /// forwarder kept for its non-streaming answer, lent as it arrives so the
+    /// router can time the first generated text. Nothing is delivered.
+    fn collected(&mut self, _chunk: &str) {}
 }
 
 /// Inference forwarding: how the router reaches a deployment's engine

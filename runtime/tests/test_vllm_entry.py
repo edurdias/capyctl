@@ -44,6 +44,8 @@ def fake_parser(drop=()):
     option("--enable-sleep-mode", action=argparse.BooleanOptionalAction, default=False)
     option("--enable-log-requests", action=argparse.BooleanOptionalAction, default=False)
     option("--disable-log-stats", action="store_true")
+    option("--enable-per-request-metrics", action=argparse.BooleanOptionalAction,
+           default=False)
     option("--log-config-file", default=None)
     option("--uvicorn-log-level", default="info")
     option("--disable-uvicorn-access-log", action="store_true")
@@ -83,6 +85,7 @@ def fake_parser(drop=()):
 
 
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
+            "--enable-per-request-metrics",
             "--tensor-parallel-size", "1", "--pipeline-parallel-size", "1",
             "--port", "20001", "--gpu-memory-utilization", "0.10",
             "--kv-cache-memory-bytes", "4294967296"]
@@ -163,6 +166,7 @@ class ResolveTests(unittest.TestCase):
                      ["--api-key", "x"], ["--middleware", "evil.Middleware"],
                      ["--gpu-memory-utilization", "0.9"], ["--kv-cache-memory-bytes", "1"],
                      ["--enable-sleep-mode"], ["--disable-log-stats"],
+                     ["--no-enable-per-request-metrics"],
                      ["--uds", "/tmp/s"], ["--root-path", "/x"], ["--grpc"],
                      ["--ssl-ciphers", "x"], ["--ssl-keyfile", "/k"],
                      ["-dp", "2"], ["--data-parallel-rank", "0"],
