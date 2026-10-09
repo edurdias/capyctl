@@ -486,12 +486,14 @@ pub fn read_model_config(checkpoint_root: &Path) -> Result<Value, String> {
 /// at `checkpoint_root`. `profile_args` are the installation's host-fixed
 /// arguments: one that already sets the maximum model length wins, and capyctl
 /// passes nothing (ADR 0014 §2, a typed field and a host-fixed argument never
-/// both set one option).
+/// both set one option). `draft_root` is a declared drafter's directory (ADR
+/// 0008 amendment 2026-10-08); without one, the arguments may name a draft.
 pub fn fit_for_launch(
     engine: Engine,
     settings: &LaunchSettings,
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
+    draft_root: Option<&Path>,
 ) -> ContextFit {
     let (common, memory, block, reserved_blocks) = match settings {
         LaunchSettings::Vllm(s) => (
@@ -521,18 +523,19 @@ pub fn fit_for_launch(
         .ok_or_else(|| "the deployment resolves to no checkpoint directory".to_owned())
         .and_then(read_model_config);
     // The draft model is read where the checkpoint is: never by a server
-    // fitting for a remote host. Resolution already confined its path to the
-    // installation's approved directories (ADR 0014 §8).
+    // fitting for a remote host. Resolution already confined an argument's
+    // path to the installation's approved directories (ADR 0014 §8); a
+    // declared drafter is the directory CapyCTL resolved (ADR 0008).
     let args: Vec<String> = profile_args
         .iter()
         .chain(settings.extra_args())
         .cloned()
         .collect();
     let draft = match (engine, checkpoint_root) {
-        (Engine::Vllm | Engine::Sglang, Some(_)) => {
-            crate::engine_policy::draft_model_path(engine, &args)
-                .map(|path| read_model_config(Path::new(&path)))
-        }
+        (Engine::Vllm | Engine::Sglang, Some(_)) => draft_root
+            .map(Path::to_path_buf)
+            .or_else(|| crate::engine_policy::draft_model_path(engine, &args).map(Into::into))
+            .map(|path| read_model_config(&path)),
         _ => None,
     };
     let vllm = (engine == Engine::Vllm).then(|| VllmFit {
@@ -560,7 +563,7 @@ pub fn fit_for_launch(
     // The pool is sized as the launch sizes it (`sglang_pool_for_launch`),
     // so status and a refused start name the same request.
     if let LaunchSettings::Sglang(sglang) = settings {
-        match sglang_pool_for_launch(sglang, profile_args, checkpoint_root) {
+        match sglang_pool_for_launch(sglang, profile_args, checkpoint_root, draft_root) {
             Ok(pool) => {
                 fit.running_limit = pool.running_limit;
                 // A derived request on a discrete device keeps the state in
@@ -741,7 +744,19 @@ pub fn fit_for_effective(effective: &crate::effective::EffectiveDeployment) -> C
         &sized_on_device(effective),
         &effective.profile.args,
         effective.model.resolved_path.as_deref().map(Path::new),
+        draft_root(effective),
     )
+}
+
+/// ADR 0008 amendment 2026-10-08: a declared drafter's directory on the
+/// machine that resolved `effective`.
+pub(crate) fn draft_root(effective: &crate::effective::EffectiveDeployment) -> Option<&Path> {
+    effective
+        .model
+        .draft
+        .as_ref()
+        .and_then(|draft| draft.resolved_path.as_deref())
+        .map(Path::new)
 }
 
 /// SGLang's settings as a launch on a device domain sizes them: found live
@@ -775,6 +790,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
         effective.profile.engine,
         &effective.engine_config,
         &effective.profile.args,
+        None,
         None,
     );
     match (declared, fit.source) {

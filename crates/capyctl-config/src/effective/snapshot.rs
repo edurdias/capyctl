@@ -81,10 +81,15 @@ pub(super) fn snapshot_inputs(
     // rebuilt deployment states the source only and resolution happens again. The
     // exact-equality check below is what proves the snapshot's claim matched.
     let mut model = value["model"].clone();
-    model
+    let object = model
         .as_object_mut()
-        .ok_or_else(|| invalid("snapshot.model", "model required"))?
-        .remove("resolved_path");
+        .ok_or_else(|| invalid("snapshot.model", "model required"))?;
+    object.remove("resolved_path");
+    // ADR 0008 amendment 2026-10-08: likewise the drafter's directory; the
+    // deployment states its source.
+    if let Some(draft) = object.get_mut("draft") {
+        *draft = draft["source"].clone();
+    }
     let mut deployment = json!({
         "schema_version": value["schema_version"], "kind": "deployment",
         "name": value["name"], "model": model, "routes": value["routes"],

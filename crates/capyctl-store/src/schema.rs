@@ -987,6 +987,29 @@ pub const SCHEMA_V45: &str = "-- explicit activation (switch_state::migrate_v45)
 /// column is added by `checkpoint_digests::migrate_v46` only when missing.
 pub const SCHEMA_V46: &str = "-- checkpoint digest provenance (migrate_v46)";
 
+/// v47 (ADR 0008 amendment 2026-10-08): a revision may name two remote
+/// sources, its weights and its speculative drafter, so each host keeps one
+/// row per source: the key gains `source_key`. Rows are copied unchanged.
+pub const SCHEMA_V47: &str = r#"
+CREATE TABLE model_sources_v47(
+  deployment_id TEXT NOT NULL CHECK(length(deployment_id)>0),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  host_id TEXT NOT NULL CHECK(length(host_id)>0),
+  source_key TEXT NOT NULL CHECK(source_key LIKE 'sources/%'),
+  state TEXT NOT NULL CHECK(state IN ('pending','downloading','verified','failed')),
+  bytes_done INTEGER NOT NULL CHECK(bytes_done>=0),
+  bytes_total INTEGER NOT NULL CHECK(bytes_total>=0),
+  reason TEXT CHECK((state='failed')=(reason IS NOT NULL)),
+  terminal INTEGER NOT NULL CHECK(terminal IN (0,1)),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,source_key)
+);
+INSERT INTO model_sources_v47(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms)
+  SELECT deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms FROM model_sources;
+DROP TABLE model_sources;
+ALTER TABLE model_sources_v47 RENAME TO model_sources;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

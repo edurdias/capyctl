@@ -340,6 +340,9 @@ def typed_keywords(settings):
     for name in ("tool_call_parser", "reasoning_parser", "max_mamba_cache_size"):
         if name in settings:
             keywords[name] = settings[name]
+    # ADR 0008 amendment 2026-10-08: the declared drafter capyctl materialized.
+    if "draft_model_path" in settings:
+        keywords["speculative_draft_model_path"] = settings["draft_model_path"]
     if settings["language_model_only"]:
         keywords["language_model_only"] = True
     if settings["cuda_graphs"] is False:
@@ -443,6 +446,11 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     # capyctl then sizes none (resolution prevents both; this rechecks).
     if "max_mamba_cache_size" in settings and (
             "max_mamba_cache_size" in extra or "mamba_full_memory_ratio" in extra):
+        raise ServerArgsError("effective_args_mismatch")
+    # ADR 0008 amendment 2026-10-08: a declared drafter is capyctl's to pass;
+    # extras naming another draft model contradict it (resolution refuses
+    # both; this rechecks).
+    if "draft_model_path" in settings and "speculative_draft_model_path" in extra:
         raise ServerArgsError("effective_args_mismatch")
     available = (available_bytes_for(settings["memory"]) if available_bytes is None
                  else available_bytes)

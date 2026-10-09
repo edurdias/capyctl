@@ -637,6 +637,30 @@ impl NativeHostExecution {
         if !(checkpoint.starts_with(root) || outside_allowed) || !checkpoint.is_dir() {
             return Err(JournalError::Unauthorized);
         }
+        // ADR 0008 amendment 2026-10-08: a declared drafter is a directory in
+        // the store its source resolved into (a remote one materialized and
+        // verified there before the launch was sent), or, when local,
+        // wherever a local model may lie.
+        if let Some(draft) = &effective.model.draft {
+            let store = draft
+                .store(&effective.host)
+                .canonicalize()
+                .map_err(|_| JournalError::Unauthorized)?;
+            let directory = draft
+                .resolved_path
+                .as_deref()
+                .map(std::path::Path::new)
+                .ok_or(JournalError::Unauthorized)?
+                .canonicalize()
+                .map_err(|_| JournalError::Unauthorized)?;
+            let local = matches!(
+                draft.source,
+                capyctl_config::model_source::ModelSource::Local { .. }
+            );
+            if !(directory.starts_with(store) || local) || !directory.is_dir() {
+                return Err(JournalError::Unauthorized);
+            }
+        }
         // ADR 0028 §6 (R7): a member loads its own host's path of the
         // checkpoint, the one its plan names.
         if let Some((_, member)) = group {

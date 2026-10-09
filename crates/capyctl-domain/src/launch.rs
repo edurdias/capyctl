@@ -371,6 +371,7 @@ pub struct NativeLaunch {
     cuda_home: Option<String>,
     build_env: std::collections::BTreeMap<String, String>,
     group: Option<crate::group::GroupMemberArgs>,
+    draft_model_path: Option<String>,
 }
 impl NativeLaunch {
     /// Internal cross-crate bridge. Call only with a validated persisted store read;
@@ -394,6 +395,7 @@ impl NativeLaunch {
             cuda_home: None,
             build_env: std::collections::BTreeMap::new(),
             group: None,
+            draft_model_path: None,
         }
     }
     /// SPEC §13.3 amendment (owner decision 2026-09-25): the profile's
@@ -421,6 +423,19 @@ impl NativeLaunch {
     #[doc(hidden)]
     pub fn group(&self) -> Option<&crate::group::GroupMemberArgs> {
         self.group.as_ref()
+    }
+    /// ADR 0008 amendment 2026-10-08: the declared drafter's directory,
+    /// which CapyCTL materialized and the entry renders as SGLang's
+    /// `speculative_draft_model_path`. A launch without one renders exactly
+    /// as before.
+    #[doc(hidden)]
+    pub fn with_draft_model(mut self, path: Option<String>) -> Self {
+        self.draft_model_path = path;
+        self
+    }
+    #[doc(hidden)]
+    pub fn draft_model_path(&self) -> Option<&str> {
+        self.draft_model_path.as_deref()
     }
     #[doc(hidden)]
     pub fn cuda_home(&self) -> Option<&str> {

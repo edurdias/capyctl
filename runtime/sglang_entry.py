@@ -95,7 +95,9 @@ _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 # ADR 0014 amendment A14: the recurrent-state slots capyctl sized for a hybrid
 # model. Present only when sized, so every other launch descriptor is unchanged.
 # ADR 0028 §10: `group` is present only on a multi-node group member (T39).
-_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group")
+# ADR 0008 amendment 2026-10-08: `draft_model_path`, the declared drafter's
+# directory capyctl materialized, is present only with a drafter.
+_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group", "draft_model_path")
 # ADR 0028 §10: a member's group object (crates/capyctl-adapters/src/sglang/
 # args.rs `public_group`); `gloo_socket_ifname` only when the host resolved one.
 _GROUP_KEYS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr", "host_ip")
@@ -220,6 +222,11 @@ def _validate_settings(settings):
         _integer(settings["max_mamba_cache_size"], 1, _I32)
     if "group" in settings:
         _validate_group(settings["group"])
+    if "draft_model_path" in settings:
+        draft = _text(settings["draft_model_path"], 4096)
+        if not draft.startswith("/") or any(part in (".", "..")
+                                            for part in draft.split("/")):
+            _reject()
     for name in _PARSER_SETTINGS:
         if name in settings:
             value = settings[name]

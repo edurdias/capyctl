@@ -199,6 +199,47 @@ fn a_draft_models_kv_layers_shorten_the_fitted_context() {
     }
 }
 
+// T14 (ADR 0008 amendment 2026-10-08): a declared drafter's `config.json`
+// (here a local drafter beside the checkpoint in the model store) feeds the
+// same draft KV fit as a draft model the arguments name, with no approved
+// path or option for it on either engine.
+#[test]
+fn a_declared_drafters_kv_layers_shorten_the_fitted_context() {
+    let draft_config = json!({
+        "num_hidden_layers": 4, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "max_position_embeddings": 32768, "torch_dtype": "bfloat16",
+    });
+    let raw = (4u64 << 30) / (512 * 1024 + 16 * 1024);
+    let fitted = raw - raw % 16;
+    for engine in ["vllm", "sglang"] {
+        let (store, effective) = resolved(engine, Some(&dense()), |d, host| {
+            let profile = &mut host["runtime_profiles"]["local"];
+            d["model"]["draft"] = json!("drafts/d");
+            d["engine_config"]["accept_extra_args"] = json!(true);
+            d["engine_config"]["extra_args"] = match engine {
+                "vllm" => {
+                    profile["security"]["approved_options"] = json!(["--speculative-config"]);
+                    json!([
+                        "--speculative-config",
+                        json!({"method": "draft_model", "num_speculative_tokens": 3}).to_string()
+                    ])
+                }
+                _ => json!(["--speculative-algorithm", "STANDALONE"]),
+            };
+        });
+        let draft = store.path().join("drafts/d");
+        std::fs::create_dir_all(&draft).unwrap();
+        std::fs::write(draft.join("config.json"), draft_config.to_string()).unwrap();
+        match engine {
+            "vllm" => assert_eq!(
+                max_model_len(&vllm_argv(&effective)),
+                Some((fitted - 16).to_string().as_str())
+            ),
+            _ => assert_eq!(sglang_context(&effective), Some(fitted as u32)),
+        }
+    }
+}
+
 fn max_num_seqs(argv: &[String]) -> Option<&str> {
     argv.windows(2)
         .find(|w| w[0] == "--max-num-seqs")

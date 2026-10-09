@@ -104,8 +104,9 @@ pub struct PendingSource {
     pub effective: EffectiveDeployment,
 }
 
-/// Record a newly accepted revision's remote source as pending on the host
-/// it resolved on. A local source has no row.
+/// Record a newly accepted revision's remote sources (its weights and, ADR
+/// 0008 amendment 2026-10-08, its drafter) as pending on the host it
+/// resolved on, one row per source. A local source has no row.
 ///
 /// A copy already verified on that host for a deployment that still exists is
 /// the same bytes (the store key pins repository, commit and file patterns),
@@ -121,47 +122,60 @@ pub(crate) fn insert_accepted(
     effective: &EffectiveDeployment,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
-    let Some(key) = effective.model.source.store_key() else {
-        return Ok(());
-    };
-    let verified: Option<(i64, i64)> = tx
-        .query_row(
-            "SELECT s.bytes_done,s.bytes_total FROM model_sources s JOIN deployments d ON d.id=s.deployment_id WHERE s.host_id=?1 AND s.source_key=?2 AND s.state='verified' ORDER BY s.updated_at_ms DESC LIMIT 1",
-            params![effective.host.name, key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let (state, done, total) = match verified {
-        Some((done, total)) => ("verified", done, total),
-        None => ("pending", 0, 0),
-    };
-    tx.execute(
-        "INSERT OR IGNORE INTO model_sources(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,0,?8)",
-        params![deployment, revision, effective.host.name, key, state, done, total, now_ms],
-    )?;
+    for (source, _) in effective.model.sources() {
+        let Some(key) = source.store_key() else {
+            continue;
+        };
+        let verified: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT s.bytes_done,s.bytes_total FROM model_sources s JOIN deployments d ON d.id=s.deployment_id WHERE s.host_id=?1 AND s.source_key=?2 AND s.state='verified' ORDER BY s.updated_at_ms DESC LIMIT 1",
+                params![effective.host.name, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (state, done, total) = match verified {
+            Some((done, total)) => ("verified", done, total),
+            None => ("pending", 0, 0),
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO model_sources(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,0,?8)",
+            params![deployment, revision, effective.host.name, key, state, done, total, now_ms],
+        )?;
+    }
     Ok(())
 }
 
-/// ADR 0008: activation waits until some host holds a verified copy, and is
-/// refused once every host's attempt failed terminally.
+/// ADR 0008: activation waits until some host holds a verified copy of every
+/// source the revision names, and is refused once every host's attempt
+/// failed terminally (any one of its sources).
 pub(crate) fn admit_start(
     tx: &Transaction<'_>,
     deployment: &str,
     revision: i64,
 ) -> std::result::Result<(), LifecycleError> {
-    let states: Vec<(String, bool)> = tx
-        .prepare("SELECT state,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2")?
+    use std::collections::{BTreeMap, BTreeSet};
+    let rows: Vec<(String, String, String, bool)> = tx
+        .prepare("SELECT host_id,source_key,state,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2")?
         .query_map(params![deployment, revision], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    if states.is_empty() || states.iter().any(|(state, _)| state == "verified") {
+    // The revision's sources are the keys any host records (the host it
+    // resolved on records them all at acceptance). Per host: the keys it
+    // holds verified, and whether one of its sources failed terminally.
+    let keys: BTreeSet<&str> = rows.iter().map(|(_, key, _, _)| key.as_str()).collect();
+    let mut hosts: BTreeMap<&str, (BTreeSet<&str>, bool)> = BTreeMap::new();
+    for (host, key, state, terminal) in &rows {
+        let entry = hosts.entry(host.as_str()).or_default();
+        if state == "verified" {
+            entry.0.insert(key.as_str());
+        }
+        entry.1 |= state == "failed" && *terminal;
+    }
+    if hosts.is_empty() || hosts.values().any(|(verified, _)| *verified == keys) {
         return Ok(());
     }
-    if states
-        .iter()
-        .all(|(state, terminal)| state == "failed" && *terminal)
-    {
+    if hosts.values().all(|(_, failed)| *failed) {
         return Err(LifecycleError::ModelSourceFailed);
     }
     Err(LifecycleError::ModelSourcePending)
@@ -180,7 +194,7 @@ fn read_all(
     revision: i64,
 ) -> Result<Vec<ModelSourceRecord>> {
     let rows: Vec<StoredRow> = tx
-        .prepare("SELECT host_id,source_key,state,bytes_done,bytes_total,reason,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id")?
+        .prepare("SELECT host_id,source_key,state,bytes_done,bytes_total,reason,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,source_key")?
         .query_map(params![deployment, revision], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
         })?
@@ -205,23 +219,24 @@ fn read_all(
 }
 
 impl crate::Store {
-    /// Every host's record of one revision's source.
+    /// Every host's record of each of one revision's sources.
     pub fn model_sources(&self, deployment: &str, revision: i64) -> Result<Vec<ModelSourceRecord>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         read_all(&tx, deployment, revision)
     }
 
-    /// One host's record of one revision's source.
+    /// One host's record of one of a revision's sources.
     pub fn model_source(
         &self,
         deployment: &str,
         revision: i64,
         host_id: &str,
+        source_key: &str,
     ) -> Result<Option<ModelSourceRecord>> {
         Ok(self
             .model_sources(deployment, revision)?
             .into_iter()
-            .find(|record| record.host_id == host_id))
+            .find(|record| record.host_id == host_id && record.source_key == source_key))
     }
 
     /// Current revisions whose source is still to be materialized on its host
@@ -256,10 +271,11 @@ impl crate::Store {
             .collect()
     }
 
-    /// Record a host's answer about one revision's source. A host with no
-    /// row yet (a placement on another allowed host) gets one, provided the
-    /// revision resolved there. A verified record is never downgraded by a
-    /// later answer from the same host.
+    /// Record a host's answer about one of a revision's sources. A host with
+    /// no row for it yet (a placement on another allowed host) gets one,
+    /// provided the revision resolved there and names that source. A
+    /// verified record is never downgraded by a later answer from the same
+    /// host.
     #[allow(clippy::too_many_arguments)]
     pub fn record_model_source(
         &self,
@@ -290,26 +306,31 @@ impl crate::Store {
         let terminal = report.reason.as_deref().is_some_and(reason::terminal);
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(|_| ModelSourceError::StaleSession)?;
-        let known: Option<(String, String)> = tx
+        let known: Option<String> = tx
             .query_row(
-                "SELECT source_key,state FROM model_sources WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
-                params![deployment, revision, host_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT state FROM model_sources WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND source_key=?4",
+                params![deployment, revision, host_id, source_key],
+                |r| r.get(0),
             )
             .optional()?;
         match known {
-            Some((key, _)) if key != source_key => return Err(ModelSourceError::Invalid),
-            Some((_, state)) if state == "verified" => {
+            Some(state) if state == "verified" => {
                 tx.commit()?;
                 return Ok(());
             }
             Some(_) => {}
             None => {
-                // ADR 0013 §3: only a host this revision resolved on.
+                // ADR 0013 §3: only a host this revision resolved on, and only
+                // a source it names (ADR 0008 amendment 2026-10-08: its
+                // weights' or its drafter's).
                 let (_, effective) =
                     crate::checkpoint_digests::frozen_revision(&tx, deployment, revision)
                         .map_err(|_| ModelSourceError::NotFound)?;
-                if effective.model.source.store_key().as_deref() != Some(source_key)
+                let named = effective
+                    .model
+                    .sources()
+                    .any(|(source, _)| source.store_key().as_deref() == Some(source_key));
+                if !named
                     || !crate::checkpoint_digests::is_resolved_host(
                         &tx, deployment, revision, &effective, host_id,
                     )
@@ -321,7 +342,7 @@ impl crate::Store {
         }
         tx.execute(
             "INSERT INTO model_sources(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-             ON CONFLICT(deployment_id,revision,host_id) DO UPDATE SET state=excluded.state,bytes_done=excluded.bytes_done,bytes_total=excluded.bytes_total,reason=excluded.reason,terminal=excluded.terminal,updated_at_ms=excluded.updated_at_ms",
+             ON CONFLICT(deployment_id,revision,host_id,source_key) DO UPDATE SET state=excluded.state,bytes_done=excluded.bytes_done,bytes_total=excluded.bytes_total,reason=excluded.reason,terminal=excluded.terminal,updated_at_ms=excluded.updated_at_ms",
             params![deployment, revision, host_id, source_key, report.state.as_str(), done, total, report.reason, terminal, now_ms],
         )?;
         tx.commit()?;

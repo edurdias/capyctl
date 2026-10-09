@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use capyctl_config::deployment_defaults::{expand_home, pin_hf, unpinned_hf};
+use capyctl_config::deployment_defaults::{expand_home, pin_hf, unpinned_hf, HF_SHORTHANDS};
 use capyctl_config::model_source::{is_commit_sha, ModelSource, DEFAULT_HUGGINGFACE_ENDPOINT};
 use capyctl_config::ConfigKind;
 use serde_json::Value;
@@ -77,15 +77,19 @@ pub fn with_home_expanded(text: &str) -> String {
 }
 
 /// The deployment document `deploy model --file` sends: the file with a `~/`
-/// model path expanded and a Hugging Face reference pinned, strictly parsed
-/// and completed with the defaults.
+/// model path expanded and each Hugging Face reference (the model's and,
+/// ADR 0008 amendment 2026-10-08, its drafter's) pinned, strictly parsed and
+/// completed with the defaults.
 pub async fn prepare(text: &str, endpoint: &reqwest::Url) -> Result<Value, StructuredError> {
     let mut document =
         capyctl_config::parse_document(text).map_err(|error| invalid(error.to_string()))?;
     expand_home(&mut document, home().as_deref());
-    if let Some((repo, reference)) = unpinned_hf(&document) {
-        let commit = pin(endpoint, &repo, &reference).await?;
-        pin_hf(&mut document, &repo, &commit);
+    for at in HF_SHORTHANDS {
+        if let Some((repo, reference)) = unpinned_hf(&document, at) {
+            let field = format!("{}.hf", at.trim_start_matches('/').replace('/', "."));
+            let commit = pin(endpoint, &field, &repo, &reference).await?;
+            pin_hf(&mut document, at, &repo, &commit);
+        }
     }
     capyctl_config::parse_strict_value(ConfigKind::Deployment, document)
         .map_err(|error| invalid(error.to_string()))
@@ -158,7 +162,13 @@ fn document_endpoint(state_dir: &Path, config: Option<&Path>) -> Option<String> 
 }
 
 /// ADR 0008: the commit `reference` (a branch or tag) of `repo` names now.
-async fn pin(base: &reqwest::Url, repo: &str, reference: &str) -> Result<String, StructuredError> {
+/// `field` names the shorthand (`model.hf`, `model.draft.hf`) in a refusal.
+async fn pin(
+    base: &reqwest::Url,
+    field: &str,
+    repo: &str,
+    reference: &str,
+) -> Result<String, StructuredError> {
     // The repository shape is the one a pinned source accepts.
     ModelSource::HuggingFace {
         repo: repo.to_owned(),
@@ -167,14 +177,14 @@ async fn pin(base: &reqwest::Url, repo: &str, reference: &str) -> Result<String,
         token_ref: None,
     }
     .validate()
-    .map_err(|error| invalid(format!("model.hf: {}", error.detail)))?;
+    .map_err(|error| invalid(format!("{field}: {}", error.detail)))?;
     if reference.is_empty()
         || !reference
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         return Err(invalid(format!(
-            "model.hf: `{reference}` is not a branch or tag name; write `{repo}@<40-character commit>`"
+            "{field}: `{reference}` is not a branch or tag name; write `{repo}@<40-character commit>`"
         )));
     }
     let url = format!(
@@ -183,7 +193,7 @@ async fn pin(base: &reqwest::Url, repo: &str, reference: &str) -> Result<String,
     );
     let unpinnable = |why: &str| {
         invalid(format!(
-            "model.hf: cannot pin `{repo}@{reference}` to a commit ({why}); write \
+            "{field}: cannot pin `{repo}@{reference}` to a commit ({why}); write \
              `{repo}@<40-character commit>` in the file"
         ))
     };
@@ -225,6 +235,54 @@ async fn pin(base: &reqwest::Url, repo: &str, reference: &str) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T14 (ADR 0008 amendment 2026-10-08): a drafter's `hf:` reference is
+    // pinned to the commit it names now, beside the model's own, so the
+    // server only ever stores pinned sources.
+    #[tokio::test]
+    async fn a_drafters_hugging_face_reference_is_pinned_with_the_models() {
+        const MODEL: &str = "0123456789abcdef0123456789abcdef01234567";
+        const DRAFT: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        let app = axum::Router::new()
+            .route(
+                "/api/models/org/model/revision/main",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": MODEL})) }),
+            )
+            .route(
+                "/api/models/acme/draft/revision/v2",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": DRAFT})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = reqwest::Url::parse(&origin).unwrap();
+        let document = prepare(
+            "name: m\nengine: sglang\nmodel: {hf: org/model, draft: {hf: acme/draft@v2}}\n",
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            document["model"]["source"],
+            serde_json::json!({"type": "huggingface", "repo": "org/model", "revision": MODEL})
+        );
+        assert_eq!(
+            document["model"]["draft"],
+            serde_json::json!({"type": "huggingface", "repo": "acme/draft", "revision": DRAFT})
+        );
+        // A drafter reference the hub does not know is refused under its name.
+        let error = prepare(
+            &format!("name: m\nengine: sglang\nmodel: {{hf: org/model@{MODEL}, draft: {{hf: acme/x}}}}\n"),
+            &endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.message.starts_with("model.draft.hf: "),
+            "{}",
+            error.message
+        );
+    }
 
     // T03 (owner rule 2026-09-25: every setting three ways): the endpoint a
     // `hf:` reference is pinned against follows `--hf-endpoint` >

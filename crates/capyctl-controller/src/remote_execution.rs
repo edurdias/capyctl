@@ -456,11 +456,12 @@ impl EngineAdapter for RemoteEngine {
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
-        if capyctl_protocol::execution::MaterializeSourcePlan::new(
+        // ADR 0008 (amendment 2026-10-08: the drafter's source too).
+        if !capyctl_protocol::execution::MaterializeSourcePlan::all(
             &plan.deployment_config,
             &plan.host_policy_fingerprint,
         )
-        .is_some()
+        .is_empty()
         {
             needs.push(capabilities::MODEL_SOURCES);
         }

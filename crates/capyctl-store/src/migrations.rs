@@ -10,7 +10,7 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V46, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V47, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -68,6 +68,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V45,
     // ADR 0014 §7 (amendment of 2026-10-08): checkpoint digest provenance.
     SCHEMA_V46,
+    // ADR 0008 amendment 2026-10-08: one source row per key (a drafter's too).
+    SCHEMA_V47,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -1175,6 +1177,59 @@ mod tests {
             .execute(
                 "INSERT INTO engine_secrets VALUES('missing','inference','i',zeroblob(24),x'03')",
                 []
+            )
+            .is_err());
+    }
+
+    /// ADR 0008 amendment 2026-10-08 (v47): a v46 store's source rows are
+    /// kept exactly, and one host may then hold a second row for the same
+    /// revision under another key (its drafter), never two under one key.
+    // T14 T33
+    #[test]
+    fn v47_keys_model_sources_by_source_and_keeps_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 46).unwrap();
+        conn.execute_batch(
+            "INSERT INTO model_sources VALUES('a',1,'lab','sources/http/w','failed',0,0,'hash_mismatch',1,7);",
+        )
+        .unwrap();
+        assert!(conn
+            .execute_batch(
+                "INSERT INTO model_sources VALUES('a',1,'lab','sources/http/d','pending',0,0,NULL,0,8);"
+            )
+            .is_err());
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let kept: (String, String, Option<String>, bool, i64) = conn
+            .query_row(
+                "SELECT source_key,state,reason,terminal,updated_at_ms FROM model_sources WHERE deployment_id='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kept,
+            (
+                "sources/http/w".into(),
+                "failed".into(),
+                Some("hash_mismatch".into()),
+                true,
+                7
+            )
+        );
+        conn.execute_batch(
+            "INSERT INTO model_sources VALUES('a',1,'lab','sources/http/d','pending',0,0,NULL,0,8);",
+        )
+        .unwrap();
+        assert!(conn
+            .execute_batch(
+                "INSERT INTO model_sources VALUES('a',1,'lab','sources/http/d','pending',0,0,NULL,0,9);"
+            )
+            .is_err());
+        assert!(conn
+            .execute_batch(
+                "INSERT INTO model_sources VALUES('a',1,'lab','elsewhere/d','pending',0,0,NULL,0,9);"
             )
             .is_err());
     }

@@ -63,6 +63,7 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--chat-template", default=None)
         parser.add_argument("--max-mamba-cache-size", type=int, default=None)
         parser.add_argument("--mamba-full-memory-ratio", type=float, default=None)
+        parser.add_argument("--speculative-draft-model-path", default=None)
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -70,7 +71,7 @@ SyntheticArgs.__struct_fields__ = (
     "ssl_keyfile", "dtype", "context_length", "reasoning_parser",
     "detokenizer_worker_num", "schedule_policy", "disable_cuda_graph",
     "engine_info_bootstrap_port", "decoupled_spec_bind_endpoint", "chat_template",
-    "max_mamba_cache_size", "mamba_full_memory_ratio")
+    "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path")
 
 
 def synthetic_constructor(**kwargs):
@@ -220,6 +221,36 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(max_mamba_cache_size=40, extra_args=extra),
                               self.placement(), constructor)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T14: ADR 0008 amendment 2026-10-08. A declared drafter's directory,
+    # which capyctl materialized, reaches the constructor as the draft model
+    # path with no host approval; absent, nothing is passed.
+    def test_a_declared_drafter_reaches_the_constructor(self):
+        kwargs = self.seen(self.spec_with(draft_model_path="/srv/models/sources/http/d"))
+        self.assertEqual(kwargs["speculative_draft_model_path"],
+                         "/srv/models/sources/http/d")
+        kwargs = self.seen(self.build_without("draft_model_path"))
+        self.assertNotIn("speculative_draft_model_path", kwargs)
+
+    # T14: ADR 0008 amendment 2026-10-08. A declared drafter and an approved
+    # draft path among the extras never both reach the engine (resolution
+    # prevents it; this rechecks).
+    def test_a_declared_drafter_and_a_draft_path_extra_are_refused(self):
+        from runtime import extra_args_policy as policy
+        approved = policy.parse_approvals(
+            '{"options": ["--speculative-draft-model-path"], "paths": ["/srv/drafters"],'
+            ' "trust_remote_code": false}')
+        extra = ["--speculative-draft-model-path", "/srv/drafters/d"]
+        mapping.construct_server_args(self.spec_with(extra_args=extra), self.placement(),
+                                      synthetic_constructor, AVAILABLE, approvals=approved)
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        with self.assertRaises(mapping.ServerArgsError) as caught:
+            mapping.construct_server_args(
+                self.spec_with(draft_model_path="/srv/models/d", extra_args=extra),
+                self.placement(), constructor, AVAILABLE, approvals=approved)
+        self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T14: extra arguments flow in through the installed parser.
     def test_extra_arguments_reach_the_constructor_under_their_field_names(self):

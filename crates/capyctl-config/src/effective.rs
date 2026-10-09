@@ -212,6 +212,33 @@ pub struct ModelIdentity {
     pub resolved_path: Option<String>,
     pub content_fingerprint: String,
     pub revision: String,
+    /// ADR 0008 amendment 2026-10-08: the speculative drafter's weights, a
+    /// model source of their own that CapyCTL materializes, sizes and hands
+    /// to the engine. Absent unless declared, so a deployment without one
+    /// encodes and fingerprints exactly as before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<DraftModel>,
+}
+
+/// ADR 0008 amendment 2026-10-08: a declared drafter source and the local
+/// directory it resolves to, exactly as [`ModelIdentity`] resolves its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftModel {
+    pub source: ModelSource,
+    /// `None` where no host is in hand (a command fingerprint).
+    pub resolved_path: Option<String>,
+}
+
+impl DraftModel {
+    /// The directory this drafter must lie inside: the model store for a
+    /// local source, the sources store for a remote one (as the weights').
+    pub fn store<'a>(&self, host: &'a HostPolicy) -> &'a Path {
+        match self.source {
+            ModelSource::Local { .. } => &host.model_store,
+            _ => host.model_sources.root(&host.model_store),
+        }
+    }
 }
 
 impl ModelIdentity {
@@ -240,6 +267,17 @@ impl ModelIdentity {
             ModelSource::Local { .. } => declared_checkpoint_digest(&self.content_fingerprint),
             _ => None,
         }
+    }
+
+    /// ADR 0008: every declared source this deployment loads from, with the
+    /// directory each resolves to: the weights, then (amendment 2026-10-08)
+    /// the drafter.
+    pub fn sources(&self) -> impl Iterator<Item = (&ModelSource, Option<&str>)> {
+        std::iter::once((&self.source, self.resolved_path.as_deref())).chain(
+            self.draft
+                .iter()
+                .map(|draft| (&draft.source, draft.resolved_path.as_deref())),
+        )
     }
 }
 
@@ -896,6 +934,10 @@ struct RawModel {
     source: Option<ModelSource>,
     content_fingerprint: String,
     revision: String,
+    /// ADR 0008 amendment 2026-10-08: the drafter's own source, in any
+    /// spelling `source` accepts.
+    #[serde(default)]
+    draft: Option<ModelSource>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1360,6 +1402,12 @@ pub fn resolve_effective_with_checkpoint(
     )?;
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
+    // ADR 0008 amendment 2026-10-08: and so does a remote drafter source.
+    if let Some(draft) = &model.draft {
+        host.model_sources
+            .permits(&draft.source)
+            .map_err(core::as_draft)?;
+    }
     core::check_single_device(&devices, &host)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
     if let Some(resources) = &declared_resources {
@@ -1398,6 +1446,7 @@ pub fn resolve_effective_with_checkpoint(
                 None => device_sizing,
             },
             domain_limit: core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
+            draft_declared: model.draft.is_some(),
         },
     )?;
     if let Some(topology) = member_of {

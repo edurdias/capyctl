@@ -1,11 +1,13 @@
 //! ADR 0008: materializing declared remote model sources on their hosts.
 //!
 //! A revision whose `model.source` is `huggingface` or `http` is accepted
-//! with its source pending on the host it resolved on. This supervisor asks
-//! that host to materialize it (`MaterializeSource`, answered at once with the
-//! source's state) and records every answer, so status shows the download's
-//! progress, and activation and the checkpoint digest (ADR 0014 §7) wait for a
-//! verified copy. A placement on another host materializes there first
+//! with its source pending on the host it resolved on, and so is a remote
+//! drafter (`model.draft`, amendment 2026-10-08), as a second source under
+//! its own key. This supervisor asks that host to materialize each
+//! (`MaterializeSource`, answered at once with the source's state) and
+//! records every answer, so status shows the download's progress, and
+//! activation and the checkpoint digest (ADR 0014 §7) wait for verified
+//! copies of both. A placement on another host materializes there first
 //! ([`ensure_materialized`]), before any launch is sent, exactly as a first
 //! placement measures its digest.
 //!
@@ -177,8 +179,9 @@ impl RemoteSources {
         let local =
             capyctl_config::remote_resources::local_deployment_document(&pending.host_id, &source)
                 .map_err(|_| Unavailable)?;
-        let plan = MaterializeSourcePlan::new(&local.to_string(), &publication.fingerprint)
-            .filter(|plan| plan.source_key == pending.source_key)
+        let plan = MaterializeSourcePlan::all(&local.to_string(), &publication.fingerprint)
+            .into_iter()
+            .find(|plan| plan.source_key == pending.source_key)
             .ok_or(Unavailable)?;
         Ok(source_command(
             &self.controller_id,
@@ -258,26 +261,35 @@ impl SourceHost for LocalSources {
         true
     }
     fn request(&self, pending: PendingSource) -> ReportFuture {
-        let source = &pending.effective.model.source;
-        // The revision names the directory it will load from; a store that
-        // would put the copy elsewhere (the store moved since the revision was
-        // accepted) is not asked, so nothing lands where no launch looks.
-        let placed = self.store.directory(source).is_some_and(|directory| {
-            pending.effective.model.resolved_path.as_deref() == directory.to_str()
-        });
-        let report = placed.then(|| report_from_status(self.store.request(source)));
+        // The revision names the directory each source loads from (its
+        // weights', its drafter's); a store that would put the copy elsewhere
+        // (the store moved since the revision was accepted) is not asked, so
+        // nothing lands where no launch looks.
+        let report = pending
+            .effective
+            .model
+            .sources()
+            .find(|(source, _)| source.store_key().as_deref() == Some(&*pending.source_key))
+            .filter(|(source, resolved)| {
+                self.store
+                    .directory(source)
+                    .is_some_and(|directory| *resolved == directory.to_str())
+            })
+            .map(|(source, _)| report_from_status(self.store.request(source)));
         Box::pin(async move { report.ok_or(Unavailable) })
     }
 }
 
-/// ADR 0008: before a launch on `host`, its copy of the revision's remote
-/// source must be verified. The host is asked (starting the download if
-/// needed) and polled until it answers `verified`, a failure, or `deadline_ms`
-/// passes. Every answer is recorded. A failure or a timeout refuses the launch
-/// before anything was sent (`model_source:<reason>`, `model_source_pending`);
-/// a download still running keeps running on the host for the next attempt.
-/// A deployment with a local source returns at once. The requests name
-/// `member_id` (ADR 0028 §6: `head` for a single-host deployment).
+/// ADR 0008: before a launch on `host`, its copy of each of the revision's
+/// remote sources (its weights' and, amendment 2026-10-08, its drafter's)
+/// must be verified. The host is asked for each in turn (starting the
+/// download if needed) and polled until it answers `verified`, a failure, or
+/// `deadline_ms` passes. Every answer is recorded. A failure or a timeout
+/// refuses the launch before anything was sent (`model_source:<reason>`,
+/// `model_source_pending`); a download still running keeps running on the
+/// host for the next attempt. A deployment with local sources only returns
+/// at once. The requests name `member_id` (ADR 0028 §6: `head` for a
+/// single-host deployment).
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_materialized(
     owner: &SharedCoordinatorState,
@@ -334,58 +346,62 @@ where
     F: Fn(MemberCommand) -> Fut,
     Fut: Future<Output = Result<pb::MemberExecutionResult, E>>,
 {
-    let Some(plan) = MaterializeSourcePlan::new(deployment_config, host_policy_fingerprint) else {
+    let plans = MaterializeSourcePlan::all(deployment_config, host_policy_fingerprint);
+    if plans.is_empty() {
         return Ok(());
-    };
+    }
     if !supported {
         // ADR 0017: the typed refusal for a host without the feature.
         return Err(RuntimeError::Refused(
             capyctl_protocol::capabilities::missing(capyctl_protocol::capabilities::MODEL_SOURCES),
         ));
     }
-    loop {
-        let now = capyctl_protocol::now_unix_ms();
-        let command = source_command(
-            controller_id,
-            host,
-            member_id,
-            deployment_id,
-            revision,
-            generation,
-            profile_fingerprint,
-            plan.clone(),
-            (now + REQUEST_DEADLINE.as_millis() as i64).min(deadline_ms),
-        );
-        let report = match send(command).await {
-            Ok(result) => report_from(&result).ok(),
-            Err(_) => None,
-        };
-        if let Some(report) = &report {
-            let _ = record(
-                owner,
+    for plan in plans {
+        loop {
+            let now = capyctl_protocol::now_unix_ms();
+            let command = source_command(
+                controller_id,
+                host,
+                member_id,
                 deployment_id,
                 revision,
-                host,
-                &plan.source_key,
-                report,
+                generation,
+                profile_fingerprint,
+                plan.clone(),
+                (now + REQUEST_DEADLINE.as_millis() as i64).min(deadline_ms),
             );
-            match report.state {
-                SourceState::Verified => return Ok(()),
-                SourceState::Failed => {
-                    return Err(RuntimeError::Refused(format!(
-                        "model_source:{}",
-                        report.reason.as_deref().unwrap_or("failed")
-                    )))
+            let report = match send(command).await {
+                Ok(result) => report_from(&result).ok(),
+                Err(_) => None,
+            };
+            if let Some(report) = &report {
+                let _ = record(
+                    owner,
+                    deployment_id,
+                    revision,
+                    host,
+                    &plan.source_key,
+                    report,
+                );
+                match report.state {
+                    SourceState::Verified => break,
+                    SourceState::Failed => {
+                        return Err(RuntimeError::Refused(format!(
+                            "model_source:{}",
+                            report.reason.as_deref().unwrap_or("failed")
+                        )))
+                    }
+                    SourceState::Pending | SourceState::Downloading => {}
                 }
-                SourceState::Pending | SourceState::Downloading => {}
             }
+            let wait = POLL_INTERVAL.as_millis() as i64;
+            if capyctl_protocol::now_unix_ms() + wait >= deadline_ms {
+                return Err(RuntimeError::Refused("model_source_pending".into()));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        let wait = POLL_INTERVAL.as_millis() as i64;
-        if capyctl_protocol::now_unix_ms() + wait >= deadline_ms {
-            return Err(RuntimeError::Refused("model_source_pending".into()));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
+    Ok(())
 }
 
 struct Attempt {
@@ -395,12 +411,16 @@ struct Attempt {
 
 /// The background supervisor: at most one request per source at a time,
 /// polling running downloads and backing off after a retryable failure.
+/// A source is one key of one revision on one host.
 pub struct SourceMaterializer {
     owner: SharedCoordinatorState,
     host: Arc<dyn SourceHost>,
-    running: Mutex<BTreeSet<(String, i64, String)>>,
-    attempts: Mutex<BTreeMap<(String, i64, String), Attempt>>,
+    running: Mutex<BTreeSet<SourceKey>>,
+    attempts: Mutex<BTreeMap<SourceKey, Attempt>>,
 }
+
+/// Deployment, revision, host and store key.
+type SourceKey = (String, i64, String, String);
 
 impl SourceMaterializer {
     pub fn new(owner: SharedCoordinatorState, host: Arc<dyn SourceHost>) -> Arc<Self> {
@@ -452,6 +472,7 @@ impl SourceMaterializer {
                 source.deployment_id.clone(),
                 source.revision,
                 source.host_id.clone(),
+                source.source_key.clone(),
             );
             let due = self
                 .attempts
