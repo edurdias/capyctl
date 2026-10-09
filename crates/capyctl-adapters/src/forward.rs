@@ -1577,7 +1577,7 @@ mod tests {
             .map(|line| format!("{line}\n\n"))
             .collect::<String>();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
         let request = serde_json::json!({"model":"public","messages":[],
             "stream_options":{"include_usage":true}});
         let mut relayed = Vec::new();
