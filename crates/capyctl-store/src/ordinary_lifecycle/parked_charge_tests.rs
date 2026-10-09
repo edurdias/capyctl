@@ -8,7 +8,7 @@ use super::*;
 use crate::Store;
 use capyctl_config::effective::{resolve_effective, PARKED_RESIDUAL_PLACEHOLDER_BYTES};
 use capyctl_domain::completion::{
-    CompletionEvidence, EffectObservation, OwnedLaunchReceipt, ProcessIdentity,
+    CleanupEvidence, CompletionEvidence, EffectObservation, OwnedLaunchReceipt, ProcessIdentity,
     StepExecutionContext,
 };
 use capyctl_domain::resources::{MemoryLimit, MemoryObservation, ProcessResident};
@@ -444,6 +444,67 @@ impl Lab {
             )
             .unwrap()
     }
+
+    /// Found live 2026-10-09: the stop the bound turned a park into runs as
+    /// any stop does. The cleanup worker discovers and arms it; the instance
+    /// keeps its Ready charge until the stop's gone evidence, which releases
+    /// it and leaves the instance stopped.
+    fn stop_runs(&self, fence: &DeploymentFence, operation: &str, now: i64) {
+        let next = self
+            .store
+            .next_ordinary_cleanup(&self.session)
+            .unwrap()
+            .expect("the cleanup worker discovers the stop");
+        assert_eq!(next.operation_id, operation);
+        let (_, context) = self
+            .store
+            .arm_ordinary_cleanup_with_context(&self.session, &next.step_id, now)
+            .unwrap();
+        let context = context.expect("a fresh arm");
+        assert_eq!(self.charge(&fence.deployment_id).1, ResourcePhase::Ready);
+        let ttl = self
+            .store
+            .resource_policy("lab")
+            .unwrap()
+            .unwrap()
+            .controls
+            .observation_ttl_ms;
+        self.store
+            .complete_cleanup(
+                &self.session,
+                &next.step_id,
+                &CleanupEvidence {
+                    binding_id: context.binding_id,
+                    incarnation: context.incarnation,
+                    identities: context.identities,
+                    observed_at_ms: now + 10,
+                    receipt: "gone".into(),
+                },
+                now + 10,
+                ttl,
+            )
+            .unwrap();
+        assert!(!self
+            .store
+            .resource_snapshot()
+            .unwrap()
+            .owners
+            .contains_key(&fence.deployment_id));
+        let (state, observed): (String, String) = self
+            .store
+            .conn
+            .query_row(
+                "SELECT o.state,i.observed_state FROM operations o JOIN deployment_instances i
+                   ON i.deployment_id=o.deployment_id AND i.instance_index=0 WHERE o.id=?1",
+                [operation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), observed.as_str()),
+            ("succeeded", "stopped")
+        );
+    }
 }
 
 /// The catalog's shape (GB10, vLLM 0.30.0): one launch parked and woken
@@ -504,6 +565,34 @@ fn a_park_after_the_parked_charge_outgrew_its_first_park_is_a_stop() {
     assert!(evidence.contains("grew from 3.5 GiB"), "{evidence}");
     // An exact retry of the command replays the same stop.
     assert_eq!(lab.park_command(&a, "park-3", 5_000), receipt);
+    // Found live 2026-10-09: the park's receipt names the stop too, and the
+    // stop still runs and releases only on its gone evidence; a retry after
+    // it settled still replays it.
+    lab.stop_runs(&a, &receipt.operation_id, 5_100);
+    assert_eq!(lab.park_command(&a, "park-3", 5_000), receipt);
+}
+
+// T16 (ADR 0014 amendment A19): the park's own receipt is the only other
+// receipt the stop it became may have. The same receipt under another
+// principal is still corruption, never authority, so the stop is not driven.
+#[test]
+fn a_growth_stop_refuses_a_park_receipt_it_did_not_answer() {
+    let lab = Lab::new();
+    let a = outgrown_launch(&lab);
+    lab.park_command(&a, "park-3", 5_000);
+    // Corruption injection, never acceptance authority.
+    lab.store
+        .conn
+        .execute(
+            "INSERT INTO command_receipts SELECT 'other',command_scope,idempotency_key,request_hash,operation_id,response_json
+               FROM command_receipts WHERE command_scope LIKE '%#park' AND idempotency_key='park-3'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        lab.store.next_ordinary_cleanup(&lab.session),
+        Err(LifecycleError::CorruptStoredData)
+    ));
 }
 
 // T16 (ADR 0014 amendment A19): growth within the bound parks as before.
@@ -556,6 +645,7 @@ fn the_idle_policy_stops_an_outgrown_launch_instead_of_parking_it() {
         lab.status(&a.deployment_id)["growth"][0]["state"],
         "stopped"
     );
+    lab.stop_runs(&a, operation_id, 10_100);
 
     let lab = Lab::new();
     let b = lab.deploy("b", derived);
@@ -658,4 +748,5 @@ fn a_switch_stops_an_outgrown_victim_instead_of_parking_it() {
         lab.status(&a.deployment_id)["growth"][0]["state"],
         "stopped"
     );
+    lab.stop_runs(&a, &release.operation_id, 5_100);
 }

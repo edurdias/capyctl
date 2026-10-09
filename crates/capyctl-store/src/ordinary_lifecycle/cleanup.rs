@@ -488,7 +488,19 @@ fn read(
     {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0 AND grant_id IS NULL) AND EXISTS(SELECT 1 FROM operations WHERE id=?2 AND deployment_id=?3 AND kind='ordinary_cleanup' AND state=?6 AND error_code IS ?12) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM command_receipts WHERE principal_id=?7 AND command_scope=?8 AND idempotency_key=?9 AND request_hash=?10 AND operation_id=?2 AND response_json=?11) AND (SELECT COUNT(*) FROM command_receipts WHERE operation_id=?2)=1",params![id,r.operation_id,original.deployment_id,r.binding_id,original.session_id,expected_operation,p.principal,p.command_scope(),p.key,hash_in(&p.principal,&p.command_scope(),p.command_revision(),r.deadline_ms)?,encode(r)?,error_code],|r|r.get(0))?;
+    // ADR 0014 amendment A19: a `park deployment` the parked growth bound
+    // turned into this stop answers with it, so that command's receipt (the
+    // deployment's park scope, or this instance's for a sibling) under the
+    // same principal and key names this operation too. No other receipt may.
+    let park_scopes = [
+        super::park::residency_scope(&original.deployment_id, None, "park"),
+        super::park::residency_scope(
+            &original.deployment_id,
+            Some(original.instance_index),
+            "park",
+        ),
+    ];
+    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0 AND grant_id IS NULL) AND EXISTS(SELECT 1 FROM operations WHERE id=?2 AND deployment_id=?3 AND kind='ordinary_cleanup' AND state=?6 AND error_code IS ?12) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM command_receipts WHERE principal_id=?7 AND command_scope=?8 AND idempotency_key=?9 AND request_hash=?10 AND operation_id=?2 AND response_json=?11) AND NOT EXISTS(SELECT 1 FROM command_receipts WHERE operation_id=?2 AND NOT (principal_id=?7 AND idempotency_key=?9 AND (command_scope=?8 OR (command_scope IN (?13,?14) AND EXISTS(SELECT 1 FROM journal_entries WHERE operation_id=?2 AND state='park_growth_stop')))))",params![id,r.operation_id,original.deployment_id,r.binding_id,original.session_id,expected_operation,p.principal,p.command_scope(),p.key,hash_in(&p.principal,&p.command_scope(),p.command_revision(),r.deadline_ms)?,encode(r)?,error_code,park_scopes[0],park_scopes[1]],|r|r.get(0))?;
     if !exact {
         return Err(LifecycleError::CorruptStoredData);
     }
