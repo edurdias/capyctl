@@ -35,13 +35,20 @@ class ObservationServerTests(unittest.TestCase):
         values.update(changes)
         return self.module.SchedulerObservationServer.start(**values)
 
-    def request(self, request_id="read-1"):
+    def request(self, request_id="read-1", refused=False):
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(client.close)
         client.settimeout(3)
         client.connect(str(self.path))
         raw = json.dumps(dict(version=1, request_id=request_id, timeout_ms=1000)).encode()
-        client.sendall(struct.pack("!I", len(raw)) + raw)
+        try:
+            client.sendall(struct.pack("!I", len(raw)) + raw)
+        except BrokenPipeError:
+            # A connection refused before its request is read (a foreign peer,
+            # failed custody) may already be closed by the time this sends:
+            # under load the server's thread accepts, refuses and closes first.
+            if not refused:
+                raise
         return client
 
     def read(self, client):
@@ -136,7 +143,7 @@ class ObservationServerTests(unittest.TestCase):
         peer = self.module._process_identity(os.getppid())
         server = self.server(expected_peer=peer)
         self.addCleanup(server.close)
-        self.assertIsNone(self.read(self.request()))
+        self.assertIsNone(self.read(self.request(refused=True)))
         self.assertEqual(self.bridge.calls, [])
 
     def test_replaced_socket_path_is_retained_and_never_unlinked(self):
@@ -163,7 +170,7 @@ class ObservationServerTests(unittest.TestCase):
         server = self.server()
         try:
             os.chmod(self.directory.name, 0o755)
-            self.assertIsNone(self.read(self.request()))
+            self.assertIsNone(self.read(self.request(refused=True)))
             self.assertEqual(self.bridge.calls, [])
             self.assertFalse(self.bridge.transport_active.is_set())
             with self.assertRaises(self.module.ObservationServerError):
