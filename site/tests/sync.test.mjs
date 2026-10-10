@@ -59,7 +59,7 @@ test('every docs/examples file is embedded verbatim on the configuration page or
   ];
   const out = pages.map((page) => toStarlight(read(page.source), page, pages, REPO, read)).join('\n');
   const files = readdirSync(new URL('docs/examples/', root)).filter((f) => f.endsWith('.yaml'));
-  assert.equal(files.length, 13);
+  assert.equal(files.length, 14);
   for (const f of files) assert.ok(out.includes(read(`docs/examples/${f}`)), f);
 });
 

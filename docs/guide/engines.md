@@ -364,7 +364,11 @@ hybrid and MLA attention, embedding and encoder models), for `n_gpu_layers`
 other than `all`, for options that move weights or the cache off the GPU
 (`--override-tensor`, `--cpu-moe`, `--n-cpu-moe`, `--no-kv-offload`) and for a
 draft model's own context (`--spec-type draft-*`, `--model-draft`). Declared
-`resources` work as for any engine.
+`resources` work as for any engine, but where CapyCTL can size the cache from
+the header, a declared `memory.kv_cache`, `memory.request` or `resources` that
+leaves less room for it than llama-server allocates at start is refused, naming
+the field. A draft model counts with all of its shards; one CapyCTL cannot
+count, outside the approved directories or with a shard missing, is refused.
 
 llama.cpp has no way to free its memory while it runs, so a llama.cpp model
 does not park, as TensorFold does not: `capyctl park deployment` refuses it,
@@ -387,9 +391,13 @@ Refused for llama.cpp, with the reason:
 - Options CapyCTL renders or keeps off, in any spelling ([Engine
   options](engine-flags.md#llamacpp-v060)), and `--name=value`: llama-server
   takes `--name value` only.
-- Engine variables llama-server reads as options or locations: `LLAMA_ARG_*`,
-  `LLAMA_API_KEY`, `LLAMA_SERVER_SLOTS_DEBUG`, `LLAMA_CACHE`,
-  `XDG_CONFIG_HOME` and `HOME` (`engine_env_reserved:<name>`).
+- Engine variables llama-server reads as options, as its port and routes, as
+  its devices or as locations: `LLAMA_ARG_*`, `LLAMA_SERVER_*`, `AIP_*`,
+  `LLAMA_API_KEY`, `MTMD_BACKEND_DEVICE`, `HF_TOKEN`, the ggml device variables
+  (`GGML_CUDA_DEVICES`, `GGML_CUDA_ENABLE_UNIFIED_MEMORY`,
+  `GGML_VK_VISIBLE_DEVICES`, `GGML_BACKEND_PATH` and the like), `LLAMA_CACHE`,
+  `XDG_CONFIG_HOME` and `HOME` (`engine_env_reserved:<name>`), even when
+  `approved_env` lists them.
 
 Options that read files, such as `--model-draft`, `--lora` or
 `--chat-template-file`, need approval when you add the engine, with the
