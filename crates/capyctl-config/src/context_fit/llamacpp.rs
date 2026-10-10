@@ -15,9 +15,9 @@
 //! or one per layer), `<arch>.attention.key_length` and `.value_length`
 //! (else `embedding_length / head_count`), with the cache types' block sizes.
 //! The request is then the launch's weights (the rendered GGUF and its
-//! shards, the projector and the draft model, ADR 0014 amendment A6) plus
-//! that cache plus the family margin (ADR 0014 §5, amendment A18, ADR 0019
-//! §3), through the derivation every engine shares.
+//! shards, the projector and the draft model with its shards, ADR 0014
+//! amendment A6) plus that cache plus the family margin (ADR 0014 §5,
+//! amendment A18, ADR 0019 §3), through the derivation every engine shares.
 //!
 //! Where the header or the arguments say the cache is laid out otherwise, or
 //! that weights or cache leave the GPU, nothing is derived and the deployment
@@ -262,7 +262,9 @@ pub fn draft_model(args: &[String]) -> Option<String> {
 /// holds `checkpoint`: the bytes it loads and its header's cache shape. Reads
 /// file sizes and the one header, never tensor data. A checkpoint with no
 /// model to pick, or a projector that is not there, is
-/// [`GgufKvRefusal::NoModel`]; the launch refuses it too.
+/// [`GgufKvRefusal::NoModel`]; the launch refuses it too. A draft model the
+/// arguments name that cannot be counted is [`GgufKvRefusal::Draft`], and
+/// resolution refuses it whatever the deployment declares.
 pub fn measure(checkpoint: &Path, files: &LlamacppFiles) -> GgufFacts {
     let no_model = GgufFacts {
         weights_bytes: 0,
@@ -284,19 +286,21 @@ pub fn measure(checkpoint: &Path, files: &LlamacppFiles) -> GgufFacts {
             Err(_) => return no_model,
         }
     }
-    // ADR 0014 amendment A6, ADR 0029 §8: a draft model is counted where it
-    // still lies inside an approved path once symlinks resolve (the launch
-    // refuses one that does not).
-    if let Some(draft) = files.draft.as_deref().and_then(|draft| {
-        let real = std::fs::canonicalize(draft).ok()?;
-        files
-            .approved_paths
-            .iter()
-            .filter_map(|root| std::fs::canonicalize(root).ok())
-            .any(|root| real.starts_with(root))
-            .then_some(real)
-    }) {
-        loaded.push(draft);
+    // ADR 0014 amendment A6, ADR 0029 §8: a draft model the arguments name,
+    // host-fixed or extra, counts with every shard llama.cpp loads, each
+    // still inside an approved path once symlinks resolve. One that cannot
+    // be counted is refused, never dropped, so the draft a launch loads is
+    // always the draft its request holds.
+    if let Some(draft) = files.draft.as_deref() {
+        match draft_files(draft, &files.approved_paths) {
+            Some(shards) => loaded.extend(shards),
+            None => {
+                return GgufFacts {
+                    kv: GgufKv::Refused(GgufKvRefusal::Draft),
+                    ..no_model
+                }
+            }
+        }
     }
     let mut weights_bytes = 0i64;
     for path in &loaded {
@@ -319,6 +323,40 @@ pub fn measure(checkpoint: &Path, files: &LlamacppFiles) -> GgufFacts {
         training_context,
         kv,
     }
+}
+
+/// ADR 0029 §8: the files a draft model loads, as llama.cpp's loader opens
+/// them (0.6.0 `llama_get_list_splits`, `src/llama-model-loader.cpp`): the
+/// named file, or every shard of the split set its first shard
+/// `<prefix>-00001-of-0000N.gguf` names, beside it. `None` when a shard is
+/// missing or not a file, when a later shard names the set (llama.cpp
+/// refuses to load from one), or when a file lies outside the approved paths
+/// once symlinks resolve.
+fn draft_files(draft: &str, approved_paths: &[String]) -> Option<Vec<PathBuf>> {
+    let named = Path::new(draft);
+    let shards: Vec<PathBuf> =
+        match crate::checkpoint_layout::shard_of(named.file_name()?.to_str()?) {
+            Some((_, index, _)) if index != 1 => return None,
+            Some((prefix, _, total)) => (1..=total)
+                .map(|index| {
+                    named.with_file_name(format!("{prefix}-{index:05}-of-{total:05}.gguf"))
+                })
+                .collect(),
+            None => vec![named.to_path_buf()],
+        };
+    let roots: Vec<PathBuf> = approved_paths
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    shards
+        .into_iter()
+        .map(|shard| {
+            let real = std::fs::canonicalize(shard).ok()?;
+            (std::fs::metadata(&real).ok()?.is_file()
+                && roots.iter().any(|root| real.starts_with(root)))
+            .then_some(real)
+        })
+        .collect()
 }
 
 /// ADR 0029 §5: the bytes one block of `values` cache values takes in a
@@ -420,4 +458,19 @@ pub fn derivation_refusal(n_gpu_layers: LlamacppGpuLayers, args: &[String]) -> O
         }
     }
     None
+}
+
+/// ADR 0029 §9: whether the layer count or the arguments keep KV cache layers
+/// off the GPU (`n_gpu_layers` other than `all`, `--no-kv-offload`). Every
+/// other reason [`derivation_refusal`] gives (weights off the GPU, an `mlock`
+/// load mode, a draft context) leaves the target model's cache where the
+/// formula puts it, so that cache is a lower bound a declared budget must
+/// hold.
+pub fn kv_leaves_gpu(n_gpu_layers: LlamacppGpuLayers, args: &[String]) -> bool {
+    matches!(n_gpu_layers, LlamacppGpuLayers::Count(_))
+        || parse_options(args).map_or(true, |options| {
+            options
+                .iter()
+                .any(|option| option.name == "--no-kv-offload")
+        })
 }

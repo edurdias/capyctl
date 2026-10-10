@@ -760,6 +760,8 @@ impl CheckpointGate {
     /// Measure the checkpoint and compare it with the recorded digest; a
     /// revision with none recorded (first placement, or a launch parked before
     /// digests existed) records this measurement first, validated as usual.
+    /// The facts measured beside the digest must still be the ones the
+    /// revision was sized with, as a remote host checks them.
     async fn check(&self) -> Result<(), GateRefusal> {
         let unrecorded = || GateRefusal::Unavailable("not_recorded".into());
         let recorded = {
@@ -776,6 +778,22 @@ impl CheckpointGate {
                     MeasureError::Refused(code) => GateRefusal::Unavailable(code),
                     MeasureError::Unavailable => GateRefusal::Unavailable("unavailable".into()),
                 })?;
+        // ADR 0014 amendment A6, ADR 0029 §8, §9: a draft model lies outside
+        // the checkpoint and its digest, so a grown or replaced draft leaves
+        // the digest unchanged; the weights and GGUF facts measured now must
+        // be the ones the revision's reservation was derived from, exactly
+        // as `verify_checkpoint` refuses them on a remote host. Nothing
+        // launches against a reservation sized for other weights.
+        let frozen = self.effective.engine_config.memory();
+        if frozen
+            .checkpoint_weights_bytes()
+            .is_some_and(|bytes| bytes != measured.manifest.weights_bytes && bytes != weights_bytes)
+            || frozen
+                .gguf
+                .is_some_and(|recorded| Some(recorded.facts) != gguf)
+        {
+            return Err(GateRefusal::Mismatch);
+        }
         match recorded {
             Some(digest) if digest == measured.manifest.digest => Ok(()),
             Some(_) => Err(GateRefusal::Mismatch),

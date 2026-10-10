@@ -557,6 +557,76 @@ async fn the_embedded_gate_verifies_before_initialize_and_restore() {
     );
 }
 
+// T34 T22 (ADR 0014 amendment A6, ADR 0029 §8, §9; found by review): a
+// llama.cpp draft model lies outside the checkpoint and its digest, so the
+// embedded gate compares the GGUF facts it measures with those the revision
+// was sized with, as a remote host does: a draft grown after the revision was
+// recorded refuses Initialize before the engine is asked anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_embedded_gate_refuses_a_grown_draft_model() {
+    let f = fixture_on(|deployment, host, models| {
+        std::fs::write(models.join("toy/toy-Q4_K_M.gguf"), "GGUF").unwrap();
+        let drafts = models.join("drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        std::fs::write(drafts.join("d.gguf"), "GGUF-draft").unwrap();
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = json!("llamacpp");
+        profile["executable"] = json!("/opt/llama.cpp/bin/llama-server");
+        profile["build_fingerprint"] = json!("0.6.0+d812350");
+        profile["args"] = json!([]);
+        profile["security"]["deep_park"] = json!("disabled");
+        profile["security"]["approved_options"] = json!(["--model-draft"]);
+        profile["security"]["approved_paths"] = json!([drafts]);
+        deployment["residency"] = json!("restart_only");
+        deployment["engine_config"] = json!({"context_length": 8192,
+            "accept_extra_args": true, "extra_args": ["--model-draft", drafts.join("d.gguf")]});
+    });
+    let checkpoints = Arc::new(CheckpointVerifier::in_memory());
+    run(&CheckpointDigests::new(
+        f.owner.clone(),
+        LocalDigests::new(checkpoints.clone()),
+    ))
+    .await;
+    assert_eq!(record_of(&f).state, DigestState::Recorded);
+    let work = {
+        let o = f.owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &f.fence, 100, 100_100)
+            .unwrap();
+        o.store().next_initialize(o.session()).unwrap().unwrap()
+    };
+    let sized = work.effective().engine_config.memory().gguf.unwrap().facts;
+    assert_eq!(
+        sized.weights_bytes,
+        4 + 10,
+        "the draft counts with the model"
+    );
+    let inner = Arc::new(Counting::default());
+    let gate = CheckpointGate::new(inner.clone(), f.owner.clone(), checkpoints, &work);
+    let _ = gate
+        .execute_persisted(&step(&f, RuntimeAction::Initialize))
+        .await;
+    assert_eq!(inner.0.load(Ordering::SeqCst), 1, "unchanged, it launches");
+    std::fs::write(f.models.path().join("drafts/d.gguf"), "GGUF-larger-draft").unwrap();
+    let refused = gate
+        .execute_persisted(&step(&f, RuntimeAction::Initialize))
+        .await
+        .unwrap_err();
+    let RuntimeError::Uncertain(text) = &refused else {
+        panic!("{refused:?}")
+    };
+    assert_eq!(
+        capyctl_domain::diagnostics::classify(None, text),
+        Some("checkpoint_mismatch"),
+        "{text}"
+    );
+    assert_eq!(
+        inner.0.load(Ordering::SeqCst),
+        1,
+        "nothing reached the engine"
+    );
+}
+
 // T37, ADR 0014 §7: a checkpoint that cannot be measured says why; only a
 // measured difference is a digest mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

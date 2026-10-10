@@ -737,7 +737,8 @@ fn llamacpp_resolution_refuses_what_llama_cpp_cannot_do() {
 
 // T42 (ADR 0029 §9): declared resources need nothing derived, offline too;
 // the measured GGUF weights are taken from the declared reservation, which
-// must hold them. Unmeasured, the revision is provisional.
+// must hold them and the cache the header fixes. Unmeasured, the revision is
+// provisional.
 #[test]
 fn declared_llamacpp_resources_bound_the_kv_cache() {
     let (mut deployment, host) = fixture();
@@ -758,10 +759,14 @@ fn declared_llamacpp_resources_bound_the_kv_cache() {
     let error =
         resolve_effective_with_checkpoint(&deployment, &host, measured(9 * GIB)).unwrap_err();
     assert_eq!(error.path, "resources");
-    // A declared KV cache is kept as declared.
-    deployment["engine_config"]["memory"] = json!({"kv_cache": "1GiB"});
+    // A declared KV cache is kept as declared where it holds the 4 GiB the
+    // header fixes for 8192 tokens in 4 slots, and refused below it.
+    deployment["engine_config"]["memory"] = json!({"kv_cache": "5GiB"});
     let effective = resolve(&deployment, &host).unwrap();
-    assert_eq!(llamacpp(&effective).memory.kv_cache_bytes, GIB);
+    assert_eq!(llamacpp(&effective).memory.kv_cache_bytes, 5 * GIB);
+    deployment["engine_config"]["memory"] = json!({"kv_cache": "1GiB"});
+    let error = resolve(&deployment, &host).unwrap_err();
+    assert_eq!(error.path, "engine_config.memory.kv_cache");
 }
 
 // T42 T37 (ADR 0029 §6): LLAMA_ARG_*, LLAMA_API_KEY, LLAMA_SERVER_SLOTS_DEBUG,

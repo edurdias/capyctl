@@ -457,11 +457,12 @@ fn write(path: &Path, bytes: &[u8], total: u64) {
     file.set_len(total).unwrap();
 }
 
-// T42 (ADR 0029 §9, ADR 0014 amendment A6): the weights a launch loads are
-// the rendered GGUF and all its shards, the projector and a draft model in an
-// approved path, not every GGUF in the checkpoint; the header is the first
-// shard's. A draft outside the approved paths is not counted (the launch
-// refuses it); several models without `gguf_file`, or an unreadable header,
+// T42 (ADR 0029 §8, §9, ADR 0014 amendment A6): the weights a launch loads
+// are the rendered GGUF and all its shards, the projector and a draft model in
+// an approved path with all its shards, not every GGUF in the checkpoint; the
+// header is the first shard's. A draft that cannot be counted (outside the
+// approved paths, a shard missing, a set named by a later shard) is refused,
+// never dropped; several models without `gguf_file`, or an unreadable header,
 // are named.
 #[test]
 fn the_measured_weights_are_what_the_launch_loads() {
@@ -487,6 +488,9 @@ fn the_measured_weights_are_what_the_launch_loads() {
             &[drafts.display().to_string()],
         )
     };
+    let bare = |gguf: Option<&str>, mmproj: Option<&str>| {
+        LlamacppFiles::new(gguf.map(str::to_owned), mmproj.map(str::to_owned), &[], &[])
+    };
     let facts = measure(
         &checkpoint,
         &files(None, Some("mmproj-F16.gguf"), &drafts.join("d.gguf")),
@@ -504,29 +508,60 @@ fn the_measured_weights_are_what_the_launch_loads() {
         &checkpoint,
         &files(None, None, &root.path().join("elsewhere/d.gguf")),
     );
-    assert_eq!(outside.weights_bytes, 403_000);
+    assert_eq!(
+        outside,
+        GgufFacts {
+            weights_bytes: 0,
+            training_context: None,
+            kv: GgufKv::Refused(GgufKvRefusal::Draft),
+        }
+    );
+    // A split draft counts every shard llama.cpp loads (found by review: only
+    // the first shard was counted).
+    write(&drafts.join("s-00001-of-00003.gguf"), b"GGUF", 70);
+    write(&drafts.join("s-00002-of-00003.gguf"), b"", 700);
+    write(&drafts.join("s-00003-of-00003.gguf"), b"", 7000);
+    let split = measure(
+        &checkpoint,
+        &files(None, None, &drafts.join("s-00001-of-00003.gguf")),
+    );
+    assert_eq!(split.weights_bytes, 403_000 + 70 + 700 + 7000);
+    // A set named by a later shard, a missing shard, and a shard that leaves
+    // the approved paths through a symlink are refused.
+    let later = measure(
+        &checkpoint,
+        &files(None, None, &drafts.join("s-00002-of-00003.gguf")),
+    );
+    assert_eq!(later.kv, GgufKv::Refused(GgufKvRefusal::Draft));
+    std::fs::remove_file(drafts.join("s-00003-of-00003.gguf")).unwrap();
+    let incomplete = measure(
+        &checkpoint,
+        &files(None, None, &drafts.join("s-00001-of-00003.gguf")),
+    );
+    assert_eq!(incomplete.kv, GgufKv::Refused(GgufKvRefusal::Draft));
+    std::os::unix::fs::symlink(
+        root.path().join("elsewhere/d.gguf"),
+        drafts.join("s-00003-of-00003.gguf"),
+    )
+    .unwrap();
+    let escaped = measure(
+        &checkpoint,
+        &files(None, None, &drafts.join("s-00001-of-00003.gguf")),
+    );
+    assert_eq!(escaped.kv, GgufKv::Refused(GgufKvRefusal::Draft));
     // A second quantization: one must be named.
     write(&checkpoint.join("m-Q8_0.gguf"), &first, 800_000);
-    let several = measure(&checkpoint, &files(None, None, Path::new("/none")));
+    let several = measure(&checkpoint, &bare(None, None));
     assert_eq!(several.kv, GgufKv::Refused(GgufKvRefusal::NoModel));
     assert_eq!(several.weights_bytes, 0);
-    let named = measure(
-        &checkpoint,
-        &files(Some("m-Q8_0.gguf"), None, Path::new("/none")),
-    );
+    let named = measure(&checkpoint, &bare(Some("m-Q8_0.gguf"), None));
     assert_eq!(named.weights_bytes, 800_000);
     // A projector that is not there.
-    let missing = measure(
-        &checkpoint,
-        &files(Some("m-Q8_0.gguf"), Some("absent.gguf"), Path::new("/none")),
-    );
+    let missing = measure(&checkpoint, &bare(Some("m-Q8_0.gguf"), Some("absent.gguf")));
     assert_eq!(missing.kv, GgufKv::Refused(GgufKvRefusal::NoModel));
     // A model whose header is not GGUF.
     write(&checkpoint.join("broken.gguf"), b"not a header", 100);
-    let broken = measure(
-        &checkpoint,
-        &files(Some("broken.gguf"), None, Path::new("/none")),
-    );
+    let broken = measure(&checkpoint, &bare(Some("broken.gguf"), None));
     assert_eq!(
         broken,
         GgufFacts {
@@ -722,15 +757,7 @@ fn refused(error: &capyctl_config::ConfigError) {
 fn derivation_is_refused_where_the_cache_is_not_derivable() {
     use GgufKvRefusal::*;
     let (deployment, host) = fixture();
-    for refusal in [
-        SlidingWindow,
-        Recurrent,
-        Hybrid,
-        Mla,
-        Layout,
-        Unreadable,
-        NoModel,
-    ] {
+    for refusal in [SlidingWindow, Recurrent, Hybrid, Mla, Layout, Unreadable] {
         let error = resolve_effective_with_checkpoint(
             &deployment,
             &host,
@@ -739,6 +766,21 @@ fn derivation_is_refused_where_the_cache_is_not_derivable() {
         .unwrap_err();
         refused(&error);
         assert!(error.detail.contains(refusal.reason()), "{error}");
+    }
+    // Weights the host could not measure size nothing, declared or not.
+    let mut declared = deployment.clone();
+    declared["engine_config"]["memory"] = json!({"kv_cache": "6GiB"});
+    for refusal in [NoModel, Draft] {
+        for deployment in [&deployment, &declared] {
+            let error = resolve_effective_with_checkpoint(
+                deployment,
+                &host,
+                facts(8 * GIB, 0, GgufKv::Refused(refusal)),
+            )
+            .unwrap_err();
+            assert_eq!(error.path, "engine_config.memory", "{error}");
+            assert!(error.detail.contains(refusal.reason()), "{error}");
+        }
     }
     let with = |engine_config: Value| {
         let mut deployment = deployment.clone();
@@ -801,6 +843,153 @@ fn derivation_is_refused_where_the_cache_is_not_derivable() {
     .unwrap();
     assert_eq!(phase_bytes(&effective)[1], vec![13 * GIB]);
     assert_eq!(memory(&effective).kv_cache_bytes, 13 * GIB - 5 * GIB);
+}
+
+// T42 T26 (ADR 0029 §5, §9, SPEC §3; found by review): with `--fit off`
+// llama-server allocates the whole cache its context and slots fix, so where
+// the header makes that cache calculable a declared KV cache, request or
+// `resources` that leaves less for it is refused naming the field; one that
+// holds it resolves as declared. A draft context only adds to the cache, so
+// the bound stands beside a draft model. Where CapyCTL cannot tell (another
+// cache layout, cache layers off the GPU) the declared estimate stands.
+#[test]
+fn a_declared_budget_holds_the_calculable_cache() {
+    let (deployment, host) = fixture();
+    let margin = unified_margin(Engine::Llamacpp, Some(5 * GIB));
+    let with = |engine_config: Value, resources: Option<Value>, kv: GgufKv| {
+        let mut deployment = deployment.clone();
+        deployment["engine_config"] = engine_config;
+        if let Some(resources) = resources {
+            deployment["resources"] = resources;
+        }
+        resolve_effective_with_checkpoint(&deployment, &host, facts(8 * GIB, 5 * GIB, kv))
+    };
+    let memory_only = |memory: Value| json!({"context_length": 8192, "memory": memory});
+    let below = [
+        (
+            memory_only(json!({"kv_cache": "1GiB"})),
+            None,
+            "engine_config.memory.kv_cache",
+        ),
+        (
+            memory_only(json!({"request": format!("{}B", 5 * GIB + KV + margin - 1)})),
+            None,
+            "engine_config.memory.request",
+        ),
+        (
+            json!({"context_length": 8192}),
+            Some(json!({"gpu": "7GiB", "ram": "1GiB"})),
+            "resources",
+        ),
+        (
+            json!({"context_length": 8192, "memory": {"kv_cache": "1GiB"},
+                   "accept_extra_args": true, "extra_args": ["--model-draft", "/srv/drafts/d.gguf"]}),
+            None,
+            "engine_config.memory.kv_cache",
+        ),
+    ];
+    for (engine_config, resources, path) in below {
+        let error = with(engine_config, resources, dense()).unwrap_err();
+        assert_eq!(error.path, path, "{error}");
+        assert!(error.detail.contains(&KV.to_string()), "{error}");
+    }
+    let kv = memory(&with(memory_only(json!({"kv_cache": "4GiB"})), None, dense()).unwrap())
+        .kv_cache_bytes;
+    assert_eq!(kv, KV);
+    let request = format!("{}B", 5 * GIB + KV + margin);
+    let effective = with(memory_only(json!({"request": request})), None, dense()).unwrap();
+    assert_eq!(memory(&effective).kv_cache_bytes, KV);
+    let effective = with(
+        json!({"context_length": 8192}),
+        Some(json!({"gpu": "9GiB", "ram": "1GiB"})),
+        dense(),
+    )
+    .unwrap();
+    assert_eq!(memory(&effective).kv_cache_bytes, 10 * GIB - 5 * GIB);
+    // Unknowable: another layout, or cache layers off the GPU.
+    let small = json!({"kv_cache": "1GiB"});
+    for (engine_config, kv) in [
+        (
+            memory_only(small.clone()),
+            GgufKv::Refused(GgufKvRefusal::SlidingWindow),
+        ),
+        (
+            json!({"context_length": 8192, "memory": small,
+                   "llamacpp": {"n_gpu_layers": 20}}),
+            dense(),
+        ),
+        (
+            json!({"context_length": 8192, "memory": small,
+                   "accept_extra_args": true, "extra_args": ["--no-kv-offload"]}),
+            dense(),
+        ),
+    ] {
+        let effective = with(engine_config, None, kv).unwrap();
+        assert_eq!(memory(&effective).kv_cache_bytes, GIB);
+    }
+}
+
+// T42 T26 (ADR 0029 §8, §9, ADR 0014 amendment A6; found by review): the draft
+// a host-fixed or an extra `--model-draft` names is measured with every shard
+// where a host measures a checkpoint (located without resolving) and where it
+// launches one (resolved) alike. A host-fixed draft outside
+// security.approved_paths is refused at resolution, declared budget or not,
+// instead of being left out of it.
+#[test]
+fn a_named_draft_is_counted_whole_or_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let store = root.path().join("store");
+    write(
+        &store.join("model/m.gguf"),
+        &header(3, &llama(32, V::U32(8))),
+        1000,
+    );
+    let drafts = root.path().join("drafts");
+    write(&drafts.join("d-00001-of-00002.gguf"), b"GGUF", 70);
+    write(&drafts.join("d-00002-of-00002.gguf"), b"", 700);
+    write(&root.path().join("elsewhere/d.gguf"), b"GGUF", 9);
+    let (mut deployment, mut host) = fixture();
+    host["model_store"]["path"] = json!(store);
+    host["runtime_profiles"]["local"]["security"]["approved_paths"] = json!([drafts]);
+    deployment["model"]["path"] = json!(store.join("model"));
+    deployment["engine_config"] = json!({"context_length": 8192, "memory": {"kv_cache": "4GiB"}});
+    let first = drafts.join("d-00001-of-00002.gguf").display().to_string();
+    let resolve = |deployment: &Value, host: &Value| {
+        let gguf = checkpoint_location(deployment, host).unwrap().gguf_facts();
+        let facts = CheckpointFacts {
+            weights_bytes: Some(1000),
+            gguf,
+            ..CheckpointFacts::default()
+        };
+        (
+            gguf,
+            resolve_effective_with_checkpoint(deployment, host, facts),
+        )
+    };
+    // An extra draft and a host-fixed one inside the approved paths.
+    let mut extra = deployment.clone();
+    extra["engine_config"]["accept_extra_args"] = json!(true);
+    extra["engine_config"]["extra_args"] = json!(["--model-draft", first]);
+    let mut fixed = host.clone();
+    fixed["runtime_profiles"]["local"]["args"] = json!(["--model-draft", first]);
+    for (deployment, host) in [(&extra, &host), (&deployment, &fixed)] {
+        let (gguf, effective) = resolve(deployment, host);
+        assert_eq!(gguf.unwrap().weights_bytes, 1000 + 70 + 700);
+        let effective = effective.unwrap();
+        assert_eq!(memory(&effective).weights_bytes, Some(1000 + 70 + 700));
+        assert_eq!(effective.gguf_facts(), gguf, "the launch measures the same");
+    }
+    // A host-fixed draft outside the approved paths.
+    let outside = root.path().join("elsewhere/d.gguf").display().to_string();
+    fixed["runtime_profiles"]["local"]["args"] = json!(["--model-draft", outside]);
+    let (gguf, effective) = resolve(&deployment, &fixed);
+    assert_eq!(gguf.unwrap().kv, GgufKv::Refused(GgufKvRefusal::Draft));
+    let error = effective.unwrap_err();
+    assert_eq!(error.path, "engine_config.memory", "{error}");
+    assert!(
+        error.detail.contains(GgufKvRefusal::Draft.reason()),
+        "{error}"
+    );
 }
 
 // T42 (ADR 0029 §5, review focus 5): a model trained at 32k deployed at
