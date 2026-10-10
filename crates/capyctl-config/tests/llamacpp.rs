@@ -779,6 +779,51 @@ fn hidden_inputs_in_the_environment_are_refused() {
     resolve_effective(&all["deployment"], &host).unwrap();
 }
 
+// T42 T37 (ADR 0029 §6, SPEC §8.2): the variables llama-server reads in place
+// of the leased port and routes (AIP_*), of a reserved option
+// (MTMD_BACKEND_DEVICE for --mmproj-device, HF_TOKEN for --hf-token), of
+// router mode (LLAMA_SERVER_*) or of the device choice are refused in a
+// profile `env`, and in a deployment `env` even when approved_env lists them.
+#[test]
+fn listener_device_and_router_overrides_in_the_environment_are_refused() {
+    for name in [
+        "AIP_MODE",
+        "AIP_HTTP_PORT",
+        "AIP_HEALTH_ROUTE",
+        "AIP_PREDICT_ROUTE",
+        "MTMD_BACKEND_DEVICE",
+        "HF_TOKEN",
+        "LLAMA_SERVER_ROUTER_PORT",
+        "LLAMA_SERVER_CHILD_MODE",
+        "GGML_CUDA_DEVICES",
+        "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
+        "GGML_VK_VISIBLE_DEVICES",
+        "GGML_BACKEND_PATH",
+        "ONEAPI_DEVICE_SELECTOR",
+        "mtmd_backend_device",
+    ] {
+        let (deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["env"] = json!({ name: "1" });
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "runtime_profiles.env", "{name}");
+        assert_eq!(error.detail, format!("engine_env_reserved:{name}"));
+
+        let upper = name.to_ascii_uppercase();
+        let (mut deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["security"]["approved_env"] =
+            json!(["AIP_*", "LLAMA_SERVER_*", "GGML_*", upper]);
+        deployment["engine_config"]["env"] = json!({ upper.clone(): "1" });
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.env", "{name}");
+        assert_eq!(error.detail, format!("engine_env_reserved:{upper}"));
+    }
+    // An approved tuning variable still reaches the engine.
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["approved_env"] = json!(["GGML_*"]);
+    deployment["engine_config"]["env"] = json!({"GGML_CUDA_NO_PINNED": "1"});
+    resolve_effective(&deployment, &host).unwrap();
+}
+
 // T42 (ADR 0029 §9): `gguf_file` and `mmproj_file` are relative `.gguf`
 // paths inside the checkpoint.
 #[test]

@@ -242,6 +242,38 @@ fn the_environment_is_closed() {
     assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
 }
 
+// T42 T37 (ADR 0029 §6, SPEC §8.2): the final filter drops the variables that
+// replace the leased port and routes, the projector device, router mode or the
+// device choice, even when the resolved environment carries them.
+#[test]
+fn the_environment_drops_listener_and_device_overrides() {
+    let mut input = plan();
+    let overrides = [
+        "AIP_MODE",
+        "AIP_HTTP_PORT",
+        "AIP_HEALTH_ROUTE",
+        "AIP_PREDICT_ROUTE",
+        "MTMD_BACKEND_DEVICE",
+        "HF_TOKEN",
+        "LLAMA_SERVER_ROUTER_PORT",
+        "LLAMA_SERVER_CHILD_MODE",
+        "GGML_CUDA_DEVICES",
+        "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
+        "GGML_BACKEND_PATH",
+    ];
+    input.build_env = overrides
+        .iter()
+        .map(|name| ((*name).to_owned(), "1".to_owned()))
+        .chain([("GGML_CUDA_NO_PINNED".to_owned(), "1".to_owned())])
+        .collect();
+    let rendered = render_command(&input).unwrap().env;
+    let env = engine_environment(&rendered, &input, &|_| None);
+    for name in overrides {
+        assert!(!env.contains_key(name), "{name} reached the engine");
+    }
+    assert_eq!(env["GGML_CUDA_NO_PINNED"], "1");
+}
+
 fn fixture(checkpoint: &Path) -> (Value, Value) {
     let all: Value = serde_json::from_str(include_str!(
         "../../capyctl-config/tests/fixtures/f2-deployment.json"

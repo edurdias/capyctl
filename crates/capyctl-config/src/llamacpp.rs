@@ -393,27 +393,56 @@ pub fn slot_pool_tokens(context_length: u32, slots: u32) -> Option<u32> {
         .and_then(|tokens| u32::try_from(tokens).ok())
 }
 
-/// ADR 0029 §6: environment names llama-server reads as options or as its
-/// configuration and cache locations. A profile or deployment `env` naming
-/// one is refused, whatever `approved_env` says: `LLAMA_ARG_*` and
-/// `LLAMA_API_KEY` set options, `LLAMA_SERVER_SLOTS_DEBUG` exposes prompts in
-/// `/slots`, and `LLAMA_CACHE`, `XDG_CONFIG_HOME` and `HOME` would move the
-/// directories CapyCTL points at its own empty ones.
+/// ADR 0029 §6: environment names llama-server reads in place of a reserved
+/// option or of CapyCTL's listener, device and directories (every `getenv`
+/// of the v0.6.0 tag was read). A profile or deployment `env` naming one is
+/// refused, whatever `approved_env` says:
+///
+/// - option aliases: `LLAMA_ARG_*`, and the three without that prefix,
+///   `LLAMA_API_KEY` (`--api-key`), `MTMD_BACKEND_DEVICE` (`--mmproj-device`)
+///   and `HF_TOKEN` (`--hf-token`);
+/// - the listener: `AIP_*` (`AIP_MODE=PREDICTION` replaces the port with
+///   `AIP_HTTP_PORT` and moves the routes, `tools/server/server-http.cpp`);
+/// - router mode: `LLAMA_SERVER_*` (`LLAMA_SERVER_ROUTER_PORT` makes the
+///   process a router child that reports to that port and
+///   `LLAMA_SERVER_CHILD_MODE=download` replaces serving;
+///   `LLAMA_SERVER_SLOTS_DEBUG` exposes prompts in `/slots`);
+/// - the device choice (one GPU, chosen by CapyCTL, ADR 0019) and device
+///   accounting: the ggml variables that pick or multiply backend devices,
+///   load another backend, or move device allocations into host memory;
+/// - `LLAMA_CACHE`, `XDG_CONFIG_HOME` and `HOME`, which would move the
+///   directories CapyCTL points at its own empty ones.
 pub const REFUSED_ENV_NAMES: &[&str] = &[
     "LLAMA_API_KEY",
-    "LLAMA_SERVER_SLOTS_DEBUG",
+    "MTMD_BACKEND_DEVICE",
+    "HF_TOKEN",
+    "GGML_CUDA_DEVICES",
+    "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
+    "GGML_VK_VISIBLE_DEVICES",
+    "GGML_VK_PREFER_HOST_MEMORY",
+    "GGML_VK_ALLOW_SYSMEM_FALLBACK",
+    "GGML_METAL_DEVICES",
+    "GGML_OPENCL_PLATFORM",
+    "GGML_OPENCL_DEVICE",
+    "GGML_HEXAGON_DEVICES",
+    "ONEAPI_DEVICE_SELECTOR",
+    "GGML_BACKEND_PATH",
     "LLAMA_CACHE",
     "XDG_CONFIG_HOME",
     "HOME",
 ];
-/// The prefix of every variable llama-server reads as an option.
-pub const REFUSED_ENV_PREFIX: &str = "LLAMA_ARG_";
+/// The prefixes of the variable families above: options, router mode and
+/// the listener.
+pub const REFUSED_ENV_PREFIXES: &[&str] = &["LLAMA_ARG_", "LLAMA_SERVER_", "AIP_"];
 
 /// Whether a profile or deployment environment may not name `name` on a
 /// llama.cpp profile (compared upper-cased, as `engine_env::is_owned` is).
 pub fn refused_env_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with(REFUSED_ENV_PREFIX) || REFUSED_ENV_NAMES.contains(&upper.as_str())
+    REFUSED_ENV_PREFIXES
+        .iter()
+        .any(|prefix| upper.starts_with(prefix))
+        || REFUSED_ENV_NAMES.contains(&upper.as_str())
 }
 
 /// The first name of a llama.cpp profile's or deployment's `env` that is

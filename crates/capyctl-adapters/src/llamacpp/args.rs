@@ -286,7 +286,8 @@ pub fn engine_environment(
     }
     // ADR 0028 §2.1: the resolved engine env comes before everything CapyCTL
     // renders, so a rendered value is never replaced. Resolution refused the
-    // names llama-server reads as options or directories; they are dropped
+    // names llama-server reads in place of a reserved option, the listener,
+    // the device choice or the directories (ADR 0029 §6); they are dropped
     // here again.
     env.extend(
         plan.build_env
