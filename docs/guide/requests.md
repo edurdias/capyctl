@@ -228,8 +228,8 @@ CapyCTL passes the salt to vLLM and SGLang unchanged. It must be a non-empty
 string of at most 1024 bytes; anything else is refused with
 `400 invalid_request`.
 
-TensorFold ignores the field, so a request with a `cache_salt` for a model that
-runs on TensorFold is refused rather than served without the isolation it asks
+TensorFold and llama.cpp ignore the field, so a request with a `cache_salt` for a
+model that runs on either is refused rather than served without the isolation it asks
 for. The answer is `400` with code `cache_salt_unsupported` (on a stream, an
 error event with that code), and nothing reaches the engine. The same request
 without `cache_salt` is served.

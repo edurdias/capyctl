@@ -1,6 +1,6 @@
 # CapyCTL documentation
 
-CapyCTL runs vLLM, SGLang and TensorFold models on GPU machines you own. It
+CapyCTL runs vLLM, SGLang, TensorFold and llama.cpp models on GPU machines you own. It
 parks the models nobody is using, which frees their GPU memory, and wakes the
 one a request asks for. Clients use one OpenAI-compatible endpoint, on your
 network, with an API key.
@@ -18,8 +18,8 @@ Start here:
 Tasks:
 
 - [Install an engine](install-engines.md): vLLM, SGLang or TensorFold in a
-  virtual environment, step by step.
-- [Add an engine](engines.md): register the vLLM, SGLang or TensorFold you have.
+  virtual environment, or a llama.cpp build, step by step.
+- [Add an engine](engines.md): register the vLLM, SGLang, TensorFold or llama.cpp you have.
 - [Deploy a model](deploy.md): the deployment file; start, stop, delete.
 - [Make a request](requests.md): curl, streaming, the Python client, other
   machines.

@@ -1,0 +1,27 @@
+# Qwen3-4B Q4_K_M (GGUF) on llama.cpp v0.6.0 on one discrete NVIDIA GPU
+# (docs/guide/engines.md, "llama.cpp"):
+# `capyctl deploy model --file deployment-llamacpp.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-llamacpp.yaml`.
+schema_version: 1
+kind: deployment
+name: qwen3-4b-gguf
+# The profile `capyctl engine add ~/llama.cpp/build/bin/llama-server` registered.
+engine: llamacpp
+# A directory under the models root holding one GGUF model; downloaded with
+# `hf download Qwen/Qwen3-4B-GGUF Qwen3-4B-Q4_K_M.gguf --local-dir ~/models/Qwen3-4B-GGUF`.
+model: Qwen3-4B-GGUF
+devices: [{id: gpu0}]
+# No `resources`: CapyCTL reads the GGUF header and derives the memory from the
+# weights and the KV cache of every slot. llama.cpp cannot free its memory while
+# it runs, so the model never parks (`residency: restart_only` is implied).
+engine_config:
+  # Required: each request's window, in tokens.
+  context_length: 8192
+  # Requests decoded together (llama.cpp's slots); 4 when not set. Each slot
+  # holds a full window of KV cache.
+  max_concurrent_requests: 4
+  # f16 when not set; also f32, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1.
+  kv_cache_dtype: f16
+  llamacpp:
+    # `all` (the default) or a layer count. Only `all` lets CapyCTL derive the memory.
+    n_gpu_layers: all

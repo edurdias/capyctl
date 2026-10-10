@@ -1104,3 +1104,51 @@ async fn a_llamacpp_scrape_reads_its_slots() {
     assert!(all[0].engine.is_none());
     assert!(all[2].engine.is_none());
 }
+
+/// A llama-server started without a key, as an embedded llama.cpp launch is
+/// (ADR 0029 §4): it answers only scrapes that carry no `Authorization`.
+async fn unkeyed_llamacpp() -> SocketAddr {
+    let open = |body: &'static str| {
+        get(move |headers: HeaderMap| async move {
+            if headers.contains_key("authorization") {
+                return (StatusCode::UNAUTHORIZED, String::new());
+            }
+            (StatusCode::OK, body.to_owned())
+        })
+    };
+    let router = Router::new()
+        .route("/metrics", open(LLAMACPP_METRICS))
+        .route("/slots", open(LLAMACPP_SLOTS));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+struct Unkeyed(SocketAddr);
+
+impl load::LoadSource for Unkeyed {
+    fn targets(&self) -> Vec<capyctl_agent::ingress::LoadTarget> {
+        vec![capyctl_agent::ingress::LoadTarget {
+            scope: scope("unkeyed", 1),
+            owned_handle: "launch-u".into(),
+            target: self.0,
+            native: None,
+            in_flight: 0,
+        }]
+    }
+}
+
+// T42, ADR 0029 §4 and §11 (found live 2026-10-09): a target with no key, an
+// embedded llama.cpp launch, is scraped without one and reports its load.
+#[tokio::test]
+async fn a_target_without_a_key_is_scraped_unkeyed() {
+    let source = std::sync::Arc::new(Unkeyed(unkeyed_llamacpp().await));
+    let reporter = LoadReporter::new(source, "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    let engine = all[0].engine.unwrap();
+    assert_eq!(
+        (engine.running, engine.waiting, engine.kv_usage_ppm),
+        (2, 3, 125_000)
+    );
+}

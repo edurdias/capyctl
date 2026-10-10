@@ -154,6 +154,48 @@ checkpoint.
 | Two-GPU groups | `--tp`, `--rank`, `--master`, `--master-port` | reserved | `topology`. CapyCTL renders them for each group member. |
 | Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. |
 
+## llama.cpp v0.6.0
+
+The options of `llama-server` at the v0.6.0 tag (`common/arg.cpp`). llama-server
+matches option names exactly, so CapyCTL does too: every long spelling of an
+option (its aliases, its `--no-` form and `_` in place of `-`) is the same
+option, and `--name=value` is refused because llama-server takes only
+`--name value`. Short options are refused for every engine.
+
+| Need | Option | Class | CapyCTL |
+|---|---|---|---|
+| Context length | `--ctx-size` | typed | `engine_config.context_length`, each request's window. CapyCTL renders the window times the slots. |
+| Max running requests | `--parallel` | typed | `engine_config.max_concurrent_requests`, 4 when not set. It sizes the KV cache, so it has one source. |
+| KV cache dtype | `--cache-type-k`, `--cache-type-v` | typed | `engine_config.kv_cache_dtype`, both caches. |
+| Layers on the GPU | `--gpu-layers`, `--n-gpu-layers` | typed | `engine_config.llamacpp.n_gpu_layers`, `all` when not set. |
+| The model file | `--model` | typed | `engine_config.llamacpp.gguf_file`, a GGUF file inside the model directory. |
+| Vision projector | `--mmproj` | typed | `engine_config.llamacpp.mmproj_file`. |
+| Flash attention | `--flash-attn` | extra | |
+| Batch sizes | `--batch-size`, `--ubatch-size` | extra | |
+| Threads | `--threads`, `--threads-batch` | extra | |
+| Prompt cache reuse | `--cache-reuse` | extra | |
+| Reasoning | `--reasoning-budget`, `--reasoning-format` | extra | |
+| Sampling defaults | `--temp`, `--top-p`, `--top-k` | extra | |
+| Speculative decoding: settings | `--spec-type`, `--draft-max`, `--draft-min` | extra | A draft context (`--spec-type draft-*`) needs `engine_config.memory.kv_cache` or `resources`. |
+| Speculative decoding: a draft model | `--model-draft` | approval | The file must be inside `security.approved_paths`. Its weights are counted. |
+| Adapters | `--lora`, `--lora-scaled`, `--control-vector`, `--control-vector-scaled` | approval | Each path must be inside `security.approved_paths`. |
+| Templates and grammars from files | `--chat-template-file`, `--grammar-file`, `--json-schema-file` | approval | The file must be inside `security.approved_paths`. |
+| Video decoding | `--video-ffmpeg-dir` | approval | It names programs llama-server runs. |
+| Listener | `--host`, `--port`, `--reuse-port`, `--path`, `--api-prefix`, `--ssl-key-file`, `--ssl-cert-file` | reserved | CapyCTL listens for the engine on loopback. |
+| Authentication | `--api-key`, `--api-key-file` | reserved | CapyCTL owns authentication. |
+| Served name | `--alias` | reserved | The deployment's name. |
+| Slot layout and self-sizing | `--kv-unified`, `--fit`, `--fit-target`, `--fit-ctx`, `--cache-ram` | reserved | CapyCTL renders `--no-kv-unified`, `--fit off` and `--cache-ram 0` so the memory matches what it derived. |
+| Context shift | `--context-shift` | reserved | Rendered off: a request never silently drops its start. |
+| Status pages | `--metrics`, `--slots`, `--props` | reserved | CapyCTL turns `/metrics` and `/slots` on and reads them. |
+| Web UI and CORS | `--webui`, `--cors-origins`, `--cors-credentials` | reserved | Off. |
+| Idle unload, router mode | `--sleep-idle-seconds`, `--models-dir`, `--models-preset`, `--models-max` | reserved | CapyCTL stops and starts the model itself. |
+| Downloads | `--offline`, `--hf-repo`, `--hf-file`, `--model-url` | reserved | CapyCTL fetches models. |
+| Saved slots, RPC | `--slot-save-path`, `--rpc` | reserved | They write files or open connections. |
+| Logs | `--log-file`, `--verbose`, `--log-verbosity` | reserved | CapyCTL owns the engine log. |
+| Devices | `--device`, `--split-mode`, `--tensor-split`, `--main-gpu` | reserved | `devices`: one GPU per deployment. |
+| Built-in tools and agent | `--tools`, `--agent` | reserved | They run code on the host. |
+| Embeddings and reranking | `--embedding`, `--rerank`, `--pooling` | reserved | A llama.cpp deployment serves chat. |
+
 ## Reaching an SGLang memory fraction
 
 SGLang sizes its memory from `--mem-fraction-static`, a share of the memory

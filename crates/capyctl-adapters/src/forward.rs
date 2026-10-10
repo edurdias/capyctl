@@ -446,8 +446,10 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         // ADR 0023 §7: TensorFold's statistics ride the final chunk; a
         // collected response carries them as the engine's own would. vLLM's
         // per-request `metrics` ride its final usage chunk the same way
-        // (0.30 `ChatCompletionStreamResponse.metrics`).
-        for field in ["tensorfold", "metrics"] {
+        // (0.30 `ChatCompletionStreamResponse.metrics`), and llama.cpp's
+        // `timings` ride its last chunk (ADR 0029 §11; found live 2026-10-09:
+        // a collected answer had lost them, so `prefill_ms` was missing).
+        for field in ["tensorfold", "metrics", "timings"] {
             if let Some(stats) = chunk.get(field).filter(|v| v.is_object()) {
                 response[field] = stats.clone();
             }
@@ -1177,6 +1179,24 @@ mod tests {
         assert_eq!(response["metrics"]["time_to_first_token_ms"], 41.5);
         assert_eq!(response["metrics"]["mean_itl_ms"], 10.0);
         assert_eq!(response["usage"]["completion_tokens"], 8);
+        assert_eq!(response["choices"][0]["message"]["content"], "hi");
+    }
+
+    // T40 T42 (ADR 0029 §11, found live 2026-10-09): llama.cpp's `timings`
+    // ride its last chunk; a collected response carries them top-level, where
+    // llama-server's own non-streaming answer does.
+    #[test]
+    fn a_collected_response_keeps_the_llamacpp_timings() {
+        let last = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":14,"total_tokens":30,"completion_tokens":16},"timings":{"cache_n":13,"prompt_n":1,"prompt_ms":6.927,"predicted_n":16,"predicted_ms":114.765,"predicted_per_second":130.7}}"#;
+        let response = assemble(vec![
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}"#.to_owned(),
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#.to_owned(),
+            last.to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(response["timings"]["prompt_ms"], 6.927);
+        assert_eq!(response["timings"]["predicted_per_second"], 130.7);
+        assert_eq!(response["usage"]["completion_tokens"], 16);
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
     }
 
