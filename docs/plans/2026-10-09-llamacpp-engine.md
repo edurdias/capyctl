@@ -78,8 +78,10 @@ reads `/health`, `/v1/models` and `/props`, and the idle gate reads `/metrics`.
 - Environment: closed (SPEC §13.3) plus `CUDA_VISIBLE_DEVICES`,
   `XDG_CONFIG_HOME=<state>/engines/llamacpp/config`,
   `LLAMA_CACHE=<state>/engines/llamacpp/cache` (service user, 0700). A profile or
-  deployment environment naming `LLAMA_ARG_*`, `LLAMA_API_KEY`,
-  `LLAMA_SERVER_SLOTS_DEBUG`, `LLAMA_CACHE`, `XDG_CONFIG_HOME` or `HOME` is refused.
+  deployment environment naming a variable llama-server reads in place of a reserved
+  option, its listener, its device or its directories (ADR 0029 §6: `LLAMA_ARG_*`,
+  `LLAMA_SERVER_*`, `AIP_*`, `LLAMA_API_KEY`, `MTMD_BACKEND_DEVICE`, `HF_TOKEN`, the
+  ggml device variables, `LLAMA_CACHE`, `XDG_CONFIG_HOME`, `HOME`) is refused.
 - Residency `restart_only` only; `deep` and `host_backed` fail with
   `capability_missing`; `capyctl park deployment` is refused unsupported.
 - Loopback listener, no engine key, no engine control path.

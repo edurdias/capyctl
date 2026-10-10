@@ -225,11 +225,21 @@ spelling, which llama.cpp itself rejects.
 The hidden inputs are closed too. The launch environment is closed (SPEC §13.3) and
 points `XDG_CONFIG_HOME` and `LLAMA_CACHE` at empty CapyCTL-owned directories
 (`<state>/engines/llamacpp/{config,cache}`, mode 0700), so no user-level
-`config.ini` applies. A profile or deployment environment may not name
-`LLAMA_ARG_*`, `LLAMA_API_KEY`, `LLAMA_SERVER_SLOTS_DEBUG`, `LLAMA_CACHE`,
-`XDG_CONFIG_HOME` or `HOME`, even when `approved_env` lists them. A launch on a host
-where `/etc/llama.cpp/config.ini` exists is refused before anything starts, with the
-closed reason `engine_config_file`.
+`config.ini` applies. A profile or deployment environment may not name a variable
+llama-server reads in place of a reserved option, its listener, its device or its
+directories, even when `approved_env` lists it (every `getenv` of the v0.6.0 tag
+read): `LLAMA_ARG_*`; `LLAMA_SERVER_*` (router-child mode and slot debugging);
+`AIP_*` (`AIP_MODE=PREDICTION` with `AIP_HTTP_PORT` replaces the port);
+`LLAMA_API_KEY`, `MTMD_BACKEND_DEVICE` and `HF_TOKEN` (the aliases of `--api-key`,
+`--mmproj-device` and `--hf-token`); the ggml variables that pick or multiply
+backend devices, load another backend or move device allocations into host memory
+(`GGML_CUDA_DEVICES`, `GGML_CUDA_ENABLE_UNIFIED_MEMORY`, `GGML_VK_VISIBLE_DEVICES`,
+`GGML_VK_PREFER_HOST_MEMORY`, `GGML_VK_ALLOW_SYSMEM_FALLBACK`, `GGML_METAL_DEVICES`,
+`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_DEVICE`, `GGML_HEXAGON_DEVICES`,
+`ONEAPI_DEVICE_SELECTOR`, `GGML_BACKEND_PATH`); and `LLAMA_CACHE`,
+`XDG_CONFIG_HOME` and `HOME`. The launch environment drops them again. A launch on a
+host where `/etc/llama.cpp/config.ini` exists is refused before anything starts, with
+the closed reason `engine_config_file`.
 
 *Alternatives:* TensorFold's prefix rule (llama.cpp does not abbreviate, so it would
 flag ordinary options such as `--cache-reuse` beside a reserved `--cache-ram`);
@@ -258,8 +268,10 @@ options are ordinary, including the weight-free `ngram-*` types and `draft-mtp`
 (MTP heads in the checkpoint). A draft model is `--model-draft`, a path option the
 host approves by name, inside `security.approved_paths`, checked lexically at deploy
 time and through symlinks before launch, never fetched and never digested (the
-TensorFold drafter rule, ADR 0023 §5). Its GGUF size counts with the checkpoint's
-weights (ADR 0014 A6).
+TensorFold drafter rule, ADR 0023 §5). Its GGUF size, every shard of a split set
+named by its first shard, counts with the checkpoint's weights (ADR 0014 A6),
+whether the host-fixed or the extra arguments name it; a draft that cannot be
+counted (outside the approved paths, a shard missing) is refused, never left out.
 
 *Alternatives:* reserving speculative decoding for v1 (loses llama.cpp's main
 throughput lever on GB10, MTP for Qwen4Exp); a typed field (one more schema block for
@@ -292,9 +304,15 @@ The derivation is refused, and the deployment must state `memory.kv_cache` or
 `--spec-type draft-mtp` is passed (its MTP context's cache is not yet measured), and
 when the arguments move weights or KV off the GPU (`n_gpu_layers` other than `all`,
 `--override-tensor`, `--cpu-moe`, `--n-cpu-moe`, `--n-cpu-ffn`, `--no-kv-offload`,
-an `mlock` load mode). Checkpoint identity stays ADR 0014 §7's digest over the whole
-directory. Undeclared `timeouts.initialize` follows ADR 0014 A1 and A7 until live rows
-measure llama.cpp's start.
+an `mlock` load mode). With `--fit off` llama-server allocates the whole cache its
+context and slots fix, so where the header makes that cache calculable (full
+attention, no cache layers off the GPU) a declared `memory.kv_cache`,
+`memory.request` or `resources` that leaves less for it is refused; other layouts
+keep the declared estimate. Checkpoint identity stays ADR 0014 §7's digest over the
+whole directory; the draft model lies outside it, so every host, the embedded one
+included, compares the weights and GGUF facts it re-measures before a launch with
+the revision's. Undeclared `timeouts.initialize` follows ADR 0014 A1 and A7 until
+live rows measure llama.cpp's start.
 
 *Alternatives:* `resources` always required (TensorFold's rule; llama.cpp's cache
 is fully allocated at start and derivable for common models); llama.cpp's own
