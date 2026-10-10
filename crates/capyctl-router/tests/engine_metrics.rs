@@ -200,6 +200,47 @@ fn vllm() -> Scripted {
     }
 }
 
+/// vLLM 0.31.0 with `--enable-per-request-metrics` and
+/// `--enable-prompt-tokens-details` (extra): the usage chunk carries the
+/// same `prompt_tokens_details.cached_tokens` as 0.30.0 on a repeated
+/// prompt, and `metrics` gained `speculative_decoding` (raw
+/// vllm-qwen3/stream-usage-chunk.txt, engine-qual 2026-10-10).
+fn vllm_0310(cached: Option<u64>) -> Scripted {
+    let chunk = |delta: Value, finish: Value| {
+        json!({"id": "chatcmpl-bb30ee4e5bd625a4",
+            "object": "chat.completion.chunk", "created": 1791671919,
+            "model": "qwen3-4b", "choices": [{"index": 0, "delta": delta,
+            "logprobs": null, "finish_reason": finish, "token_ids": null}]})
+        .to_string()
+    };
+    let metrics = json!({"time_to_first_token_ms": 19.4,
+        "generation_time_ms": 91.7, "queue_time_ms": 0.024, "mean_itl_ms": 18.3,
+        "tokens_per_second": 54.0});
+    let details = cached.map(|cached| json!({"cached_tokens": cached}));
+    let usage = json!({"prompt_tokens": 418, "total_tokens": 424,
+        "completion_tokens": 6, "prompt_tokens_details": details,
+        "completion_tokens_details": {"reasoning_tokens": 5}});
+    Scripted {
+        chunks: vec![
+            chunk(json!({"role": "assistant", "reasoning": ""}), Value::Null),
+            chunk(json!({"reasoning": "Thinking"}), Value::Null),
+            chunk(json!({}), json!("stop")),
+            json!({"id": "chatcmpl-bb30ee4e5bd625a4",
+                "object": "chat.completion.chunk", "created": 1791671919,
+                "model": "qwen3-4b", "choices": [],
+                "usage": usage, "system_fingerprint": "vllm-0.31.0-9f1a7227",
+                "metrics": metrics})
+            .to_string(),
+        ],
+        whole: json!({"id": "chatcmpl-bb30ee4e5bd625a4", "object": "chat.completion",
+            "created": 1791671919, "model": "qwen3-4b",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                "reasoning": "Thinking"}, "logprobs": null,
+                "finish_reason": "stop"}],
+            "usage": usage, "metrics": metrics}),
+    }
+}
+
 /// SGLang 0.5.21 with `--enable-cache-report`: `"usage": null` on every
 /// delta, then the usage chunk with `prompt_tokens_details`.
 fn sglang(cached: Option<u64>) -> Scripted {
@@ -286,6 +327,45 @@ async fn vllm_reports_its_own_timings() {
     let (data, figures) = streamed(engine).await;
     assert_eq!(data, sent, "every engine chunk is relayed byte for byte");
     assert_eq!(figures, expected);
+}
+
+// T40: vLLM 0.31.0 reports the same `usage.prompt_tokens_details.cached_tokens`
+// 0.30.0 does on a repeated prompt with `--enable-prompt-tokens-details`
+// (extra), and its `metrics` object (which gained `speculative_decoding`)
+// never carries cached tokens; without the flag nothing was cached is
+// reported and the figure stays absent, never zero.
+#[tokio::test]
+async fn vllm_0310_maps_cached_tokens_from_usage() {
+    let expected = json!({
+        "ttft_ms": {"value": 19.424, "source": "engine"},
+        "queue_ms": {"value": 0.024, "source": "engine"},
+        "prefill_ms": {"value": 19.4, "source": "engine"},
+        "decode_tokens_per_second": {"value": 54.645, "source": "engine"},
+        "cached_tokens": {"value": 416, "source": "engine"},
+    });
+    for stream in [false, true] {
+        let engine = vllm_0310(Some(416));
+        let sent = engine.chunks.clone();
+        let whole = engine.whole.clone();
+        let (answer, figures) = if stream {
+            let (data, figures) = streamed(engine).await;
+            assert_eq!(data, sent, "every engine chunk is relayed byte for byte");
+            (Value::Null, figures)
+        } else {
+            let (answer, figures) = collected(engine).await;
+            assert_eq!(answer["usage"], whole["usage"]);
+            (answer, figures)
+        };
+        assert_eq!(figures, expected, "{answer}");
+    }
+    for stream in [false, true] {
+        let figures = if stream {
+            streamed(vllm_0310(None)).await.1
+        } else {
+            collected(vllm_0310(None)).await.1
+        };
+        assert!(figures.get("cached_tokens").is_none(), "{figures}");
+    }
 }
 
 // T40 T41: TensorFold's statistics map; its 0.0 tokens per second is

@@ -66,6 +66,7 @@ fn vllm_reserved_names_match_the_protected_entry() {
     let source = runtime_source("vllm_entry.py");
     let mut python = quoted_block(&source, "RESERVED = (", "\n)");
     python.extend(quoted_block(&source, "RESERVED_IF_PRESENT = (", ")"));
+    python.extend(quoted_block(&source, "RESERVED_IF_DEFINED = (", ")"));
     python.extend(quoted_block(&source, "SLEEP_RESERVED = (", ")"));
     let python_families = quoted_block(&source, "RESERVED_FAMILIES = (", ")");
     let rust: BTreeSet<String> = reserved_options(Engine::Vllm, true)

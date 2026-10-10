@@ -10,9 +10,13 @@ capyctl launches `python vllm_entry.py serve <model> <reserved> --capyctl-user-a
    parser (the `vllm serve` subcommand parser of the installed build), so
    abbreviations, underscores, `=value`, dotted JSON keys, negations and
    aliases resolve exactly as vLLM resolves them;
-3. compares every reserved destination of the two results; any difference,
-   or a reserved destination the installed parser does not have, is a closed
-   `effective_args_mismatch` (ADR 0014 open issue 4: drift fails closed);
+3. compares every reserved destination of the two results — the reserved set
+   read from the destinations the installed parser itself defines, so a
+   build that moved an option reserves the name it spells (ADR 0017 §2:
+   vLLM 0.31.0 moved logging into the nested `--logging-config`); any
+   difference, or a flat reserved name the parser does not define, is a
+   closed `effective_args_mismatch` (ADR 0014 open issue 4: drift fails
+   closed);
 4. validates and runs the server in this process from the very namespace it
    checked, so nothing is parsed twice with different rules.
 
@@ -57,6 +61,19 @@ RESERVED = (
 # vLLM 0.30 scale-out (extra serving routes) is reserved the same way.
 RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
                        "enable_scale_out")
+# ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into the nested
+# `--logging-config` dotted config (vllm/config/logging.py, `LoggingConfig`:
+# log_level, configure_logging, pylogging_config_file). The serve parser
+# defines the whole surface on one destination, `logging_config` — the
+# `--logging-config` JSON and every `--logging-config.<field>` resolve to
+# it — beside legacy flat `--log-level` and `--log-config-file` overrides,
+# each an argparse SUPPRESS destination: absent from a namespace until a
+# token sets it. Each name is reserved where the installed parser defines
+# it (raw vllm-0310-apiserver-help.txt, engine-qual 2026-10-10; 0.29.0 and
+# 0.30.0 define none of them), so a user cannot double-set the logging
+# configuration on any build; a build without them reserves nothing, since
+# no argument can then reach them.
+RESERVED_IF_DEFINED = ("logging_config", "log_level")
 # ADR 0014 §2: destinations the typed fields render (engine_policy.rs
 # VLLM_TYPED_OPTIONS); an extra argument may not restate or reverse them.
 TYPED = ("dtype", "quantization", "kv_cache_dtype", "max_model_len", "max_num_seqs",
@@ -158,27 +175,53 @@ def _parse(parser, argv):
         raise LaunchError("invalid_arguments") from None
 
 
-def reserved_destinations(namespace, sleep_mode):
+def _parser_destinations(parser):
+    """Every destination the installed parser's own argparse tree defines,
+    subparsers included (engine_capabilities.parser_destinations)."""
+    return _capabilities().parser_destinations(parser)
+
+
+def reserved_destinations(defined, sleep_mode):
+    """ADR 0014 §3: the parser destinations capyctl owns on the installed build.
+
+    Version-skew aware (ADR 0017 §2): `defined` is every destination the
+    installed parser's own argparse tree defines, so a build that moved an
+    option reserves the name it spells. The flat RESERVED names are returned
+    unconditionally (a build that defines none of them is refused by
+    `check_reserved`, never silently unreserved); an if-present or if-defined
+    name is reserved only where defined; a family reserves every defined
+    destination that starts with it.
+    """
     names = set(RESERVED)
-    names.update(name for name in vars(namespace) if name.startswith(RESERVED_FAMILIES))
-    names.update(name for name in RESERVED_IF_PRESENT if hasattr(namespace, name))
+    names.update(name for name in defined if name.startswith(RESERVED_FAMILIES))
+    names.update(name for name in RESERVED_IF_PRESENT if name in defined)
+    names.update(name for name in RESERVED_IF_DEFINED if name in defined)
     if sleep_mode:
         names.update(SLEEP_RESERVED)
     return sorted(names)
 
 
-def check_reserved(expected, actual):
-    """Every reserved destination keeps the value capyctl rendered, exactly."""
+def check_reserved(expected, actual, defined):
+    """Every reserved destination keeps the value capyctl rendered, exactly.
+
+    A destination the installed parser defines with an argparse SUPPRESS
+    default (vLLM 0.31.0's nested logging surface) is absent from a namespace
+    until a token sets it: both parses leaving it absent is agreement;
+    either one alone, any value difference, or a flat reserved name the
+    parser does not define (ADR 0014 open issue 4) is closed drift.
+    """
     sleep_mode = getattr(expected, "enable_sleep_mode", None)
     if type(sleep_mode) is not bool:
         raise LaunchError("effective_args_mismatch")
-    names = set(reserved_destinations(expected, sleep_mode))
-    names.update(reserved_destinations(actual, sleep_mode))
-    for name in names:
-        missing = object()
+    missing = object()
+    for name in reserved_destinations(defined, sleep_mode):
+        if name in RESERVED and name not in defined:
+            raise LaunchError("effective_args_mismatch")
         want = getattr(expected, name, missing)
         have = getattr(actual, name, missing)
-        if want is missing or have is missing or type(want) is not type(have) or want != have:
+        if (want is missing) != (have is missing):
+            raise LaunchError("effective_args_mismatch")
+        if want is not missing and (type(want) is not type(have) or want != have):
             raise LaunchError("effective_args_mismatch")
 
 
@@ -222,11 +265,12 @@ def resolve(argv, parser, approvals=None):
     fixed, extra = split_user(user)
     check_user_tokens(fixed)
     check_user_tokens(extra)
+    defined = _parser_destinations(parser)
     expected = _parse(parser, reserved)
     base = _parse(parser, reserved + fixed)
     actual = _parse(parser, reserved + fixed + extra)
-    check_reserved(expected, base)
-    check_reserved(expected, actual)
+    check_reserved(expected, base, defined)
+    check_reserved(expected, actual, defined)
     check_extra(base, actual, approvals, argv[1])
     # ADR 0014 §8 / T21: trust_remote_code runs checkpoint code; the host's
     # approval is rechecked here, not only at deploy time.
