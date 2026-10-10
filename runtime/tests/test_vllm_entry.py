@@ -16,7 +16,14 @@ from unittest import mock
 from runtime import vllm_entry as entry
 
 
-def fake_parser(drop=()):
+def _fake_parser(drop=(), nested=False):
+    # `nested` shapes vLLM 0.31.0's serve parser (ADR 0017 §2): logging moved
+    # into the nested `--logging-config` dotted config, and the parser defines
+    # the whole surface on one `logging_config` destination — the
+    # `--logging-config` JSON and every `--logging-config.<field>` resolve to
+    # it — beside legacy flat `--log-level` and `--log-config-file` overrides,
+    # each an argparse SUPPRESS destination: absent from a namespace until a
+    # token sets it (raw vllm-0310-apiserver-help.txt, vllm/config/logging.py).
     parser = argparse.ArgumentParser(prog="vllm")
     sub = parser.add_subparsers(dest="subparser")
     serve = sub.add_parser("serve")
@@ -46,7 +53,15 @@ def fake_parser(drop=()):
     option("--disable-log-stats", action="store_true")
     option("--enable-per-request-metrics", action=argparse.BooleanOptionalAction,
            default=False)
-    option("--log-config-file", default=None)
+    if nested:
+        option("--log-config-file", dest="log_config_file", default=argparse.SUPPRESS)
+        option("--logging-config", dest="logging_config", default=argparse.SUPPRESS)
+        option("--log-level", dest="log_level", default=argparse.SUPPRESS)
+        for field in ("log_level", "configure_logging", "pylogging_config_file"):
+            option(f"--logging-config.{field}", dest="logging_config",
+                   default=argparse.SUPPRESS)
+    else:
+        option("--log-config-file", default=None)
     option("--uvicorn-log-level", default="info")
     option("--disable-uvicorn-access-log", action="store_true")
     option("--distributed-executor-backend", default=None)
@@ -82,6 +97,19 @@ def fake_parser(drop=()):
     option("--download-dir", default=None)
     option("--chat-template", default=None)
     return parser
+
+
+def fake_parser(drop=()):
+    """The vLLM 0.29.0 and 0.30.0 serve parser: flat logging flags with
+    default values present in every parsed namespace."""
+    return _fake_parser(drop)
+
+
+def fake_parser_0310(drop=()):
+    """The vLLM 0.31.0 serve parser: `log_config_file` no longer resolves a
+    default, so a namespace-first reservation reads nothing; the version-skew
+    aware entry reads the parser's own actions instead."""
+    return _fake_parser(drop, nested=True)
 
 
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
@@ -213,7 +241,7 @@ class ResolveTests(unittest.TestCase):
         expected = parser.parse_args(RESERVED)
         actual = parser.parse_args(RESERVED + ["--config", "x"])
         with self.assertRaises(entry.LaunchError):
-            entry.check_reserved(expected, actual)
+            entry.check_reserved(expected, actual, entry._parser_destinations(parser))
 
     def test_marker_help_and_version_are_closed(self):
         for vector in (RESERVED, RESERVED + [entry.MARKER, entry.MARKER],
@@ -317,6 +345,96 @@ class ExtraArgumentTests(unittest.TestCase):
     def test_the_extra_marker_appears_at_most_once(self):
         with self.assertRaises(entry.LaunchError):
             self.resolve([entry.EXTRA_MARKER])
+
+
+
+class VersionSkewTests(unittest.TestCase):
+    """ADR 0017 §2: the reservation follows the destinations the installed
+    parser itself defines, so vLLM 0.31.0 — logging moved into the nested
+    `--logging-config` dotted config, every name an argparse SUPPRESS
+    destination — launches under the same rendered reserved block, and a
+    0.30.0 parser keeps today's behaviour byte for byte."""
+
+    def vector(self, rendered=(), user=(), sleep=False):
+        return RESERVED + list(rendered) + (SLEEP if sleep else []) + [entry.MARKER, *user]
+
+    def resolve(self, user=(), sleep=False, drop=(), parser=None, rendered=()):
+        # argparse writes its own usage on refusal; keep test output clean.
+        with mock.patch("sys.stderr", io.StringIO()):
+            return entry.resolve(self.vector(rendered, user, sleep),
+                                 parser or fake_parser(drop))
+
+    def refused(self, user, parser, code="effective_args_mismatch", rendered=()):
+        with self.assertRaises(entry.LaunchError) as caught:
+            self.resolve(user, parser=parser, rendered=rendered)
+        self.assertEqual(caught.exception.code, code)
+        for token in user:
+            self.assertNotIn(token, str(caught.exception))
+
+    # T14 T21: the same rendered reserved block launches on the 0.31.0 shape;
+    # its SUPPRESS logging destinations are absent from both parses, which is
+    # agreement, not drift (the 2026-10-10 live row's refusal).
+    def test_the_rendered_block_launches_on_the_0310_parser(self):
+        args = self.resolve(parser=fake_parser_0310())
+        self.assertEqual(args.model_tag, "/models/qwen")
+        self.assertIs(args.enable_per_request_metrics, True)
+        for name in ("log_config_file", "logging_config", "log_level"):
+            self.assertIs(getattr(args, name, None), None)
+        args = self.resolve(sleep=True, parser=fake_parser_0310())
+        self.assertIs(args.enable_sleep_mode, True)
+
+    # T21: the whole 0.31.0 logging surface stays reserved however spelled —
+    # the JSON object, every dotted field, the legacy flat overrides — so a
+    # user cannot double-set the logging configuration on any build.
+    def test_the_0310_logging_surface_stays_reserved(self):
+        parser = fake_parser_0310()
+        for user in (["--log-config-file", "l.json"], ["--log-config-file=l.json"],
+                     ["--log-conf", "l.json"], ["--log-level", "DEBUG"],
+                     ["--logging-config", '{"log_level":"DEBUG"}'],
+                     ["--logging-config.log_level", "DEBUG"],
+                     ["--logging-config.configure_logging", "false"],
+                     ["--logging-config.pylogging_config_file", "l.json"],
+                     ["--uvicorn-log-level", "debug"],
+                     ["--disable-uvicorn-access-log"]):
+            with self.subTest(user=user):
+                self.refused(user, parser)
+
+    # ADR 0014 §3, §8: a logging configuration capyctl renders in the reserved
+    # block is kept exactly on either parser shape, and a user token
+    # re-setting it is drift.
+    def test_a_rendered_logging_configuration_is_kept_exactly(self):
+        flat = ["--log-config-file", "capyctl.json"]
+        for parser in (fake_parser(), fake_parser_0310()):
+            with self.subTest(parser=parser):
+                args = self.resolve(parser=parser, rendered=flat)
+                self.assertEqual(args.log_config_file, "capyctl.json")
+                self.refused(["--log-config-file", "other.json"], parser)
+        # The 0.31.0 dotted spelling renders the same protection.
+        dotted = ["--logging-config.pylogging_config_file", "capyctl.json"]
+        parser = fake_parser_0310()
+        args = self.resolve(parser=parser, rendered=dotted)
+        self.assertEqual(args.logging_config, "capyctl.json")
+        for user in (["--logging-config.pylogging_config_file", "other.json"],
+                     ["--log-config-file", "other.json"], ["--log-level", "DEBUG"]):
+            with self.subTest(user=user):
+                self.refused(user, parser, rendered=dotted)
+
+    # ADR 0014 open issue 4: a flat reserved name a build does not define is
+    # still drift, on either parser shape.
+    def test_a_build_without_a_flat_reserved_name_fails_closed(self):
+        for parser in (fake_parser(drop=("grpc",)),
+                       fake_parser_0310(drop=("grpc",))):
+            with self.subTest(parser=parser):
+                self.refused([], parser)
+
+    # The 0.30.0 shape is unchanged: the flat logging flags are ordinary
+    # parser defaults, compared and equal.
+    def test_the_0300_logging_flags_stay_reserved(self):
+        args = self.resolve(parser=fake_parser())
+        self.assertIsNone(args.log_config_file)
+        self.assertEqual(args.uvicorn_log_level, "info")
+        self.assertIs(args.disable_uvicorn_access_log, False)
+        self.refused(["--log-config-file", "l.json"], fake_parser())
 
 
 class PluginTests(unittest.TestCase):

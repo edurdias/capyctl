@@ -9,10 +9,13 @@
 //! | `decode_tokens_per_second` | 1000 / `mean_itl_ms` | `tokens_per_second` (positive only) | — | `predicted_per_second` (positive only) | (completion tokens − 1) / first generated text to last chunk |
 //! | `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` | the same | the same (`--enable-cache-report`) | the same | — |
 //!
-//! llama.cpp (ADR 0029 §11) reports no time to first token and no queue time
-//! (`prompt_ms` excludes the wait for a slot), so its `ttft_ms` is the
-//! router's; the router's decode rate counts `usage.completion_tokens`, else
-//! `timings.predicted_n`.
+//! vLLM 0.31.0 (ADR 0017 §2) still reports cached tokens at the same usage
+//! path, gated by the same `--enable-prompt-tokens-details` extra flag
+//! (`vllm/entrypoints/openai/chat_completion/serving.py`
+//! `_make_prompt_tokens_details`); its per-request `metrics` object, which
+//! gained `speculative_decoding`, never carries them, so the figure maps
+//! from usage on both the 0.30.0 and 0.31.0 shapes and stays absent when the
+//! engine reported none.
 //!
 //! An engine figure wins; the router derives `ttft_ms` and
 //! `decode_tokens_per_second` from its own clock only when the engine sent
@@ -234,6 +237,46 @@ mod tests {
             figures,
             json!({"prefill_ms": {"value": 41.5, "source": "engine"}})
         );
+    }
+
+    // T40: vLLM 0.31.0's answer keeps the same figures (raw
+    // vllm-manual/chat-nonstream.json, engine-qual 2026-10-10): `metrics`
+    // gained `speculative_decoding` and `usage.prompt_tokens_details` is
+    // null without `--enable-prompt-tokens-details` (extra). The cached-token
+    // figure maps from usage on that shape too and stays absent when the
+    // engine reported none; the metrics object never carries it.
+    #[test]
+    fn vllm_0310_maps_cached_tokens_from_usage_or_leaves_it_absent() {
+        let base = json!({
+            "id": "chatcmpl-9aa8c1eaac803980", "object": "chat.completion",
+            "created": 1791670426, "model": "frognano-nvfp4",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+                "refusal": null, "annotations": null, "audio": null,
+                "function_call": null, "reasoning": "Thinking"}, "logprobs": null,
+                "finish_reason": "length", "stop_reason": null, "token_ids": null,
+                "routed_experts": null}],
+            "service_tier": null, "system_fingerprint": "vllm-0.31.0-b6c14f9f",
+            "usage": {"prompt_tokens": 16, "total_tokens": 64, "completion_tokens": 48,
+                "prompt_tokens_details": {"cached_tokens": 16},
+                "completion_tokens_details": {"reasoning_tokens": 48}},
+            "prompt_logprobs": null,
+            "metrics": {"time_to_first_token_ms": 41.2, "generation_time_ms": 371.7,
+                "queue_time_ms": 0.026, "mean_itl_ms": 7.9, "tokens_per_second": 116.2,
+                "speculative_decoding": null}
+        });
+        let figures = engine_only(&base);
+        assert_eq!(
+            figures["cached_tokens"],
+            json!({"value": 16, "source": "engine"})
+        );
+        assert_eq!(
+            figures["prefill_ms"],
+            json!({"value": 41.2, "source": "engine"})
+        );
+        let mut uncached = base;
+        uncached["usage"]["prompt_tokens_details"] = json!(null);
+        let figures = engine_only(&uncached);
+        assert!(figures.get("cached_tokens").is_none(), "{figures}");
     }
 
     // T40 T41: TensorFold 0.6.5's `tensorfold` statistics, in seconds; its

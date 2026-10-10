@@ -77,7 +77,15 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // SPEC §17 (owner decision 2026-10-09): always on; the router reads the
     // per-request `metrics` object it adds to each response.
     "--enable-per-request-metrics",
+    // ADR 0014 §3, ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into
+    // the nested `--logging-config` dotted config (`vllm/config/logging.py`);
+    // the whole surface and every `--logging-config.<field>` spelling resolve
+    // to one parser destination, beside the legacy `--log-config-file` and
+    // `--log-level` overrides. Reserved however the build spells them; the
+    // protected entry compares the destinations the installed parser defines.
     "--log-config-file",
+    "--logging-config",
+    "--log-level",
     "--uvicorn-log-level",
     "--disable-uvicorn-access-log",
     "--data-parallel-size",

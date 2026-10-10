@@ -703,6 +703,8 @@ fn request_logging_is_never_rendered_and_cannot_be_enabled() {
         "--enable-log-requests",
         "--enable-log-outputs",
         "--log-config-file",
+        "--logging-config",
+        "--log-level",
         "--uvicorn-log-level",
     ] {
         assert!(
@@ -727,6 +729,32 @@ fn request_logging_is_never_rendered_and_cannot_be_enabled() {
         );
         let mut extra = base_input();
         extra.extra_args = vec![spelling.into()];
+        assert!(
+            render_command(&extra).is_err(),
+            "{spelling} accepted in deployment arguments"
+        );
+    }
+
+    // ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into the nested
+    // `--logging-config` dotted config (vllm/config/logging.py): the JSON
+    // object, every `--logging-config.<field>` spelling and the legacy
+    // `--log-level` override are reserved beside `--log-config-file`, so a
+    // user cannot double-set the logging configuration on any build.
+    for spelling in [
+        "--log-config-file=l.json",
+        "--logging-config={\"log_level\":\"DEBUG\"}",
+        "--log-level=DEBUG",
+        "--logging-config.log_level=DEBUG",
+        "--logging-config.pylogging_config_file=l.json",
+    ] {
+        let mut fixed = base_input();
+        fixed.engine_args.push(spelling.into());
+        assert!(
+            matches!(render_command(&fixed), Err(ArgsError::ReservedConflict(_))),
+            "{spelling} accepted in host-fixed arguments"
+        );
+        let mut extra = base_input();
+        extra.extra_args.push(spelling.into());
         assert!(
             render_command(&extra).is_err(),
             "{spelling} accepted in deployment arguments"
