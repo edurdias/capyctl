@@ -23,10 +23,20 @@ checked against the parser of a CPU build of the tag; nothing ran on a GPU.
   the launch builder; a quoted list is refused. The name shapes of ADR 0014 open
   issue 5 still apply, except to `--no-host`. Two spellings of one option are a
   duplicate. Host-fixed arguments follow the same exact-name policy.
-- **Hidden inputs.** A llama.cpp profile or deployment `env` naming `LLAMA_ARG_*`,
-  `LLAMA_API_KEY`, `LLAMA_SERVER_SLOTS_DEBUG`, `LLAMA_CACHE`, `XDG_CONFIG_HOME` or
-  `HOME` is refused `engine_env_reserved:<name>`, whatever `approved_env` says. The
-  host's engine cache creates `<state>/engines/llamacpp/{config,cache}` private
+- **Hidden inputs.** A llama.cpp profile or deployment `env` naming a variable
+  llama-server reads in place of a reserved option, its listener, its device or its
+  directories is refused `engine_env_reserved:<name>`, whatever `approved_env` says,
+  and the launch environment drops it again: `LLAMA_ARG_*`, `LLAMA_SERVER_*` (router
+  mode, slot debugging), `AIP_*` (`AIP_MODE=PREDICTION` with `AIP_HTTP_PORT`
+  replaces the port), `LLAMA_API_KEY`, `MTMD_BACKEND_DEVICE` (`--mmproj-device`),
+  `HF_TOKEN` (`--hf-token`), the ggml device variables (`GGML_CUDA_DEVICES`,
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY`, `GGML_VK_VISIBLE_DEVICES`,
+  `GGML_VK_PREFER_HOST_MEMORY`, `GGML_VK_ALLOW_SYSMEM_FALLBACK`,
+  `GGML_METAL_DEVICES`, `GGML_OPENCL_PLATFORM`, `GGML_OPENCL_DEVICE`,
+  `GGML_HEXAGON_DEVICES`, `ONEAPI_DEVICE_SELECTOR`, `GGML_BACKEND_PATH`),
+  `LLAMA_CACHE`, `XDG_CONFIG_HOME` and `HOME`. The list comes from every `getenv` of
+  the v0.6.0 tag; other ggml tuning variables stay available through `approved_env`.
+  The host's engine cache creates `<state>/engines/llamacpp/{config,cache}` private
   (0700) and refuses a configuration directory that is not empty.
 - **Resolution.** `engine_config.llamacpp` (`n_gpu_layers`, a count or `all`,
   default `all`; `gguf_file`; `mmproj_file`, both relative `.gguf` paths inside the
