@@ -545,6 +545,50 @@ fn llamacpp_kv_cache(
     .ok_or_else(overflow)
 }
 
+/// ADR 0029 §5, §9: the KV cache llama-server provably allocates on the GPU
+/// for this launch, whatever the deployment declares: the formula above
+/// where the measured header shows full attention and no option keeps cache
+/// layers off the GPU (a draft context adds its own cache, so it stays a
+/// lower bound). `None` where CapyCTL cannot tell (another cache layout, a
+/// pending or unreadable header, cache layers on the CPU): a declared
+/// estimate stands there.
+fn llamacpp_fixed_kv(
+    raw: &RawEngineConfig,
+    inputs: &EngineInputs<'_>,
+    extra_args: &[String],
+) -> Result<Option<i64>, ConfigError> {
+    use capyctl_domain::gguf::GgufKv;
+    let Some(GgufKv::Attention(shape)) = inputs.facts.gguf.map(|gguf| gguf.kv) else {
+        return Ok(None);
+    };
+    let args: Vec<String> = inputs
+        .profile_args
+        .iter()
+        .chain(extra_args)
+        .cloned()
+        .collect();
+    let n_gpu_layers = raw
+        .llamacpp
+        .as_ref()
+        .and_then(|llamacpp| llamacpp.n_gpu_layers)
+        .unwrap_or_default();
+    if crate::context_fit::llamacpp::kv_leaves_gpu(n_gpu_layers, &args) {
+        return Ok(None);
+    }
+    crate::context_fit::llamacpp::kv_cache_bytes(
+        &shape,
+        raw.context_length.unwrap_or_default(),
+        raw.max_concurrent_requests
+            .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL),
+        raw.kv_cache_dtype
+            .as_deref()
+            .unwrap_or(crate::llamacpp::DEFAULT_CACHE_TYPE),
+        crate::context_fit::llamacpp::flash_attention_on(&args),
+    )
+    .map(Some)
+    .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))
+}
+
 /// ADR 0014 amendment A18: the margin of a request on memory that is not a
 /// discrete GPU's ([`unified_margin`]); a snapshot that records the family
 /// margin keeps it.
@@ -1487,6 +1531,28 @@ pub(super) fn normalize_engine_config(
              read its GGUF header",
         ));
     }
+    // ADR 0014 amendment A6, ADR 0029 §9: weights the host could not measure
+    // (no model to render, or a draft model it could not count) size nothing,
+    // whatever the deployment declares: a budget beside them would hold none
+    // of their bytes.
+    if let Some(refusal) = inputs
+        .facts
+        .gguf
+        .filter(|_| engine == Engine::Llamacpp)
+        .and_then(|gguf| match gguf.kv {
+            capyctl_domain::gguf::GgufKv::Refused(refusal) => Some(refusal),
+            _ => None,
+        })
+        .filter(|refusal| refusal.weights_unmeasured())
+    {
+        return Err(invalid(
+            "engine_config.memory",
+            format!(
+                "cannot size this llama.cpp deployment: {}",
+                refusal.reason()
+            ),
+        ));
+    }
     let raw_memory = raw.memory.clone().unwrap_or_default();
     let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;
     let kv_cache = raw_memory
@@ -1505,6 +1571,16 @@ pub(super) fn normalize_engine_config(
         Some(llamacpp_kv_cache(&raw, &inputs, &extra_args)?)
     } else {
         kv_cache
+    };
+    // ADR 0029 §5, §9: with `--fit off` llama-server allocates the whole
+    // cache its context and slots fix, whatever budget the deployment
+    // declares; where the header makes it calculable, a declared KV cache,
+    // request or `resources` must hold it (uncertainty keeps the declared
+    // estimate, never a smaller one).
+    let fixed_kv = if engine == Engine::Llamacpp && !kv_derived {
+        llamacpp_fixed_kv(&raw, &inputs, &extra_args)?
+    } else {
+        None
     };
     // ADR 0023 §4: TensorFold is told no KV size; `--context` fixes it inside
     // the declared reservation, which is all an undeclared KV cache is bounded by.
@@ -1581,6 +1657,27 @@ pub(super) fn normalize_engine_config(
         weights: inputs.facts.weights_bytes,
         margin,
     })?;
+    if let Some(required) = fixed_kv.filter(|required| memory.kv_cache_bytes < *required) {
+        let path = if raw_memory.kv_cache.is_some() {
+            "engine_config.memory.kv_cache"
+        } else if declared_request.is_some() {
+            "engine_config.memory.request"
+        } else {
+            "resources"
+        };
+        return Err(invalid(
+            path,
+            format!(
+                "llama-server allocates a {required}-byte KV cache for context_length {} in {} \
+                 slots (from the GGUF header, `--fit off`), and the declared budget leaves {} \
+                 bytes for it; raise it, or lower context_length or max_concurrent_requests",
+                raw.context_length.unwrap_or_default(),
+                raw.max_concurrent_requests
+                    .unwrap_or(capyctl_domain::launch::LLAMACPP_DEFAULT_PARALLEL),
+                memory.kv_cache_bytes,
+            ),
+        ));
+    }
     if engine == Engine::Sglang {
         memory.state_slot_bytes = inputs.facts.state_slot_bytes;
     }

@@ -23,10 +23,22 @@ tag (`ggml/src/gguf.cpp`, `src/llama-model.cpp`, `src/llama-hparams.cpp`,
   `q5_1` 24). Without `--flash-attn on` the V cache is counted padded to its widest
   layer, as llama.cpp lays it out then.
 - **Derived request.** Weights (the rendered GGUF and all its shards, the projector,
-  a draft model inside the approved paths, ADR 0014 A6) + KV + the family margin
+  the draft model and all its shards, ADR 0014 A6) + KV + the family margin
   (unified: ADR 0014 A18; discrete GPU: weights × 1.10 + KV, ADR 0019 §3). The
   startup peak is the request: cold, Ready, parking and wake charge it, parked
   nothing. The margin stays the placeholder until the live rows measure it.
+- **Draft model.** A `--model-draft` in the host-fixed or the extra arguments counts
+  with every shard llama.cpp loads (a split set named by its first shard), each inside
+  `security.approved_paths` once symlinks resolve. A draft that cannot be counted
+  (outside the approved paths, a shard missing, a set named by a later shard) is
+  refused at resolution, declared budget or not, instead of being left out of it; so
+  is a checkpoint with no model to pick.
+- **Declared budgets.** llama-server allocates the whole cache its context and slots
+  fix (`--fit off`), so where the header makes it calculable (full attention, no
+  cache layers off the GPU via `n_gpu_layers` or `--no-kv-offload`) a declared
+  `memory.kv_cache`, `memory.request` or `resources` that leaves less for the KV cache
+  than that figure is refused naming the field. A draft context only adds to it, so
+  the bound stands beside a draft model. Other layouts keep the declared estimate.
 - **Refusals.** Derivation is refused, naming `engine_config.memory.kv_cache` or
   `resources`, for a sliding-window header (a key, or an architecture whose model code
   has such layers, `llama4` without a window of 0 included), recurrent (`ssm.*`,
@@ -45,15 +57,21 @@ tag (`ggml/src/gguf.cpp`, `src/llama-model.cpp`, `src/llama-hparams.cpp`,
   `CheckpointDigestEvidence.gguf` and `SingleLaunchPlan.checkpoint_gguf` (capability
   `checkpoint_gguf`, refused before sending to a host without it), are recorded in the
   revision's `memory.gguf` beside the whole checkpoint's weights (which a plan still
-  names and a host verifies), and re-measured before a launch. A llama.cpp revision is
-  provisional until a host measured its checkpoint (`CheckpointFacts::provisional()`
-  carries a pending header), declared resources included, so the training-context
-  check always applies.
+  names and a host verifies), and re-measured before a launch: a remote host and the
+  embedded (standalone) host alike refuse a launch whose re-measured weights or GGUF
+  facts differ from the revision's (`checkpoint_mismatch`), so a draft model grown
+  after the revision was recorded, outside the checkpoint's digest, never launches
+  against the old reservation. A llama.cpp revision is provisional until a host
+  measured its checkpoint (`CheckpointFacts::provisional()` carries a pending header),
+  declared resources included, so the training-context check always applies.
 
 Tests (T42, T26, CPU only): `crates/capyctl-config/tests/llamacpp_sizing.rs`
 (reader and bounds, the formula and the plan's 48-layer figure, per-layer
-`head_count_kv`, refusals, measured weights, derived phases on unified and discrete
-memory, snapshot re-derivation, training context), `crates/capyctl-protocol/tests/
+`head_count_kv`, refusals, measured weights with split and refused drafts, a
+host-fixed draft, declared budgets against the calculable cache, derived phases on
+unified and discrete memory, snapshot re-derivation, training context),
+`crates/capyctl-controller/src/checkpoint_digests/tests.rs` (T34 T22: a grown draft
+refuses an embedded Initialize), `crates/capyctl-protocol/tests/
 checkpoint_digest.rs` (wire round trip and capability), `capyctl-domain` unit tests.
 CPU and Fake-engine tests are not qualification; only LC1–LC6 qualify llama.cpp.
 

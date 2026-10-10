@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct GgufFacts {
     /// ADR 0029 §9, ADR 0014 amendment A6: the bytes the launch loads: the
     /// rendered GGUF (all its shards), the multimodal projector and the draft
-    /// model. Zero while pending or when no model could be picked.
+    /// model (all its shards). Zero while pending, when no model could be
+    /// picked or when the draft model could not be counted.
     pub weights_bytes: i64,
     /// `<arch>.context_length`, the model's training context, when the header
     /// states one.
@@ -60,6 +61,10 @@ pub struct GgufKvShape {
 pub enum GgufKvRefusal {
     /// No single GGUF model could be picked from the checkpoint.
     NoModel,
+    /// ADR 0014 amendment A6, ADR 0029 §8: the draft model the arguments
+    /// name could not be counted: missing, a split set incomplete or not
+    /// named by its first shard, or outside `security.approved_paths`.
+    Draft,
     /// The header could not be read, or states no attention shape.
     Unreadable,
     /// Sliding-window (or chunked) attention layers.
@@ -76,8 +81,9 @@ pub enum GgufKvRefusal {
 }
 
 impl GgufKvRefusal {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::NoModel,
+        Self::Draft,
         Self::Unreadable,
         Self::SlidingWindow,
         Self::Recurrent,
@@ -90,6 +96,7 @@ impl GgufKvRefusal {
     pub fn code(self) -> &'static str {
         match self {
             Self::NoModel => "no_model",
+            Self::Draft => "draft",
             Self::Unreadable => "unreadable",
             Self::SlidingWindow => "sliding_window",
             Self::Recurrent => "recurrent",
@@ -107,6 +114,11 @@ impl GgufKvRefusal {
     pub fn reason(self) -> &'static str {
         match self {
             Self::NoModel => "the checkpoint holds no single GGUF model to render",
+            Self::Draft => {
+                "the draft model the arguments name cannot be counted: it must be a GGUF file \
+                 (a split set named by its first shard, every shard present) inside \
+                 security.approved_paths"
+            }
             Self::Unreadable => "the GGUF header cannot be read or states no attention shape",
             Self::SlidingWindow => "the model uses sliding-window attention",
             Self::Recurrent => "the model has recurrent layers",
@@ -114,6 +126,13 @@ impl GgufKvRefusal {
             Self::Mla => "the model uses multi-head latent attention",
             Self::Layout => "llama.cpp lays out this model's cache its own way",
         }
+    }
+
+    /// Whether the refusal leaves the weights the launch loads unknown (no
+    /// model to render, or a draft model that could not be counted), so a
+    /// declared budget cannot be checked against them either.
+    pub fn weights_unmeasured(self) -> bool {
+        matches!(self, Self::NoModel | Self::Draft)
     }
 }
 

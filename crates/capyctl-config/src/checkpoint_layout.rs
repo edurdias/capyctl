@@ -299,7 +299,7 @@ fn is_projector(path: &Path) -> bool {
 
 /// `<prefix>-<index>-of-<total>.gguf`, llama.cpp's split naming
 /// (`llama_split_path`: five digits each, the index from 1).
-fn shard_of(name: &str) -> Option<(&str, u32, u32)> {
+pub(crate) fn shard_of(name: &str) -> Option<(&str, u32, u32)> {
     let stem = name.get(..name.len().checked_sub(".gguf".len())?)?;
     let (rest, total) = stem.rsplit_once("-of-")?;
     let (prefix, index) = rest.rsplit_once('-')?;
