@@ -437,10 +437,13 @@ fn every_documented_example_passes_validate_config() {
         // The quickstart's standalone deployment names standalone's `local`
         // engine, which host.yaml does not publish; `site_quickstart.rs`
         // places it on a fresh standalone instead.
-        // The TensorFold example names the `tensorfold` profile, which
-        // host.yaml does not declare either; it is checked on its own.
+        // The TensorFold and llama.cpp examples name the `tensorfold` and
+        // `llamacpp` profiles, which host.yaml does not declare either; they
+        // are checked on their own.
         let standalone = file.file_name().is_some_and(|n| {
-            n == "deployment-standalone.yaml" || n == "deployment-tensorfold.yaml"
+            n == "deployment-standalone.yaml"
+                || n == "deployment-tensorfold.yaml"
+                || n == "deployment-llamacpp.yaml"
         });
         // ADR 0028 §2 (OD8): the group example resolves on both hosts it
         // names; `a_group_validates_against_every_named_host` checks it.
@@ -482,7 +485,7 @@ fn every_documented_example_passes_validate_config() {
         "docs/examples/deployment-minimal.yaml is validated"
     );
     // The per-engine examples of docs/guide/engines.md are among them.
-    for engine in ["vllm", "sglang", "tensorfold"] {
+    for engine in ["vllm", "sglang", "tensorfold", "llamacpp"] {
         let name = format!("deployment-{engine}.yaml");
         assert!(
             files.iter().any(|f| f.ends_with(&name)),

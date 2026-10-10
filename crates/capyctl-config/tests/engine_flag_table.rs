@@ -20,6 +20,7 @@ const SECTIONS: &[(&str, Engine)] = &[
     ("## vLLM 0.30", Engine::Vllm),
     ("## SGLang 0.5.21", Engine::Sglang),
     ("## TensorFold 0.6.5", Engine::Tensorfold),
+    ("## llama.cpp v0.6.0", Engine::Llamacpp),
 ];
 
 const HEADER: &str = "| Need | Option | Class | CapyCTL |";
@@ -94,7 +95,11 @@ fn classify(engine: Engine, option: &str) -> (&'static str, Option<String>) {
     match validate_extra_args(&[option.to_owned(), "1".to_owned()], &context) {
         Ok(()) => ("extra", None),
         Err(ProfileArgError::Reserved(_) | ProfileArgError::ConfigFile(_)) => ("reserved", None),
-        Err(ProfileArgError::TypedField { field, .. }) => ("typed", Some(field)),
+        // llama.cpp's typed options are reserved ones a field renders (ADR 0029 §6).
+        Err(
+            ProfileArgError::TypedField { field, .. }
+            | ProfileArgError::ReservedField { field, .. },
+        ) => ("typed", Some(field)),
         Err(ProfileArgError::Sensitive(_) | ProfileArgError::PathNotApproved(_)) => {
             ("approval", None)
         }

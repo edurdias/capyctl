@@ -10,6 +10,7 @@ more than one, each in its own environment.
 | vLLM | 0.30.0, 0.29.0 | `~/venvs/vllm` |
 | SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
+| llama.cpp | v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -175,6 +176,56 @@ TensorFold's own guide: the
 [runbook](https://github.com/ashhart/TensorFold/blob/v0.6.5/RUNBOOK.md)
 at the release tag.
 
+## llama.cpp v0.6.0
+
+llama.cpp is a C++ program: CapyCTL runs its `llama-server` binary, built from
+the release tag. The build needs `git`, `cmake`, a C++ compiler and a CUDA
+toolkit with `nvcc` (`ls /usr/local/cuda/bin/nvcc` to check).
+
+1. Get the release tag:
+
+   ```bash
+   git clone --branch v0.6.0 --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+   ```
+
+2. Build `llama-server` with CUDA. `-DLLAMA_BUILD_IS_DEV=OFF` makes the binary
+   report `0.6.0` rather than `0.6.0-dev`; `CMAKE_CUDA_ARCHITECTURES` limits
+   the kernels to your GPU (`89` for RTX 40 series; leave it out to build for
+   every architecture, which takes much longer):
+
+   ```bash
+   cd ~/llama.cpp
+   cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF \
+     -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=89
+   cmake --build build -j --target llama-server
+   ```
+
+   The binary is `~/llama.cpp/build/bin/llama-server`, with the libraries it
+   loads (`libllama.so`, `libggml-cuda.so`, ...) beside it. Keep them together:
+   CapyCTL fingerprints the binary and those libraries as one installation.
+
+3. Check it:
+
+   ```bash
+   ~/llama.cpp/build/bin/llama-server --version
+   ```
+
+   It prints `version: 0.6.0 (build 1, commit d81235049)` on standard error.
+
+4. Get a model as a GGUF file, in a directory of its own under `~/models`,
+   for example:
+
+   ```bash
+   hf download Qwen/Qwen3-4B-GGUF Qwen3-4B-Q4_K_M.gguf --local-dir ~/models/Qwen3-4B-GGUF
+   ```
+
+Do not create `/etc/llama.cpp/config.ini`: llama-server reads it as options, so
+CapyCTL refuses to register or start llama.cpp on a machine that has it.
+
+llama.cpp's own guide: the
+[server README](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/tools/server/README.md)
+at the release tag.
+
 ## Register it with CapyCTL
 
 1. Find it:
@@ -192,7 +243,8 @@ at the release tag.
    capyctl engine add ~/venvs/vllm
    ```
 
-   Name `~/venvs/sglang` or `~/venvs/tensorfold` for the others.
+   Name `~/venvs/sglang` or `~/venvs/tensorfold` for the others, or the
+   `llama-server` binary (`~/llama.cpp/build/bin/llama-server`) for llama.cpp.
    [Add an engine](engines.md) shows what it prints.
 
    `engine add` writes `engines.yaml` beside the role's config file, not under

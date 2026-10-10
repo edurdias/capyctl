@@ -33,7 +33,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `multi_gpu_unsupported` | The deployment names two GPUs on one machine. | Use one GPU per machine; to spread one model over machines, give it a `topology` and `placement.hosts`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
-| 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold), or a deployment asking such an engine to park. | Leave `--deep-park` out; use `residency: restart_only`. |
+| 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp), or a deployment asking such an engine to park. | Leave `--deep-park` out; use `residency: restart_only`. |
 | 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)). |
 | 5 | `group_instances_unsupported` | `instances` above 1 with a `topology`. | Deploy one group per deployment. |
 | 5 | `group_drift:<field>` | The engine changed a multi-machine setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
@@ -47,8 +47,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 13 | `internal` | An internal, storage or I/O failure, or a launch that failed (`operation_failed`). | Read the message, `capyctl status deployment <name>` and the role's log. |
 | 14 | `host_revoked` | The server revoked this host. The host exits and is not restarted. | Bring it back (see [Several machines](several-machines.md#take-a-machine-out)). |
 | 15 | `host_ineligible` | No allowed host can take the deployment: drained, revoked, offline or too old. | Undrain, reconnect, upgrade or re-enroll the host the message names. |
-| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or search with `capyctl engine detect --path <dir>`. |
-| 17 | `engine_unsupported` | The package is not a supported engine. | Register a vLLM, SGLang or TensorFold installation. |
+| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or a `llama-server` binary or its directory, or search with `capyctl engine detect --path <dir>`. |
+| 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`. |
 | 18 | `engine_version_failed` | The engine's version check failed or timed out; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
 | 19 | `profile_exists` | The engine profile name is taken. | Pass `--name`, or remove the existing profile first. |
 | 20 | `profile_in_use` | Removing or replacing the engine would affect the deployments listed. | Stop them, or rerun with `--drain`. |
@@ -79,13 +79,20 @@ exits with them:
 - `host_tuning_warning:<item>`: a machine's check found a gap (`compaction`,
   `memlock` or `infiniband`); the group still runs.
 
-A deployment on one machine can show this code the same way:
+A deployment on one machine can show these codes the same way:
 
 - `wake_mismatch`: after a wake, the model answered a fixed prompt
   differently than when it first became ready, so its weights did not come
   back intact. The wake fails and CapyCTL stops the instance;
   `capyctl status deployment <name>` shows the code as its last error. The
   next request or `capyctl start deployment <name>` loads it fresh.
+- `engine_config_file` (llama.cpp): `/etc/llama.cpp/config.ini` exists on the
+  machine, so llama-server would read options CapyCTL cannot check. Nothing
+  starts until the file is removed.
+- `effective_args_mismatch` (llama.cpp): once started, llama-server reported a
+  different slot count or window, or its `/metrics` or `/slots` page off, than
+  CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
+  differently from llama.cpp v0.6.0.
 
 ## Troubleshooting
 

@@ -102,12 +102,14 @@ impl Entry {
 }
 /// SPEC §10, D9: one open scope the host load reporter scrapes on loopback.
 /// The native key authenticates the scrape only; it never leaves the host.
+/// `None` is a launch that takes no key (an embedded llama.cpp launch, ADR
+/// 0029 §4); its scrapes carry no `Authorization` header.
 #[derive(Clone)]
 pub struct LoadTarget {
     pub scope: IngressScope,
     pub owned_handle: String,
     pub target: SocketAddr,
-    pub native: [u8; 32],
+    pub native: Option<[u8; 32]>,
     pub in_flight: usize,
 }
 #[derive(Default)]
@@ -331,7 +333,7 @@ impl Ingress {
                 scope: entry.scope.clone(),
                 owned_handle,
                 target: entry.target,
-                native: entry.native,
+                native: Some(entry.native),
                 in_flight: entry.current.load(Ordering::SeqCst),
             });
         }

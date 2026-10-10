@@ -1,6 +1,6 @@
 # Add an engine
 
-CapyCTL runs the vLLM, SGLang or TensorFold you already have. It does not install engines.
+CapyCTL runs the vLLM, SGLang, TensorFold or llama.cpp you already have. It does not install engines.
 To install one first, see [Install an engine](install-engines.md).
 You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
@@ -62,7 +62,8 @@ the CLI and the running role the same ones.
 ## Custom builds
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 and 0.5.21 or
-TensorFold 0.6.0 to 0.6.3 and 0.6.5, the versions this release of CapyCTL knows. CapyCTL still runs it. Give it its own
+TensorFold 0.6.0 to 0.6.3 and 0.6.5, the versions this release of CapyCTL knows; every
+llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 
 ```bash
@@ -283,6 +284,135 @@ minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
 discrete GPU it runs, but no live check has passed there yet.
 
+## llama.cpp
+
+CapyCTL runs llama.cpp's `llama-server` from v0.6.0, one GGUF model per
+deployment. llama.cpp is a single binary, not a Python environment: build it
+([Install an engine](install-engines.md#llamacpp-v060)) and name the binary, or
+the directory that holds it:
+
+```bash
+capyctl engine add ~/llama.cpp/build/bin/llama-server
+```
+
+```text
+Registered llamacpp (llamacpp 0.6.0)
+
+  Executable     /home/me/llama.cpp/build/bin/llama-server
+  Deep park      disabled
+  Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
+  Published      when capyctl starts
+```
+
+`engine add` runs `llama-server --version` once and reads the version and the
+commit it prints (`version: 0.6.0 (build 1, commit d81235049)`). The profile's
+version reads `0.6.0+d81235049`: the build number depends on the clone, so the
+commit names the build. CapyCTL fingerprints the binary together with the
+`lib*.so` files beside it (or in `<prefix>/lib`), since `llama-server` loads
+its code from them; a rebuild in place is a change of installation. A symbolic
+link is refused, naming its target: register the target. `engine detect`
+finds `llama-server` on your `PATH`, in `~/llama.cpp/build*/bin`,
+`/opt/*/bin` and `/usr/local/bin` without running it.
+
+`engine add` refuses a machine that has `/etc/llama.cpp/config.ini`
+(`engine_unsupported`), and a launch is refused while that file exists
+(`engine_config_file`): llama-server reads it as options CapyCTL cannot see.
+Your own `~/.config/llama.cpp/config.ini` is not read, because CapyCTL points
+the engine's configuration directory at an empty one of its own.
+
+Every llama.cpp build lists as `CUSTOM yes` for now. A build of v0.6.0 runs;
+`custom` only says this release has not finished checking llama.cpp.
+
+### A llama.cpp deployment
+
+<!-- include: ../examples/deployment-llamacpp.yaml -->
+
+`model` is a directory under your models directory holding one GGUF model: one
+`.gguf` file, or the shards of one split model. With several, name the one to
+serve in `engine_config.llamacpp.gguf_file`, a path inside the directory; a
+vision model's projector goes in `engine_config.llamacpp.mmproj_file`.
+
+The settings llama.cpp takes from the deployment:
+
+| Setting | What it does | Default |
+|---|---|---|
+| `engine_config.context_length` | Each request's window, in tokens. Required. At most the model's training context. | none |
+| `engine_config.max_concurrent_requests` | How many requests llama.cpp decodes together (its slots). | 4 |
+| `engine_config.kv_cache_dtype` | The KV cache type: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` or `q5_1`. | `f16` |
+| `engine_config.llamacpp.n_gpu_layers` | How many layers run on the GPU, or `all`. | `all` |
+| `engine_config.llamacpp.gguf_file` | The GGUF file to serve, when the directory holds several. | the only one |
+| `engine_config.llamacpp.mmproj_file` | A vision model's projector. | none |
+
+Every slot gets the full window: CapyCTL starts llama-server with
+`--ctx-size` set to the window, rounded up to a multiple of 256, times the
+slots, and `--no-kv-unified`, so 8192 tokens and 4 slots are a 32768-token
+cache split four ways. Status shows the slots:
+
+```text
+Streams up to 4 requests decoded together (CapyCTL default)
+```
+
+Without `resources` or `memory.request`, CapyCTL reads the GGUF header and
+derives the memory: the GGUF files, the KV cache of every slot and a margin.
+For Qwen3-4B Q4_K_M with 8192 tokens and 4 slots on a 16 GiB laptop GPU it
+derived 8.3 GiB of GPU memory; llama-server used 7.2 GiB at its peak and
+while it ran (2.3 GiB of weights, a 4.5 GiB KV cache, which is the figure
+CapyCTL computed, and its compute buffers). The derivation is refused, naming
+`engine_config.memory.kv_cache` or `resources` to state instead, for models
+whose cache CapyCTL cannot size from the header (sliding-window, recurrent,
+hybrid and MLA attention, embedding and encoder models), for `n_gpu_layers`
+other than `all`, for options that move weights or the cache off the GPU
+(`--override-tensor`, `--cpu-moe`, `--n-cpu-moe`, `--no-kv-offload`) and for a
+draft model's own context (`--spec-type draft-*`, `--model-draft`). Declared
+`resources` work as for any engine.
+
+llama.cpp has no way to free its memory while it runs, so a llama.cpp model
+does not park, as TensorFold does not: `capyctl park deployment` refuses it,
+and a deployment asking for `residency: deep` or `host_backed` is refused
+`capability_missing`. When CapyCTL needs the memory, or the model sits idle
+past `ready_idle_timeout`, it waits for the model's requests to finish,
+stops llama-server and starts it again on the next request. Stopping took half
+a second and released all of the GPU memory; starting again took about two
+seconds for a 2.3 GiB model.
+
+Refused for llama.cpp, with the reason:
+
+- `engine_config.dtype`, `quantization`, `cuda_graphs`, `trust_remote_code: true`
+  and `language_model_only: true`: a GGUF model carries its own types and
+  llama.cpp runs no model code.
+- `model.draft`: pass a draft model with `--model-draft` in `extra_args`,
+  approved when you add the engine (below).
+- A request with `cache_salt` (`cache_salt_unsupported`): llama.cpp's prompt
+  cache cannot be split by it.
+- Options CapyCTL renders or keeps off, in any spelling ([Engine
+  options](engine-flags.md#llamacpp-v060)), and `--name=value`: llama-server
+  takes `--name value` only.
+- Engine variables llama-server reads as options or locations: `LLAMA_ARG_*`,
+  `LLAMA_API_KEY`, `LLAMA_SERVER_SLOTS_DEBUG`, `LLAMA_CACHE`,
+  `XDG_CONFIG_HOME` and `HOME` (`engine_env_reserved:<name>`).
+
+Options that read files, such as `--model-draft`, `--lora` or
+`--chat-template-file`, need approval when you add the engine, with the
+directories they may name:
+
+```bash
+capyctl engine add ~/llama.cpp/build/bin/llama-server --name llamacpp-draft \
+  --approve-option=--model-draft --approve-path /srv/drafts
+```
+
+llama-server listens on loopback with no key, reached only through
+CapyCTL's endpoint, which checks your API key. Its `/metrics` and `/slots`
+pages tell CapyCTL when it is idle and how loaded it is; status lists those
+pages as the deployment's unauthenticated loopback surface.
+
+Each answer carries llama.cpp's `timings` object unchanged, and CapyCTL's
+figures (`prefill_ms`, `decode_tokens_per_second`, `cached_tokens`,
+`ttft_ms`) come from it ([Requests](requests.md)). Tool calls and
+`reasoning_content` come from the model's chat template, with no parser to
+choose.
+
+llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
+
 ## Tool calls and reasoning
 
 vLLM and SGLang return structured `tool_calls` and a separate reasoning trace
@@ -320,7 +450,8 @@ The same option in `extra_args` still works and wins over `auto`, so recipes
 that pass `--tool-call-parser` and `--reasoning-parser` by hand run unchanged;
 those arguments are no longer needed for the families above. Naming a parser
 in the block and passing the same option in `extra_args` is refused.
-TensorFold handles tool calls itself and has no parser setting.
+TensorFold handles tool calls itself and has no parser setting. llama.cpp
+parses tool calls and reasoning from the model's chat template, with no setting.
 
 [Engine options](engine-flags.md) lists, for each engine, which options are
 typed fields, which pass in `extra_args`, which need host approval and which

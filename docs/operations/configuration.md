@@ -166,8 +166,8 @@ model:
 ## Engine installation
 
 These describe the role's own engine installation. One executable is published
-as the runtime profile `local`; several as `local-vllm`, `local-sglang` and
-`local-tensorfold`. On a
+as the runtime profile `local`; several as `local-vllm`, `local-sglang`,
+`local-tensorfold` and `local-llamacpp`. On a
 host the profile is added to the document the host publishes, beside the
 profiles in `runtime_profiles` and the ones registered with `capyctl engine add`;
 a name stated twice is refused. The switches below apply to the `local`
@@ -179,6 +179,7 @@ block.
 | vLLM executable | `local_engine.vllm` | `--vllm-bin <path>` | `CAPYCTL_VLLM_BIN` | none | host, standalone |
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
 | TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
+| llama.cpp `llama-server` binary | `local_engine.llamacpp` | `--llamacpp-bin <path>` | `CAPYCTL_LLAMACPP_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
@@ -203,6 +204,15 @@ on unified memory (faster to run light but slower to wake), `eager` on a discret
 GPU (faster to wake but heavier while loading and running). A deployment that does
 not park gets no loader choice from CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
+
+A llama.cpp deployment's settings are `engine_config.context_length` (required:
+each request's window), `engine_config.max_concurrent_requests` (the slots, 4 when
+not set), `engine_config.kv_cache_dtype` (`f16` when not set) and the block
+`engine_config.llamacpp`: `n_gpu_layers` (a count or `all`, the default),
+`gguf_file` and `mmproj_file` (paths of `.gguf` files inside the model
+directory); see [llama.cpp](../guide/engines.md#llamacpp). The role's own
+llama.cpp never parks, as a registered one does not, and is refused while
+`/etc/llama.cpp/config.ini` exists.
 
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other

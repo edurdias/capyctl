@@ -32,8 +32,11 @@ struct EmbeddedTargets {
 impl EmbeddedTargets {
     /// This session's Ready embedded launches whose dispatch is open (as a
     /// host ingress reports only open scopes), each with its recorded endpoint
-    /// and inference key read as one answer. A launch whose binding changed,
-    /// whose endpoint names no IP address or that has no key is left out.
+    /// and inference key read as one answer. A launch whose binding changed or
+    /// whose endpoint names no IP address is left out. A launch with no
+    /// recorded key is sampled without one: an embedded llama.cpp launch takes
+    /// none (ADR 0029 §4; found live 2026-10-09, when its load read stayed
+    /// `sample: null`), and any other engine refuses an unkeyed scrape.
     fn launches(&self) -> Vec<LoadTarget> {
         let Ok(owner) = self.owner.lock() else {
             return Vec::new();
@@ -65,8 +68,7 @@ impl EmbeddedTargets {
                         &binding.incarnation,
                         capyctl_store::secrets::SecretRole::Inference,
                     )
-                    .ok()
-                    .flatten()?;
+                    .ok()?;
                 Some(LoadTarget {
                     scope: IngressScope {
                         host_id: self.host_id.clone(),

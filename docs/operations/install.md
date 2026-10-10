@@ -101,8 +101,8 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
-| 16 | The path holds no `vllm`, `sglang` or `tensorfold` package (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm`, `bin/tensorfold` or its `bin/python3`, or scan more with `capyctl engine detect --path DIR`. |
-| 17 | The package is not a supported engine (`engine_unsupported`) | none | Register a vLLM, SGLang or TensorFold installation. |
+| 16 | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm`, `bin/tensorfold` or its `bin/python3`, or a `llama-server` binary or its directory, or scan more with `capyctl engine detect --path DIR`. |
+| 17 | The package is not a supported engine, a `llama-server`'s version line does not parse, or `/etc/llama.cpp/config.ini` exists (`engine_unsupported`) | none | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove the system `config.ini`. |
 | 18 | The version check failed or timed out; nothing is written (`engine_version_failed`) | none | Repair the installation until its version check succeeds and matches its package metadata, then add it again. |
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
@@ -666,8 +666,9 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments; runs nothing
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments and llama-server binaries; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
+    capyctl engine add ~/llama.cpp/build/bin/llama-server   # llama.cpp: the binary or its directory
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
     capyctl engine remove vllm [--drain]
@@ -788,6 +789,34 @@ does not take or answer the request exits 22 (`agent_unreachable`).
 them against its working directory first, so `capyctl engine add … --config
 host.yaml` run beside `host.yaml` writes the `engines.yaml` next to it and asks
 the running role to publish it.
+
+### Registering a llama-server binary
+
+llama.cpp is registered as a bare binary, not a Python environment. `detect`
+finds an executable `llama-server` on `PATH`, in `~/llama.cpp/build*/bin`,
+`/opt/*/bin`, `/usr/local/bin` and under `--path`, reads its version from a
+`libllama.so.X.Y.Z` beside it (or in `<prefix>/lib`) and runs nothing; it follows
+no link out of the directory it scans. `engine add` takes the binary or its
+directory and refuses a symbolic link, naming its target. It then runs
+`llama-server --version` under a bound (about a second on a CUDA build, which
+initialises the GPU), reads `version: <v> (build <n>, commit <h>)` from
+standard error and records `build_fingerprint: <v>+<h>` (the build number
+depends on the clone and is dropped), `security.deep_park: disabled` and no
+`cuda_home`. The installation fingerprint covers the binary and every
+`lib*.so*` beside it (and in `<prefix>/lib` for `<prefix>/bin/llama-server`), so
+rebuilding in place is installation drift. A machine with
+`/etc/llama.cpp/config.ini` is refused before the binary runs
+(`engine_unsupported`), and a launch on a machine where the file appeared later
+is refused `engine_config_file`. `--deep-park enabled` is `capability_missing`.
+
+The role's own llama.cpp is `local_engine.llamacpp`, `--llamacpp-bin` or
+`CAPYCTL_LLAMACPP_BIN` ([Settings](configuration.md#engine-installation)).
+
+Every launch runs llama-server on loopback with a closed environment: no
+`HOME` and no `LLAMA_ARG_*` variable, with `XDG_CONFIG_HOME` and `LLAMA_CACHE`
+pointed at empty private directories under `<state dir>/engines/llamacpp/`.
+llama-server takes no key; it is reached only through CapyCTL's
+inference endpoint.
 
 ## Engine logs and troubleshooting
 

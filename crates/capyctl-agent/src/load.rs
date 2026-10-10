@@ -589,6 +589,16 @@ async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
     Some(body)
 }
 
+/// A loopback read of `path` on the target, with the launch's key when it has
+/// one (an embedded llama.cpp launch has none, ADR 0029 §4).
+fn keyed_get(client: &reqwest::Client, target: &LoadTarget, path: &str) -> reqwest::RequestBuilder {
+    let request = client.get(format!("http://{}{path}", target.target));
+    match target.native {
+        Some(key) => request.bearer_auth(hex::encode(key)),
+        None => request,
+    }
+}
+
 impl LoadReporter {
     pub fn new(source: Arc<dyn LoadSource>, host_id: String) -> Result<Self, LoadError> {
         Ok(Self {
@@ -619,10 +629,7 @@ impl LoadReporter {
             return None;
         }
         let read = async {
-            let response = self
-                .client
-                .get(format!("http://{}/metrics", target.target))
-                .bearer_auth(hex::encode(target.native))
+            let response = keyed_get(&self.client, target, "/metrics")
                 .send()
                 .await
                 .ok()?;
@@ -674,10 +681,7 @@ impl LoadReporter {
             return None;
         }
         let read = async {
-            let response = self
-                .client
-                .get(format!("http://{}{LLAMACPP_SLOTS_PATH}", target.target))
-                .bearer_auth(hex::encode(target.native))
+            let response = keyed_get(&self.client, target, LLAMACPP_SLOTS_PATH)
                 .send()
                 .await
                 .ok()?;
@@ -700,10 +704,7 @@ impl LoadReporter {
             return None;
         }
         let read = async {
-            let response = self
-                .client
-                .get(format!("http://{}{SGLANG_LOADS_PATH}", target.target))
-                .bearer_auth(hex::encode(target.native))
+            let response = keyed_get(&self.client, target, SGLANG_LOADS_PATH)
                 .send()
                 .await
                 .ok()?;

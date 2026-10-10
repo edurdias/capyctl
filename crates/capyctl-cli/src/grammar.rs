@@ -284,7 +284,7 @@ impl Command {
 #[command(
     name = "capyctl",
     version,
-    about = "Run vLLM, SGLang and TensorFold models on your own GPUs",
+    about = "Run vLLM, SGLang, TensorFold and llama.cpp models on your own GPUs",
     disable_help_subcommand = true
 )]
 struct Cli {
