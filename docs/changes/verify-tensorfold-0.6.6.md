@@ -42,14 +42,32 @@ T41; both failed before the mapping change, pass after). The old unit fixture
 labelled `"engine": "cuda"` carried the MLX shape and is now labelled `mlx`.
 CPU and Fake-engine tests are not qualification.
 
-Live (host A, quick-check): PENDING
+Live on host A, 2026-10-14 (one GB10, `scripts/live/engine-quick-check.sh
+--engine tensorfold --new 0.6.6 --old 0.6.5 --host a`, standalone from
+origin/main `a230cf9a`; a new `~/tensorfold-0.6.6-venv` at `cb2ebf05` with the
+same pins as 0.6.5: Python 3.12.14, torch 2.13.0+cu130, triton 3.7.1, CUDA
+13.0). Qwen3.8-27B NVFP4 with the DFlash2 drafter, `--parallel 8`, greedy.
+Every lifecycle step passed: `engine add`, cold start 101.5 s (0.6.5: 139.2 s),
+warm 13.9 s, a reasoning stream (14 reasoning chunks, content, `stop`, usage,
+first token 0.142 s), stop and a 409 after it, `--evict` and wake on request
+(15.6 s), the variant without drafts, engine `/health` and `/metrics` (no key).
+Benchmark against 0.6.5 (medians, two interleaved passes): aggregate tok/s C1
+42.5 / 42.4, C4 122.1 / 120.3, C8 195.0 / 194.2; decode and prefill at 2k, 32k
+and 128k within 1%; TTFT at 128k 87.7 / 87.1 s; peak memory equal. C4's TTFT
+p50 read 0.269 / 0.187 s with p95 equal: both versions show the same discrete
+tiers by queue position (about 0.10, 0.14, 0.21, 0.33 and 0.38 s), and 0.6.5's
+own two passes differ the same way. `token_sha` matched on 30 of 30 keys,
+between versions and within each. Host B's `~/tensorfold-0.6.6-venv` is a
+byte-identical copy of host A's (file digest compared). That run used the
+binary from before the CUDA `prefill_s` mapping; the mapping is checked on the
+live release checks.
 
 # Release note: Engines
 
 - **TensorFold 0.6.6 verified.** CapyCTL lists TensorFold 0.6.6 as verified
   beside 0.6.0 to 0.6.3 and 0.6.5. Its new `--name-priority ID=background`
-  option is an ordinary extra argument; on the follower of a two-GPU group,
-  which CapyCTL starts without `--name`, it may fail.
+  option is an ordinary extra argument; on the second machine of a two-machine
+  group, which CapyCTL starts without `--name`, it may fail.
 - **TensorFold's key variable is reserved.** `TENSORFOLD_API_KEY` can no
   longer be set in a profile's or deployment's `engine_env`, whatever the
   approvals: it turned on TensorFold's own authentication and locked CapyCTL
