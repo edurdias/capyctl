@@ -91,12 +91,6 @@ test refuses every 0.31.0 spelling in host-fixed and deployment arguments
 into the one-table check on both sides of the launch. CPU and Fake-engine
 tests are not qualification.
 
-Live recheck (laptop, same `~/vllm-0.31.0-venv`, local machine only): recorded
-under `~/projects/crossfunctionalai/engine-qual-2026-10-10/recheck/` — engine
-add, start `--wait` to Ready, one non-streaming chat and one streamed chat via
-the relay with `cached_tokens` present on a repeat prompt, a deep-park cycle,
-and stop, with the GPU back at its baseline.
-
 # Release note: Requests
 
 - **vLLM 0.31.0 launches.** The reserved argument check now follows the

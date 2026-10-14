@@ -30,8 +30,8 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
 
 2. **Build both architectures** from the merged `main`, in one of two ways:
    - Run the **Release build** workflow manually (Actions → Release build → Run
-     workflow) with an exact Rust version such as `1.90.0`. It builds x86_64 and
-     aarch64, checks the archives are reproducible, runs
+     workflow) with the exact Rust version `rust-toolchain.toml` pins (`1.99.0`
+     today). It builds x86_64 and aarch64, checks the archives are reproducible, runs
      `scripts/verify-packaging.sh`, and uploads a `release-assets` artifact
      holding both tarballs, `install.sh` and `SHA256SUMS`. It never publishes.
    - Or build locally on one x86_64 and one aarch64 Linux machine with the same

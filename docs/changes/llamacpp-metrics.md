@@ -31,4 +31,4 @@ Live checks still open: a captured v0.6.0 answer, stream and `/metrics` body; th
 `/slots` body size with long prompts (it carries prompt and generated text, against the
 4 MiB scrape bound) and its read time under load.
 
-Release note: none.
+# Release note: none
