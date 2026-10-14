@@ -62,7 +62,7 @@ the CLI and the running role the same ones.
 ## Custom builds
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 and 0.5.21 or
-TensorFold 0.6.0 to 0.6.3 and 0.6.5, the versions this release of CapyCTL knows; every
+TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
 llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
 
@@ -123,7 +123,7 @@ requests and about 61 GiB for 32. Set `max_concurrent_requests` to run more.
 
 ## TensorFold
 
-CapyCTL runs TensorFold 0.6.0 to 0.6.3 and 0.6.5 from a plain venv. TensorFold builds
+CapyCTL runs TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6 from a plain venv. TensorFold builds
 CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
 a C++ compiler where the engine can find them: the venv's `bin`, the CUDA
 toolkit's `bin`, or `/usr/local/bin`, `/usr/bin`, `/bin`. Either install a system

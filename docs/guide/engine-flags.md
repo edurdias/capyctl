@@ -125,9 +125,9 @@ The speculative options in that wheel (`arg_groups/fields/spec.py`) are
 `--speculative-ngram-*` families, and `--uno-lora-path`. Options ending in
 `-path`, `-dir` or `-config` need approval, like the draft model path.
 
-## TensorFold 0.6.5
+## TensorFold 0.6.6
 
-The options of `tensorfold serve` (`tensorfold/cli_args.py` at v0.6.5).
+The options of `tensorfold serve` (`tensorfold/cli_args.py` at v0.6.6).
 TensorFold has no option for a tool-call parser, quantization, CUDA graphs, a
 log level, request logging, KV offload to another store, or plugins: it
 chooses parsers by model family and takes the quantization from the
@@ -152,7 +152,8 @@ checkpoint.
 | Custom kernels | `--lane-kernels` | approval | It loads code. |
 | Vision from URLs | `--vision-urls` | approval | It reaches off the host. |
 | Two-GPU groups | `--tp`, `--rank`, `--master`, `--master-port` | reserved | `topology`. CapyCTL renders them for each group member. |
-| Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. |
+| Background priority by served name | `--name-priority` | extra | 0.6.6 and later, CUDA only: `ID=background`, where `ID` is the served name or an alias. CapyCTL passes no `--name` to the follower of a two-GPU group, so the option may fail there. |
+| Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. The `TENSORFOLD_API_KEY` variable is reserved too. |
 
 ## llama.cpp v0.6.0
 

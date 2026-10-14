@@ -5,7 +5,7 @@
 //! |---|---|---|---|---|---|
 //! | `ttft_ms` | `queue_time_ms` + `time_to_first_token_ms` | `time_to_first_token` | — | — | forward start to first generated text |
 //! | `queue_ms` | `queue_time_ms` | — | — | — | — |
-//! | `prefill_ms` | `time_to_first_token_ms` | `prefill_seconds` | — | `prompt_ms` | — |
+//! | `prefill_ms` | `time_to_first_token_ms` | `prefill_seconds`, else `prefill_s` (CUDA) | — | `prompt_ms` | — |
 //! | `decode_tokens_per_second` | 1000 / `mean_itl_ms` | `tokens_per_second` (positive only) | — | `predicted_per_second` (positive only) | (completion tokens − 1) / first generated text to last chunk |
 //! | `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` | the same | the same (`--enable-cache-report`) | the same | — |
 //!
@@ -112,7 +112,12 @@ impl EngineReport {
             if let Some(ttft) = measured(stats, "time_to_first_token") {
                 self.ttft_ms = Some(ttft * 1000.0);
             }
-            if let Some(prefill) = measured(stats, "prefill_seconds") {
+            // TensorFold 0.6.6's CUDA Qwen engine (`families/qwen3_5/cuda/engine.py`
+            // `generate`) reports `prefill_s` and `decode_s` instead, and no
+            // time to first token or rate; those stay the router's.
+            if let Some(prefill) =
+                measured(stats, "prefill_seconds").or_else(|| measured(stats, "prefill_s"))
+            {
                 self.prefill_ms = Some(prefill * 1000.0);
             }
             if let Some(rate) = measured(stats, "tokens_per_second").filter(|r| *r > 0.0) {
@@ -279,7 +284,7 @@ mod tests {
         assert!(figures.get("cached_tokens").is_none(), "{figures}");
     }
 
-    // T40 T41: TensorFold 0.6.5's `tensorfold` statistics, in seconds; its
+    // T40 T41: TensorFold 0.6.5's MLX `tensorfold` statistics, in seconds; its
     // 0.0 tokens per second (no decode timed) and null prefill are unknown.
     #[test]
     fn tensorfold_statistics_map_and_placeholders_stay_absent() {
@@ -290,7 +295,7 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": 0},
                 "completion_tokens_details": {"reasoning_tokens": 0}},
             "exact_mode": "target-verified",
-            "tensorfold": {"engine": "cuda", "tokens_per_second": 40.5, "seconds": 0.5,
+            "tensorfold": {"engine": "mlx", "tokens_per_second": 40.5, "seconds": 0.5,
                 "prefill_seconds": 0.2, "time_to_first_token": 0.3}
         }));
         assert_eq!(
@@ -309,6 +314,41 @@ mod tests {
         // The batched path reports no per-request timing at all.
         let figures = engine_only(&json!({"tensorfold": {"batch_size": 2, "seconds": 0.4}}));
         assert_eq!(figures, json!({}));
+    }
+
+    // T40 T41: TensorFold 0.6.6's CUDA Qwen statistics (`cuda/engine.py`
+    // `generate`, sent by `cuda/http.py`): only `prefill_s` maps; `decode_s`
+    // gives no time to first token or rate, so the engine reports none.
+    #[test]
+    fn tensorfold_cuda_statistics_map_prefill_only() {
+        let figures = engine_only(&json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 0}},
+            "tensorfold": {"prefill_s": 0.2, "decode_s": 0.25, "rounds": 3, "cached": 0,
+                "drafts": true, "min_rows": 4, "drafted": 12, "accepted": 5,
+                "token_sha": "ab12"}
+        }));
+        assert_eq!(
+            figures,
+            json!({
+                "prefill_ms": {"value": 200.0, "source": "engine"},
+                "cached_tokens": {"value": 0, "source": "engine"},
+            })
+        );
+        for bad in [json!(-1.0), json!(null), json!("0.2")] {
+            let figures = engine_only(&json!({"tensorfold": {"prefill_s": bad, "decode_s": 0.25}}));
+            assert_eq!(figures, json!({}));
+        }
+        // `prefill_seconds` wins when both are present.
+        let figures =
+            engine_only(&json!({"tensorfold": {"prefill_seconds": 0.1, "prefill_s": 0.2}}));
+        assert_eq!(
+            figures,
+            json!({"prefill_ms": {"value": 100.0, "source": "engine"}})
+        );
     }
 
     // T40: SGLang 0.5.21 reports only cached tokens, and only when some were

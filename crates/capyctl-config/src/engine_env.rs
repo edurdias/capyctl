@@ -38,6 +38,9 @@ pub const OWNED_NAMES: &[&str] = &[
     "VLLM_PLUGINS",
     "VLLM_SERVER_DEV_MODE",
     "VLLM_API_KEY",
+    // TensorFold reads this key (`server/authentication.py`) and then refuses
+    // the unkeyed health and metrics routes CapyCTL reads.
+    "TENSORFOLD_API_KEY",
     "TORCH_EXTENSIONS_DIR",
     "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
     "TENSORFOLD_NO_UPDATE_CHECK",
