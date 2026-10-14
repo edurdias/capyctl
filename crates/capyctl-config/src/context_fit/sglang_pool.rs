@@ -34,9 +34,11 @@
 //! `max_mamba_cache_size` fixes the state pool, reserving
 //! `(slots + 1) × state` plus, with speculative decoding, `(running + 1) ×
 //! draft tokens × state` of intermediate states; `max_total_tokens` caps the
-//! KV pool at what is left. Shapes this module does not model (sliding-window
-//! or latent attention, other hybrids) keep SGLang's own sizing, with the
-//! reason recorded.
+//! KV pool at what is left. `--enable-linear-replayssm-spec` (both versions)
+//! drops the intermediate states and keeps a ReplaySSM ring and the conv
+//! windows per running request plus one instead (`MambaPool.__init__`).
+//! Shapes this module does not model (sliding-window or latent attention,
+//! other hybrids) keep SGLang's own sizing, with the reason recorded.
 //!
 //! On unified memory every launch whose weights are known renders a static
 //! pool of the weights, the KV cache, the state (sized here, or fixed by the
@@ -141,6 +143,36 @@ struct GatedDeltaHybrid {
     attention_layers: u64,
     /// One request's recurrent state across every linear-attention layer.
     state_bytes: u64,
+    /// One record of a request's ReplaySSM spec-verify ring across every
+    /// linear-attention layer (`replayssm_ring_bytes_per_req` for one record).
+    replay_record_bytes: u64,
+    /// One column of a request's speculative conv window across every
+    /// linear-attention layer.
+    conv_column_bytes: u64,
+    conv_kernel: u64,
+}
+
+impl GatedDeltaHybrid {
+    /// What SGLang 0.5.20 and 0.5.21 keep beside the slots for each running
+    /// request plus one: with speculative decoding, one intermediate state per
+    /// draft token; under `--enable-linear-replayssm-spec` (`ring` records)
+    /// none, but the ReplaySSM ring and, with speculative decoding, the
+    /// deduplicated conv window of `draft tokens + kernel - 2` columns
+    /// (`MambaPool.__init__`, `_allocate_deduplicated_conv_window`; SGLang
+    /// refuses the flag for a tree draft, whose windows are not deduplicated).
+    fn scratch_bytes(&self, draft_tokens: u64, ring: Option<u64>) -> Option<u64> {
+        let Some(records) = ring else {
+            return draft_tokens.checked_mul(self.state_bytes);
+        };
+        let windows = if draft_tokens > 0 {
+            (draft_tokens + self.conv_kernel - 2).checked_mul(self.conv_column_bytes)?
+        } else {
+            0
+        };
+        records
+            .checked_mul(self.replay_record_bytes)?
+            .checked_add(windows)
+    }
 }
 
 fn text_config(config: &Value) -> &Value {
@@ -163,8 +195,9 @@ pub(super) fn gated_delta_attention_layers(config: &Value) -> Option<u64> {
 /// SGLang's state per request (`Mamba2CacheParams.mamba_cache_per_req`):
 /// per linear-attention layer, a bfloat16 convolution state of
 /// `kernel - 1` positions and a temporal state in `mamba_ssm_dtype`
-/// (float32 unless the configuration or `--mamba-ssm-dtype` says otherwise).
-fn gated_delta_hybrid(config: &Value, ssm_dtype: Option<&str>) -> Option<GatedDeltaHybrid> {
+/// ([`ssm_dtype`] of the launch `args`, else the configuration's, else
+/// float32).
+fn gated_delta_hybrid(config: &Value, args: &[String]) -> Option<GatedDeltaHybrid> {
     let attention_layers = gated_delta_attention_layers(config)?;
     let text = text_config(config);
     let types = text.get("layer_types")?.as_array()?;
@@ -174,7 +207,11 @@ fn gated_delta_hybrid(config: &Value, ssm_dtype: Option<&str>) -> Option<GatedDe
     let value_heads = positive(text, "linear_num_value_heads")?;
     let value_dim = positive(text, "linear_value_head_dim")?;
     let kernel = positive(text, "linear_conv_kernel_dim")?;
-    let ssm = match ssm_dtype.or_else(|| text.get("mamba_ssm_dtype").and_then(Value::as_str)) {
+    let named = ssm_dtype(args);
+    let ssm = match named
+        .as_deref()
+        .or_else(|| text.get("mamba_ssm_dtype").and_then(Value::as_str))
+    {
         Some(name) => dtype_bytes(name)?,
         None => 4,
     };
@@ -186,10 +223,60 @@ fn gated_delta_hybrid(config: &Value, ssm_dtype: Option<&str>) -> Option<GatedDe
         .checked_mul(key_dim)?
         .checked_mul(value_dim)?
         .checked_mul(ssm)?;
+    // `replayssm_ring_bytes_per_req` for a gated-delta-net layer with a
+    // bfloat16 conv dtype: compact d and normalized k with their low parts
+    // (2 + 2 bytes each) and a float32 scalar gate per value head.
+    let record = value_heads
+        .checked_mul(value_dim)?
+        .checked_add(key_heads.checked_mul(key_dim)?)?
+        .checked_add(value_heads)?
+        .checked_mul(4)?;
     Some(GatedDeltaHybrid {
         attention_layers,
         state_bytes: recurrent.checked_mul(conv.checked_add(temporal)?)?,
+        replay_record_bytes: recurrent.checked_mul(record)?,
+        conv_column_bytes: recurrent.checked_mul(conv_dim.checked_mul(2)?)?,
+        conv_kernel: kernel,
     })
+}
+
+/// SGLang 0.5.20 and 0.5.21's `--enable-linear-replayssm-spec`
+/// (`arg_groups/fields/exec_.py`), a `store_true` flag.
+const REPLAYSSM_SPEC: &str = "--enable-linear-replayssm-spec";
+
+/// Its sibling `--enable-linear-replayssm` (the decode ring), which an exact
+/// match selects over the longer flag in SGLang's parser.
+const REPLAYSSM_DECODE: &str = "--enable-linear-replayssm";
+
+/// `--linear-replayssm-cache-len`'s default in SGLang 0.5.20 and 0.5.21.
+const REPLAYSSM_CACHE_LEN: u64 = 16;
+
+/// The ReplaySSM spec-verify ring length when the arguments turn
+/// `--enable-linear-replayssm-spec` on (abbreviations included, but no
+/// abbreviation of the decode flag); `None` when they do not. The flag takes
+/// no value: SGLang's parser refuses `=value`, so such a launch never runs.
+fn replayssm_ring(args: &[String]) -> Option<u64> {
+    let on = parse_options(args).ok()?.iter().any(|parsed| {
+        parsed.value.is_none()
+            && parsed.name.len() > REPLAYSSM_DECODE.len()
+            && matches_name(&parsed.name, REPLAYSSM_SPEC)
+    });
+    on.then(|| {
+        option_value(args, "--linear-replayssm-cache-len")
+            .1
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(REPLAYSSM_CACHE_LEN)
+    })
+}
+
+/// The temporal state's dtype the arguments give SGLang:
+/// `--mamba-ssm-dtype`, else float32 under `--enable-linear-replayssm-spec`
+/// (SGLang 0.5.20 and 0.5.21 declare it in `handle_linear_attn_backend`,
+/// ahead of the checkpoint's), else none.
+fn ssm_dtype(args: &[String]) -> Option<String> {
+    option_value(args, "--mamba-ssm-dtype")
+        .1
+        .or_else(|| replayssm_ring(args).map(|_| "float32".to_owned()))
 }
 
 /// The last value the arguments give `option` (abbreviations included), and
@@ -234,18 +321,15 @@ fn left_to_sglang(reason: impl Into<String>) -> SglangPool {
 }
 
 /// The recurrent state SGLang reserves for `running` requests of `state`
-/// bytes each: the slots plus a padding slot, and with speculative decoding
-/// one intermediate state per draft token for each running request plus one.
-fn state_bytes(running: u64, state: u64, draft_tokens: u64) -> Option<u64> {
-    let slots = running
+/// bytes each: the slots plus a padding slot, and `scratch` bytes (what
+/// speculative decoding or ReplaySSM keeps, [`GatedDeltaHybrid::scratch_bytes`])
+/// for each running request plus one.
+fn state_bytes(running: u64, state: u64, scratch: u64) -> Option<u64> {
+    running
         .checked_mul(STATE_SLOTS_PER_REQUEST)?
-        .checked_add(1)?;
-    let intermediate = if draft_tokens > 0 {
-        (running + 1).checked_mul(draft_tokens)?
-    } else {
-        0
-    };
-    slots.checked_add(intermediate)?.checked_mul(state)
+        .checked_add(1)?
+        .checked_mul(state)?
+        .checked_add(running.checked_add(1)?.checked_mul(scratch)?)
 }
 
 /// SGLang's pools for `settings`, from the checkpoint configuration (and the
@@ -302,14 +386,14 @@ pub fn sglang_pool(
 
 /// The recurrent state SGLang 0.5.21 reserves for the slots the arguments
 /// fix on a gated-delta-net hybrid (`--max-mamba-cache-size`,
-/// `_handle_max_mamba_cache`): the slots plus a padding slot and, with
-/// speculative decoding, one intermediate state per draft token for each
-/// request it runs plus one (it runs at most the deployment's count, and
-/// never more than the slots). Zero for any other model, or when SGLang
-/// sizes the state itself.
+/// `_handle_max_mamba_cache`): the slots plus a padding slot and
+/// [`GatedDeltaHybrid::scratch_bytes`] for each request it runs plus one.
+/// It runs at most the deployment's count; the intermediate states are
+/// charged for no more than the slots (`capped_reqs`), the ReplaySSM ring
+/// for the count as it is (`replay_req_slots`). Zero for any other model,
+/// or when SGLang sizes the state itself.
 fn argument_state(settings: &SglangLaunchSettings, config: &Value, args: &[String]) -> u64 {
-    let (_, ssm_dtype) = option_value(args, "--mamba-ssm-dtype");
-    let Some(hybrid) = gated_delta_hybrid(config, ssm_dtype.as_deref()) else {
+    let Some(hybrid) = gated_delta_hybrid(config, args) else {
         return 0;
     };
     let Some(slots) = option_value(args, "--max-mamba-cache-size")
@@ -318,23 +402,25 @@ fn argument_state(settings: &SglangLaunchSettings, config: &Value, args: &[Strin
     else {
         return 0;
     };
-    let intermediate = if option_value(args, "--speculative-algorithm").0 {
-        let draft_tokens = option_value(args, "--speculative-num-draft-tokens")
+    let draft_tokens = if option_value(args, "--speculative-algorithm").0 {
+        option_value(args, "--speculative-num-draft-tokens")
             .1
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let running = settings
-            .common
-            .max_concurrent_requests
-            .map_or(slots, |running| u64::from(running).min(slots));
-        running.saturating_add(1).saturating_mul(draft_tokens)
+            .unwrap_or(0)
     } else {
         0
     };
+    let ring = replayssm_ring(args);
+    let declared = settings.common.max_concurrent_requests.map(u64::from);
+    let running = match ring {
+        Some(_) => declared.unwrap_or(slots),
+        None => declared.map_or(slots, |running| running.min(slots)),
+    };
+    let scratch = hybrid.scratch_bytes(draft_tokens, ring).unwrap_or(u64::MAX);
     slots
         .saturating_add(1)
-        .saturating_add(intermediate)
         .saturating_mul(hybrid.state_bytes)
+        .saturating_add(running.saturating_add(1).saturating_mul(scratch))
 }
 
 const LEFT_TO_SGLANG: &str = "; SGLang sizes its pools itself";
@@ -362,8 +448,7 @@ fn sized_pool(
         Ok(element) => element,
         Err(reason) => return Ok(left_to_sglang(reason)),
     };
-    let (_, ssm_dtype) = option_value(&args, "--mamba-ssm-dtype");
-    let hybrid = gated_delta_hybrid(config, ssm_dtype.as_deref());
+    let hybrid = gated_delta_hybrid(config, &args);
     let target = match (hybrid, shape.approximation) {
         (Some(hybrid), _) => {
             2 * shape.kv_heads * shape.head_dim * element * hybrid.attention_layers
@@ -452,7 +537,9 @@ fn sized_pool(
         return Ok(pool);
     };
     let (margin, static_bytes) = static_pool_bytes(memory);
-    let need = |running: u32| state_bytes(u64::from(running), hybrid.state_bytes, draft_tokens);
+    let ring = replayssm_ring(&args);
+    let scratch = hybrid.scratch_bytes(draft_tokens, ring).unwrap_or(u64::MAX);
+    let need = |running: u32| state_bytes(u64::from(running), hybrid.state_bytes, scratch);
     // Owner decision 2026-10-03: a request CapyCTL derived (weights + KV +
     // margin) fits what it can, the state taking up to half of the margin on
     // unified memory; the other half stays for SGLang's runtime outside its
@@ -522,13 +609,16 @@ fn sized_pool(
                 if running == 1 { "" } else { "s" },
                 u64::from(running) * STATE_SLOTS_PER_REQUEST + 1,
                 hybrid.state_bytes,
-                if draft_tokens > 0 {
-                    format!(
+                match (ring, scratch) {
+                    (_, 0) => String::new(),
+                    (Some(_), _) => format!(
+                        " and {} ReplaySSM scratch sets of {scratch} bytes",
+                        u64::from(running) + 1
+                    ),
+                    (None, _) => format!(
                         " and {} draft-token states",
                         (u64::from(running) + 1) * draft_tokens
-                    )
-                } else {
-                    String::new()
+                    ),
                 },
                 available,
                 if running > 1 {
@@ -639,14 +729,13 @@ fn derived_request(settings: &SglangLaunchSettings, weights: u64) -> bool {
 
 /// ADR 0014 amendment A16: one request slot of SGLang's recurrent state for
 /// the checkpoint at `checkpoint_root` (`config.json`), as a launch with
-/// `args` sizes it (`--mamba-ssm-dtype`); `None` for any other shape or an
+/// `args` sizes it ([`ssm_dtype`]); `None` for any other shape or an
 /// unreadable configuration. The host that measures the checkpoint records
 /// it beside the weights, so resolution, which reads no checkpoint file, can
 /// size a derived request for the state.
 pub fn sglang_state_slot_bytes(checkpoint_root: &Path, args: &[String]) -> Option<i64> {
     let config = read_model_config(checkpoint_root).ok()?;
-    let (_, ssm_dtype) = option_value(args, "--mamba-ssm-dtype");
-    let hybrid = gated_delta_hybrid(&config, ssm_dtype.as_deref())?;
+    let hybrid = gated_delta_hybrid(&config, args)?;
     i64::try_from(hybrid.state_bytes)
         .ok()
         .filter(|bytes| *bytes > 0)
@@ -657,7 +746,11 @@ pub fn sglang_state_slot_bytes(checkpoint_root: &Path, args: &[String]) -> Optio
 /// (or `SGLANG_HYBRID_DEFAULT_RUNNING`), whose request still `fits`. `None` when
 /// none fits, when the arguments size the state pool themselves, or with
 /// speculative decoding and no draft-token count: the launch then sizes the
-/// state as before.
+/// state as before. Knowing only the slot, it reserves the intermediate
+/// states under `--enable-linear-replayssm-spec` too: with speculative
+/// decoding on a gated-delta-net hybrid they exceed the ReplaySSM ring at
+/// its default length and the conv windows, and the launch, which reads the
+/// checkpoint, sizes what SGLang keeps within that reservation.
 pub(crate) fn derived_state_reserve(
     slot: u64,
     args: &[String],
@@ -678,9 +771,10 @@ pub(crate) fn derived_state_reserve(
     } else {
         0
     };
+    let scratch = draft_tokens.checked_mul(slot)?;
     (1..=declared.unwrap_or(SGLANG_HYBRID_DEFAULT_RUNNING))
         .rev()
-        .filter_map(|running| state_bytes(u64::from(running), slot, draft_tokens))
+        .filter_map(|running| state_bytes(u64::from(running), slot, scratch))
         .find(|bytes| fits(*bytes))
 }
 

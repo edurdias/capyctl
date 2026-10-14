@@ -840,6 +840,9 @@ Rule (vLLM is unchanged; it is already given the KV cache in bytes):
   state must fit the request less the margin, the weights and the KV cache. The state is
   `(slots + 1) × slot`, plus `(running + 1) × draft tokens × slot` of intermediate states
   with speculative decoding (`--speculative-num-draft-tokens`), as SGLang reserves them.
+  With `--enable-linear-replayssm-spec` (SGLang 0.5.20 and 0.5.21) there are none:
+  `(running + 1)` ReplaySSM rings and speculative conv windows take their place
+  (2026-10-14).
 - The weights are the revision's recorded weights. A revision that declares both its
   request and its KV cache records none (it is not re-resolved with the measurement), so
   the launch sums the weight files it reads: the checkpoint's and the draft model's
@@ -971,7 +974,9 @@ Rule (unified memory; a discrete device keeps the note above):
 - The state is the one CapyCTL sized, or, when the arguments fix it on a gated-delta-net
   hybrid (`--max-mamba-cache-size N`), the `N + 1` slots SGLang reserves, plus with
   speculative decoding `(running + 1) × draft tokens` intermediate states, the running
-  requests being the deployment's count, at most `N`. A state SGLang sizes itself
+  requests being the deployment's count, at most `N` (with
+  `--enable-linear-replayssm-spec`, `(running + 1)` ReplaySSM rings and conv windows
+  instead, for the deployment's count). A state SGLang sizes itself
   (`--mamba-full-memory-ratio`, another hybrid kind) is not counted.
 
 Consequence: on a pool left to SGLang (a sliding-window model), SGLang's KV pool now gets
