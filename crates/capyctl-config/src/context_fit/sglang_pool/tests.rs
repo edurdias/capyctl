@@ -711,9 +711,178 @@ fn a_derived_request_reserves_the_state_that_fits() {
         derived_state_reserve(STATE, &args, Some(2), all),
         Some((11 + 3 * 8) * STATE)
     );
+    // Under ReplaySSM spec-verify the slot alone cannot size the ring: the
+    // intermediate states, which exceed it, stay reserved.
+    let mut replay = args.clone();
+    replay.push("--enable-linear-replayssm-spec".to_owned());
+    assert_eq!(
+        derived_state_reserve(STATE, &replay, Some(2), all),
+        Some((11 + 3 * 8) * STATE)
+    );
     // Without a draft-token count, or when the arguments size the state
     // pool, the launch sizes it as before.
     assert_eq!(derived_state_reserve(STATE, &args[..2], Some(2), all), None);
     let args = ["--max-mamba-cache-size".to_owned(), "64".to_owned()];
     assert_eq!(derived_state_reserve(STATE, &args, None, all), None);
+}
+
+/// The Qwen3.8-27B NVFP4 deployment the ReplaySSM report came from: EAGLE
+/// with 4 draft tokens, 22 running requests, `--max-mamba-cache-size 110`,
+/// a 79 GiB request and a 29 GiB KV cache; `extra` is appended to its
+/// arguments.
+fn eagle_27b(extra: &[&str]) -> SglangLaunchSettings {
+    let mut deployment = settings(79 * GIB, 29 * GIB, Some(21_920_000_000));
+    deployment.common.max_concurrent_requests = Some(22);
+    deployment.extra_args = [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--max-mamba-cache-size",
+        "110",
+    ]
+    .iter()
+    .chain(extra)
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    deployment
+}
+
+/// SGLang 0.5.20 and 0.5.21's ReplaySSM spec-verify scratch for one
+/// request of Qwen3.8-27B with 4 draft tokens: per linear-attention layer,
+/// the 16-record ring (`replayssm_ring_bytes_per_req`: bfloat16 compact d
+/// and k with their low parts, a float32 gate) and the deduplicated conv
+/// window (10240 channels × (4 + 4 - 2) bfloat16 columns).
+const REPLAY: u64 = 48 * (16 * (48 * 128 * 4 + 16 * 128 * 4 + 48 * 4) + 10240 * 6 * 2);
+
+// T14 (reported 2026-10-14, SGLang 0.5.21 `kv_cache_configurator.py`
+// `_handle_max_mamba_cache` and `memory_pool.py` `MambaPool.__init__`):
+// `--enable-linear-replayssm-spec` drops the per-draft-token intermediate
+// states; SGLang keeps the ReplaySSM ring and the conv windows for each
+// running request plus one instead. CapyCTL counted 92 intermediate states
+// (13.2 GiB) and capped the static pool at the whole request.
+#[test]
+fn replayssm_spec_verify_keeps_a_ring_instead_of_intermediate_states() {
+    let target = qwen38_27b();
+    let weights = 21_920_000_000;
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    // Without the flag, unchanged: 111 slots and (22 + 1) × 4 intermediate
+    // states overflow the request, so the static pool is all of it.
+    let plain = pool(&eagle_27b(&[]), &target).unwrap();
+    assert_eq!(plain.max_total_tokens, Some(475136));
+    assert_eq!(plain.max_mamba_cache_size, None);
+    assert_eq!(plain.max_running_requests, None);
+    assert_eq!(plain.static_bytes, Some(79 * GIB));
+    // With it, the slots and 23 ReplaySSM scratch sets fit well inside: the
+    // static pool is the request less its 8 GiB margin.
+    let replay = pool(&eagle_27b(&["--enable-linear-replayssm-spec"]), &target).unwrap();
+    assert_eq!(replay.static_bytes, Some(71 * GIB));
+    assert_eq!(replay.max_total_tokens, plain.max_total_tokens);
+    // At a 72 GiB request (a 64 GiB floor) the static pool shows what is
+    // counted.
+    let at_72 = |profile: &[String], extra: &[&str]| {
+        let mut deployment = eagle_27b(extra);
+        deployment.memory.request_bytes = 72 * GIB;
+        sglang_pool(&deployment, profile, Ok(&target), None)
+            .unwrap()
+            .static_bytes
+    };
+    assert_eq!(REPLAY, 31_211_520);
+    let counted = Some(weights + 29 * GIB + 111 * STATE as i64 + 23 * REPLAY as i64 + overhead);
+    assert_eq!(at_72(&[], &["--enable-linear-replayssm-spec"]), counted);
+    assert_eq!(at_72(&[], &[]), Some(72 * GIB));
+    // SGLang's parser takes an unambiguous abbreviation too, and the flag
+    // counts in the host-fixed arguments as in the deployment's.
+    assert_eq!(at_72(&[], &["--enable-linear-replayssm-sp"]), counted);
+    let host = ["--enable-linear-replayssm-spec".to_owned()];
+    assert_eq!(at_72(&host, &[]), counted);
+    // A longer ring (`--linear-replayssm-cache-len`) grows with its records.
+    let ring_16 = 48 * 16 * (48 * 128 * 4 + 16 * 128 * 4 + 48 * 4);
+    assert_eq!(
+        at_72(
+            &[],
+            &[
+                "--enable-linear-replayssm-spec",
+                "--linear-replayssm-cache-len",
+                "32",
+            ]
+        ),
+        counted.map(|bytes| bytes + 23 * ring_16)
+    );
+    // The decode ring (`--enable-linear-replayssm`, another option) keeps
+    // the intermediate states, and SGLang's boolean flag takes no value: a
+    // `=true` spelling is refused by its parser, so it counts nothing.
+    for extra in [
+        "--enable-linear-replayssm",
+        "--enable-linear-replayssm-spec=true",
+    ] {
+        assert_eq!(at_72(&[], &[extra]), Some(72 * GIB), "{extra}");
+    }
+}
+
+// T14: when CapyCTL sizes the state pool itself, the flag drops the
+// intermediate states there too. The 79 GiB request cannot hold 22 running
+// requests with 92 intermediate states; with the ring it does.
+#[test]
+fn replayssm_spec_verify_lets_the_sized_state_pool_hold_its_requests() {
+    let target = qwen38_27b();
+    let weights = 21_920_000_000;
+    let without_slots = |extra: &[&str]| {
+        let mut deployment = eagle_27b(extra);
+        deployment.extra_args.truncate(8);
+        deployment
+            .extra_args
+            .extend(extra.iter().map(|arg| (*arg).to_owned()));
+        pool(&deployment, &target)
+    };
+    let refusal = without_slots(&[]).unwrap_err();
+    assert!(
+        refusal.contains(&format!("{} bytes", (111 + 23 * 4) * STATE)),
+        "{refusal}"
+    );
+    let found = without_slots(&["--enable-linear-replayssm-spec"]).unwrap();
+    assert_eq!(found.max_mamba_cache_size, Some(110));
+    assert_eq!(found.max_running_requests, None);
+    assert_eq!(found.running_limit, None);
+    assert_eq!(found.static_bytes, Some(71 * GIB));
+    // At a 75 GiB request (a 67 GiB floor) they still fit, and the static
+    // pool shows what is counted.
+    let mut tighter = eagle_27b(&["--enable-linear-replayssm-spec"]);
+    tighter.extra_args.remove(8);
+    tighter.extra_args.remove(8);
+    tighter.memory.request_bytes = 75 * GIB;
+    assert_eq!(
+        pool(&tighter, &target).unwrap().static_bytes,
+        Some(
+            weights
+                + 29 * GIB
+                + 111 * STATE as i64
+                + 23 * REPLAY as i64
+                + STATIC_OVERHEAD_BYTES as i64
+        )
+    );
+}
+
+// T14: SGLang declares a float32 temporal state under the flag unless
+// `--mamba-ssm-dtype` names one (`handle_linear_attn_backend`), whatever
+// the checkpoint says.
+#[test]
+fn replayssm_spec_verify_keeps_a_float32_temporal_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = qwen38_27b();
+    config["text_config"]["mamba_ssm_dtype"] = json!("bfloat16");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let halved = 48 * (61_440 + 1_572_864);
+    assert_eq!(sglang_state_slot_bytes(dir.path(), &[]), Some(halved));
+    let flag = "--enable-linear-replayssm-spec".to_owned();
+    assert_eq!(
+        sglang_state_slot_bytes(dir.path(), std::slice::from_ref(&flag)),
+        Some(STATE as i64)
+    );
+    let named = [flag, "--mamba-ssm-dtype".to_owned(), "bfloat16".to_owned()];
+    assert_eq!(sglang_state_slot_bytes(dir.path(), &named), Some(halved));
 }
