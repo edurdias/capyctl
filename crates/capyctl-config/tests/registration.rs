@@ -274,6 +274,8 @@ fn the_verified_set_marks_custom_builds() {
     assert!(is_verified(Engine::Vllm, "0.29.0"));
     assert!(is_verified(Engine::Vllm, "0.30.0"));
     assert!(!is_verified(Engine::Vllm, "0.30.1"));
+    assert!(is_verified(Engine::Vllm, "0.31.0"));
+    assert!(!is_verified(Engine::Vllm, "0.31.1"));
     assert!(is_verified(Engine::Sglang, "0.5.20"));
     assert!(is_verified(Engine::Sglang, "0.5.21"));
     assert!(!is_verified(Engine::Sglang, "0.5.22"));

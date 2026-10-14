@@ -7,7 +7,7 @@ more than one, each in its own environment.
 
 | Engine | Versions this release knows | Environment used below |
 |---|---|---|
-| vLLM | 0.30.0, 0.29.0 | `~/venvs/vllm` |
+| vLLM | 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
 | SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |

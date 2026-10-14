@@ -370,6 +370,8 @@ pub fn write_engines(
 pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Vllm, "0.29.0"),
     (Engine::Vllm, "0.30.0"),
+    // ADR 0018 §1 (owner decision 2026-10-14).
+    (Engine::Vllm, "0.31.0"),
     (Engine::Sglang, "0.5.20"),
     (Engine::Sglang, "0.5.21"),
     // ADR 0023 §1.
