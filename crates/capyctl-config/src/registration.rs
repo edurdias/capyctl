@@ -378,6 +378,9 @@ pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Tensorfold, "0.6.2"),
     (Engine::Tensorfold, "0.6.3"),
     (Engine::Tensorfold, "0.6.5"),
+    // ADR 0023 §1 (owner decision 2026-10-14): 0.6.6 differs from 0.6.5 only by
+    // `--name-priority`.
+    (Engine::Tensorfold, "0.6.6"),
 ];
 
 /// ADR 0018 §1: whether `version` is in the verified set. ADR 0029 §2: a

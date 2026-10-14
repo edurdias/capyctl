@@ -154,10 +154,10 @@ figure nobody measured is left out, never shown as zero.
 
 | Figure | vLLM 0.30 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
 |---|---|---|---|---|
-| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request | router |
+| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | router |
 | `queue_ms` | engine | — | — | — |
-| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request | engine (`timings.prompt_ms`, from when a slot took the request) |
-| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode | engine (`timings.predicted_per_second`); router when it timed no decode |
+| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request (CUDA Qwen models: `prefill_s`, from when it started the request) | engine (`timings.prompt_ms`, from when a slot took the request) |
+| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode, and on CUDA Qwen models | engine (`timings.predicted_per_second`); router when it timed no decode |
 | `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine |
 
 CapyCTL starts vLLM with `--enable-per-request-metrics` and SGLang with

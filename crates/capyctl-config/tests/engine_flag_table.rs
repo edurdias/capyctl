@@ -19,7 +19,7 @@ const PAGE: &str = include_str!("../../../docs/guide/engine-flags.md");
 const SECTIONS: &[(&str, Engine)] = &[
     ("## vLLM 0.30", Engine::Vllm),
     ("## SGLang 0.5.21", Engine::Sglang),
-    ("## TensorFold 0.6.5", Engine::Tensorfold),
+    ("## TensorFold 0.6.6", Engine::Tensorfold),
     ("## llama.cpp v0.6.0", Engine::Llamacpp),
 ];
 

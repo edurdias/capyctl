@@ -75,6 +75,7 @@ fn owned_names_are_never_settable() {
         "VLLM_PLUGINS",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_API_KEY",
+        "TENSORFOLD_API_KEY",
         "TORCH_EXTENSIONS_DIR",
         "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         "TENSORFOLD_NO_UPDATE_CHECK",
@@ -87,6 +88,16 @@ fn owned_names_are_never_settable() {
         assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
         let e = resolve_engine_env(&map(&[(name, "x")]), &a, &map(&[])).unwrap_err();
         assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+    }
+    // T21: the TensorFold key is refused whatever its case, through its own
+    // prefix glob too; naming it alone is not a valid approval.
+    assert!(ApprovedEnv::parse(&["TENSORFOLD_API_KEY".to_string()]).is_err());
+    let named = approved(&["TENSORFOLD_*"]);
+    for name in ["tensorfold_api_key", "TensorFold_Api_Key"] {
+        for approval in [&a, &named] {
+            assert!(resolve_engine_env(&map(&[]), approval, &map(&[(name, "x")])).is_err());
+            assert!(resolve_engine_env(&map(&[(name, "x")]), approval, &map(&[])).is_err());
+        }
     }
 }
 

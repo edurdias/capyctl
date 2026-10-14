@@ -24,7 +24,9 @@ profile name is `tensorfold`; the entry point is `<env>/bin/tensorfold`; the
 version check is `<env>/bin/tensorfold --version`. Detection reads
 `tensorfold-*.dist-info` with ADR 0018 §1's bounds and locations and executes
 nothing. The verified set gains TensorFold 0.6.0, 0.6.1, 0.6.2, 0.6.3 and 0.6.5; any
-other version is `custom` (0.6.4 was not run live).
+other version is `custom` (0.6.4 was not run live). Owner decision 2026-10-14:
+the verified set also gains 0.6.6, whose only upstream change from 0.6.5 is the
+`--name-priority` option.
 
 ### 2. Registration
 

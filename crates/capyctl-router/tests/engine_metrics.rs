@@ -305,6 +305,36 @@ fn tensorfold(tokens_per_second: f64) -> Scripted {
     }
 }
 
+/// TensorFold 0.6.6's CUDA Qwen engine (`cuda/http.py` at v0.6.6): the
+/// `generate` statistics on the finish chunk, which also carries usage when
+/// the request did not ask for a separate usage chunk.
+fn tensorfold_cuda() -> Scripted {
+    let chunk = |delta: Value, finish: Value| {
+        json!({"id": "chatcmpl-t", "object": "chat.completion.chunk", "created": 1,
+            "model": "m", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+    };
+    let stats = json!({"prefill_s": 0.2, "decode_s": 0.25, "rounds": 2, "cached": 0,
+        "drafts": true, "min_rows": 4, "drafted": 8, "accepted": 1, "token_sha": "ab12"});
+    let usage = json!({"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15,
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 0}});
+    let mut finish = chunk(json!({}), json!("stop"));
+    finish["tensorfold"] = stats.clone();
+    finish["usage"] = usage.clone();
+    Scripted {
+        chunks: vec![
+            chunk(json!({"role": "assistant"}), Value::Null).to_string(),
+            chunk(json!({"content": "Hi"}), Value::Null).to_string(),
+            chunk(json!({"content": "!"}), Value::Null).to_string(),
+            finish.to_string(),
+        ],
+        whole: json!({"id": "chatcmpl-t", "object": "chat.completion", "created": 1,
+            "model": "m", "choices": [{"index": 0, "message": {"role": "assistant",
+            "content": "Hi!"}, "finish_reason": "stop"}], "usage": usage,
+            "tensorfold": stats}),
+    }
+}
+
 // T40: vLLM's own timings fill every timing figure, labelled `engine`; its
 // `metrics` object and usage reach the client unchanged.
 #[tokio::test]
@@ -395,6 +425,42 @@ async fn tensorfold_reports_its_statistics() {
         };
         let (_, source) = figure(&figures, "decode_tokens_per_second");
         assert_eq!(source, "router", "{figures}");
+        assert!(figures.get("queue_ms").is_none(), "{figures}");
+    }
+}
+
+// T40 T41: TensorFold 0.6.6's CUDA statistics give the prefill time only; the
+// time to first token and decode rate are the router's, streamed or not.
+#[tokio::test]
+async fn tensorfold_cuda_reports_prefill_only() {
+    for stream in [false, true] {
+        let figures = if stream {
+            let engine = tensorfold_cuda();
+            let sent = engine.chunks.clone();
+            let (data, figures) = streamed(engine).await;
+            assert_eq!(data, sent);
+            figures
+        } else {
+            let (answer, figures) = collected(tensorfold_cuda()).await;
+            assert_eq!(answer["tensorfold"]["prefill_s"], 0.2);
+            figures
+        };
+        assert_eq!(
+            figure(&figures, "prefill_ms"),
+            (200.0, "engine"),
+            "{figures}"
+        );
+        assert_eq!(
+            figure(&figures, "cached_tokens"),
+            (0.0, "engine"),
+            "{figures}"
+        );
+        assert_eq!(figure(&figures, "ttft_ms").1, "router", "{figures}");
+        assert_eq!(
+            figure(&figures, "decode_tokens_per_second").1,
+            "router",
+            "{figures}"
+        );
         assert!(figures.get("queue_ms").is_none(), "{figures}");
     }
 }
