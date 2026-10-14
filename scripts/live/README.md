@@ -32,8 +32,12 @@ the host. In order, it:
    versions with `engine add`, and checks the lifecycle on the new version: cold
    and warm start, engine `/health`, one streamed request with reasoning and
    usage, stop, a request after stop (409), wake on request after a `--evict`
-   start of the old version (or `n/a` when both fit), the no-drafts variant,
-   engine `/metrics` and `capyctl status` during a request.
+   start of the old version (or `n/a` when both fit), the no-drafts variant, and,
+   during a request, `capyctl status` and CapyCTL's load read
+   (`/management/v1/metrics/load`), which must carry fresh engine samples. The
+   engine's own `/metrics` is read with the launch key, which the harness never
+   reads; under deep parking vLLM keys it (CapyCTL's guard), so an unkeyed
+   read is only noted (`metrics-notes.txt`).
 4. Benchmarks old against new with capyctl-bench: C1, C4 and C8 at 512 tokens,
    5 rounds after a warm-up, in 2 interleaved passes (old, new, old, new), then a
    context sweep (2k, 32k, 128k, 3 runs, one pass). The passes are pooled and the

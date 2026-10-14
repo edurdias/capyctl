@@ -109,7 +109,7 @@ fi
 # 2. Helpers, capyctl-bench and settings to the host's work directory.
 step "prepare the host work directory"
 rsh "$HOST" "rm -rf $WORK && mkdir -m 700 -p $WORK"
-x rsync -rlpz --chmod=Dgo-w,Fgo-w "$QC/remote.sh" "$QC/stream_check.py" "$HOST:$WORK/"
+x rsync -rlpz --chmod=Dgo-w,Fgo-w "$QC/remote.sh" "$QC/stream_check.py" "$QC/load_check.py" "$HOST:$WORK/"
 x rsync -rlpz --chmod=Dgo-w,Fgo-w --exclude __pycache__ --exclude tests "$BENCH/" "$HOST:$WORK/capyctl-bench/"
 ENVFILE=$(mktemp)
 {

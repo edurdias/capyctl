@@ -312,21 +312,30 @@ nodraft() {
   stopd "$n"
 }
 
-metrics() { # engine /metrics and /health on the loopback port CapyCTL gave it, no key
-  local n port code lines; n=$(dname main new)
-  startd "$n" warm-metrics || { rec "engine /metrics" fail "start failed"; return; }
+# CapyCTL's own load read of the engine, engine /health, and status during a request.
+# CapyCTL reads the engine's loopback /metrics with the launch's key (SPEC §10,
+# ADR 0013 §10); under deep parking a vLLM launch's /metrics sits behind
+# CapyCTL's key guard (runtime/capyctl_vllm_guard.py), so an unkeyed read is
+# 401 by design. The unkeyed code is kept as a note only; the check is that
+# the management load read carries fresh engine samples during a request.
+metrics() {
+  local n port code r req; n=$(dname main new)
+  startd "$n" warm-metrics || { rec "engine load via CapyCTL" fail "start failed"; return; }
   port=$(engine_port)
-  pgrep -af -- "$(engine_re)" | grep -c -- "--api-key" | sed 's/^/api-key options on the engine command line: /' >>"$RES/metrics-notes.txt"
-  code=$(curl -s -o "$RES/metrics-new.txt" -w '%{http_code}' "http://127.0.0.1:$port/metrics")
-  lines=$(grep -cE "^(tensorfold|vllm|sglang)[:_]" "$RES/metrics-new.txt" 2>/dev/null || true)
-  if [ "$code" = 200 ] && [ "${lines:-0}" -gt 0 ]; then rec "engine /metrics" pass "200, $lines engine samples"
-  else rec "engine /metrics" fail "HTTP $code, ${lines:-0} engine samples"; fi
+  {
+    pgrep -af -- "$(engine_re)" | grep -c -- "--api-key" | sed 's/^/api-key options on the engine command line: /'
+    pgrep -af -- "$(engine_re)" | grep -c -- "--middleware capyctl_vllm_guard" | sed 's/^/capyctl key guard on the engine command line: /'
+    echo "unkeyed engine /metrics: HTTP $(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/metrics") (informational; CapyCTL reads it with the launch key)"
+  } >>"$RES/metrics-notes.txt"
   code=$(health_code)
   if [ "$code" = 200 ]; then rec "engine /health under CapyCTL" pass 200; else rec "engine /health under CapyCTL" fail "$code"; fi
-  chat "$n" >/dev/null & local req=$!
+  chat "$n" >/dev/null & req=$!
   sleep 1
   if c status deployment "$n" >"$RES/status-new.txt" 2>&1; then rec "capyctl status during a request" pass "read"
   else rec "capyctl status during a request" fail "see status-new.txt"; fi
+  r=$(python3 "$HERE/load_check.py" "$CRED" "$SD/run/management-address" "$n" "$req" "$RES/load-new.jsonl" 60 2>>"$RES/cli.log") ||
+    r=$'fail\tno load read result'
+  rec "engine load via CapyCTL" "${r%%$'\t'*}" "${r#*$'\t'}"
   # Only the request: a bare wait would also wait for the role (a child of this shell).
   wait "$req"; stopd "$n"
 }
