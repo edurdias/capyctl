@@ -79,4 +79,4 @@ Live checks still open: the KV figure against llama.cpp's startup log line, the
 margin and the startup peak against measured memory, the draft and MTP contexts'
 caches.
 
-Release note: none.
+# Release note: none
