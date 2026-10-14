@@ -49,7 +49,8 @@ behave the same on a host and in standalone.
   declared in the role document, is refused `profile_exists`. The entry point is `<env>/bin/vllm` for vLLM and `<env>/bin/python3` for
   SGLang; `build_fingerprint` is the checked version.
 - A version outside the verified set (vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 and 0.5.21) is shown as `custom`.
-  The mark is derived when listing; nothing is written for it.
+  The mark is derived when listing; nothing is written for it. Owner decision 2026-10-14:
+  the verified set also gains vLLM 0.31.0.
 - A probe that reports `deep_park` missing writes `security.deep_park: disabled` unless the
   operator asked for `enabled`, so deployments on it resolve `restart_only`.
 

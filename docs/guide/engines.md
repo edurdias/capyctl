@@ -61,7 +61,7 @@ the CLI and the running role the same ones.
 
 ## Custom builds
 
-`CUSTOM yes` means a version other than vLLM 0.29.0 and 0.30.0, SGLang 0.5.20 and 0.5.21 or
+`CUSTOM yes` means a version other than vLLM 0.29.0, 0.30.0 and 0.31.0, SGLang 0.5.20 and 0.5.21 or
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
 llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. Give it its own
 name so it does not replace your main one:
