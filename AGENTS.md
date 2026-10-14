@@ -120,8 +120,9 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
   environments in use, all owner-approved (list updated 2026-10-14):
-  - both hosts: SGLang 0.5.21, vLLM 0.30.0 and TensorFold 0.6.6 (host B's TensorFold
-    0.6.6 is a byte-identical copy of host A's; approved 2026-10-14);
+  - both hosts: SGLang 0.5.21, vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
+    (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
+    owner approval; 0.6.6 approved 2026-10-14);
   - host A: vLLM 0.31.0 and a llama.cpp build in the home directory (approved
     2026-10-14);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B.
