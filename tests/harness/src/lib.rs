@@ -418,7 +418,10 @@ mod tests {
             Ok(Readiness::Ready)
         }
         async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
-            Ok(Quiescence { quiescent: true })
+            Ok(Quiescence {
+                quiescent: true,
+                unproven: None,
+            })
         }
         async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
             Err(AdapterError::PolicyDenied)
