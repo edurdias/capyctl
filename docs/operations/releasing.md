@@ -45,21 +45,44 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
    `scripts/private-denylist.txt` and `scripts/live/matrix/hosts.local.env`:
 
    ```bash
-   CAPYCTL_VERIFY_STRICT=1 scripts/verify-packaging.sh <dir>/capyctl-*.tar.gz
+   CAPYCTL_VERIFY_STRICT=1 scripts/verify-packaging.sh <dir>/capyctl-<version>-linux-<arch>.tar.gz
    ```
 
-   Every check must pass with no `SKIP` lines.
+   The script checks the first tarball it is given and runs its binary, so
+   check each architecture on a machine of that architecture (an x86_64
+   machine for the x86_64 tarball, an aarch64 one for aarch64), with the
+   release's `SHA256SUMS`, `install.sh` and both tarballs in the same
+   directory. A `shellcheck` binary in a temporary directory, named by
+   `SHELLCHECK=...`, will do on a machine without one. Every check must pass
+   with no `SKIP` lines, for both architectures. Remove the denylist copy from
+   any machine it was copied to for the check.
 
 4. **Create a draft release** tagged `v<version>` on the release commit and
    upload the two tarballs, their `.sha256` files, `install.sh` and
    `SHA256SUMS`. Paste the release notes as the description.
 
 5. **Check it live.** Install from the draft on a real host with
-   `install.sh --version v<version>` (a draft needs `gh auth login` or
-   `GITHUB_TOKEN`), start the server and a host, and run a deployment on a
-   native engine. CPU and Fake-engine tests are not
-   qualification; a release is not checked until a native engine has served a
-   request.
+   `install.sh --version v<version>`, start the server and a host
+   ([Several machines](../guide/several-machines.md), both on one machine
+   works), and run a deployment on a native engine. CPU and Fake-engine tests
+   are not qualification; a release is not checked until a native engine has
+   served a request.
+
+   A draft is not reachable by `GITHUB_TOKEN` alone: GitHub's release-by-tag
+   API returns 404 for a draft, so `install.sh` finds nothing. Either log in
+   with `gh auth login` on that host, or download the draft's tarball for the
+   host's architecture and `SHA256SUMS` (`gh release download v<version> -p
+   ...` on a machine where `gh` is logged in), copy them into one directory on
+   the host, and point the installer at it:
+
+   ```bash
+   CAPYCTL_INSTALL_BASE_URL=file:///path/to/that/directory \
+     sh install.sh --version v<version>
+   ```
+
+   The installer still verifies the tarball against `SHA256SUMS`. Use
+   `PREFIX=...` to keep the check apart from a capyctl already installed on
+   that host.
 
 6. **Publish** the draft. The site's `install.sh` then resolves the new release
    as the latest.
