@@ -31,13 +31,14 @@ pub enum ReapedStatus {
 
 static REAPED: Mutex<VecDeque<(ProcessIdentity, ReapedStatus)>> = Mutex::new(VecDeque::new());
 
-/// Record how the child with exactly this identity ended.
-pub(crate) fn record(identity: &ProcessIdentity, status: std::process::ExitStatus) {
-    use std::os::unix::process::ExitStatusExt;
-    let status = match (status.code(), status.signal()) {
-        (Some(code), _) => ReapedStatus::Code(code),
-        (None, Some(signal)) => ReapedStatus::Signal(signal),
-        (None, None) => return,
+/// Record how the child with exactly this identity ended, as its launcher's
+/// wait observed it (before the reap: `pinned_leader`).
+pub(crate) fn record(identity: &ProcessIdentity, status: nix::sys::wait::WaitStatus) {
+    use nix::sys::wait::WaitStatus;
+    let status = match status {
+        WaitStatus::Exited(_, code) => ReapedStatus::Code(code),
+        WaitStatus::Signaled(_, signal, _) => ReapedStatus::Signal(signal as i32),
+        _ => return,
     };
     let Ok(mut reaped) = REAPED.lock() else {
         return;
@@ -77,14 +78,16 @@ mod tests {
     // T33: a status is keyed by the whole identity, never a PID alone.
     #[test]
     fn a_status_is_found_only_for_the_exact_identity() {
-        use std::os::unix::process::ExitStatusExt;
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+        use nix::unistd::Pid;
         record(
             &identity(4_000_001, 7),
-            std::process::ExitStatus::from_raw(9),
+            WaitStatus::Signaled(Pid::from_raw(1), Signal::SIGKILL, false),
         );
         record(
             &identity(4_000_002, 8),
-            std::process::ExitStatus::from_raw(3 << 8),
+            WaitStatus::Exited(Pid::from_raw(2), 3),
         );
         assert_eq!(
             status_of(&identity(4_000_001, 7)),

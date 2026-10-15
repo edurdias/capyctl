@@ -369,12 +369,25 @@ pub fn open_private_log(path: &std::path::Path) -> std::io::Result<std::fs::File
 }
 
 fn detach_reaper(mut retained: RetainedChild) {
+    // SPEC §13.2, ADR 0028 §11: held from before the spawn returns, so the
+    // group it leads stays this launch's to signal until it is reaped.
+    if let Some(identity) = &retained.identity {
+        crate::pinned_leader::hold(identity);
+    }
     std::thread::spawn(move || {
         let _gate = retained.write_gate;
-        // SPEC §13.2 (W13): the parent is the only party that learns how the
-        // engine ended; an exit report names it from here.
-        if let (Ok(status), Some(identity)) = (retained.child.wait(), &retained.identity) {
-            crate::reaped::record(identity, status);
+        match &retained.identity {
+            // SPEC §13.2 (W13): the parent is the only party that learns how
+            // the engine ended; an exit report names it from here. It is
+            // reaped once nothing of its group runs any more.
+            Some(identity) => crate::pinned_leader::reap_when_group_ends(
+                identity,
+                &mut retained.child,
+                |status| crate::reaped::record(identity, status),
+            ),
+            None => {
+                let _ = retained.child.wait();
+            }
         }
     });
 }

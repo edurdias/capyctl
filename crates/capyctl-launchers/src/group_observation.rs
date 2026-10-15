@@ -96,7 +96,10 @@ pub fn observe_process_group(
 /// all started later and are reported here. Nothing is signalled on the strength of
 /// that, because a recorded identity is what `terminate_owned` signals; the effect
 /// is that the group reads as non-empty and the release is refused. Fail-closed,
-/// and never a kill of something that is not ours.
+/// and never a kill of something that is not ours. A leader its own launcher
+/// still holds unreaped (`pinned_leader`) pins the id, so no such reuse can
+/// happen while it is held; the held leader itself runs nothing and is not a
+/// member here.
 pub fn observe_process_group_or_empty(
     expected_api: &ProcessIdentity,
 ) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
@@ -119,7 +122,13 @@ pub fn observe_process_group_or_empty(
                 return Ok(Vec::new());
             }
             let mut members = scan_group_by_pgid(expected_api.pid, &boot)?;
-            members.retain(|fact| fact.start_ticks >= expected_api.start_ticks);
+            let held = crate::pinned_leader::exited_and_held(expected_api);
+            members.retain(|fact| {
+                fact.start_ticks >= expected_api.start_ticks
+                    && !(held
+                        && fact.pid == expected_api.pid
+                        && fact.start_ticks == expected_api.start_ticks)
+            });
             Ok(members)
         }
     }

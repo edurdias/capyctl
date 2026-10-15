@@ -201,37 +201,42 @@ impl DurableProcessLaunch {
                 )),
             };
         };
-        // SPEC §13.2: signal only a group whose leader is provably ours. `presence`
-        // compares boot id and start ticks, so a reused pid reads as Gone and is
-        // never signalled.
-        if presence(api) == Presence::Alive {
-            signal_group(api.pid, nix::sys::signal::Signal::SIGTERM)?;
+        // SPEC §13.2: signal only a group whose id is provably ours: its leader
+        // is alive (`presence` compares boot id and start ticks, so a reused pid
+        // reads as Gone and is never signalled), or this launcher still holds it
+        // unreaped, which pins the group id (ADR 0028 §11, `pinned_leader`).
+        if presence(api) == Presence::Alive || crate::pinned_leader::is_held(api) {
+            signal_launch_group(api, nix::sys::signal::Signal::SIGTERM)?;
             if self.settled(identities, api, Instant::now() + grace, 200)? {
                 return Ok(false);
             }
-            if presence(api) == Presence::Alive {
-                signal_group(api.pid, nix::sys::signal::Signal::SIGKILL)?;
-            }
+            // ADR 0028 §11 (MN5, found live): a leader that died, during grace or
+            // before this stop, is still held, so the processes of its group that
+            // were never recorded (a vLLM worker the engine forked after the
+            // tree was recorded) get the group's SIGKILL too.
+            signal_launch_group(api, nix::sys::signal::Signal::SIGKILL)?;
             // Spec §5 escalates per identity, not only per group. A leader that
-            // died during grace can no longer be signalled through, so a worker
-            // still holding device memory would otherwise never receive the
-            // group's SIGKILL. Everything recorded has had SIGTERM and the whole
-            // grace window by now, so the second signal follows immediately
-            // rather than opening another grace window: a stop stays within
-            // grace plus the proof window, which is what the coordinator
-            // validates its protocol timeout against.
+            // died during grace and was not held can no longer be signalled
+            // through, so a worker still holding device memory would otherwise
+            // never receive the group's SIGKILL. Everything recorded has had
+            // SIGTERM and the whole grace window by now, so the second signal
+            // follows immediately rather than opening another grace window: a
+            // stop stays within grace plus the proof window, which is what the
+            // coordinator validates its protocol timeout against.
             signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
             signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
                 return Ok(true);
             }
         } else {
-            // The head crashed and left its workers behind. There is no leader to
-            // signal the group through, but each recorded identity carries a boot
-            // id and start ticks that `presence` has just matched, so naming them
-            // one by one kills exactly the launch's own processes and nothing
-            // else. Refusing here instead would pause an operator over a state
-            // capyctl can prove and end.
+            // The head crashed and left its workers behind, and this process
+            // does not hold the leader (it was launched before this role
+            // restarted). There is no leader to signal the group through, but
+            // each recorded identity carries a boot id and start ticks that
+            // `presence` has just matched, so naming them one by one kills
+            // exactly the launch's own processes and nothing else. Refusing here
+            // instead would pause an operator over a state capyctl can prove and
+            // end.
             //
             // ADR 0028 §8, §11: only recorded identities are signalled here. A
             // leaderless group scan can name an unrelated group once the
@@ -322,8 +327,23 @@ fn signal_recorded(
 /// Signal the whole group the leader started, the way `ExecLauncher` does: the
 /// engine's own children belong to the launch and must not outlive it. A group
 /// that has already gone is not an error.
-fn signal_group(leader_pid: u32, signal: nix::sys::signal::Signal) -> Result<(), RuntimeError> {
-    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(leader_pid as i32), signal) {
+///
+/// SPEC §13.2, ADR 0028 §11: through the hold when this launcher holds the
+/// leader, alive or exited (the id cannot be reused while it is held);
+/// otherwise only through a leader `presence` reads alive now. Anything else
+/// is not signalled at all.
+fn signal_launch_group(
+    api: &ProcessIdentity,
+    signal: nix::sys::signal::Signal,
+) -> Result<(), RuntimeError> {
+    let sent = match crate::pinned_leader::signal_group(api, signal) {
+        Some(sent) => sent,
+        None if presence(api) == Presence::Alive => {
+            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(api.pid as i32), signal)
+        }
+        None => return Ok(()),
+    };
+    match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(error) => Err(uncertain(format!("signal failed: {error}"))),
     }
@@ -416,6 +436,99 @@ mod tests {
         tool.terminate_owned(&members, Duration::from_millis(200))
             .unwrap();
         assert!(tool.observe_group(&api).unwrap().is_empty());
+    }
+
+    /// Whether `pid` runs: an exited process (a zombie) does not.
+    fn runs(pid: u32) -> bool {
+        crate::subreaper::proc_stat(pid).is_some_and(|stat| !stat.exited())
+    }
+
+    /// ADR 0028 §11 (MN5 vLLM, found live): the leader of a group worker died
+    /// and left a worker it forked after the tree was recorded, so only the
+    /// leader is recorded. This launcher still holds the dead leader unreaped,
+    /// so the group id is still the launch's: Terminate signals the whole
+    /// group, the unrecorded worker ends, and the recorded set is proven gone
+    /// with the group empty. Before the hold, the leader was reaped at once and
+    /// the stop answered "recorded processes gone but the group still has
+    /// members" for as long as the worker ran.
+    // T31, T33
+    #[test]
+    fn an_unrecorded_worker_of_a_dead_held_leader_is_terminated() {
+        let tool = DurableProcessLaunch::new(Arc::new(Accept));
+        let api = tool.spawn_durable("orphan", &sleeper(60)).unwrap();
+        let members = until_group(&tool, &api);
+        assert!(members.len() >= 2, "{members:?}");
+        let worker = members[1].clone();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(api.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tool.present(&api) != Presence::Gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tool.present(&api), Presence::Gone, "the leader ended");
+        assert!(runs(worker.pid), "the worker outlived its leader");
+        // The leader's exit is known, as before: its launcher observed it.
+        assert_eq!(
+            crate::reaped::status_of(&api),
+            Some(crate::reaped::ReapedStatus::Signal(9))
+        );
+
+        // Only the leader is recorded, as the live worker's tree was.
+        let escalated = tool
+            .terminate_escalating(std::slice::from_ref(&api), Duration::from_secs(2))
+            .unwrap();
+        assert!(!escalated, "a sleep ends on SIGTERM");
+        assert!(!runs(worker.pid), "the unrecorded worker was terminated");
+        assert!(tool.observe_group(&api).unwrap().is_empty());
+        assert_eq!(verify_gone(&[api.clone(), worker]), GoneProof::AllGone);
+        // Nothing of the group runs any more, so the leader is reaped.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{}", api.pid)).exists() {
+            assert!(Instant::now() < deadline, "the leader was never reaped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tool.present(&api), Presence::Gone);
+    }
+
+    /// SPEC §13.2, ADR 0028 §8, §11: a leaderless group this launcher does not
+    /// hold (its leader was spawned and reaped elsewhere, as after a restart of
+    /// the role) is never signalled by its id: its unrecorded survivor keeps
+    /// running and the stop is uncertain.
+    // T33
+    #[test]
+    fn an_unheld_leaderless_group_is_never_signalled() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo $!; sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0);
+        let mut leader = crate::subreaper::spawn_direct(&mut command).unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(leader.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let survivor: u32 = line.trim().parse().unwrap();
+        let api = crate::exec::process_identity(leader.id(), "api").unwrap();
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert_eq!(presence(&api), Presence::Gone);
+
+        let tool = DurableProcessLaunch::new(Arc::new(Accept));
+        assert!(tool
+            .terminate_escalating(std::slice::from_ref(&api), Duration::from_millis(200))
+            .is_err());
+        assert!(runs(survivor), "an unheld group was signalled");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
     }
 
     /// A leader with one child, which starts a grandchild of its own: an engine

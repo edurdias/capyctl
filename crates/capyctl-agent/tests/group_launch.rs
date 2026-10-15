@@ -1404,13 +1404,18 @@ fn ended(pid: u32) -> bool {
     }
 }
 
-// T31, T33 (ADR 0028 §8, §11): a child the worker starts just after its spawn
-// is in the Launch reply and the journal. With the leader dead and reaped,
-// Terminate signals recorded identities only: the recorded child ends, and a
-// child started after the tree settled (never recorded) is never signalled;
-// it keeps the stop uncertain, with the claim retained.
+// T31, T33 (ADR 0028 §8, §11; MN5 vLLM, found live): a child the worker starts
+// just after its spawn is in the Launch reply and the journal; one started
+// after the tree settled (a vLLM `Worker_TP1`) is not. When the recorded
+// leader dies first, its launcher still holds it unreaped, so the group id
+// stays this launch's: Terminate signals the whole group, the unrecorded
+// child ends with the recorded one, and the host answers gone evidence for
+// exactly the recorded identities with the claim released, which the
+// controller settles the member on. Before the hold, the leader was reaped at
+// once, the leaderless group was never signalled, and every Terminate failed
+// while the unrecorded child ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncertain() {
+async fn a_dead_worker_leaders_unrecorded_child_is_terminated_and_the_stop_settles() {
     let host = FakeHost::new("host-b")
         .with_groups_policy(WORKER_PEER)
         .with_late_children();
@@ -1447,35 +1452,35 @@ async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncerta
     {
         assert!(
             std::time::Instant::now() < deadline,
-            "the leader was never reaped"
+            "the leader never ended"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // (b) The unrecorded survivor makes the stop uncertain: no gone report.
-    assert!(host
+    assert!(!ended(later), "the unrecorded child outlived its leader");
+    // Gone evidence for exactly the recorded identities, the claim released.
+    let gone = host
         .terminate(&out.owned_handle, &out.processes)
         .await
-        .is_err());
-    // (a) The recorded child was signalled and ended.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ended(early) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a recorded child survived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // A leaderless group scan never authorizes a signal: it is still running.
-    assert!(!ended(later), "an unrecorded process was signalled");
-    assert!(host
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+    let named = |processes: &[pb::OwnedProcessObservation]| {
+        let mut named: Vec<_> = processes.iter().map(|p| (p.pid, p.start_ticks)).collect();
+        named.sort();
+        named
+    };
+    assert_eq!(named(&gone.result.processes), named(&out.processes));
+    // Both children ended: the recorded one and the one never recorded.
+    assert!(ended(early), "a recorded child survived");
+    assert!(
+        ended(later),
+        "the unrecorded child survived its group's stop"
+    );
+    assert!(!host
         .journal()
         .claimed_launches("")
         .unwrap()
         .iter()
         .any(|claim| claim.command.identity.command_id == out.owned_handle));
-    // The test ends the process it injected the fault into.
-    // SAFETY: kill has no memory preconditions; the pid is the fake's child.
-    unsafe { libc::kill(later as i32, libc::SIGKILL) };
 }
 
 // T31, T33: a worker terminates its own recorded tree only.

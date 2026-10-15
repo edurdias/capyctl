@@ -19,7 +19,9 @@
 //! - a child in CapyCTL's own process group: every `Command` that does not move
 //!   its child into another group;
 //! - a child started through [`spawn_direct`]: every spawn that does, which is
-//!   every engine launch.
+//!   every engine launch. An engine leader its launcher holds unreaped until
+//!   its group ends (`pinned_leader`, ADR 0028 §11) is one of these, so this
+//!   reaper never takes it, however long it stays a zombie.
 //!
 //! An exited child is a zombie, and only its parent can reap it, so its pid
 //! cannot be reused before the wait below: the identity read from its `stat` is
