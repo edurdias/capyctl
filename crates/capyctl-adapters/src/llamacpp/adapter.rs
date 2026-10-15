@@ -155,6 +155,7 @@ impl EngineAdapter for LlamacppAdapter {
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
         Ok(Quiescence {
             quiescent: self.idle_before_signal(member).await == Some(EngineWork::Idle),
+            unproven: None,
         })
     }
 

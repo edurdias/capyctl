@@ -52,7 +52,10 @@ impl EngineAdapter for StuckAdapter {
         &self,
         _: &MemberRef,
     ) -> Result<capyctl_adapters::traits::Quiescence, AdapterError> {
-        Ok(capyctl_adapters::traits::Quiescence { quiescent: false })
+        Ok(capyctl_adapters::traits::Quiescence {
+            quiescent: false,
+            unproven: None,
+        })
     }
     async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
         Ok(WorkObservation::Streaming {

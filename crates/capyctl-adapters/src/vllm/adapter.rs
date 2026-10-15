@@ -445,13 +445,19 @@ impl EngineAdapter for VllmAdapter {
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
         // Quiescence = what the adapter can prove: no live work observed.
         if self.is_parked(member) {
-            return Ok(Quiescence { quiescent: true });
+            return Ok(Quiescence {
+                quiescent: true,
+                unproven: None,
+            });
         }
         // SPEC §10 step 4, §9.2: the engine's own running and waiting gauges
         // must both read zero. An unreadable or missing gauge is unknown work,
         // which is never quiescence.
         let quiescent = matches!(self.http.work_counts().await, Ok(Some((running, waiting))) if running == 0.0 && waiting == 0.0);
-        Ok(Quiescence { quiescent })
+        Ok(Quiescence {
+            quiescent,
+            unproven: None,
+        })
     }
 
     async fn engine_quiescent(&self, member: &MemberRef, _after_ms: i64) -> bool {

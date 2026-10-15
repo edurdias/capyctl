@@ -117,7 +117,10 @@ socket only, under a canonical service-owned 0700 directory whose ancestors
 follow the owner-only rule. Existing files/sockets are never adopted, replaced or repaired. The
 socket is 0600, descriptors are non-inheritable, and one worker handles accepted
 connections through one retained transport instance. The existing bounded replay
-set therefore spans connections rather than resetting on each accept.
+set therefore spans connections rather than resetting on each accept. The socket
+is bound, and the host connects, through a descriptor of its directory
+(`/proc/self/fd/<fd>/<leaf>`), so a directory path of any length fits the
+108-byte `sun_path`.
 
 Retain the server for the scheduler lifetime. `close()` interrupts socket I/O and
 waits at most three seconds for the worker. If a bridge or kernel call remains
@@ -142,7 +145,9 @@ whether physical memory backs each one: a pause unmaps it, a resume maps it
 again. Key mode replaces the enrolled controller PID with a per-launch key
 derived from the admin credential, so a restarted host still observes the
 launch it owns. Any enrollment failure leaves the engine serving without an
-observation, and the host refuses Park unchanged. The host side is
+observation, names its stage on the engine's log
+(`capyctl_saver_enrollment_refused`), and the host refuses Park unchanged; an
+embedded park refusal then says the observation is not enrolled. The host side is
 `crates/capyctl-agent/src/native_execution/saver_source.rs`.
 
 The Rust `NativeObservationClient` interoperability fixture now uses this actual

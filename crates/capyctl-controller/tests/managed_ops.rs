@@ -44,7 +44,10 @@ impl EngineAdapter for ProcAdapter {
         &self,
         _: &MemberRef,
     ) -> Result<capyctl_adapters::traits::Quiescence, AdapterError> {
-        Ok(capyctl_adapters::traits::Quiescence { quiescent: true })
+        Ok(capyctl_adapters::traits::Quiescence {
+            quiescent: true,
+            unproven: None,
+        })
     }
     async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
         Ok(ParkOutcome::Parked { retained_bytes: 0 })

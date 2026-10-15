@@ -274,6 +274,14 @@ def scheduler_target(secret=None):
                              observation_secret=ObservationSecret(secret))
 
 
+class ScopeRefused(Exception):
+    """Why the entry publishes no scope, as a closed code for `_refused`."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 def entry_environment(directory, binding, incarnation, weight_restore="disk_reload",
                       group=None):
     """Validate the host's observation directory and publish the child scope.
@@ -282,28 +290,38 @@ def entry_environment(directory, binding, incarnation, weight_restore="disk_relo
     an absolute, canonical, private (0700, service-owned) directory, and
     `weight_restore` the launch's declared restore. ADR 0028 §12: `group` is a
     group member's (tp, pp, nnodes), published for the topology check; None
-    for a single rank. Returns False (no enrollment) otherwise.
+    for a single rank. Returns False (no enrollment) otherwise, and says why on
+    the engine's log (`_refused`, stage `scope`).
+
+    The directory's length is not limited: the listener binds and the host
+    connects through a descriptor of it (sglang_observation_server.py). Found
+    live 2026-10-14: a 108-byte `<dir>/<binding>.sock` was refused here
+    without a word, and every park of the launch was refused as not quiescent.
     """
     try:
-        if (weight_restore not in WEIGHT_RESTORES
-                or type(directory) is not str or not directory.startswith("/")
-                or os.path.realpath(directory) != directory
-                or len(os.fsencode(os.path.join(directory, binding + ".sock"))) > 107):
-            return False
+        if weight_restore not in WEIGHT_RESTORES:
+            raise ScopeRefused("weight_restore")
+        if (type(directory) is not str or not directory.startswith("/")
+                or os.path.realpath(directory) != directory):
+            raise ScopeRefused("directory_path")
         if group is not None:
             group = ":".join(str(value) for value in group)
-            _group(group)
+            try:
+                _group(group)
+            except ValueError:
+                raise ScopeRefused("group") from None
         info = os.stat(directory, follow_symlinks=False)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o700):
-            return False
+            raise ScopeRefused("directory_mode")
         os.environ[ENV_DIR] = directory
         os.environ[ENV_SCOPE] = binding + ":" + incarnation
         os.environ[ENV_RESTORE] = weight_restore
         if group is not None:
             os.environ[ENV_GROUP] = group
         return True
-    except Exception:
+    except Exception as error:
+        _refused("scope", error)
         return False
 
 

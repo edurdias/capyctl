@@ -50,15 +50,22 @@ class EnrollmentTests(unittest.TestCase):
     def scope(self):
         self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION))
 
-    def ask(self, proof=None, request_id="read-1", version=2, secret="a" * 64):
+    def ask(self, proof=None, request_id="read-1", version=2, secret="a" * 64, directory=None):
         """One request from a client thread while this thread, the one that
-        enrolled (the scheduler thread), ticks the safe point."""
+        enrolled (the scheduler thread), ticks the safe point. The client
+        connects through its own descriptor of the directory, as the host does,
+        so a directory of any length is reachable."""
         answers = []
+        directory = self.directory.name if directory is None else directory
 
         def client():
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.settimeout(3)
-            connection.connect(os.path.join(self.directory.name, BINDING + ".sock"))
+            parent = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                connection.connect(f"/proc/self/fd/{parent}/{BINDING}.sock")
+            finally:
+                os.close(parent)
             key = observation_key(secret, BINDING, INCARNATION)
             body = dict(version=version, request_id=request_id, timeout_ms=1000,
                         proof=proof or request_proof(key, BINDING, INCARNATION, request_id))
@@ -103,6 +110,49 @@ class EnrollmentTests(unittest.TestCase):
         released = self.ask(request_id="read-2")
         self.assertEqual(released["observation"]["allocations"]["mapped_bytes"], 0)
         self.assertEqual(released["observation"]["allocations"]["virtual_bytes"], 28672)
+
+    # T22 T20 (found live 2026-10-14): a state directory long enough to put
+    # `<dir>/<binding>.sock` past the 108-byte `sun_path` once left the launch
+    # unenrolled without a word, and every park was refused as not quiescent.
+    # The listener binds through its own descriptor of the directory instead.
+    def test_a_long_observation_directory_still_enrolls(self):
+        import io
+        deep = Path(self.directory.name)
+        for name in ("s" * 60, "state", "observation"):
+            deep = deep / name
+            deep.mkdir(mode=0o700)
+            os.chmod(deep, 0o700)
+        directory = str(deep)
+        self.assertGreater(len(os.fsencode(os.path.join(directory, BINDING + ".sock"))), 108)
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            self.assertTrue(enrollment.entry_environment(directory, BINDING, INCARNATION))
+            self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(stat.S_ISSOCK((deep / (BINDING + ".sock")).lstat().st_mode))
+        self.assertEqual(json.loads((deep / (BINDING + ".json")).read_text())["socket"],
+                         BINDING + ".sock")
+        self.assertEqual(self.ask(directory=directory)["status"], "observed")
+
+    # T22 T20 (found live 2026-10-14): a scope the entry cannot publish names
+    # why on the engine's own log, with fixed words only, instead of leaving
+    # the launch silently unenrolled.
+    def test_an_unpublishable_scope_names_its_reason(self):
+        import io
+        os.chmod(self.directory.name, 0o750)
+        missing = os.path.join(self.directory.name, "absent")
+        for args, code in (((self.directory.name, BINDING, INCARNATION), "directory_mode"),
+                           ((missing, BINDING, INCARNATION), None),
+                           (("relative", BINDING, INCARNATION), "directory_path"),
+                           ((self.directory.name, BINDING, INCARNATION, "cpu"), "weight_restore")):
+            stderr = io.StringIO()
+            with self.subTest(code=code), mock.patch.object(sys, "stderr", stderr):
+                self.assertFalse(enrollment.entry_environment(*args))
+                event = json.loads(stderr.getvalue())
+                self.assertEqual((event["event"], event["stage"], event["code"]),
+                                 ("capyctl_saver_enrollment_refused", "scope", code))
+                self.assertNotIn(self.directory.name, stderr.getvalue())
+        self.assertNotIn(enrollment.ENV_SCOPE, os.environ)
 
     # T22 / ADR 0019: a host_backed launch's scope carries its declared
     # `cpu_backup` restore, so its weights backup is observed; the same saver

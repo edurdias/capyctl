@@ -503,6 +503,39 @@ async fn a_refused_park_returns_the_launch_to_service() {
     w.shutdown().await.unwrap();
 }
 
+// T20 T22 (found live 2026-10-14): an embedded park refused before any effect
+// names the closed reason the engine gave (a saver observation that never
+// enrolled), not only that the engine is not quiescent.
+#[test]
+fn an_unobserved_engine_park_refusal_says_it_is_not_enrolled() {
+    use capyctl_adapters::traits::Unproven;
+    let not = |unproven| {
+        Ok(Quiescence {
+            quiescent: false,
+            unproven,
+        })
+    };
+    assert_eq!(
+        super::super::quiescence_refusal(not(Some(Unproven::ObservationNotEnrolled))).as_deref(),
+        Some("the engine's saver observation is not enrolled")
+    );
+    assert_eq!(
+        super::super::quiescence_refusal(not(None)).as_deref(),
+        Some("the engine is not quiescent")
+    );
+    assert_eq!(
+        super::super::quiescence_refusal(Ok(Quiescence {
+            quiescent: true,
+            unproven: None,
+        })),
+        None
+    );
+    assert_eq!(
+        super::super::quiescence_refusal(Err(AdapterError::UnsupportedCapability)),
+        None
+    );
+}
+
 // T20, AGENTS.md: an uncertain park keeps the peak reservation and the claim,
 // is never sent again, and only an operator stop's gone evidence releases it.
 #[tokio::test]

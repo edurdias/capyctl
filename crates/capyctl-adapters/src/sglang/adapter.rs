@@ -77,9 +77,13 @@ pub trait SglangRuntimeObserver: Send + Sync {
     }
 
     /// SPEC §10 step 4 before an embedded Park, with no engine effect: the
-    /// engine proves quiescence and a fully mapped saver. Unknown is `false`.
-    async fn quiescent(&self, _access: &ObservationAccess<'_>) -> bool {
-        false
+    /// engine proves quiescence and a fully mapped saver. Unknown is not
+    /// quiescent; a closed reason, when known, says why (`Unproven`).
+    async fn quiescent(&self, _access: &ObservationAccess<'_>) -> Quiescence {
+        Quiescence {
+            quiescent: false,
+            unproven: None,
+        }
     }
 
     /// SPEC §9.2: the host's private directory a memory-saver launch enrolls
@@ -740,11 +744,13 @@ impl EngineAdapter for SglangAdapter {
     async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
         // SPEC §10 step 4: only the observer can prove quiescence and a fully
         // mapped saver; without one (or without credentials) it is not.
-        let quiescent = match (&self.observer, self.access()) {
-            (Some(observer), Ok(access)) => observer.quiescent(&access).await,
-            _ => false,
-        };
-        Ok(Quiescence { quiescent })
+        match (&self.observer, self.access()) {
+            (Some(observer), Ok(access)) => Ok(observer.quiescent(&access).await),
+            _ => Ok(Quiescence {
+                quiescent: false,
+                unproven: None,
+            }),
+        }
     }
     async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
         // SPEC §10 (amended 2026-10-01): the engine's own running and queued
