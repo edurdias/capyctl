@@ -39,7 +39,8 @@
 //! host's evidence (ADR 0028 §11). CPU and fake-engine tests only cover this;
 //! the live rows MN1–MN9 qualify it.
 use crate::group_activation::{
-    probe_head, GroupCtx, HeadLaunch, READINESS_PROBE_DEADLINE, READINESS_PROBE_TOKENS,
+    probe_head, GroupCtx, HeadEvidence, HeadLaunch, READINESS_PROBE_DEADLINE,
+    READINESS_PROBE_TOKENS,
 };
 use crate::group_settlement::GroupTarget;
 use capyctl_config::effective::Residency;
@@ -279,9 +280,15 @@ pub async fn wake_group(
     probe_head(ctx, &head, READINESS_PROBE_TOKENS, READINESS_PROBE_DEADLINE)
         .await
         .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?;
+    // ADR 0028 §12: the canary compares token ids only; an answer without
+    // them (text alone, HeadEvidence::Text) proves no wake.
     let observed = probe_head(ctx, &head, CANARY_TOKENS, CANARY_DEADLINE)
         .await
-        .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?;
+        .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?
+        .into_tokens()
+        .ok_or_else(|| {
+            GroupResidencyError::HeadNotReady("the canary answered no token ids".into())
+        })?;
     match canary_reference(ctx, &target.group) {
         Some(reference) if !canary_matches(&reference, &observed) => {
             Err(GroupResidencyError::CanaryMismatch)
@@ -302,7 +309,11 @@ pub async fn wake_group(
 /// that fails records nothing and the group stays ready; its next wake
 /// records the reference instead of comparing.
 pub async fn record_canary(ctx: &GroupCtx, head: &HeadLaunch, instance_index: u32) {
-    let Ok(tokens) = probe_head(ctx, head, CANARY_TOKENS, CANARY_DEADLINE).await else {
+    let Some(tokens) = probe_head(ctx, head, CANARY_TOKENS, CANARY_DEADLINE)
+        .await
+        .ok()
+        .and_then(HeadEvidence::into_tokens)
+    else {
         return;
     };
     let target = GroupTarget {
