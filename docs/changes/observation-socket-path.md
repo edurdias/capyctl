@@ -56,6 +56,35 @@ CPU tests only; they are not qualification. Live check still needed: a `deep`
 SGLang park and wake on a role whose state directory makes the socket path
 longer than 107 bytes.
 
+## Engine log redaction keeps model paths
+
+Found in the same live run: SGLang's `server_args` line in the engine log
+read `'model_path': '<redacted>.8-27B-NVFP4@482ca0f3...'` and
+`'/home/edurdias/.cache/huggingface/hub/models--RadixArk--Qwen3.<redacted>'`.
+The suspected URL-userinfo rule was not the cause: `redact_urls` only touches
+text after a `scheme://`, and the probe showed it left both lines unchanged.
+The long-run rule was the cause, in both the Python scrubber inside the engine
+(`runtime/sglang_startup_guards.scrub`) and the log writer
+(`capyctl_adapters::vllm::args::redact_text`). A run starting with `/` was
+kept as a path, but a `.` in the path (`.cache`, `capyctl-0.1.3`, `Qwen3.6`)
+ended the run. The rest of the path then began without `/`, and when it was
+48 characters or more it was blanked as a credential. The Python scrubber also
+blanked any whole path of 48 characters or more. Now a run that starts with
+`/` makes the rest of its word a path, past any `.`, `@` or `:`, until
+whitespace, a quote or bracketing punctuation. A path is kept segment by
+segment, so a credential-length segment inside one is still blanked. Launch
+keys (by value), URL userinfo, query strings and bearer values are redacted
+as before.
+
+Tests (T37), failing before and passing after:
+`engine_log::tests::model_paths_in_the_argument_echo_are_kept` and
+`runtime/tests/test_sglang_startup_guards.py`
+`test_scrub_keeps_model_paths_and_still_redacts_keys`. Both use the two live
+paths and also check that the keys on the line, a 64-character segment inside
+a path, URL credentials and bearer values are still redacted. CPU tests only.
+Live check: the `server_args` line of the next SGLang launch shows its model
+path.
+
 # Release note: Fixes
 
 - **Deep parking of SGLang failed on hosts whose state directory path is
@@ -65,3 +94,8 @@ longer than 107 bytes.
   works with a state directory of any length. If it still cannot start, the
   engine log says why, and a refused park says the engine's saver
   observation is not enrolled.
+- **Engine logs no longer hide model paths.** A model path containing a
+  `.` (for example under `~/.cache/huggingface`) showed up in SGLang's
+  argument line with part of it replaced by `<redacted>`. Paths are now kept
+  whole. A credential-length segment inside a path, keys, URL credentials and
+  bearer values are still redacted.

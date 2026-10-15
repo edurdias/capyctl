@@ -548,6 +548,18 @@ fn credential_shaped(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
 }
 
+/// Characters that end a word of free text, and with it a path: whitespace,
+/// quotes and the punctuation around a value. A `.`, `@` or `:` inside a path
+/// (`.cache`, `<repo>@<revision>`, `capyctl-0.1.3`) does not.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+        )
+}
+
 fn starts_with_ignoring_case(text: &[char], marker: &str) -> bool {
     let marker: Vec<char> = marker.chars().collect();
     text.len() >= marker.len()
@@ -567,6 +579,11 @@ pub fn redact_text(text: &str) -> String {
     const MARKERS: [&str; 2] = ["bearer ", "vllm_api_key="];
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
+    // Whether the current word is a path: it began with `/` and has not
+    // ended yet. Found live 2026-10-14: SGLang's `server_args` line showed
+    // `/home/u/.cache/huggingface/hub/models--RadixArk--Qwen3.<redacted>`
+    // because the run after a `.` in a path no longer began with `/`.
+    let mut in_path = false;
     let mut i = 0;
     while i < chars.len() {
         if let Some(marker) = MARKERS
@@ -591,12 +608,14 @@ pub fn redact_text(text: &str) -> String {
                 .iter()
                 .position(|c| !credential_shaped(*c))
                 .map_or(chars.len(), |offset| i + offset);
-            // A run that begins with `/` is a path, never a bare token: the engine
+            // A run that begins with `/`, or continues a path past a `.`, `@` or
+            // `:` in the same word, is a path, never a bare token: the engine
             // prints checkpoint directories deeper than this threshold, and a
             // failure reason that blanks the path the weights came from hides the
             // one fact an operator needs. A path is kept segment by segment, so a
             // credential carried inside it (`/v1/models/<key>`) is still blanked.
-            if chars[i] == '/' {
+            if chars[i] == '/' || in_path {
+                in_path = true;
                 let mut first = true;
                 for segment in chars[i..end].split(|c| *c == '/') {
                     if !first {
@@ -616,6 +635,9 @@ pub fn redact_text(text: &str) -> String {
             }
             i = end;
             continue;
+        }
+        if ends_word(chars[i]) {
+            in_path = false;
         }
         out.push(chars[i]);
         i += 1;

@@ -153,6 +153,35 @@ class StartupGuardsTests(unittest.TestCase):
                 self.assertIn(b"ordinary line", child.stdout)
                 self.assertIn(b"and plain", child.stdout)
 
+    # T37 (found live 2026-10-14): SGLang's `server_args` line keeps its model
+    # paths. A `.` in a path (`.cache`, `capyctl-0.1.3`) used to end the path,
+    # and the long run after it was blanked as a credential; a key, a
+    # credential-length segment inside a path and a bearer value are still.
+    def test_scrub_keeps_model_paths_and_still_redacts_keys(self):
+        sys.path.insert(0, ROOT)
+        self.addCleanup(sys.path.remove, ROOT)
+        from runtime.sglang_startup_guards import scrub
+        store = ("/home/edurdias/capyctl-0.1.3-live-runs/2026-10-14-1854-b18/state/models/"
+                 "sources/hf/nvidia/Qwen3.8-27B-NVFP4@482ca0f3b9a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5")
+        hub = ("/home/edurdias/.cache/huggingface/hub/models--RadixArk--Qwen3.6-35B-A3B-NVFP4/"
+               "snapshots/0123456789abcdef0123456789abcdef01234567")
+        plain = "/var/lib/capyctl/models/org/model/snapshots/0123456789abcdef0123456789abcdef01234567"
+        key = "ab" * 32
+        line = (f"server_args=ServerArgs(model_path='{store}', tokenizer_path='{hub}', "
+                f"download_dir={plain!r}, api_key='{key}')")
+        out = scrub(line)
+        self.assertIn(f"model_path='{store}'", out)
+        self.assertIn(f"tokenizer_path='{hub}'", out)
+        self.assertIn(f"download_dir='{plain}'", out)
+        self.assertNotIn(key, out)
+        self.assertIn("api_key='<redacted>'", out)
+        for text in (f"GET /v1/models/x.{key} 401", f"/home/u/.cache/{key}/w.bin",
+                     f"Authorization: Bearer {key[:20]}", f"token {key}"):
+            with self.subTest(text=text):
+                scrubbed = scrub(text)
+                self.assertNotIn(key[:20], scrubbed)
+                self.assertIn("<redacted>", scrubbed)
+
     def test_prior_native_import_is_too_late(self):
         child = self.child('''
             from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError

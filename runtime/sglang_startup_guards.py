@@ -89,13 +89,37 @@ def enforce_closed_plugins():
 
 # SPEC §13.3 / T21: a bearer value, or a run of credential-shaped characters as
 # long as capyctl's keys (64 hex) or longer than any ordinary token. Mirrors
-# `crates/capyctl-adapters/src/vllm/args.rs::redact_text`.
-_CREDENTIAL = re.compile(r"(?i)(bearer\s+)[^\s'\",;]+|[A-Za-z0-9+/=_-]{48,}")
+# `crates/capyctl-adapters/src/vllm/args.rs::redact_text`: a run that begins
+# with `/` is a path, and so is the rest of its word past any `.`, `@` or `:`;
+# a path is kept segment by segment, so only a credential-length segment inside
+# it is redacted. Found live
+# 2026-10-14: SGLang's `server_args` line showed
+# `/home/u/.cache/huggingface/hub/models--RadixArk--Qwen3.<redacted>`.
+_BEARER = re.compile(r"(?i)(bearer\s+)[^\s'\",;]+")
+_WORD_END = re.compile(r"([\s\x00-\x1f\x7f\"'`,;()\[\]{}<>])")
+_RUN = re.compile(r"[A-Za-z0-9+/=_-]+")
+_SECRET_RUN_MIN = 48
+
+
+def _scrub_word(word):
+    in_path = False
+
+    def run(match):
+        nonlocal in_path
+        text = match.group(0)
+        if in_path or text.startswith("/"):
+            in_path = True
+            return "/".join("<redacted>" if len(segment) >= _SECRET_RUN_MIN else segment
+                            for segment in text.split("/"))
+        return "<redacted>" if len(text) >= _SECRET_RUN_MIN else text
+
+    return _RUN.sub(run, word)
 
 
 def scrub(text):
     """The text with bearer values and credential-shaped runs redacted."""
-    return _CREDENTIAL.sub(lambda match: (match.group(1) or "") + "<redacted>", text)
+    text = _BEARER.sub(lambda match: match.group(1) + "<redacted>", text)
+    return "".join(_scrub_word(part) for part in _WORD_END.split(text))
 
 
 class _ScrubbingStream:
