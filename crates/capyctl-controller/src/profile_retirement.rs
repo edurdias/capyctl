@@ -51,7 +51,9 @@ impl RetirementStep {
                 .cloned()
                 .collect(),
             reason: match self {
-                Self::Refused(reason) => reason.chars().take(MAX_REASON).collect(),
+                Self::Refused(reason) => {
+                    capyctl_domain::diagnostics::bound_chars(reason, MAX_REASON)
+                }
                 _ => String::new(),
             },
         }

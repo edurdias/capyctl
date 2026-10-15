@@ -496,7 +496,9 @@ pub fn sglang_pool(
 /// [`STATIC_OVERHEAD_BYTES`], with the family's margin outside it, is refused
 /// with the smallest whole-GiB request that holds them. A derived request keeps
 /// taking what it lacks from its margin, and an unknown weight size refuses
-/// nothing.
+/// nothing. Found live 2026-10-15: the refusal leads with the request to
+/// raise to, then gives its figures, so a reader that bounds the reason
+/// (status keeps 512 bytes) cuts the figures, never the request.
 fn fixed_state_fits(
     settings: &SglangLaunchSettings,
     args: &[String],
@@ -534,11 +536,11 @@ fn fixed_state_fits(
         .1
         .unwrap_or_default();
     Err(format!(
-        "SGLang's static pool holds {weights} bytes of weights{}, the {kv}-byte KV cache, \
+        "raise engine_config.memory.request {named}, keeping memory.kv_cache at {kv} bytes: \
+         SGLang's static pool holds {weights} bytes of weights{}, the {kv}-byte KV cache, \
          {state} bytes of recurrent state for the {slots} slots `--max-mamba-cache-size` \
          fixes{}, and {overhead} bytes of SGLang's own allocations, {} bytes in all; with the \
-         {margin}-byte margin outside it that is more than the {}-byte memory request; raise \
-         engine_config.memory.request {named}, keeping memory.kv_cache at {kv} bytes",
+         {margin}-byte margin outside it that is more than the {}-byte memory request",
         if draft_tables > 0 {
             format!(", the MTP draft's {draft_tables}-byte embedding and LM head")
         } else {
@@ -771,15 +773,21 @@ fn sized_pool(
             // Found live 2026-10-04: the request named is the smallest whole
             // MiB this same check accepts for an explicit request, with the
             // KV cache as it is: SGLang's margin stays outside the static pool.
+            // Found live 2026-10-15: it leads, so a bounded reason keeps it.
             let named = smallest_request(memory, held.saturating_add(kv), needed)
                 .map(|mib| format!("to \"{mib}MiB\" ({} bytes)", mib << 20))
                 .unwrap_or_else(|| "beyond what CapyCTL can express".into());
             return Err(format!(
-                "SGLang keeps {needed} bytes of recurrent state for {running} running \
+                "raise engine_config.memory.request {named}, keeping memory.kv_cache at {kv} \
+                 bytes{}: SGLang keeps {needed} bytes of recurrent state for {running} running \
                  request{} of this hybrid model ({} state slots of {} bytes{}), beside {held} \
                  bytes of weights{} and the {kv}-byte KV cache, and the memory request leaves \
-                 {} bytes for it; raise engine_config.memory.request {named}, keeping \
-                 memory.kv_cache at {kv} bytes{}",
+                 {} bytes for it",
+                if running > 1 {
+                    " (or lower max_concurrent_requests)"
+                } else {
+                    ""
+                },
                 if running == 1 { "" } else { "s" },
                 u64::from(running) * STATE_SLOTS_PER_REQUEST + 1,
                 hybrid.state_bytes,
@@ -800,11 +808,6 @@ fn sized_pool(
                     String::new()
                 },
                 available,
-                if running > 1 {
-                    " (or lower max_concurrent_requests)"
-                } else {
-                    ""
-                },
             ));
         }
     };

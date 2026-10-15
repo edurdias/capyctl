@@ -1522,7 +1522,7 @@ impl crate::Store {
 const SWITCH_PRINCIPAL: &str = "switch";
 
 fn redact_reason(reason: &str) -> String {
-    reason.chars().take(512).collect()
+    capyctl_domain::diagnostics::bound_chars(reason, 512)
 }
 
 fn limits(policy: &ResourcePolicySnapshot) -> Vec<MemoryLimit> {

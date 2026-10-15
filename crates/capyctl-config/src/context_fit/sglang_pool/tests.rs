@@ -502,6 +502,44 @@ fn named_request_gib(refusal: &str) -> i64 {
     tail.split("GiB\"").next().unwrap().parse().unwrap()
 }
 
+// Found live 2026-10-15 (Qwen3.8-27B with an EAGLE MTP draft and
+// `--max-mamba-cache-size 60` at a 65 GiB request on host A): status bounds
+// a reason to 512 bytes, and the refusal, which named the request to raise to
+// last, reached the operator cut at "raise engin". It now leads with that
+// request, 75 GiB (71163366912 + 8589934592 = 79753301504 bytes, rounded up
+// to whole GiB), and keeps every figure after it.
+#[test]
+fn the_live_eagle_refusal_leads_with_the_request_to_raise() {
+    let mut live = settings(69_793_218_560, 31_138_512_896, Some(21_921_697_280));
+    let args = [
+        "--max-mamba-cache-size",
+        "60",
+        "--speculative-algorithm",
+        "EAGLE",
+    ]
+    .map(String::from);
+    live.extra_args = args.to_vec();
+    let refusal = fixed_state_fits(&live, &args, 9_796_337_664, 5_085_593_600).unwrap_err();
+    assert_eq!(
+        refusal,
+        "raise engine_config.memory.request to \"75GiB\" (80530636800 bytes), keeping \
+         memory.kv_cache at 31138512896 bytes: SGLang's static pool holds 21921697280 bytes of \
+         weights, the MTP draft's 5085593600-byte embedding and LM head, the 31138512896-byte \
+         KV cache, 9796337664 bytes of recurrent state for the 60 slots \
+         `--max-mamba-cache-size` fixes (with its speculative decoding scratch), and \
+         3221225472 bytes of SGLang's own allocations, 71163366912 bytes in all; with the \
+         8589934592-byte margin outside it that is more than the 69793218560-byte memory \
+         request"
+    );
+    assert_eq!(named_request_gib(&refusal), 75);
+    assert_eq!(counted_in(&refusal), 71_163_366_912);
+    // The request it names is the smallest whole GiB that holds them.
+    live.memory.request_bytes = 75 * GIB;
+    assert!(fixed_state_fits(&live, &args, 9_796_337_664, 5_085_593_600).is_ok());
+    live.memory.request_bytes = 74 * GIB;
+    assert!(fixed_state_fits(&live, &args, 9_796_337_664, 5_085_593_600).is_err());
+}
+
 /// The static pool a refusal of a declared request says it needs, in bytes.
 fn counted_in(refusal: &str) -> i64 {
     let head = refusal
@@ -551,6 +589,14 @@ fn a_refusal_names_the_smallest_request_that_fits() {
     cases.push(derived);
     for case in cases {
         let refusal = check(&case).unwrap_err();
+        // Found live 2026-10-15: the request to raise to leads the refusal.
+        assert!(
+            refusal.starts_with(&format!(
+                "raise engine_config.memory.request to \"{}MiB\"",
+                named_request_mib(&refusal)
+            )),
+            "{refusal}"
+        );
         let named = named_request_mib(&refusal);
         assert!(named << 20 > case.memory.request_bytes, "{refusal}");
         assert!(

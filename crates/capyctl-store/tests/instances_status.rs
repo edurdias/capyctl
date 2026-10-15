@@ -221,6 +221,93 @@ fn status_marks_an_operation_whose_start_gave_up() {
         .is_none());
 }
 
+/// The live SGLang sizing refusal of 2026-10-15 as the coordinator journals it
+/// (`capyctl_config::context_fit::sglang_pool`, pinned there).
+const LIVE_REFUSAL: &str = "deployment d: gave up: host policy refused the launch before any \
+    effect: raise engine_config.memory.request to \"75GiB\" (80530636800 bytes), keeping \
+    memory.kv_cache at 31138512896 bytes: SGLang's static pool holds 21921697280 bytes of \
+    weights, the MTP draft's 5085593600-byte embedding and LM head, the 31138512896-byte KV \
+    cache, 9796337664 bytes of recurrent state for the 60 slots `--max-mamba-cache-size` fixes \
+    (with its speculative decoding scratch), and 3221225472 bytes of SGLang's own allocations, \
+    71163366912 bytes in all; with the 8589934592-byte margin outside it that is more than the \
+    69793218560-byte memory request";
+
+/// Found live 2026-10-15: status bounds a reason to 512 bytes, and an SGLang
+/// sizing refusal reached the operator cut at "raise engin". The refusal now
+/// leads with the request to raise to, so the status reason keeps it; a cut
+/// reason ends in a visible ellipsis, and its hint is classified from the
+/// whole reason, so a closed code past the bound still picks it.
+#[test]
+fn a_bounded_reason_keeps_the_request_to_raise_and_shows_the_cut() {
+    use capyctl_domain::diagnostics::{operator_hint, ELLIPSIS, MAX_REASON_BYTES};
+    let (_dir, store, writer) = fixture();
+    writer
+        .execute_batch(&format!(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,observed_state,admission_enabled,dispatch_enabled,suspended,current_generation,schema_version,revision) VALUES('d','d','model','ready','starting',0,0,0,5,1,1);
+            INSERT INTO effective_revisions VALUES('d',1,'{VLLM_EXPOSED}','f');
+            UPDATE deployment_instances SET generation=5 WHERE deployment_id='d' AND instance_index=0;
+            INSERT INTO operations(id,deployment_id,kind,state,accepted_at) VALUES
+              ('o1','d','initialize','pending','2026-01-01T00:00:02.000Z');
+            INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json,instance_index) VALUES
+              ('o1','d',1,5,'s','activate','running',1,'{{}}',0);"#
+        ))
+        .unwrap();
+    let given_up = |evidence: &str| {
+        writer
+            .execute(
+                "INSERT INTO journal_entries(id,host_id,operation_id,state,evidence) VALUES(?1,NULL,'o1','given_up',?2)",
+                rusqlite::params![ulid::Ulid::new().to_string(), evidence],
+            )
+            .unwrap();
+        serde_json::to_value(store.snapshot().unwrap()).unwrap()
+    };
+    let json = given_up(LIVE_REFUSAL);
+    let full = LIVE_REFUSAL.strip_prefix("deployment d: ").unwrap();
+    for latest in [
+        &json["deployments"][0]["latest_operation"],
+        &json["deployments"][0]["instances"][0]["latest_operation"],
+    ] {
+        let reason = latest["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(
+                "gave up: host policy refused the launch before any effect: raise \
+                 engine_config.memory.request to \"75GiB\" (80530636800 bytes), keeping \
+                 memory.kv_cache at 31138512896 bytes: SGLang's static pool holds"
+            ),
+            "{reason}"
+        );
+        assert!(reason.len() <= MAX_REASON_BYTES, "{}", reason.len());
+        assert!(reason.ends_with(ELLIPSIS), "{reason}");
+        assert!(
+            full.starts_with(reason.trim_end_matches(ELLIPSIS)),
+            "{reason}"
+        );
+    }
+    // A very long reason (within the 4096 bytes status reads) keeps its lead,
+    // and the closed code past the bound still picks the hint.
+    let long = format!(
+        "deployment d: gave up: host policy refused the launch before any effect: raise \
+         engine_config.memory.request to \"75GiB\" (80530636800 bytes): {}insufficient_memory",
+        "71163366912 bytes in all; ".repeat(100)
+    );
+    let json = given_up(&long);
+    let latest = &json["deployments"][0]["latest_operation"];
+    let reason = latest["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with(
+            "gave up: host policy refused the launch before any effect: raise \
+             engine_config.memory.request to \"75GiB\" (80530636800 bytes): "
+        ) && reason.ends_with(ELLIPSIS)
+            && reason.len() <= MAX_REASON_BYTES,
+        "{reason}"
+    );
+    assert_eq!(
+        latest["hint"].as_str(),
+        operator_hint("insufficient_memory"),
+        "{latest}"
+    );
+}
+
 /// ADR 0013 §7: compaction moves an instance that holds no runtime into a free
 /// lower index. The runs recorded at that index belong to the incarnations
 /// that used it before; the instance now there never ran them. Status derives
