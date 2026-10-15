@@ -475,6 +475,11 @@ impl HostJournal {
         // and its bounded wait and was ended with SIGKILL. Evidence only, same
         // schema version like member_exits.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS terminate_escalations(command_id TEXT PRIMARY KEY REFERENCES commands(command_id));")?;
+        // ADR 0028 §8 (found live 2026-10-15, MN5): a process a launch step's
+        // own scan journaled that was proven gone before the step reported
+        // (SGLang's short-lived first child): history only, never one of the
+        // launch's recorded processes. Same schema version like member_exits.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS departed_processes(command_id TEXT NOT NULL REFERENCES commands(command_id),role TEXT NOT NULL,pid INTEGER NOT NULL,boot TEXT NOT NULL,ticks INTEGER NOT NULL,PRIMARY KEY(command_id,pid,boot,ticks));")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -2089,13 +2094,15 @@ fn after_readiness(
 /// stable for each process identity across scans. A group scan names a
 /// launch's processes `worker-<i>` and `helper-<i>` by start order among those
 /// alive now, so once a short-lived child exited (SGLang's worker forks one
-/// before its rank processes) the next child took its name, and the journal,
-/// which keeps every process it recorded, gone ones too, held two `worker-0`:
-/// the member's identities were refused as invalid and the group stopped. Here
-/// a process already recorded keeps its recorded role, and a new one takes the
-/// next index of its kind after every index recorded or taken in this scan, so
-/// no index is reused. The roles are journaled with the processes, so a
-/// restarted host role names them the same.
+/// before its rank processes) the next child took its name, and the journal
+/// held two `worker-0`: the member's identities were refused as invalid and
+/// the group stopped. Here a process already recorded keeps its recorded role,
+/// and a new one takes the next index of its kind after every index recorded
+/// or taken in this scan, so no recorded index is ever reused. The roles are
+/// journaled with the processes, so a restarted host role names them the
+/// same. A launch step's own scans first set aside what departed before the
+/// step reported ([`depart_gone`]), which frees its index: the recorded
+/// processes stay `worker-0..n` with no gap, as a head's readiness requires.
 fn stable_roles(
     recorded: &[ProcessIdentity],
     observed: Vec<ProcessIdentity>,
@@ -2129,6 +2136,43 @@ fn stable_roles(
             p
         })
         .collect()
+}
+
+/// ADR 0028 §8 (found live 2026-10-15, MN5): during its own launch step, a
+/// journaled process that this scan no longer sees and that is proven gone
+/// by identity (SGLang's short-lived first child) departed before the step
+/// reported. It is moved from the launch's recorded processes to
+/// `departed_processes` (history only), so the Launch reply, the controller's
+/// record of the member and the supervision of a Ready launch never name it:
+/// recorded, its exit read as the member's own and failed the group right
+/// after it answered. The spawned leader is never set aside, and a process
+/// whose presence cannot be established stays recorded (uncertainty retains
+/// it). Returns the processes still recorded.
+fn depart_gone(
+    tx: &Connection,
+    command: &str,
+    observed: &[ProcessIdentity],
+) -> Result<Vec<ProcessIdentity>, JournalError> {
+    let same = |a: &ProcessIdentity, b: &ProcessIdentity| {
+        a.pid == b.pid && a.boot_id == b.boot_id && a.start_ticks == b.start_ticks
+    };
+    let (departed, kept): (Vec<_>, Vec<_>) =
+        record(tx, command)?.processes.into_iter().partition(|p| {
+            p.role != "api"
+                && !observed.iter().any(|o| same(o, p))
+                && capyctl_launchers::process_absence::presence(p) == Presence::Gone
+        });
+    for p in &departed {
+        tx.execute(
+            "INSERT OR IGNORE INTO departed_processes VALUES(?1,?2,?3,?4,?5)",
+            params![command, p.role, p.pid, p.boot_id, p.start_ticks as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM processes WHERE command_id=?1 AND pid=?2 AND boot=?3 AND ticks=?4",
+            params![command, p.pid, p.boot_id, p.start_ticks as i64],
+        )?;
+    }
+    Ok(kept)
 }
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
@@ -2405,14 +2449,16 @@ impl OwnedProcessLaunch for JournalLaunchTools {
             return Err(RuntimeError::Uncertain("unowned process".into()));
         }
         let observed = self.tools.observe_group(api)?;
-        // ADR 0028 §8 (found live 2026-10-15, MN2): each process keeps the
-        // role it was first journaled under ([`stable_roles`]).
+        // ADR 0028 §8 (found live 2026-10-15, MN2, MN5): what departed is set
+        // aside, then each process keeps the role it was first journaled
+        // under ([`stable_roles`]).
         let persist = || -> Result<Vec<ProcessIdentity>, JournalError> {
             self.journal.validate()?;
             let mut db = self.journal.db.lock().map_err(|_| JournalError::Storage)?;
             let tx = db.transaction()?;
             let id = &self.command.identity.command_id;
-            let named = stable_roles(&record(&tx, id)?.processes, observed);
+            let recorded = depart_gone(&tx, id, &observed)?;
+            let named = stable_roles(&recorded, observed);
             for identity in &named {
                 persist_process(&tx, id, identity)?;
             }
