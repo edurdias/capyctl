@@ -10,6 +10,35 @@
 /// The longest reason status shows.
 pub const MAX_REASON_BYTES: usize = 512;
 
+/// What a reason cut to its bound ends with, so a reader sees it was cut.
+pub const ELLIPSIS: char = '…';
+
+/// `text` within `max_bytes` bytes: as it is when it fits, else cut on a
+/// character boundary and ended with [`ELLIPSIS`], the whole within the
+/// bound. Found live 2026-10-15: a reason that leads with what to do keeps
+/// it, and the cut is visible.
+pub fn bound_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes.saturating_sub(ELLIPSIS.len_utf8());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &text[..end])
+}
+
+/// `text` within `max_chars` characters: as it is when it fits, else its
+/// first `max_chars - 1` characters and [`ELLIPSIS`].
+pub fn bound_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().nth(max_chars).is_none() {
+        return text.to_owned();
+    }
+    let mut bounded: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    bounded.push(ELLIPSIS);
+    bounded
+}
+
 /// Closed categories with an operator hint, most specific first, so a reason
 /// that names several is classified by the most specific one.
 const HINTS: &[(&str, &str)] = &[
@@ -141,12 +170,15 @@ pub fn classify(error_code: Option<&str>, reason: &str) -> Option<&'static str> 
         .map(|(known, _)| *known)
 }
 
-/// The recorded reason as status shows it, or `None` when nothing may be shown.
+/// The recorded reason as status shows it, before its bound, or `None` when
+/// nothing may be shown. Status classifies this, then bounds it with
+/// [`bound_bytes`] to [`MAX_REASON_BYTES`], so a closed code the bound would
+/// cut still picks the hint.
 ///
 /// Only the first line is kept (an engine log tail never follows it), the
 /// journal's `deployment <id>: ` prefix and the coordinator's service wrapper
 /// are removed, and a reason that may quote a credential is withheld.
-pub fn public_reason(evidence: &str) -> Option<String> {
+pub fn public_text(evidence: &str) -> Option<String> {
     let mut text = evidence.lines().next()?.trim();
     // A structured journal record is evidence for tools, not a reason.
     if text.starts_with('{') || text.starts_with('[') {
@@ -180,11 +212,7 @@ pub fn public_reason(evidence: &str) -> Option<String> {
             "the recorded reason is withheld from status because it may quote a credential".into(),
         );
     }
-    let mut end = text.len().min(MAX_REASON_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(text[..end].to_owned())
+    Some(text.to_owned())
 }
 
 #[cfg(test)]
@@ -207,7 +235,7 @@ mod tests {
     fn a_reason_keeps_one_line_without_the_log_tail() {
         let evidence = "deployment 01ABC: launch failed: coordinator service failed: engine exited before readiness; log tail:\nValueError: --moe-backend bogus\nsecret";
         assert_eq!(
-            public_reason(evidence).as_deref(),
+            public_text(evidence).as_deref(),
             Some("launch failed: engine exited before readiness")
         );
     }
@@ -215,20 +243,47 @@ mod tests {
     // T08: a structured journal record is not a reason.
     #[test]
     fn a_structured_record_is_not_a_reason() {
-        assert_eq!(public_reason(r#"{"event":"quiesce_unknown"}"#), None);
-        assert_eq!(public_reason(""), None);
-        assert_eq!(public_reason("\nsecond line"), None);
+        assert_eq!(public_text(r#"{"event":"quiesce_unknown"}"#), None);
+        assert_eq!(public_text(""), None);
+        assert_eq!(public_text("\nsecond line"), None);
     }
 
     // T29: anything that may quote a credential is withheld, and the reason
     // is bounded.
     #[test]
     fn a_reason_that_may_quote_a_credential_is_withheld_and_long_ones_are_bounded() {
-        let withheld = public_reason("launch failed: header Authorization: Bearer abc").unwrap();
+        let withheld = public_text("launch failed: header Authorization: Bearer abc").unwrap();
         assert!(!withheld.contains("abc"));
         assert!(withheld.contains("withheld"));
-        let long = public_reason(&"é".repeat(600)).unwrap();
+        let long = bound_bytes(&public_text(&"é".repeat(600)).unwrap(), MAX_REASON_BYTES);
         assert!(long.len() <= MAX_REASON_BYTES);
+    }
+
+    // T08 T29 (found live 2026-10-15): a bounded reason is cut on a character
+    // boundary and ends in a visible ellipsis, within the bound; one that
+    // fits is kept as it is. A reason that leads with what to do keeps it
+    // however long its figures run.
+    #[test]
+    fn a_cut_reason_ends_in_an_ellipsis_and_keeps_its_lead() {
+        let fits = "x".repeat(MAX_REASON_BYTES);
+        assert_eq!(bound_bytes(&fits, MAX_REASON_BYTES), fits);
+        for long in [
+            "é".repeat(600),
+            "x".repeat(600),
+            format!("x{}", "é".repeat(600)),
+        ] {
+            let cut = bound_bytes(&long, MAX_REASON_BYTES);
+            assert!(cut.len() <= MAX_REASON_BYTES, "{}", cut.len());
+            assert!(cut.len() > MAX_REASON_BYTES - 5, "{}", cut.len());
+            assert!(cut.ends_with(ELLIPSIS), "{cut}");
+            assert!(long.starts_with(cut.trim_end_matches(ELLIPSIS)));
+        }
+        let lead = "raise engine_config.memory.request to \"75GiB\" (80530636800 bytes)";
+        let reason = format!("{lead}: {}", "71163366912 bytes in all; ".repeat(100));
+        let cut = bound_bytes(&reason, MAX_REASON_BYTES);
+        assert!(cut.starts_with(lead) && cut.ends_with(ELLIPSIS), "{cut}");
+        assert_eq!(bound_chars("ééé", 3), "ééé");
+        assert_eq!(bound_chars("éééé", 3), "éé…");
     }
 
     // T08 T29: the most specific closed category the reason names picks the

@@ -843,7 +843,7 @@ impl crate::Store {
                     } else {
                         error.to_string()
                     };
-                    let diagnostic = reason.chars().take(512).collect::<String>();
+                    let diagnostic = capyctl_domain::diagnostics::bound_chars(&reason, 512);
                     tx.execute(
                         "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5,provenance=?7 WHERE deployment_id=?1 AND revision=?2",
                         params![deployment, revision, digest, host_id, now_ms, diagnostic, provenance.code()],
