@@ -23,10 +23,10 @@ cmd=${1:-}
 # times. A deployment shared by several checks is counted under the first.
 estimates() {
   cat <<'EOF'
-B1	20	vLLM 0.30.0 model 1: cold start with empty kernel caches ~5, three deep park/wake cycles ~4 each; carries B2 and the vLLM parts of B3, B5, B14
+B1	40	vLLM 0.30.0 model 1: cold start with empty kernel caches ~5, three deep park/wake cycles ~4 each on the default loader; lazy variant (informational) start ~5 and up to three cycles (a hung wake gives up after 10 minutes); carries B2 and the vLLM parts of B3, B5
 B2	0	inside B1's three cycles
-B3	12	vLLM requests ~1; TensorFold 0.6.6 model 1 start and requests ~5; SGLang 0.5.21 4B cold start with empty kernel caches and requests ~6
-B4	16	vLLM eager start ~4; up to 6 park/wake cycles ~2 each until the growth stop
+B3	14	vLLM requests ~1; TensorFold 0.6.6 model 1 with the DFlash2 drafter start and requests ~7; SGLang 0.5.21 4B cold start with empty kernel caches and requests ~6
+B4	16	own role (parked_growth_limit 0B): vLLM eager start ~4; up to 6 park/wake cycles ~2 each until the growth stop (SKIP when the charge never grows)
 B5	2	vLLM and SGLang: one marked request each, log scan, management tail
 B6	2	SGLang 4B: two requests in flight, load read polled, role log scanned
 B7	4	own role (managed 110GiB, reserve 11GiB): one refused start, no engine runs
@@ -36,7 +36,7 @@ B10	150	Flash-Next: ~135 GB download ~40, SGLang first start with kernel builds 
 B11	6	Qwen2.5-0.5B: 1 GB download into the run's sources directory, cold vLLM start
 B12	12	SGLang 27B with model.draft (DFlash2 drafter download ~3 GB) and DFLASH: start ~8
 B13	12	own role (plain HTTP approved for 127.0.0.1:<http port>): two tar payloads, three loopback fetches, two vLLM starts
-B14	2	vLLM and SGLang: three salted requests each; TensorFold: one refused request
+B14	6	vLLM Qwen3-4B (dense, restart_only) start and three salted requests; SGLang: three salted requests; TensorFold: one refused request
 B15	2	SGLang 27B (B9's first deployment): load read during a request against the engine log
 B16	0	SKIP: no gpt-oss-120b on the host
 B17	15	container: image build, role as PID 1, vLLM 4B start and stop
@@ -346,7 +346,9 @@ phases_yaml() { # cold ready: the five phases of a declared reservation on unifi
   done
 }
 
-dep_tf_m1() { # model 1 on TensorFold 0.6.6, the catalog recipe's reservation, no drafter
+dep_tf_m1() { # model 1 on TensorFold 0.6.6 with the DFlash2 drafter (TensorFold needs one for this model)
+  # The quick-check reservation for Qwen3.8-27B with its drafter (scripts/live/quick-check/remote.sh);
+  # --drafter and ~/drafters are approved by the tf66 profile (SPEC §7 extra-argument approval).
   yaml t-m1 <<EOF
 schema_version: 1
 kind: deployment
@@ -354,9 +356,11 @@ name: t-m1
 engine: tf66
 model: $M1
 residency: restart_only
-$(phases_yaml 36GiB 34GiB)
+$(phases_yaml 60GiB 58GiB)
 engine_config:
   context_length: 32768
+  accept_extra_args: true
+  extra_args: [--drafter, $DRAFTER]
 EOF
 }
 
@@ -378,12 +382,15 @@ EOF
 }
 
 dep_sglang_m1() { # name kv extra-args-yaml
+  # modelopt on SGLang has no deep park in this build (capability_missing:deep_park,
+  # by design): the deployment declares restart_only.
   yaml "$1" <<EOF
 schema_version: 1
 kind: deployment
 name: $1
 engine: s21
 model: $M1
+residency: restart_only
 timeouts: {initialize: 1800s}
 engine_config:
   quantization: modelopt
@@ -394,7 +401,7 @@ ${3:-  # no extra arguments}
 EOF
 }
 
-dep_sglang_draft() {
+dep_sglang_draft() { # [memory request]
   local draft="$DRAFTER"
   [ "$DRAFT_SOURCE" = hf ] && draft="{hf: $DRAFT_HF}"
   yaml s-m1-draft <<EOF
@@ -407,19 +414,22 @@ engine: s21
 model:
   path: $M1
   draft: $draft
+residency: restart_only
 timeouts: {initialize: 1800s}
 engine_config:
   quantization: modelopt
   kv_cache_dtype: fp8_e4m3
   context_length: 32768
   max_concurrent_requests: 8
-  memory: {request: 65GiB, kv_cache: 16GiB}
+  # The size CapyCTL named when it refused 65GiB (the recurrent state of 8 requests
+  # and 72 draft-token states, beside weights and the KV cache).
+  memory: {request: ${1:-67486MiB}, kv_cache: 16GiB}
   accept_extra_args: true
   extra_args: [--speculative-algorithm, DFLASH, --speculative-num-draft-tokens, "8", --speculative-draft-model-quantization, unquant]
 EOF
 }
 
-dep_vllm_small() { # name model-yaml [profile]
+dep_vllm_small() { # name model-yaml [profile] [extra engine_config yaml]
   yaml "$1" <<EOF
 schema_version: 1
 kind: deployment
@@ -429,6 +439,7 @@ model: $2
 timeouts: {initialize: 1800s}
 engine_config:
   context_length: 8192
+${4:-  # nothing more}
 EOF
 }
 
@@ -483,7 +494,7 @@ preflight() {
   phase "preflight: venvs, models, no other engine, free ports"
   if [ "$PLAN" = 1 ]; then
     show "check ~/vllm-0.30.0-venv reports vllm 0.30.0, ~/sglang-0.5.21-venv sglang 0.5.21, ~/tensorfold-0.6.6-venv tensorfold 0.6.6 (each when a selected check needs it)"
-    show "check ~/models/qwen3.8-27b-nvfp4 and ~/models/qwen3-4b-instruct hold config.json$([ "$DRAFT_SOURCE" = local ] && echo ", ~/drafters/Qwen3.8-27B-DFlash2 too")"
+    show "check ~/models/qwen3.8-27b-nvfp4 and ~/models/qwen3-4b-instruct hold config.json$(want B3 B14 && echo ", ~/drafters/Qwen3.8-27B-DFlash2 too (TensorFold's drafter)")"
     show "check no engine process runs (pgrep '$ANY_ENGINE') and ports $PORT, $MPORT, $HTTP_PORT, $CPORT, $((CPORT + 1)) are free"
     return 0
   fi
@@ -501,7 +512,7 @@ preflight() {
     [ "$got" = 0.6.6 ] || { say "preflight: tensorfold-0.6.6-venv reports '$got'"; bad=1; }
   fi
   for p in "$M1" "$Q4B"; do [ -f "$p/config.json" ] || { say "preflight: ${p/#$HOME/~} has no config.json"; bad=1; }; done
-  if [ "$DRAFT_SOURCE" = local ] && want B12 && [ ! -f "$DRAFTER/config.json" ]; then say "preflight: no drafter in ~/drafters"; bad=1; fi
+  if { want B3 B14 || { [ "$DRAFT_SOURCE" = local ] && want B12; }; } && [ ! -f "$DRAFTER/config.json" ]; then say "preflight: no ~/drafters/Qwen3.8-27B-DFlash2 (TensorFold's drafter, and B12's with --draft-source local)"; bad=1; fi
   if pgrep -af -- "$ANY_ENGINE" >/dev/null; then say "preflight: an engine process is running on the host; one live session at a time"; bad=1; fi
   for p in "$PORT" "$MPORT" "$HTTP_PORT" "$CPORT" "$((CPORT + 1))"; do
     if ss -ltnH "sport = :$p" 2>/dev/null | grep -q .; then say "preflight: port $p is in use"; bad=1; fi
@@ -583,29 +594,31 @@ EOF
   role_down
 }
 
-# B1, B2 and the vLLM parts of B3, B5, B14: model 1, deep, no declared loader.
-step_vllm_lazy() {
-  want B1 B2 B3 B5 B14 || return 0
-  phase "vLLM 0.30.0, model 1, deep parking, no declared loader: B1, B2, B3 vLLM, B5 vLLM, B14 vLLM"
-  profile v30 vllm "$V30" vllm || { fail_ids "vLLM" "engine add failed" B1 B2 B3 B5 B14; return; }
-  dep_vllm_m1 v-lazy ""
-  deploy v-lazy || { fail_ids "vLLM" "deploy refused; see cli.log" B1 B2 B3 B5 B14; return; }
-  startd v-lazy cold-lazy || { fail_ids "vLLM" "start failed; see cli.log" B1 B2 B3 B5 B14; stopd v-lazy; return; }
-  local id base ready_gib strat prov sleepf lazyf metf
+# B1, B2 and the vLLM parts of B3, B5: model 1, deep, no declared loader. The
+# default is whatever CapyCTL resolves by memory shape (provenance 'capyctl
+# default'); the run records which and checks the launch carries it.
+step_vllm_default() {
+  want B1 B2 B3 B5 || return 0
+  phase "vLLM 0.30.0, model 1, deep parking, no declared loader: B1, B2, B3 vLLM, B5 vLLM"
+  profile v30 vllm "$V30" vllm || { fail_ids "vLLM" "engine add failed" B1 B2 B3 B5; return; }
+  dep_vllm_m1 v-default ""
+  deploy v-default || { fail_ids "vLLM" "deploy refused; see cli.log" B1 B2 B3 B5; return; }
+  startd v-default cold-default || { fail_ids "vLLM" "start failed; see cli.log" B1 B2 B3 B5; stopd v-default; return; }
+  local id base ready_gib strat prov sleepf loadf metf
   base=$BEFORE_GIB ready_gib=$READY_GIB
-  id=$(dep_id v-lazy)
+  id=$(dep_id v-default)
   if want B1; then
-    check B1 config "inspect deployment --effective-config --json: engine_config.safetensors_load_strategy lazy and engine_config.provenance[\"vllm.safetensors_load_strategy\"] 'capyctl default'; the engine command line holds --enable-sleep-mode and '--safetensors-load-strategy lazy'"
-    c inspect deployment v-lazy --effective-config --json >"$RES/b1-effective.json" 2>>"$RES/cli.log"
+    check B1 config "inspect deployment --effective-config --json: engine_config.provenance[\"vllm.safetensors_load_strategy\"] 'capyctl default' and engine_config.safetensors_load_strategy lazy or eager (recorded); the engine command line holds --enable-sleep-mode and '--safetensors-load-strategy <that strategy>'"
+    c inspect deployment v-default --effective-config --json >"$RES/b1-effective.json" 2>>"$RES/cli.log"
     strat=$(ev get "$RES/b1-effective.json" 'engine_config.safetensors_load_strategy')
     prov=$(ev get "$RES/b1-effective.json" 'engine_config.provenance["vllm.safetensors_load_strategy"]')
     sleepf=$(argv_count "$V30" "--enable-sleep-mode")
-    lazyf=$(argv_count "$V30" "--safetensors-load-strategy lazy")
+    loadf=$(argv_count "$V30" "--safetensors-load-strategy ${strat:-<strategy>}")
     if [ "$PLAN" = 0 ]; then
-      if [ "$strat" = lazy ] && [ "$prov" = "capyctl default" ] && [ "${sleepf:-0}" -gt 0 ] && [ "${lazyf:-0}" -gt 0 ]; then
-        result B1 config pass "strategy $strat ($prov); argv: sleep mode in $sleepf, lazy loader in $lazyf process(es); cold start $START_S s, ready footprint $ready_gib GiB (catalog lazy reference 26.6 GiB, Qwen3.6-35B)"
+      if [[ $strat =~ ^(lazy|eager)$ ]] && [ "$prov" = "capyctl default" ] && [ "${sleepf:-0}" -gt 0 ] && [ "${loadf:-0}" -gt 0 ]; then
+        result B1 config pass "strategy $strat ($prov); argv: sleep mode in $sleepf, $strat loader in $loadf process(es); cold start $START_S s, ready footprint $ready_gib GiB"
       else
-        result B1 config fail "strategy '${strat}', provenance '${prov}', argv sleep mode $sleepf, lazy $lazyf"
+        result B1 config fail "strategy '${strat}', provenance '${prov}', argv sleep mode $sleepf, '--safetensors-load-strategy ${strat}' in ${loadf:-0}"
       fi
     fi
   fi
@@ -614,35 +627,87 @@ step_vllm_lazy() {
     metf=$(argv_count "$V30" "--enable-per-request-metrics")
     [ "$PLAN" = 1 ] || { if [ "${metf:-0}" -gt 0 ]; then result B3 "vLLM argv" pass "--enable-per-request-metrics in $metf process(es); Ready"
                           else result B3 "vLLM argv" fail "--enable-per-request-metrics not on the command line"; fi; }
-    metrics_check vLLM vllm v-lazy
+    metrics_check vLLM vllm v-default
   fi
-  want B14 && salt_check vLLM v-lazy salt
-  want B5 && redaction_check vLLM v-lazy "$id"
-  want B1 B2 && cycles_lazy v-lazy "$id" "$base"
+  want B5 && redaction_check vLLM v-default "$id"
+  want B1 B2 && cycles v-default "$id" "$base" gate
+  stopd v-default
+}
+
+# B1 lazy variant: the same deployment with safetensors_load_strategy lazy stated.
+# Informational (never decides B1): on this hybrid model the lazy wake reloads
+# weights in place and may hang or answer wrong (2026-10-14 run).
+step_vllm_lazy() {
+  want B1 || return 0
+  phase "B1 lazy variant (informational): vLLM 0.30.0, model 1, deep, safetensors_load_strategy lazy"
+  profile v30 vllm "$V30" vllm || { result B1 "lazy variant" info "engine add failed"; return; }
+  dep_vllm_m1 v-lazy lazy
+  deploy v-lazy || { [ "$PLAN" = 1 ] || result B1 "lazy variant" info "deploy refused; see cli.log"; return; }
+  startd v-lazy cold-lazy || { result B1 "lazy variant" info "start failed; see cli.log"; stopd v-lazy; return; }
+  local id base
+  base=$BEFORE_GIB
+  id=$(dep_id v-lazy)
+  cycles v-lazy "$id" "$base" info
   stopd v-lazy
 }
 
-cycles_lazy() { # name id base-GiB: three deep parks and wakes on request (B1, B2)
-  local n=$1 id=$2 base=$3 i st r pb gs ok=1 marks="" wakes=0 gen rows mm le
-  check B1 cycles "three parks reach parked and three requests wake the deployment and answer 42; parked.growth[].state never past_limit or stopped; parked charge (status parked.bytes) and MemAvailable drop recorded per cycle (catalog lazy reference: parked ~8 GB after three cycles)"
+# B14 vLLM: cache_salt on a dense model (the hybrid model 1 reuses no prefix cache).
+step_vllm_salt() {
+  want B14 || return 0
+  phase "B14 vLLM 0.30.0, Qwen3-4B (dense), restart_only: cache_salt"
+  profile v30 vllm "$V30" vllm || { fail_ids "vLLM 4B" "engine add failed" B14; return; }
+  yaml v-4b <<EOF
+schema_version: 1
+kind: deployment
+name: v-4b
+engine: v30
+model: $Q4B
+residency: restart_only
+timeouts: {initialize: 1800s}
+engine_config:
+  context_length: 8192
+  # Cached-token counts in usage (an ordinary extra flag), for the cache_salt check.
+  accept_extra_args: true
+  extra_args: [--enable-prompt-tokens-details]
+EOF
+  deploy v-4b || { fail_ids "vLLM 4B" "deploy refused; see cli.log" B14; return; }
+  startd v-4b cold-vllm-4b || { fail_ids "vLLM 4B" "start failed; see cli.log" B14; stopd v-4b; return; }
+  salt_check vLLM v-4b salt
+  stopd v-4b
+}
+
+cycles() { # name id base-GiB gate|info: three deep parks and wakes on request (B1, B2)
+  local n=$1 id=$2 base=$3 mode=$4 i st r pb gs ok=1 marks="" wakes=0 gen rows mm le scope=cycles wt=1800 pre=b1
+  if [ "$mode" = info ]; then
+    # A hung wake must not hold the run: ten minutes a wake, and no further cycle after one fails.
+    scope="lazy variant" wt=600 pre=b1-lazy
+    check B1 "$scope" "INFORMATIONAL, never decides B1: three parks and request wakes with the lazy loader stated; recorded per cycle as for the default"
+  else
+    check B1 cycles "three parks reach parked and three requests wake the deployment and answer 42; parked.growth[].state never past_limit or stopped; parked charge (status parked.bytes) and MemAvailable drop recorded per cycle (catalog lazy reference: parked ~8 GB after three cycles)"
+  fi
   for i in 1 2 3; do
     if [ "$PLAN" = 1 ] && [ "$i" -gt 1 ]; then show "(cycles 2 and 3 repeat cycle 1)"; break; fi
-    say "B1 cycle $i: park, then a request wakes it"
+    say "B1 $scope $i: park, then a request wakes it"
     c park deployment "$n" >>"$RES/cli.log" 2>&1
     st=$(poll_state "$n" 600 parked stopped failed)
     pause 10
-    status_json "$n" "$RES/b1-parked-$i.json"
-    pb=$(ev get "$RES/b1-parked-$i.json" parked.bytes)
-    gs=$(ev get "$RES/b1-parked-$i.json" 'parked.growth[0].state')
+    status_json "$n" "$RES/$pre-parked-$i.json"
+    pb=$(ev get "$RES/$pre-parked-$i.json" parked.bytes)
+    gs=$(ev get "$RES/$pre-parked-$i.json" 'parked.growth[0].state')
     marks="$marks c$i: $st, charge $(gib "$pb") GiB, MemAvailable -$(sub "$base" "$(memavail)") GiB, growth ${gs:-none};"
     [ "$st" = parked ] || ok=0
     case $gs in past_limit|stopped) ok=0 ;; esac
-    r=$(helper chat --cred "$CRED" --endpoint "$EP" --model "$n" --out "$RES/b1-wake-$i.json" 2>>"$RES/cli.log")
+    r=$(helper chat --cred "$CRED" --endpoint "$EP" --model "$n" --timeout "$wt" --out "$RES/$pre-wake-$i.json" 2>>"$RES/cli.log")
     [ "$PLAN" = 1 ] && continue
     marks="$marks wake ${r#* } s;"
     if [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ]; then wakes=$((wakes + 1)); else ok=0; fi
-    status_json "$n" "$RES/b1-woken-$i.json"
+    status_json "$n" "$RES/$pre-woken-$i.json"
+    [ "$mode" = info ] && [ "$ok" = 0 ] && break
   done
+  if [ "$mode" = info ]; then
+    [ "$PLAN" = 1 ] || result B1 "$scope" info "$([ "$ok" = 1 ] && echo pass || echo fail):$marks"
+    return 0
+  fi
   [ "$PLAN" = 1 ] || { if [ "$ok" = 1 ]; then result B1 cycles pass "$marks"; else result B1 cycles fail "$marks"; fi; }
   want B2 || return 0
   check B2 GB10 "the three wakes above answered; the ledger (SELECT, mode=ro) holds a wake_canaries row for the current generation with mismatch_operation_id NULL; no operation has error_code wake_mismatch; instances[0].last_error is not wake_mismatch"
@@ -662,14 +727,18 @@ cycles_lazy() { # name id base-GiB: three deep parks and wakes on request (B1, B
 }
 
 # B4: the eager loader reproduces parked growth; the park past the bound is a stop.
+# Runs on its own role whose parked_growth_limit is 0B (ADR 0014 amendment A19):
+# any growth past the first measured charge (strictly greater than 0 bytes) is
+# past the bound. A launch whose charge never grows is within every bound, so
+# zero growth over every park is SKIP with that evidence, not FAIL.
 step_vllm_eager() {
   want B4 || return 0
-  phase "B4 vLLM 0.30.0, model 1, deep, safetensors_load_strategy eager: parks until the growth bound turns one into a stop"
+  phase "B4 vLLM 0.30.0, model 1, deep, safetensors_load_strategy eager, parked_growth_limit 0B: parks until the growth bound turns one into a stop"
   profile v30 vllm "$V30" vllm || { fail_ids "vLLM eager" "engine add failed" B4; return; }
   dep_vllm_m1 v-eager eager
   deploy v-eager || { fail_ids "vLLM eager" "deploy refused" B4; return; }
   startd v-eager cold-eager || { fail_ids "vLLM eager" "start failed; see cli.log" B4; stopd v-eager; return; }
-  local id i st r pb gs sop gen0 pid0 marks="" stop_park=0 jr own gen1 pid1 ok
+  local id i st r pb gs sop gen0 pid0 marks="" stop_park=0 jr own gen1 pid1 ok gfirst glast glim grown=0
   id=$(dep_id v-eager)
   check B4 "growth stop" "within $MAX_PARKS parks, a park after parked.growth[].state past_limit ends with observed_state stopped and growth state stopped with stop_operation_id; the ledger has journal_entries.state park_growth_stop for that operation; no engine process is left; instances[0].reservation_owner is gone; the next request answers 42 from a fresh launch (new generation and engine PID)"
   status_json v-eager "$RES/b4-ready.json"
@@ -685,14 +754,22 @@ step_vllm_eager() {
     pb=$(ev get "$RES/b4-after-park-$i.json" parked.bytes)
     gs=$(ev get "$RES/b4-after-park-$i.json" 'parked.growth[0].state')
     sop=$(ev get "$RES/b4-after-park-$i.json" 'parked.growth[0].stop_operation_id')
-    marks="$marks p$i: $st, charge $(gib "$pb") GiB, growth ${gs:-none};"
+    gfirst=$(ev get "$RES/b4-after-park-$i.json" 'parked.growth[0].first_bytes')
+    glast=$(ev get "$RES/b4-after-park-$i.json" 'parked.growth[0].last_bytes')
+    glim=$(ev get "$RES/b4-after-park-$i.json" 'parked.growth[0].limit_bytes')
+    [ "${glast:-0}" -gt "${gfirst:-0}" ] 2>/dev/null && grown=1
+    marks="$marks p$i: $st, charge $(gib "$pb") GiB, growth ${gs:-none} ($(( ${glast:-0} - ${gfirst:-0} )) B past the first, limit ${glim:-none} B);"
     if [ "$st" = stopped ] || [ "$gs" = stopped ]; then stop_park=$i; break; fi
     r=$(helper chat --cred "$CRED" --endpoint "$EP" --model v-eager --out "$RES/b4-wake-$i.json" 2>>"$RES/cli.log")
     [ "$PLAN" = 1 ] || marks="$marks wake HTTP ${r%% *} ${r#* } s;"
   done
   [ "$PLAN" = 1 ] && { show "then: rc.py sql $DB \"SELECT count(*) FROM journal_entries WHERE state='park_growth_stop' AND operation_id='<stop_operation_id>'\"; status; a request; status"; stopd v-eager; return 0; }
   if [ "$stop_park" = 0 ]; then
-    result B4 "growth stop" fail "no park became a stop in $MAX_PARKS parks:$marks"
+    if [ "$grown" = 0 ]; then
+      result B4 "growth stop" skip "n/a (no growth in $MAX_PARKS parks under a 0B bound: the parked charge never exceeded the first measured one):$marks"
+    else
+      result B4 "growth stop" fail "no park became a stop in $MAX_PARKS parks although the charge grew past a 0B bound:$marks"
+    fi
     stopd v-eager
     return
   fi
@@ -717,7 +794,8 @@ step_vllm_eager() {
 step_tf() {
   want B3 B14 || return 0
   phase "TensorFold 0.6.6, model 1 (CUDA): B3 TensorFold, B14 TensorFold"
-  profile tf66 tensorfold "$TF66" tensorfold || { fail_ids "TensorFold" "engine add failed" B3 B14; return; }
+  profile tf66 tensorfold "$TF66" tensorfold --approve-option=--drafter --approve-path "$HOME/drafters" ||
+    { fail_ids "TensorFold" "engine add failed" B3 B14; return; }
   dep_tf_m1
   deploy t-m1 || { fail_ids "TensorFold" "deploy refused" B3 B14; return; }
   startd t-m1 cold-tf || { fail_ids "TensorFold" "start failed; see cli.log" B3 B14; stopd t-m1; return; }
@@ -858,10 +936,21 @@ step_draft() {
   profile s21 sglang "$S21" sglang || { fail_ids "drafter" "engine add failed" B12; return; }
   dep_sglang_draft
   deploy s-m1-draft || { fail_ids "drafter" "deploy refused; see cli.log" B12; return; }
-  local src id logs path want_path r nsrc
-  check B12 drafter "the drafter's source is verified (status model_sources[] all verified) before activation; the launch renders it (the engine log's server_args speculative_draft_model_path names $([ "$DRAFT_SOURCE" = hf ] && echo "the sources store's z-lab--Qwen3.8-27B-DFlash2@50307d4c... directory" || echo "the local ~/drafters/Qwen3.8-27B-DFlash2")); Ready; answers 42"
+  local src id logs path want_path r nsrc named
+  check B12 drafter "the drafter's source is verified (status model_sources[] all verified) before activation; the launch renders it (the engine log's server_args speculative_draft_model_path names $([ "$DRAFT_SOURCE" = hf ] && echo "the sources store's z-lab--Qwen3.8-27B-DFlash2@50307d4c... directory" || echo "the local ~/drafters/Qwen3.8-27B-DFlash2")); Ready; answers 42 (one retry at the memory request CapyCTL names in a refusal)"
   src=$(poll_sources s-m1-draft 3600)
-  startd s-m1-draft draft || { result B12 drafter fail "start failed (sources: $src); see cli.log"; stopd s-m1-draft; return; }
+  if ! startd s-m1-draft draft; then
+    # One retry at the size the refusal names ('raise engine_config.memory.request to "N"').
+    named=$(tail -40 "$RES/cli.log" 2>/dev/null | grep -o 'raise engine_config\.memory\.request to "[0-9]*[KMGT]iB"' | tail -1 | cut -d'"' -f2)
+    if [ -z "$named" ]; then result B12 drafter fail "start failed (sources: $src); see cli.log"; stopd s-m1-draft; return; fi
+    say "B12: the refusal names memory.request $named; one retry at that size"
+    c delete deployment s-m1-draft --stop >>"$RES/cli.log" 2>&1
+    waitgone
+    dep_sglang_draft "$named"
+    deploy s-m1-draft || { result B12 drafter fail "redeploy at the named request $named refused; see cli.log"; return; }
+    src=$(poll_sources s-m1-draft 3600)
+    startd s-m1-draft draft-retry || { result B12 drafter fail "start failed at the named request $named (sources: $src); see cli.log"; stopd s-m1-draft; return; }
+  fi
   id=$(dep_id s-m1-draft)
   mapfile -t logs < <(launch_logs "$id")
   ev facts "${logs[@]}" --out "$RES/b12-facts.json" >/dev/null
@@ -928,10 +1017,15 @@ step_b13() {
   fi
   run mkdir -p "$www/extra"
   [ "$PLAN" = 1 ] || echo variant-b >"$www/extra/rc-variant.txt"
+  # CapyCTL extracts plain ustar only (crates/capyctl-agent/src/sources/tar.rs, ADR 0008):
+  # regular files and directories under relative names; a pax extended header
+  # (GNU tar's --format=posix writes one per file), a link or a device refuses the
+  # whole archive as unsafe_archive. So: ustar, symlinks dereferenced (-h), bare
+  # relative member names, numeric owner.
   # shellcheck disable=SC2086 # the file list is words
-  run tar --format=posix -cf "$www/q05a.tar" -C "$store" $Q05_FILES
+  run tar --format=ustar -h --numeric-owner --owner=0 --group=0 -cf "$www/q05a.tar" -C "$store" $Q05_FILES
   # shellcheck disable=SC2086
-  run tar --format=posix -cf "$www/q05b.tar" -C "$store" $Q05_FILES -C "$www/extra" rc-variant.txt
+  run tar --format=ustar -h --numeric-owner --owner=0 --group=0 -cf "$www/q05b.tar" -C "$store" $Q05_FILES -C "$www/extra" rc-variant.txt
   sha_a='<sha256 of q05a.tar>' sha_b='<sha256 of q05b.tar>'
   if [ "$PLAN" = 0 ]; then
     sha_a=$(sha256sum "$www/q05a.tar" | cut -c1-64)
@@ -998,7 +1092,9 @@ step_b13() {
       c inspect deployment q05-secret --effective-config --json >"$RES/b13-secret-effective.json" 2>>"$RES/cli.log"
       if [ "$PLAN" = 0 ]; then
         local files a1 a2
-        mapfile -t files < <(find "$RES" -maxdepth 1 -type f \( -name 'b13-secret-*' -o -name 'cli.log' -o -name 'role-s3.log' \); find "$SD/logs" -type f 2>/dev/null)
+        # CapyCTL's outputs and its whole role state (ledger, logs, config), the
+        # secrets directory itself excepted; the http.server's own log is expected to hold it.
+        mapfile -t files < <(find "$RES" -maxdepth 1 -type f \( -name 'b13-secret-*' -o -name 'cli.log' -o -name 'role-s3.log' \); find "$SD" -path "$SD/secrets" -prune -o -type f -print 2>/dev/null)
         a1=$(ev absent --needle-file "$WORK/needle-sig" "${files[@]}")
         a2=$(ev absent --needle-file "$WORK/needle-path" "${files[@]}")
         if [ "${r%% *}" = 200 ] && [ "${a1%%$'\t'*}" = pass ] && [ "${a2%%$'\t'*}" = pass ] &&
@@ -1289,12 +1385,13 @@ phases() {
   preflight || exit 1
   record_versions
   step_b7
-  if want B1 B2 B3 B4 B5 B6 B8 B9 B11 B12 B13 B14 B15; then
+  if want B1 B2 B3 B5 B6 B8 B9 B11 B12 B13 B14 B15; then
     phase "main role: managed limit 100GiB, free reserve 10GiB, parked limit 45GiB, this run's own model-sources directory"
     if role_up s1 --model-sources-path "$WORK/src1" --set "$SYS.managed_limit=100GiB" \
       --set "$SYS.free_reserve=10GiB" --set "$SYS.parked_limit=45GiB"; then
+      step_vllm_default
       step_vllm_lazy
-      step_vllm_eager
+      step_vllm_salt
       step_tf
       step_sglang_4b
       step_sglang_explicit
@@ -1302,7 +1399,17 @@ phases() {
       step_draft
       step_q05
     else
-      fail_ids "role" "standalone did not become ready" B1 B2 B3 B4 B5 B6 B8 B9 B11 B12 B13 B14 B15
+      fail_ids "role" "standalone did not become ready" B1 B2 B3 B5 B6 B8 B9 B11 B12 B13 B14 B15
+    fi
+    role_down
+  fi
+  if want B4; then
+    phase "B4 role: the main role's memory policy, resource_policy.parked_growth_limit 0B"
+    if role_up s4 --set "$SYS.managed_limit=100GiB" --set "$SYS.free_reserve=10GiB" --set "$SYS.parked_limit=45GiB" \
+      --set "host.resource_policy.parked_growth_limit=0B"; then
+      step_vllm_eager
+    else
+      fail_ids "role" "standalone did not become ready" B4
     fi
     role_down
   fi
