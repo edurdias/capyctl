@@ -67,13 +67,15 @@ pub(super) async fn initialize(
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
     // ADR 0028 §9, §10: rank 1 serves nothing and follows rank 0; readiness
     // is the head's, so it is never polled or probed. Its step ends once its
-    // process is recorded and present.
+    // process is recorded and present: a follower serves from that one
+    // process (ADR 0023 §6), so no rank process is waited for.
     if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
         let log = plan.engine_log.clone();
         return crate::group::worker_spawned(
             context,
             tools,
             api,
+            0,
             builds,
             || {
                 let tail = crate::launch_failure::log_tail(log.as_deref());

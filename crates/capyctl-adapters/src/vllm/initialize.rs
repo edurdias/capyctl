@@ -190,13 +190,15 @@ pub(super) async fn initialize(
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
     // ADR 0028 §9, §10: a headless worker serves nothing; readiness is the
-    // head's. Its step ends once its process is recorded and present.
-    if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
+    // head's. Its step ends once its tree, its ranks' `VLLM::Worker_TP<n>`
+    // processes included, is recorded and present.
+    if let Some(group) = plan.group.as_ref().filter(|group| !group.is_head()) {
         let log = plan.engine_log.clone();
         return crate::group::worker_spawned(
             context,
             tools,
             api,
+            group.local_ranks() as usize,
             builds,
             || {
                 let tail = crate::launch_failure::log_tail(log.as_deref());
