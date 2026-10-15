@@ -29,7 +29,14 @@ Live evidence:
   refuses on 0.30.0 too (fixed in the quick-check on branch
   `fix/vllm031-metrics-auth`), and the context sweep's calibration could not
   read a 1-token reply from a reasoning model (fixed in capyctl-recipes main).
-- Rerun with both harness fixes: PENDING
+- Rerun with both harness fixes (host A, 2026-10-14, origin/main `ae6852bf`, warm
+  starts): every lifecycle step passed, including the new `engine load via CapyCTL`
+  step (12 of 12 load reads during a request carried a fresh engine sample).
+  Aggregate tok/s C1 21.9 / 21.9, C4 106.5 / 106.4, C8 207.4 / 207.0 (0.31.0 /
+  0.30.0); decode at 2k and 8k within 0.2%, prefill within 2%. The 32k context
+  point was refused by both versions (`engine_rejected`, maximum context 29104):
+  that is the context CapyCTL fitted for the preset's Qwen3-4B deployment, not a
+  difference between versions.
 
 # Release note: Engines
 
