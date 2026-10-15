@@ -7,6 +7,8 @@ pub mod group_observation;
 pub mod native_observation;
 pub mod owned_launch;
 mod ownership;
+// SPEC §13.2, ADR 0028 §11: a launch's leader is reaped only once its group ends.
+mod pinned_leader;
 pub mod process_absence;
 // SPEC §13.2 (W13): how a launched engine ended, recorded by its reaper.
 pub mod reaped;

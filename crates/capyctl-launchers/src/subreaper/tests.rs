@@ -189,5 +189,74 @@ fn subreaper_fixture() {
         presence(&identity) == Presence::Gone
     });
     assert!(!exited_unreaped(&identity));
+
+    // ADR 0028 §11 (MN5): a launch leader its launcher holds unreaped
+    // (`pinned_leader`) is a child spawned here, so the reaper never waits
+    // for it, sweeping or asked by `presence`: it stays a zombie while a
+    // process of its group runs, the group can be signalled through it, and
+    // it is reaped once the group is empty. The orphaned worker it leaves is
+    // handed here and reaped like any other.
+    struct Accept;
+    impl crate::durable::LaunchAssociation for Accept {
+        fn persist_api_identity(
+            &self,
+            _: &capyctl_domain::completion::ProcessIdentity,
+        ) -> Result<(), crate::durable::AssociationError> {
+            Ok(())
+        }
+    }
+    use capyctl_adapters::traits::OwnedProcessLaunch;
+    let tool = crate::DurableProcessLaunch::new(std::sync::Arc::new(Accept));
+    let api = tool
+        .spawn_durable(
+            "held-leader",
+            &capyctl_adapters::traits::RenderedCommand {
+                argv: vec!["sh".into(), "-c".into(), "sleep 30 & sleep 30".into()],
+                env: Default::default(),
+            },
+        )
+        .unwrap();
+    let mut worker = None;
+    until("the leader starts its worker", || {
+        worker = tool
+            .observe_group(&api)
+            .unwrap()
+            .into_iter()
+            .find(|member| member.pid != api.pid);
+        worker.is_some()
+    });
+    let worker = worker.unwrap();
+    kill(api.pid);
+    until("the leader exits", || {
+        proc_stat(api.pid).is_some_and(|stat| stat.exited())
+    });
+    until("the leader's exit is observed", || {
+        presence(&api) == Presence::Gone
+    });
+    assert_eq!(
+        proc_stat(worker.pid).unwrap().ppid,
+        me,
+        "orphan handed here"
+    );
+    // Two sweeps of the role's own reaper thread, and the sweep run directly.
+    std::thread::sleep(SWEEP_INTERVAL * 2);
+    assert_eq!(reap_orphans(), 0, "a held leader is not reaped");
+    assert!(!reap_exited(api.pid, api.start_ticks));
+    assert!(
+        proc_stat(api.pid).is_some_and(|stat| stat.exited() && stat.start_ticks == api.start_ticks),
+        "the held leader is still a zombie while its group runs"
+    );
+    let escalated = tool
+        .terminate_escalating(std::slice::from_ref(&api), Duration::from_secs(2))
+        .expect("the worker never recorded ends through the held leader");
+    assert!(!escalated, "a sleep ends on SIGTERM");
+    assert_eq!(
+        presence(&worker),
+        Presence::Gone,
+        "the orphan is reaped here"
+    );
+    until("the held leader is reaped once its group is empty", || {
+        !std::path::Path::new(&format!("/proc/{}", api.pid)).exists()
+    });
     println!("{PASSED}");
 }

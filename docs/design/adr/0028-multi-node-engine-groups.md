@@ -658,3 +658,24 @@ deploy it again for the share.
 `64 GiB x 2.25 + margin` exceeds the 97.4 GiB automatic managed limit, so such a
 deployment declares `memory.startup` (the group activation charges each member the
 cold phase its revision resolved; it has no first-start whole-host fallback).
+
+## Amendment of 2026-10-15: a member's leader is reaped only once its group ends
+
+Found live (MN5 vLLM): SIGKILL of a TP2 worker member's vLLM process left the
+`VLLM::Worker_TP1` it had forked (38 GiB of device memory) and a resource tracker
+running. A worker's tree is recorded when the tree first settles after the spawn,
+before vLLM forks its workers, so only the leader was recorded. The leader was reaped
+at once, and a leaderless process group never authorizes a signal (its id can name an
+unrelated group once the leader's pid is reused), so every `Terminate` ended
+uncertain, the member stayed charged and the stop expired unsettled.
+
+The launcher that spawned a launch's leader now waits for its exit without reaping it
+(`WNOWAIT`) and reaps it only once no other process of its group runs. While the
+leader is held, its pid, and so the group id, cannot be reused, so §11's "terminate
+its journaled process tree" signals the whole group through the held leader, live or
+dead, the processes never recorded included. A held leader that has exited reads
+gone and its exit is reported as before, with the status the wait observed. Release
+still needs gone evidence for every recorded identity and an empty group. A leader
+this process did not spawn (a launch from before a restart of the host role) is not
+held, and its leaderless group is still never signalled: that case stays uncertain and
+charged, as before.
