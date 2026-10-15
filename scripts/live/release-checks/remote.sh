@@ -937,7 +937,7 @@ step_draft() {
   dep_sglang_draft
   deploy s-m1-draft || { fail_ids "drafter" "deploy refused; see cli.log" B12; return; }
   local src id logs path want_path r nsrc named
-  check B12 drafter "the drafter's source is verified (status model_sources[] all verified) before activation; the launch renders it (the engine log's server_args speculative_draft_model_path names $([ "$DRAFT_SOURCE" = hf ] && echo "the sources store's z-lab--Qwen3.8-27B-DFlash2@50307d4c... directory" || echo "the local ~/drafters/Qwen3.8-27B-DFlash2")); Ready; answers 42 (one retry at the memory request CapyCTL names in a refusal)"
+  check B12 drafter "the drafter's source is verified (status model_sources[] all verified) before activation; the launch renders it (the engine log's server_args speculative_draft_model_path names $([ "$DRAFT_SOURCE" = hf ] && echo "a z-lab--Qwen3.8-27B-DFlash2@<pinned commit> directory under the main role's sources directory (src1/sources)" || echo "the local ~/drafters/Qwen3.8-27B-DFlash2")); Ready; answers 42 (one retry at the memory request CapyCTL names in a refusal)"
   src=$(poll_sources s-m1-draft 3600)
   if ! startd s-m1-draft draft; then
     # One retry at the size the refusal names ('raise engine_config.memory.request to "N"').
@@ -960,9 +960,17 @@ step_draft() {
 try: print(len(json.load(sys.stdin)))
 except ValueError: print(0)' 2>/dev/null)
   r=$(helper chat --cred "$CRED" --endpoint "$EP" --model s-m1-draft --out "$RES/b12-chat.json" 2>>"$RES/cli.log")
-  if [ "$DRAFT_SOURCE" = hf ]; then want_path="z-lab--Qwen3.8-27B-DFlash2@50307d4c"; else want_path=$DRAFTER; fi
+  # The rendered path, as the engine's server_args name it: a fetched drafter is a directory
+  # of the main role's sources store (--model-sources-path $WORK/src1), named repo@commit.
+  path=$(realpath -m -- "${path/#\~\//$HOME/}" 2>/dev/null)
+  if [ "$DRAFT_SOURCE" = hf ]; then
+    want_path="$(realpath -m -- "$WORK/src1/sources")/*/z-lab--Qwen3.8-27B-DFlash2@${DRAFT_HF#*@}"
+  else
+    want_path=$(realpath -m -- "$DRAFTER")
+  fi
   if [ "$PLAN" = 0 ]; then
-    if [[ $path == *"$want_path"* ]] && { [ "$DRAFT_SOURCE" = local ] || [ "$src" = verified ]; } &&
+    # shellcheck disable=SC2053 # want_path is a glob for hf: any store kind directory
+    if [ -n "$path" ] && [[ $path == $want_path ]] && { [ "$DRAFT_SOURCE" = local ] || [ "$src" = verified ]; } &&
        [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ]; then
       result B12 drafter pass "sources $src ($nsrc listed); draft path rendered ${path/#$HOME/~}; Ready in $START_S s; answered in ${r#* } s"
     else

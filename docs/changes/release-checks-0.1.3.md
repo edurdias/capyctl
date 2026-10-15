@@ -1,4 +1,4 @@
-# Status: 0.1.3 release live checks driver — 2026-10-14 (branch `test/backlog-0.1.3`)
+# Status: 0.1.3 release live checks driver — 2026-10-15 (branch `test/release-checks-0.1.3`)
 
 A driver for the live checks the changes merged since 0.1.2 still owe (B1-B17
 of the 0.1.3 live backlog), on one GB10 host: `scripts/live/release-checks/run.sh`,
@@ -39,8 +39,24 @@ SKIP by default: B10 (the host's Flash-Next copy is not a complete checkpoint;
 (no gpt-oss-120b on a host) and B17 (`--container` builds an image on the host).
 B18 has its own driver in capyctl-recipes.
 
-Checked: `bash -n`, `shellcheck -x` (v0.11.0) clean, the dry run. Not yet run
-on a lab host; the live results go in the status runbook when they exist.
+Checked: `bash -n`, `shellcheck -x` (v0.11.0) clean, the dry run, and two live
+runs on host A (below).
+
+Live runs on host A (evidence in `target/live/0.1.3-backlog/<run>/`):
+
+- 2026-10-14 full run (`2026-10-14-2311-release-checks`): B5, B6, B7, B8 and
+  B11 pass; B10, B16 and B17 SKIP (the reasons above). B1/B2 failed from a
+  product bug, vLLM deep wake (fixed in #121). B3/B14 TensorFold, B4, B9, B12,
+  B13, B14 vLLM and B15 failed on harness faults, fixed below; B3 vLLM/SGLang
+  and B14 SGLang passed.
+- 2026-10-15 rerun of B1-B4, B9 and B12-B15 (`2026-10-15-0133-release-checks`,
+  with #121 and #122): every row passes except B12's, which read an empty draft
+  path while the engine's server_args named the drafter in the role's sources
+  store (`src1/sources/huggingface/z-lab--Qwen3.8-27B-DFlash2@50307d4c...`),
+  sources verified, request answered; the same evidence passes under the fixed
+  B12 below.
+
+So every check passes, or is SKIP for B10, B16 and B17.
 
 Harness fixes after the first run on host A (2026-10-14, evidence in
 `target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`):
@@ -73,5 +89,10 @@ Harness fixes after the first run on host A (2026-10-14, evidence in
   deployment with `safetensors_load_strategy: lazy` stated runs the cycles as
   an `info` row (`rc.py verdict` never lets `info` decide a check; a wake gives
   up after 10 minutes and stops the variant).
+- B12 (after the rerun): SGLang 0.5.21 logs `server_args` as a dict
+  (`'speculative_draft_model_path': '...'`), not `ServerArgs(key='...')`;
+  `rc.py facts` reads both forms, and B12 asserts the rendered path is the
+  pinned `z-lab--Qwen3.8-27B-DFlash2@<commit>` directory under the main role's
+  sources directory (`--draft-source local`: the local drafter path).
 
 # Release note: none
