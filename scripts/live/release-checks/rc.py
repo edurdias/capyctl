@@ -466,8 +466,10 @@ FACT_PATTERNS = {
     "context_len": r"\bcontext_len=(\d+)",
     "mem_fraction_static": r"\bmem_fraction_static=([\d.]+)",
     "max_mamba_cache_size": r"\bmax_mamba_cache_size[=:]\s*(\d+)",
-    "speculative_algorithm": r"\bspeculative_algorithm='?([A-Za-z0-9_]+)",
-    "speculative_draft_model_path": r"\bspeculative_draft_model_path='([^']+)'",
+    # SGLang logs server_args as `ServerArgs(key='v', ...)` or, as 0.5.21 does, as a
+    # dict `{'key': 'v', ...}`; both forms match.
+    "speculative_algorithm": r"\bspeculative_algorithm'?(?:=|: )'([A-Za-z0-9_]+)'",
+    "speculative_draft_model_path": r"\bspeculative_draft_model_path'?(?:=|: )'([^']+)'",
     "kv_tokens_allocated": r"KV Cache is allocated\. #tokens: (\d+)",
 }
 
