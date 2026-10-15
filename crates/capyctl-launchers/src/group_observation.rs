@@ -233,13 +233,31 @@ fn stat_comm(raw: &str) -> Option<&str> {
 /// this, any unrelated process exiting anywhere on the host during a scan made
 /// the whole observation fail, which on a busy host is nearly every scan.
 fn read_listed(pid: u32, boot: &str) -> Option<Result<GroupProcessFact, GroupObservationError>> {
-    match read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES) {
-        Ok(raw) => Some(parse_stat(pid, &raw, boot)),
-        Err(GroupObservationError::Visibility)
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() =>
-        {
-            None
-        }
+    let still_listed = || std::path::Path::new(&format!("/proc/{pid}")).exists();
+    classify_listed(
+        pid,
+        read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES),
+        boot,
+        still_listed,
+    )
+}
+
+/// The decision behind [`read_listed`]. A process that is exiting can open and
+/// then read back an empty or truncated `stat`, which does not parse. Like a
+/// failed read, such a parse failure is skipped only when the pid is gone once
+/// we look again; for a pid that is still listed it fails closed.
+fn classify_listed(
+    pid: u32,
+    read: Result<String, GroupObservationError>,
+    boot: &str,
+    still_listed: impl Fn() -> bool,
+) -> Option<Result<GroupProcessFact, GroupObservationError>> {
+    match read {
+        Ok(raw) => match parse_stat(pid, &raw, boot) {
+            Err(GroupObservationError::InvalidData) if !still_listed() => None,
+            parsed => Some(parsed),
+        },
+        Err(GroupObservationError::Visibility) if !still_listed() => None,
         Err(error) => Some(Err(error)),
     }
 }
@@ -479,6 +497,29 @@ mod tests {
             boot_id: BOOT.into(),
             start_ticks: 10,
         }
+    }
+
+    /// T31: a process exiting during a scan can read back an empty or
+    /// truncated `stat`. Gone by the time we look again, it is skipped; still
+    /// listed, the same unparsable `stat` fails the scan closed.
+    #[test]
+    fn an_unparsable_stat_is_skipped_only_when_the_pid_is_gone() {
+        for raw in ["", "77 (sh", "77 (sh) S 1"] {
+            assert!(classify_listed(77, Ok(raw.into()), BOOT, || false).is_none());
+            assert_eq!(
+                classify_listed(77, Ok(raw.into()), BOOT, || true),
+                Some(Err(GroupObservationError::InvalidData))
+            );
+        }
+        let good = classify_listed(77, Ok(stat(77, 1, 77, 9)), BOOT, || false);
+        assert_eq!(good.unwrap().unwrap().process_group, 77);
+        assert!(
+            classify_listed(77, Err(GroupObservationError::Visibility), BOOT, || false).is_none()
+        );
+        assert_eq!(
+            classify_listed(77, Err(GroupObservationError::Limit), BOOT, || false),
+            Some(Err(GroupObservationError::Limit))
+        );
     }
 
     /// ADR 0014 amendment A12: a compiler in the launched group is a kernel

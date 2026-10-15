@@ -13,6 +13,16 @@ built, tagged or published yet: next are the manual Release build workflow
 with Rust 1.99.0, the strict local packaging check, a draft release and the
 live check from the draft (docs/operations/releasing.md). The owner publishes.
 
+The release PR's hosted CPU checks failed once on
+`group_observation::tests::unrelated_process_exits_during_a_scan_do_not_fail_the_observation`
+(1 of 200 scans `InvalidData`), an old flake: a process exiting during a group scan can read
+back an empty or truncated `/proc/<pid>/stat`, which failed to parse, and only a failed read
+of a vanished pid was skipped. `classify_listed` (capyctl-launchers `group_observation.rs`)
+now also skips an unparsable `stat` when the pid is gone on a second look; for a pid still
+listed it fails closed as before. New unit test
+`an_unparsable_stat_is_skipped_only_when_the_pid_is_gone`; the stress test passed 5 of 5 under
+4 cores.
+
 ## llama.cpp GB10 rows LC1–LC6 run live on host A, all pass — 2026-10-15 (branch `test/live-rows-0.1.3`)
 
 Owner approval 2026-10-14: a llama.cpp build on host A, in the home directory, with
