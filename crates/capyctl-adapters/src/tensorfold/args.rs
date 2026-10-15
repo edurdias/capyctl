@@ -27,6 +27,8 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "CUDA_HOME",
     "MAX_JOBS",
     "FLASHINFER_NVCC_THREADS",
+    // ADR 0028 §10 (found live 2026-10-15, MN3): a group member's libnccl.
+    "TF_NCCL_LIB",
 ];
 /// Variables taken from the agent's own environment.
 const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES"];
@@ -67,6 +69,56 @@ pub struct PlanInputTensorfold {
     /// ADR 0028 §10: this launch's member of a two-rank group; `None` for a
     /// single-rank launch, which renders exactly as before.
     pub group: Option<GroupMemberArgs>,
+    /// ADR 0028 §10 (found live 2026-10-15, MN3): the installation's
+    /// `libnccl.so.2`, rendered as `TF_NCCL_LIB` for a group member. The
+    /// Initialize step resolves it ([`installation_nccl_lib`]) and refuses a
+    /// group launch without one.
+    pub nccl_lib: Option<String>,
+}
+
+/// ADR 0028 §10 (found live 2026-10-15, MN3): TensorFold 0.6.5 and 0.6.6
+/// (`tensorfold/cuda/comm.py` `_library`) load libnccl from the file named by
+/// `TF_NCCL_LIB`, else `ctypes.util.find_library("nccl")`, system
+/// `/usr/lib/*` and `/usr/local/lib/python3*/dist-packages`, else torch's own
+/// `lib`. A pip venv keeps it in neither: it is in the `nvidia-nccl` wheel,
+/// `<venv>/lib/python3*/site-packages/nvidia/nccl/lib/libnccl.so.2`. The venv
+/// is the directory above the executable's `bin`; the executable's path is not
+/// resolved through symlinks, which would leave the venv. The first match in
+/// name order wins; torch's `lib` is the fallback, as in TensorFold.
+pub fn installation_nccl_lib(engine_bin: &str) -> Option<String> {
+    let venv = std::path::Path::new(engine_bin).parent()?.parent()?;
+    let mut pythons: Vec<std::path::PathBuf> = std::fs::read_dir(venv.join("lib"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("python3"))
+        .map(|entry| entry.path().join("site-packages"))
+        .collect();
+    pythons.sort();
+    let wheel = pythons
+        .iter()
+        .map(|site| site.join("nvidia/nccl/lib/libnccl.so.2"))
+        .find(|lib| lib.is_file());
+    let torch = || {
+        pythons.iter().find_map(|site| {
+            let mut libs: Vec<_> = std::fs::read_dir(site.join("torch/lib"))
+                .ok()?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("libnccl"))
+                        && path.to_string_lossy().contains(".so")
+                })
+                .collect();
+            libs.sort();
+            libs.into_iter().next()
+        })
+    };
+    wheel
+        .or_else(torch)
+        .map(|lib| lib.to_string_lossy().into_owned())
 }
 
 /// ADR 0028 §2.1: `build_env` values may hold tokens, so Debug prints its names only.
@@ -94,6 +146,7 @@ impl std::fmt::Debug for PlanInputTensorfold {
             .field("warm_startup_ms", &self.warm_startup_ms)
             .field("memory_limit_bytes", &self.memory_limit_bytes)
             .field("group", &self.group)
+            .field("nccl_lib", &self.nccl_lib)
             .finish()
     }
 }
@@ -277,11 +330,17 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
         argv.extend(["--drafter".to_owned(), "none".to_owned()]);
     }
     argv.extend(pass_through);
-    // ADR 0028 §10: TensorFold has no own-address variable and its NCCL is
-    // built in, so a group member renders exactly the single-rank variables:
-    // nothing `NCCL_*`, `GLOO_*`, `MASTER_*` or `TF_COMM*` (decision 4).
+    // ADR 0028 §10: TensorFold has no own-address variable, so a group member
+    // renders nothing `NCCL_*`, `GLOO_*`, `MASTER_*` or `TF_COMM*` (decision 4).
+    // Its NCCL is not built in, though (found live 2026-10-15, MN3): it loads
+    // libnccl at run time, so a member renders the installation's library.
     let mut env = BTreeMap::new();
     env.insert("TENSORFOLD_NO_UPDATE_CHECK".into(), "1".into());
+    if input.group.is_some() {
+        if let Some(lib) = &input.nccl_lib {
+            env.insert("TF_NCCL_LIB".into(), lib.clone());
+        }
+    }
     // ADR 0023 §3: the engine fetches nothing; capyctl's model store does.
     env.insert("HF_HUB_OFFLINE".into(), "1".into());
     env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());

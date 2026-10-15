@@ -548,6 +548,11 @@ impl FakeHost {
         let tensorfold = bin.join("tensorfold");
         fake(&vllm);
         fake(&tensorfold);
+        // ADR 0028 §10: a TensorFold group member loads the installation's
+        // libnccl, where the nvidia-nccl wheel lays it out in the venv.
+        let nccl = path.join("venv/lib/python3.12/site-packages/nvidia/nccl/lib");
+        std::fs::create_dir_all(&nccl).unwrap();
+        std::fs::write(nccl.join("libnccl.so.2"), "").unwrap();
         module(
             &runtime.join("vllm_entry.py"),
             &format!(

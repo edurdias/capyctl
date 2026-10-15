@@ -390,7 +390,7 @@ configuration layer reads for the §2 checks.
 | Parallel sizes | `--tensor-parallel-size T --pipeline-parallel-size P` | `--tp-size T --pp-size P` | `--tp 2` |
 | Rank and world | `--nnodes N --node-rank r` | `--nnodes N --node-rank r` | `--rank r` |
 | Rendezvous | `--master-addr <head> --master-port <port>` | `--dist-init-addr <head>:<port>` | `--master <head> --master-port <port>` |
-| Backend | `--distributed-executor-backend mp` | default | NCCL (built in) |
+| Backend | `--distributed-executor-backend mp` | default | NCCL, loaded at run time: `TF_NCCL_LIB=<installation libnccl.so.2>` on every rank, else refused `nccl_library_missing` (amended 2026-10-15, found live) |
 | Worker | `--headless`; no host, port, key or middleware | same command, `--host 127.0.0.1 --port <worker_port>` | no host or port |
 | Own address | `VLLM_HOST_IP=<own>` | `SGLANG_HOST_IP=<own>` | none |
 | Deep park flag | `--enable-sleep-mode` on every rank | `--enable-memory-saver` on every rank | not applicable |

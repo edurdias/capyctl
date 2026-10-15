@@ -14,6 +14,8 @@ use super::{
 use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
+/// The closed refusal of a group member whose installation holds no libnccl.
+pub const NCCL_LIBRARY_MISSING: &str = "nccl_library_missing";
 const READINESS_POLL: Duration = Duration::from_millis(500);
 const BUILDER_MARGIN_MS: i64 = 2_000;
 
@@ -29,13 +31,22 @@ pub(super) async fn initialize(
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
     let context = &command.context;
-    let (plan, tools) = adapter.launch_parts()?;
+    let (mut plan, tools) = adapter.launch_parts()?;
     if !matches!(
         context.launch_settings,
         Some(capyctl_domain::launch::LaunchSettings::Tensorfold(_))
     ) || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
         return Err(RuntimeError::Unsupported);
+    }
+    // ADR 0028 §10 (found live 2026-10-15, MN3): a group member without the
+    // installation's libnccl would exit `libnccl not found`; refuse before
+    // any effect instead, with the closed category.
+    if plan.group.is_some() {
+        plan.nccl_lib = Some(
+            super::args::installation_nccl_lib(&plan.engine_bin)
+                .ok_or_else(|| RuntimeError::Refused(NCCL_LIBRARY_MISSING.into()))?,
+        );
     }
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let mut cmd =

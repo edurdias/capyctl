@@ -513,3 +513,84 @@ async fn a_first_request_build_is_still_bounded_by_the_startup_budget() {
     );
     assert!(error.to_string().contains("probe deadline"), "{error}");
 }
+
+/// A pip venv as `engine add` registers it: `<venv>/bin/tensorfold`, with the
+/// nvidia-nccl wheel's library when `nccl` is set.
+fn venv(nccl: bool) -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("tensorfold"), "").unwrap();
+    let lib = dir
+        .path()
+        .join("lib/python3.12/site-packages/nvidia/nccl/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let lib = lib.join("libnccl.so.2");
+    if nccl {
+        std::fs::write(&lib, "").unwrap();
+    }
+    let exe = bin.join("tensorfold").to_string_lossy().into_owned();
+    (dir, exe, lib.to_string_lossy().into_owned())
+}
+
+fn group_plan(port: u16, exe: &str, rank: u32) -> PlanInputTensorfold {
+    PlanInputTensorfold {
+        engine_bin: exe.into(),
+        group: Some(capyctl_domain::group::GroupMemberArgs {
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            nnodes: 2,
+            node_rank: rank,
+            head_address: "192.0.2.10".parse().unwrap(),
+            rendezvous_port: 25000,
+            own_address: format!("192.0.2.{}", 10 + rank).parse().unwrap(),
+            worker_port: None,
+            own_interface: None,
+        }),
+        ..plan(port, 60_000)
+    }
+}
+
+// T16 T21 (ADR 0028 §10, found live 2026-10-15, MN3): TensorFold loads
+// libnccl at run time and finds no venv wheel itself, so both ranks of a
+// group start with `TF_NCCL_LIB` naming the installation's library.
+#[tokio::test]
+async fn both_group_ranks_start_with_the_installations_libnccl() {
+    let (_dir, exe, lib) = venv(true);
+    for rank in [0, 1] {
+        let (_stub, port) = stub_engine("nemotron", 0, false).await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![]));
+        let adapter = TensorfoldAdapter::new(url(port), "0.6.5".into(), "nemotron".into())
+            .with_launch(group_plan(port, &exe, rank))
+            .with_tools(tool.clone());
+        let _ = adapter.execute_persisted(&initialize_command(3_000)).await;
+        let spawned = tool.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1, "rank {rank}");
+        assert_eq!(spawned[0].env["TF_NCCL_LIB"], lib, "rank {rank}");
+    }
+}
+
+// T16 (ADR 0028 §10): a group member whose installation holds no libnccl is
+// refused with the closed category before anything is spawned.
+#[tokio::test]
+async fn a_group_member_without_libnccl_is_refused_before_any_effect() {
+    let (_dir, exe, _) = venv(false);
+    for rank in [0, 1] {
+        let port = free_port().await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![]));
+        let adapter = TensorfoldAdapter::new(url(port), "0.6.5".into(), "nemotron".into())
+            .with_launch(group_plan(port, &exe, rank))
+            .with_tools(tool.clone());
+        let error = adapter
+            .execute_persisted(&initialize_command(3_000))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            RuntimeError::Refused("nccl_library_missing".into()),
+            "rank {rank}"
+        );
+        assert!(error.to_string().contains("nvidia-nccl"), "{error}");
+        assert!(tool.spawned.lock().unwrap().is_empty());
+    }
+}
