@@ -1489,18 +1489,25 @@ async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncerta
     unsafe { libc::kill(later as i32, libc::SIGKILL) };
 }
 
-// T31 (ADR 0028 §8; found live 2026-10-15, MN2): a worker that forks a
-// short-lived child before its rank process reports both, the gone child as
-// gone, each under its own role: no two of its processes share one, so the
-// controller records the member launched. Failed before the change: the rank
-// process was journaled as a second `worker-0` beside the gone one, and the
-// controller refused the identities (`mark_member_launched`: Plan).
+// T31 (ADR 0028 §8, §11; found live 2026-10-15, MN2 and MN5): a worker forks a
+// short-lived child before its rank process. The child, gone before the
+// worker reports, is no recorded process of the member: the Launch reply (what
+// the controller records) names only processes alive when it reported, each
+// under its own role (MN2: two `worker-0`, a Plan error), and the processes
+// supervision watches once the group is Ready are exactly those, all alive
+// (MN5: the child's exit failed the member right after Ready). Failed before
+// the change: the reply carried the gone child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gone_transient_child_never_lends_its_role_to_the_rank_process() {
+async fn a_gone_transient_child_is_never_a_recorded_process_of_the_member() {
     let host = FakeHost::new("host-b")
         .with_groups_policy(WORKER_PEER)
         .with_transient_child();
     let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    assert!(
+        out.processes.len() >= 2 && out.processes.iter().all(|p| p.presence == "alive"),
+        "the leader and its rank process, nothing gone: {:?}",
+        out.processes
+    );
     let identities: Vec<_> = out
         .processes
         .iter()
@@ -1511,22 +1518,23 @@ async fn a_gone_transient_child_never_lends_its_role_to_the_rank_process() {
             start_ticks: p.start_ticks,
         })
         .collect();
-    assert!(
-        out.processes.iter().any(|p| p.presence == "gone"),
-        "the transient child is reported, gone: {:?}",
-        out.processes
-    );
-    assert!(
-        out.processes
-            .iter()
-            .filter(|p| p.presence == "alive")
-            .count()
-            >= 2,
-        "the leader and its rank process run: {:?}",
-        out.processes
-    );
     capyctl_domain::group::validate_local_processes(&identities)
         .unwrap_or_else(|_| panic!("every role is unique: {:?}", out.processes));
+    // What supervision watches for this member: every process alive, so no
+    // exit is reported for it.
+    let watched = host
+        .journal()
+        .ready_launches()
+        .unwrap()
+        .into_iter()
+        .find(|(command, _)| command.identity.command_id == out.owned_handle)
+        .map(|(_, processes)| processes)
+        .expect("the worker is watched from its Launch on");
+    assert_eq!(watched.len(), out.processes.len(), "{watched:?}");
+    assert!(watched.iter().all(|p| {
+        capyctl_launchers::process_absence::presence(p)
+            == capyctl_domain::completion::Presence::Alive
+    }));
 }
 
 // T31, T33: a worker terminates its own recorded tree only.
