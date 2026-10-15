@@ -378,11 +378,20 @@ Group of instance 0: vllm, TP 2 x PP 1 on 2 hosts
 
 ### Park, wake, stop and failures
 
-- **Park and wake.** A group with `residency: deep` (vLLM, SGLang) parks on
-  every machine at once and wakes the same way. After a wake, CapyCTL checks
-  that the model answers a fixed prompt as before; if not, it stops the group
-  (`group_wake_mismatch`). TensorFold groups, and groups with
+- **Park and wake.** A vLLM group with `residency: deep` parks on every
+  machine at once and wakes the same way. After a wake, CapyCTL checks that
+  the model answers a fixed prompt as before; if not, it stops the group
+  (`group_wake_mismatch`). SGLang and TensorFold groups, and groups with
   `residency: restart_only`, park by stopping and wake by starting again.
+- **Known issue in 0.1.3: SGLang groups restart instead of parking.** An
+  SGLang group with no `residency` gets `restart_only`; one that states
+  `deep` or `host_backed` is refused at deploy with
+  `capability_missing:deep_park` and the hint to declare
+  `residency: restart_only`. In a live run (SGLang 0.5.21, tensor parallel 2
+  across two GB10 machines) a group's deep park completed, but its first wake
+  reloaded the head's weights for 222 s and then failed safe
+  (`restore_uncertain`, group stopped). An SGLang deployment on one machine
+  still parks.
 - **Stop.** Stopping the deployment stops every member.
 - **A member fails.** If any member exits or fails, CapyCTL stops the whole
   group (`group_member_failed`). A request with no first token within
