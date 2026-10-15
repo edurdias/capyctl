@@ -1673,6 +1673,10 @@ impl GroupWorld {
             deployment["residency"] = serde_json::json!("restart_only");
             deployment["engine_config"] = serde_json::json!({"context_length": 8192});
         }
+        // ADR 0028 note of 2026-10-15: an SGLang group does not park in 0.1.3.
+        if self.engine == "sglang" {
+            deployment["residency"] = serde_json::json!("restart_only");
+        }
         if let Some(residency) = residency {
             deployment["residency"] = serde_json::json!(residency);
         }
@@ -2839,8 +2843,9 @@ async fn readiness_probe_goes_through_the_head_only() {
     assert_eq!(world.probes_sent_to("host-b"), 0);
 }
 
-// T14 (decided 2026-10-06): a deep SGLang group whose member paths differ is refused before
-// the reservation, naming both paths; a restart-only SGLang group with the same differing paths activates.
+// T14, T22 (decided 2026-10-06; ADR 0028 note of 2026-10-15): a deep SGLang group is
+// refused at deploy (`capability_missing:deep_park`, before the path check), and nothing is
+// reserved; a restart-only SGLang group with differing member paths activates.
 #[tokio::test]
 async fn sglang_deep_group_with_differing_paths_is_refused() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -2851,17 +2856,10 @@ async fn sglang_deep_group_with_differing_paths_is_refused() {
         .try_deploy_group_with_residency("g", &["host-a", "host-b"], "deep")
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "group_model_path_mismatch");
-    assert!(err.to_string().contains("/models/a") && err.to_string().contains("/models/b"));
-    assert!(world.group_plan("g").is_none());
-    let id = world.id("g");
-    assert_eq!(
-        world.wait_settled(&id).await.last_error(),
-        "group_model_path_mismatch"
-    );
-    assert_eq!(
-        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
-        0
+    assert!(
+        err.to_string().contains("capability_missing:deep_park")
+            && err.to_string().contains("restart_only"),
+        "{err}"
     );
     assert_eq!(world.launches(), 0);
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -4218,7 +4216,8 @@ impl GroupWorld {
 // T20: park settles only when every rank reports its memory released; one collective only.
 #[tokio::test]
 async fn park_needs_every_rank() {
-    for engine in ["vllm", "sglang"] {
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
         let world = GroupWorld::ready_group_with("g", &["host-a", "host-b"], engine).await;
         world.park("g").await.unwrap();
         assert_eq!(world.group.sleep_calls(), 1, "{engine}");
@@ -4249,7 +4248,8 @@ async fn park_needs_every_rank() {
 #[tokio::test]
 async fn a_park_settles_on_released_device_memory_and_charges_each_members_residue() {
     const ANONYMOUS: u64 = 3 << 30;
-    for engine in ["vllm", "sglang"] {
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
         let world = GroupWorld::hosts(&["host-a", "host-b"])
             .with_engine(engine)
             .with_derived_memory()
@@ -4290,7 +4290,8 @@ async fn a_park_settles_on_released_device_memory_and_charges_each_members_resid
 // the coordinator waited out the whole step.
 #[tokio::test]
 async fn a_member_without_evidence_of_its_own_fails_the_park_within_the_window() {
-    for engine in ["vllm", "sglang"] {
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
         let world = GroupWorld::hosts(&["host-a", "host-b"])
             .with_engine(engine)
             .records_leader_only("host-b")

@@ -737,3 +737,20 @@ accepts it only for that handle and that host, with at least one well-formed pro
 (roles may repeat, a process may not), and records those processes with the
 settlement. A host with an empty journal names nothing and claims nothing, which is
 no evidence: the member stays charged, as §11 requires. No protocol field is added.
+
+## Note of 2026-10-15: SGLang groups do not park in 0.1.3
+
+Found live (MN4, SGLang 0.5.21, TP2 across two GB10 hosts): with the amendment
+above, a group deep park completes, but the first wake fails. The head reloaded
+its weights from disk for 222 s, the wake canary ran, and 3 s later the wake
+went `restore_uncertain` and the group was stopped. It fails safe; group wake
+is not usable. vLLM groups pass 5/5 deep park cycles and are unchanged.
+
+Owner decision 2026-10-15, narrowing §2's support table for 0.1.3: an SGLang
+group (world size above 1) does not park. `group_support("sglang").deep_park`
+is false, so a group that states no residency resolves `restart_only`, and one
+that states `deep` or `host_backed` is refused at deploy with
+`capability_missing:deep_park` and the hint to declare `restart_only` (both
+parking tiers, for every engine whose group cannot park). A single-host SGLang
+deployment, its residency and its pinned identities are unchanged. Lift the
+rule once a live group wake passes on the installed SGLang.
