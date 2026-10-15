@@ -2520,6 +2520,28 @@ async fn drive_group(
     }
 }
 
+/// SPEC §10 step 5: why an embedded engine's park is refused before any
+/// effect, or `None` to proceed. An engine without the check proceeds; its
+/// Park step proves its own evidence.
+fn quiescence_refusal(
+    quiescence: Result<
+        capyctl_adapters::traits::Quiescence,
+        capyctl_adapters::traits::AdapterError,
+    >,
+) -> Option<String> {
+    match quiescence {
+        Ok(quiescence) if quiescence.quiescent => None,
+        Err(capyctl_adapters::traits::AdapterError::UnsupportedCapability) => None,
+        // Found live 2026-10-14: a launch whose saver observation never
+        // enrolled read only as "not quiescent"; its closed reason says so.
+        Ok(quiescence) => Some(match quiescence.unproven {
+            Some(unproven) => unproven.to_string(),
+            None => "the engine is not quiescent".to_string(),
+        }),
+        Err(error) => Some(format!("engine quiescence is unknown: {error}")),
+    }
+}
+
 /// SPEC §§6.3, 9.1, 10, 13 (W5): arm and send one planned park or restore.
 /// Returns whether anything changed. A step whose runtime this worker does not
 /// retain, whose host cannot be observed now, that is still draining or that
@@ -2618,12 +2640,7 @@ async fn drive_residency(
             deployment_id: work.deployment_id.clone(),
             member_id: work.binding_id.clone(),
         };
-        let refusal = match driver.engine.prepare_park(&member).await {
-            Ok(quiescence) if quiescence.quiescent => None,
-            Err(capyctl_adapters::traits::AdapterError::UnsupportedCapability) => None,
-            Ok(_) => Some("the engine is not quiescent".to_string()),
-            Err(error) => Some(format!("engine quiescence is unknown: {error}")),
-        };
+        let refusal = quiescence_refusal(driver.engine.prepare_park(&member).await);
         if let Some(reason) = refusal {
             let step = work.step_id.clone();
             shared

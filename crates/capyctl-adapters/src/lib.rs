@@ -130,7 +130,10 @@ mod tests {
         assert_eq!(HandleStatus::StaleReused, HandleStatus::StaleReused);
         assert_eq!(HandleStatus::Gone, HandleStatus::Gone);
 
-        let q = Quiescence { quiescent: true };
+        let q = Quiescence {
+            quiescent: true,
+            unproven: None,
+        };
         assert!(q.quiescent);
     }
 

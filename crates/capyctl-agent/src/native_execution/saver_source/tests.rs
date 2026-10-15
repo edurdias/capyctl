@@ -117,6 +117,9 @@ impl SaverResidency for Saver {
             kv_virtual_bytes: 1 << 20,
         })
     }
+    fn unenrolled(&self, binding_id: &str) -> bool {
+        self.0.lock().unwrap().unenrolled && binding_id == BINDING
+    }
 }
 
 struct Stand {
@@ -411,20 +414,47 @@ fn weights_left_mapped_count_as_released_only_when_they_stay_resident() {
 
 /// W5: an embedded launch with engine work, or with no enrolled observation,
 /// is not quiescent, so the coordinator refuses the park before any call.
+/// Found live 2026-10-14: the one that never enrolled says so.
 // T22 T20
 #[tokio::test]
 async fn an_embedded_sglang_without_evidence_is_not_quiescent() {
     let stand = stand().await;
     let adapter = adapter(&stand);
     stand.engine.lock().unwrap().busy = true;
-    assert!(!adapter.prepare_park(&member()).await.unwrap().quiescent);
+    let busy = adapter.prepare_park(&member()).await.unwrap();
+    assert_eq!((busy.quiescent, busy.unproven), (false, None));
     {
         let mut e = stand.engine.lock().unwrap();
         e.busy = false;
         e.unenrolled = true;
     }
-    assert!(!adapter.prepare_park(&member()).await.unwrap().quiescent);
+    let unobserved = adapter.prepare_park(&member()).await.unwrap();
+    assert_eq!(
+        (unobserved.quiescent, unobserved.unproven),
+        (false, Some(Unproven::ObservationNotEnrolled))
+    );
     assert!(stand.engine.lock().unwrap().calls.is_empty());
+}
+
+/// Found live 2026-10-14: a launch provably never enrolled is one whose
+/// readable private directory holds no record for its binding; anything
+/// unreadable or malformed is unknown, never "not enrolled".
+// T22 T20
+#[test]
+fn only_a_readable_directory_without_a_record_is_unenrolled() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let observation = dir.path().join("observation");
+    std::fs::create_dir(&observation).unwrap();
+    std::fs::set_permissions(&observation, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let saver = EnrolledSaver::new(observation.clone());
+    assert!(saver.unenrolled(BINDING));
+    assert!(!saver.unenrolled("../escape"));
+    std::fs::write(observation.join(format!("{BINDING}.json")), "{}").unwrap();
+    assert!(!saver.unenrolled(BINDING));
+    std::fs::set_permissions(&observation, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(!saver.unenrolled(INCARNATION));
+    assert!(!EnrolledSaver::new(dir.path().join("absent")).unenrolled(BINDING));
 }
 
 /// T20: a resume that maps the weights but not the cache is partial evidence:

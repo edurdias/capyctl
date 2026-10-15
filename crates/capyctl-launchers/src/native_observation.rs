@@ -188,7 +188,7 @@ fn identifier(value: &str) -> bool {
 fn protected_socket(path: &Path) -> Result<(u64, u64)> {
     let text = path.to_str().ok_or(ObservationError)?;
     if !path.is_absolute()
-        || text.len() > 107
+        || text.len() > 4095
         || text.chars().any(char::is_control)
         || text
             .split('/')
@@ -287,7 +287,34 @@ fn wait_cause(
 fn wait(stream: &UnixStream, events: i16, deadline: Instant) -> Result<()> {
     wait_cause(stream, events, deadline).map_err(|_| ObservationError)
 }
+/// SPEC §9.2: the socket is reached through a descriptor of its directory,
+/// `/proc/self/fd/<fd>/<leaf>`, so its address fits `sun_path` (108 bytes with
+/// the NUL) whatever the directory's own path length; the listener binds the
+/// same way (`runtime/sglang_observation_server.py`). Found live 2026-10-14: a
+/// state directory that put `<dir>/<binding>.sock` at 108 bytes left the
+/// launch unenrolled, and every park was refused as not quiescent.
 fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return Err(ObservationError);
+    };
+    // Held open until the connection is made, so the address stays this directory.
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|_| ObservationError)?;
+    let mut name = format!("/proc/self/fd/{}/", directory.as_raw_fd()).into_bytes();
+    name.extend_from_slice(leaf.as_encoded_bytes());
+    let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
+    // One byte stays zero: the address is NUL-terminated.
+    if name.len() >= address.sun_path.len() {
+        return Err(ObservationError);
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (dst, src) in address.sun_path.iter_mut().zip(&name) {
+        *dst = *src as _;
+    }
     let raw = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -299,15 +326,6 @@ fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
         return Err(ObservationError);
     }
     let stream = unsafe { UnixStream::from_raw_fd(raw) };
-    let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as _;
-    for (dst, src) in address
-        .sun_path
-        .iter_mut()
-        .zip(path.as_os_str().as_encoded_bytes())
-    {
-        *dst = *src as _;
-    }
     let code = unsafe {
         libc::connect(
             raw,
@@ -683,14 +701,39 @@ mod tests {
     /// without the bridge being asked.
     #[test]
     fn interoperates_with_actual_python_transport_in_key_mode() {
-        use std::io::BufRead;
-        use std::process::{Command, Stdio};
         let dir = tempfile::Builder::new()
             .prefix("capyctl-observer-")
             .tempdir_in(std::env::var("HOME").unwrap())
             .unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let path = dir.path().join("observe.sock");
+        key_mode_against_python(dir.path().join("observe.sock"));
+    }
+    /// T22 T20 (found live 2026-10-14): a socket whose path is past the
+    /// 108-byte `sun_path` (a long state directory) is still bound by the
+    /// listener and reached by the host, each through a descriptor of the
+    /// directory; before, the launch went unenrolled and every park was
+    /// refused as not quiescent.
+    #[test]
+    fn a_socket_under_a_long_directory_is_observed() {
+        let dir = tempfile::Builder::new()
+            .prefix("capyctl-observer-")
+            .tempdir_in(std::env::var("HOME").unwrap())
+            .unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let long = "s".repeat(60);
+        let mut deep = dir.path().to_path_buf();
+        for name in [long.as_str(), "state", "observation"] {
+            deep.push(name);
+            fs::create_dir(&deep).unwrap();
+            fs::set_permissions(&deep, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = deep.join("01M4YCG0X1N4KJN7J16YET37VM.sock");
+        assert!(path.as_os_str().len() > 108, "{}", path.display());
+        key_mode_against_python(path);
+    }
+    fn key_mode_against_python(path: PathBuf) {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()

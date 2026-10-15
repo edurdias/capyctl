@@ -25,7 +25,7 @@
 use super::residency::{SaverMapped, SaverResidency, SaverScope, SaverUnavailable};
 use capyctl_adapters::{
     sglang::{ObservationAccess, SglangRuntimeObservation, SglangRuntimeObserver},
-    traits::{RuntimeAction, RuntimeCommand, RuntimeError},
+    traits::{Quiescence, RuntimeAction, RuntimeCommand, RuntimeError, Unproven},
 };
 use capyctl_domain::completion::{ExecutionIdentities, Presence, ProcessIdentity};
 use capyctl_launchers::native_observation::{AllocationTag, NativeObservationClient};
@@ -290,6 +290,13 @@ impl SaverResidency for EnrolledSaver {
         Some(&self.dir)
     }
 
+    fn unenrolled(&self, binding_id: &str) -> bool {
+        token(binding_id)
+            && self.private_dir().is_ok()
+            && std::fs::symlink_metadata(self.dir.join(format!("{binding_id}.json")))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    }
+
     fn retire(&self, binding_id: &str) {
         // Only this user's own record and socket for exactly that binding;
         // anything else in the directory is left as it is.
@@ -471,7 +478,7 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
         })
     }
 
-    async fn quiescent(&self, access: &ObservationAccess<'_>) -> bool {
+    async fn quiescent(&self, access: &ObservationAccess<'_>) -> Quiescence {
         // SPEC §10 step 4 before an embedded Park: the engine's gauges are at
         // zero and the enrolled saver is real and fully mapped. The Park step
         // then re-proves both against the launch's recorded processes.
@@ -483,9 +490,17 @@ impl SglangRuntimeObserver for LaunchSglangObserver {
             access.inference_key,
         )
         .await;
-        idle == Ok(true)
+        let quiescent = idle == Ok(true)
             && saver_facts(&mapped, access.resident_weights)
-                .is_some_and(|f| f.real_saver && f.resident)
+                .is_some_and(|f| f.real_saver && f.resident);
+        // Found live 2026-10-14: a launch that never enrolled was refused as
+        // merely not quiescent; the refusal now says it is unobserved.
+        let unproven = (!quiescent && self.saver.unenrolled(access.binding_id))
+            .then_some(Unproven::ObservationNotEnrolled);
+        Quiescence {
+            quiescent,
+            unproven,
+        }
     }
 
     fn observation_dir(&self) -> Option<PathBuf> {

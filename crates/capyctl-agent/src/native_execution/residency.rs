@@ -130,6 +130,12 @@ pub trait SaverResidency: Send + Sync {
         None
     }
 
+    /// Whether the launch provably never enrolled: its private directory is
+    /// readable and holds no record for this binding. `false` when unknown.
+    fn unenrolled(&self, _binding_id: &str) -> bool {
+        false
+    }
+
     /// Forget a launch proven gone: its enrollment is no longer evidence.
     fn retire(&self, _binding_id: &str) {}
 }
@@ -335,7 +341,9 @@ impl Run<'_> {
                 if !ready {
                     // Found live 2026-09-23 (M28): a refused SGLang park said
                     // only `unchanged`. Which fact failed, and the saver's
-                    // bytes per tag when readable, on the host's own log.
+                    // bytes per tag when readable, on the host's own log, and
+                    // (found live 2026-10-14) whether the launch never enrolled.
+                    let unenrolled = saver.unenrolled(&self.plan.binding_id);
                     let saver = match self.saver_scope() {
                         Some(scope) => read_saver(saver, scope).await.ok(),
                         None => None,
@@ -357,6 +365,7 @@ impl Run<'_> {
                         "unknown_work": o.unknown_work,
                         "allocations_resident": o.allocations,
                         "saver": saver,
+                        "unenrolled": unenrolled,
                     }));
                 }
                 ready

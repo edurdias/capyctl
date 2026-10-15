@@ -31,8 +31,10 @@ class _Custody:
         self.socket_info = None
         self.path = path
         try:
+            # The path itself may be as long as any path: the socket is bound
+            # through this custody's descriptor of its directory (`address`).
             if (type(path) is not str or not path.startswith("/")
-                    or not path.isprintable() or len(os.fsencode(path)) > 107
+                    or not path.isprintable() or len(os.fsencode(path)) > 4095
                     or any(part in ("", ".", "..") for part in path[1:].split("/"))):
                 raise ObservationServerError()
             parts = path[1:].split("/")
@@ -56,6 +58,19 @@ class _Custody:
         except Exception:
             self.release()
             raise ObservationServerError() from None
+
+    def address(self):
+        """The socket's address through this custody's descriptor of its
+        directory, `/proc/self/fd/<fd>/<leaf>`: the socket is bound in exactly
+        the directory custody verified, and the address fits `sun_path` (108
+        bytes with its NUL) whatever the directory's own path length. Found
+        live 2026-10-14: a state directory whose `<dir>/<binding>.sock` was 108
+        bytes left the launch unenrolled, so every park was refused. Not an
+        abstract address: the socket is a 0600 file in the private directory."""
+        address = "/proc/self/fd/%d/%s" % (self.fds[-1], self.leaf)
+        if len(os.fsencode(address)) > 107:
+            raise ObservationServerError()
+        return address
 
     def check_directories(self):
         last = len(self.fds) - 1
@@ -143,7 +158,7 @@ The listener never removes a replaced path and never adopts an existing socket.
             custody = _Custody(path)
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.set_inheritable(False)
-            listener.bind(path)
+            listener.bind(custody.address())
             custody.capture_socket()
             listener.listen(1)
             listener.settimeout(0.1)

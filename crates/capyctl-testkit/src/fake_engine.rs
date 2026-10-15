@@ -353,7 +353,10 @@ impl EngineAdapter for FakeEngine {
         if self.knobs.lock().unwrap().fail_at == Some(Phase::Parking) {
             return Err(AdapterError::Crash(Phase::Parking));
         }
-        Ok(Quiescence { quiescent: true })
+        Ok(Quiescence {
+            quiescent: true,
+            unproven: None,
+        })
     }
 
     async fn park(

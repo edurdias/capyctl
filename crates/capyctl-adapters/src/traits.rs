@@ -174,6 +174,28 @@ pub enum Readiness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quiescence {
     pub quiescent: bool,
+    /// Why quiescence was not proven, when the adapter knows a closed reason
+    /// beyond the engine's own work; `None` otherwise.
+    pub unproven: Option<Unproven>,
+}
+
+/// SPEC §9.2: a closed reason an engine's quiescence could not be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unproven {
+    /// The launch's saver observation never enrolled in the host's private
+    /// directory, so nothing can show its saver fully mapped. Found live
+    /// 2026-10-14: such parks read only as "not quiescent".
+    ObservationNotEnrolled,
+}
+
+impl std::fmt::Display for Unproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unproven::ObservationNotEnrolled => {
+                f.write_str("the engine's saver observation is not enrolled")
+            }
+        }
+    }
 }
 
 /// How deeply to park a member.
