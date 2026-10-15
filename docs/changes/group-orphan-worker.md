@@ -1,4 +1,4 @@
-# Status: A killed group worker's unrecorded processes are stopped — 2026-10-15 (branch `fix/group-orphan-worker`)
+# Status: A killed group worker's unrecorded processes are stopped, and a member with no recorded identities settles — 2026-10-15 (branch `fix/group-orphan-worker`)
 
 Found live in MN5 vLLM (0.1.3 matrix, run matrix-20261015T071325Z): SIGKILL of the
 worker member's vLLM process (rank 1 on host B) left its `VLLM::Worker_TP1` (38 GiB of
@@ -45,6 +45,40 @@ plan should settle within seconds with `failed_rank 1`, no `VLLM::Worker_TP1` or
 resource tracker left on host B, no `a local effect failed` in host B's log, and the
 member's charge released.
 
+Found live in MN2 SGLang TP2 (diagnosis `MN2/diag-*`): host B's Launch reply for rank
+1 named two processes under one role (`worker-0` twice in its journal; that naming
+bug is fixed separately), so `mark_member_launched` refused it and the member stayed
+dispatched with no identities. `settle_member` settles a dispatched member only on
+its recorded identities, and the stop's own fallback recorded the Terminate reply's
+identities first through the same refused call, so rank 1 stayed `uncertain` with its
+54 GB cold charge and a worker lease held, although host B had answered 54 Terminates
+and no engine process remained. Any dispatched member whose identities were never
+recorded (a lost, refused or unrecordable Launch reply) dead-ended the same way.
+
+Fix (ADR 0028 amendment of 2026-10-15, R23, SPEC §11): such a member now settles on
+its own host's evidence for the Launch it was dispatched with. The Terminate reply
+already carries it: the owned handle (that Launch's command id), every process the
+host's journal recorded for it with its presence, and whether the claim is retained.
+The controller passes it to a new store call, `settle_unrecorded_member`, only when
+every process is gone and the claim is released. The store checks the member's
+host, that it was dispatched with no identities recorded, that the handle is the
+Launch it was dispatched with, and that the evidence names at least one process (pid,
+boot id, start ticks, one boot, none twice; roles may repeat). It then releases the
+charge and records those processes. Anything else, an empty journal included, keeps
+the member uncertain and charged. The protocol does not change: the fields are the
+ones every agent already sends, so older hosts give the same evidence.
+
+Tests (T30, T31, T33). `capyctl-controller` group world
+`an_unrecorded_member_settles_on_its_hosts_launch_evidence` fails on `main` (the
+member never settles; timed out) and passes now;
+`an_unrecorded_member_without_launch_evidence_stays_charged` (the host came back
+with an empty journal) passes on both. `capyctl-store`
+`an_unrecorded_member_settles_only_on_evidence_for_its_own_launch` covers the
+refusals (another Launch, another host, no process, a process twice, two boots) and
+the settlement. Live check still needed: rerun MN2; a worker member whose identities
+were not recorded should settle on the stop's first Terminate, its charge and worker
+lease released.
+
 # Release note: Multi-node groups
 
 - **A killed group worker no longer leaves its engine processes behind.** When a
@@ -53,3 +87,8 @@ member's charge released.
   the deployment stayed `stopping` with the member's memory charged, and `start` and
   `delete` were refused. The host now stops every process of the member's launch and
   the group settles.
+- **A group member whose launch was never recorded settles once it is gone.** A
+  worker member whose Launch reply was lost, refused or could not be recorded used to
+  stay uncertain with its memory charged even after its host had stopped every
+  process. It now settles on its host's evidence that every process of that Launch
+  is gone.

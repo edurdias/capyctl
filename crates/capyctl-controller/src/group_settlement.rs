@@ -11,12 +11,15 @@
 //!
 //! - a member with recorded identities settles on gone-evidence naming
 //!   exactly those (ADR 0028 §8, R23);
-//! - a member whose Launch reply was lost has none recorded; its host's
-//!   journal answers the Terminate with the identities it journaled for that
-//!   Launch, which are recorded for it first (`mark_member_launched`), then
-//!   settled on. A host that lost its journal (an agent restarted with an
-//!   empty journal, Review Focus 3) knows no such Launch and reports nothing,
-//!   so the member stays uncertain: an empty journal is never gone-evidence;
+//! - a member whose identities were never recorded (its Launch reply was
+//!   lost, refused, or named processes that could not be recorded, MN2) has
+//!   none; its host's journal answers the Terminate of that Launch with the
+//!   processes it journaled for it, each proven gone, and the claim released,
+//!   and the store settles it on that evidence for exactly the Launch it was
+//!   dispatched with (`settle_unrecorded_member`). A host that lost its
+//!   journal (an agent restarted with an empty journal, Review Focus 3)
+//!   knows no such Launch and reports nothing, so the member stays
+//!   uncertain: an empty journal is never gone-evidence;
 //! - a member never dispatched settles on empty evidence;
 //! - a member whose host does not answer, or reports a process alive, stays
 //!   charged and `uncertain` (`mark_member_uncertain`). Nothing here, and no
@@ -39,7 +42,7 @@ use capyctl_protocol::{
     execution::{MemberAction, MemberCommand},
     pb,
 };
-use capyctl_store::groups::{GroupSettlement, MemberGone, MemberRow, MemberState};
+use capyctl_store::groups::{GroupSettlement, LaunchGone, MemberGone, MemberRow, MemberState};
 use std::time::Duration;
 
 /// ADR 0028 §11: the state a `Terminate` is authorized in on the member's
@@ -292,26 +295,33 @@ async fn settle_member(ctx: &GroupCtx, target: &GroupTarget, row: MemberRow) {
             );
         }
     }
-    // R23: a member whose Launch reply was lost gets the identities its
-    // host's journal named for that Launch recorded before it settles.
-    if row.identities.is_none()
-        && store(&|s| {
-            s.mark_member_launched(
+    // The store compares the evidence with exactly what is recorded.
+    let settled = match &row.identities {
+        Some(_) => settle(reported),
+        // R23, MN2 (found live): no identities were recorded for this member
+        // (its Launch reply lost or refused, or naming processes that could
+        // not be recorded). Its host's journal answered the Terminate of the
+        // Launch it was dispatched with, released its claim and proved every
+        // process it journaled for that Launch gone; the store checks the
+        // handle against the member's own.
+        None if !reply.claim_retained && reply.owned_handle == handle => store(&|s| {
+            s.settle_unrecorded_member(
                 &target.deployment_id,
                 target.instance_index,
                 generation,
                 row.rank,
-                &reported,
+                LaunchGone {
+                    member: gone(Vec::new()).member,
+                    launch_handle: handle.clone(),
+                    identities: reported.clone(),
+                },
             )
+            .map(drop)
             .map_err(|e| e.to_string())
-        })
-        .is_err()
-    {
-        uncertain();
-        return;
-    }
-    // The store compares the evidence with exactly what is recorded.
-    if settle(reported).is_err() {
+        }),
+        None => Err("the host still claims the member's launch".into()),
+    };
+    if settled.is_err() {
         uncertain();
     }
 }

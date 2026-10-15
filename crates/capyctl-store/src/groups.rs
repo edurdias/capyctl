@@ -179,10 +179,25 @@ pub struct HostedMember {
 /// member's own host. `identities` are the processes it proved gone; a member
 /// with identities recorded settles only when they are exactly those, a
 /// member never dispatched only with none, and a member dispatched without
-/// identities recorded not at all until they are.
+/// identities recorded only on [`LaunchGone`] evidence for its own Launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberGone {
     pub member: MemberKey,
+    pub identities: Vec<ProcessIdentity>,
+}
+
+/// ADR 0028 §8, §11 (MN2, found live): gone evidence for a dispatched member
+/// whose identities were never recorded (its Launch reply was lost, refused
+/// or could not be recorded). The member's own host answered a Terminate of
+/// `launch_handle`, the Launch it journaled, with the claim released, and
+/// `identities` are every process its journal recorded for that Launch, each
+/// proven gone (pid, boot id and start ticks). Only the Launch the member was
+/// dispatched with is accepted, and only with at least one process: an empty
+/// journal proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchGone {
+    pub member: MemberKey,
+    pub launch_handle: String,
     pub identities: Vec<ProcessIdentity>,
 }
 
@@ -291,6 +306,28 @@ fn decode_plan(json: &str) -> Result<GroupPlan, GroupStoreError> {
         stored.generation,
     )
     .map_err(|_| corrupt())
+}
+
+/// ADR 0028 §8, §11: processes a host's journal recorded for one Launch, as
+/// gone evidence ([`LaunchGone`]): at least one, each named by pid, boot id
+/// and start ticks of one boot, none twice. Roles are not checked for
+/// uniqueness: they are the host's names, and the identity is the process.
+fn journaled_processes(identities: &[ProcessIdentity]) -> bool {
+    const MAX_PROCESSES: usize = 256;
+    let Some(first) = identities.first() else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    identities.len() <= MAX_PROCESSES
+        && identities.iter().all(|p| {
+            !p.role.trim().is_empty()
+                && p.role.len() <= 128
+                && p.pid != 0
+                && p.start_ticks != 0
+                && !p.boot_id.trim().is_empty()
+                && p.boot_id == first.boot_id
+                && seen.insert((p.pid, p.start_ticks))
+        })
 }
 
 /// The canonical stored form of a member's identities: sorted, so evidence
@@ -1180,6 +1217,87 @@ impl crate::Store {
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
                 params![deployment_id, instance_index, generation, rank],
             )?;
+        }
+        let outcome = finish_if_settled(&tx, deployment_id, instance_index, generation)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// ADR 0028 §8, §11, SPEC §11 (MN2, found live): release a dispatched
+    /// member whose identities were never recorded, on its own host's gone
+    /// evidence for the Launch it was dispatched with ([`LaunchGone`]).
+    ///
+    /// Before this, such a member could never settle: [`Self::settle_member`]
+    /// refuses a dispatched member without recorded identities, and recording
+    /// them from the Terminate reply ([`Self::mark_member_launched`]) fails
+    /// whenever the reply's identities are not a valid recorded set (MN2: two
+    /// processes reported under one role), so the member stayed `uncertain`
+    /// with its charge held after every process was gone.
+    ///
+    /// Accepted only for a member that is dispatched, has no identities
+    /// recorded, and whose recorded Launch handle is the evidence's; the
+    /// evidence names its own host and member and at least one well-formed
+    /// process of one boot, none twice. The processes are recorded with the
+    /// settlement, so a retry with the same evidence reports the group's state
+    /// again. Anything else is a `Conflict` and keeps the charge.
+    pub fn settle_unrecorded_member(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+        evidence: LaunchGone,
+    ) -> Result<GroupSettlement, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        type Row = (String, String, String, bool, Option<String>, Option<String>);
+        let row: Option<Row> = tx
+            .query_row(
+                "SELECT host_id,owner_id,state,dispatched,launch_handle,identities_json
+                   FROM group_members
+                  WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
+                params![deployment_id, instance_index, generation, rank],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((host, owner, state, dispatched, handle, recorded)) = row else {
+            return Err(GroupStoreError::Conflict);
+        };
+        if evidence.member.host_id != host
+            || evidence.member.member_id != member_id(rank)
+            || !dispatched
+            || evidence.launch_handle.trim().is_empty()
+            || handle.as_deref() != Some(evidence.launch_handle.as_str())
+            || !journaled_processes(&evidence.identities)
+        {
+            return Err(GroupStoreError::Conflict);
+        }
+        let proven = canonical_identities(&evidence.identities);
+        match (MemberState::parse(&state)?, recorded) {
+            (MemberState::Dispatching | MemberState::Uncertain, None) => {
+                let released =
+                    tx.execute("DELETE FROM resource_owners WHERE owner_id=?1", [&owner])?;
+                if released != 1 {
+                    return Err(corrupt());
+                }
+                crate::resource_ledger::advance_completion_epoch(&tx).map_err(|_| corrupt())?;
+                tx.execute(
+                    "UPDATE group_members SET state='settled',identities_json=?5
+                      WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4",
+                    params![deployment_id, instance_index, generation, rank, proven],
+                )?;
+            }
+            // A retry of this settlement.
+            (MemberState::Settled, Some(recorded)) if recorded == proven => {}
+            _ => return Err(GroupStoreError::Conflict),
         }
         let outcome = finish_if_settled(&tx, deployment_id, instance_index, generation)?;
         tx.commit()?;

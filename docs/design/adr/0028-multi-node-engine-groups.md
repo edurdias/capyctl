@@ -721,3 +721,19 @@ ADR 0014 amendment A19's growth bound applies per member, each against its own h
 `parked_growth_limit`; a member past it turns the group's next park into a group stop.
 
 CPU and Fake-engine tests only; the MN4 rows qualify it.
+
+## Amendment of 2026-10-15: a member with no recorded identities settles on its host's journal
+
+Found live (MN2 SGLang): a worker's Launch reply named two processes under one role,
+so its identities could not be recorded and the member, dispatched, could settle on
+nothing (§11, R23: a dispatched member settles only on recorded identities). It stayed
+`uncertain` and charged after its host had stopped every process.
+
+A dispatched member with no recorded identities (its Launch reply lost, refused or
+not recordable) now settles on its own host's gone-evidence for the Launch it was
+dispatched with: the host's answer to the Terminate of that Launch's handle names every
+process its journal recorded for it, each gone, with the claim released. The store
+accepts it only for that handle and that host, with at least one well-formed process
+(roles may repeat, a process may not), and records those processes with the
+settlement. A host with an empty journal names nothing and claims nothing, which is
+no evidence: the member stays charged, as §11 requires. No protocol field is added.
