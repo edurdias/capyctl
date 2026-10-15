@@ -1,5 +1,6 @@
 ---
 import { GPU_CLASSES, gpuRow } from '../../data/gpu.mjs';
+import { href } from '../../../site.config.mjs';
 const rows = GPU_CLASSES.map((c) => ({ ...c, ...gpuRow(c.budget) }));
 ---
 <section>
@@ -16,10 +17,10 @@ const rows = GPU_CLASSES.map((c) => ({ ...c, ...gpuRow(c.budget) }));
       ))}
       <tr>
         <th scope="row">Several machines</th>
-        <td>Each machine as above. The server places each model on a machine with room and routes requests there.</td>
+        <td>Each machine as above. The server places each model on a machine with room and routes requests there. A model too large for one machine can run across two, one engine rank on each (<a href={href('/docs/several-machines/')}>several machines</a>).</td>
       </tr>
     </tbody>
   </table>
   </div>
-  <p class="note">Illustrative, from model weight sizes. KV cache and engine overhead vary with context length and settings. One model runs on one GPU today. Not a list of supported cards.</p>
+  <p class="note">Illustrative, from model weight sizes. KV cache and engine overhead vary with context length and settings. On one machine a model runs on one GPU. Not a list of supported cards.</p>
 </section>
