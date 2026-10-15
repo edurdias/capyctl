@@ -371,6 +371,11 @@ to the head's agent as an additive extension of the existing member probe; the a
 runs it on loopback with the per-launch key and returns the generated token ids. It
 never goes through ingress or the router, and worker hosts never receive one. One probe
 function serves readiness, the request-stall check (§11) and the wake canary (§12).
+Amended 2026-10-15 (owner decision, found live in MN3, MN5 and MN6): TensorFold answers
+the ids in its response's own `tensorfold` block, where they are read. A TensorFold
+head whose answer carries no ids passes readiness and the stall check on its non-empty
+generated text, and the controller logs that it did; a vLLM or SGLang head always
+needs the ids, and the wake canary compares ids only.
 Worker hosts never probe readiness; SGLang's nonzero-rank health server always
 answers 200 and is never read. The router routes only to the head's ingress, opens
 the route only on READY (T30), and treats a group as one replica in balancing and

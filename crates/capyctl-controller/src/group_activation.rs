@@ -238,6 +238,29 @@ pub enum ProbeError {
     Failed(String),
 }
 
+/// What a completion probe through the head proved (ADR 0028 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadEvidence {
+    /// The generated token ids: every engine's evidence when it answers
+    /// them, and the only one a wake canary compares (ADR 0028 §12).
+    Tokens(Vec<u32>),
+    /// Owner decision 2026-10-15: a TensorFold head whose answer carries no
+    /// token ids (a build without them in its `tensorfold` block) proves
+    /// readiness with its non-empty generated text. TensorFold groups are
+    /// restart-only, so no wake canary ever needs their ids.
+    Text,
+}
+
+impl HeadEvidence {
+    /// The generated token ids, when the head answered them.
+    pub fn into_tokens(self) -> Option<Vec<u32>> {
+        match self {
+            Self::Tokens(tokens) => Some(tokens),
+            Self::Text => None,
+        }
+    }
+}
+
 /// The head launch a completion probe is sent to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadLaunch {
@@ -286,13 +309,13 @@ pub fn check_member_paths(
 /// retained launch with the per-launch key (ADR 0012), never through ingress
 /// or the router. Worker hosts are never sent one. The one probe function of
 /// readiness (1 token), the wake canary and the request-stall check; it
-/// waits at most `deadline` and returns the generated token ids.
+/// waits at most `deadline` and returns what the head's answer proved.
 pub async fn probe_head(
     ctx: &GroupCtx,
     head: &HeadLaunch,
     max_tokens: u32,
     deadline: Duration,
-) -> Result<Vec<u32>, ProbeError> {
+) -> Result<HeadEvidence, ProbeError> {
     let command = probe_command(&ctx.hosts.controller_id(), head, max_tokens, deadline);
     let result = tokio::time::timeout(deadline, ctx.hosts.execute(command))
         .await
@@ -340,22 +363,40 @@ pub fn probe_command(
     command
 }
 
-/// The generated token ids of a completion probe's answer: completed on the
-/// head's own launch, at least one token and at most `max_tokens`.
+/// What a completion probe's answer proved: completed on the head's own
+/// launch, with at least one token id and at most `max_tokens`. Owner
+/// decision 2026-10-15: a TensorFold head's answer with no token ids passes
+/// on its non-empty generated text ([`HeadEvidence::Text`]), and that
+/// evidence is logged; a vLLM or SGLang head's never does.
 pub fn probe_answer(
     result: &pb::MemberExecutionResult,
     head: &HeadLaunch,
     max_tokens: u32,
-) -> Result<Vec<u32>, ProbeError> {
+) -> Result<HeadEvidence, ProbeError> {
     if result.state != "completed" || result.owned_handle != head.owned_handle {
         return Err(ProbeError::Failed(
             "the head did not complete the probe on its launch".into(),
         ));
     }
-    if result.probe_tokens.is_empty() || result.probe_tokens.len() > max_tokens as usize {
-        return Err(ProbeError::Failed("the head generated no token".into()));
+    let tokens = &result.probe_tokens;
+    if !tokens.is_empty() && tokens.len() <= max_tokens as usize {
+        return Ok(HeadEvidence::Tokens(tokens.clone()));
     }
-    Ok(result.probe_tokens.clone())
+    if tokens.is_empty()
+        && !result.probe_text.is_empty()
+        && head.plan.engine() == GroupEngine::Tensorfold
+    {
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Notice,
+            &format!(
+                "deployment {}: the TensorFold head answered its completion probe with \
+                 text and no token ids; its readiness is judged on the generated text",
+                head.deployment_id
+            ),
+        );
+        return Ok(HeadEvidence::Text);
+    }
+    Err(ProbeError::Failed("the head generated no token".into()))
 }
 
 /// One member as the activation prepares it.

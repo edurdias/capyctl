@@ -8,7 +8,8 @@
 //! for the generated token ids in its own request form. Owner decision
 //! 2026-10-09: the answer also carries the generated text, so a single
 //! launch's wake canary still compares something when an engine answers no
-//! token ids. A group probe still needs the token ids.
+//! token ids. A group probe still needs the token ids, except a TensorFold
+//! head's (owner decision 2026-10-15, `group_activation::probe_answer`).
 use serde_json::{json, Value};
 
 use crate::traits::AdapterError;
@@ -33,8 +34,9 @@ pub struct ProbeAnswer {
     pub text: String,
 }
 
-/// vLLM and TensorFold: OpenAI `/v1/completions` asking for the token ids
-/// (`return_token_ids`), answered in `choices[0].token_ids`.
+/// vLLM, TensorFold and llama.cpp: OpenAI `/v1/completions` asking for the
+/// token ids (`return_token_ids`). vLLM answers them in
+/// `choices[0].token_ids`; TensorFold in its own block ([`tensorfold_answer`]).
 pub(crate) const OPENAI_PATH: &str = "/v1/completions";
 
 pub(crate) fn openai_request(served: &str, max_tokens: u32) -> Value {
@@ -51,6 +53,20 @@ pub(crate) fn openai_request(served: &str, max_tokens: u32) -> Value {
 pub(crate) fn openai_answer(answer: &Value) -> Result<ProbeAnswer, AdapterError> {
     let choice = &answer["choices"][0];
     probe_answer(&choice["token_ids"], &choice["text"])
+}
+
+/// TensorFold: the OpenAI answer, whose ids TensorFold 0.6.5 (609ca419) and
+/// 0.6.6 (cb2ebf05) put in the response's own `tensorfold` block when
+/// `return_token_ids` is set (`tensorfold.token_ids`, src/tensorfold/cuda/
+/// server.py:558 and cuda/http.py:240-242), never in the choice. A choice's
+/// `token_ids` is read when the block carries none, as vLLM's form.
+pub(crate) fn tensorfold_answer(answer: &Value) -> Result<ProbeAnswer, AdapterError> {
+    let choice = &answer["choices"][0];
+    let ids = match &answer["tensorfold"]["token_ids"] {
+        Value::Null => &choice["token_ids"],
+        ids => ids,
+    };
+    probe_answer(ids, &choice["text"])
 }
 
 /// SGLang: its native `/generate`, answered in `output_ids`.
@@ -181,5 +197,58 @@ mod tests {
             assert!(openai_answer(&bad).is_err(), "{bad}");
         }
         assert!(sglang_answer(&json!({"output_ids": []})).is_err());
+    }
+
+    // T30 (found live 2026-10-15, MN3/MN5/MN6): TensorFold answers the ids in
+    // its `tensorfold` block. Both shapes are TensorFold 0.6.5's and 0.6.6's
+    // non-streamed text completion (cuda/http.py:240-242): the choice carries
+    // `index`, `text` and `finish_reason` only; the block carries the decode
+    // stats, `token_sha`, and `token_ids` when `return_token_ids` is set.
+    #[test]
+    fn tensorfold_ids_come_from_its_own_block() {
+        let shape = |block: Value| {
+            json!({"id": "cmpl-0123456789abcdef01234567", "object": "text_completion",
+                   "created": 1, "model": "tg-n35",
+                   "choices": [{"index": 0, "text": " Ready", "finish_reason": "length"}],
+                   "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5,
+                             "prompt_tokens_details": {"cached_tokens": 0},
+                             "completion_tokens_details": {"reasoning_tokens": 0}},
+                   "tensorfold": block})
+        };
+        let stats = json!({"prefill_s": 0.0312, "cached": 0, "drafts": true, "token_sha": "5f1c"});
+        let mut with_ids = stats.clone();
+        with_ids["token_ids"] = json!([21872]);
+        assert_eq!(
+            tensorfold_answer(&shape(with_ids.clone())).unwrap(),
+            ProbeAnswer {
+                tokens: vec![21872],
+                text: " Ready".into()
+            }
+        );
+        // vLLM's reader finds no ids in the same answer: the live failure.
+        assert!(openai_answer(&shape(with_ids)).unwrap().tokens.is_empty());
+        // A build without the block's ids answers its text alone.
+        assert_eq!(
+            tensorfold_answer(&shape(stats)).unwrap(),
+            ProbeAnswer {
+                tokens: vec![],
+                text: " Ready".into()
+            }
+        );
+        // With no block, the choice's ids are read.
+        assert_eq!(
+            tensorfold_answer(&json!({"choices": [{"text": "ok", "token_ids": [3]}]})).unwrap(),
+            ProbeAnswer {
+                tokens: vec![3],
+                text: "ok".into()
+            }
+        );
+        for bad in [
+            shape(json!({"token_ids": [-1]})),
+            shape(json!({"token_ids": "7"})),
+            json!({"choices": [{"text": ""}], "tensorfold": {"token_sha": "5f1c"}}),
+        ] {
+            assert!(tensorfold_answer(&bad).is_err(), "{bad}");
+        }
     }
 }

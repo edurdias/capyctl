@@ -121,6 +121,10 @@ struct HostState {
     prepare_refusal: Option<String>,
     /// The head's completion probes generate no token.
     probe_fails: bool,
+    /// Found live 2026-10-15 (MN3, MN5, MN6): the head's completion probes
+    /// answer generated text and no token ids, as a TensorFold head read
+    /// without its `tensorfold` block's ids did.
+    probe_text_only: bool,
     /// Every Launch is carried out but its reply never reaches the server.
     lose_launch_replies: bool,
     /// Every Launch starts its rank, which exits at once (a launch failure).
@@ -176,6 +180,7 @@ impl GroupHost {
                 next_pid: 4000,
                 prepare_refusal: None,
                 probe_fails: false,
+                probe_text_only: false,
                 lose_launch_replies: false,
                 launch_fails: false,
                 duplicate_roles: false,
@@ -468,7 +473,7 @@ impl GroupHost {
         {
             return Err(HostError::Unauthorized);
         }
-        let tokens: Vec<u32> = if state.probe_fails {
+        let tokens: Vec<u32> = if state.probe_fails || state.probe_text_only {
             Vec::new()
         } else {
             self.group
@@ -476,6 +481,11 @@ impl GroupHost {
                 .into_iter()
                 .take(max_tokens as usize)
                 .collect()
+        };
+        let probe_text = if state.probe_text_only {
+            "Ready.".to_owned()
+        } else {
+            String::new()
         };
         // As the agent, the probe reports on the binding of the launch it
         // names.
@@ -490,6 +500,7 @@ impl GroupHost {
             processes: self.observed(&state, &launch.identities),
             claim_retained: true,
             probe_tokens: tokens,
+            probe_text,
             binding_id,
             incarnation,
             ..Self::reply(command)
@@ -1410,6 +1421,12 @@ impl GroupWorld {
     /// The head's completion probes generate no token.
     pub(super) fn probe_fails(self) -> Self {
         self.hosts[0].state().probe_fails = true;
+        self
+    }
+
+    /// The head's completion probes answer text and no token ids.
+    pub(super) fn probe_answers_text_only(self) -> Self {
+        self.hosts[0].state().probe_text_only = true;
         self
     }
 
@@ -2825,6 +2842,49 @@ async fn failing_readiness_probe_fails_the_activation() {
     ));
     assert!(!world.route_open("g"));
     assert_eq!(world.probe_calls(), 1);
+}
+
+// T30 (owner decision 2026-10-15; found live MN3, MN5, MN6): a TensorFold head
+// whose completion answers text and no token ids proves readiness with the
+// text: the group activates and its route opens.
+#[tokio::test]
+async fn tensorfold_readiness_passes_on_text_without_token_ids() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("tensorfold")
+        .probe_answers_text_only();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    assert!(world.route_open("g"));
+    assert_eq!(world.probe_calls(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
+}
+
+// T30 (decided 2026-10-06, unchanged by the owner decision of 2026-10-15): a
+// vLLM or SGLang head whose completion answers text and no token ids fails
+// readiness; only a TensorFold head's text is evidence.
+#[tokio::test]
+async fn vllm_and_sglang_readiness_still_needs_token_ids() {
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine(engine)
+            .probe_answers_text_only();
+        let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+        world.group.launch_completes();
+        assert!(
+            matches!(
+                world.wait_activation(&id).await,
+                GroupActivation::Failed {
+                    failed_rank: 0,
+                    failure: LaunchFailure::MemberFailed,
+                    ..
+                }
+            ),
+            "{engine}"
+        );
+        assert!(!world.route_open("g"), "{engine}");
+        assert_eq!(world.probe_calls(), 1, "{engine}");
+    }
 }
 
 // T30 (decided 2026-10-06): a passing 1-token probe through the head opens the route; workers are never probed.
