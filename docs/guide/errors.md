@@ -86,6 +86,20 @@ A deployment on one machine can show these codes the same way:
   back intact. The wake fails and CapyCTL stops the instance;
   `capyctl status deployment <name>` shows the code as its last error. The
   next request or `capyctl start deployment <name>` loads it fresh.
+- `wake_reload_failed` (vLLM): during a wake, the engine reported that
+  reloading the model's weights failed. The wake fails and CapyCTL stops the
+  instance, as for `wake_mismatch`; the next request or
+  `capyctl start deployment <name>` loads it fresh. The engine log
+  ([engine logs](../operations/install.md#engine-logs-and-troubleshooting))
+  has vLLM's reason.
+- `wake_uncertain`: a wake did not finish within the deployment's wake
+  window (`timeouts.wake`), or CapyCTL could not tell whether one of its steps
+  took effect (the engine stopped answering, or did not answer the fixed
+  prompt). The model is never served half-woken: CapyCTL stops the instance,
+  keeping its memory charged until the engine is proven gone, and the next
+  request loads it fresh. A wake that keeps timing out on a large model may
+  need a longer `timeouts.wake` in the deployment (as in the
+  [example deployment](../examples/deployment-single.yaml)).
 - `engine_config_file` (llama.cpp): `/etc/llama.cpp/config.ini` exists on the
   machine, so llama-server would read options CapyCTL cannot check. Nothing
   starts until the file is removed.

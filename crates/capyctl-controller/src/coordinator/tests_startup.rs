@@ -761,8 +761,10 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     use capyctl_store::lifecycle::LifecycleError;
     let (dir, owner, fence, observations) = setup().await;
     // Weights 20 GiB, KV 4 GiB: request 20 + 4 + 8 (margin) = 32 GiB; the
-    // placeholder peak is 20 × 2.25 + 8 = 53 GiB (ADR 0014 amendment A8),
-    // above the 36 GiB limit.
+    // parking deployment's undeclared loader is `eager` (ADR 0014 amendment
+    // A21, note of 2026-10-15), so the placeholder peak is 20 × 3.6 + 8 =
+    // 80 GiB (amendment A8 with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR`), above
+    // the 36 GiB limit.
     managed_limit(&owner, &observations, 36 * GIB);
     let big = {
         let o = owner.lock().unwrap();
@@ -862,7 +864,7 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     assert!(footprint(&owner, &id).is_none());
     let before = serde_json::to_value(status(&owner).startup.unwrap()).unwrap();
     assert_eq!(before["provenance"], "default");
-    assert_eq!(before["bytes"], 53 * GIB + OVERHEAD);
+    assert_eq!(before["bytes"], 80 * GIB + OVERHEAD);
 
     // Alone on the host it starts and holds the whole managed limit.
     let stop = w.stop("owner", &fence, "stop-small", 60_000).unwrap();

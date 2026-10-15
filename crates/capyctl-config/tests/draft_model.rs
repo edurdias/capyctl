@@ -259,12 +259,12 @@ fn an_absent_drafter_keeps_every_encoding_and_fingerprint() {
         "29c1337aca5fdb3a56e9e70e023f57af5906c2e9567c38165dde76e7e77431e2"
     );
     let effective = resolve_effective(&deployment, &host).unwrap();
-    // Re-pinned for ADR 0014 amendment A21 (2026-10-09): the fixture parks on
-    // unified memory, so its effective configuration now carries the
-    // defaulted `lazy` loader and its provenance entry.
+    // Re-pinned for ADR 0014 amendment A21 (note of 2026-10-15): the fixture
+    // parks, so its effective configuration carries the defaulted `eager`
+    // loader, its provenance entry and the eager startup placeholder.
     assert_eq!(
         effective.recipe_fingerprint,
-        "95db2ad97a7c5754e87992568811fdffaa4609b2a987e2d729159faf0f8f2249"
+        "d469543900111ea97c7040b561726a1e8023340b8a3741d31da491539e737c23"
     );
     let model = serde_json::to_value(&effective.model).unwrap();
     assert_eq!(

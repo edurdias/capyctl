@@ -199,10 +199,12 @@ to run from a directory you maintain yourself; CapyCTL never writes to it.
 Engine tuning such as vLLM's loader under deep parking
 (`engine_config.vllm.safetensors_load_strategy`: `eager` or `lazy`) is a deployment
 setting, written in the deployment file like every other `engine_config` field.
-Left unset, a deep-parking deployment's loader follows the machine's memory: `lazy`
-on unified memory (faster to run light but slower to wake), `eager` on a discrete
-GPU (faster to wake but heavier while loading and running). A deployment that does
-not park gets no loader choice from CapyCTL either way. See
+Left unset, a deep-parking deployment loads with `eager` on every machine (faster to
+wake). `lazy` holds far less memory on unified memory while loading, running and
+parked, but starts and wakes slower, and on vLLM 0.30 with Qwen3.8-27B NVFP4 its
+wake took over two minutes to reload the weights and did not complete. A
+deployment that does not park gets no loader choice from
+CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
 
 A llama.cpp deployment's settings are `engine_config.context_length` (required:

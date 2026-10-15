@@ -89,11 +89,15 @@ fn sleep_mode_follows_the_host_deep_park_switch() {
 
     let enabled = effective("enabled");
     let plan = plan_from_effective(&enabled, 8123, "l".into(), "/r".into()).unwrap();
-    // ADR 0014 amendment A21 (owner decision 2026-10-09): the fixture's host
-    // is unified memory, so an undeclared loader now defaults to `lazy`.
+    // ADR 0014 amendment A21 (note of 2026-10-15): an undeclared loader on a
+    // parking deployment defaults to `eager` on every memory shape.
     assert_eq!(
         plan.sleep_flags,
-        vec!["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+        vec![
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
     );
     assert_eq!(park_policy(&enabled), ParkPolicy::Enabled);
     let rendered = render_command(&plan).unwrap();
@@ -107,12 +111,11 @@ fn sleep_mode_follows_the_host_deep_park_switch() {
         .any(|w| w == ["--middleware", "capyctl_vllm_guard.RequireEngineKey"]));
 }
 
-/// ADR 0014 §4 (amended 2026-10-07, owner decision 1; amendment A21, owner
-/// decision 2026-10-09): under sleep mode the loader stays beside the
-/// switch, resolved from the deployment's choice or capyctl's default for
-/// the host's memory shape; outside sleep mode a declared loader renders
-/// once as a typed field and a defaulted one renders nothing (vLLM's own
-/// default).
+/// ADR 0014 §4 (amended 2026-10-07, owner decision 1; amendment A21, note of
+/// 2026-10-15): under sleep mode the loader stays beside the switch,
+/// resolved from the deployment's choice or capyctl's default `eager`;
+/// outside sleep mode a declared loader renders once as a typed field and a
+/// defaulted one renders nothing (vLLM's own default).
 // T14 T21
 #[test]
 fn the_load_strategy_follows_the_deployment_setting() {
@@ -137,14 +140,18 @@ fn the_load_strategy_follows_the_deployment_setting() {
         (plan.sleep_flags, strategy(&argv))
     };
 
-    // The fixture's host is unified memory, so an undeclared loader resolves
-    // to `lazy` (amendment A21).
+    // The fixture's host is unified memory; an undeclared loader still
+    // resolves to `eager` (amendment A21, note of 2026-10-15).
     let (sleep, rendered) = render("enabled", None);
     assert_eq!(
         sleep,
-        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+        [
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
     );
-    assert_eq!(rendered, ["lazy"]);
+    assert_eq!(rendered, ["eager"]);
 
     let (sleep, rendered) = render("enabled", Some("lazy"));
     assert_eq!(
@@ -162,16 +169,14 @@ fn the_load_strategy_follows_the_deployment_setting() {
     assert!(rendered.is_empty());
 }
 
-/// ADR 0014 amendment A21 (owner decision 2026-10-09): absent a declared
-/// choice, a parking deployment's loader defaults to the host's own
-/// unified/discrete memory shape (ADR 0019 covers discrete GPUs): `lazy` on
-/// unified memory, `eager` on a discrete GPU (the fixture parks: residency
-/// `deep`, deep park enabled). A declared choice wins on either shape, and
-/// the resolved value (declared or defaulted) always renders under sleep
-/// mode.
+/// ADR 0014 amendment A21 (note of 2026-10-15): absent a declared choice, a
+/// parking deployment's loader defaults to `eager` on unified memory and on
+/// a discrete GPU alike (the fixture parks: residency `deep`, deep park
+/// enabled). A declared choice wins on either shape, and the resolved value
+/// (declared or defaulted) always renders under sleep mode.
 // T14 T21
 #[test]
-fn the_default_load_strategy_follows_the_host_memory_shape() {
+fn the_default_load_strategy_is_eager_on_every_memory_shape() {
     let strategy = |argv: &[String]| -> Vec<String> {
         argv.windows(2)
             .filter(|w| w[0] == "--safetensors-load-strategy")
@@ -218,13 +223,17 @@ fn the_default_load_strategy_follows_the_host_memory_shape() {
     };
 
     let (effective, defaulted, sleep, rendered) = render(false, None);
-    assert_eq!(effective.as_deref(), Some("lazy"));
+    assert_eq!(effective.as_deref(), Some("eager"));
     assert!(defaulted, "an undeclared choice is a capyctl default");
     assert_eq!(
         sleep,
-        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
+        [
+            "--enable-sleep-mode",
+            "--safetensors-load-strategy",
+            "eager"
+        ]
     );
-    assert_eq!(rendered, ["lazy"]);
+    assert_eq!(rendered, ["eager"]);
 
     let (effective, defaulted, sleep, rendered) = render(true, None);
     assert_eq!(effective.as_deref(), Some("eager"));
@@ -240,18 +249,14 @@ fn the_default_load_strategy_follows_the_host_memory_shape() {
     assert_eq!(rendered, ["eager"]);
 
     // An explicit choice wins on either shape and carries no provenance entry.
-    let (effective, defaulted, sleep, rendered) = render(false, Some("eager"));
-    assert_eq!(effective.as_deref(), Some("eager"));
+    let (effective, defaulted, sleep, rendered) = render(false, Some("lazy"));
+    assert_eq!(effective.as_deref(), Some("lazy"));
     assert!(!defaulted, "a declared choice has no provenance entry");
     assert_eq!(
         sleep,
-        [
-            "--enable-sleep-mode",
-            "--safetensors-load-strategy",
-            "eager"
-        ]
+        ["--enable-sleep-mode", "--safetensors-load-strategy", "lazy"]
     );
-    assert_eq!(rendered, ["eager"]);
+    assert_eq!(rendered, ["lazy"]);
 
     let (effective, defaulted, sleep, rendered) = render(true, Some("lazy"));
     assert_eq!(effective.as_deref(), Some("lazy"));
@@ -263,7 +268,7 @@ fn the_default_load_strategy_follows_the_host_memory_shape() {
     assert_eq!(rendered, ["lazy"]);
 }
 
-/// ADR 0014 amendment A21: the host-shape default only applies to a parking
+/// ADR 0014 amendment A21: the parking default only applies to a parking
 /// deployment, because that is the only case CapyCTL actually renders it
 /// (`VllmLaunchSettings::renders_eager_loader`). An undeclared, non-parking
 /// deployment resolves no strategy at all, on unified memory or a discrete

@@ -194,12 +194,12 @@ fn declared_resources_are_unchanged() {
     assert_eq!(memory.member, None);
     assert_eq!(ready(&member), 8 * GIB);
     assert!(!serde_json::to_string(&member).unwrap().contains("member"));
-    // Re-pinned for ADR 0014 amendment A21 (2026-10-09): the fixture parks
-    // on unified memory, so its effective configuration now carries the
-    // defaulted `lazy` loader and its provenance entry.
+    // Re-pinned for ADR 0014 amendment A21 (note of 2026-10-15): the fixture
+    // parks, so its effective configuration carries the defaulted `eager`
+    // loader, its provenance entry and the eager startup placeholder.
     assert_eq!(
         member.recipe_fingerprint,
-        "fec0b283800966df2d2d273b35f590b665e2d2395442e0dc768708a7cbf0094a"
+        "87b4f2a6be74acb45054478feab6842fc3f8d70fafb30ea61bd95330f046a506"
     );
 }
 
@@ -226,12 +226,12 @@ fn a_single_host_deployment_is_unchanged() {
     // 60 GiB checkpoint is above its 26.7 GiB floor, so that change, not this
     // one, moved the identity. The assertions above prove the group share
     // leaves a single host untouched. Re-pinned again for amendment A21
-    // (2026-10-09): the fixture parks on unified memory, so its effective
-    // configuration now carries the defaulted `lazy` loader and its
-    // provenance entry.
+    // (note of 2026-10-15): the fixture parks, so its effective
+    // configuration carries the defaulted `eager` loader, its provenance
+    // entry and the eager startup placeholder.
     assert_eq!(
         single.recipe_fingerprint,
-        "84d40e87f397081bf2cfc4b126e21bc85ce2ec964d5ea7150fa9b15f9f5bf6ee"
+        "50a8f976977b50613eb3fef4b3b59253825e5392776db0a3e5f54408ef7625bc"
     );
 }
 

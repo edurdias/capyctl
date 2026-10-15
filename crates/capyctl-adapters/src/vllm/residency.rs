@@ -24,8 +24,9 @@
 //! Error contract. `Unsupported` means no engine call was made: the policy
 //! gate, the step's shape, its deadline or the adapter's fence refused it.
 //! `Uncertain` means an engine call was dispatched and its effect is unknown;
-//! the adapter then refuses every further residency step, so a partial
-//! restoration is never repeated blindly (SPEC §13.2, T20).
+//! `ReloadFailed` means the engine answered that its weight reload failed.
+//! After either the adapter refuses every further residency step, so a
+//! partial restoration is never repeated blindly (SPEC §13.2, T20).
 use crate::traits::{MemberRef, RuntimeAction, RuntimeCommand, RuntimeError};
 use crate::vllm::{
     adapter::VllmAdapter,
@@ -153,10 +154,23 @@ async fn step(
                 Milestone::WeightsUsable
             } else {
                 // Collective control, invoked exactly once through the lead
-                // (SPEC §11).
-                http.collective_rpc()
+                // (SPEC §11). The reload re-reads the checkpoint, so it gets
+                // what is left of the restore's own deadline (the wake
+                // window), not a fixed bound of its own: found live
+                // 2026-10-15, a 123 s lazy reload inside a 180 s window was
+                // cut at a fixed 120 s and left the wake uncertain.
+                let left = c.deadline_ms.saturating_sub(now_ms()?).max(0);
+                http.collective_rpc(std::time::Duration::from_millis(left as u64))
                     .await
-                    .map_err(|e| uncertain("reload_weights", e))?;
+                    .map_err(|e| match e {
+                        // The engine answered: `reload_weights` raised. Its
+                        // weights are not usable; this is evidence, not an
+                        // unknown outcome.
+                        HttpError::UnexpectedStatus(status) => RuntimeError::ReloadFailed(format!(
+                            "vLLM answered reload_weights with status {status}"
+                        )),
+                        other => uncertain("reload_weights", other),
+                    })?;
                 Milestone::WeightsUsable
             }
         }

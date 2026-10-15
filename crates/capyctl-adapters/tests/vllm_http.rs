@@ -14,6 +14,10 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// The adapter-level reload bound the collective is given here.
+const RELOAD: std::time::Duration =
+    std::time::Duration::from_secs(capyctl_adapters::vllm::http::WEIGHT_RELOAD_TIMEOUT_SECS);
+
 #[derive(Clone, Default)]
 struct MockState {
     models_hit: Arc<AtomicUsize>,
@@ -95,7 +99,7 @@ async fn health_and_models_read() {
 async fn collective_rpc_requests_weight_reload() {
     let (addr, _) = spawn_mock().await;
     let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
-    http.collective_rpc().await.unwrap();
+    http.collective_rpc(RELOAD).await.unwrap();
 }
 
 #[tokio::test]
@@ -144,7 +148,7 @@ async fn checkpoint_reload_can_exceed_short_control_timeout() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
-    let result = http.collective_rpc().await;
+    let result = http.collective_rpc(RELOAD).await;
     server.abort();
     result.expect("checkpoint reload must outlive the 30-second control timeout");
 }
@@ -247,7 +251,7 @@ async fn engine_client_never_follows_a_redirect() {
     assert!(http.is_sleeping().await.is_err());
     assert!(http.sleep(1).await.is_err());
     assert!(http.wake().await.is_err());
-    assert!(http.collective_rpc().await.is_err());
+    assert!(http.collective_rpc(RELOAD).await.is_err());
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }
 
@@ -366,7 +370,7 @@ async fn drive_every_route(http: &EngineHttp) {
         .await
         .unwrap();
     assert!(!http.is_sleeping().await.unwrap());
-    http.collective_rpc().await.unwrap();
+    http.collective_rpc(RELOAD).await.unwrap();
     http.reset_prefix_cache().await.unwrap();
 }
 
@@ -406,7 +410,7 @@ async fn control_routes_take_the_admin_key_and_inference_takes_the_inference_key
     let inference_only = EngineHttp::new(base, Some("inference-key".into()));
     assert!(inference_only.sleep(1).await.is_err());
     assert!(inference_only.is_sleeping().await.is_err());
-    assert!(inference_only.collective_rpc().await.is_err());
+    assert!(inference_only.collective_rpc(RELOAD).await.is_err());
     assert!(inference_only.reset_prefix_cache().await.is_err());
     assert!(seen.lock().unwrap().iter().all(|(_, admitted)| !admitted));
 }

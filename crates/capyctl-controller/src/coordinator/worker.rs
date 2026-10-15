@@ -3119,23 +3119,27 @@ async fn execute_residency(
     context: capyctl_domain::completion::StepExecutionContext,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), CoordinatorError> {
+    use crate::wake_canary::{WAKE_MISMATCH, WAKE_RELOAD_FAILED, WAKE_UNCERTAIN};
     let now = (shared.clock)()?;
-    // A restore reloads weights and probes the model: bounded by its own
-    // deadline (the deployment's wake window), under the Initialize ceiling.
+    // A restore reloads weights and probes the model: the whole restore, its
+    // wake canary included, is bounded by its own deadline (the deployment's
+    // wake window, ADR 0014 §5 / T14), under the Initialize ceiling.
     let bound =
         Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
             .min(shared.options.initialize_timeout);
+    let deadline = tokio::time::Instant::now() + bound;
     let canary_context = context.clone();
     let outcome = tokio::select! {
         biased;
         _ = stop.changed() => None,
-        result = tokio::time::timeout(bound, residency_effect(driver, work.kind, context)) => Some(result),
+        result = tokio::time::timeout_at(deadline, residency_effect(driver, work.kind, context)) => Some(result),
     };
     let step = work.step_id.clone();
     let verb = match work.kind {
         ResidencyKind::Park => "park",
         ResidencyKind::Restore => "restore",
     };
+    let restore = work.kind == ResidencyKind::Restore;
     let uncertain = |reason: String| {
         let step = step.clone();
         async move {
@@ -3151,52 +3155,75 @@ async fn execute_residency(
                 .map(|_| ())
         }
     };
-    match outcome {
+    // What did not complete: the wake's closed code and the reason.
+    let failed: Option<(&'static str, String)> = match outcome {
         None => {
-            uncertain(format!("the controller stopped during the {verb}")).await?;
+            if restore {
+                // The next scheduler pass (of this controller or the next)
+                // stops it, as any wake that ended without its evidence.
+                record_wake_failure(shared, work, &canary_context, WAKE_UNCERTAIN).await;
+            }
+            let reason = format!("the controller stopped during the {verb}");
+            uncertain(if restore {
+                format!("{WAKE_UNCERTAIN}: {reason}")
+            } else {
+                reason
+            })
+            .await?;
             return Err(CoordinatorError::Stopped(format!(
                 "shutdown during a {verb}"
             )));
         }
-        Some(Err(_)) => uncertain(format!("the {verb} outlived its deadline")).await?,
+        Some(Err(_)) => Some((WAKE_UNCERTAIN, format!("the {verb} outlived its deadline"))),
         Some(Ok(Ok(observation))) => {
             // Owner decision 2026-10-09: a wake proves the model answers as
-            // it did at the launch's first readiness before it completes.
-            if work.kind == ResidencyKind::Restore {
-                match wake_canary_check(shared, driver, work, &canary_context).await {
-                    CanaryCheck::Passed => {}
-                    CanaryCheck::Unanswered(reason) => {
-                        uncertain(reason).await?;
-                        return Ok(());
-                    }
-                    CanaryCheck::Differs => {
-                        // Recorded before the step reads uncertain, so the
-                        // scheduler's retry of the stop never misses it.
-                        record_wake_mismatch(shared, work, &canary_context).await?;
-                        uncertain(format!(
-                            "{}: the model answered the wake canary differently than at its \
-                             first readiness",
-                            crate::wake_canary::WAKE_MISMATCH
-                        ))
-                        .await?;
-                        retry_wake_mismatch_stops(shared).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            let step = step.clone();
-            let completed = shared
-                .read(move |owner, now| {
-                    owner
-                        .store()
-                        .complete_residency(owner.session(), &step, &observation, now)
+            // it did at the launch's first readiness before it completes,
+            // within the restore's own deadline (found live 2026-10-15).
+            let canary = if restore {
+                tokio::time::timeout_at(
+                    deadline,
+                    wake_canary_check(shared, driver, work, &canary_context),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    CanaryCheck::Unanswered(
+                        "the wake canary was not answered before the wake's deadline".into(),
+                    )
                 })
-                .await;
-            if let Err(error) = completed {
-                if !shared.accepting.load(Ordering::Acquire) {
-                    return Err(error);
+            } else {
+                CanaryCheck::Passed
+            };
+            match canary {
+                CanaryCheck::Unanswered(reason) => Some((WAKE_UNCERTAIN, reason)),
+                CanaryCheck::Differs => Some((
+                    WAKE_MISMATCH,
+                    "the model answered the wake canary differently than at its first \
+                     readiness"
+                        .to_owned(),
+                )),
+                CanaryCheck::Passed => {
+                    let step = step.clone();
+                    let completed = shared
+                        .read(move |owner, now| {
+                            owner.store().complete_residency(
+                                owner.session(),
+                                &step,
+                                &observation,
+                                now,
+                            )
+                        })
+                        .await;
+                    match completed {
+                        Ok(()) => None,
+                        Err(error) if !shared.accepting.load(Ordering::Acquire) => {
+                            return Err(error)
+                        }
+                        Err(error) => Some((
+                            WAKE_UNCERTAIN,
+                            format!("its evidence was not accepted: {error}"),
+                        )),
+                    }
                 }
-                uncertain(format!("its evidence was not accepted: {error}")).await?;
             }
         }
         // SPEC §13 (W4): refused before any effect: settled at once.
@@ -3215,14 +3242,37 @@ async fn execute_residency(
                         .refuse_residency(owner.session(), &step, &reason)
                 })
                 .await?;
+            None
         }
-        Some(Ok(Err(RuntimeError::Uncertain(reason)))) => uncertain(reason).await?,
+        Some(Ok(Err(RuntimeError::Uncertain(reason)))) => Some((WAKE_UNCERTAIN, reason)),
+        // Found live 2026-10-15: the engine answered that the reload failed.
+        Some(Ok(Err(RuntimeError::ReloadFailed(reason)))) => Some((WAKE_RELOAD_FAILED, reason)),
         // A park or restore never launches; an engine reported gone here is
         // an unexplained effect, so it stays uncertain with its accounting.
         Some(Ok(Err(error @ RuntimeError::LaunchFailed(_)))) => {
-            uncertain(error.to_string()).await?
+            Some((WAKE_UNCERTAIN, error.to_string()))
         }
+    };
+    let Some((code, reason)) = failed else {
+        return Ok(());
+    };
+    if !restore {
+        // SPEC §13.2, T20: an uncertain park keeps everything until a stop
+        // proves the group gone.
+        return uncertain(reason).await;
     }
+    // Found live 2026-10-15 (the owner decision of 2026-10-09 for
+    // `wake_mismatch`, extended): a wake that did not complete is never
+    // re-armed, so it owes the instance's ordinary stop. The code is
+    // recorded before the step reads uncertain, so the scheduler's retry of
+    // the stop never misses it; accounting is released only on gone evidence.
+    if code == WAKE_MISMATCH {
+        record_wake_mismatch(shared, work, &canary_context).await?;
+    } else {
+        record_wake_failure(shared, work, &canary_context, code).await;
+    }
+    uncertain(format!("{code}: {reason}")).await?;
+    retry_wake_stops(shared).await?;
     Ok(())
 }
 
@@ -3252,10 +3302,15 @@ async fn record_wake_canary(
     context: &capyctl_domain::completion::StepExecutionContext,
 ) {
     use crate::wake_canary::{CANARY_DEADLINE, CANARY_TOKENS};
-    if let Ok(answer) = driver
-        .engine
-        .wake_canary(context, CANARY_TOKENS, CANARY_DEADLINE)
-        .await
+    // Bounded here too: an engine that never answers must not hold the
+    // worker (found live 2026-10-15 for the wake's own canary).
+    if let Ok(Ok(answer)) = tokio::time::timeout(
+        CANARY_DEADLINE,
+        driver
+            .engine
+            .wake_canary(context, CANARY_TOKENS, CANARY_DEADLINE),
+    )
+    .await
     {
         store_wake_canary(shared, instance, context, &answer).await;
     }
@@ -3373,17 +3428,46 @@ async fn record_wake_mismatch(
         .await
 }
 
-/// Owner decision 2026-10-09 (R42 pattern): one scheduler pass's retry of
-/// every stop a `wake_mismatch` still owes, read from the store (so a
+/// Found live 2026-10-15: the wake `work` did not complete for a reason
+/// other than its canary (`code` is `wake_reload_failed` or
+/// `wake_uncertain`); name it in the instance's status. The code only names
+/// the failure: the stop it owes is read from the wake's uncertain step
+/// ([`retry_wake_stops`]), so a code that cannot be recorded (the instance
+/// was stopped meanwhile) never keeps the step from reading uncertain.
+async fn record_wake_failure(
+    shared: &Arc<Shared>,
+    work: &ResidencyWork,
+    context: &capyctl_domain::completion::StepExecutionContext,
+    code: &'static str,
+) {
+    let (deployment, instance, generation) = (
+        work.deployment_id.clone(),
+        work.instance,
+        context.token.generation,
+    );
+    let _ = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .record_wake_failure(&deployment, instance, generation, code)
+                .map_err(service)
+        })
+        .await;
+}
+
+/// Owner decision 2026-10-09 (R42 pattern), extended to every wake that did
+/// not complete (found live 2026-10-15): one scheduler pass's retry of every
+/// stop a single launch's uncertain wake still owes (`wake_mismatch`,
+/// `wake_reload_failed`, `wake_uncertain`), read from the store (so a
 /// controller restart retries it too). It is an ordinary stop of the
 /// instance under the engine-exit principal: the host terminates the
 /// recorded engine and everything is released only on its gone evidence;
-/// the status names the code as its last error. Until one is accepted the
-/// instance's dispatch stays closed and its memory charged. Returns whether
-/// any stop was accepted.
-async fn retry_wake_mismatch_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+/// the status names the code as its last error, and the next request starts
+/// the instance fresh. Until one is accepted the instance's dispatch stays
+/// closed and its memory charged. Returns whether any stop was accepted.
+async fn retry_wake_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
     let owed = shared
-        .with_owner(|owner| owner.store().wake_mismatch_stops_due().map_err(service))
+        .with_owner(|owner| owner.store().wake_stops_due().map_err(service))
         .await?;
     if owed.is_empty() {
         return Ok(false);
@@ -3399,7 +3483,7 @@ async fn retry_wake_mismatch_stops(shared: &Arc<Shared>) -> Result<bool, Coordin
                     &owed.deployment_id,
                     owed.instance_index,
                     crate::engine_exit::EXIT_PRINCIPAL,
-                    &format!("wake-mismatch:{}:{}", owed.operation_id, owed.generation),
+                    &format!("wake-stop:{}:{}", owed.operation_id, owed.generation),
                 )
                 .is_ok()
             })
@@ -3454,7 +3538,7 @@ async fn residency_effect(
                 })
                 .await
                 .map_err(|error| match error {
-                    RuntimeError::Uncertain(reason) => RuntimeError::Uncertain(reason),
+                    error @ (RuntimeError::Uncertain(_) | RuntimeError::ReloadFailed(_)) => error,
                     other => RuntimeError::Uncertain(format!(
                         "the restore stopped after its first effect: {other}"
                     )),

@@ -360,12 +360,14 @@ async fn an_opted_out_host_makes_no_residency_call() {
     assert!(engine.lock().unwrap().calls.is_empty());
 }
 
-/// SPEC §13.2 / T20: a collective whose outcome is unknown is never repeated.
-/// The failed step is uncertain, and the adapter refuses every later residency
-/// step without an engine call, including a retry under a new step id.
+/// SPEC §13.2 / T20: a collective is never repeated. A reload the engine
+/// answers with an error status ran and failed (found live 2026-10-15): the
+/// step fails `wake_reload_failed`, and the adapter refuses every later
+/// residency step without an engine call, including a retry under a new
+/// step id.
 // T20
 #[tokio::test]
-async fn a_failed_reload_is_uncertain_and_never_repeated() {
+async fn a_failed_reload_fails_the_wake_and_is_never_repeated() {
     let engine = Shared::default();
     let port = serve(engine.clone()).await;
     let vllm = adapter(port, ParkPolicy::Enabled);
@@ -376,11 +378,15 @@ async fn a_failed_reload_is_uncertain_and_never_repeated() {
         .await
         .unwrap();
     engine.lock().unwrap().fail = Some("reload_weights".into());
-    assert!(matches!(
-        vllm.execute_persisted(&step(RuntimeAction::ReloadWeights, "r"))
-            .await,
-        Err(RuntimeError::Uncertain(_))
-    ));
+    let failed = vllm
+        .execute_persisted(&step(RuntimeAction::ReloadWeights, "r"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failed, RuntimeError::ReloadFailed(why) if why.contains("500")),
+        "{failed:?}"
+    );
+    assert!(failed.to_string().starts_with("wake_reload_failed: "));
     engine.lock().unwrap().fail = None;
     for (action, id) in [
         (RuntimeAction::ReloadWeights, "r2"),

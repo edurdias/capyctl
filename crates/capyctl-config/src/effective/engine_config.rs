@@ -80,17 +80,18 @@ pub const STARTUP_WEIGHTS_FACTOR: (i64, i64) = (9, 4);
 /// The factor of a revision frozen before amendment A8 (1.6), which it keeps.
 pub const LEGACY_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
 
-/// ADR 0014 amendment A21 (owner decision 2026-10-09): [`STARTUP_WEIGHTS_FACTOR`]
-/// was measured without a safetensors loader flag rendered (vLLM 0.30's own
-/// default, memory-mapped), which is what every launch still gets unless vLLM
-/// actually receives `--safetensors-load-strategy eager`
-/// (`VllmLaunchSettings::renders_eager_loader`). Eager reads each file into CPU
-/// memory before loading, a larger transient footprint. Found live (catalog
-/// run, Qwen3.6-35B-A3B NVFP4, vLLM 0.30, host A, deep park): eager's loading
-/// peak was 54.2 GiB against lazy's 34.5 GiB, 1.57× it. Applied to
-/// `STARTUP_WEIGHTS_FACTOR` (2.25) and rounded up for headroom, as that factor
-/// was itself rounded up over its own measured ratio. A placeholder, not a
-/// measurement.
+/// ADR 0014 amendment A21 (owner decision 2026-10-09; note of 2026-10-15):
+/// [`STARTUP_WEIGHTS_FACTOR`] was measured without a safetensors loader flag
+/// rendered (vLLM 0.30's own default, memory-mapped). This factor applies
+/// exactly where vLLM receives `--safetensors-load-strategy eager`
+/// (`VllmLaunchSettings::renders_eager_loader`): a declared `eager`, or the
+/// `eager` capyctl defaults a parking deployment to on every memory shape.
+/// Eager reads each file into CPU memory before loading, a larger transient
+/// footprint. Found live (catalog run, Qwen3.6-35B-A3B NVFP4, vLLM 0.30,
+/// host A, deep park): eager's loading peak was 54.2 GiB against lazy's
+/// 34.5 GiB, 1.57× it. Applied to `STARTUP_WEIGHTS_FACTOR` (2.25) and
+/// rounded up for headroom, as that factor was itself rounded up over its own
+/// measured ratio. A placeholder, not a measurement.
 pub const VLLM_EAGER_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (18, 5);
 
 /// ADR 0014 amendment A8 (found live 2026-10-02): the first-start graph
@@ -344,10 +345,9 @@ struct RawVllmFields {
     block_size_tokens: Option<u32>,
     #[serde(default)]
     max_num_batched_tokens: Option<u32>,
-    // ADR 0014 §4 (amended 2026-10-07); amendment A21 (owner decision
-    // 2026-10-09): `eager` or `lazy`; omitted, a parking deployment keeps
-    // capyctl's default for the host's memory shape (`lazy` on unified
-    // memory, `eager` on a discrete GPU), a non-parking one stays unset
+    // ADR 0014 §4 (amended 2026-10-07); amendment A21 (note of 2026-10-15):
+    // `eager` or `lazy`; omitted, a parking deployment keeps capyctl's
+    // default `eager` on every memory shape, a non-parking one stays unset
     // (vLLM's own default governs, already memory-mapped loading).
     #[serde(default)]
     safetensors_load_strategy: Option<SafetensorsLoadStrategy>,
@@ -1357,28 +1357,22 @@ pub(super) fn normalize_engine_config(
     let parks = inputs.residency.parks();
     let sleep_mode = parks && inputs.security.deep_park.is_enabled();
 
-    // ADR 0014 amendment A21 (owner decision 2026-10-09): a parking
-    // deployment's safetensors loader defaults to the host's own
-    // unified/discrete memory shape (ADR 0019 covers discrete GPUs) absent a
-    // declared choice: lazy on unified memory, eager on a discrete GPU.
-    // Found live (catalog run, Qwen3.6-35B NVFP4, vLLM 0.30, host A, deep
-    // park): eager vs lazy start 98 s vs 180 s, loading peak 54.2 vs 34.5
-    // GiB, ready footprint 43.95 vs 26.63 GiB, parked charge after three
-    // cycles 28.3 vs 8.3 GB, wake to first token about 51 s vs 81 s; eager
-    // also drove the parked-growth guard (amendment A19) into stops. Scoped
-    // to `sleep_mode`: vLLM's own default when nothing renders is already
-    // memory-mapped (lazy) loading (vLLM 0.30 `LoadConfig.safetensors_load_strategy`
-    // docstring), so a non-parking, undeclared deployment keeps showing no
-    // chosen strategy and no command-identity change, exactly as the note on
-    // §3 and §4 (2026-10-07) left it.
+    // ADR 0014 amendment A21 (note of 2026-10-15): absent a declared choice,
+    // a parking deployment's safetensors loader defaults to `eager` on every
+    // memory shape, as in 0.1.2. The 2026-10-09 unified-memory `lazy` default
+    // was reverted on live evidence (host A, Qwen3.8-27B NVFP4, vLLM 0.30,
+    // deep park): lazy's in-place weight reload took 123 s and the wake ended
+    // uncertain, while eager woke six times in 23-28 s. `lazy` stays an
+    // explicit choice. Scoped to `sleep_mode`: vLLM's own default when
+    // nothing renders is already memory-mapped (lazy) loading (vLLM 0.30
+    // `LoadConfig.safetensors_load_strategy` docstring), so a non-parking,
+    // undeclared deployment keeps showing no chosen strategy and no
+    // command-identity change, exactly as the note on §3 and §4 (2026-10-07)
+    // left it.
     let vllm_strategy_declared = vllm.safetensors_load_strategy;
     let vllm_strategy_resolved = match vllm_strategy_declared {
         Some(strategy) => Some(strategy),
-        None if sleep_mode => Some(if inputs.device.is_some() {
-            SafetensorsLoadStrategy::Eager
-        } else {
-            SafetensorsLoadStrategy::Lazy
-        }),
+        None if sleep_mode => Some(SafetensorsLoadStrategy::Eager),
         None => None,
     };
     // Mirrors `VllmLaunchSettings::renders_eager_loader`: whether CapyCTL

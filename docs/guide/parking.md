@@ -53,7 +53,10 @@ Before a woken vLLM or SGLang model serves again, CapyCTL asks it a fixed
 prompt and compares the answer with the one it gave when it first became
 ready. A different answer means its weights did not come back intact: the
 wake fails with `wake_mismatch` and CapyCTL stops the model instead of serving
-wrong answers ([Errors](errors.md)).
+wrong answers ([Errors](errors.md)). A wake whose weight reload fails
+(`wake_reload_failed`) or that does not finish within the wake window
+(`wake_uncertain`) stops the model the same way; the next request loads it
+fresh.
 
 ## Switch between models
 

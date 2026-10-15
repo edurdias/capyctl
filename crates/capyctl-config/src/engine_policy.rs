@@ -123,8 +123,8 @@ const VLLM_RESERVED_FAMILIES: &[&str] = &["--ssl-", "--data-parallel-", "--capyc
 
 /// ADR 0014 §4: reserved while sleep mode is on, where capyctl always renders
 /// the loader: the deployment's typed `vllm.safetensors_load_strategy`, or
-/// capyctl's default for the host's memory shape (`lazy` on unified memory,
-/// `eager` on a discrete GPU; amendment A21, owner decision 2026-10-09).
+/// capyctl's default `eager` on every memory shape (amendment A21, note of
+/// 2026-10-15).
 const VLLM_SLEEP_RESERVED: &[&str] = &["--safetensors-load-strategy"];
 
 /// ADR 0014 §3: SGLang `ServerArgs` fields capyctl owns. The option spelling is the

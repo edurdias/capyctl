@@ -124,6 +124,10 @@ fn an_impossible_startup_peak_is_refused() {
 fn an_undeclared_startup_peak_is_the_placeholder_default() {
     let (mut deployment, host) = fixture();
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
+    // A declared `lazy` loader keeps amendment A8's factor; the parking
+    // fixture's undeclared default is `eager` (amendment A21, note of
+    // 2026-10-15), covered by `the_startup_placeholder_follows_the_effective_loader`.
+    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
     let effective =
         resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     let expected = 30 * GIB * 9 / 4 + VLLM_OVERHEAD_MARGIN_BYTES;
@@ -165,20 +169,28 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     );
 }
 
-/// ADR 0014 amendment A21 (owner decision 2026-10-09): the startup
-/// placeholder scales with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` exactly when
-/// CapyCTL will actually pass `--safetensors-load-strategy eager` to vLLM,
-/// never with a defaulted or declared `lazy` loader on the same (unified)
-/// host.
+/// ADR 0014 amendment A21 (owner decision 2026-10-09; note of 2026-10-15):
+/// the startup placeholder scales with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR`
+/// exactly when CapyCTL will actually pass `--safetensors-load-strategy
+/// eager` to vLLM, declared or defaulted (a parking deployment's undeclared
+/// default is `eager` on unified memory too), never with a declared `lazy`
+/// loader on the same (unified) host.
 // T14 T26
 #[test]
 fn the_startup_placeholder_follows_the_effective_loader() {
     let (mut deployment, host) = fixture();
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
-    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "eager"});
-    let eager = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     let expected = 30 * GIB / 5 * 18 + VLLM_OVERHEAD_MARGIN_BYTES;
     assert_eq!(expected, 116 * GIB);
+
+    // Undeclared on a parking deployment (the fixture parks on unified
+    // memory): the defaulted `eager` takes the eager factor.
+    let defaulted =
+        resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
+    assert_eq!(cold(&defaulted), expected + OVERHEAD);
+
+    deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "eager"});
+    let eager = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     assert_eq!(cold(&eager), expected + OVERHEAD);
     assert_eq!(
         default_startup_bytes(
@@ -192,7 +204,7 @@ fn the_startup_placeholder_follows_the_effective_loader() {
     );
 
     // Declared `lazy` on the same unified host keeps the lighter factor
-    // (amendment A8's 2.25), the same as the fixture's undeclared default.
+    // (amendment A8's `STARTUP_WEIGHTS_FACTOR`, 2.25).
     let mut lazy = deployment.clone();
     lazy["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
     let lazy_effective =
@@ -330,10 +342,12 @@ fn the_placeholder_startup_covers_the_first_starts_graphs() {
             assert!(decode_effective_snapshot(&forged.to_string()).is_err());
         }
     }
-    // Large weights: the load term still wins when it is larger.
+    // Large weights: the load term still wins when it is larger. This parking
+    // vLLM deployment loads `eager` by default (ADR 0014 amendment A21, note
+    // of 2026-10-15): 30 GiB × 3.6 + the 8 GiB margin.
     let (deployment, host) = speculative("vllm", true);
     let heavy = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    assert_eq!(cold(&heavy), 75 * GIB + GIB / 2 + OVERHEAD);
+    assert_eq!(cold(&heavy), 116 * GIB + OVERHEAD);
     // A declared startup peak is the operator's and carries no allowance.
     let (mut declared, host) = speculative("vllm", true);
     declared["engine_config"]["memory"]["startup"] = json!("45GiB");

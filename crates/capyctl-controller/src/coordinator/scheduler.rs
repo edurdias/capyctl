@@ -508,13 +508,11 @@ impl Scheduler {
         {
             shared.changed.notify_waiters();
         }
-        // Owner decision 2026-10-09: a single launch whose wake canary
-        // differed (`wake_mismatch`) owes a stop; one not accepted yet is
-        // retried every pass, its dispatch closed and its memory charged.
-        if super::retry_wake_mismatch_stops(&shared)
-            .await
-            .map_err(failed)?
-        {
+        // Owner decision 2026-10-09, extended 2026-10-15: a single launch
+        // whose wake did not complete (`wake_mismatch`, `wake_reload_failed`,
+        // `wake_uncertain`) owes a stop; one not accepted yet is retried every
+        // pass, its dispatch closed and its memory charged.
+        if super::retry_wake_stops(&shared).await.map_err(failed)? {
             shared.changed.notify_waiters();
         }
         // Owner decision 2026-09-22: a drain Stop that expired, never armed,

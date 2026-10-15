@@ -15,6 +15,10 @@ enum Answer {
     Proven,
     Refused,
     Uncertain,
+    /// Never answers, as a reload or probe that hangs in the engine.
+    Hang,
+    /// The engine answers that the weight reload failed.
+    ReloadFailed,
 }
 
 /// A remote (compound restore) or embedded (stepwise restore) engine.
@@ -24,6 +28,8 @@ struct Residency {
     clock: Arc<AtomicI64>,
     park: Mutex<Answer>,
     restore: Mutex<Answer>,
+    /// How an embedded (stepwise) engine answers `ReloadWeights`.
+    reload: Mutex<Answer>,
     /// (action, binding, generation, step id) of every call after Initialize.
     calls: Mutex<Vec<(RuntimeAction, String, i64, String)>>,
     /// Cleanups the scripted host carried out (the engine terminated).
@@ -34,6 +40,8 @@ struct Residency {
     /// Owner decision 2026-10-09: what the engine generates for the wake
     /// canary; `None` is an engine without one.
     canary: Mutex<Option<ProbeAnswer>>,
+    /// The wake canary is asked but never answered.
+    canary_hangs: std::sync::atomic::AtomicBool,
     /// (incarnation, generation) of every wake canary asked.
     canaries: Mutex<Vec<(String, i64)>>,
 }
@@ -48,10 +56,12 @@ impl Residency {
             clock,
             park: Mutex::new(Answer::Proven),
             restore: Mutex::new(Answer::Proven),
+            reload: Mutex::new(Answer::Proven),
             calls: Mutex::new(vec![]),
             cleanups: AtomicUsize::new(0),
             residents: Mutex::new(vec![]),
             canary: Mutex::new(None),
+            canary_hangs: std::sync::atomic::AtomicBool::new(false),
             canaries: Mutex::new(vec![]),
         })
     }
@@ -88,11 +98,8 @@ impl EngineAdapter for Residency {
         let answer = match command.action {
             RuntimeAction::Park => self.park.lock().unwrap().clone(),
             RuntimeAction::Restore => self.restore.lock().unwrap().clone(),
-            RuntimeAction::ReloadWeights
-            | RuntimeAction::InvalidateCache
-            | RuntimeAction::Probe
-                if !self.compound =>
-            {
+            RuntimeAction::ReloadWeights if !self.compound => self.reload.lock().unwrap().clone(),
+            RuntimeAction::InvalidateCache | RuntimeAction::Probe if !self.compound => {
                 Answer::Proven
             }
             _ => return Err(RuntimeError::Unsupported),
@@ -114,6 +121,10 @@ impl EngineAdapter for Residency {
         match answer {
             Answer::Refused => Err(RuntimeError::Unsupported),
             Answer::Uncertain => Err(RuntimeError::Uncertain("scripted: outcome lost".into())),
+            Answer::Hang => std::future::pending().await,
+            Answer::ReloadFailed => Err(RuntimeError::ReloadFailed(
+                "scripted: reload_weights raised".into(),
+            )),
             Answer::Proven => Ok(EffectObservation {
                 token: c.token.clone(),
                 binding_id: c.binding_id.clone(),
@@ -169,6 +180,9 @@ impl EngineAdapter for Residency {
             .lock()
             .unwrap()
             .push((context.incarnation.clone(), context.token.generation));
+        if self.canary_hangs.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
         self.canary
             .lock()
             .unwrap()
@@ -1104,6 +1118,154 @@ async fn a_new_launch_records_a_new_reference() {
     let wake = park_and_wake(&w, &dir, &next).await;
     until("woken", || operation(&owner, &wake).0 == "succeeded").await;
     w.shutdown().await.unwrap();
+}
+
+/// Park, then wake with a deadline half a second past the frozen test clock,
+/// so the restore's own bound is half a second of real time.
+async fn park_and_wake_bounded(
+    w: &OwnedCoordinator,
+    dir: &tempfile::TempDir,
+    fence: &DeploymentFence,
+    clock: &AtomicI64,
+) -> String {
+    w.commands()
+        .park(
+            "operator",
+            &fence.deployment_id,
+            fence.revision,
+            &ulid::Ulid::new().to_string(),
+            100_000,
+        )
+        .unwrap();
+    until("parked", || {
+        instance(dir, &fence.deployment_id).0 == "parked"
+    })
+    .await;
+    w.commands()
+        .wake(
+            "operator",
+            &fence.deployment_id,
+            WakeScope::All,
+            fence.revision,
+            &ulid::Ulid::new().to_string(),
+            clock.load(Ordering::SeqCst) + 500,
+        )
+        .unwrap()
+        .unwrap()
+        .operation_id
+}
+
+/// T20 (found live 2026-10-15): a wake `script` makes fail or hang ends in
+/// an ordinary stop under the engine-exit principal: the instance is released
+/// only on the host's gone evidence, reads stopped with `code` as its last
+/// error, and the next on-demand request starts it fresh on a new engine.
+async fn a_failed_wake_is_stopped_and_starts_fresh(
+    compound: bool,
+    script: impl FnOnce(&Residency),
+    code: &str,
+) {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(compound, clock.clone());
+    let slot = Arc::new(Mutex::new(engine.clone()));
+    let w = residency_worker_with(
+        owner.clone(),
+        observations,
+        slot.clone(),
+        clock.clone(),
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let generation = instance(&dir, &fence.deployment_id).2;
+    script(&engine);
+    let wake = park_and_wake_bounded(&w, &dir, &fence, &clock).await;
+    // Before the fix the wake stayed uncertain, charged and closed for good.
+    until("released", || phase(&owner, &fence.deployment_id).is_none()).await;
+    let (state, open, now_generation, _) = instance(&dir, &fence.deployment_id);
+    assert_eq!((state.as_str(), open), ("stopped", false));
+    assert!(
+        now_generation > generation,
+        "the stop drew a new generation"
+    );
+    assert_eq!(
+        last_error(&dir, &fence.deployment_id).as_deref(),
+        Some(code)
+    );
+    assert_ne!(operation(&owner, &wake).0, "succeeded");
+    assert_eq!(engine.cleanups.load(Ordering::SeqCst), 1, "terminated once");
+    // The next request starts a fresh launch, which serves.
+    let fresh = Residency::new(compound, clock.clone());
+    *slot.lock().unwrap() = fresh.clone();
+    let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    use crate::port::LifecyclePort;
+    let activation = port.auto_activate(&fence.deployment_id).await.unwrap();
+    assert_eq!(
+        port.wait_terminal(&activation).await.unwrap(),
+        capyctl_domain::LifecycleState::Ready
+    );
+    let (state, open, fresh_generation, _) = instance(&dir, &fence.deployment_id);
+    assert_eq!((state.as_str(), open), ("ready", true));
+    assert_eq!(
+        fresh_generation, now_generation,
+        "the fresh launch runs at the generation the stop drew"
+    );
+    assert_eq!(
+        *fresh.gate.calls.lock().unwrap(),
+        [RuntimeAction::Initialize]
+    );
+    assert!(fresh.actions().is_empty(), "nothing parked or woken");
+    w.shutdown().await.unwrap();
+}
+
+// T20 (found live 2026-10-15): an embedded vLLM wake whose weight reload
+// never returns outlives the restore's deadline and is stopped.
+#[tokio::test]
+async fn a_wake_whose_reload_never_returns_is_stopped_and_starts_fresh() {
+    a_failed_wake_is_stopped_and_starts_fresh(
+        false,
+        |engine| *engine.reload.lock().unwrap() = Answer::Hang,
+        "wake_uncertain",
+    )
+    .await;
+}
+
+// T20 (found live 2026-10-15): an embedded vLLM wake whose engine answers
+// that the weight reload failed fails `wake_reload_failed` and is stopped.
+#[tokio::test]
+async fn a_wake_whose_reload_fails_is_stopped_and_starts_fresh() {
+    a_failed_wake_is_stopped_and_starts_fresh(
+        false,
+        |engine| *engine.reload.lock().unwrap() = Answer::ReloadFailed,
+        "wake_reload_failed",
+    )
+    .await;
+}
+
+// T20 (found live 2026-10-15): a wake whose canary is never answered ends at
+// the restore's deadline and is stopped.
+#[tokio::test]
+async fn a_wake_whose_canary_never_answers_is_stopped_and_starts_fresh() {
+    a_failed_wake_is_stopped_and_starts_fresh(
+        true,
+        |engine| {
+            engine.generates(&[1, 2, 3]);
+            engine.canary_hangs.store(true, Ordering::SeqCst);
+        },
+        "wake_uncertain",
+    )
+    .await;
+}
+
+// T20 (found live 2026-10-15): a remote wake whose outcome is unknown is
+// stopped too, instead of staying uncertain until an operator stops it.
+#[tokio::test]
+async fn an_uncertain_wake_is_stopped_and_starts_fresh() {
+    a_failed_wake_is_stopped_and_starts_fresh(
+        true,
+        |engine| *engine.restore.lock().unwrap() = Answer::Uncertain,
+        "wake_uncertain",
+    )
+    .await;
 }
 
 // T20 (owner decision 2026-10-09): a controller restart between the first
