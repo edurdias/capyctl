@@ -13,7 +13,8 @@
 //!
 //! - the KV pool is `kv_cache` divided by SGLang's KV bytes per token
 //!   (full-attention layers only on a gated-delta-net hybrid, plus the draft
-//!   model's KV layers), passed as `--max-total-tokens`;
+//!   model's KV layers, or the one layer an EAGLE draft from the checkpoint's
+//!   own MTP head keeps), passed as `--max-total-tokens`;
 //! - on a gated-delta-net hybrid, the state pool holds
 //!   [`STATE_SLOTS_PER_REQUEST`] slots per running request
 //!   (`--max-mamba-cache-size`), and the running requests are the deployment's
@@ -42,8 +43,9 @@
 //!
 //! On unified memory every launch whose weights are known renders a static
 //! pool of the weights, the KV cache, the state (sized here, or fixed by the
-//! arguments) and [`STATIC_OVERHEAD_BYTES`], taken from the margin and never
-//! above the request, whether or not CapyCTL sized the pools.
+//! arguments), an MTP draft's own embedding and LM head ([`CheckpointDraft`])
+//! and [`STATIC_OVERHEAD_BYTES`], taken from the margin and never above the
+//! request, whether or not CapyCTL sized the pools.
 
 use std::path::Path;
 
@@ -332,6 +334,95 @@ fn state_bytes(running: u64, state: u64, scratch: u64) -> Option<u64> {
         .checked_add(running.checked_add(1)?.checked_mul(scratch)?)
 }
 
+/// The width of one cached KV element of a draft model on SGLang:
+/// `--speculative-draft-kv-cache-dtype`, else as the target's ([`kv_element`]).
+fn draft_kv_element(
+    settings: &SglangLaunchSettings,
+    args: &[String],
+    shape: &KvShape,
+) -> Result<u64, String> {
+    match option_value(args, "--speculative-draft-kv-cache-dtype").1 {
+        Some(name) if !name.eq_ignore_ascii_case("auto") => {
+            dtype_bytes(&name).ok_or_else(|| format!("unknown draft KV cache dtype `{name}`"))
+        }
+        _ => kv_element(settings, shape),
+    }
+}
+
+/// What SGLang 0.5.20 and 0.5.21 keep for a gated-delta-net hybrid's own
+/// multi-token-prediction head when EAGLE drafts with it (`EAGLE`, `EAGLE3`,
+/// or `NEXTN`, its alias, and no `--speculative-draft-model-path`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointDraft {
+    /// The draft worker's KV pool per token: one full-attention layer at the
+    /// target's geometry (`_build_hybrid_linear_kv_pool`, layer `[0]`), for
+    /// the target's token count (`memory_pool_config`). The target's profile
+    /// does not count it: its `eagle_draft_num_layers` comes from the target
+    /// configuration, which names no `num_nextn_predict_layers`.
+    kv_per_token: u64,
+    /// The draft's own embedding and LM head (`Qwen3_5ForCausalLMMTP`), in the
+    /// model dtype. The draft worker loads them before the target's profile
+    /// (`init_target_memory_pool`), which charges them against the static
+    /// pool, and frees them for the target's when its pool exists
+    /// (`init_lm_head`). The MTP layer itself is in the checkpoint's weights.
+    resident: u64,
+}
+
+/// The checkpoint's MTP draft the arguments run, if any (see
+/// [`CheckpointDraft`]); `Err` when its KV element is unknown.
+fn checkpoint_draft(
+    settings: &SglangLaunchSettings,
+    config: &Value,
+    args: &[String],
+) -> Result<Option<CheckpointDraft>, String> {
+    let eagle = option_value(args, "--speculative-algorithm")
+        .1
+        .is_some_and(|name| {
+            ["EAGLE", "EAGLE3", "NEXTN"]
+                .iter()
+                .any(|eagle| name.eq_ignore_ascii_case(eagle))
+        });
+    if !eagle
+        || option_value(args, "--speculative-draft-model-path").0
+        || gated_delta_attention_layers(config).is_none()
+    {
+        return Ok(None);
+    }
+    let text = text_config(config);
+    let heads = ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
+        .iter()
+        .any(|key| positive(text, key).is_some());
+    let (true, Some(vocab), Some(hidden), Ok(shape)) = (
+        heads,
+        positive(text, "vocab_size"),
+        positive(text, "hidden_size"),
+        KvShape::from_config(config),
+    ) else {
+        return Ok(None);
+    };
+    let element = draft_kv_element(settings, args, &shape)?;
+    let width = match settings
+        .common
+        .dtype
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case("auto"))
+    {
+        Some(name) => dtype_bytes(name).ok_or_else(|| format!("unknown dtype `{name}`"))?,
+        None => shape
+            .model_dtype_bytes
+            .ok_or("the model configuration names no dtype")?,
+    };
+    let tied = [text, config]
+        .iter()
+        .find_map(|config| config.get("tie_word_embeddings").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let tables = if tied { 1 } else { 2 };
+    Ok(Some(CheckpointDraft {
+        kv_per_token: 2 * shape.kv_heads * shape.head_dim * element,
+        resident: vocab.saturating_mul(hidden).saturating_mul(width) * tables,
+    }))
+}
+
 /// SGLang's pools for `settings`, from the checkpoint configuration (and the
 /// draft model's) at `checkpoint_root`. `Err` is a refusal: the state the
 /// running requests need does not fit the memory request.
@@ -354,6 +445,16 @@ pub fn sglang_pool(
         .as_ref()
         .ok()
         .map_or(0, |config| argument_state(settings, config, &args));
+    // The checkpoint's MTP draft tables sit in the static pool at SGLang's
+    // profile whoever sizes the state (found live 2026-10-14, see
+    // [`CheckpointDraft`]).
+    let draft_tables = match (&config, &draft) {
+        (Ok(config), None) => checkpoint_draft(settings, config, &args)
+            .ok()
+            .flatten()
+            .map_or(0, |draft| draft.resident),
+        _ => 0,
+    };
     let mut pool = sized_pool(settings, profile_args, config, draft)?;
     // ADR 0014, note on amendment A14: SGLang 0.5.21 charges the weights as
     // loaded and its own allocations against the static pool before any KV
@@ -365,7 +466,8 @@ pub fn sglang_pool(
     // a KV cache of 2 GiB or less ("Loaded weights leave no GPU memory for
     // the KV cache").
     if pool.static_bytes.is_none() {
-        pool.static_bytes = grown_static(&settings.memory, fixed_state);
+        pool.static_bytes =
+            grown_static(&settings.memory, fixed_state.saturating_add(draft_tables));
     }
     // Note on amendment A14: the fraction lets SGLang's profile reach pools
     // it cannot exceed. A pool left to SGLang's own sizing gets none, so
@@ -462,21 +564,23 @@ fn sized_pool(
     // Amendment A9: the draft model's KV layers share the pool. SGLang counts
     // every draft layer as full attention (`dflash_draft_cell_size_per_token`)
     // in the deployment's KV dtype, or `--speculative-draft-kv-cache-dtype`.
-    let draft_bytes = match draft {
-        None => 0,
+    // Without a separate draft model, an EAGLE draft from the checkpoint's own
+    // MTP head keeps one layer's KV beside the target's, and its embedding and
+    // LM head in the static pool (found live 2026-10-14, [`CheckpointDraft`]).
+    let (draft_bytes, draft_tables) = match draft {
+        None => match checkpoint_draft(settings, config, &args) {
+            Ok(draft) => draft.map_or((0, 0), |draft| (draft.kv_per_token, draft.resident)),
+            Err(reason) => return Ok(left_to_sglang(format!("the draft model: {reason}"))),
+        },
         Some(Err(reason)) => return Ok(left_to_sglang(format!("the draft model: {reason}"))),
         Some(Ok(draft)) => {
             let draft = match KvShape::from_config(draft) {
                 Ok(draft) => draft,
                 Err(reason) => return Ok(left_to_sglang(format!("the draft model: {reason}"))),
             };
-            let element = match option_value(&args, "--speculative-draft-kv-cache-dtype").1 {
-                Some(name) if !name.eq_ignore_ascii_case("auto") => dtype_bytes(&name)
-                    .ok_or_else(|| format!("unknown draft KV cache dtype `{name}`")),
-                _ => kv_element(settings, &draft),
-            };
+            let element = draft_kv_element(settings, &args, &draft);
             match element.map(|element| draft.bytes_per_token(element)) {
-                Ok(Some(bytes)) => bytes,
+                Ok(Some(bytes)) => (bytes, 0),
                 Ok(None) => return Ok(left_to_sglang("the draft model's KV bytes overflow")),
                 Err(reason) => return Ok(left_to_sglang(format!("the draft model: {reason}"))),
             }
@@ -556,9 +660,11 @@ fn sized_pool(
     } else {
         0
     };
+    // The weights, and the draft's tables while SGLang profiles.
+    let held = weights.saturating_add(draft_tables);
     let room = u64::try_from(static_bytes)
         .unwrap_or(0)
-        .saturating_sub(weights.saturating_add(kv))
+        .saturating_sub(held.saturating_add(kv))
         .max(reserved);
     let discrete = memory.device_total_bytes.is_some();
     // Amendment A16: a request that holds its state lends nothing more.
@@ -597,13 +703,13 @@ fn sized_pool(
             // Found live 2026-10-04: the request named is the smallest whole
             // MiB this same check accepts for an explicit request, with the
             // KV cache as it is: SGLang's margin stays outside the static pool.
-            let named = smallest_request(memory, weights.saturating_add(kv), needed)
+            let named = smallest_request(memory, held.saturating_add(kv), needed)
                 .map(|mib| format!("to \"{mib}MiB\" ({} bytes)", mib << 20))
                 .unwrap_or_else(|| "beyond what CapyCTL can express".into());
             return Err(format!(
                 "SGLang keeps {needed} bytes of recurrent state for {running} running \
-                 request{} of this hybrid model ({} state slots of {} bytes{}), beside {weights} \
-                 bytes of weights and the {kv}-byte KV cache, and the memory request leaves \
+                 request{} of this hybrid model ({} state slots of {} bytes{}), beside {held} \
+                 bytes of weights{} and the {kv}-byte KV cache, and the memory request leaves \
                  {} bytes for it; raise engine_config.memory.request {named}, keeping \
                  memory.kv_cache at {kv} bytes{}",
                 if running == 1 { "" } else { "s" },
@@ -619,6 +725,11 @@ fn sized_pool(
                         " and {} draft-token states",
                         (u64::from(running) + 1) * draft_tokens
                     ),
+                },
+                if draft_tables > 0 {
+                    format!(" (the MTP draft's {draft_tables}-byte embedding and LM head included)")
+                } else {
+                    String::new()
                 },
                 available,
                 if running > 1 {
@@ -643,7 +754,10 @@ fn sized_pool(
     if running < declared.unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT) {
         pool.running_limit = Some(running);
     }
-    pool.static_bytes = grown_static(memory, need(running).unwrap_or(0));
+    pool.static_bytes = grown_static(
+        memory,
+        need(running).unwrap_or(0).saturating_add(draft_tables),
+    );
     pool.reason = Some(format!(
         "hybrid model: recurrent state for {running} running request{} sized {}",
         if running == 1 { "" } else { "s" },
