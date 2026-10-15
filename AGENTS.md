@@ -4,8 +4,9 @@ Rust controller for managing inference-engine deployments on hardware that canno
 keep all model weights resident. The primary audience is home users and prosumers
 running models on GPU machines they own.
 
-Current phase: 0.1.2 on `main` (two-host, single-rank vLLM and SGLang; TP2 is
-parked). Releases are published as GitHub releases; release candidates as
+Current phase: 0.1.3 on `main` (multi-node groups qualified on two hosts: vLLM
+with deep parking, SGLang groups restart only, TensorFold TP2). Releases are
+published as GitHub releases; release candidates as
 pre-releases.
 
 This file is the working agreement for every contributor, human or coding agent.

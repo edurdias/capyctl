@@ -1,5 +1,2275 @@
 # Current implementation and launch status
 
+## 0.1.3 release preparation — 2026-10-15
+
+Version bumped to 0.1.3 with release notes in
+`docs/operations/release-notes-0.1.3.md`, assembled from the 46 change files
+by `scripts/assemble-changes.sh 0.1.3` and edited into one note (multi-node
+groups qualified on two GB10 hosts, llama.cpp as a fourth engine, TensorFold
+0.6.6 and vLLM 0.31.0 verified, the memory, request and wake fixes since
+0.1.2, and known issues). The status entries of those change files are folded
+in below. The verification result is in the release pull request. Nothing is
+built, tagged or published yet: next are the manual Release build workflow
+with Rust 1.99.0, the strict local packaging check, a draft release and the
+live check from the draft (docs/operations/releasing.md). The owner publishes.
+
+## llama.cpp GB10 rows LC1–LC6 run live on host A, all pass — 2026-10-15 (branch `test/live-rows-0.1.3`)
+
+Owner approval 2026-10-14: a llama.cpp build on host A, in the home directory, with
+no system package, driver or CUDA change. [ADR 0029](../design/adr/0029-llamacpp-engine.md),
+plan slice L6, and the "Still open" list of `llamacpp-docs-live.md` (the GB10 row and the
+row scripts).
+
+- `scripts/live/llamacpp-build.sh` (`source`, `model`, `prebuilt`, `check`, each
+  idempotent, every effect through the harness's `rsh`, `--dry-run` prints the plan):
+  clones tag `v0.6.0` (checked against commit `d812350`) into `~/llamacpp-v0.6.0` and
+  builds `llama-server` with `-DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF
+  -DCMAKE_CUDA_ARCHITECTURES=121a-real` (GB10 is sm_121; the tag's `ggml-cuda` CMake
+  turns a plain `12X` into `12Xa`, and its own default list uses `121a-real` with CUDA
+  12.9 and later, which works with any CMake); prints the `--version` line, the build
+  fingerprint `<v>+<commit>` and the sha256 of the binary and its libraries. `model`
+  downloads `Qwen/Qwen3-4B-GGUF` `Qwen3-4B-Q4_K_M.gguf` at the laptop rows' revision
+  and checks its size and digest. `prebuilt` fetches the `b11429` Ubuntu CUDA 13.4 arm64
+  archive and its CUDA runtime only to record the version line (live check 9); the rows
+  never run it.
+- `scripts/live/matrix/rows/LC1.sh`–`LC6.sh`, with `llamacpp_rows.sh` (shared steps)
+  and `llamacpp_probe.py` (run on the host: chat and stream shapes, the engine's
+  `/metrics`, `/slots`, `/props`, the management load read, hang-ups, concurrent
+  streams, and memory samples every 0.5 s from `/proc/meminfo`, the process's resident
+  set, `nvidia-smi` and the GGUF's page-cache bytes by `mincore`). Each row stops host
+  A's matrix role, runs a standalone role with its own state directory (as ENG2), and
+  restarts the matrix role. LC2 measures the default mmap load and `--load-mode none`
+  one after the other, which answers whether mmap keeps a page-cache copy beside the
+  device copy. LC4 runs llama.cpp beside host A's owner-approved vLLM 0.30.0 environment
+  under a lowered managed limit (40 GiB by default) and checks first that each request
+  fits alone and the two do not. LC6 does not run `--spec-type draft-mtp`: Qwen3-4B has
+  no MTP heads and no model with them is staged.
+- `lib.sh`: `ENGINE_PGREP` also matches `llama-server`, so `host_clean` reports a
+  leftover llama.cpp engine.
+
+CPU and Fake-engine tests are not qualification; these rows are. Live 2026-10-15 on
+host A (llama-server 0.6.0+d812350, sm_121; evidence `target/live/matrix/LC*/`, summary
+`target/live/matrix/0.1.3-summary.md`): LC1–LC6 pass.
+
+- LC2: Ready 8.3 s with the default mmap load, 3.2 s with `--load-mode none`; decode
+  about 71 tok/s. mmap: steady MemAvailable drop 8.24 GB, device 7264 MiB; `none`:
+  5.13 GB and 2567 MiB steady. The GGUF stays in the page cache in both, so mmap keeps
+  a page-cache copy beside the device copy (about 3 GB more MemAvailable used).
+- LC4 at 40 GiB: llama.cpp request 17.26 GB (measured), vLLM va-4 38.89 GB before its
+  first start and 27.11 GB once measured. A request to vLLM stopped llama.cpp (30.6 s);
+  a request to llama.cpp parked vLLM (9.2 s, vLLM device 12495 → 311 MiB); vLLM woke
+  in 9.9 s. At 44 GiB the measured pair fitted and nothing was parked, which is correct.
+  Rerun on the 0.1.3 build (with #121's vLLM wake path), same day: pass. Switch to
+  vLLM 35.2 s, to llama.cpp 7.5 s with vLLM `parked` (12495 → 311 MiB), vLLM wake
+  10.2 s.
+- LC3 park refused `unsupported_capability`; LC5 hang-ups free the slot in 55 ms
+  (decode) and 2 ms (prefill); LC6 three concurrent streams all complete.
+
+Harness fixes from the run: a standalone with only `CAPYCTL_LLAMACPP_BIN` publishes the
+profile `local`, not `local-llamacpp` (LC2/3/5/6); LC4's limit (32 GiB was below vLLM's
+default request) and its park assertion; LC4's early exit stops its memory sampler.
+Still to do: recompute `LLAMACPP_OVERHEAD_MARGIN_BYTES` and the host overhead
+placeholder (`crates/capyctl-config/src/effective/engine_config.rs`) from these figures.
+
+## Multi-node live rows MN1-MN8 pass on the 0.1.3 build — 2026-10-15; SGLang groups are restart_only (branch `test/live-rows-0.1.3`)
+
+Plan `docs/plans/2026-10-05-multi-node-groups.md` Task 21, design
+`docs/specs/2026-10-05-multi-node-groups-design.md` §17.2, ADR 0028. The live
+harness gains the multi-node group rows, first run live 2026-10-15 (below).
+
+- `scripts/live/matrix/rows/MN1.sh` … `MN8.sh`: bring-up at TP 2 for vLLM,
+  SGLang and TensorFold (Ready, 20/20 routed completions, RDMA counters before
+  and after on both hosts recorded as `transport: rdma` or `socket`), five deep
+  park and wake cycles with per-member reservations, MemAvailable on each host,
+  the wake canary's reference tokens and one `parked`/`restored` journal entry
+  per cycle (MN4 vLLM; MN4 SGLang checks the restart_only park and the refusal of
+  `residency: deep` instead), SIGKILL of the worker's or the head's engine from its
+  recorded member identity (MN5, MN6), host B's agent stopped and restarted
+  through the harness's role control while Ready (MN7: `uncertain` with the
+  charge held, then settled), and the group alternating with a single-rank
+  deployment on host A under `start --evict` (MN8). Every row starts with a
+  read-only preflight (both hosts online with `engine_groups`, each host's
+  direct-link address as its peer address, one build fingerprint for the
+  engine's profile on both hosts, the checkpoint on both with the same files)
+  and cleans up on failure through the row trap; MN7's trap restarts host B's
+  agent first.
+- `grouplib.sh` (group status and ledger views, cleanup on both hosts),
+  `gen_group.py` (fixtures `vg-30`, `sg-30`, `tg-n35`), `rdma_counters.py`
+  with `tests/test_rdma_counters.py`, `ledger.py group` and `members`
+  (read-only views of `group_plans`, `group_members` and member charges), and
+  `fault.sh member`.
+- `roles.sh host-doc` declares `resource_policy.groups` (peer address
+  `HOST_<A|B>_DIRECT_ADDR`, rendezvous range `GROUP_RENDEZVOUS_PORTS`,
+  default 25000-25099; `CAPYCTL_GROUPS=0` leaves it out) and, with
+  `TENSORFOLD_VENV_DIR`, a `tensorfold` profile written as `engine add`
+  writes one. The harness's engine process pattern now covers
+  `bin/tensorfold serve`.
+
+Checked: `bash -n` and `shellcheck -x` (v0.11.0) on the rows and changed
+scripts, a dry run of every row, `python3 -m unittest discover -s
+scripts/live/matrix/tests`, `test_bench.py`, and the three fixtures resolved
+by `capyctl validate config --host … --host …` against generated host
+documents. These are harness checks, not evidence: CPU and Fake-engine tests
+are not qualification; the rows MN1-MN8 on the two hosts are.
+
+Final rerun, third session, on the qualifying build (the second session's build plus
+three fixes: departed processes are never recorded, TensorFold probe ids from
+`tensorfold.token_ids`, SGLang groups restart_only). Fresh run, every row passed:
+
+- MN2 SGLang: Ready 225 s, 20/20, rdma.
+- MN3 TensorFold: Ready 111 s on a cold kernel build (13 s warm), 20/20, rdma. Real
+  canary token ids, and no text-evidence notice in the controller log.
+  `TF_NCCL_LIB` on both ranks is the venv's
+  `…/site-packages/nvidia/nccl/lib/libnccl.so.2`, read from each member's recorded
+  process.
+- MN5 SGLang and TensorFold, MN6 TensorFold: the Ready plan settles in 2–4 s at the
+  killed rank, the relaunch is Ready (SGLang 223 s, TensorFold 12 s), answers, and
+  stops clean. SGLang's transient child lands in the host journal's
+  `departed_processes`, not the record.
+- MN4 SGLang, restart_only: status reads `restart_only`; a park stops the group in
+  4 s with nothing left on either host; a request brings it back on plan 2 (217 s).
+  `residency: deep` on the same fixture is refused at deploy
+  `capability_missing:deep_park`, and the message names `restart_only`.
+- MN1 vLLM sanity: Ready 110 s, 20/20, rdma.
+
+MN4 vLLM, MN5/MN6 vLLM, MN6 SGLang, MN7 and MN8 pass from the second session (below)
+and were not rerun.
+
+Second session, 2026-10-15, on the 0.1.3 build before those three fixes: origin/main
+with #124 and the
+group fixes (TF_NCCL_LIB, unreachable member, orphan worker, deep park, stable role
+names, unrecorded-member settlement). Evidence is under `target/live/matrix/MN*/`, the
+summary in `target/live/matrix/0.1.3-summary.md`. vLLM 0.30.0 with one build
+fingerprint on both hosts, SGLang 0.5.21, TensorFold 0.6.5.
+
+- Pass:
+  - MN1 vLLM (Ready 120 s, 20/20) and MN2 SGLang (Ready 252 s, 20/20), both
+    `transport: rdma` by RDMA operation counters on `roceP2p1s0f1` and
+    `rocep1s0f1` on both hosts, memory back after stop.
+  - MN4 vLLM: five deep park and wake cycles. Parked in 10 s, woken in 49–74 s,
+    87–90 % of the Ready drop released on each host, each member charged its
+    measured residue (about 3.4 GB), the canary's reference tokens equal every
+    cycle, 5 `parked` and 5 `restored`.
+  - MN5 vLLM and MN6 vLLM/SGLang: the Ready plan settles in 2–7 s with the killed
+    rank as `failed_rank`, the group relaunches under `recovery: reconcile`,
+    answers, and stops with nothing left on either host.
+  - MN7 vLLM: rank 1 `uncertain` and still charged while host B's agent is down,
+    then back and serving.
+  - MN8 vLLM: two `--evict` alternations.
+- Fixed during this session, verified live: a SGLang worker's transient child gave
+  the tree two `worker-0` roles, so its identities were never recorded and the
+  member stayed `uncertain` with 54 GB charged. After a restart on the same state
+  with the fix, it settled within 12 s and the charge was released.
+- Product failures (owner decisions 2026-10-15 in brackets):
+  - MN4 SGLang: the park completes, but the wake fails. The head reloads its weights
+    from disk (186–222 s); within seconds of its reply the restore is
+    `restore_uncertain` and the group stops (two runs). [SGLang groups resolve
+    `restart_only` and refuse deep for 0.1.3.]
+  - MN5 SGLang: the relaunched plan recorded a transient child that had already
+    exited, so the member failed right after Ready and the group relaunched again.
+    [Being fixed: record only processes alive at report.]
+  - TensorFold (MN3, MN5, MN6): both ranks load and serve, but readiness fails
+    because TensorFold's `/v1/completions` answers no `token_ids`. [Being fixed:
+    text probe.]
+- Harness fixes from both sessions:
+  - roles run under their own tmux server (an older one passed memlock 8 MiB, and
+    NCCL failed);
+  - configurable loopback ports for the run server;
+  - MN5/MN6 judge the Ready plan and accept the reconcile relaunch;
+  - TensorFold group members declare 40 GiB GPU (TensorFold's TP 2 startup estimate
+    is 32.49 GiB, so 30 GiB + 2 GiB refused every window);
+  - `fault.sh member` picks a group worker's spawned process now that its whole
+    tree is recorded;
+  - the SGLang group fixture declares no residency, and MN4 SGLang is the
+    restart_only check; MN1-MN3 record each member's collective environment
+    (`TF_NCCL_LIB`, …) with `proc_probe.py`.
+- First session (an earlier build): TensorFold failed on libnccl, MN4 stayed
+  `parking`, MN5 vLLM left an orphan `VLLM::Worker_TP1` and stayed charged, and MN7
+  never showed `uncertain`. The group fixes above address all four.
+- Deviation from the fault rule (first session, MN5 vLLM, 2026-10-15 about 10:30Z):
+  - What was sent: to free host B after the stuck member, `signal_owned.py` sent TERM
+    and then KILL to `VLLM::Worker_TP1` (pid 3037932), and TERM to its resource
+    tracker (pid 3037931).
+  - Why it was a deviation: neither pid was in the ledger. Ownership was inferred from
+    their recorded parent (the host role's pid file) and matched by pid, start ticks
+    and boot id. AGENTS.md allows signals only to ledger-recorded identities, so this
+    should not have been done.
+  - Evidence: `MN5-vllm.prev-20261015T195859Z/recovery-orphan-term.txt`.
+  - In the second and third sessions no process outside the ledger was signalled;
+    a row that would need it records the process and stops instead.
+
+## A group's deep park completes on every member's own evidence — 2026-10-15 (branch `fix/group-deep-park`)
+
+Found live at MN4 (vLLM 0.30.0 and SGLang 0.5.21, TP2 over two GB10 hosts): the head's collective succeeded (`POST /sleep?level=2`, `POST /release_memory_occupation`, both 200), yet the group stayed `parking` for the whole 15-minute park step, then `park_uncertain`, `residency_handed_to_stop`, the park failing `resolved_by_owned_cleanup`. Owner decision 2026-10-15, recorded as ADR 0028's amendment of that date. Three causes:
+
+- A group worker's Launch reported its process tree one second after the spawn, before the engine forked its rank process (vLLM's `VLLM::Worker_TP1`, SGLang's rank scheduler), so the member's recorded processes were the leader alone (MN4 rank 1: one process; the GPU-holding `Worker pid=3000772` never recorded). Its host's `process_residency` named none of them (vLLM) and its saver enrollment was refused `owner_not_a_launch_member` (SGLang; `failed_rank` null, silent). The worker's Launch now waits, bounded by its deadline, until its tree holds one process per local rank besides the spawned one (none for a TensorFold follower), then settles as before (`capyctl-adapters` `group::worker_spawned`). The same record is what cleanup and supervision act on. Found live with that wait: SGLang's worker forks a short-lived child before its rank processes. At MN2 each scan named children `worker-<i>` by start order among those alive, so the rank process was journaled as a second `worker-0` beside the gone child and the controller refused the member's identities (`mark_member_launched`: Plan); at MN5 the gone child was one of the member's recorded processes, so supervision read its exit as the member's and failed the group (`failed_rank` 1) right after Ready. Now a launch step's own scans first move a journaled process that is no longer seen and is proven gone by identity out of the launch's recorded processes into `departed_processes` (history only; the spawned leader and anything of unknown presence stay recorded), and then a recorded process keeps its role on every scan while a new one takes the next index of its kind (`journal::depart_gone`, `journal::stable_roles`, persisted, so a restarted host role names them the same). The Launch reply, the controller's record and supervision name only processes alive when the step reported, with distinct roles, and a head's recorded workers stay `worker-0..n` with no gap.
+- A vLLM member was judged on its processes' device memory plus anonymous pages against its 2 GiB parked placeholder, which a parked vLLM never meets on a unified host (MN4 vLLM: `failed_rank` 0, `group_member_failed`). Park and wake are now judged on the device memory the driver attributes to the member's processes (what the collective releases); SGLang stays on its saver map.
+- The coordinator waited for member evidence until the step's deadline. It now waits a bounded window after the head's reply (60 s): a member still resident fails the group (`group_member_failed`), a member with no evidence of its own is `group_member_uncertain`; charges are retained either way and the group stop settles each member on its own host's evidence.
+
+Each member's park also needs the residue its own processes hold in a host sample taken after the head's reply; for a revision whose phases CapyCTL derived, it is recorded for the revision on that member's host and for the launch (ADR 0014 amendments A13, A19) and the member is charged it instead of the placeholder (never above its Ready charge). A19's growth bound applies per member against its own host's `parked_growth_limit`. Declared `resources` keep their declared parked phase.
+
+Tests (T20, T22, T31, T32): `a_worker_reports_its_rank_process_forked_after_its_imports` and `a_worker_without_its_ranks_by_the_deadline_is_uncertain` (adapters); `a_child_after_a_gone_transient_one_never_takes_its_role` (agent journal) and `a_gone_transient_child_is_never_a_recorded_process_of_the_member` (agent, a fake worker forking a child that exits before its rank process: the reply and the supervised processes are all alive with distinct roles; failed before with the gone child in the reply, as live); `a_park_settles_on_released_device_memory_and_charges_each_members_residue` and `a_member_without_evidence_of_its_own_fails_the_park_within_the_window` in the group world, for vLLM and SGLang. CPU and Fake-engine tests are not qualification. Live check outstanding: MN2 and MN5 SGLang (the group reaches Ready and stays Ready; the member's recorded identities hold no gone process, and host B's journal `departed_processes` holds the transient child), and MN4 vLLM and SGLang; the park reaches `parked` within about a minute of the head's call, each member charged its measured residue (status `held.member_owners` footprints above 2 GiB), the wake and canary pass, and no `owner_not_a_launch_member` appears in host B's log.
+
+## A killed group worker's unrecorded processes are stopped, and a member with no recorded identities settles — 2026-10-15 (branch `fix/group-orphan-worker`)
+
+Found live in MN5 vLLM (0.1.3 matrix, run matrix-20261015T071325Z): SIGKILL of the
+worker member's vLLM process (rank 1 on host B) left its `VLLM::Worker_TP1` (38 GiB of
+device memory) and its resource tracker running, reparented to the host role. Rank 1
+stayed `uncertain` with its 52.9 GB charge held, the deployment stayed `stopping` for
+more than 1 h 45 min, `start` answered `still_stopping`, `delete` answered
+`delete_requires_cleanup`, and host B logged `host control session ended: a local
+effect failed; reconnecting` 15 times.
+
+Cause. A group worker's recorded tree is the one `worker_spawned` reports once the
+tree is unchanged for one second after the spawn; vLLM forks its TP worker about four
+seconds later, so rank 1 recorded only its leader (`members-vg-30-ready.json`). The
+leader's launcher reaped it at once, and a leaderless process group never authorized a
+signal (ADR 0028 §8, §11: its id can name an unrelated group once the pid is reused).
+Each `Terminate` (one per stop retry) therefore signalled only the dead leader and
+ended in `recorded processes gone but the group still has members`, which the host's
+Terminate effect turns into a session end (the 15 reconnects); no gone evidence was
+ever answered. The stop's retries ended with its deadline (the last `cleanup_retried`
+at 08:39:48), so nothing asked again after the orphans were killed by hand; a fresh
+`stop` is refused `still_stopping` and host-role restarts only reconcile a journal
+whose launch claim was still retained.
+
+Fix (ADR 0028 amendment of 2026-10-15, SPEC §13.2): the durable launcher holds each
+launch's leader unreaped (`waitid` with `WNOWAIT`) until no other process of its group
+runs, which pins the group id; `terminate_escalating` signals the whole group through
+a held leader, alive or dead, so the unrecorded worker gets the group's SIGTERM and
+SIGKILL, and the Terminate answers gone evidence once every recorded identity is gone
+and the group is empty. A held leader that has exited reads gone, and its exit is
+reported as before with the status the wait observed. A leader this role did not spawn
+(launched before a restart of the host role) is not held, and its leaderless group is
+still never signalled: that case stays uncertain and charged. Recording the worker's
+whole tree at launch is a separate change (MN4 park).
+
+Tests (T31, T33). `capyctl-launchers`
+`an_unrecorded_worker_of_a_dead_held_leader_is_terminated` fails on `main` (the
+Terminate errors) and passes now; `an_unheld_leaderless_group_is_never_signalled`
+guards the unheld case and passes on both. `capyctl-agent` `group_launch`
+`a_dead_worker_leaders_unrecorded_child_is_terminated_and_the_stop_settles` replaces
+`late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncertain`: it fails
+on `main` (the Terminate ends the session) and passes now, with gone evidence for
+exactly the recorded identities and the claim released. CPU and Fake-engine tests are
+not qualification. Live check still needed: rerun MN5 vLLM; after the rank-1 kill, the
+plan should settle within seconds with `failed_rank 1`, no `VLLM::Worker_TP1` or
+resource tracker left on host B, no `a local effect failed` in host B's log, and the
+member's charge released.
+
+Found live in MN2 SGLang TP2 (diagnosis `MN2/diag-*`): host B's Launch reply for rank
+1 named two processes under one role (`worker-0` twice in its journal; that naming
+bug is fixed separately), so `mark_member_launched` refused it and the member stayed
+dispatched with no identities. `settle_member` settles a dispatched member only on
+its recorded identities, and the stop's own fallback recorded the Terminate reply's
+identities first through the same refused call, so rank 1 stayed `uncertain` with its
+54 GB cold charge and a worker lease held, although host B had answered 54 Terminates
+and no engine process remained. Any dispatched member whose identities were never
+recorded (a lost, refused or unrecordable Launch reply) dead-ended the same way.
+
+Fix (ADR 0028 amendment of 2026-10-15, R23, SPEC §11): such a member now settles on
+its own host's evidence for the Launch it was dispatched with. The Terminate reply
+already carries it: the owned handle (that Launch's command id), every process the
+host's journal recorded for it with its presence, and whether the claim is retained.
+The controller passes it to a new store call, `settle_unrecorded_member`, only when
+every process is gone and the claim is released. The store checks the member's
+host, that it was dispatched with no identities recorded, that the handle is the
+Launch it was dispatched with, and that the evidence names at least one process (pid,
+boot id, start ticks, one boot, none twice; roles may repeat). It then releases the
+charge and records those processes. Anything else, an empty journal included, keeps
+the member uncertain and charged. The protocol does not change: the fields are the
+ones every agent already sends, so older hosts give the same evidence.
+
+Tests (T30, T31, T33). `capyctl-controller` group world
+`an_unrecorded_member_settles_on_its_hosts_launch_evidence` fails on `main` (the
+member never settles; timed out) and passes now;
+`an_unrecorded_member_without_launch_evidence_stays_charged` (the host came back
+with an empty journal) passes on both. `capyctl-store`
+`an_unrecorded_member_settles_only_on_evidence_for_its_own_launch` covers the
+refusals (another Launch, another host, no process, a process twice, two boots) and
+the settlement. Live check still needed: rerun MN2; a worker member whose identities
+were not recorded should settle on the stop's first Terminate, its charge and worker
+lease released.
+
+## TensorFold group members get the installation's libnccl — 2026-10-15 (branch `fix/group-tf-nccl`)
+
+Found live 2026-10-15 (MN3): both ranks of a TensorFold 0.6.5 TP2 group
+exited `RuntimeError: libnccl not found (set TF_NCCL_LIB)`. TensorFold 0.6.5
+and 0.6.6 (`tensorfold/cuda/comm.py` `_library`) load libnccl from the file
+`TF_NCCL_LIB` names, else `find_library("nccl")`, system `/usr/lib/*` and
+`dist-packages`, else torch's `lib`; a pip venv keeps it in the nvidia-nccl
+wheel (`<venv>/lib/python3*/site-packages/nvidia/nccl/lib/libnccl.so.2`),
+which none of those reach. CapyCTL owned `TF_NCCL_LIB` (ADR 0028 §2.1) and
+stripped it, but never set it; ADR 0028 §10's note that TensorFold's NCCL is
+built in was wrong.
+
+Now the TensorFold Initialize step of a group member resolves the
+installation's library from the registered executable's venv (the wheel's
+`libnccl.so.2`, else torch's `lib/libnccl*.so*`) and renders it as
+`TF_NCCL_LIB` on both ranks, inside the closed environment; the agent's own
+value never passes through. With no library it refuses before any effect with
+the closed category `nccl_library_missing` and an operator hint. Single-rank
+launches are unchanged.
+
+Tests (`capyctl-adapters`): `both_group_ranks_start_with_the_installations_libnccl`
+and `a_group_member_without_libnccl_is_refused_before_any_effect` fail before
+(no `TF_NCCL_LIB`, the launch spawns) and pass after;
+`no_transport_variables_and_no_credentials` now asserts the rendered value on
+both ranks. The agent's `group_launch` fake venv now holds the wheel's
+`libnccl.so.2`, as a real installation does. CPU and Fake-engine tests are not qualification; live check still
+needed: MN3 and MN5 tensorfold rows must reach Ready.
+
+## A group member on an unreachable host reads uncertain — 2026-10-15 (branch `fix/group-unreachable-member`)
+
+ADR 0028 §11 says a member whose host cannot be reached stays charged and
+`uncertain` (`group_member_uncertain`). The 0.1.3 live row MN7 (vLLM TP2 across
+two GB10 hosts) stopped host B's agent: host B showed offline at once, but
+rank 1 stayed `launched` for seven minutes (`13-uncertain-check.out`,
+`18-held-check.out`). Nothing moved a member on session loss. Only a stop, a
+silent park or an unanswered Launch marked a member uncertain, and a
+single-rank instance only gets its dispatch closed (`reconciling`).
+
+The readiness supervisor (`remote_readiness.rs`) already runs a pass whenever
+a host session changes, and every 250 ms. Each pass now also visits every
+launched or uncertain member of an active group plan:
+
+- A `launched` member whose host has no current session (lost, draining, or
+  silent past the heartbeat bound) becomes `uncertain`
+  (`Store::mark_member_unreachable`). Its charge, dispatch fence and recorded
+  identities are kept, and nothing is released.
+- An `uncertain` member becomes `launched` again only when its host's
+  reconciled session replayed a journal that still claims the member's Launch
+  (`AgentSessions::claims_launch`, the session's `ReconcileHistory`), through
+  `Store::mark_member_reconciled`. The store refuses this when another path
+  owns the uncertainty: no identities recorded (an unanswered Launch), a
+  recorded group failure, a stop run in progress, or an instance status that
+  names an unsettled stop. A host back with an empty journal proves nothing,
+  so its member stays uncertain until a stop settles it on evidence. An
+  engine that exited while its host was away is reported again once the
+  member is back to `launched`, and that exit fails the group as any exit
+  does.
+
+Tests (T30, T32, `coordinator/tests_groups.rs`, which drives the production
+supervisor over the group world):
+`a_lost_member_host_reads_uncertain_until_its_journal_returns`,
+`a_member_host_back_with_an_empty_journal_stays_uncertain` and
+`a_member_that_exited_while_its_host_was_away_fails_the_group_on_return`.
+All three fail without the member pass and pass with it. CPU and Fake-engine
+tests are not qualification. Live check still needed: rerun MN7 (vLLM) and
+check that rank 1 reads `uncertain` with its charge held within a second or so
+of host B's agent stopping, then reads `launched` after the agent returns,
+and that the group still stops cleanly.
+
+## SGLang groups restart instead of parking — 2026-10-15 (branch `fix/sglang-group-restart-only`)
+
+Found live at MN4 (SGLang 0.5.21, TP2 across two GB10 hosts): a group deep park completes, but the first wake fails. The head reloaded weights from disk for 222 s, the wake canary ran, and 3 s later the wake went `restore_uncertain` and the group was stopped. It fails safe, but group wake is not usable. vLLM groups pass 5/5 deep park cycles. Owner decision 2026-10-15, recorded as ADR 0028's note of that date.
+
+- `group_support("sglang").deep_park` is now false (`crates/capyctl-config/src/group_support.rs`). `check_engine_shape` refuses every parking tier (`deep` and `host_backed`) for an engine whose group cannot park, with `capability_missing:deep_park: a sglang group cannot park (residency `deep`); declare `residency: restart_only``.
+- `resolve_effective_with_checkpoint` (`crates/capyctl-config/src/effective.rs`) defaults the residency of a member of a group of more than one host to `restart_only` when its engine's group cannot park (the group's shape, else the member's `member_of`).
+- Single-host SGLang and vLLM groups are unchanged; single-host identities are untouched.
+- `docs/guide/engines.md` (groups table, known issue) and `docs/guide/several-machines.md` (park and wake) say SGLang groups restart instead of parking in 0.1.3.
+
+Tests (T03, T22), in `crates/capyctl-config/tests/topology.rs`: `sglang_group_resolves_restart_only_and_refuses_parking` and `engine_shape_support` failed before; `vllm_group_resolves_with_default_residency` (now asserting `deep`) and `single_host_sglang_still_parks` pass before and after. Controller group world (`crates/capyctl-controller/src/coordinator/tests_groups.rs`): SGLang groups deploy `restart_only`; `sglang_deep_group_with_differing_paths_is_refused` now expects the deploy refusal; the three deep group park tests run on vLLM only. CPU tests only; not qualification. Live recheck: redeploy the MN4 SGLang group with no residency and confirm `restart_only` in status and that a park stops and a wake starts the group; with `residency: deep` confirm the deploy refusal.
+
+## TensorFold group readiness reads TensorFold's token ids — 2026-10-15 (branch `fix/tensorfold-group-probe`)
+
+Found live 2026-10-15 (MN3, MN5, MN6): with libnccl fixed, both ranks of a
+TensorFold 0.6.5 TP2 group loaded, then activation failed `group_member_failed:
+rank 0: the completion probe through the head failed: the head generated no
+token`. TensorFold 0.6.5 (609ca419) and 0.6.6 (cb2ebf05) honor
+`return_token_ids` on `/v1/completions`, but answer the ids in the response's own
+`tensorfold` block (`tensorfold.token_ids`, `src/tensorfold/cuda/server.py:558`,
+`cuda/http.py:240-242`), never in `choices[0].token_ids`, where CapyCTL read
+them. The head answered text with no ids found, and a group probe needs ids
+(ADR 0028 §9).
+
+The `TypeError: cannot unpack non-iterable NoneType object` lines in the rows'
+error captures are unrelated to the probe. Each one ends a process's `main()`
+(`raise SystemExit(main())`). The capture greps the whole run directory, so its
+lines come from every row run there so far, carry no timestamps, and also
+appear in the vLLM and SGLang rows' captures (MN4-vllm and MN4-sglang of the
+07:13 run). A probe request cannot produce such a trace: TensorFold's request
+handler turns any exception into a 500 answer and logs
+`[tensorfold] request error`. Neither appeared, and the probe got an answer
+(text without ids). No request field CapyCTL sends causes the crash, so
+`return_token_ids` stays in the request.
+
+Owner decision 2026-10-15, ADR 0028 §9 amended:
+
+- The completion probe reads TensorFold's ids from `tensorfold.token_ids`,
+  falling back to `choices[0].token_ids` (`completion_probe::tensorfold_answer`,
+  the one reader of TensorFold completion ids: group readiness, the
+  request-stall check and the single-launch `complete_probe` all use it).
+  TensorFold group readiness is now judged on token ids, as vLLM's and SGLang's
+  is.
+- If a TensorFold head's answer carries no ids in either place (a build without
+  them in its block), the group readiness, stall and re-proof checks accept its
+  non-empty generated text (`group_activation::HeadEvidence::Text`). The
+  controller logs a notice naming the deployment when it does. A vLLM or SGLang
+  head without ids still fails as before. The wake canary compares ids only
+  (`HeadEvidence::into_tokens`): a canary answered with text alone fails the
+  wake and records no reference. TensorFold groups are restart-only and never
+  wake.
+
+Tests: adapters `tensorfold_asks_for_token_ids_without_a_key` (TensorFold's
+0.6.5/0.6.6 response shape, ids in the block) fails before (`tokens: []`) and
+passes after; the new unit test `tensorfold_ids_come_from_its_own_block` pins
+both shapes (with the block's ids, and without them, which answers text only)
+plus the choice fallback and malformed ids. Controller
+`tensorfold_readiness_passes_on_text_without_token_ids` (a TensorFold-shaped
+fake head answering text and no ids) fails before (the activation never reaches
+Ready) and passes after. `vllm_and_sglang_readiness_still_needs_token_ids`
+passes before and after. CPU and Fake-engine tests are not qualification. Live
+check still needed: the MN3, MN5 and MN6 tensorfold rows must reach Ready, with
+no TensorFold text-evidence notice in the controller log (the 0.6.5 head
+answers ids).
+
+## A sizing refusal leads with the request to raise to — 2026-10-15 (branch `fix/refusal-hint-first`)
+
+Found live on host A (B18, Qwen3.8-27B with an EAGLE MTP draft and
+`--max-mamba-cache-size 60` at a 65 GiB request): the SGLang sizing refusal
+(owner decision 2026-10-14) reached `start --wait` and status cut off at
+`... more than the 69793218560-byte memory request; raise engin`. Status bounds
+an operation's reason to 512 bytes (SPEC §6.4,
+`capyctl_domain::diagnostics::MAX_REASON_BYTES`), and the refusal named the
+request to raise to last, so the bound removed the one part the operator acts
+on.
+
+- Both SGLang sizing refusals (`crates/capyctl-config/src/context_fit/sglang_pool.rs`:
+  arguments that fix the state pool, and a hybrid model's recurrent state
+  that does not fit) now lead with the request to raise to, then give every
+  figure: `raise engine_config.memory.request to "75GiB" (80530636800 bytes),
+  keeping memory.kv_cache at 31138512896 bytes: SGLang's static pool holds ...`.
+  The live case names 75 GiB (71163366912 + 8589934592 = 79753301504 bytes,
+  rounded up to whole GiB).
+- A bounded reason is cut on a character boundary and ends in a visible `…`,
+  within its bound (`diagnostics::bound_bytes`, `bound_chars`): status's
+  operation reason, the unusable-checkpoint diagnostic, a parked instance's
+  release reason, a switch's detail, and the live-profile and retirement
+  refusals sent to a host. Status picks an operation's hint from the whole
+  reason before it bounds it (`diagnostics::public_text`), so a closed code
+  past the bound still gives the hint.
+
+Tests (failing before, passing after):
+`the_live_eagle_refusal_leads_with_the_request_to_raise` (capyctl-config, the
+live figures; the request named is the smallest whole GiB that holds them),
+`a_refusal_names_the_smallest_request_that_fits` (now asserts the request
+leads), `a_cut_reason_ends_in_an_ellipsis_and_keeps_its_lead`
+(capyctl-domain), `a_bounded_reason_keeps_the_request_to_raise_and_shows_the_cut`
+(capyctl-store: status keeps the request, ends in `…` within 512 bytes, and
+classifies a code past the bound). `wait_ends_at_once_when_the_start_gave_up`
+(capyctl-cli) and `a_deterministic_refusal_gives_up_without_retrying`
+(capyctl-controller) use the new order. CPU and Fake-engine tests only; they
+are not qualification. Live check still needed: repeat the B18 start on host A
+and confirm `start --wait` and status name `75GiB`.
+
+## 0.1.3 release live checks driver — 2026-10-15 (branch `test/release-checks-0.1.3`)
+
+A driver for the live checks the changes merged since 0.1.2 still owe (B1-B17
+of the 0.1.3 live backlog), on one GB10 host: `scripts/live/release-checks/run.sh`,
+with `remote.sh` (host phases, run detached) and `rc.py` (requests, reads and
+the verdict, standard library only). Modelled on `scripts/live/engine-quick-check.sh`
+and the B18 comparison driver: CapyCTL built on the host into
+`~/capyctl-0.1.3-live`, the checks run in `~/c13/<run>` (a short path, since
+deep parking's observation socket lives under the state directory), results
+copied back to `target/live/0.1.3-backlog/<run>/` with host names redacted,
+and the host's work directory removed. `--dry-run` prints the whole plan,
+every deployment file and each check's pass condition; `--only` runs a subset.
+
+Each group of checks runs on its own standalone role with its own state,
+config and model-sources directories and port (18643, management 18644, engines
+8340-8359), each profile with empty kernel caches of its own; the main role
+raises `managed_limit` to 100GiB with a 10GiB `free_reserve` and a 45GiB
+`parked_limit`. Deployments are shared to keep cold starts down: vLLM 0.30.0
+model 1 with no declared loader (B1, B2's three GB10 wakes, B3, B5, B14), its
+eager variant (B4), TensorFold 0.6.6 model 1 (B3 with the CUDA `prefill_ms`
+mapping, B14's refusal), SGLang 0.5.21 Qwen3-4B (B3, B5, B6, B14; B8 with
+explicit activation), SGLang model 1 (B9's two small-KV launches, B15, B12 with
+`model.draft`), Qwen2.5-0.5B downloaded by CapyCTL (B11, and the tar payloads
+B13 serves from a loopback `python3 -m http.server` to a role that approves
+plain HTTP for that origin only). B7 has its own role (110GiB managed, 11GiB
+reserve). Every field the checks assert was read from the code: the effective
+configuration (`inspect deployment --effective-config`), status
+(`parked.growth[]`, `checkpoint_digest.provenance`, `model_sources[]`,
+`activation`), `list hosts` (`session.memory_warnings`), the load read, the
+engine-log tail route, the role log's `router_selection` events, the
+`engine build limits: MAX_JOBS=` line, and the ledger's `wake_canaries` and
+`journal_entries` (read-only SELECTs). Engine keys are never read: the log
+redaction check is by rule, by the role's own key and token, and by a unique
+prompt marker. Every role, deployment, profile, HTTP server and container is
+removed at the end, after a failure too.
+
+SKIP by default: B10 (the host's Flash-Next copy is not a complete checkpoint;
+`--download-flash-next` lets CapyCTL download it into `~/models/sources`), B16
+(no gpt-oss-120b on a host) and B17 (`--container` builds an image on the host).
+B18 has its own driver in capyctl-recipes.
+
+Checked: `bash -n`, `shellcheck -x` (v0.11.0) clean, the dry run, and two live
+runs on host A (below).
+
+Live runs on host A (evidence in `target/live/0.1.3-backlog/<run>/`):
+
+- 2026-10-14 full run (`2026-10-14-2311-release-checks`): B5, B6, B7, B8 and
+  B11 pass; B10, B16 and B17 SKIP (the reasons above). B1/B2 failed from a
+  product bug, vLLM deep wake (fixed in #121). B3/B14 TensorFold, B4, B9, B12,
+  B13, B14 vLLM and B15 failed on harness faults, fixed below; B3 vLLM/SGLang
+  and B14 SGLang passed.
+- 2026-10-15 rerun of B1-B4, B9 and B12-B15 (`2026-10-15-0133-release-checks`,
+  with #121 and #122): every row passes except B12's, which read an empty draft
+  path while the engine's server_args named the drafter in the role's sources
+  store (`src1/sources/huggingface/z-lab--Qwen3.8-27B-DFlash2@50307d4c...`),
+  sources verified, request answered; the same evidence passes under the fixed
+  B12 below.
+
+So every check passes, or is SKIP for B10, B16 and B17.
+
+Harness fixes after the first run on host A (2026-10-14, evidence in
+`target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`):
+
+- B3/B14 TensorFold: TensorFold 0.6.6 needs a drafter for Qwen3.8-27B; the
+  deployment passes `--drafter ~/drafters/Qwen3.8-27B-DFlash2` (the `tf66`
+  profile approves `--drafter` and `~/drafters`, as the quick check does) with
+  the quick check's 60GiB reservation; B3 still requires `prefill_ms` source
+  engine (the CUDA `prefill_s` mapping).
+- B9/B15/B12: SGLang `quantization: modelopt` with deep parking is refused
+  `capability_missing:deep_park` by design; these deployments declare
+  `residency: restart_only`. B12 asks for the 67486MiB `memory.request` CapyCTL
+  named when it refused 65GiB, and retries once at whatever size a refusal names.
+- B13: GNU tar's `--format=posix` writes a pax extended header per member, and
+  CapyCTL's tar reader (ADR 0008, `crates/capyctl-agent/src/sources/tar.rs`)
+  refuses extension headers and links as `unsafe_archive`. The payloads are
+  ustar with symlinks dereferenced (`-h`) and relative member names. The
+  secret URL's `sig` marker is looked for in the whole role state directory
+  (ledger, logs, config; the secrets directory excepted) besides the CLI
+  output and status/inspect JSON.
+- B14 vLLM: the cache_salt check runs on dense Qwen3-4B (`restart_only`); the
+  hybrid model reuses no prefix cache.
+- B4: its own role with `resource_policy.parked_growth_limit: 0B` (ADR 0014
+  amendment A19; a park is past the bound only when its charge exceeds the
+  first by more than the bound, so 0B makes any growth a stop). Zero growth
+  over every park is SKIP `n/a (no growth in N parks ...)` with the per-park
+  first/last bytes, not FAIL.
+- B1: the gating rows check whatever loader `capyctl default` provenance
+  reports (lazy or eager) and that the engine argv carries it; a second
+  deployment with `safetensors_load_strategy: lazy` stated runs the cycles as
+  an `info` row (`rc.py verdict` never lets `info` decide a check; a wake gives
+  up after 10 minutes and stops the variant).
+- B12 (after the rerun): SGLang 0.5.21 logs `server_args` as a dict
+  (`'speculative_draft_model_path': '...'`), not `ServerArgs(key='...')`;
+  `rc.py facts` reads both forms, and B12 asserts the rendered path is the
+  pinned `z-lab--Qwen3.8-27B-DFlash2@<commit>` directory under the main role's
+  sources directory (`--draft-source local`: the local drafter path).
+
+## A wake that does not complete stops the instance — 2026-10-15 (branch `fix/vllm-deep-wake`)
+
+Found live on host A (GB10, standalone, vLLM 0.30.0, Qwen3.8-27B NVFP4, deep park, no
+declared loader, so `lazy` under ADR 0014 amendment A21; run
+`target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`, check B1). The first wake's
+`/wake_up?tags=weights` returned at once, then vLLM's `Reloading weights inplace` took
+123 s. CapyCTL's `reload_weights` collective had a fixed 120 s bound
+(`WEIGHT_RELOAD_TIMEOUT_SECS`), so at 121 s the step failed as uncertain (`collective_rpc:
+error sending request`) and the request got `activation_uncertain`. The engine finished the
+reload 2 s later and was never asked anything again. An uncertain restore is never re-armed
+and nothing stopped it, so the instance read `uncertain` with its restore `running`, its
+memory charged and dispatch closed, for 21 minutes until the script deleted the deployment;
+the next two wakes failed at once on it.
+
+vLLM logged `WARNING [layerwise.py:268] MRotaryEmbedding: Failed to load weights` during that
+reload. It is not evidence of a failed reload: the six correct `eager` wakes of check B4 on
+the same model log it too. In vLLM 0.30 it is `finalize_layerwise_processing` putting a
+layer's kernel tensors back when the checkpoint holds none of its weights, and
+`reload_weights` returns `None` either way, so the collective's answer carries no load
+result. CapyCTL does not scrape engine logs for it. The structured signal vLLM does give is
+the collective's status: when `reload_weights` raises, `/collective_rpc` answers an error.
+
+What changed (SPEC §9.1, §13.2, T20; the 2026-10-09 owner decision for `wake_mismatch`,
+extended):
+
+- **One deadline for the whole restore.** The persisted restore was already bounded by its
+  wake window (`timeouts.wake`, under the Initialize ceiling), but the reload had its own
+  shorter, fixed 120 s bound and the wake canary was bounded only by the adapter honouring
+  the bound it was passed. Now vLLM's persisted `ReloadWeights` step gives the collective
+  what is left of the restore's deadline (`EngineHttp::collective_rpc(timeout)`), and the
+  coordinator runs the canary under the same deadline (`execute_residency`); the canary at
+  first readiness is bounded by `CANARY_DEADLINE` in the coordinator too. The adapter-level
+  `EngineAdapter::reload_weights` keeps the 120 s bound.
+- **A failed reload fails the wake.** A `reload_weights` collective vLLM answers with an
+  error status is `RuntimeError::ReloadFailed` (new): the wake fails with the new closed code
+  `wake_reload_failed`, and the adapter refuses every later step, as before.
+- **A wake that ended without its evidence stops the instance.** Every single launch's wake
+  that ends uncertain (deadline passed, a step's outcome unknown, canary unanswered, evidence
+  not accepted, the controller stopped during it) records `wake_uncertain` as the instance's
+  last error (`Store::record_wake_failure`), unless it is `wake_reload_failed` or
+  `wake_mismatch`, and the step reads uncertain. `Store::wake_stops_due` (replacing
+  `wake_mismatch_stops_due`) lists every single-launch instance whose restore at its current
+  generation ended uncertain and that still reads desired ready, whatever the code, and the
+  scheduler retries each one's ordinary stop every pass under `EXIT_PRINCIPAL`
+  (`retry_wake_stops`, keyed `wake-stop:<operation>:<generation>`). As for `wake_mismatch`,
+  the host terminates the recorded engine and the reservation, claim and gate are released
+  only on its gone evidence; status reads `failed` with the code as last error, and the next
+  request starts the instance fresh. A group's wake still owes its group stop
+  (`group_residency_stops_due`); an uncertain park still waits for an operator stop.
+- Remote hosts report every failed restore step as uncertain (the host protocol has no
+  reload-failed category), so a remote reload failure reads `wake_uncertain`, with the same
+  stop.
+- New closed status codes `wake_reload_failed` and `wake_uncertain` (no exit; CLI codes,
+  errors guide, parking guide).
+
+Tests, failing before and passing after:
+
+- `capyctl-controller`
+  `tests::residency::a_wake_whose_reload_never_returns_is_stopped_and_starts_fresh`
+  (embedded, the reload never answers), `a_wake_whose_canary_never_answers_is_stopped_and_starts_fresh`
+  (the canary never answers) and `an_uncertain_wake_is_stopped_and_starts_fresh` (remote,
+  outcome lost): on `origin/main` all three time out after 30 s waiting for the release (the
+  wake stays uncertain and charged; with the canary, the worker hangs); now the instance is
+  stopped once, released on the host's gone evidence, reads `stopped` with
+  `wake_uncertain`, and the next on-demand request starts a fresh launch that reaches Ready.
+- `capyctl-controller` `tests::residency::a_wake_whose_reload_fails_is_stopped_and_starts_fresh`
+  and `capyctl-adapters` `vllm_residency::a_failed_reload_fails_the_wake_and_is_never_repeated`
+  (renamed from `a_failed_reload_is_uncertain_and_never_repeated`; a 500 from
+  `/collective_rpc` was uncertain before): new API, so they did not build before.
+- `capyctl-store` `wake_canary::tests::an_uncertain_wake_owes_the_stop_until_a_new_generation`
+  and `a_mismatch_names_its_code` (replacing `a_mismatch_owes_the_stop_while_its_wake_is_uncertain`).
+- `capyctl-cli` `group_status_codes_have_no_exit` covers the two new codes.
+
+CPU and Fake-engine tests only; they are not qualification. Live check still needed: on host
+A, model 1 (Qwen3.8-27B NVFP4) on vLLM 0.30 with deep park and a declared
+`safetensors_load_strategy: lazy`, park and wake three times. Each wake either answers
+correctly (the reload now has the 180 s wake window), or ends within the wake window with
+the instance stopped, `wake_uncertain` or `wake_reload_failed` as its last error, its memory
+released once the engine is gone, and the next request starting it fresh. Never an instance
+left `uncertain`.
+
+## SGLang ReplaySSM spec-verify and MTP drafts sized as SGLang allocates them — 2026-10-14 (branch `fix/sglang-replayssm-state`)
+
+Reported for a Qwen3.8-27B NVFP4 deployment with EAGLE (4 draft tokens,
+`--speculative-eagle-topk 1`), `--enable-linear-replayssm-spec`,
+`--max-mamba-cache-size 110`, `max_concurrent_requests: 22` and
+`memory: {request: 79GiB, kv_cache: 29GiB}`: CapyCTL counted
+`(22 + 1) × 4` intermediate recurrent states (13.2 GiB) that SGLang does not
+keep under that flag, so the static pool it rendered was the whole request
+and the margin was 0 (ADR 0014 amendment A14 and its note on SGLang's static
+pool on unified memory).
+
+SGLang 0.5.21 and 0.5.20 (both define the flag; their sizing is the same)
+read from the published wheels: with the flag on a gated-delta-net or KDA
+hybrid, `_handle_max_mamba_cache` (`kv_cache_configurator.py`) reserves no
+intermediate states and charges a ReplaySSM ring for
+`max_running_requests + 1` requests instead, and `MambaPool.__init__`
+(`memory_pool.py`) allocates no `intermediate_ssm`, but allocates that ring
+(per linear-attention layer and record, bfloat16 compact d and k with their
+low parts and a float32 gate; 16 records unless `--linear-replayssm-cache-len`
+says otherwise) and still allocates the deduplicated conv windows
+(`draft tokens + kernel - 2` columns) for each running request plus one. The
+flag also makes the temporal state float32 unless `--mamba-ssm-dtype` names
+another dtype (`handle_linear_attn_backend`).
+
+`crates/capyctl-config/src/context_fit/sglang_pool.rs` now counts that: the
+state the arguments fix (`argument_state`) and the state CapyCTL sizes itself
+hold the slots plus, for each running request plus one, either the
+intermediate states (no flag, unchanged) or the ring and the conv windows
+(flag), and the temporal state is float32 under the flag. For the reported
+deployment that is 0.67 GiB instead of 13.2 GiB, and the static pool is the
+request less its 8 GiB margin. The flag is recognised as SGLang's parser takes
+it: the full name or an abbreviation that is not `--enable-linear-replayssm`
+(the decode ring, another option), in the deployment's or the host-fixed
+arguments; it is a `store_true` flag, so `=true` (which SGLang refuses)
+counts nothing. A derived request, whose resolution reads no checkpoint,
+still reserves the intermediate states under the flag; they exceed the ring
+at its default length, and the launch sizes what SGLang keeps within that
+reservation. Deployments without the flag size and fingerprint as before.
+ADR 0014's state formula notes the flag.
+
+Tests (`sglang_pool/tests.rs`, T14): the reported deployment without the flag
+counts its 111 slots and 92 intermediate states as before (it is now refused
+at 79 GiB, see below) and with it renders a 71 GiB static pool, 475136 KV
+tokens; at a tighter request the refusal counts exactly the
+111 slots and 23 ring-and-window sets; an abbreviation, the host-fixed
+arguments and a longer ring are counted, and `--enable-linear-replayssm` or
+`=true` are not; CapyCTL's own sizing at 79 GiB was refused and now holds 22
+running requests; the flag's float32 temporal state. Those three tests
+failed before the change and pass after; a derived request's reservation
+under the flag is pinned unchanged, and the existing pool, recipe-fingerprint
+and golden effective-revision tests pass unchanged.
+
+## An EAGLE draft from the checkpoint's own MTP head
+
+Found live on host A on 2026-10-14 (SGLang 0.5.21, a standalone built from
+this branch's first commit, d4b86843): the deployment above as
+RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead at 009632fe (23749332688 bytes of
+measured weights) with `kv_cache_dtype: fp8_e4m3`, EAGLE 3/1/4 drafting with
+the checkpoint's MTP layer and `--enable-mixed-chunk`. CapyCTL passed 950272
+KV tokens (29 GiB at 32 KiB) and a 71 GiB static pool; SGLang ran the 22
+requests but held 770984 and 776670 KV tokens, and the process took 78.7 to
+81.8 GiB at Ready against the 79 GiB request (an 80 GiB Ready charge with
+the engine overhead). The engine log's `server_args` were not in the evidence;
+the rendered figures are CapyCTL's sizing at d4b86843.
+
+Cause, read in SGLang 0.5.21 and 0.5.20 (the same code): without
+`--speculative-draft-model-path`, the draft worker loads the checkpoint as
+`Qwen3_5ForCausalLMMTP`. It is built before the target's KV pool
+(`Scheduler.init_model_worker`: the draft worker, then `init_memory_pools`),
+so the target's profile (`_profile_available_bytes`) charges against the
+static pool its MTP layer (in the measured weights) and its own BF16
+embedding and LM head, 2 × 248320 × 5120 × 2 bytes = 4.74 GiB, which it frees
+only after the target's pool exists (`init_lm_head`). Its KV pool, one
+full-attention layer (`_build_hybrid_linear_kv_pool`, layer `[0]`) for the
+target's token count in the target's KV dtype, is allocated after the
+profile and outside it: the target's `eagle_draft_num_layers` comes from the
+target configuration, which names no `num_nextn_predict_layers`. Modelled,
+the 71 GiB static pool left the target 804866 tokens; the live figures sit
+0.86 to 1.03 GiB below, the draft runner's own allocations, which no figure
+here models.
+
+CapyCTL now counts that draft (`EAGLE`, `EAGLE3` or `NEXTN` on a
+gated-delta-net hybrid whose configuration names an MTP head, with no
+separate draft model): its KV layer shares the KV cache, as a draft model's
+layers do (amendment A9), so the tokens passed are 29 GiB / (32768 + 2048) =
+894373, and the static pool holds its embedding and LM head (one table when
+they are tied; `--speculative-draft-kv-cache-dtype` and `--dtype` apply), 75.44
+GiB here, which leaves SGLang's profile 0.7 GiB beyond the target's pool even
+with the GiB it was short live. When CapyCTL sizes the state itself the tables
+count with the weights, so that deployment without `--max-mamba-cache-size`
+is refused at 79 GiB, naming them, and holds its 22 requests at 82 GiB. The
+tables are freed at start-up, so the margin gets them back. ADR 0014's rule
+for the static pool on unified memory states it. A launch without speculative
+decoding, with a separate draft model, or of a checkpoint without an MTP head
+sizes as before.
+
+## A stated request that cannot hold the state its arguments fix is refused
+
+Owner decision 2026-10-14 (AGENTS.md: uncertainty must retain accounting):
+until now the static pool CapyCTL rendered for a state fixed by
+`--max-mamba-cache-size` was capped at the memory request, and what it lacked
+came out of the margin unannounced: with the MTP draft counted, the deployment
+above would have rendered 75.44 GiB of its 79 GiB, a 3.6 GiB margin,
+under-charged. Now, when a stated (not derived) memory
+request's static pool, the request less its family's margin (8 GiB on unified
+memory, `(request − kv_cache) / 11` on a discrete GPU), cannot hold the
+weights (with an MTP draft's tables), the KV cache, that state and, on
+unified memory, the 3 GiB of SGLang's own allocations, CapyCTL refuses it as
+it refuses a CapyCTL-sized state that does not fit: `status` and `validate`
+warn beforehand and the start is refused (resolution reads no checkpoint, so
+it cannot refuse earlier), naming each component, their total and the
+smallest whole-GiB request that holds them. For the live deployment: 81000320720
+bytes (75.44 GiB) with the 8 GiB margin, so `request: 84GiB`, which passes
+894373 KV tokens and a 76 GiB static pool; 83 GiB is refused. Without
+`--enable-linear-replayssm-spec` the same deployment (92 intermediate states)
+needs 96 GiB. A derived request still takes what it lacks from its margin.
+The pinned recipe, fingerprint and golden tests (`capyctl-config`,
+`capyctl-adapters`, `capyctl-store`, `capyctl-cli`, `capyctl-controller`)
+resolve unchanged; three unit tests that showed the capped static pool with a
+stated request now show the refusal and the request it names
+(`arguments_that_size_the_state_pool_win` moves its 48 GiB request to 64 GiB
+so the 65 slots it fixes fit).
+
+Tests (`sglang_pool/tests.rs`, T14):
+`an_mtp_draft_keeps_its_kv_layer_and_tables_in_the_static_pool` reproduces the
+live deployment from the checkpoint's configuration and safetensors headers
+(the old figures and SGLang's profile of them, the new 894373 tokens and
+static pool, `NEXTN`, `EAGLE3`, a draft KV dtype, the CapyCTL-sized refusal
+and 82 GiB; the 79 GiB request refused naming 84 GiB, and 84 GiB passing
+894373 tokens); `other_launches_of_an_mtp_checkpoint_size_as_before` pins the
+unchanged cases and the tied tables. Both failed before the change and pass
+after, and `arguments_that_fix_the_state_pool_are_held_by_the_static_pool`
+pins the refusal's whole-GiB request and its boundary.
+
+CPU and Fake-engine tests only; they are not qualification. Live check still
+needed: launch the MTP deployment on SGLang 0.5.21 with `request: 84GiB` and
+confirm the engine log shows `--max-total-tokens 894373` and
+`max_total_num_tokens` 894373, the "Mamba Cache is allocated" and "GDN
+ReplaySSM ring buffers allocated" lines (no `intermediate_ssm_state_cache`)
+match the counted bytes, and the Ready footprint (expected 3.8 to 4.0 GiB
+above the live run's 78.7 to 81.8 GiB) stays within the charge; and that at
+79 GiB `status` warns and the start is refused naming 84 GiB.
+
+## vLLM 0.31.0 verified — 2026-10-14 (branch `feat/verify-vllm-0.31.0`)
+
+Owner decision 2026-10-14: vLLM 0.31.0 joins the verified set (ADR 0018 §1).
+AGENTS.md already lists vLLM 0.31.0 on host A.
+
+What changed: `(Engine::Vllm, "0.31.0")` is in `registration::VERIFIED`, so a
+0.31.0 installation no longer lists as `CUSTOM yes`. `docs/guide/engines.md`
+(custom builds), `docs/guide/install-engines.md` (versions this release knows)
+and ADR 0018 §1 (dated note) name it.
+
+Tests: `capyctl-config` `registration.rs` `the_verified_set_marks_custom_builds`
+(T22; 0.31.0 verified, 0.31.1 not).
+
+Live evidence:
+
+- Laptop (RTX 4090, 2026-10-10 and 2026-10-14): see
+  `docs/changes/vllm-0310-support.md` (launch, chat, `cached_tokens`, deep park,
+  stop), and today's wake-canary check (two matching wakes, and a tampered
+  reference failing `wake_mismatch` with the engine stopped and memory
+  released) and load read (fresh engine samples, `load_source: engine`).
+- Host A (GB10, `engine-quick-check.sh --engine vllm --new 0.31.0 --old 0.30.0
+  --model qwen3-4b`, origin/main a230cf9a): venv created with the guide's steps;
+  engine add; cold start 142.4 s (0.30.0: 99.2 s), warm 71–87 s; streamed
+  reasoning request passed (first token 0.186 s), stop and 409 after it;
+  aggregate tok/s C1 22.0/22.0, C4 106.2/106.6, C8 207.0/207.3 (0.31.0/0.30.0),
+  TTFT p50 within noise; reply lengths differ at C4/C8 as batch-order effects
+  allow (no token hash on vLLM). Two harness failures were not CapyCTL's: the
+  probe read `/metrics` without the launch key, which CapyCTL's own guard
+  refuses on 0.30.0 too (fixed in the quick-check on branch
+  `fix/vllm031-metrics-auth`), and the context sweep's calibration could not
+  read a 1-token reply from a reasoning model (fixed in capyctl-recipes main).
+- Rerun with both harness fixes (host A, 2026-10-14, origin/main `ae6852bf`, warm
+  starts): every lifecycle step passed, including the new `engine load via CapyCTL`
+  step (12 of 12 load reads during a request carried a fresh engine sample).
+  Aggregate tok/s C1 21.9 / 21.9, C4 106.5 / 106.4, C8 207.4 / 207.0 (0.31.0 /
+  0.30.0); decode at 2k and 8k within 0.2%, prefill within 2%. The 32k context
+  point was refused by both versions (`engine_rejected`, maximum context 29104):
+  that is the context CapyCTL fitted for the preset's Qwen3-4B deployment, not a
+  difference between versions.
+
+## SGLang saver observation under a long state directory — 2026-10-14 (branch `fix/observation-socket-path`)
+
+Found live 2026-10-14 on host A (GB10, standalone, SGLang 0.5.21, `deep`
+deployments, build d4b86843): every `capyctl park deployment` of two SGLang
+deployments was refused at once with `park refused before any effect (the
+engine is not quiescent)`, and the role's `<state>/observation/` directory
+stayed empty while the engines served. The same model and recipe parked on
+2026-10-05 (ADR 0014 A17 evidence).
+
+Root cause, confirmed in code and by the tests below. The state directory was
+`/home/edurdias/capyctl-0.1.3-live-runs/2026-10-14-1854-b18/state`, so the
+launch's socket `<state>/observation/<binding>.sock` was 108 bytes. The
+protected entry's `entry_environment` (`runtime/sglang_observation_enrollment.py`)
+refused any such path over 107 bytes (the `sun_path` limit) by returning
+`False` without a word, so the launch ran without an enrolled saver
+observation (SPEC §9.2). With no record in the observation directory, every
+embedded park failed SPEC §10 step 4 and was refused as not quiescent. Host
+roles share the layout, so any role whose state directory is longer than
+63 bytes was affected the same way.
+
+Fix:
+
+- The listener binds, and the host connects, through a descriptor of the
+  socket's directory, `/proc/self/fd/<fd>/<binding>.sock`, so the address fits
+  `sun_path` whatever the directory's length
+  (`sglang_observation_server._Custody.address`,
+  `capyctl_launchers::native_observation::connect`). The listener now binds in
+  exactly the directory its custody verified. The socket is still a 0600 file
+  in the 0700 owner-only directory, with the same peer-credential and key
+  checks; no abstract address is used. Paths are bounded at 4095 bytes.
+- A scope the entry cannot publish now names why on the engine's log, with a
+  closed code and no path: `capyctl_saver_enrollment_refused`, stage `scope`
+  (`weight_restore`, `directory_path`, `group`, `directory_mode`, or the error
+  class).
+- An embedded park refused because the launch's observation never enrolled
+  (a readable private directory without the binding's record) now says `the
+  engine's saver observation is not enrolled` instead of `the engine is not
+  quiescent` (`Quiescence::unproven`, `Unproven::ObservationNotEnrolled`). A
+  host's `sglang_park_not_quiescent` log event gains `unenrolled`.
+
+Tests (T22, T20):
+
+- `runtime/tests/test_sglang_observation_enrollment.py`
+  `test_a_long_observation_directory_still_enrolls` (a socket path over 108
+  bytes enrolls, writes its record and answers a keyed observation) and
+  `test_an_unpublishable_scope_names_its_reason`: both failed before (the
+  scope was refused, and nothing was logged) and pass after.
+- `capyctl-launchers` `native_observation::tests::a_socket_under_a_long_directory_is_observed`
+  (the Rust client against the real Python listener under a 108+-byte path):
+  failed before, passes after.
+- `capyctl-agent` `saver_source::tests::an_embedded_sglang_without_evidence_is_not_quiescent`
+  (extended) and `only_a_readable_directory_without_a_record_is_unenrolled`;
+  `capyctl-controller` `an_unobserved_engine_park_refusal_says_it_is_not_enrolled`.
+
+CPU tests only; they are not qualification. Live check still needed: a `deep`
+SGLang park and wake on a role whose state directory makes the socket path
+longer than 107 bytes.
+
+## Engine log redaction keeps model paths
+
+Found in the same live run: SGLang's `server_args` line in the engine log
+read `'model_path': '<redacted>.8-27B-NVFP4@482ca0f3...'` and
+`'/home/edurdias/.cache/huggingface/hub/models--RadixArk--Qwen3.<redacted>'`.
+The suspected URL-userinfo rule was not the cause: `redact_urls` only touches
+text after a `scheme://`, and the probe showed it left both lines unchanged.
+The long-run rule was the cause, in both the Python scrubber inside the engine
+(`runtime/sglang_startup_guards.scrub`) and the log writer
+(`capyctl_adapters::vllm::args::redact_text`). A run starting with `/` was
+kept as a path, but a `.` in the path (`.cache`, `capyctl-0.1.3`, `Qwen3.6`)
+ended the run. The rest of the path then began without `/`, and when it was
+48 characters or more it was blanked as a credential. The Python scrubber also
+blanked any whole path of 48 characters or more. Now a run that starts with
+`/` makes the rest of its word a path, past any `.`, `@` or `:`, until
+whitespace, a quote or bracketing punctuation. A path is kept segment by
+segment, so a credential-length segment inside one is still blanked. Launch
+keys (by value), URL userinfo, query strings and bearer values are redacted
+as before.
+
+Tests (T37), failing before and passing after:
+`engine_log::tests::model_paths_in_the_argument_echo_are_kept` and
+`runtime/tests/test_sglang_startup_guards.py`
+`test_scrub_keeps_model_paths_and_still_redacts_keys`. Both use the two live
+paths and also check that the keys on the line, a 64-character segment inside
+a path, URL credentials and bearer values are still redacted. CPU tests only.
+Live check: the `server_args` line of the next SGLang launch shows its model
+path.
+
+## Engine quick check reads load through CapyCTL, not unkeyed /metrics — 2026-10-14 (branch `fix/vllm031-metrics-auth`)
+
+The vLLM 0.31.0 quick check on host A failed its `engine /metrics` step: the
+probe curled the launch's loopback `/metrics` without a key and got `401
+{"error": "Unauthorized"}`. That answer is CapyCTL's own key guard, by design,
+and not a CapyCTL defect:
+
+- Under deep parking (default on, ADR 0012, SPEC §9.1 / T21) the vLLM argv
+  carries `--middleware capyctl_vllm_guard.RequireEngineKey`
+  (`crates/capyctl-adapters/src/vllm/args.rs`) and the per-launch key rides
+  `VLLM_API_KEY` in the engine's environment, not `--api-key`. The guard keys
+  every path but `/health`, `/metrics` included
+  (`runtime/capyctl_vllm_guard.py`, `_INFERENCE_EXACT`), whatever the vLLM
+  version, so vLLM 0.30.0 answers the same.
+- vLLM's own `AuthenticationMiddleware` guards only `/v1`, `/v2`,
+  `/inference` and `/cohere` (`vllm/entrypoints/serve/middleware/authenticate.py`,
+  `GUARDED_PREFIX`); `/metrics` is a separate mount
+  (`entrypoints/serve/instrumentator/metrics.py`). Read from the vLLM 0.30.0
+  sdist and the installed 0.31.0: the auth, middleware registration and
+  metrics mount are the same apart from whitespace, and every gauge and
+  histogram name CapyCTL reads is in both `v1/metrics/loggers.py`.
+- Every CapyCTL reader sends the launch key: the host agent and standalone's
+  embedded load (`capyctl_agent::load::keyed_get`, used by
+  `capyctl_controller::embedded_load`), and the vLLM adapter's quiescence read
+  (`EngineHttp::work_counts`, keyed through `auth`). Their tests already serve
+  a fake engine whose `/metrics` refuses an unkeyed read
+  (`crates/capyctl-agent/tests/load.rs`, `crates/capyctl-adapters/tests/vllm_http.rs`).
+
+Live on the maintainers' RTX 4090 laptop, vLLM 0.31.0, Qwen2.5-1.5B-Instruct,
+an isolated standalone from `origin/main` (057c1a47): the engine argv has the
+guard and no `--api-key`; unkeyed `/metrics` and `/v1/models` answer 401,
+`/health` 200; during a streamed request every
+`GET /management/v1/metrics/load` read carried a fresh sample with
+`engine.running` 1 and `waiting` 0, and 0 and 0 once it finished. Cleaned up
+afterwards (deployment, profile and role gone, GPU back to its baseline).
+
+The probe (`scripts/live/quick-check/remote.sh` `metrics`) now checks
+CapyCTL's contract: during a request, the new `load_check.py` polls the
+management load read with the admin token and passes when a fresh sample for
+the deployment carries the engine's running and waiting counts. The unkeyed
+`/metrics` code and whether the guard is on the argv are kept as notes in
+`metrics-notes.txt`. Exercised against the laptop's live role; the quick-check
+driver itself has not been rerun on host A.
+
+Seen on the same run, unrelated to the key: standalone's latency view
+carries router series only. `EmbeddedLoad::tick` records each report's load
+sample but not its engine latency histograms, so `source: engine` series are
+absent on standalone for every engine and version.
+
+## TensorFold 0.6.6 verified — 2026-10-14 (branch `feat/verify-tensorfold-0.6.6`)
+
+Owner decision 2026-10-14: TensorFold 0.6.6 joins the verified set (ADR 0023
+§1), installed on both lab hosts (host B's venv a byte-identical copy of host
+A's); AGENTS.md's engine list also records vLLM 0.31.0 and a llama.cpp build in
+the home directory on host A, approved the same day.
+
+Source audit of v0.6.6 (`cb2ebf05`) against v0.6.5: the only upstream change
+CapyCTL sees is the new `tensorfold serve --name-priority ID=background`
+option (CUDA only), an ordinary extra argument; no environment, HTTP route,
+metrics or build change. `--name-priority` names a served name or alias, and
+CapyCTL passes no `--name` to a TP2 follower, so it may fail there
+(documented in the engine options table). The audit found two gaps that
+predate 0.6.6, both fixed here:
+
+- `TENSORFOLD_API_KEY` was not an owned name. TensorFold reads it
+  (`server/authentication.py`) and then refuses the unkeyed health and
+  metrics routes CapyCTL reads; a profile or deployment `engine_env` entry
+  under an approval such as `TENSORFOLD_*` reached the engine through
+  `engine_env.values()` → `tensorfold/frozen.rs` `build_env` → the launch
+  environment. It is now in `engine_env::OWNED_NAMES`.
+- The router's TensorFold mapping read only the MLX statistics
+  (`prefill_seconds`, `time_to_first_token`, `tokens_per_second`). The CUDA
+  Qwen engine (`families/qwen3_5/cuda/engine.py` `generate`, sent by
+  `cuda/http.py`) reports `prefill_s`, `decode_s` and draft counters instead,
+  so a CUDA answer had no engine figures beyond cached tokens. A finite
+  non-negative `prefill_s` now maps to `prefill_ms` (source `engine`) when
+  `prefill_seconds` is absent. `decode_s` is not turned into a rate: the
+  first token comes out of prefill and a gated request's statistics cover its
+  last run only, so the engine gives no rate CapyCTL can state; time to first
+  token and decode rate stay the router's on CUDA. `docs/guide/requests.md`
+  says so.
+
+Tests: `capyctl-config` `tensorfold.rs` (0.6.6 verified, 0.6.4 and 0.6.7
+not), `capyctl-cli` `engine_cli.rs`
+`tensorfold_066_is_verified_and_064_and_067_are_custom` (T07),
+`capyctl-config` `engine_env.rs` `owned_names_are_never_settable` (T21;
+failed before the owned-name change, passes after),
+`capyctl-router` unit `tensorfold_cuda_statistics_map_prefill_only` and
+integration `tensorfold_cuda_reports_prefill_only`, streamed and not (T40
+T41; both failed before the mapping change, pass after). The old unit fixture
+labelled `"engine": "cuda"` carried the MLX shape and is now labelled `mlx`.
+CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-14 (one GB10, `scripts/live/engine-quick-check.sh
+--engine tensorfold --new 0.6.6 --old 0.6.5 --host a`, standalone from
+origin/main `a230cf9a`; a new `~/tensorfold-0.6.6-venv` at `cb2ebf05` with the
+same pins as 0.6.5: Python 3.12.14, torch 2.13.0+cu130, triton 3.7.1, CUDA
+13.0). Qwen3.8-27B NVFP4 with the DFlash2 drafter, `--parallel 8`, greedy.
+Every lifecycle step passed: `engine add`, cold start 101.5 s (0.6.5: 139.2 s),
+warm 13.9 s, a reasoning stream (14 reasoning chunks, content, `stop`, usage,
+first token 0.142 s), stop and a 409 after it, `--evict` and wake on request
+(15.6 s), the variant without drafts, engine `/health` and `/metrics` (no key).
+Benchmark against 0.6.5 (medians, two interleaved passes): aggregate tok/s C1
+42.5 / 42.4, C4 122.1 / 120.3, C8 195.0 / 194.2; decode and prefill at 2k, 32k
+and 128k within 1%; TTFT at 128k 87.7 / 87.1 s; peak memory equal. C4's TTFT
+p50 read 0.269 / 0.187 s with p95 equal: both versions show the same discrete
+tiers by queue position (about 0.10, 0.14, 0.21, 0.33 and 0.38 s), and 0.6.5's
+own two passes differ the same way. `token_sha` matched on 30 of 30 keys,
+between versions and within each. Host B's `~/tensorfold-0.6.6-venv` is a
+byte-identical copy of host A's (file digest compared). That run used the
+binary from before the CUDA `prefill_s` mapping; the mapping is checked on the
+live release checks.
+
+## vLLM 0.31.0 launches under a version-skew-aware reservation — 2026-10-10 (branch `feat/vllm-0.31.0-support`)
+
+Owner decision from the 2026-10-10 engine qualification (RTX 4090 laptop,
+vLLM 0.31.0 wheel, Python 3.12.13, torch 2.13.0+cu130; evidence under
+`~/projects/crossfunctionalai/engine-qual-2026-10-10/`, `ROWS.txt` indexes
+`raw/`): CapyCTL launches vLLM 0.31.0, without changing one rendered byte of a
+0.30.0 launch.
+
+**The reservation follows the parser (ADR 0014 §3, ADR 0017 §2).** vLLM 0.31.0
+moved logging into the nested `--logging-config` dotted config
+(`vllm/config/logging.py`, `LoggingConfig`: `log_level`, `configure_logging`,
+`pylogging_config_file`; `--log-level` and legacy `--log-config-file` override
+their matching fields, the deprecated alias leaves in 0.33.0). The serve parser
+defines the whole surface on one destination, `logging_config` — the
+`--logging-config` JSON and every `--logging-config.<field>` resolve to it —
+beside legacy flat `--log-level` and `--log-config-file` overrides, each an
+argparse `SUPPRESS` destination: absent from a parsed namespace until a token
+sets it (`raw/vllm-0310-apiserver-help.txt`). The entry's `RESERVED` list named
+the flat 0.29.0/0.30.0 spellings, so `log_config_file` — a name no longer
+present in a 0.31.0 namespace — failed every launch closed:
+`vllm_startup_failed: effective_args_mismatch` (`status/start-frognano.txt`,
+`status/inspect-frognano-failed.json`).
+
+The rule now: the entry reads the destinations the installed parser's own
+argparse tree defines (`engine_capabilities.parser_destinations`, the same
+probe the capability report uses) and reserves what the build spells. Flat
+`RESERVED` names stay unconditional — a build that defines none of them is
+drift, never a silent un-reservation (ADR 0014 open issue 4: drift fails
+closed); `RESERVED_IF_PRESENT` (rendezvous, scale-out) stays as it was;
+`RESERVED_IF_DEFINED` adds the 0.31.0 logging surface (`logging_config`,
+`log_level`), reserved wherever the build defines it, nothing reserved on a
+build without it. An `SUPPRESS` destination absent from both parses is
+agreement; absent from either one alone, or any value difference, is closed
+drift. A 0.30.0 launch renders and compares byte-identically: every flat name
+is defined with ordinary defaults, and `logging_config`/`log_level` are
+reserved on 0.31.0 alone. Deploy-time policy (`engine_policy.rs`) reserves
+`--logging-config` and `--log-level` beside `--log-config-file` (checked twice,
+ADR 0014 §3), so a user cannot double-set the logging configuration on any
+build, in any spelling: the JSON object, any dotted field, `=value`,
+underscores, or an abbreviation.
+
+**Cached tokens stay a usage figure (SPEC §17, the metrics contract of #101).**
+vLLM 0.31.0's `usage.prompt_tokens_details` is `null` without
+`--enable-prompt-tokens-details` (`raw/vllm-manual/chat-repeat-cached.json`,
+`raw/vllm-qwen3/cached-tokens-repeat.json`: 418-token repeat prompt, 416/416
+prefix-cache hits, `prompt_tokens_details` null), and the per-request `metrics`
+object — which gained `speculative_decoding` and `tokens_per_second` — never
+carries them (`raw/vllm-manual/chat-stream.sse`, usage chunk). The figure maps
+from `usage.prompt_tokens_details.cached_tokens` on both the 0.30.0 and 0.31.0
+response shapes — a response-shape-driven rule like the existing per-engine
+mapping, since the router cannot know the engine version at request time — and
+stays absent, never zero, when the engine reported none
+(`crates/capyctl-router/src/engine_metrics.rs`).
+
+Live recheck (laptop, RTX 4090, same `~/vllm-0.31.0-venv`, local machine only;
+evidence `~/projects/crossfunctionalai/engine-qual-2026-10-10/recheck/`):
+every row PASS through the release build of this branch, driven with
+`--config` on the client as well (an earlier attempt without it resolved the
+machine's own implicit registry — `vllm` 0.29.0 — and refused with
+`profile_exists`; nothing was written there). `engine add`: vLLM 0.31.0
+registered, custom, deep park enabled, published. `deploy model` +
+`start --wait`: Ready 1/1 (initialize succeeded) — the exact launch the flat
+reservation refused before. Chat via the relay (the deployment passes
+`--enable-prompt-tokens-details` as an extra): non-streaming and streamed
+answers both carry `cached_tokens` `{"source": "engine", "value": 0}` — the
+engine measured zero, because FrogNano-4B-2609 is a hybrid (Mamba) model
+whose prefix cache does not hit on these prompts (`vllm:prefix_cache_hits_total
+0.0` in the engine's own scrape, matching the manual qualification; the dense
+Qwen3-4B row in `raw/vllm-qwen3/` hit 416/418); the figure maps from
+`usage.prompt_tokens_details.cached_tokens` on the 0.31.0 shape and would stay
+absent had the engine reported nothing. Deep-park cycle: park released
+9.5 GiB to 727 MiB, one request woke it in 7.5 s with the figures present,
+memory returned. `stop`: engines stopped, GPU back at the 111 MiB baseline.
+Unlike the CPU and Fake-engine tests, this recheck ran the real engine.
+
+Tests (T14, T21, T40, T41): the entry suite gained a `VersionSkewTests` class
+with a fixture parser per shape — the 0.29.0/0.30.0 flat parser unchanged, and
+a 0.31.0 parser whose logging actions are `SUPPRESS`-destined dotted
+destinations (`fake_parser_0310`) — checking the rendered block launches on
+the 0.31.0 shape, the whole 0.31.0 logging surface stays reserved however
+spelled, a rendered logging configuration is kept exactly and re-set is
+refused on either shape, and a build without a flat reserved name fails closed
+(`runtime/tests/test_vllm_entry.py`). Router unit
+(`vllm_0310_maps_cached_tokens_from_usage_or_leaves_it_absent`) and integration
+(`vllm_0310_maps_cached_tokens_from_usage`, streamed and not, relayed byte for
+byte) tests read the raw 0.31.0 response and usage-chunk shapes and hold the
+absent-not-zero rule; the 0.30.0 tests are untouched. The adapters' logging
+test refuses every 0.31.0 spelling in host-fixed and deployment arguments
+(`crates/capyctl-adapters/tests/vllm_args.rs`), and the reserved-parity test
+(`crates/capyctl-config/tests/reserved_parity.rs`) folds `RESERVED_IF_DEFINED`
+into the one-table check on both sides of the launch. CPU and Fake-engine
+tests are not qualification.
+
+## llama.cpp guide and first live rows on a discrete GPU (plan slice L6) — 2026-10-09 (branch `feat/llamacpp-l6-docs-live`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md), plan slice L6
+(`docs/plans/2026-10-09-llamacpp-engine.md`). The user guide gains llama.cpp, and
+the first live rows ran on a maintainer's laptop (one 16 GiB discrete NVIDIA GPU,
+CUDA 13.4 toolkit already installed, nothing installed system-wide) in a standalone
+role with its own state directory and ports. No lab host was used.
+
+## Docs
+
+`docs/guide/engines.md` (a llama.cpp section: registration, the typed fields, the
+derived memory, restart-only, what is refused and why), `docs/guide/install-engines.md`
+(building `llama-server` from the tag with `-DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF`),
+`docs/guide/engine-flags.md` (the llama.cpp v0.6.0 table, now checked by
+`engine_flag_table.rs`, which reads llama.cpp's typed refusal `ReservedField` as
+typed), `docs/guide/errors.md` (`engine_config_file`, `effective_args_mismatch`,
+llama.cpp in `engine_not_found`, `engine_unsupported`, `capability_missing`),
+`docs/guide/requests.md` (`cache_salt`), `docs/operations/install.md` (registering a
+`llama-server` binary), `docs/operations/configuration.md` (`local_engine.llamacpp`,
+`engine_config.llamacpp`), `docs/examples/deployment-llamacpp.yaml` (validated by
+`every_documented_example_passes_validate_config`), the engine lists of the guide
+pages, the site's platform list and `capyctl --help`.
+
+## Live rows (laptop, standalone)
+
+Binary: a source build of tag `v0.6.0` (commit `d81235049`) with
+`-DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF -DCMAKE_CUDA_ARCHITECTURES=89`;
+`llama-server --version` prints `version: 0.6.0 (build 1, commit d81235049)` on
+standard error. Model: `Qwen/Qwen3-4B-GGUF` revision
+`bc640142c66e1fdd12af0bd68f40445458f3869b`, `Qwen3-4B-Q4_K_M.gguf` (2 497 280 256
+bytes, sha256 `7485fe6f…fdf5`), deployed with `context_length: 8192` and the default
+4 slots, no `resources`.
+
+| Check | Derived or expected | Measured |
+|---|---|---|
+| LC1 `engine add` | llama.cpp 0.6.0, fingerprint `<v>+<commit>` | `Registered llamacpp (llamacpp 0.6.0)`, `0.6.0+d81235049`, custom `yes`, deep park disabled; the version check took 0.89 s (CUDA initialisation included) |
+| Start to Ready, first deploy | within the Initialize window | 7.3 s for `deploy --activate --wait`, the 2.5 GB checkpoint digest included; llama-server listening 1.37 s after its start |
+| Start to Ready, `start` after `stop` | a fresh launch | 2.2 s, generation 2 |
+| Rendered command | ADR 0029 §5 | `--ctx-size 32768 --parallel 4 --no-kv-unified --gpu-layers all --cache-type-k f16 --cache-type-v f16 --fit off --cache-ram 0 --no-context-shift --metrics --slots --offline --no-webui --cors-origins localhost --no-cors-credentials`; readiness found `n_slots = 4, n_ctx_slot = 8192` |
+| KV cache | 4 × 8192 × 36 × 8 × (128 × 2 + 128 × 2) = 4 831 838 208 B = 4608.00 MiB | `llama_kv_cache: CUDA0 KV buffer size = 4608.00 MiB` (equal) |
+| GPU memory | derived 8 921 023 708 B (8507 MiB) | 7342 MiB for the process at its peak and while serving (model 2375.91, KV 4608.00, compute 85.01, about 273 CUDA context); 1165 MiB (16 %) under the request |
+| Host memory | derived `ram` 4 GiB (provenance `default`) | resident set 877 MiB |
+| Stop (SIGTERM) | exit and full release | `stop` returned in 0.15 s, the process exited 0.51 s after the command, GPU back to its 113 MiB baseline |
+| Park | refused, restart-only | `capyctl park deployment` exit 5, `unsupported_capability` |
+| Chat, non-streaming | answer with `timings` and figures | `content` and `reasoning_content`; after the fix below, `timings` relayed and `capyctl.metrics` `prefill_ms`, `decode_tokens_per_second` (engine), `cached_tokens`, `ttft_ms` |
+| Chat, streaming | deltas within `STREAM_DELTA_FIELDS` | deltas `role`, `content`; `timings` on the last chunk; with `stream_options.include_usage` that chunk also has `usage`; the `x-capyctl-metrics` comment carries the engine's `prefill_ms` and decode rate either way |
+| Tool call and reasoning | relayed | `tool_calls` (`get_weather`, `{"city": "Lisbon"}`, `finish_reason: tool_calls`) and `reasoning_content`, non-streaming and streaming (deltas `role`, `content`, `reasoning_content`, `tool_calls`) |
+| Load during 3 streams | running 3, KV usage from `/slots` | `/metrics` `requests_processing 3`; `/slots` 5081 bytes; after the fix below the management load read shows `running 3, waiting 0, kv_usage_ppm 35950`, fresh |
+| Client hang-up mid-decode | `requests_processing` 0 promptly | 0 at the first read after the cut (under 0.1 s) |
+| Client hang-up mid-prefill (6.6k-token prompt) | 0 promptly | 0 within 0.5–0.8 s |
+
+The design note's live-check list, item by item: 1, start time — above (laptop
+only). 2, peak and steady memory against the request — above: the process holds what
+it allocates at start, so peak equals steady; the derived request is 16 % above it
+and the `ram` default is about 4.7 times the resident set. The margin and the `ram`
+figure are not recomputed from one small model; that waits for a larger model and
+the GB10 row. 3, the KV formula — equal to llama.cpp's own line. 4, SIGTERM — above.
+5, stream shapes — above. 6, hang-up — above, mid-prefill included. 7, `/slots` KV
+usage under load — above. 8, the MTP context's cache with `draft-mtp` and a quantized
+V cache with flash attention `auto` — not checked (Qwen3-4B has no MTP heads). 9, a
+prebuilt `b11429` binary's version line — not checked (source build). 10, whether the
+version check needs CUDA initialisation time — 0.89 s on this CUDA build, inside the
+bound.
+
+## Defects found live and fixed
+
+- **A non-streaming answer lost llama.cpp's `timings`.** CapyCTL collects a
+  non-streaming request from the engine's stream; `assemble`
+  (`capyctl-adapters/src/forward.rs`) kept `tensorfold` and `metrics` from the final
+  chunk but not `timings`, so the answer had no `timings` and `capyctl.metrics` had
+  no `prefill_ms` and the router's decode rate. `timings` is now kept. Test:
+  `a_collected_response_keeps_the_llamacpp_timings` (failed before).
+- **Standalone reported no load for llama.cpp.** The embedded load sampler
+  (`capyctl-controller/src/embedded_load.rs`) left out a launch with no recorded
+  inference key, and an embedded llama.cpp launch has none (ADR 0029 §4), so the
+  load read stayed `sample: null`. `LoadTarget.native` is now optional and a keyless
+  target is scraped without an `Authorization` header (`capyctl-agent/src/load.rs`);
+  a host's ingress targets still always carry their key. Test:
+  `a_target_without_a_key_is_scraped_unkeyed` (`crates/capyctl-agent/tests/load.rs`).
+
+## Still open
+
+- `VERIFIED` does not gain `(llamacpp, "0.6.0")`: the plan's acceptance is LC1–LC6
+  and two parts did not run on the laptop. LC4 (a llama.cpp and a vLLM deployment
+  switching under memory pressure) needs a vLLM environment on the same machine,
+  and the laptop has none. LC6's `--spec-type draft-mtp` needs a GGUF model with MTP
+  heads. Every llama.cpp build still lists as `custom`.
+- The GB10 row (after the owner approves a lab-host build and it is added to
+  AGENTS.md's list): start time, peak and steady memory on unified memory, whether the
+  default mmap load keeps a page-cache copy beside the device copy, and the prebuilt
+  `b11429` arm64 archive's version line.
+- The margin and the `ram` figure in `context_fit/llamacpp.rs`, recomputed from the
+  GB10 row and a larger model; the live row scripts `scripts/live/matrix/rows/LC1.sh`
+  to `LC6.sh` for the lab harness.
+- `capyctl park deployment` on llama.cpp says only `unsupported_capability:
+  Requested capability is unavailable`; the guide explains why, the message does not.
+
+CPU and Fake-engine tests are not qualification. The laptop rows above are live
+evidence for one discrete GPU and one small model only.
+
+## llama.cpp per-request figures and load reports (plan slice L5) — 2026-10-09 (branch `feat/llamacpp-l5-metrics`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md) §11, plan slice L5
+(`docs/plans/2026-10-09-llamacpp-engine.md`). The shapes were read from the v0.6.0
+tag (`tools/server/server-task.cpp`, `server-common.cpp`, `server-chat.cpp`,
+`server-context.cpp`); nothing ran against a llama-server.
+
+- **Per-request figures** (`capyctl-router/src/engine_metrics.rs`). `prefill_ms` from
+  `timings.prompt_ms`, `decode_tokens_per_second` from `timings.predicted_per_second`
+  (positive only), `cached_tokens` from `usage.prompt_tokens_details.cached_tokens`;
+  `ttft_ms` is the router's and `queue_ms` is absent. The router's decode rate counts
+  `usage.completion_tokens`, else `timings.predicted_n`. A stream chunk is parsed when
+  it carries `timings` (the usage chunk, else the finish chunk); `timings` is relayed
+  unchanged.
+- **Streamed fields.** llama.cpp's deltas (`role`, `content`, `reasoning_content`,
+  `tool_calls`) are already on the relay's list; the table in
+  `docs/guide/requests.md` gains its column.
+- **Load reports** (`capyctl-agent/src/load.rs`). Running is
+  `llamacpp:requests_processing`, waiting `llamacpp:requests_deferred`; the KV usage is
+  the tokens of processing slots over the sum of the slots' `n_ctx`, from one keyed,
+  bounded `/slots` read per tick. A failed or malformed `/slots` read leaves the engine
+  load out. No latency series is forwarded and the sample names no engine family.
+
+Tests (T40, T42, CPU only): `capyctl-router` `engine_metrics` unit tests (answer,
+stream with the usage chunk and with the finish chunk only, zero rate absent, the
+`predicted_n` fallback), `crates/capyctl-agent/tests/load.rs` (the v0.6.0 `/metrics`
+body, the `/slots` ratio, a refused and a malformed `/slots`). Fake-engine tests are not
+qualification.
+
+Live checks still open: a captured v0.6.0 answer, stream and `/metrics` body; the
+`/slots` body size with long prompts (it carries prompt and generated text, against the
+4 MiB scrape bound) and its read time under load.
+
+## llama.cpp GGUF header and sizing (plan slice L4) — 2026-10-09 (branch `feat/llamacpp-l4-sizing`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md) §5, §9, plan slice L4
+(`docs/plans/2026-10-09-llamacpp-engine.md`). A llama.cpp deployment no longer has to
+state `resources`: CapyCTL reads the GGUF header of the model it renders and derives
+the memory request. The format, the keys and the KV layout were read from the v0.6.0
+tag (`ggml/src/gguf.cpp`, `src/llama-model.cpp`, `src/llama-hparams.cpp`,
+`src/llama-kv-cache.cpp`, `src/llama-context.cpp`, `src/llama-arch.cpp`,
+`src/models/*.cpp`, commit `d812350`); nothing ran on a GPU.
+
+- **Header reader** (`capyctl-config/src/gguf.rs`). Magic `GGUF`, version 2 or 3,
+  then the metadata key/value pairs; never tensor data. Bounded: 64 MiB of metadata,
+  1 048 576 keys, strings up to 1 MiB, arrays up to 1 048 576 entries; a truncated
+  file, a duplicate key, an array of arrays or an unknown type is refused. Only
+  numbers, booleans, `general.architecture` and short integer arrays are kept;
+  every key's name is kept.
+- **KV formula** (`capyctl-config/src/context_fit/llamacpp.rs`).
+  `slots × pad256(context_length) × Σ_layers head_count_kv × (key_length × bytes(K) +
+  value_length × bytes(V))`; `head_count_kv` a number or one per layer (default the
+  heads), `key_length`/`value_length` else `embedding_length / head_count`; the MTP
+  layers (`nextn_predict_layers`) are not the main context's; the cache types' block
+  sizes (`q8_0` 34 bytes per 32 values, `q4_0`/`iq4_nl` 18, `q4_1` 20, `q5_0` 22,
+  `q5_1` 24). Without `--flash-attn on` the V cache is counted padded to its widest
+  layer, as llama.cpp lays it out then.
+- **Derived request.** Weights (the rendered GGUF and all its shards, the projector,
+  the draft model and all its shards, ADR 0014 A6) + KV + the family margin
+  (unified: ADR 0014 A18; discrete GPU: weights × 1.10 + KV, ADR 0019 §3). The
+  startup peak is the request: cold, Ready, parking and wake charge it, parked
+  nothing. The margin stays the placeholder until the live rows measure it.
+- **Draft model.** A `--model-draft` in the host-fixed or the extra arguments counts
+  with every shard llama.cpp loads (a split set named by its first shard), each inside
+  `security.approved_paths` once symlinks resolve. A draft that cannot be counted
+  (outside the approved paths, a shard missing, a set named by a later shard) is
+  refused at resolution, declared budget or not, instead of being left out of it; so
+  is a checkpoint with no model to pick.
+- **Declared budgets.** llama-server allocates the whole cache its context and slots
+  fix (`--fit off`), so where the header makes it calculable (full attention, no
+  cache layers off the GPU via `n_gpu_layers` or `--no-kv-offload`) a declared
+  `memory.kv_cache`, `memory.request` or `resources` that leaves less for the KV cache
+  than that figure is refused naming the field. A draft context only adds to it, so
+  the bound stands beside a draft model. Other layouts keep the declared estimate.
+- **Refusals.** Derivation is refused, naming `engine_config.memory.kv_cache` or
+  `resources`, for a sliding-window header (a key, or an architecture whose model code
+  has such layers, `llama4` without a window of 0 included), recurrent (`ssm.*`,
+  `wkv.*`), hybrid (`full_attention_interval`, `shortconv.*`, llama.cpp's hybrid
+  architectures), MLA (`attention.kv_lora_rank`), other layouts (indexer caches,
+  embedding, diffusion and encoder models, a projector), an unreadable header or no
+  single model to pick; for `n_gpu_layers` other than `all`, `--override-tensor`,
+  `--cpu-moe`, `--n-cpu-moe`, `--n-cpu-ffn`, `--no-kv-offload`, an `mlock` load mode;
+  and for a draft context: any `--spec-type draft-*` and a `--model-draft` (judgement
+  call: llama.cpp gives the draft model its own context with as many cells as the
+  target's, which the ADR does not size; a declared `memory.kv_cache` still derives
+  the request with the draft model's weights). A `context_length` above the GGUF's
+  `<arch>.context_length` is refused, declared resources or not.
+- **Facts.** The host measures them beside the digest (`GgufFacts`: loaded bytes,
+  training context, the cache shape or why not); they travel as
+  `CheckpointDigestEvidence.gguf` and `SingleLaunchPlan.checkpoint_gguf` (capability
+  `checkpoint_gguf`, refused before sending to a host without it), are recorded in the
+  revision's `memory.gguf` beside the whole checkpoint's weights (which a plan still
+  names and a host verifies), and re-measured before a launch: a remote host and the
+  embedded (standalone) host alike refuse a launch whose re-measured weights or GGUF
+  facts differ from the revision's (`checkpoint_mismatch`), so a draft model grown
+  after the revision was recorded, outside the checkpoint's digest, never launches
+  against the old reservation. A llama.cpp revision is provisional until a host
+  measured its checkpoint (`CheckpointFacts::provisional()` carries a pending header),
+  declared resources included, so the training-context check always applies.
+
+Tests (T42, T26, CPU only): `crates/capyctl-config/tests/llamacpp_sizing.rs`
+(reader and bounds, the formula and the plan's 48-layer figure, per-layer
+`head_count_kv`, refusals, measured weights with split and refused drafts, a
+host-fixed draft, declared budgets against the calculable cache, derived phases on
+unified and discrete memory, snapshot re-derivation, training context),
+`crates/capyctl-controller/src/checkpoint_digests/tests.rs` (T34 T22: a grown draft
+refuses an embedded Initialize), `crates/capyctl-protocol/tests/
+checkpoint_digest.rs` (wire round trip and capability), `capyctl-domain` unit tests.
+CPU and Fake-engine tests are not qualification; only LC1–LC6 qualify llama.cpp.
+
+Live checks still open: the KV figure against llama.cpp's startup log line, the
+margin and the startup peak against measured memory, the draft and MTP contexts'
+caches.
+
+## llama.cpp adapter, readiness and restart-only lifecycle (plan slice L3) — 2026-10-09 (branch `feat/llamacpp-l3-adapter`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md) §4, §6, §7, §10, §11, plan slice
+L3 (`docs/plans/2026-10-09-llamacpp-engine.md`). A llama.cpp deployment now
+launches, becomes ready, serves chat and stops, on a host agent and in standalone
+alike. The launch refusals slices L1 and L2 left in place are gone: the host
+agent's launch authorization (`resolve_as`), `prepare`, the launching and probe
+adapters, and the embedded coordinator's `ProfileBindings::spec`. Shapes were read
+from the v0.6.0 tag (`tools/server/server-context.cpp`, `server-http.cpp`,
+`server-task.cpp`, `common/arg.cpp`, commit `d812350`).
+
+- **Adapter** (`capyctl-adapters::llamacpp::{adapter,http,initialize}`,
+  `AdapterSpec::Llamacpp`). No key: llama-server listens on loopback and is
+  reached only through CapyCTL's routed path. Initialize refuses a machine-wide
+  `config.ini`, renders through the shared builder, spawns through the director's
+  tool, then waits (watching the process) for `/health` 200 (every route answers
+  503 `Loading model` until the model is loaded) and for `/v1/models` to list the
+  served name. SPEC §8.2's check after the engine's parser: `/props` must report
+  `total_slots` equal to the rendered `--parallel` and `endpoint_metrics` and
+  `endpoint_slots` true, and `/v1/models` `meta.n_ctx` must equal the rendered
+  slot window `pad256(context_length)`, capped at `meta.n_ctx_train` as
+  llama-server caps it; any difference fails the launch `effective_args_mismatch`
+  before the probe, and the coordinator stops it on its recorded processes. Then
+  the bounded chat probe (non-empty `content` or `reasoning_content`). The bound is
+  the Initialize window (ADR 0014 A1 and A7). Reads are bounded (5 s, 4 MiB: `/props`
+  carries the chat templates). The completion probe uses `POST /v1/completions`;
+  llama-server answers its text, without token ids.
+- **Restart-only.** Park, Restore and ReloadWeights are unsupported; the Park arms
+  of the host agent and the coordinator refuse the kind as before (`residency_tier`
+  on a host); a group member never resolves to llama.cpp. A wake is a fresh launch
+  of the same frozen contract.
+- **Idle gate and quiescence** (ADR 0029 §10, ADR 0023 §6). `idle_before_signal`,
+  `engine_quiescent`, `prepare_park` and `observe_work` read `/metrics`:
+  `llamacpp:requests_processing` and `llamacpp:requests_deferred` both 0 is idle;
+  either one above 0 is busy; nothing listening or 503 is signalled at once; an
+  answer without both gauges, an error status or no answer is signalled when the
+  bound ends (30 s or the command's remaining time); busy at the bound withholds
+  the signal and the cleanup stays uncertain. The wait is the shared
+  `tensorfold::wait_idle`, which the embedded coordinator already ran for every
+  engine. On the host agent the Terminate gate (`native_execution/idle_gate.rs`,
+  moved out of `tensorfold.rs` unchanged for TensorFold) now builds a llama.cpp
+  adapter for a llama.cpp launch.
+- **Requests.** `cache_salt` is refused `cache_salt_unsupported` before anything is
+  sent. SSE `:` comments (llama-server's `--sse-ping-interval` pings) were already
+  not progress and are not relayed; a test now pins it for llama.cpp. A served name
+  llama-server would split or trim (`--alias` takes a comma list) is refused at
+  render, since readiness could never find it listed.
+- **Hidden configuration at launch** (ADR 0029 §6). A llama.cpp launch on a host
+  where `/etc/llama.cpp/config.ini` exists is refused before any effect with the
+  new closed policy refusal `engine_config_file`: in the host agent's admission
+  (provisioning, pre-admission and the locked recheck alike, so no key is stored,
+  nothing is journaled and the reservation is released on that evidence), and in
+  the adapter's Initialize before the spawn (the embedded path, where a `Refused`
+  Initialize settles as the installation gate's does). The root is `/`; tests name
+  their own (`with_llamacpp_system_root`, `LlamacppAdapter::with_system_root`).
+  `engine_config_file` and `effective_args_mismatch` have status hints.
+- **Launch-failure summary.** llama-server's `error: invalid argument: --name` is
+  read like the other parsers' refusals, so an engine that exits on a bad argument
+  is reported `engine_argument_rejected` naming the option, never its value.
+- **Development controls.** llama.cpp launches are marked with their
+  unauthenticated loopback surface (`/v1`, `/health`, `/metrics`, `/props`,
+  `/slots`, `/lora-adapters`, access `inference`), as TensorFold's are.
+- **Still refused or not here:** park and group paths (restart-only, multi-rank out
+  of scope, ADR 0029); deriving the request from the GGUF header and the
+  training-context refusal (slice L4); per-request figures and load reports
+  (slice L5); the errors guide, engine guide and live rows (slice L6).
+
+Tests (T42 with T14, T16, T17, T21, T29, T37, T41): `capyctl-adapters/tests/
+llamacpp_adapter.rs` against an axum engine with llama-server 0.6.0's shapes
+(readiness through 503 and an unlisted model; `effective_args_mismatch` for
+`total_slots`, `n_ctx` below and above the window, and `endpoint_metrics`; the
+window capped at the training context; a reasoning-only probe; an exit reporting
+the rejected argument; `config.ini` refusing before any spawn; the gauges; the
+wait at the bound; no park path; `cache_salt`; SSE pings; a hang-up quiescent only
+once the gauges read 0), `llamacpp_args.rs` (the served-name refusal),
+`launch_failure` and `llamacpp::http` unit tests, `resolve` tests, the agent's
+native-execution tests (prepare from local policy, Park refused `residency_tier`,
+`engine_config_file` as a terminal refusal with no key and no journal entry, the
+Terminate gate on `/metrics`), the controller's `engine_bindings` test (the embedded
+spec, no key, the same command on every start, no cache root no launch) and the
+embedded stop test `only_an_engine_answering_busy_is_not_signalled`, now run for
+llama.cpp's `/metrics` too. A CPU build of the v0.6.0 tag served a 0.5B Qwen2.5
+GGUF with the rendered command: `/health`, `/v1/models` (`n_ctx` 512 for
+`context_length` 500, `n_ctx_train` 32768), `/props` (`total_slots` 4, both
+endpoints on), `/metrics` (processing 1 during a stream, 0 within half a second of
+the client hanging up), the completion probe's text and SIGTERM (exit in 0.1 s)
+matched what the adapter reads. CPU and Fake-engine tests are not qualification;
+only the live rows LC1–LC6 (slice L6) qualify llama.cpp. Still needing a live
+check on a GPU: start time to readiness, the SIGTERM exit and memory release, and
+the hang-up behaviour mid-prefill.
+
+## llama.cpp option policy, resolution and rendering (plan slice L2) — 2026-10-09 (branch `feat/llamacpp-l2-args`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md) §5, §6, §8, §9, plan slice L2
+(`docs/plans/2026-10-09-llamacpp-engine.md`). The fail-closed option arms of slice L1
+are replaced by llama.cpp's own policy, a llama.cpp deployment resolves, and the
+`llama-server` command and its closed environment are rendered. Flag names were read
+from the v0.6.0 tag (`common/arg.cpp`, commit `d812350`) and the rendered command was
+checked against the parser of a CPU build of the tag; nothing ran on a GPU.
+
+- **Option policy** (`engine_policy.rs`, tables in `llamacpp.rs`). llama-server
+  takes exact names only, so names are compared exactly after `_` → `-`, against
+  every long alias and negative form of each option; the other engines' prefix rule
+  is not applied (`--cache-reuse` beside the reserved `--cache-ram` is ordinary).
+  `--name=value` is refused, saying llama.cpp refuses it. Reserved options are
+  ADR 0029 §6's two lists; a reserved option a typed field renders names that field
+  (`--ctx-size` → `context_length`, `--parallel` → `max_concurrent_requests`,
+  `--cache-type-k`/`-v` → `kv_cache_dtype`, `--gpu-layers` →
+  `llamacpp.n_gpu_layers`, `--model` → `llamacpp.gguf_file`, `--mmproj` →
+  `llamacpp.mmproj_file`). The sensitive options need approval by name (any
+  spelling approves the option); each path a path option names, as llama-server
+  splits it (`--lora` and `--control-vector` lists, `<path>:<scale>` lists), lies
+  inside `security.approved_paths` lexically at deploy time and through symlinks in
+  the launch builder; a quoted list is refused. The name shapes of ADR 0014 open
+  issue 5 still apply, except to `--no-host`. Two spellings of one option are a
+  duplicate. Host-fixed arguments follow the same exact-name policy.
+- **Hidden inputs.** A llama.cpp profile or deployment `env` naming a variable
+  llama-server reads in place of a reserved option, its listener, its device or its
+  directories is refused `engine_env_reserved:<name>`, whatever `approved_env` says,
+  and the launch environment drops it again: `LLAMA_ARG_*`, `LLAMA_SERVER_*` (router
+  mode, slot debugging), `AIP_*` (`AIP_MODE=PREDICTION` with `AIP_HTTP_PORT`
+  replaces the port), `LLAMA_API_KEY`, `MTMD_BACKEND_DEVICE` (`--mmproj-device`),
+  `HF_TOKEN` (`--hf-token`), the ggml device variables (`GGML_CUDA_DEVICES`,
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY`, `GGML_VK_VISIBLE_DEVICES`,
+  `GGML_VK_PREFER_HOST_MEMORY`, `GGML_VK_ALLOW_SYSMEM_FALLBACK`,
+  `GGML_METAL_DEVICES`, `GGML_OPENCL_PLATFORM`, `GGML_OPENCL_DEVICE`,
+  `GGML_HEXAGON_DEVICES`, `ONEAPI_DEVICE_SELECTOR`, `GGML_BACKEND_PATH`),
+  `LLAMA_CACHE`, `XDG_CONFIG_HOME` and `HOME`. The list comes from every `getenv` of
+  the v0.6.0 tag; other ggml tuning variables stay available through `approved_env`.
+  The host's engine cache creates `<state>/engines/llamacpp/{config,cache}` private
+  (0700) and refuses a configuration directory that is not empty.
+- **Resolution.** `engine_config.llamacpp` (`n_gpu_layers`, a count or `all`,
+  default `all`; `gguf_file`; `mmproj_file`, both relative `.gguf` paths inside the
+  checkpoint). `context_length` is required; the slots are
+  `max_concurrent_requests`, else 4, and `pad256(context_length) × slots` must fit
+  llama-server's `int`; `kv_cache_dtype` is one of llama.cpp's nine cache types,
+  default `f16`; `dtype`, `quantization`, `cuda_graphs`, `trust_remote_code: true`
+  and `language_model_only: true` are refused naming the path; `deep` and
+  `host_backed` are `capability_missing` and an undeclared residency is
+  `restart_only`; `model.draft` is refused (`--model-draft` is the way). Until the
+  request is derived from the GGUF header (slice L4), `resources` are required,
+  offline too, and the KV cache is bounded by the declared Ready allocation less
+  the measured weights. Defaults are recorded as `capyctl default`, so a snapshot
+  re-resolves to itself. Status and `validate config` show the slots under
+  `context.streams` with source `declared` or `default`, and they are the load
+  read's running limit.
+- **GGUF pick** (`checkpoint_layout.rs`, read where the checkpoint is): the one
+  `.gguf` that is not a projector, or the first shard of the one complete split
+  set, or the file `gguf_file` names (a later shard or a projector is refused);
+  several candidates without `gguf_file` are refused naming each.
+- **Rendering** (`capyctl-adapters::llamacpp`): `--host 127.0.0.1 --port <p>
+  --model <gguf> --alias <served> --ctx-size <pad256(ctx) × slots> --parallel
+  <slots> --no-kv-unified --gpu-layers <n|all> --cache-type-k <t> --cache-type-v
+  <t> --fit off --cache-ram 0 --no-context-shift --metrics --slots --offline
+  --no-webui --cors-origins localhost --no-cors-credentials [--mmproj <file>]`,
+  then the host-fixed and the deployment's arguments. The pass-through arguments are
+  checked again at render, and the final vector is rechecked: each rendered option
+  exactly once, `--mmproj` at most once, no other reserved option, no `=` spelling.
+  The environment is closed: `PATH`, the GPU pin, `XDG_CONFIG_HOME`, `LLAMA_CACHE`,
+  the engine log and the resolved engine environment less the refused names; no
+  `HOME`.
+- **Still refused until the later slices land**: the launch (the host agent's launch
+  authorization and the embedded coordinator's Initialize refuse the kind, and the
+  launch builder, adapter, readiness, idle gate and the launch-time
+  `/etc/llama.cpp/config.ini` check are slice L3); deriving the request from the
+  GGUF header and the training-context refusal (slice L4, so `resources` stay
+  required); per-request figures and load reports (slice L5); park and group paths
+  refuse the kind as before.
+
+Tests (T42 with T14, T37): `capyctl-config/tests/llamacpp.rs` (every reserved
+spelling and `_` spelling in extra and host-fixed arguments, the fields named, the
+`=` spelling, ordinary options, duplicates across spellings, approvals and paths,
+options refused even when approved, the tables against llama-server 0.6.0's option
+list in `tests/fixtures/llama-server-0.6.0-options.txt`, resolution, slots and their
+source, the environment refusals, `gguf_file`/`mmproj_file`, the GGUF pick),
+`capyctl-adapters/tests/llamacpp_args.rs` (`--ctx-size 60416 --parallel 4` for 15000
+tokens and 4 slots, the reserved block complete and in order, refusals at render,
+the recheck, the closed environment, the builder's GGUF and projector, a draft model
+outside the approved paths through a symlink) and the `engine_cache` unit test (the
+private directories). The engine flag table of `docs/guide/engine-flags.md` and its
+test rows land with the guide in slice L6. CPU and Fake-engine tests only; they are
+not qualification. Only the live rows LC1–LC6 (slice L6) qualify llama.cpp.
+
+## llama.cpp registration (plan slice L1) — 2026-10-09 (branch `feat/llamacpp-l1-registration`)
+
+[ADR 0029](../design/adr/0029-llamacpp-engine.md) §1–§2, plan slice L1
+(`docs/plans/2026-10-09-llamacpp-engine.md`). `llamacpp` is the fourth engine kind
+in every closed engine set, and a bare `llama-server` binary registers beside the
+dist-info installations. SPEC §20 gains T42 (llama.cpp conformance).
+
+- **Kind.** `Engine::Llamacpp` (serde and CLI name `llamacpp`), in `Engine::ALL`;
+  the environment profile `local-llamacpp`. `capyctl-config/src/llamacpp.rs` holds
+  the executable name, the version-line parser, the `<version>+<commit>`
+  fingerprint, the release tag commits (`0.6.0` → `d812350`) and the
+  `/etc/llama.cpp/config.ini` check under a replaceable system root.
+- **Detection** finds an executable regular `llama-server` in `PATH` entries,
+  `~/llama.cpp/build*/bin`, `/opt/*/bin`, `/usr/local/bin` and under `--path`,
+  follows no link out of the scanned root, reads the version from a
+  `libllama.so.X.Y.Z` name beside it (or in `<prefix>/lib`), else `unknown`, and
+  runs nothing.
+- **`engine add`** takes the binary or its directory (a link is refused, naming its
+  target), runs the bounded version check reading standard error, parses
+  `version: <v> (build <n>, commit <h>)` and writes `build_fingerprint: <v>+<h>`
+  (the build number is dropped) with `security.deep_park: disabled` and no
+  `cuda_home`. A version line on standard output alone does not parse
+  (`engine_unsupported`); `--deep-park enabled` is `capability_missing`; a machine
+  with `/etc/llama.cpp/config.ini` is `engine_unsupported` naming the file, before
+  the binary runs. Nothing is written for any refusal. Nothing is probed: the
+  capability report says deep parking is missing.
+- **Digest** (ADR 0008): the binary and every `lib*.so*` entry beside it, and in
+  `<prefix>/lib` for `<prefix>/bin/llama-server`; a link counts by its target text.
+- **Listing.** `custom` follows the verified set read through the release a build
+  counts as: `0.6.0-dev` with the tag's commit counts as `0.6.0`. Listings show a
+  llama.cpp profile's fingerprint rather than the library version the host
+  reports. The verified set has no llama.cpp entry yet (ruling 2: it lands with
+  the live rows), so every build lists as `custom`.
+- **The role's own engine.** `local_engine.llamacpp`, `--llamacpp-bin` and
+  `CAPYCTL_LLAMACPP_BIN`, with the shared precedence; the profile is `local`, or
+  `local-llamacpp` beside another engine. Its version is read from standard error,
+  it never parks, and it is refused while the system `config.ini` exists.
+- **Until slices L2–L5 land**, a deployment on a llama.cpp profile is refused at
+  resolution, every llama.cpp option (host-fixed, extra or rendered) is refused so
+  the option policy fails closed, a parking residency on a llama.cpp profile is
+  `capability_missing`, and the launch, park and group paths refuse the kind.
+
+Tests (T42 with T01, T03, T07, T14, T21, T22, T37): `capyctl-config/tests/llamacpp.rs`
+(kind, version line, listing rule under a test verified table, deep park, options
+failing closed, the config file, the resolution refusal), `tests/registration.rs`
+(a release before ADR 0029 skips a `llamacpp` profile as an unknown kind; this one
+loads it), `engine_settings` unit tests (three ways, profile names, the host's own
+llama.cpp), `capyctl-agent/tests/engines.rs` (detection runs nothing, links out of
+the root, resolution, the version check on standard error),
+`installation` unit tests (the digest over the libraries and `<prefix>/lib`),
+`capyctl-cli/tests/engine_cli.rs` (`engine add` and its refusals),
+`tests/grammar.rs` (`--llamacpp-bin`) and the standalone provider's own llama.cpp.
+CPU and Fake-engine tests only; they are not qualification. Only the live rows
+LC1–LC6 (slice L6) qualify llama.cpp.
+
+## llama.cpp engine designed (ADR 0029) — 2026-10-09 (branch `docs/llamacpp-engine-design`)
+
+Owner decision 2026-10-09: llama.cpp's `llama-server` (v0.6.0, tag `v0.6.0`, commit
+`d812350`) becomes the fourth engine, restart-only and one model per deployment for
+v1, landing as TensorFold did (ADR 0023). Recorded as
+[ADR 0029](../design/adr/0029-llamacpp-engine.md), with the design note
+`docs/specs/2026-10-09-llamacpp-engine-design.md` and the plan
+`docs/plans/2026-10-09-llamacpp-engine.md` (slices L1–L6). SPEC §1 R01 and §9.4
+admit llama.cpp; ADR 0018 carries a pointer to the bare-binary registration.
+
+Adopted defaults: a bare-binary installation (version read from `--version` on
+standard error, `build_fingerprint` `<version>+<commit>`, digest over the binary and
+the shared libraries beside it); qualification on a maintainer's discrete-GPU machine
+first, a lab-host build only after owner approval; no engine key and a loopback
+listener; `-c` rendered as the window times the slot count with `--no-kv-unified`,
+4 slots by default, explicit `-ngl` and cache types, `--fit off`, `--cache-ram 0`;
+`--fit*`, `--sleep-idle-seconds`, router-mode options, `--rpc`, `--slot-save-path`,
+`--api-key*`, `--tools` and `--agent` reserved; `/etc/llama.cpp/config.ini` and
+`LLAMA_ARG_*` closed as hidden inputs; router mode unused; speculative decoding
+through approved extra arguments with the draft model counted (ADR 0014 A6); sizing
+from the GGUF header with a placeholder margin until live rows; per-request figures
+from `timings` and load from `/metrics` and `/slots`; `cache_salt` refused;
+template-driven tool and reasoning parsing. A deep tier waits for an upstream
+single-model sleep and wake.
+
+The claims were checked against the v0.6.0 sources (`tools/server`, `common/arg.cpp`,
+`common/common.*`, `src/llama-context.cpp`, `src/llama-kv-cache.cpp`, the build-info
+CMake files and the release workflow) and a CPU-only build of the tag run for
+`--version`, `--help` and parser behavior. No GPU run, no lab host. The design
+note lists the ten items that need a live check. Documents only: no code, no tests.
+CPU and Fake-engine tests are not qualification; the live rows LC1–LC6 are.
+
+## The compile-job count leaves out the model on unified memory — 2026-10-09 (branch `fix/max-jobs-unified-memory`)
+
+Found live on a GB10 (catalog model 8, SGLang 0.5.21, `main` eb214aad): CapyCTL
+set the engine's `MAX_JOBS` from `MemAvailable` at launch, 14 jobs there. SGLang
+builds its FlashInfer JIT kernels after the model has loaded; on unified memory
+the model had taken about 95 GiB of the same pool, about 20 GiB was left, the
+parallel `nvcc` jobs took the machine to 116.4 GiB and the first start was
+killed for memory twice (also with `--disable-flashinfer-autotune`). With
+`MAX_JOBS=2` the first start built and became Ready in 1745 s, inside the
+1800 s Initialize bound.
+
+The rule (owner decision 2026-09-25, SPEC §13.3 amendment) now leaves out what
+the engine itself holds when the builds run:
+`MAX_JOBS = clamp(floor((MemAvailable at launch − unified Ready charge) / 8 GiB),
+1, CPU count)`.
+
+- The unified Ready charge is the sum of the deployment's Ready-phase
+  allocations on `unified` domains (`engine_env::unified_ready_bytes`,
+  `crates/capyctl-adapters/src/engine_env.rs`; SPEC §7.2, ADR 0007
+  footprints). The Ready charge, not the startup charge, is used: the builds run
+  once the model is resident, and a measured startup peak can itself be the
+  build's (ADR 0014: a 111 GiB peak recorded during a 9-minute build). With the
+  figures above, 117 GiB less 95 GiB gives 2 jobs.
+- On a discrete GPU the model sits in the card's own memory: `device` and
+  `distinct` domains add nothing, so a discrete host's count is unchanged
+  (ADR 0019).
+- The 8 GiB per job stays: each fused-MoE `nvcc`/`cicc` job held 7 to 9 GB on
+  GB10 (2026-09-25), and the 2 jobs that the new rule gives here are the count
+  that built.
+- The SGLang launch (`NativeLaunch::unified_ready_bytes`) and the vLLM and
+  TensorFold plans (`unified_ready_bytes`) carry the charge from the frozen
+  effective deployment to Initialize. All three engines compile after the
+  weights load (TensorFold builds extensions on its first request, ADR 0023
+  §6).
+- A `MAX_JOBS` in the resolved engine env (the profile's `env` or the
+  deployment's `engine_config.env`, ADR 0028 §2.1) still wins; the host log
+  now names it `engine env`, and a computed count names the Ready charge it
+  left out.
+- `docs/operations/install.md`, `docs/operations/configuration.md` and the
+  host examples describe the rule and the override.
+
+Tests: `engine_env` unit tests (a 95 GiB charge on 117 GiB gives 2 jobs, a
+charge at or above what is available keeps the floor of 1, a set `MAX_JOBS`
+wins whatever the charge, only `unified` domains count);
+`vllm_frozen.rs` and `device_namespace.rs` check that the vLLM plan and the
+SGLang launch carry the Ready charge on unified memory and none on a device
+domain. The old rule gave 14 jobs for the 117 GiB case. CPU tests
+only; they are not qualification. Live check still needed: a first start of
+catalog model 8 on SGLang 0.5.21 on a GB10 with an empty JIT cache, with no
+`MAX_JOBS` set, should log `MAX_JOBS=2` and become Ready without a memory kill.
+
+## vLLM's safetensors loader stays `eager` by default while parking — 2026-10-15 (branch `fix/vllm-deep-wake`)
+
+ADR 0014 amendment A21 and its note of 2026-10-15. On 2026-10-09 amendment A21 made a
+parking vLLM deployment's undeclared loader follow the host's memory shape (`lazy` on unified
+memory, `eager` on a discrete GPU), from a catalog comparison on host A (Qwen3.6-35B NVFP4,
+vLLM 0.30, deep park, `eager` vs `lazy`: loading peak 54.2 vs 34.5 GiB, parked charge after
+three cycles 28.3 vs 8.3 GB, wake to first token about 51 s vs 81 s). The same release
+reverted it on live evidence from host A (GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4, deep park,
+run `target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`):
+
+- No declared loader (`lazy` default): cold start 601.6 s; the first wake's in-place weight
+  reload took 123 s, beyond the 120 s `reload_weights` bound, so the wake ended uncertain and
+  the instance stayed uncertain for 21 minutes until the deployment was deleted.
+- Declared `eager`: six wakes of 23-28 s, each with a correct answer, parked charge flat at
+  4.8 GiB.
+- The `MRotaryEmbedding: Failed to load weights` warning appeared in both runs and is not the
+  cause.
+- The same branch (change file `vllm-deep-wake.md`) bounds a wake's weight reload by the
+  wake window (180 s here) instead of a fixed 120 s, so that 123 s reload would no longer be
+  cut; a `lazy` wake of this model has not been rechecked live.
+
+What ships: absent a declared `engine_config.vllm.safetensors_load_strategy`, a parking
+deployment resolves `eager` on unified memory and on a discrete GPU alike, as 0.1.2 did, shown
+in the effective configuration with `provenance["vllm.safetensors_load_strategy"]` naming it
+`capyctl default`. A declared `lazy` or `eager` wins and has no provenance entry. A
+non-parking, undeclared deployment still resolves and renders no loader. The startup
+placeholder uses `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6) exactly where
+`--safetensors-load-strategy eager` renders (`VllmLaunchSettings::renders_eager_loader`), which
+now includes the defaulted `eager` on unified memory; a declared `lazy` keeps
+`STARTUP_WEIGHTS_FACTOR` (2.25).
+
+Tests, failing before and passing after:
+
+- `the_default_load_strategy_is_eager_on_every_memory_shape` (capyctl-adapters, renamed from
+  `the_default_load_strategy_follows_the_host_memory_shape`): unified and discrete fixtures
+  both resolve `eager` with a `capyctl default` provenance entry and render it; a declared
+  `lazy` wins on either shape with no provenance entry.
+- `sleep_mode_follows_the_host_deep_park_switch` and
+  `the_load_strategy_follows_the_deployment_setting` (capyctl-adapters): the unified fixture's
+  undeclared loader renders `eager`.
+- `an_undeclared_strategy_stays_unset_without_parking` (capyctl-adapters): unchanged.
+- `an_omitted_load_strategy_keeps_existing_identities` (capyctl-config): the unified fixture's
+  omitted loader resolves `eager` with `capyctl default`; a declared `lazy` resolves `lazy`
+  with no provenance entry; the command fingerprint stays pinned.
+- `the_startup_placeholder_follows_the_effective_loader` (capyctl-config): a defaulted parking
+  deployment on unified memory and a declared `eager` both use the eager factor; a declared
+  `lazy` uses `STARTUP_WEIGHTS_FACTOR`.
+- Recipe fingerprints re-pinned where the parking fixture's resolved loader changed
+  (`an_absent_drafter_keeps_every_encoding_and_fingerprint`, `declared_resources_are_unchanged`,
+  `a_single_host_deployment_is_unchanged`, `effective-vllm-golden.json`).
+
+CPU and Fake-engine tests only; they are not qualification. Live check still needed: on host
+A, model 1 on vLLM 0.30, deep park, no declared loader: the argv carries
+`--safetensors-load-strategy eager`, the effective configuration shows provenance
+`capyctl default`, and three wakes answer correctly.
+
+## Observation server refusal tests tolerate an early close — 2026-10-09 (branch `test/observation-bridge-broken-pipe`)
+
+`test_sglang_observation_server` `test_foreign_peer_never_reaches_bridge` failed
+intermittently in the fast `scripts/ci-local.sh` runtime step with
+`BrokenPipeError` at the test's `request()` (`sendall`). It passed when run
+alone. `test_aliases_and_changed_parent_permissions_deny_connections` failed
+once the same way. This was a test fault; the server is unchanged. The server
+refuses both connections before it reads any request: the transport
+authenticates the peer (`SO_PEERCRED`) before its first read, and the server
+checks socket custody before handing the connection over. It then closes the
+connection. The test connected and then sent its request. When the server's
+thread ran first and closed the connection, the send failed with `EPIPE`,
+before the test could see what it asserts: no response. The transport tests
+already accept the same early close
+(`test_broken_cancel_consumption_poison_disallows_new_requests`). `request()`
+now accepts `BrokenPipeError` only for these two connections, which it is told
+the server refuses. Every other connection must still send its whole request.
+
+Tests. Every loop ran on 4 cores (`taskset`) beside 8 busy loops pinned to the
+same cores.
+
+- `test_foreign_peer_never_reaches_bridge`: before, 192/200, all 8 failures
+  `BrokenPipeError`. After, 200/200.
+- `test_aliases_and_changed_parent_permissions_deny_connections`: before,
+  193/200, all 7 failures `BrokenPipeError`. After, 200/200.
+- The whole module: before, 92/100 (9 `BrokenPipeError`s across the two tests,
+  once both in one run). After, 100/100.
+- A 200 ms pause between the client's connect and its send, which lets the
+  server's thread run first, reproduces the failure deterministically. The
+  module passed 0/5 before (both refusal tests `BrokenPipeError` every time)
+  and 5/5 after.
+
+CPU tests only; they are not qualification. No live check is needed.
+
+## A start refused on available memory gives its figures — 2026-10-09 (branch `admission-figures`)
+
+Found live on host A (standalone, `main` eb214aad): with `managed_limit 110GiB`
+and `free_reserve 11GiB`, accepted because together they fit the 121.7 GiB
+total, a deployment with a 109.25 GiB cold charge passed placement but was
+refused at arm. SPEC §7.2 admits a charge only when the memory available now,
+less the charge, leaves the free reserve (118.2 − 109.25 = 8.95 < 11 GiB).
+`capyctl start --wait` then reported only `gave up: resource or evidence check
+failed: insufficient resources` after three attempts, with no figures.
+
+The rule is unchanged (uncertainty keeps accounting); the refusal now carries
+its figures end to end:
+
+- `ResourceError::InsufficientAvailable(AvailableShortfall)`
+  (`crates/capyctl-domain/src/resources.rs`) holds the domain, the memory
+  available, the candidate's charge, other starts' charges not yet resident,
+  the free reserve to keep (on a device domain, the part ADR 0019 §2 does not
+  absorb) and the shortfall. `admit_phase`'s free-memory check
+  (`crates/capyctl-scheduler/src/residency.rs`) returns it; the managed-limit
+  refusal stays `Insufficient`. It reads in capacity_blocked's wording under
+  the closed code a host's own refusal uses: `insufficient_memory: needs
+  109.2 GiB of system memory, 118.2 GiB available and a 11.0 GiB free reserve
+  to keep, 2.1 GiB short` (`insufficient_device_memory` on a GPU). Every place
+  that treated `Insufficient` from this check as a free-memory refusal (a
+  park's own phase, a switch victim's parking, a grant that allocates nothing
+  new) treats the new variant the same way.
+- The operation's failure, its journal, `status` (`latest_operation.reason`,
+  with the `insufficient_memory` hint) and the CLI carry that text.
+  `start --wait` ends a start that gave up for memory with
+  `insufficient_resources` (exit 4), as `capacity_blocked` does.
+- When a standalone role starts, or an enrolled host publishes its policy, a
+  domain whose managed limit plus free reserve exceeds the memory available
+  then (plus what deployments already charged there hold) gets a warning with
+  the figures in the role log and in `list hosts` (`session.memory_warnings`,
+  and a `warning:` line under the table). Nothing is refused for it.
+- `docs/operations/configuration.md` (standalone memory limits) explains that
+  available memory, not total, must cover the charge plus the reserve;
+  `docs/guide/errors.md` shows the new reason.
+
+Tests: the scheduler's free-memory refusals now assert their figures
+(`resource_admission.rs`, `resource_sequences.rs`); domain unit tests cover
+the wording and when the warning appears; `admission_figures.rs` drives the
+shipped CLI against an in-process standalone with 10 GiB of 32 available
+(status JSON and text carry the four figures; `list hosts` warns, and does
+not with all 32 GiB available); `live_profiles.rs` checks an enrolled
+host's publication warns only when its limits exceed what it reports
+available; `start_wait_replicas.rs` checks the `--wait` JSON error and exit 4.
+CPU and Fake-engine tests only; they are not qualification. Live check still
+needed: repeat the host A start and confirm the figures in `start --wait` and
+the start-up warning.
+
+## Two load-dependent failures: the subreaper fixture and the port probe — 2026-10-09 (branch `test/fix-two-flakes`)
+
+Two tests failed once each under load and passed when run again.
+
+`subreaper::tests::an_inherited_zombie_is_reaped_and_one_that_cannot_be_is_reported`
+(capyctl-launchers, from #88) failed in CI "CPU checks" with
+`left: Gone, right: Unknown` at `subreaper/tests.rs:159`. This was a test
+fault. The fixture's background children exited on their own (`/bin/true`,
+`sleep 0.5`) while their shell might still be a shell. A shell reaps a
+background child that has already exited when it next finishes a command,
+built-ins included: dash does this after `echo $!`. When the child exited
+before that point, the shell reaped it. The "zombie of another live process"
+was then already gone (CI's failure). Locally the more common symptom was
+`timed out waiting: the child exits`. The children now run `sleep 30` and the
+fixture kills them: the orphan only after its shell has exited, and the zombie
+only once its parent has exec'd `sleep` (its `/proc/<pid>/comm`), which never
+waits. No production code changed for this one.
+
+`group_launch` `a_worker_answers_no_completion_probe` failed in the #97 deep run
+with `service_port_in_use:23868`. That port came from the `capyctl_testkit`
+pool (#92), and this was the first test of the binary to finish. The earlier
+`sglang_worker_ignoring_sigterm_is_escalated` failures with the same signature
+(ports 33274, 37834 and 41162) ran before #92. Every FakeHost test takes this
+path. The cause was in the agent. `host_checks::port_free` and
+`refusal::engine_port_free` probed with `TcpListener::bind`, which leaves the
+probe socket listening until it is dropped. The agent forks engines from other
+threads (`pre_exec`, so a real `fork`). A child forked while a probe was open
+kept a listening copy of it until its `exec`, and the next probe of the same
+port was refused as if another program held it. A group Launch probes its port
+five times: three binds in `port_free`, then `engine_port_free` in pre-admission
+and again under the journal lock. So a free port was refused while sibling
+tests were spawning engines. In production this was a spurious, retried
+refusal. The probes now go through `host_checks::probe_bind`, which binds with
+`SO_REUSEADDR` (as `TcpListener::bind` does) and never listens. A copy of it
+in a child refuses no later probe and no listener that sets `SO_REUSEADDR`.
+It still refuses whenever anything listens on the address or on an address
+overlapping it.
+
+Tests. Every loop ran on 4 cores (`taskset`) beside 8 busy loops pinned to the
+same cores.
+
+- Subreaper test alone: before, 46/50 (three `timed out waiting: the child
+  exits` and CI's `Gone`/`Unknown`). After, 50/50 and 200/200. Whole
+  `capyctl-launchers` lib: before, 18/20 (both failures in this test). After,
+  20/20.
+- Port probe mechanism, as a standalone program: `port_free`'s three binds ran
+  in a loop on a free port while 4 threads spawned `/bin/true` through `fork`.
+  The listening probe refused 304,966 of 423,039 probes. The bound probe
+  refused 0 of 225,553. Both probes refuse a listener on 127.0.0.1, 0.0.0.0,
+  `::`, `::1`, 127.0.0.2 and a LAN address.
+- In place: during the Launch of `a_worker_answers_no_completion_probe`, 16
+  threads of the test process spawned `/bin/true` through `fork`, as sibling
+  tests spawn engines. Before, 94/100, with six `service_port_in_use:<pool
+  port>`. After, 100/100. Without that injection the failure is too rare to
+  measure here: the whole suite passed 35/35 before at 4 test threads. After
+  the fix, the failing test alone passed 50/50, the escalation test alone
+  50/50, and the whole suite at 32 test threads 20/20.
+- New unit tests `host_checks::tests::a_probe_left_open_holds_nothing` and
+  `refusal::tests::a_probe_left_open_is_no_port_conflict` hold a probe's socket
+  open, as a forked child would. Both fail with the listening probe and pass
+  with the bound one.
+
+Seen while stressing, not changed here: with five instances of the
+`group_launch` suite at once on 4 busy cores,
+`late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncertain`
+failed 50/50 at `group_launch.rs:1426`. Its Launch took longer than the 3 s
+after which the fake starts its unrecorded child. Under normal load it
+passes.
+
+CPU and Fake-engine tests only; they are not qualification. No live check is
+needed: the probe refuses the same holders as before.
+
+## Local git worktrees live under `.worktrees/` — 2026-10-09 (branch `chore/ignore-worktrees`)
+
+Owner decision 2026-10-09. Contributors and agents create git worktrees under
+`.worktrees/<name>` inside the checkout instead of as sibling directories.
+`.gitignore` now ignores `/.worktrees/`, so they never show up as untracked
+files. No code or behavior change.
+
+## Per-request engine metrics on every chat answer — 2026-10-09 (branch `feat/per-request-engine-metrics`)
+
+Owner decision 2026-10-09: every completed chat response carries normalized
+per-request engine metrics, and SGLang's cache report is on by default
+(SPEC §17). The router adds `capyctl.metrics` to a non-streaming body and one
+SSE comment, `: x-capyctl-metrics {...}`, before `data: [DONE]` on a completed
+stream (beside the opt-in `x-capyctl-timing` comment; engine chunks are
+relayed byte for byte). Figures: `ttft_ms`, `queue_ms`, `prefill_ms`,
+`decode_tokens_per_second`, `cached_tokens`, each `{"value", "source"}` with
+source `engine` or `router`, and absent when nobody measured it. Mapping
+(`crates/capyctl-router/src/engine_metrics.rs`): vLLM 0.30 `metrics`
+(`queue_time_ms`; `time_to_first_token_ms`, which runs from scheduling, as
+prefill; their sum as TTFT; 1000 / `mean_itl_ms` as decode rate); TensorFold
+0.6.x `tensorfold` (`time_to_first_token`, `prefill_seconds`,
+`tokens_per_second`, whose 0.0 placeholder counts as unknown); cached tokens
+from `usage.prompt_tokens_details.cached_tokens` for every engine. The router
+derives TTFT (forward start to the first chunk with generated text) and the
+decode rate ((completion tokens − 1) over first text to last chunk) only where
+the engine reported none, which is always the case for SGLang 0.5.21. A
+collecting forwarder now lends each chunk to the router (`ChatSink::collected`)
+so a non-streaming answer is timed the same way, and a collected vLLM answer
+keeps the `metrics` object from its usage chunk.
+
+Launch defaults: vLLM renders `--enable-per-request-metrics` in its reserved
+block (single-rank and group head; a headless worker has no API server), and
+the protected entry compares `enable_per_request_metrics` (present in 0.29.0
+and 0.30.0 `FrontendArgs`; read from the published 0.30.0 sdist). SGLang's
+`enable_cache_report` is a reserved constant `True` (`fields/serving.py` in
+0.5.20 and 0.5.21; 0.5.21 read from the published wheel). Both are in the
+deploy-time reserved lists, so extra arguments cannot set or reverse them;
+`docs/guide/engine-flags.md` has rows for both and for vLLM's
+`--enable-prompt-tokens-details` (extra). `docs/guide/requests.md` documents
+the figures and the per-engine table.
+
+Tests (T14, T40, T41): router unit tests per engine on real-shaped bodies
+(`vllm_metrics_map_and_nulls_stay_absent`,
+`tensorfold_statistics_map_and_placeholders_stay_absent`,
+`sglang_reports_cached_tokens_only`, `only_chunks_that_may_report_are_read`,
+`attach_leaves_the_engine_fields`); router integration tests
+(`crates/capyctl-router/tests/engine_metrics.rs`) per engine, non-streaming
+and streaming, with relayed chunks checked byte for byte and absent-not-zero
+cases; `a_collected_response_keeps_the_vllm_metrics_object`;
+`per_request_metrics_render_by_default_and_are_reserved`; reserved spellings
+in `engine_config.rs`, `sglang_args.rs`, `test_vllm_entry.py` and
+`test_sglang_server_args.py`. `stream_safety.rs` expectations now include the
+metrics comment. CPU and Fake-engine tests are not qualification.
+
+Live check still needed (no lab host was used): on each engine (vLLM 0.30.0,
+SGLang 0.5.21, TensorFold 0.6.5), one non-streaming request and one stream
+with `stream_options.include_usage`, checking that the vLLM launch is accepted
+by the protected entry with the flag, that `capyctl.metrics` and the comment
+carry engine figures, and that SGLang reports `cached_tokens` on a repeated
+prompt.
+
+## DP attention head check covers P+13 — 2026-10-09 (branch `dp-attention-ports`, stacked on #86)
+
+Owner decision 2026-10-09: extend the R33 pre-launch check (ADR 0028 §7) now, although `enable_dp_attention` is still reserved (path unreachable). Read against SGLang 0.5.21 source (`srt/server_args.py` `PortArgs.init_new`, `srt/managers/data_parallel_controller.py`): with `--dist-init-addr` the head binds `port_base..port_base+5` with `port_base = P+1`, or `P-7` when `P+6 > 65535` (the previous `P+7` trigger was off by one: at `P=65529` SGLang uses `65530..65535`), plus the REP handshake at `P + DP_ATTENTION_HANDSHAKE_PORT_DELTA` (13) with no fallback, plus one `get_zmq_socket_on_host` PUSH per DP rank on an ephemeral port. `host_checks::dp_attention_ports` now returns `P+1..P+6, P+13`, and `None` above 65522 (refused `rendezvous_port_in_use:<P>`); SGLang's own move of the six is therefore never reached. Per-rank ports documented as uncheckable in the guide, ADR 0028 §7 and the spec. Test `dp_attention_probes_the_derived_head_ports` (R33): the new assertions do not hold against the previous range-returning function, pass after. CPU tests are not qualification. Fast `scripts/ci-local.sh` passes; deep pending. Live check pending with MN1 (`ss -ltnp` on a DP-attention head) once DP attention is allowed.
+
+## Group listeners documented — 2026-10-08 (branch `docs/multi-host-listeners`, stacked on #71)
+
+Owner decision 2026-10-08: ADR 0028 decision 3 (trust the network, bind to the direct link where the engine allows, known risk) stands. The several-machines guide gains "Ports a group opens": per engine (vLLM 0.30, SGLang 0.5.21, TensorFold 0.6.5) every listener, its bind (link address, all interfaces, loopback or engine-chosen), no authentication and the pickle risk, and example nftables and ufw rules for the direct link. Sourced from vLLM 0.29 and SGLang 0.5.20 sources, TensorFold 0.6.3, and `crates/capyctl-adapters` group renderers; torch store, NCCL and TensorFold's `--parallel` port are marked inferred. Found from source: SGLang with DP attention also binds `P+13` (handshake) and one ephemeral socket per DP rank on the head's link address, which `Prepare` does not probe. ADR 0028 decision 3 carries the reaffirmation. Docs only; fast `scripts/ci-local.sh` run; deep pending. Live check pending: MN1 records the actual binds with `ss -ltnp` on both hosts.
+
+## Engine options page and a memory-fraction mapping — 2026-10-08 (branch `docs/engine-flag-table`)
+
+Owner decision 2026-10-08: no raw override of SGLang's `--mem-fraction-static`
+(it stays reserved, ADR 0014 §3); a documented table and a mapping instead.
+`docs/guide/engine-flags.md` has one table per engine (vLLM 0.30, SGLang 0.5.21,
+TensorFold 0.6.5) classing common options as typed, extra, approval or reserved,
+and a worked mapping from a target SGLang fraction to `memory.request` and
+`memory.kv_cache` on `main` (8 GiB margin, 2 GiB static overhead; open PRs #74 and
+#75 revisit both). `enable_linear_replayssm_spec` was found declared in the
+published SGLang 0.5.21 wheel (`arg_groups/fields/exec_.py`); it is an ordinary
+extra argument. `engine_policy::typed_options` is now public for the test.
+
+Tests (T14): `the_engine_option_tables_match_the_policy` runs every tabled option
+through `validate_extra_args` with no approvals and checks each row's class and
+typed field, and that every policy typed option is tabled; `a_wrong_row_fails_the_check`
+proves a wrong class, a wrong field and a missing typed row fail (a deliberately
+wrong `--enable-mixed-chunk` row failed the first test before it was reverted).
+CPU tests only; the engine option lists were read from the published vLLM 0.30.0
+sdist, the SGLang 0.5.21 wheel and TensorFold's `v0.6.5` tag, not from the lab
+hosts' environments, and no live run was made.
+
+## A role behaves correctly inside a container — 2026-10-08 (branch `feat/container-readiness`)
+
+Owner decision 2026-10-08: make a host or standalone role correct as a container's main process now; the live container run on a GB10 comes later. Four changes. (1) Memory (SPEC §7.2, T26): `memory::read_host_memory` bounds `/proc/meminfo` by cgroup v2. The process's unified cgroup comes from `/proc/self/cgroup`; for it and every ancestor under `/sys/fs/cgroup` with a numeric `memory.max`, capacity is `min(MemTotal, memory.max)` and availability `min(MemAvailable, memory.max − (memory.current − inactive_file))`, the tightest level winning. Crediting `inactive_file` is a deliberate refinement of the requested `memory.max − memory.current`: without it a model's weights in the page cache read as used. The source travels as `HostMemorySample.source` and in the additive proto field `DomainObservation.memory_source` (`meminfo`, `cgroup_v2:<cgroup>`, `meminfo:cgroup_v1_unread`, `meminfo:cgroup_v2_unreadable`). The server keeps it in `DomainView` (bounded like other names, status only), standalone's host domains report it, and the role logs it at start when it is not plain meminfo. cgroup v1 is out of scope: never read, reported as such. Every consumer of the host reading follows the bound: the unified (GB10) domain, a discrete host's `distinct` system domain, admission refusal, standalone's derived limits and doctor. Engine `MAX_JOBS` sizing (`capyctl-adapters` `engine_env`) still reads the machine's `MemAvailable`; documented. (2) Reaping (SPEC §13.2, T12 T33): new `capyctl_launchers::subreaper`. At start a role sets `PR_SET_CHILD_SUBREAPER` (PID 1 reaps without it) and sweeps once a second, reaping every exited child it did not spawn itself. Its own direct children keep their waiters: a child in CapyCTL's process group, or one spawned through `subreaper::spawn_direct` (ExecLauncher, DurableSpawn, the installation probe and the engine version check; spawn and registration happen under a shared gate the sweep takes exclusively). `process_absence` reads an exited, single-threaded zombie as `Observed::Exited`. When the role is its parent it reaps it on sight, and the next reading proves it gone. Otherwise it is `Unknown` and a recorded set reports the new `GoneProof::Unreaped`, so it is no longer read as alive forever. Termination no longer refuses over such a process (it holds only its pid), and a zombie leader's group is scanned by pgid. PID-reuse protection is unchanged: start ticks are matched before every reap, and only the parent can reap a zombie, so its pid cannot change before the wait. Known limit: an orphan left in CapyCTL's own process group (a grandchild of a plain `Command`) is never reaped. (3) `nvidia-smi` (T26): `gpu_memory::nvidia_smi` tries `/usr/bin` and `/bin`, then each absolute `PATH` directory, and only executable files. Used by the GPU sample (and so the device inventory's corroboration) and by process residency, with the 3 s bound unchanged. (4) Docs: "Running in a container" in `docs/operations/install.md`. CPU tests only (cgroup fixtures, a re-executed subreaper fixture that reaps an inherited zombie and reports an unreapable one, PATH lookup, server and proto round trips); not run in a container or live. The live container run on a GB10 is pending.
+
+## Standalone reports its own engine load — 2026-10-08 (branch `fix/standalone-load-reports`)
+
+Owner decision 2026-10-08 (SPEC §§10, 17, ADR 0013 §10, D9): an external
+router needs the engine's running and waiting counts and its real running
+limit on a single machine too. Until now the standalone role sampled nothing:
+it composed `GET /management/v1/metrics/load` with no load table
+(`remote_roles::load_view(.., None)` in `roles.rs`), and its
+`CoordinatorLifecycle` had no load to read, so every embedded instance read
+`sample: null`, `max_running` stayed derived (`declared`, `default`, ...), and
+the router scored embedded instances on its own in-flight count alone
+(`load_source: router_in_flight`). The host agent's `LoadReporter` was the only
+sampler, and it read its targets only from a host ingress, which standalone
+does not have. This supersedes the "Standalone has no host load report" line of
+the load-read entry below.
+
+Standalone now samples its engines in process with the host agent's reporter.
+`capyctl_agent::load::LoadSource` names what a reporter samples; the host
+ingress implements it as before, and `capyctl_controller::embedded_load`
+implements it from the store: every Ready embedded launch of the current
+session with open dispatch (`local_ready_launches`, which now carries the
+instance index), on its recorded loopback endpoint with its sealed inference
+key, under the embedded host's published name. Each second it scrapes
+`/metrics`, reads SGLang's `/v1/loads?include=core` once per launch, validates
+each report (`LoadReport::try_from`) and records it in its own `LoadTable` with
+the same fences a host report meets. The management load read and the router
+read that table: `CoordinatorLifecycle::with_embedded_load` gives an embedded
+instance its fresh sample by its placed host, and `balance::usable_load` now
+matches a sample to the remote host, else the placed host. A sample's
+`ingress_in_flight` is the router's count for the instance, since standalone
+forwards to its engine directly. Engine latency histograms carried on the
+samples are not read in standalone; its latency view is unchanged. The guide's
+[reading load](../guide/parking.md#reading-load) section no longer says
+standalone has no sample.
+
+Tests: `standalone_reports_its_engine_load` (`capyctl-cli`, `roles_f1`) boots
+standalone on the Fake installation, starts a deployment and stands an
+SGLang-shaped engine at the recorded endpoint that answers keyed `/metrics` and
+`/v1/loads`; the load read shows a fresh sample with the engine's gauges and
+`max_running` `{"count": 24, "source": "engine"}`, and the router's candidate
+uses that engine load. It failed before (`sample: null`, source `default`) and
+passes after. `unusable_samples_fall_back_to_router_in_flight` now expects an
+embedded instance's sample to be used when it names the placed host, and not
+otherwise. CPU and Fake-engine tests are not qualification.
+
+Live check still needed: rerun live check #2 on host A (standalone, SGLang
+0.5.21, `max_concurrent_requests: 2`): during an in-flight request the load
+read shows a fresh `sample` with `engine.running` and `max_running.source:
+engine`, and the router's candidate logs `load_source: engine`.
+
+## Tables an engine keeps on disk count against the models disk — 2026-10-09 (branch `feat/disk-backed-weights`)
+
+Owner decision 2026-10-09 ([ADR 0014 amendment A20](../design/adr/0014-deployment-engine-configuration.md)).
+Every safetensors byte counted as memory weights, so Qwen3.8-Flash-Next (126 GiB, 47.7 GiB of
+it one n-gram table) never fit a 121.7 GiB GB10. The host now reads the n-gram table shards
+(`ple_embedding.ngram_embedding.shard_<n>.{weight,scales,biases}`) from the safetensors headers
+in the layout pass and reports them with the digest. When the engine arguments turn on SGLang
+0.5.21 `--ple-offload-backend file` or TensorFold 0.6.5 `--ple-on-ssd` (vLLM 0.30 has none),
+the memory weights are the rest of the checkpoint (a group member: its share of it) plus the
+engine's cache of each table (SGLang 8 GiB, its default budget; TensorFold 1 GiB). The record
+is `engine_config.memory.disk_tables`; launch plans carry `checkpoint_tables` (capability
+`checkpoint_tables`), which the host checks against its own headers. Without the option or the
+tables nothing changes: fingerprints pinned from main. Setting
+`SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB` beside the file backend is refused.
+
+Tests, failing before (rule disabled: 5 of 7 in `crates/capyctl-config/tests/disk_tables.rs`
+fail) and passing after: `flash_next_fits_one_gb10_with_sglang_keeping_the_table_on_disk`,
+`flash_next_fits_one_gb10_with_tensorfold_reading_the_table_from_ssd`,
+`flash_next_does_not_fit_one_gb10_without_the_option`,
+`a_group_member_keeps_its_share_of_the_table_on_disk`,
+`without_the_option_the_tables_change_nothing`, `a_changed_sglang_table_budget_is_refused`,
+`the_engine_options_are_recognized`; plus `tables_are_found_beside_the_layout`,
+`measured_tables_size_an_engine_that_keeps_them_on_disk` (store),
+`the_checkpoint_tables_ride_beside_the_weights` (protocol) and the agent's plan check. CPU
+tests only; not qualification.
+
+Live check outstanding: model 8 (Qwen3.8-Flash-Next) on one GB10 with SGLang
+(`--ple-offload-backend file`) and with TensorFold (`--ple-on-ssd`). The derived Ready phase is
+about 108.5 GiB, above the automatic managed limit (97.4 GiB), so the host needs a managed
+limit of about 110 GiB and a declared startup peak, or a first start that measures it. SGLang's
+file backend also writes its own sparse copy of the table under its cache directory, outside
+the model store.
+
+## Wake canary for single-host launches — 2026-10-09 (branch `single-host-wake-canary`)
+
+Owner decision 2026-10-09. Single-host wakes compare the engine's answer with a
+reference, as groups do (ADR 0028 §12). At a launch's first readiness the
+coordinator (`worker::record_wake_canary`) asks `EngineAdapter::wake_canary` for one
+completion of `completion_probe::PROMPT` (`CANARY_TOKENS` = 8, temperature 0,
+bounded by `CANARY_DEADLINE`) and stores the token ids and text in the new
+`wake_canaries` table (schema v48), keyed by instance, generation and incarnation:
+a controller restart keeps it, and a new launch records its own (earlier
+generations are dropped). After a restore's own steps succeed and before its
+evidence commits, `wake_canary_check` repeats the probe. Token ids are compared
+with the group rule (`canary_matches`) when both answers carry them, the text
+otherwise (`wake_canary::verdict`); a launch with no reference records one; an
+unanswered canary leaves the wake uncertain, as a failed fresh probe does. A
+different answer records `wake_mismatch` (the instance's last error and
+`mismatch_operation_id`), marks the wake uncertain and accepts an ordinary stop
+under `EXIT_PRINCIPAL` (as after an engine exit), retried every scheduler pass from
+`wake_mismatch_stops_due`, so a restart retries it too. Every wake of a single
+launch is checked, deep and `host_backed` alike.
+
+Remote launches run the probe on the host agent (`MemberAction::Probe` with
+`max_tokens`, sent only to hosts declaring `engine_groups`; older hosts keep the
+wake checks they had); embedded vLLM and SGLang probe their own endpoint;
+TensorFold is restart-only and unaffected. The completion probe now answers
+`ProbeAnswer { tokens, text }` (adapters `complete_probe`, renamed from
+`complete_token_ids`; new `MemberExecutionResult.probe_text`, at most 4096 bytes),
+so an engine that returns no token ids is compared by text; groups still require
+token ids. New closed code `wake_mismatch` (CLI codes, errors guide, parking guide).
+
+Tests (new APIs, so they did not build on `main`; all pass after):
+`capyctl-controller` `tests::residency::a_matching_wake_canary_completes_the_wake`
+(remote and embedded, three cycles), `a_differing_wake_canary_fails_the_wake_and_stops_the_instance`,
+`a_new_launch_records_a_new_reference`, `a_controller_restart_keeps_the_reference`,
+`wake_canary::tests::*`; `capyctl-store` `wake_canary::tests::*` (including a
+reopened store); `capyctl-protocol` `probe_text_answers_a_completion_probe_only`;
+adapter `completion_probe` unit and integration tests for the text fallback. CPU
+and Fake-engine tests are not qualification.
+
+Live check still needed: model 1 on vLLM, deep park and wake three times on a
+GB10, each wake passing the canary. A known-broken wake is refused upstream
+(#76), so a mismatch is tested by hand: on a maintainer's local standalone
+machine (never a lab server), with a vLLM model ready, stop the role, run
+`UPDATE wake_canaries SET tokens_json='[1]', text='x'` on its store, start the
+role (it adopts the running engine), then park and wake the model; the wake must
+fail `wake_mismatch` and the instance stop, `wake_mismatch` as its last error.
+
+## Draft model source — 2026-10-08 (branch `feat/draft-model-source`)
+
+A deployment may declare `model.draft`, its speculative drafter's own model source (ADR 0008 amendment 2026-10-08): validated and policy-checked like `model.source`, part of the revision fingerprints (absent: unchanged), materialized and verified as a second source row per host (store schema 47, `model_sources` keyed by source), and waited for before activation, digest and launch. Its weights are sized with the checkpoint's without approvals, its `config.json` feeds the draft KV fit, and CapyCTL renders it to SGLang (`speculative_draft_model_path` via the entry), vLLM (`--speculative-config` `model`, merged with the operator's) and TensorFold (`--drafter`). CPU and Fake tests only; a native SGLang or vLLM launch with a materialized drafter on a lab host is still needed.
+
+## Faster checkpoint readiness — 2026-10-08 (branch `feat/digest-readiness`)
+
+Owner decision 2026-10-08 (ADR 0014 §7, amendment of 2026-10-08): option (a) now, option (b) only with host approval. (a) `sources.rs` computes each file's SHA-256 while it streams (beside the git blob id where that is the pin), notes it with the file's stat identity right after the rename, and writes an owner-only `<id>.manifest` at commit; `CheckpointVerifier` adopts it when the walked files and identities match and the small files rehash to it (`fetched`, no weight file read; same canonical manifest, so the same digest). Tar extractions and unnoted files are measured. (b) `checkpoints.trust_declared_digest` (flag `--trust-declared-digest`, `CAPYCTL_TRUST_DECLARED_DIGEST`, YAML; default off) lets a host take a local source's canonical declared digest on first sight, hashing only small files and seeding the stat cache; a changed file forces a full rehash, the policy off forces a measurement, and the store records `declared_trusted` only for the revision's own declaration. Provenance travels as `CheckpointDigestEvidence.provenance` (field 10, additive), is stored in `checkpoint_digests.provenance` (v46; earlier digests `measured`) and shown by status.
+
+Tests (T03 T14 T34): `a_fetched_checkpoint_digest_needs_no_second_read` (reads counted: only small files), `a_changed_or_unpinned_download_is_measured`, `a_declared_digest_is_trusted_only_when_the_host_allows_it`, `a_trusted_declaration_still_catches_a_changed_file`, `digest_checkpoint_trusts_a_declaration_only_by_host_policy`, `the_embedded_host_trusts_a_declared_digest_only_by_policy`, `a_recorded_digest_keeps_where_it_came_from`, `a_recorded_digest_keeps_its_provenance`, `v46_marks_earlier_digests_measured_idempotently`, `declared_digest_trust_follows_flag_env_document_default`, `status_shows_how_a_digest_was_recorded`, protocol validation. CPU tests only; not qualification. A live Hugging Face download and first start on a lab host is pending. Schema v46 and the dated ADR amendment may collide with other open branches that also add v46; renumber on merge.
+
+## Plain HTTP by host approval, download URLs by secret reference — 2026-10-08 (branch `feat/source-extensions`)
+
+Owner approval 2026-10-08, recorded as the ADR 0008 amendment of that date. An `http` model
+source may now name a plain `http://` URL; the host fetches it only when it approves plain HTTP
+(`model_sources.plain_http: allowed`, `--model-sources-plain-http`,
+`CAPYCTL_MODEL_SOURCES_PLAIN_HTTP`; flag over environment over YAML; default `denied`, encoded
+only when allowed, so existing host policies and revisions are byte-identical), still inside
+`http: allowed` and `allowed_hosts`, still verified against its `sha256`. A fetch that starts on
+HTTPS is never redirected down to plain HTTP. An `http` source may instead state
+`url_ref: secret://<name>` (a deployment-document field, YAML only like every deployment
+field): the host reads the URL from `<state_dir>/secrets/<name>` (owner-only) at the moment of
+the fetch and checks it against its own policy first (`denied` otherwise,
+`secret_unavailable` for a missing, loose or non-URL secret). The document, revision, ledger,
+status and logs hold the reference only; the store directory stays `sources/http/<sha256>`.
+The sources store's log lines pass through the new shared
+`capyctl_domain::redact::redact_urls` (userinfo, query and fragment become `<redacted>`).
+
+Tests (T14 T37): `plain_http_sources_need_the_hosts_approval`,
+`a_secret_url_reference_is_all_a_declaration_holds` (config, runtime failures before the
+change), `plain_http_follows_flag_env_document_default`,
+`plain_http_and_secret_url_sources_resolve_into_the_store`,
+`a_secret_url_is_fetched_verified_and_never_persisted_or_logged` (no stored file, status,
+failure or log line holds the URL), `plain_http_sources_are_fetched_only_where_the_host_approves`
+(agent, loopback origin), and the `redact` unit tests (domain). CPU tests only; they are not
+qualification. A live fetch from a plain-HTTP mirror and from a presigned URL on a lab host is
+pending.
+
+## Engine logs kept, redacted as written, with a management tail — 2026-10-08 (branch `engine-log-redaction`)
+
+Owner decision 2026-10-08, SPEC §13.3 amended. Every engine's stdout and stderr now pass through a redacting writer process (the `capyctl` binary re-executed as `/proc/self/exe __engine-log-relay`, own process group, outlives an agent restart, ends at EOF) on the way to the launch's owner-only log (`crates/capyctl-launchers/src/engine_log_relay.rs`, used by `DurableSpawn` and `ExecLauncher`). It replaces the launch's credentials by value (protected-descriptor keys and observation credential, secret-named environment values, handed over on descriptor 3) and by rule URL userinfo, URL query strings and fragments (`capyctl_domain::redact::redact_urls`, shared with the model-source work), secret-named assignments, `hf_` tokens, bearer values and ≥48-character credential runs (`capyctl_adapters::engine_log::LogRedactor`). The log rotates at 16 MiB keeping `.1` and `.2`. SGLang now runs at `log_level`/`log_level_http` `info` (was `error`) and its output is no longer sent to `/dev/null` (`contain_startup_output` removed; the Python scrubber now runs in both modes); `log_requests` stays off, crash dumps stay off, and SGLang's refusal reason is logged in both modes. `--debug-engine-logs` keeps its meaning (SGLang debug level, output written without the writer) and leaves a `<log>.raw` marker. New route `GET /management/v1/deployments/{id}/engine-log?instance=<n>&kib=<1..256>` (admin token; server through the new `ExecuteMember.engine_log_tail` action, capability `engine_log_tail`, host→server message limit 320 KiB; standalone in-process) returns a bounded, re-redacted tail; a raw log is refused `403 forbidden`.
+
+Prompt evidence at default level (source read, not live): SGLang 0.5.21 logs request text only under `log_requests` (`srt/utils/request_logger.py:88-90, 159-163`; OpenAI path `serving_base.py:87-89`), and logs `server_args=` with both keys at info (`srt/entrypoints/engine.py:1123`), which the writer redacts by value; vLLM 0.30.0 logs prompts only with `--enable-log-requests` (default off, `engine/arg_utils.py:3000`; prompts at DEBUG, `serve/utils/request_logger.py:44-61`), reserved by CapyCTL; TensorFold (0.6.3 read; 0.6.5 not available locally) prints request lines and token counts only and has no request-logging switch.
+
+Tests (T21, T34): `crates/capyctl-launchers/tests/engine_log_relay.rs` (`a_launch_log_holds_no_owned_secret`, `a_worker_log_holds_no_observation_credential`, `the_exec_launcher_log_is_redacted_too`: seen failing with redaction disabled), `engine_log_relay::tests::*` (rotation, split reads, overlong lines), `capyctl_adapters::engine_log::tests::*`, `crates/capyctl-cli/tests/engine_log_relay.rs` (the built binary in writer mode), `runtime/tests` (`test_info_is_the_default_level_and_request_logging_stays_off`, `test_default_guard_keeps_output_and_still_rejects_plugins`, `test_output_is_scrubbed_of_credentials`: seen failing on the previous runtime), `vllm_args::request_logging_is_never_rendered_and_cannot_be_enabled` (locks existing behaviour), `crates/capyctl-management/tests/engine_log.rs` (bounds, redaction, raw refusal, auth), protocol `engine_log_tail` tests, `version_skew::an_engine_log_tail_needs_the_capability_and_is_otherwise_answered`, agent `engine_log_tail_serves_a_claimed_launch_bounded_and_redacted`. CPU tests only; not qualification. Live check needed: SGLang 0.5.21 and vLLM 0.30.0 on a GPU host, grep the engine log for the launch's keys and for a driven prompt's text, confirm SGLang's info-level warnings now appear, and read the tail route on server and standalone.
+
+## A park the parked growth bound turns into a stop runs the stop — 2026-10-09 (branch `fix/parked-growth-stop-runs`)
+
+Found live 2026-10-09 on host A (standalone, vLLM 0.30.0 deep, eager
+loader). This fixes ADR 0014 amendment A19. A launch's parked charge grew
+4.7, 9.6, then 13.1 GiB. Its fourth `capyctl park deployment` became the
+growth stop, and status said so. That stop never ran. Its operation stayed
+`pending` and its run `queued` for 25 minutes, and the generation-1 engine
+kept its 22.6 GiB. An operator's Stop was refused with `lifecycle_conflict`,
+and `drain host` asked for reconciliation. A role restart did not clear it.
+
+Cause: `accept_park_command` answers with the stop's operation. It stored the
+park's own command receipt (the deployment's `#park` scope, or a sibling
+instance's) naming that operation, beside the receipt the stop already has.
+The ordinary cleanup's validation (`cleanup::read`) requires exactly one
+receipt per cleanup operation. So every read of that stop failed with
+`CorruptStoredData`: discovery, arming, status and adoption after a restart.
+The coordinator's worker halted with `corrupt stored lifecycle data`. Nothing
+was released: the accounting stayed held, with the engine running. The
+generation 2 in the ledger is normal: every stop fences its launch to the
+next generation. The idle-policy and switch-victim growth stops store only
+the stop's own receipt, so they were not affected. Their tests now drive
+their stops too.
+
+Fix: the cleanup validation also admits the park command's receipt, and only
+that one. It must be under the stop's principal and key, in the deployment's
+or this instance's `#park` scope, for a stop journaled `park_growth_stop`.
+Any other extra receipt is still corruption. An exact retry of the park
+still replays the stop, also after the stop has settled. The stop still
+releases only on its gone evidence.
+
+Tests, failing before and passing after:
+
+- `a_park_the_growth_bound_turns_into_a_stop_runs_the_stop` (controller
+  scheduler, scripted embedded engine whose host reports growing parked
+  residues). Three parks and wakes are measured at 3, 5.5 and 7 GiB. The
+  fourth park becomes the stop. Before the fix, the worker read
+  `Failed("coordinator service failed: corrupt stored lifecycle data")` with
+  the stop `pending` and the instance at generation 2, observed `ready`, as on
+  host A. After the fix, the engine is terminated once, the instance is
+  released and reads `stopped`, the fourth park is never sent, the worker keeps
+  running, and an operator's Stop afterwards is accepted.
+- `a_park_after_the_parked_charge_outgrew_its_first_park_is_a_stop` (store).
+  The stop is discovered, armed and released on gone evidence, and a retry
+  replays it before and after. Before the fix, discovery failed with
+  `CorruptStoredData`.
+
+New: `a_growth_stop_refuses_a_park_receipt_it_did_not_answer` (the same
+receipt under another principal is still corruption). The idle-policy and
+switch-victim growth tests now also drive their stops; they passed before.
+
+CPU and Fake-engine tests only; they are not qualification. Live recheck
+still needed: on host A, on a fresh ledger, repeat the four park/wake cycles
+on vLLM 0.30.0 deep and confirm the fourth park's stop terminates the
+engine, releases it and leaves it stopped.
+
+## Explicit activation — 2026-10-08 (branch `feat/explicit-activation`)
+
+Owner-approved 2026-10-08. `lifecycle.activation: explicit` (deployment
+document, or a host document for every deployment that may run on it;
+standalone `host.lifecycle.activation`, also `--set` / `CAPYCTL_SET__…`)
+makes a deployment move only on an operator's action (SPEC §6.5, §10
+amendments). A request while it is stopped or parked is refused at once, 409
+`deployment_inactive`, with nothing accepted; it is never a switch victim,
+never idled, never reclaimed from the parked set (a park that needs its room
+is refused `parked_capacity`). An operator's stop keeps `deployment_stopped`.
+Schema v45 adds `deployment_revision_instances.activation` (`on_demand` for
+existing rows) and `host_activation_policies`, written with each approved
+host publication and at every standalone start. Unset: command identity,
+recipe fingerprints and the host's resolution document are unchanged (tests).
+Status shows `activation: explicit` (additive).
+
+Tests (failing before, passing after): config `instances`, `remote_roles`,
+`setting_overrides`; store `instances_placement`, `host_publication`,
+`park_tests`, migration v45; controller `tests_switching`; CLI
+`explicit_activation` (HTTP 409 end to end, park and wake by operator).
+CPU and Fake-engine tests only; not qualification. Pending: a live check on a
+lab host (explicit host, a request for a parked deployment answered 409 with
+no wake, then `start` waking it; a second deployment's request not evicting
+it). Under a `resource_policy.queue.max_pending_per_deployment` of 0 the
+refusal is still 409 `deployment_inactive`, not 429 `queue_full`, since no
+activation would start (CLI test
+`with_no_waiting_an_inactive_explicit_deployment_is_refused_409`).
+
+## Binary-driven CLI tests no longer read the machine's free memory — 2026-10-08 (branch `test/standalone-memory-independent`)
+
+Owner decision 2026-10-08. The `capyctl-cli` integration tests that spawn the
+real binary (standalone and host roles) read this machine's own
+`/proc/meminfo`. With about 14 GiB available of 61, every deploy failed with
+`insufficient resources`, on clean `main` too: standalone derives a 20% free
+reserve, and the golden host states a 16 GiB one. In debug builds only,
+`capyctl_agent::memory::read_host_memory` now reads the test-only
+`CAPYCTL_TEST_PINNED_HOST_MEMORY` (`<capacity_bytes>:<available_bytes>`) when
+it is set. Release builds compile that read out. It is not a user setting and
+is not documented as one. `support::capyctl()` pins every role it spawns to the
+in-process suite's stated 32 GiB, all of it free. This goes through
+`support::pin_host_memory`, which the two helpers that clear the environment
+call again. The in-process tests already state their memory
+(`support::test_memory`). The real `/proc/meminfo` path keeps its own tests
+(`crates/capyctl-agent/tests/memory.rs`). On a discrete machine, GPU memory is
+still sampled from `nvidia-smi`.
+
+Tests: the five `role_shutdown` and two `engine_exit` standalone tests named in
+the decision failed before with 14 GiB available. With a held allocation keeping
+13.5–14.8 GiB available, all 20 binary-driven test files passed 3 times
+(163 tests each). `cargo test -p capyctl-cli --all-targets` passed (463 tests)
+with 13.7 GiB available. New unit tests check the pinned reading's format.
+Still open: in one earlier run,
+`a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand` waited out
+its 900 s deploy deadline. Its reason was not captured, and 14 later runs
+passed, 10 of them on 2 cores. CPU and Fake-engine tests only; they are not
+qualification. No live check is needed.
+
+## Change files instead of runbook and release note edits — 2026-10-09 (branch `doc-changes-convention`)
+
+Owner decision 2026-10-09. Every pull request added its entry at the top of
+this runbook and to `docs/operations/release-notes-0.1.3.md`, so each merge
+made every open pull request conflict. A pull request now adds one file,
+`docs/changes/<short-slug>.md`, with `# Status: <title>` (this entry) and
+`# Release note: <section>` (or `none`); the format is in
+[docs/changes/README.md](../changes/README.md). When a release is cut,
+`scripts/assemble-changes.sh [--dry-run] <version>` puts the status entries at
+the top of the runbook, newest first by the commit that added each file, and
+each release note after the last bullet of its section in
+`release-notes-<version>.md` (adding a missing section at the end, or the
+file), checks every file first (headings, `../` relative links) and removes
+them. AGENTS.md, CONTRIBUTING.md and [Releasing](../operations/releasing.md)
+describe the convention; the runbook stays the single status authority and no
+existing entry moved. CI and `scripts/ci-local.sh` run
+`scripts/test-assemble-changes.sh` (step `changes`) and shellcheck both
+scripts.
+
+Tests: `scripts/test-assemble-changes.sh` (dry run changes nothing; runbook and
+notes compared byte for byte; second run is a no-op; missing notes file
+created; eight refusals leave every file unchanged). It failed before the
+script existed and passes after, with mawk and busybox awk. Not added: a check
+that a pull request touching code adds a change file (proposed in the pull
+request).
+
 ## `cache_salt` passed to vLLM and SGLang, refused for TensorFold — 2026-10-08 (branch `feat/cache-salt-passthrough`)
 
 SPEC §10 note (owner decision 2026-10-08): `cache_salt` joins `CHAT_REQUEST_FIELDS` and is forwarded unchanged; `validate_chat_request` bounds it to a non-empty string of at most `MAX_CACHE_SALT_BYTES` (1024, vLLM's own bound; null is absent). `RuntimeEndpoint` now carries the engine family the launch's revision froze (`Store::revision_engine`, `$.profile.engine`), and the router's forwarder honours the salt only for `vllm` and `sglang` (`engine_honours_cache_salt`); for TensorFold, or an unrecorded family (a deployment from before managed configuration), the forwarder refuses before connecting with the new `AdapterError::CacheSaltUnsupported`, answered `400 cache_salt_unsupported` (in-band on a stream) with the lease closed not accepted. The engine adapters' own forwarders follow the same rule. Tests: `cache_salt_reaches_vllm_and_sglang_unchanged`, `cache_salt_is_refused_for_an_engine_that_would_ignore_it`, `a_malformed_cache_salt_is_refused_before_any_engine` (router), `cache_salt_is_allowed_and_its_value_bounded`, `a_forwarder_for_an_engine_ignoring_cache_salt_refuses_it_before_sending` (adapters). CPU tests only. Live check still needed: on a real SGLang (and vLLM 0.30) deployment, an identical long prefix sent twice under one salt reports `cached_tokens` > 0 on the second request, and under a second salt reports 0.
