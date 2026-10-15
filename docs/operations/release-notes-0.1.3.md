@@ -524,5 +524,5 @@ machines.
   Qwen3.8-27B NVFP4, a deep-parked deployment loading with `lazy` took about
   2 minutes (123 s) to reload its weights in place on its first wake, against
   23–28 s with `eager`. That wake now gets the whole wake window instead of
-  failing at 120 s, but a `lazy` wake of this model has not been rechecked
-  live. Keep the default `eager` where wake time matters.
+  failing at 120 s: rechecked live, three `lazy` wakes answered correctly in
+  130–159 s. Keep the default `eager` where wake time matters.
