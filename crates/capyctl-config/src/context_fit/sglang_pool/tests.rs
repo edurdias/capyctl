@@ -197,7 +197,8 @@ fn a_draft_model_adds_its_kv_and_intermediate_states() {
 }
 
 // T14 (#40's rule): arguments that size the state pool own it; CapyCTL
-// passes nothing for it and still sizes the KV pool.
+// passes nothing for it and still sizes the KV pool. (A request that holds
+// the 65 slots the first fixes: owner decision 2026-10-14.)
 #[test]
 fn arguments_that_size_the_state_pool_win() {
     let target = qwen38_27b();
@@ -205,14 +206,14 @@ fn arguments_that_size_the_state_pool_win() {
         ["--max-mamba-cache-size", "64"],
         ["--mamba-full-memory-ratio", "0.5"],
     ] {
-        let mut owned = fp8(settings(48 * GIB, 16 * GIB, Some(21_920_000_000)));
+        let mut owned = fp8(settings(64 * GIB, 16 * GIB, Some(21_920_000_000)));
         owned.extra_args = extra.map(String::from).to_vec();
         let found = pool(&owned, &target).unwrap();
         assert_eq!(found.max_mamba_cache_size, None, "{extra:?}");
         assert_eq!(found.max_running_requests, None, "{extra:?}");
         assert_eq!(found.max_total_tokens, Some(524288), "{extra:?}");
         // The installation's host-fixed arguments too.
-        let host = fp8(settings(48 * GIB, 16 * GIB, Some(21_920_000_000)));
+        let host = fp8(settings(64 * GIB, 16 * GIB, Some(21_920_000_000)));
         let found = sglang_pool(&host, &extra.map(String::from), Ok(&target), None).unwrap();
         assert_eq!(found.max_mamba_cache_size, None, "{extra:?}");
     }
@@ -452,20 +453,35 @@ fn arguments_that_fix_the_state_pool_are_held_by_the_static_pool() {
         pool(&declared, &target).unwrap().static_bytes,
         Some(weights + (1536 << 20) + (9 + 3 * 4) * STATE as i64 + overhead)
     );
-    // Undeclared, the slots bound it (a request large enough to hold it).
+    // Undeclared, the slots bound it (a derived request with a margin large
+    // enough to hold it).
     declared.common.max_concurrent_requests = None;
     declared.memory.request_bytes += 8 * GIB;
+    declared.memory.margin_bytes += 8 * GIB;
     assert_eq!(
         pool(&declared, &target).unwrap().static_bytes,
         Some(weights + (1536 << 20) + (9 + 9 * 4) * STATE as i64 + overhead)
     );
-    // Never above the request.
+    // Owner decision 2026-10-14: a declared request that cannot hold that
+    // static pool with its margin outside is refused, naming the smallest
+    // whole GiB that does; that request keeps the request less the margin.
     let mut explicit = fp8(settings(24 * GIB, 1536 << 20, Some(weights)));
     explicit.extra_args = ["--max-mamba-cache-size", "8"].map(String::from).to_vec();
+    let refusal = pool(&explicit, &target).unwrap_err();
+    let want = weights + (1536 << 20) + 9 * STATE as i64 + overhead;
+    assert!(
+        refusal.contains(&format!("{want} bytes in all")),
+        "{refusal}"
+    );
+    let gib = named_request_gib(&refusal);
+    assert_eq!(gib, (want + 8 * GIB + GIB - 1) / GIB);
+    explicit.memory.request_bytes = gib * GIB;
     assert_eq!(
         pool(&explicit, &target).unwrap().static_bytes,
-        Some(24 * GIB)
+        Some((gib - 8) * GIB)
     );
+    explicit.memory.request_bytes = (gib - 1) * GIB;
+    assert!(pool(&explicit, &target).is_err());
 }
 
 /// The memory request a refusal names, in MiB.
@@ -475,6 +491,24 @@ fn named_request_mib(refusal: &str) -> i64 {
         .nth(1)
         .unwrap_or_else(|| panic!("no named request: {refusal}"));
     tail.split("MiB\"").next().unwrap().parse().unwrap()
+}
+
+/// The memory request a refusal names, in whole GiB.
+fn named_request_gib(refusal: &str) -> i64 {
+    let tail = refusal
+        .split("raise engine_config.memory.request to \"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no named request: {refusal}"));
+    tail.split("GiB\"").next().unwrap().parse().unwrap()
+}
+
+/// The static pool a refusal of a declared request says it needs, in bytes.
+fn counted_in(refusal: &str) -> i64 {
+    let head = refusal
+        .split(" bytes in all")
+        .next()
+        .unwrap_or_else(|| panic!("no static pool: {refusal}"));
+    head.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
 /// `settings` with an explicit request of `mib` MiB.
@@ -770,31 +804,30 @@ fn replayssm_spec_verify_keeps_a_ring_instead_of_intermediate_states() {
     let target = qwen38_27b();
     let weights = 21_920_000_000;
     let overhead = STATIC_OVERHEAD_BYTES as i64;
-    // Without the flag, unchanged: 111 slots and (22 + 1) × 4 intermediate
-    // states overflow the request, so the static pool is all of it.
-    let plain = pool(&eagle_27b(&[]), &target).unwrap();
-    assert_eq!(plain.max_total_tokens, Some(475136));
-    assert_eq!(plain.max_mamba_cache_size, None);
-    assert_eq!(plain.max_running_requests, None);
-    assert_eq!(plain.static_bytes, Some(79 * GIB));
+    // Without the flag: 111 slots and (22 + 1) × 4 intermediate states, which
+    // with the margin overflow the request (owner decision 2026-10-14:
+    // refused, naming the request that holds them).
+    let intermediates = weights + 29 * GIB + (111 + 23 * 4) * STATE as i64 + overhead;
+    let refusal = pool(&eagle_27b(&[]), &target).unwrap_err();
+    assert_eq!(counted_in(&refusal), intermediates);
+    assert_eq!(
+        named_request_gib(&refusal),
+        (intermediates + 8 * GIB + GIB - 1) / GIB
+    );
     // With it, the slots and 23 ReplaySSM scratch sets fit well inside: the
     // static pool is the request less its 8 GiB margin.
     let replay = pool(&eagle_27b(&["--enable-linear-replayssm-spec"]), &target).unwrap();
     assert_eq!(replay.static_bytes, Some(71 * GIB));
-    assert_eq!(replay.max_total_tokens, plain.max_total_tokens);
-    // At a 72 GiB request (a 64 GiB floor) the static pool shows what is
-    // counted.
+    assert_eq!(replay.max_total_tokens, Some(475136));
+    // At a 72 GiB request the refusal shows what is counted.
     let at_72 = |profile: &[String], extra: &[&str]| {
         let mut deployment = eagle_27b(extra);
         deployment.memory.request_bytes = 72 * GIB;
-        sglang_pool(&deployment, profile, Ok(&target), None)
-            .unwrap()
-            .static_bytes
+        counted_in(&sglang_pool(&deployment, profile, Ok(&target), None).unwrap_err())
     };
     assert_eq!(REPLAY, 31_211_520);
-    let counted = Some(weights + 29 * GIB + 111 * STATE as i64 + 23 * REPLAY as i64 + overhead);
+    let counted = weights + 29 * GIB + 111 * STATE as i64 + 23 * REPLAY as i64 + overhead;
     assert_eq!(at_72(&[], &["--enable-linear-replayssm-spec"]), counted);
-    assert_eq!(at_72(&[], &[]), Some(72 * GIB));
     // SGLang's parser takes an unambiguous abbreviation too, and the flag
     // counts in the host-fixed arguments as in the deployment's.
     assert_eq!(at_72(&[], &["--enable-linear-replayssm-sp"]), counted);
@@ -811,7 +844,7 @@ fn replayssm_spec_verify_keeps_a_ring_instead_of_intermediate_states() {
                 "32",
             ]
         ),
-        counted.map(|bytes| bytes + 23 * ring_16)
+        counted + 23 * ring_16
     );
     // The decode ring (`--enable-linear-replayssm`, another option) keeps
     // the intermediate states, and SGLang's boolean flag takes no value: a
@@ -820,7 +853,7 @@ fn replayssm_spec_verify_keeps_a_ring_instead_of_intermediate_states() {
         "--enable-linear-replayssm",
         "--enable-linear-replayssm-spec=true",
     ] {
-        assert_eq!(at_72(&[], &[extra]), Some(72 * GIB), "{extra}");
+        assert_eq!(at_72(&[], &[extra]), intermediates, "{extra}");
     }
 }
 
@@ -964,15 +997,41 @@ fn an_mtp_draft_keeps_its_kv_layer_and_tables_in_the_static_pool() {
     assert!((770984..=776670).all(|live| live < profiled_tokens(before, overhead)));
     assert!(profiled_tokens(before, overhead + (21 << 26)) < 770984);
     // Now the draft's 2048-byte fp8 layer shares the KV cache, so the pool is
-    // 29 GiB / (32768 + 2048) bytes, and the static pool holds the tables.
-    let found = pool(&mtp_eagle(&[]), &target).unwrap();
-    assert_eq!(found.max_total_tokens, Some(894373));
+    // 29 GiB / (32768 + 2048) bytes, and the static pool holds the tables:
+    // 75.44 GiB, which with the 8 GiB margin the 79 GiB request cannot hold
+    // (owner decision 2026-10-14). The refusal names 84 GiB.
     let rendered = weights + 29 * GIB + state + overhead + 2 * TABLE;
-    assert_eq!(found.static_bytes, Some(rendered));
-    // SGLang's profile now reaches the tokens passed even with that extra
-    // GiB, and the draft's layer (allocated after it) fits what is left.
+    let refusal = pool(&mtp_eagle(&[]), &target).unwrap_err();
+    assert_eq!(counted_in(&refusal), rendered);
+    assert_eq!(named_request_gib(&refusal), 84);
+    assert!(
+        refusal.contains(&format!(
+            "the MTP draft's {}-byte embedding and LM head",
+            2 * TABLE
+        )),
+        "{refusal}"
+    );
+    // Without `--enable-linear-replayssm-spec` its 92 intermediate states
+    // need 96 GiB.
+    let mut intermediates = mtp_eagle(&[]);
+    intermediates.extra_args.remove(8);
+    let refusal = pool(&intermediates, &target).unwrap_err();
+    assert_eq!(named_request_gib(&refusal), 96);
+    let at_84 = |extra: &[&str]| {
+        let mut deployment = mtp_eagle(extra);
+        deployment.memory.request_bytes = 84 * GIB;
+        pool(&deployment, &target).unwrap()
+    };
+    let found = at_84(&[]);
+    assert_eq!(found.max_total_tokens, Some(894373));
+    assert_eq!(found.static_bytes, Some(76 * GIB));
+    let mut short = mtp_eagle(&[]);
+    short.memory.request_bytes = 83 * GIB;
+    assert!(pool(&short, &target).is_err());
+    // SGLang's profile reaches the tokens passed from the static pool counted
+    // even with that extra GiB, and the draft's layer (allocated after it)
+    // fits what is left.
     assert!(profiled_tokens(rendered, overhead + GIB) >= 894373);
-    assert!(rendered <= 79 * GIB);
     let target_kv = 894373 * 32768;
     let draft_kv = 894373 * 2048;
     assert!(target_kv + draft_kv <= 29 * GIB);
@@ -980,13 +1039,10 @@ fn an_mtp_draft_keeps_its_kv_layer_and_tables_in_the_static_pool() {
     for algorithm in ["NEXTN", "eagle3"] {
         let mut named = mtp_eagle(&[]);
         named.extra_args[1] = algorithm.to_owned();
+        named.memory.request_bytes = 84 * GIB;
         assert_eq!(pool(&named, &target).unwrap(), found, "{algorithm}");
     }
-    let bf16_draft = pool(
-        &mtp_eagle(&["--speculative-draft-kv-cache-dtype", "bfloat16"]),
-        &target,
-    )
-    .unwrap();
+    let bf16_draft = at_84(&["--speculative-draft-kv-cache-dtype", "bfloat16"]);
     assert_eq!(bf16_draft.max_total_tokens, Some(844686));
     // When CapyCTL sizes the state itself it counts them alike: the 79 GiB
     // request is refused, naming them, and 82 GiB holds them.
@@ -1045,10 +1101,6 @@ fn other_launches_of_an_mtp_checkpoint_size_as_before() {
     let mut tied = target.clone();
     tied["text_config"]["tie_word_embeddings"] = json!(true);
     tied["tie_word_embeddings"] = json!(true);
-    let at_80 = |config: &Value| {
-        let mut deployment = mtp_eagle(&[]);
-        deployment.memory.request_bytes = 80 * GIB;
-        pool(&deployment, config).unwrap().static_bytes.unwrap()
-    };
-    assert_eq!(at_80(&target) - at_80(&tied), TABLE);
+    let counted = |config: &Value| counted_in(&pool(&mtp_eagle(&[]), config).unwrap_err());
+    assert_eq!(counted(&target) - counted(&tied), TABLE);
 }
