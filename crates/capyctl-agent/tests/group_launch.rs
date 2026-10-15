@@ -84,6 +84,13 @@ with open(os.path.join(here, "record.tmp"), "w") as f:
                "observation_fd": "--observation-credential-fd" in args}, f)
 os.replace(os.path.join(here, "record.tmp"), os.path.join(here, "record.json"))
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+if os.path.exists(os.path.join(here, "transient-child")):
+    # SGLang's worker first forks a short-lived child, then its rank processes
+    # (found live 2026-10-15, MN2).
+    if os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(0)
+    time.sleep(1.2)
 parent = os.getppid()
 if os.fork() == 0:
     while os.path.isdir(here):
@@ -317,6 +324,7 @@ struct FakeHost {
     engine: GroupEngine,
     ignore_sigterm: bool,
     late_children: bool,
+    transient_child: bool,
     deep: bool,
     /// Whether the substituted host holds its own peer address.
     holds_peer: bool,
@@ -451,6 +459,7 @@ impl FakeHost {
             engine: GroupEngine::Vllm,
             ignore_sigterm: false,
             late_children: false,
+            transient_child: false,
             deep: false,
             holds_peer: true,
             held: Vec::new(),
@@ -490,6 +499,12 @@ impl FakeHost {
     /// The worker forks a child 0.4 s after it starts and another after 3 s.
     fn with_late_children(mut self) -> Self {
         self.late_children = true;
+        self
+    }
+    /// The engine forks a child that exits after 0.5 s, then its lasting
+    /// child 1.2 s after it starts.
+    fn with_transient_child(mut self) -> Self {
+        self.transient_child = true;
         self
     }
     /// The engine's whole tree ignores SIGTERM (SGLang rank > 0 does).
@@ -565,6 +580,7 @@ impl FakeHost {
         for (marker, on) in [
             ("ignore-sigterm", self.ignore_sigterm),
             ("late-children", self.late_children),
+            ("transient-child", self.transient_child),
         ] {
             if on {
                 for dir in [&bin, &runtime] {
@@ -1471,6 +1487,46 @@ async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncerta
     // The test ends the process it injected the fault into.
     // SAFETY: kill has no memory preconditions; the pid is the fake's child.
     unsafe { libc::kill(later as i32, libc::SIGKILL) };
+}
+
+// T31 (ADR 0028 §8; found live 2026-10-15, MN2): a worker that forks a
+// short-lived child before its rank process reports both, the gone child as
+// gone, each under its own role: no two of its processes share one, so the
+// controller records the member launched. Failed before the change: the rank
+// process was journaled as a second `worker-0` beside the gone one, and the
+// controller refused the identities (`mark_member_launched`: Plan).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gone_transient_child_never_lends_its_role_to_the_rank_process() {
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_transient_child();
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    let identities: Vec<_> = out
+        .processes
+        .iter()
+        .map(|p| capyctl_domain::completion::ProcessIdentity {
+            role: p.role.clone(),
+            pid: p.pid,
+            boot_id: p.boot_id.clone(),
+            start_ticks: p.start_ticks,
+        })
+        .collect();
+    assert!(
+        out.processes.iter().any(|p| p.presence == "gone"),
+        "the transient child is reported, gone: {:?}",
+        out.processes
+    );
+    assert!(
+        out.processes
+            .iter()
+            .filter(|p| p.presence == "alive")
+            .count()
+            >= 2,
+        "the leader and its rank process run: {:?}",
+        out.processes
+    );
+    capyctl_domain::group::validate_local_processes(&identities)
+        .unwrap_or_else(|_| panic!("every role is unique: {:?}", out.processes));
 }
 
 // T31, T33: a worker terminates its own recorded tree only.
