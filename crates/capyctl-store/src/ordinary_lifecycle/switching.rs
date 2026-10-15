@@ -696,7 +696,7 @@ impl crate::Store {
                     .iter()
                     .map(|v| format!("{}/{}", v.deployment_id, v.instance))
                     .collect(),
-                detail: record.detail.chars().take(512).collect(),
+                detail: capyctl_domain::diagnostics::bound_chars(record.detail, 512),
             },
         )
         .map_err(|error| match error {

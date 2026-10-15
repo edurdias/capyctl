@@ -1448,9 +1448,9 @@ impl AgentSessions {
                                 }
                                 let (accepted, reason) = match verdict {
                                     Ok(()) => (true, String::new()),
-                                    // ADR 0018: the reason is bounded; `chars` never
-                                    // cuts a character in two.
-                                    Err(reason) => (false, reason.chars().take(capabilities::MAX_REASON).collect()),
+                                    // ADR 0018: the reason is bounded on a character
+                                    // boundary, a cut one ending in an ellipsis.
+                                    Err(reason) => (false, capyctl_domain::diagnostics::bound_chars(&reason, capabilities::MAX_REASON)),
                                 };
                                 if accepted {
                                     // Placement reads the new snapshot from here on.

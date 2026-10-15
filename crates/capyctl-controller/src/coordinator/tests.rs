@@ -1669,7 +1669,9 @@ async fn attempts_until_given_up(failure: capyctl_adapters::traits::RuntimeError
 async fn a_deterministic_refusal_gives_up_without_retrying() {
     use capyctl_adapters::traits::RuntimeError;
     for reason in [
-        "SGLang keeps 2111963136 bytes of recurrent state for 8 running requests",
+        "raise engine_config.memory.request to \"40960MiB\" (42949672960 bytes), keeping \
+         memory.kv_cache at 17179869184 bytes: SGLang keeps 2111963136 bytes of recurrent \
+         state for 8 running requests",
         "checkpoint_mismatch",
         "capability_missing:deep_park",
     ] {

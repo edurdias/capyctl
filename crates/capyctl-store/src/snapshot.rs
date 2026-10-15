@@ -302,11 +302,11 @@ impl Store {
 }
 
 /// SPEC §6.4: an operation and its error as status shows them. The reason is
-/// the latest journal evidence of an operation that did not succeed, bounded
-/// and redacted (`capyctl_domain::diagnostics::public_reason`): one line, never an
-/// engine log tail, an option value or a credential. The hint is fixed text
-/// for the closed category the error belongs to. Recorded history, not proof
-/// of what runs now.
+/// the latest journal evidence of an operation that did not succeed, redacted
+/// (`capyctl_domain::diagnostics::public_text`) and bounded (`bound_bytes`):
+/// one line, never an engine log tail, an option value or a credential. The
+/// hint is fixed text for the closed category the error belongs to. Recorded
+/// history, not proof of what runs now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LatestOperation {
     pub id: String,
@@ -1133,7 +1133,9 @@ fn latest_operation(
     sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<Option<LatestOperation>, SnapshotError> {
-    use capyctl_domain::diagnostics::{classify, is_closed_code, operator_hint, public_reason};
+    use capyctl_domain::diagnostics::{
+        bound_bytes, classify, is_closed_code, operator_hint, public_text, MAX_REASON_BYTES,
+    };
     let mut statement = tx.prepare_cached(sql)?;
     let mut rows = statement.query(params)?;
     let Some(r) = rows.next()? else {
@@ -1151,15 +1153,18 @@ fn latest_operation(
         .get::<_, Option<String>>(3)?
         .filter(|code| is_closed_code(code));
     let failed = state != "succeeded";
-    let reason = failed
+    // The hint is classified from the whole reason, then the reason is
+    // bounded: a cut reason never loses its hint.
+    let text = failed
         .then(|| r.get::<_, Option<String>>(4))
         .transpose()?
         .flatten()
-        .and_then(|evidence| public_reason(&evidence));
+        .and_then(|evidence| public_text(&evidence));
     let hint = failed
-        .then(|| classify(error_code.as_deref(), reason.as_deref().unwrap_or("")))
+        .then(|| classify(error_code.as_deref(), text.as_deref().unwrap_or("")))
         .flatten()
         .and_then(operator_hint);
+    let reason = text.map(|text| bound_bytes(&text, MAX_REASON_BYTES));
     Ok(Some(LatestOperation {
         id: r.get(0)?,
         kind: r.get(1)?,

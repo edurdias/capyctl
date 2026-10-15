@@ -146,9 +146,13 @@ async fn wait_succeeds_once_every_replica_is_ready() {
 // sizing refusal, a TensorFold memory cap) gives up and closes the instance's
 // admission while its operation stays pending until the Initialize deadline.
 // `--wait` ends at once with the refusal status shows, not after the window.
+// Found live 2026-10-15: status bounds that reason, and the sizing refusal
+// now leads with the request to raise to, so the printed error keeps it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_ends_at_once_when_the_start_gave_up() {
-    const REFUSAL: &str = "gave up: launch refused: SGLang keeps 1 bytes of recurrent state";
+    const REFUSAL: &str = "gave up: host policy refused the launch before any effect: raise \
+        engine_config.memory.request to \"75GiB\" (80530636800 bytes), keeping memory.kv_cache \
+        at 31138512896 bytes: SGLang's static pool holds 21921697280 bytes of weights…";
     let (output, began) = wait_for_given_up(REFUSAL).await;
     let said = format!(
         "{}{}",
@@ -160,7 +164,15 @@ async fn wait_ends_at_once_when_the_start_gave_up() {
         "{said}"
     );
     assert!(!output.status.success(), "{said}");
-    assert!(said.contains(REFUSAL), "{said}");
+    let error: Value = said
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_else(|| panic!("no JSON error: {said}"));
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("Operation {OPERATION} failed: {REFUSAL}")),
+        "{message}"
+    );
 }
 
 // T29 (found live 2026-10-09): a start that gave up because the host's
