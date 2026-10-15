@@ -988,6 +988,14 @@ Rule (unified memory; a discrete device keeps the note above):
   model's KV layers (amendment A9), it shares the KV cache, so the tokens passed are the
   KV cache over the target's and that layer's bytes per token. The MTP layer itself is in
   the measured weights.
+- Owner decision 2026-10-14 (uncertainty retains accounting): a stated memory request
+  whose static pool (the request less the margin of its family, unified or discrete)
+  cannot hold the weights (with an MTP draft's tables), the KV cache, the state the
+  arguments fix with `--max-mamba-cache-size` and, on unified memory, the 3 GiB is refused
+  before the launch, as an unfitting CapyCTL-sized state is: status warns and the start
+  is refused, naming the components and the smallest whole-GiB request that holds them.
+  The margin is no longer taken for it. A derived request still takes what it lacks from
+  its margin.
 
 Consequence: on a pool left to SGLang (a sliding-window model), SGLang's KV pool now gets
 about the KV cache the deployment states, where it got that less SGLang's own allocations;

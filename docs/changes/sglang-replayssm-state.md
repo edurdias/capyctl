@@ -39,8 +39,9 @@ reservation. Deployments without the flag size and fingerprint as before.
 ADR 0014's state formula notes the flag.
 
 Tests (`sglang_pool/tests.rs`, T14): the reported deployment without the flag
-keeps its figures (475136 KV tokens, a 79 GiB static pool) and with it
-renders a 71 GiB one; at a tighter request the static pool is exactly the
+counts its 111 slots and 92 intermediate states as before (it is now refused
+at 79 GiB, see below) and with it renders a 71 GiB static pool, 475136 KV
+tokens; at a tighter request the refusal counts exactly the
 111 slots and 23 ring-and-window sets; an abbreviation, the host-fixed
 arguments and a longer ring are counted, and `--enable-linear-replayssm` or
 `=true` are not; CapyCTL's own sizing at 79 GiB was refused and now holds 22
@@ -88,27 +89,57 @@ GiB here, which leaves SGLang's profile 0.7 GiB beyond the target's pool even
 with the GiB it was short live. When CapyCTL sizes the state itself the tables
 count with the weights, so that deployment without `--max-mamba-cache-size`
 is refused at 79 GiB, naming them, and holds its 22 requests at 82 GiB. The
-memory request and charge are unchanged: the tables are freed at start-up, so
-the margin gets them back. ADR 0014's rule for the static pool on unified
-memory states it. A launch without speculative decoding, with a separate draft
-model, or of a checkpoint without an MTP head sizes as before.
+tables are freed at start-up, so the margin gets them back. ADR 0014's rule
+for the static pool on unified memory states it. A launch without speculative
+decoding, with a separate draft model, or of a checkpoint without an MTP head
+sizes as before.
+
+## A stated request that cannot hold the state its arguments fix is refused
+
+Owner decision 2026-10-14 (AGENTS.md: uncertainty must retain accounting):
+until now the static pool CapyCTL rendered for a state fixed by
+`--max-mamba-cache-size` was capped at the memory request, and what it lacked
+came out of the margin unannounced: with the MTP draft counted, the deployment
+above would have rendered 75.44 GiB of its 79 GiB, a 3.6 GiB margin,
+under-charged. Now, when a stated (not derived) memory
+request's static pool, the request less its family's margin (8 GiB on unified
+memory, `(request − kv_cache) / 11` on a discrete GPU), cannot hold the
+weights (with an MTP draft's tables), the KV cache, that state and, on
+unified memory, the 3 GiB of SGLang's own allocations, CapyCTL refuses it as
+it refuses a CapyCTL-sized state that does not fit: `status` and `validate`
+warn beforehand and the start is refused (resolution reads no checkpoint, so
+it cannot refuse earlier), naming each component, their total and the
+smallest whole-GiB request that holds them. For the live deployment: 81000320720
+bytes (75.44 GiB) with the 8 GiB margin, so `request: 84GiB`, which passes
+894373 KV tokens and a 76 GiB static pool; 83 GiB is refused. Without
+`--enable-linear-replayssm-spec` the same deployment (92 intermediate states)
+needs 96 GiB. A derived request still takes what it lacks from its margin.
+The pinned recipe, fingerprint and golden tests (`capyctl-config`,
+`capyctl-adapters`, `capyctl-store`, `capyctl-cli`, `capyctl-controller`)
+resolve unchanged; three unit tests that showed the capped static pool with a
+stated request now show the refusal and the request it names
+(`arguments_that_size_the_state_pool_win` moves its 48 GiB request to 64 GiB
+so the 65 slots it fixes fit).
 
 Tests (`sglang_pool/tests.rs`, T14):
 `an_mtp_draft_keeps_its_kv_layer_and_tables_in_the_static_pool` reproduces the
 live deployment from the checkpoint's configuration and safetensors headers
 (the old figures and SGLang's profile of them, the new 894373 tokens and
-static pool, `NEXTN`, `EAGLE3`, a draft KV dtype, the refusal and 82 GiB);
-`other_launches_of_an_mtp_checkpoint_size_as_before` pins the unchanged cases
-and the tied tables. Both failed before the change and pass after.
+static pool, `NEXTN`, `EAGLE3`, a draft KV dtype, the CapyCTL-sized refusal
+and 82 GiB; the 79 GiB request refused naming 84 GiB, and 84 GiB passing
+894373 tokens); `other_launches_of_an_mtp_checkpoint_size_as_before` pins the
+unchanged cases and the tied tables. Both failed before the change and pass
+after, and `arguments_that_fix_the_state_pool_are_held_by_the_static_pool`
+pins the refusal's whole-GiB request and its boundary.
 
 CPU and Fake-engine tests only; they are not qualification. Live check still
-needed: launch the MTP deployment on SGLang 0.5.21 and confirm the engine log
-shows `--max-total-tokens 894373` and `max_total_num_tokens` 894373, the
-"Mamba Cache is allocated" and "GDN ReplaySSM ring buffers allocated" lines
-(no `intermediate_ssm_state_cache`) match the counted bytes, and the Ready
-footprint. With 29 GiB of KV now actually allocated the Ready footprint is
-expected to grow by 3.8 to 4.0 GiB over the live run's, above the 79 GiB
-request: that deployment needs a larger request or a smaller KV cache.
+needed: launch the MTP deployment on SGLang 0.5.21 with `request: 84GiB` and
+confirm the engine log shows `--max-total-tokens 894373` and
+`max_total_num_tokens` 894373, the "Mamba Cache is allocated" and "GDN
+ReplaySSM ring buffers allocated" lines (no `intermediate_ssm_state_cache`)
+match the counted bytes, and the Ready footprint (expected 3.8 to 4.0 GiB
+above the live run's 78.7 to 81.8 GiB) stays within the charge; and that at
+79 GiB `status` warns and the start is refused naming 84 GiB.
 
 # Release note: Memory
 
@@ -119,3 +150,7 @@ request: that deployment needs a larger request or a smaller KV cache.
   its own MTP head now has that draft's KV layer counted in its KV cache and
   its start-up copy of the embedding and LM head in SGLang's static pool, so
   SGLang holds the KV pool CapyCTL passes instead of a smaller one.
+  A stated memory request that cannot hold the state `--max-mamba-cache-size`
+  fixes, with the weights, the KV cache, SGLang's own allocations and the
+  margin, is now refused before the start, naming the request that does,
+  instead of running on a smaller margin.

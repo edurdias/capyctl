@@ -72,7 +72,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Context length | `--context-length` | typed | `engine_config.context_length` |
 | Max running requests | `--max-running-requests` | typed | `engine_config.max_concurrent_requests` |
 | KV pool in tokens | `--max-total-tokens` | typed | `engine_config.sglang.max_total_tokens`. Without it CapyCTL computes it from `memory.kv_cache`. |
-| Mamba / state cache | `--max-mamba-cache-size`, `--mamba-full-memory-ratio`, `--mamba-ssm-dtype` | extra | On a gated-delta-net hybrid CapyCTL sets `--max-mamba-cache-size` itself from `max_concurrent_requests`. If you pass either of the first two, it leaves the state pool to you, and `memory.request` must hold it. |
+| Mamba / state cache | `--max-mamba-cache-size`, `--mamba-full-memory-ratio`, `--mamba-ssm-dtype` | extra | On a gated-delta-net hybrid CapyCTL sets `--max-mamba-cache-size` itself from `max_concurrent_requests`. If you pass either of the first two, it leaves the state pool to you, and `memory.request` must hold it. A stated `memory.request` that cannot hold the state `--max-mamba-cache-size` fixes, with the weights, the KV cache, SGLang's own allocations and the margin, is refused before the start, naming the request that does. |
 | Static memory fraction | `--mem-fraction-static` | reserved | `engine_config.memory.request` and `memory.kv_cache`. See [Reaching a memory fraction](#reaching-an-sglang-memory-fraction). |
 | CPU offload, weight backup | `--cpu-offload-gb`, `--enable-weights-cpu-backup` | reserved | `residency`: CapyCTL chooses how weights come back after parking. |
 | Memory saver | `--enable-memory-saver` | reserved | `residency` (parking) |

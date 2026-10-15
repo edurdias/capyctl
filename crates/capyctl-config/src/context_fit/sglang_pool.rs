@@ -456,6 +456,9 @@ pub fn sglang_pool(
         _ => 0,
     };
     let mut pool = sized_pool(settings, profile_args, config, draft)?;
+    if fixed_state > 0 {
+        fixed_state_fits(settings, &args, fixed_state, draft_tables)?;
+    }
     // ADR 0014, note on amendment A14: SGLang 0.5.21 charges the weights as
     // loaded and its own allocations against the static pool before any KV
     // pool (`_profile_available_bytes`), whether CapyCTL fixed the pools or
@@ -484,6 +487,71 @@ pub fn sglang_pool(
         pool.static_allowance = Some(DISCRETE_BASELINE_ALLOWANCE_BYTES);
     }
     Ok(pool)
+}
+
+/// Owner decision 2026-10-14 (AGENTS.md: uncertainty retains accounting): a
+/// declared memory request whose static pool cannot hold the state the
+/// arguments fix (`--max-mamba-cache-size`) beside the weights (with an MTP
+/// draft's tables), the KV cache and, on unified memory,
+/// [`STATIC_OVERHEAD_BYTES`], with the family's margin outside it, is refused
+/// with the smallest whole-GiB request that holds them. A derived request keeps
+/// taking what it lacks from its margin, and an unknown weight size refuses
+/// nothing.
+fn fixed_state_fits(
+    settings: &SglangLaunchSettings,
+    args: &[String],
+    state: u64,
+    draft_tables: u64,
+) -> Result<(), String> {
+    let memory = &settings.memory;
+    let Some(weights) = memory.weights_bytes.and_then(|w| u64::try_from(w).ok()) else {
+        return Ok(());
+    };
+    if derived_request(settings, weights) {
+        return Ok(());
+    }
+    let kv = u64::try_from(memory.kv_cache_bytes).unwrap_or(0);
+    let overhead = match memory.device_total_bytes {
+        Some(_) => 0,
+        None => STATIC_OVERHEAD_BYTES,
+    };
+    let held = weights.saturating_add(draft_tables).saturating_add(kv);
+    let needed = state.saturating_add(overhead);
+    let (margin, static_bytes) = static_pool_bytes(memory);
+    if u64::try_from(static_bytes).unwrap_or(0) >= held.saturating_add(needed) {
+        return Ok(());
+    }
+    let named = smallest_request(memory, held, needed)
+        .and_then(|mib| {
+            let gib = mib.checked_add(1023)? / 1024;
+            Some(format!(
+                "to \"{gib}GiB\" ({} bytes)",
+                gib.checked_mul(1 << 30)?
+            ))
+        })
+        .unwrap_or_else(|| "beyond what CapyCTL can express".into());
+    let slots = option_value(args, "--max-mamba-cache-size")
+        .1
+        .unwrap_or_default();
+    Err(format!(
+        "SGLang's static pool holds {weights} bytes of weights{}, the {kv}-byte KV cache, \
+         {state} bytes of recurrent state for the {slots} slots `--max-mamba-cache-size` \
+         fixes{}, and {overhead} bytes of SGLang's own allocations, {} bytes in all; with the \
+         {margin}-byte margin outside it that is more than the {}-byte memory request; raise \
+         engine_config.memory.request {named}, keeping memory.kv_cache at {kv} bytes",
+        if draft_tables > 0 {
+            format!(", the MTP draft's {draft_tables}-byte embedding and LM head")
+        } else {
+            String::new()
+        },
+        if option_value(args, "--speculative-algorithm").0 {
+            " (with its speculative decoding scratch)"
+        } else {
+            ""
+        },
+        held.saturating_add(needed),
+        memory.request_bytes,
+    ))
 }
 
 /// The recurrent state SGLang 0.5.21 reserves for the slots the arguments
