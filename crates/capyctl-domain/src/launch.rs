@@ -244,13 +244,12 @@ pub struct VllmLaunchSettings {
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_batched_tokens: Option<u32>,
-    /// ADR 0014 §4 (amended 2026-10-07; amendment A21, owner decision
-    /// 2026-10-09): vLLM's safetensors loader. `None` means CapyCTL applies
-    /// no choice: the deployment did not declare one and does not park
-    /// (vLLM's own default then governs, already memory-mapped/lazy
-    /// loading). A parking deployment that does not declare one always
-    /// resolves `Some`: capyctl's default for the host's memory shape
-    /// (`lazy` on unified memory, `eager` on a discrete GPU, ADR 0019).
+    /// ADR 0014 §4 (amended 2026-10-07; amendment A21, note of 2026-10-15):
+    /// vLLM's safetensors loader. `None` means CapyCTL applies no choice:
+    /// the deployment did not declare one and does not park (vLLM's own
+    /// default then governs, already memory-mapped/lazy loading). A parking
+    /// deployment that does not declare one always resolves `Some`:
+    /// capyctl's default `eager`, on every memory shape.
     /// `provenance["vllm.safetensors_load_strategy"]` names a defaulted
     /// value; a declared one has no entry. Only
     /// `VllmLaunchSettings::renders_eager_loader` says whether CapyCTL
@@ -298,12 +297,14 @@ impl VllmLaunchSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SafetensorsLoadStrategy {
-    /// Read each file into CPU memory before loading (capyctl's default on a
-    /// discrete GPU, ADR 0019: the fast deep wake measured on vLLM 0.29).
+    /// Read each file into CPU memory before loading (capyctl's default for a
+    /// parking deployment on every memory shape, ADR 0014 amendment A21 note
+    /// of 2026-10-15: the fast deep wake measured on vLLM 0.29 and 0.30).
     Eager,
-    /// Memory-map each file and load on demand (capyctl's default on unified
-    /// memory, amendment A21: on vLLM 0.30 NVFP4 it held far less memory
-    /// loading and parked, at a slower deep wake).
+    /// Memory-map each file and load on demand (an explicit choice only,
+    /// amendment A21: on vLLM 0.30 NVFP4 on unified memory it held far less
+    /// memory loading and parked, at a slower start and deep wake; its
+    /// in-place wake failed live on Qwen3.8-27B NVFP4, note of 2026-10-15).
     Lazy,
 }
 

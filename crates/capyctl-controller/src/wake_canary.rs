@@ -20,7 +20,7 @@ use capyctl_adapters::completion_probe::{ProbeAnswer, PROMPT};
 use capyctl_store::wake_canary::StoredWakeCanary;
 
 pub use crate::group_residency::{CANARY_DEADLINE, CANARY_TOKENS};
-pub use capyctl_store::wake_canary::WAKE_MISMATCH;
+pub use capyctl_store::wake_canary::{WAKE_MISMATCH, WAKE_RELOAD_FAILED, WAKE_UNCERTAIN};
 
 /// What a wake's canary proves against its launch's reference.
 #[derive(Clone, Debug, PartialEq, Eq)]

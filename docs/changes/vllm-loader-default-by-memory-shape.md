@@ -1,68 +1,66 @@
-# Status: vLLM's safetensors loader defaults by memory shape — 2026-10-09 (branch `feat/vllm-lazy-default-unified`)
+# Status: vLLM's safetensors loader stays `eager` by default while parking — 2026-10-15 (branch `fix/vllm-deep-wake`)
 
-Owner decision 2026-10-09 (ADR 0014 amendment A21). The note on §3 and §4 (2026-10-07,
-PR #73) left vLLM's safetensors loader defaulting to `eager` under sleep mode on every
-host, from a Qwen3-4B qualification on a discrete GPU (vLLM 0.29, `785b887`: wake 57 s to
-7.5 s). A controlled catalog comparison now makes the default follow the host's own
-unified/discrete memory shape instead: host A, Qwen3.6-35B NVFP4, vLLM 0.30, deep park,
-`eager` vs `lazy` — start 98 s vs 180 s, loading peak 54.2 vs 34.5 GiB, ready footprint
-43.95 vs 26.63 GiB, parked charge after three cycles 28.3 vs 8.3 GB, wake to first token
-about 51 s vs 81 s. `eager` also drove amendment A19's parked-growth guard into stops.
+ADR 0014 amendment A21 and its note of 2026-10-15. On 2026-10-09 amendment A21 made a
+parking vLLM deployment's undeclared loader follow the host's memory shape (`lazy` on unified
+memory, `eager` on a discrete GPU), from a catalog comparison on host A (Qwen3.6-35B NVFP4,
+vLLM 0.30, deep park, `eager` vs `lazy`: loading peak 54.2 vs 34.5 GiB, parked charge after
+three cycles 28.3 vs 8.3 GB, wake to first token about 51 s vs 81 s). The same release
+reverted it on live evidence from host A (GB10, vLLM 0.30.0, Qwen3.8-27B NVFP4, deep park,
+run `target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`):
 
-Resolution now picks `lazy` on unified memory and keeps `eager` on a discrete GPU (ADR
-0019) absent a declared `engine_config.vllm.safetensors_load_strategy`, reusing the same
-device-domain detection the memory request and margin already derive on
-(`EngineInputs::device`) — but only for a **parking** deployment, the only case CapyCTL
-ever renders the flag (§3: reserved to sleep mode unless declared). A review caught an
-earlier revision resolving the default for every deployment, so an undeclared, non-parking
-launch on a discrete GPU showed `eager` while rendering nothing; vLLM 0.30's own
-`LoadConfig.safetensors_load_strategy` default is already memory-mapped (`lazy`) loading
-(`vllm/config/load.py`), not eager, so that shown value did not match what ran. A
-non-parking, undeclared deployment now resolves and shows no strategy at all, on either
-memory shape, exactly as before this change. Where a default does apply, it is shown in the
-effective configuration (`VllmLaunchSettings::safetensors_load_strategy`), with
-`provenance["vllm.safetensors_load_strategy"]` naming it `capyctl default`; a declared value
-still has no entry. Rendering is unchanged: under sleep mode the resolved value always
-renders beside `--enable-sleep-mode`, and outside it only a declared value renders, so an
-undeclared, non-parking launch keeps its command identity and fingerprint.
+- No declared loader (`lazy` default): cold start 601.6 s; the first wake's in-place weight
+  reload took 123 s, beyond the 120 s `reload_weights` bound, so the wake ended uncertain and
+  the instance stayed uncertain for 21 minutes until the deployment was deleted.
+- Declared `eager`: six wakes of 23-28 s, each with a correct answer, parked charge flat at
+  4.8 GiB.
+- The `MRotaryEmbedding: Failed to load weights` warning appeared in both runs and is not the
+  cause.
+- The same branch (change file `vllm-deep-wake.md`) bounds a wake's weight reload by the
+  wake window (180 s here) instead of a fixed 120 s, so that 123 s reload would no longer be
+  cut; a `lazy` wake of this model has not been rechecked live.
 
-The startup placeholder (`STARTUP_WEIGHTS_FACTOR`, 2.25) was measured with no loader flag
-rendered at all (vLLM's own default, memory-mapped); it stays the factor for every
-non-eager launch. A new `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6, scaled from the evidence's
-54.2 / 34.5 loading-peak ratio and rounded up for headroom) applies exactly when CapyCTL
-will actually render `--safetensors-load-strategy eager`
-(`VllmLaunchSettings::renders_eager_loader`), in both the deploy-time placeholder
-(`resolve_startup`) and the store's solo-first-start recomputation
-(`ordinary_lifecycle::startup::weighed_placeholder`).
+What ships: absent a declared `engine_config.vllm.safetensors_load_strategy`, a parking
+deployment resolves `eager` on unified memory and on a discrete GPU alike, as 0.1.2 did, shown
+in the effective configuration with `provenance["vllm.safetensors_load_strategy"]` naming it
+`capyctl default`. A declared `lazy` or `eager` wins and has no provenance entry. A
+non-parking, undeclared deployment still resolves and renders no loader. The startup
+placeholder uses `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6) exactly where
+`--safetensors-load-strategy eager` renders (`VllmLaunchSettings::renders_eager_loader`), which
+now includes the defaulted `eager` on unified memory; a declared `lazy` keeps
+`STARTUP_WEIGHTS_FACTOR` (2.25).
 
 Tests, failing before and passing after:
 
-- `the_default_load_strategy_follows_the_host_memory_shape` (capyctl-adapters): a unified
-  fixture resolves `lazy`, a discrete one resolves `eager`, a declared choice wins on either
-  and carries no provenance entry, and the resolved value (declared or defaulted) renders in
-  `sleep_flags` and the argv.
-- `an_undeclared_strategy_stays_unset_without_parking` (capyctl-adapters): a non-parking
-  deployment resolves no strategy, shows no provenance entry and renders nothing, on
-  unified memory or a discrete GPU alike (the review correction above).
-- `an_omitted_load_strategy_keeps_existing_identities` (capyctl-config): the unified
-  fixture's omitted loader now resolves to `lazy` with a `capyctl default` provenance entry
-  that round-trips through the effective snapshot; the command fingerprint stays pinned.
-- `the_startup_placeholder_follows_the_effective_loader` (capyctl-config): a declared
-  `eager` loader scales the startup placeholder by `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR`; a
-  declared `lazy` loader on the same host keeps `STARTUP_WEIGHTS_FACTOR`.
-- `sleep_mode_follows_the_host_deep_park_switch` and `the_load_strategy_follows_the_deployment_setting`
-  (capyctl-adapters) updated for the unified fixture's new default.
+- `the_default_load_strategy_is_eager_on_every_memory_shape` (capyctl-adapters, renamed from
+  `the_default_load_strategy_follows_the_host_memory_shape`): unified and discrete fixtures
+  both resolve `eager` with a `capyctl default` provenance entry and render it; a declared
+  `lazy` wins on either shape with no provenance entry.
+- `sleep_mode_follows_the_host_deep_park_switch` and
+  `the_load_strategy_follows_the_deployment_setting` (capyctl-adapters): the unified fixture's
+  undeclared loader renders `eager`.
+- `an_undeclared_strategy_stays_unset_without_parking` (capyctl-adapters): unchanged.
+- `an_omitted_load_strategy_keeps_existing_identities` (capyctl-config): the unified fixture's
+  omitted loader resolves `eager` with `capyctl default`; a declared `lazy` resolves `lazy`
+  with no provenance entry; the command fingerprint stays pinned.
+- `the_startup_placeholder_follows_the_effective_loader` (capyctl-config): a defaulted parking
+  deployment on unified memory and a declared `eager` both use the eager factor; a declared
+  `lazy` uses `STARTUP_WEIGHTS_FACTOR`.
+- Recipe fingerprints re-pinned where the parking fixture's resolved loader changed
+  (`an_absent_drafter_keeps_every_encoding_and_fingerprint`, `declared_resources_are_unchanged`,
+  `a_single_host_deployment_is_unchanged`, `effective-vllm-golden.json`).
 
-CPU and Fake-engine tests only; they are not qualification. Live check still needed: on
-host A or B, a unified-memory deep-park deployment with no declared loader wakes with
-`lazy` and holds the lower footprint and parked charge the catalog measured; a discrete-GPU
-deployment still gets `eager`.
+CPU and Fake-engine tests only; they are not qualification. Live check still needed: on host
+A, model 1 on vLLM 0.30, deep park, no declared loader: the argv carries
+`--safetensors-load-strategy eager`, the effective configuration shows provenance
+`capyctl default`, and three wakes answer correctly.
 
 # Release note: Memory
 
-- **vLLM's weight loader now defaults by the machine's memory.** A deep-parking vLLM
-  deployment that does not set `engine_config.vllm.safetensors_load_strategy` gets `lazy`
-  on a machine with unified memory (GPU and system memory share one pool) and `eager` on a
-  discrete GPU. On unified memory this trades a slower wake for far less memory held while
-  loading, running and parked; set the field to `eager` by hand if the wake time matters
-  more. See [vLLM weight loading while parking](../guide/engines.md#vllm-weight-loading-while-parking).
+- **vLLM's weight loader while parking stays `eager` by default.** 0.1.3 does not change the
+  default: a deep-parking vLLM deployment that does not set
+  `engine_config.vllm.safetensors_load_strategy` loads with `eager`, as in 0.1.2, on every
+  machine. You can set `lazy` instead; on unified memory it holds far less memory while
+  loading, running and parked (Qwen3.6-35B NVFP4: 34.5 against 54.2 GiB while loading, 8.3
+  against 28.3 GB parked), at the cost of a slower start and wake. On vLLM 0.30 with
+  Qwen3.8-27B NVFP4, a `lazy` wake took over two minutes to reload the weights and did not
+  complete. See [vLLM weight loading while parking](../guide/engines.md#vllm-weight-loading-while-parking).

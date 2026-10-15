@@ -44,6 +44,15 @@ pub enum RuntimeError {
     /// released only on verified absence of the recorded processes.
     #[error("engine launch failed: {0}")]
     LaunchFailed(String),
+    /// SPEC §9.1, §13.2 (found live 2026-10-15): a restore's weight reload
+    /// ran and the engine answered that it failed (vLLM's `/collective_rpc`
+    /// returns an error status when `reload_weights` raises). This is
+    /// evidence, not uncertainty: the weights are not usable and nothing
+    /// retries the reload in place. The caller fails the wake
+    /// `wake_reload_failed` and stops the instance; its accounting is
+    /// released only on gone evidence.
+    #[error("wake_reload_failed: {0}")]
+    ReloadFailed(String),
 }
 
 /// ADR 0008 (owner decision 2026-09-23): the operator's next step for a

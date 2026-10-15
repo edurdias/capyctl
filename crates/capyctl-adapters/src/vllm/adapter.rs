@@ -520,7 +520,9 @@ impl EngineAdapter for VllmAdapter {
         // gated by the same policy as park.
         self.require_policy("reload_weights")?;
         self.http
-            .collective_rpc()
+            .collective_rpc(std::time::Duration::from_secs(
+                crate::vllm::http::WEIGHT_RELOAD_TIMEOUT_SECS,
+            ))
             .await
             .map_err(|e| Self::uncertain_http("reload_weights", e))?;
         Ok(ReloadOutcome::Reloaded)

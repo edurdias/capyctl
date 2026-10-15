@@ -1441,7 +1441,10 @@ impl crate::Store {
 
     /// SPEC §13.2, T20: the armed step's outcome is unknown. Everything is
     /// retained (peak reservation, claim, closed dispatch) and the step is
-    /// never re-armed; an operator Stop resolves it on gone evidence.
+    /// never re-armed; a stop resolves it on gone evidence. A wake owes that
+    /// stop at once (a single launch's from `wake_stops_due`, found live
+    /// 2026-10-15; a group's from `group_residency_stops_due`); an uncertain
+    /// single launch's park waits for an operator stop.
     pub fn mark_residency_uncertain(
         &self,
         s: &CoordinatorSession,

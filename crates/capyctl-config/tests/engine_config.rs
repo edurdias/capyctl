@@ -298,9 +298,10 @@ fn the_load_strategy_is_a_typed_vllm_field() {
 /// ADR 0014 §4 (amended 2026-10-07): an omitted loader leaves every existing
 /// deployment's command identity as it was; declaring one changes it. The
 /// pinned fingerprint is the one `main` computed before the field existed.
-/// Amendment A21 (owner decision 2026-10-09) changed what an omitted loader
-/// resolves to in the *effective* configuration (shown with its source), but
-/// not the command identity, which is unaffected here either way.
+/// Amendment A21 (owner decision 2026-10-09; note of 2026-10-15) changed what
+/// an omitted loader resolves to in the *effective* configuration (`eager`
+/// for a parking deployment on every memory shape, shown with its source),
+/// but not the command identity, which is unaffected here either way.
 // T09
 #[test]
 fn an_omitted_load_strategy_keeps_existing_identities() {
@@ -316,15 +317,16 @@ fn an_omitted_load_strategy_keeps_existing_identities() {
     let LaunchSettings::Vllm(settings) = &effective.engine_config else {
         panic!("vLLM settings");
     };
-    // The fixture's host is unified memory (amendment A21): an omitted
-    // loader resolves to `lazy`, shown with its source.
+    // The fixture's host is unified memory and the fixture parks (amendment
+    // A21, note of 2026-10-15): an omitted loader resolves to `eager`, shown
+    // with its source.
     assert_eq!(
         settings.safetensors_load_strategy,
-        Some(SafetensorsLoadStrategy::Lazy)
+        Some(SafetensorsLoadStrategy::Eager)
     );
     assert_eq!(
         snapshot["engine_config"]["safetensors_load_strategy"],
-        json!("lazy")
+        json!("eager")
     );
     assert_eq!(
         snapshot["engine_config"]["provenance"]["vllm.safetensors_load_strategy"],
@@ -342,6 +344,21 @@ fn an_omitted_load_strategy_keeps_existing_identities() {
         original,
         deployment_command_fingerprint(&declared, 300_000).unwrap()
     );
+
+    // A declared `lazy` wins and carries no provenance entry.
+    let mut lazy = deployment.clone();
+    lazy["engine_config"]["vllm"]["safetensors_load_strategy"] = "lazy".into();
+    let lazy = resolve_effective(&lazy, &host).unwrap();
+    let LaunchSettings::Vllm(settings) = &lazy.engine_config else {
+        panic!("vLLM settings");
+    };
+    assert_eq!(
+        settings.safetensors_load_strategy,
+        Some(SafetensorsLoadStrategy::Lazy)
+    );
+    assert!(!settings
+        .provenance
+        .contains_key("vllm.safetensors_load_strategy"));
 }
 
 /// ADR 0014 §2, §6: shape and duplicates. A typed field's native spelling is a

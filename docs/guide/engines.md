@@ -467,27 +467,29 @@ CapyCTL reserves.
 
 ## vLLM weight loading while parking
 
-A vLLM deployment that parks `deep` reloads its weights on every wake. CapyCTL
-picks a default loader from the machine's memory, unless you set one:
-`lazy` on a machine with unified memory (GPU and system memory share one
-pool, like a GB10), `eager` on a discrete GPU.
+A vLLM deployment that parks `deep` reloads its weights on every wake. Unless
+you set a loader, CapyCTL uses `eager` on every machine.
 
 `eager` reads each weight file into memory before loading. On a discrete GPU
-(vLLM 0.29, Qwen3-4B) this cut a wake from 57 s to 7.5 s. On a unified-memory
-machine (vLLM 0.30, an NVFP4 model) the trade runs the other way: `eager`
-held around 54 GiB while loading against `lazy`'s 34 GiB, about 44 GiB
-against 27 GiB once running, and around 28 GB still held after parking and
-waking three times in a row against `lazy`'s 8 GB — holding onto that much
-memory can also trip the stop that CapyCTL uses instead of a park once the
-parked memory keeps growing run after run. `eager`'s wake (about 51 s) is
-still faster than `lazy`'s (about 81 s), so pick `eager` by hand if the wake
-time matters more than the memory. `lazy` maps the weight files instead of
-reading them up front. Choose it either way in the deployment:
+(vLLM 0.29, Qwen3-4B) this cut a wake from 57 s to 7.5 s. On a GB10 (vLLM
+0.30, Qwen3.8-27B NVFP4) each `eager` wake took 23-28 s and answered
+correctly.
+
+`lazy` maps the weight files instead of reading them up front. On a machine
+with unified memory (GPU and system memory share one pool, like a GB10) it
+holds far less memory: with Qwen3.6-35B NVFP4 on vLLM 0.30, around 34 GiB
+while loading against `eager`'s 54 GiB, about 27 GiB against 44 GiB once
+running, and around 8 GB still held after parking and waking three times in
+a row against `eager`'s 28 GB. The cost is a slower start and wake (about
+81 s against 51 s there). On vLLM 0.30 with Qwen3.8-27B NVFP4, a `lazy` wake
+took over two minutes to reload the weights and did not complete, so check
+that your model wakes within its wake window (`timeouts.wake`) before relying
+on it. Choose it in the deployment:
 
 ```yaml
 engine_config:
   vllm:
-    safetensors_load_strategy: eager   # eager or lazy; default follows the machine's memory
+    safetensors_load_strategy: lazy   # eager (the default while parking) or lazy
 ```
 
 A deployment that does not park renders the loader only when you set it.

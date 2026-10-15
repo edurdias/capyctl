@@ -41,18 +41,15 @@ pub enum VllmPlanError {
 /// profile asks for sleep mode and the host has not opted out of deep park
 /// (Spec §3).
 ///
-/// ADR 0014 §4 (amended 2026-10-07; amendment A21, owner decision
-/// 2026-10-09): the loader is `settings.safetensors_load_strategy`, already
-/// resolved at config time to the deployment's choice or capyctl's default
-/// for the host's memory shape (`lazy` on unified memory, `eager` on a
-/// discrete GPU, ADR 0019). `unwrap_or(Eager)` only guards a `VllmLaunchSettings`
-/// built outside normal resolution (e.g. test fixtures). The eager default
-/// came from 785b887 (vLLM 0.29, Qwen3-4B, wake 57 s to 7.5 s); the catalog on
-/// vLLM 0.30 NVFP4 found the opposite trade on unified memory (host A,
-/// Qwen3.6-35B, deep park: start 98 s vs 180 s, loading peak 54.2 vs 34.5 GiB,
-/// ready footprint 43.95 vs 26.63 GiB, parked charge after three cycles 28.3
-/// vs 8.3 GB, wake to first token about 51 s vs 81 s), so unified hosts now
-/// default to `lazy`; a discrete GPU keeps `eager`.
+/// ADR 0014 §4 (amended 2026-10-07; amendment A21, note of 2026-10-15): the
+/// loader is `settings.safetensors_load_strategy`, already resolved at config
+/// time to the deployment's choice or capyctl's default `eager` on every
+/// memory shape. `unwrap_or(Eager)` only guards a `VllmLaunchSettings` built
+/// outside normal resolution (e.g. test fixtures). The eager default came from
+/// 785b887 (vLLM 0.29, Qwen3-4B, wake 57 s to 7.5 s). `lazy` holds less memory
+/// on unified memory but its in-place wake failed live on vLLM 0.30
+/// (Qwen3.8-27B NVFP4: the weight reload took 123 s and the wake ended
+/// uncertain), so it is an explicit choice only.
 pub fn sleep_flags(settings: &VllmLaunchSettings, deep_park_enabled: bool) -> Vec<String> {
     // ADR 0014 §3: sleep mode is reserved and derived at resolution from the
     // host's deep-park switch and the deployment's residency; the host switch is

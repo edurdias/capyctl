@@ -146,8 +146,8 @@ the deployment may override, shown with provenance `mllm default` in the effecti
 configuration (T14): SGLang CUDA graphs off while the memory saver is on (until A13), SGLang
 tokenizer and detokenizer workers 1, vLLM's safetensors loader whenever sleep mode is on
 (reserved there; the deployment chooses it with the typed `vllm.safetensors_load_strategy`,
-see the note on §4 of 2026-10-07 and amendment A21 of 2026-10-09: `lazy` on unified memory,
-`eager` on a discrete GPU). Every other `_FIXED` value is dropped and the engine's own default
+see the note on §4 of 2026-10-07 and amendment A21 with its note of 2026-10-15: `eager` on
+every memory shape, `lazy` only when declared). Every other `_FIXED` value is dropped and the engine's own default
 applies.
 
 ### 5. Memory request (P2)
@@ -1607,3 +1607,29 @@ memory shape (`the_default_load_strategy_follows_the_host_memory_shape`,
 `an_omitted_load_strategy_keeps_existing_identities`,
 `the_startup_placeholder_follows_the_effective_loader`). No live park has run with the new
 unified default yet.
+
+Note (2026-10-15, branch `fix/vllm-deep-wake`): the unified-memory `lazy` default is reverted
+before release. Live evidence on host A (GB10 unified memory, vLLM 0.30.0, Qwen3.8-27B NVFP4,
+deep park; run `target/live/0.1.3-backlog/2026-10-14-2311-release-checks/`):
+
+- B1, no declared loader (this amendment's `lazy` default): cold start 601.6 s, ready
+  footprint 45.92 GiB. The first wake reloaded the weights in place in 123.16 s, beyond
+  CapyCTL's 120 s `reload_weights` bound, so the wake ended uncertain
+  (`activation_uncertain`, 503 after 121 s) and the instance stayed uncertain for 21 minutes
+  until the deployment was deleted; wakes 2 and 3 failed at once on the retained uncertainty.
+- B4, same model, declared `eager`: six parks and wakes, each wake 23-28 s end to end
+  (reload 16.6-21.6 s) with a correct answer, parked charge flat at 4.8 GiB.
+- Both runs logged `MRotaryEmbedding: Failed to load weights` (vLLM 0.30
+  `finalize_layerwise_processing` placing a layer with no checkpoint weights back as a
+  fallback); it appears on the six correct eager wakes, so it is not the cause.
+
+Decision: absent a declared `vllm.safetensors_load_strategy`, a parking deployment resolves
+`eager` on every memory shape again, as in 0.1.2, with the same `capyctl default` provenance
+entry; a non-parking, undeclared deployment still resolves none. `lazy` stays available as an
+explicit choice. `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` is kept and, through
+`renders_eager_loader`, now applies to the defaulted `eager` on unified memory too; a declared
+`lazy` keeps `STARTUP_WEIGHTS_FACTOR`. `EngineInputs::device` no longer takes part in the
+loader default. Tests: `the_default_load_strategy_is_eager_on_every_memory_shape`,
+`an_undeclared_strategy_stays_unset_without_parking`,
+`an_omitted_load_strategy_keeps_existing_identities`,
+`the_startup_placeholder_follows_the_effective_loader`.

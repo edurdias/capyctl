@@ -263,7 +263,13 @@ fn a_measured_group_charges_each_member_its_share_of_the_weights() {
                 + memory.margin_bytes
                 + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
         );
-        assert!(member.cold.allocations[0].bytes < 20 * GIB * 9 / 4);
+        // Below the whole checkpoint's eager placeholder (the parking
+        // default, ADR 0014 amendment A21, note of 2026-10-15).
+        assert!(
+            member.cold.allocations[0].bytes
+                < 20 * GIB * capyctl_config::effective::VLLM_EAGER_STARTUP_WEIGHTS_FACTOR.0
+                    / capyctl_config::effective::VLLM_EAGER_STARTUP_WEIGHTS_FACTOR.1
+        );
     }
 }
 

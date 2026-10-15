@@ -12,8 +12,10 @@ use futures::StreamExt;
 /// Engine-control request timeout (versioned default; F1 design §5/§8).
 pub const ENGINE_CONTROL_TIMEOUT_SECS: u64 = 30;
 
-/// Reload stages checkpoint bytes again (46s for Qwen3-4B on Spark).
-/// Keep it bounded independently of the short sleep/wake controls.
+/// The reload bound of the adapter-level `reload_weights` control. A persisted
+/// restore step (`vllm::residency`) bounds its reload by the restore's own
+/// deadline instead (found live 2026-10-15: a lazy reload of Qwen3.8-27B NVFP4
+/// took 123 s on a GB10, inside its wake window but past this bound).
 pub const WEIGHT_RELOAD_TIMEOUT_SECS: u64 = 120;
 
 /// SPEC §9.1 / T21: the longest body read from the engine (a model list, a
@@ -288,14 +290,18 @@ impl EngineHttp {
     /// `POST /collective_rpc` — the dangerous collective control surface
     /// (vLLM security docs [S2]). Reachable only under the deep-park policy
     /// gate; the adapter invokes it exactly once per collective (SPEC §11).
-    pub async fn collective_rpc(&self) -> Result<WakeOutcome, HttpError> {
+    /// The reload re-reads the checkpoint, so it is bounded by `timeout`, not
+    /// by the short control timeout. vLLM answers an error status when
+    /// `reload_weights` raised (`UnexpectedStatus`); its answer carries no
+    /// other result (vLLM 0.30 `reload_weights` returns `None`).
+    pub async fn collective_rpc(&self, timeout: Duration) -> Result<WakeOutcome, HttpError> {
         let req = self
             .admin_auth(
                 self.client
                     .post(self.url("/collective_rpc"))
                     .json(&serde_json::json!({"method": "reload_weights"})),
             )
-            .timeout(Duration::from_secs(WEIGHT_RELOAD_TIMEOUT_SECS));
+            .timeout(timeout);
         self.post_outcome(req, "collective_rpc")
             .await
             .map(|()| WakeOutcome::Applied)
