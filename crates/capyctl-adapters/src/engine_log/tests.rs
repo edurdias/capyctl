@@ -86,6 +86,40 @@ fn ordinary_output_is_kept() {
     }
 }
 
+// T37 (found live 2026-10-14): SGLang's `server_args` line keeps its model
+// paths. A `.` in a path (`.cache`, `capyctl-0.1.3`) used to end the path,
+// and the long run after it was blanked as a credential; the keys on the same
+// line, a credential-length segment inside a path and URL credentials are
+// still redacted.
+#[test]
+fn model_paths_in_the_argument_echo_are_kept() {
+    let store = "/home/edurdias/capyctl-0.1.3-live-runs/2026-10-14-1854-b18/state/models/sources/hf/nvidia/Qwen3.8-27B-NVFP4@482ca0f3b9a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5";
+    let hub = "/home/edurdias/.cache/huggingface/hub/models--RadixArk--Qwen3.6-35B-A3B-NVFP4/snapshots/0123456789abcdef0123456789abcdef01234567";
+    let line = format!(
+        "server_args=ServerArgs(model_path='{store}', tokenizer_path='{hub}', api_key='{ENGINE_KEY}', admin_api_key='{ADMIN_KEY}')"
+    );
+    let out = redactor().redact(&line);
+    assert!(out.contains(&format!("model_path='{store}'")), "{out}");
+    assert!(out.contains(&format!("tokenizer_path='{hub}'")), "{out}");
+    assert!(
+        !out.contains(ENGINE_KEY) && !out.contains(ADMIN_KEY),
+        "{out}"
+    );
+    let unowned = LogRedactor::new();
+    let secret = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    for line in [
+        format!("GET /v1/models/x.{secret} 401"),
+        format!("/home/u/.cache/{secret}/w.bin"),
+        "fetch https://operator:p4ssw0rd@models.example/org/Qwen3.8-27B@main failed".to_owned(),
+    ] {
+        let out = unowned.redact(&line);
+        assert!(
+            !out.contains(secret) && !out.contains("p4ssw0rd") && out.contains(REDACTED),
+            "{line} -> {out}"
+        );
+    }
+}
+
 // The writer process receives the owned values encoded; nothing is lost.
 #[test]
 fn owned_values_survive_encoding() {
