@@ -137,6 +137,7 @@ fn report(rank: u32, host: &str, resident_bytes: i64, observed_at_ms: i64) -> Me
         host_id: host.into(),
         resident_bytes,
         observed_at_ms,
+        residue: None,
     }
 }
 

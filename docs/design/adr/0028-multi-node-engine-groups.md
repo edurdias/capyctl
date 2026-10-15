@@ -679,3 +679,45 @@ still needs gone evidence for every recorded identity and an empty group. A lead
 this process did not spawn (a launch from before a restart of the host role) is not
 held, and its leaderless group is still never signalled: that case stays uncertain and
 charged, as before.
+
+## Amendment of 2026-10-15: park evidence and the parked charge per member (owner decision)
+
+Found live at MN4 (vLLM 0.30.0 and SGLang 0.5.21, TP2 over two GB10 hosts): the
+head's collective succeeded (`POST /sleep?level=2` and `POST /release_memory_occupation`
+both 200), yet the group stayed `parking` for the whole 15-minute park step and then
+stopped. Three causes, each fixed here:
+
+- **A worker recorded its leader alone.** A worker's Launch reported its process tree
+  one second after the spawn, before the engine forked its rank process (vLLM's
+  `VLLM::Worker_TP1`, SGLang's rank scheduler) once its imports were done, so the
+  member's recorded processes were not the ones holding its device: its host's
+  `process_residency` named none of them and its saver enrollment was refused
+  (`owner_not_a_launch_member`). A worker's Launch now reports its tree only once it
+  holds a process per local rank besides the spawned one (none for a TensorFold
+  follower), bounded by the step's deadline (§8: "worker: its process tree").
+- **A vLLM member was judged on its anonymous pages.** Its host's `process_residency`
+  adds each process's anonymous resident pages to its device memory on a unified
+  host; a parked vLLM keeps more than its 2 GiB placeholder there (4.7 GiB measured on
+  one GB10 host), so no report ever settled. The park (and the wake) is now judged on
+  the device memory the driver attributes to the member's processes, which is what
+  the collective releases and restores; a SGLang member stays judged on its saver map.
+- **The wait ran to the step's deadline.** The collective returns once every rank
+  acted, so each member's own evidence is awaited for a bounded window after the head's
+  reply (60 s). A member still resident (or not resident after a wake) then fails the
+  group (`group_member_failed`); one that reported nothing of its own is
+  `group_member_uncertain` and keeps its full charge. Either stops the group, each
+  member released only on its own host's evidence (§11).
+
+**The parked charge.** §12's "parked members stay charged at their parked budget" now
+reads: a member's parked budget is its measured residue once one is recorded (ADR 0014
+amendment A13). A park of a revision whose phases CapyCTL derived needs, from each
+member's own host, the residue its processes hold in a sample taken after the head's
+reply (device memory on a discrete host's `device` domain, device memory plus
+anonymous pages on a unified pool). The residue is recorded for the revision on that
+member's host and for the launch, and the member is charged it (never below its
+placeholder, never above its Ready charge); a member reported without one leaves the
+park unsettled. A revision with declared `resources` keeps its declared parked phase.
+ADR 0014 amendment A19's growth bound applies per member, each against its own host's
+`parked_growth_limit`; a member past it turns the group's next park into a group stop.
+
+CPU and Fake-engine tests only; the MN4 rows qualify it.

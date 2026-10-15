@@ -36,14 +36,25 @@ pub(super) struct Member {
     pub(super) launch_handle: Option<String>,
     pub(super) identities: Option<String>,
     pub(super) effective: EffectiveDeployment,
+    /// ADR 0014 amendment A13, ADR 0028 §12 (amended 2026-10-15): the parked
+    /// residue recorded for the revision on this member's host.
+    pub(super) measured: super::super::parked_charge::Measured,
 }
 
 impl Member {
     pub(super) fn ready(&self) -> PhaseFootprint {
         phase(&self.effective.resources.ready, ResourcePhase::Ready)
     }
+    /// ADR 0028 §12 (amended 2026-10-15), ADR 0014 amendment A13: the
+    /// member's parked charge: its placeholder until a park of the revision
+    /// on its host measured what its processes hold parked, then that
+    /// residue (never below the placeholder, never above the Ready charge).
     pub(super) fn parked(&self) -> PhaseFootprint {
-        phase(&self.effective.resources.parked, ResourcePhase::Parked)
+        super::super::parked_charge::apply(
+            &phase(&self.effective.resources.parked, ResourcePhase::Parked),
+            &self.ready(),
+            &self.measured,
+        )
     }
     /// SPEC §7.3: the wake peak, from the parked budget into the wake phase.
     pub(super) fn wake(&self) -> PhaseFootprint {
@@ -100,6 +111,8 @@ pub(super) fn members(
                 let (raw, _) = frozen_on_host(tx, deployment, revision, Some(&host))?;
                 let effective = decode_effective_snapshot(&raw)
                     .map_err(|_| LifecycleError::CorruptStoredData)?;
+                let measured =
+                    super::super::parked_charge::measured(tx, deployment, revision, &effective)?;
                 Ok(Member {
                     rank,
                     host,
@@ -108,6 +121,7 @@ pub(super) fn members(
                     launch_handle,
                     identities,
                     effective,
+                    measured,
                 })
             },
         )
@@ -223,15 +237,32 @@ pub struct ArmedMember {
 }
 
 /// ADR 0028 §12 (R12): what one member's own host reported of it after the
-/// head's collective: the bytes its own processes hold (vLLM, per-member
-/// `process_residency`) or its saver still maps (SGLang, saver-map facts
-/// from that host's observation directory), observed at `observed_at_ms`.
+/// head's collective, observed at `observed_at_ms`. `resident_bytes` is what
+/// the collective releases and restores, judged against the member's parked
+/// budget: the device memory the driver attributes to the member's own
+/// processes (vLLM, per-member `process_residency`; found live 2026-10-15,
+/// MN4: their anonymous pages never fall under a 2 GiB budget, so a sum is
+/// no release evidence) or what its saver still maps (SGLang, saver-map
+/// facts from that host's observation directory). `residue` is what the
+/// member's processes hold, sampled by its host after the collective
+/// returned: a park charges it (ADR 0028 §12 as amended 2026-10-15, ADR 0014
+/// amendment A13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberResidency {
     pub rank: u32,
     pub host_id: String,
     pub resident_bytes: i64,
     pub observed_at_ms: i64,
+    pub residue: Option<MemberResidue>,
+}
+
+/// ADR 0014 amendment A13: what one member's own processes hold, as its own
+/// host's `process_residency` reports them: the device memory the driver
+/// attributes to them, and that plus their anonymous resident pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberResidue {
+    pub device_bytes: i64,
+    pub bytes: i64,
 }
 
 impl MemberResidency {
@@ -472,6 +503,13 @@ pub(super) fn arm(
 /// at or below its parked budget for a park, above it for a wake. Each member
 /// owner then moves to its own host's Parked (park) or Ready (wake)
 /// footprint; anything short of every member leaves everything unchanged.
+///
+/// ADR 0028 §12 as amended 2026-10-15 (ADR 0014 amendments A13, A19): a park
+/// of a revision whose phases CapyCTL derived also needs each member's own
+/// residue, which is recorded for the revision on that member's host and for
+/// the launch; each member is then charged its measured residue (never below
+/// its placeholder, never above its Ready charge) instead of the placeholder.
+/// A member reported without one leaves everything unchanged.
 pub(super) fn complete(
     tx: &Transaction<'_>,
     s: &CoordinatorSession,
@@ -530,6 +568,15 @@ pub(super) fn complete(
             ttl,
         )?;
         last_observed = last_observed.max(report.observed_at_ms);
+        if p.kind == ResidencyKind::Park
+            && super::super::parked_charge::measurable(&m.effective)
+            && report.residue.is_none()
+        {
+            return Err(LifecycleError::Rejected(format!(
+                "rank {} on {} reported no parked residue of its own processes",
+                m.rank, m.host
+            )));
+        }
         let held = match p.kind {
             ResidencyKind::Park => m.ready(),
             ResidencyKind::Restore => m.wake(),
@@ -559,8 +606,45 @@ pub(super) fn complete(
         control_receipt: Some(receipt.to_owned()),
         milestones: p.kind.facts().to_vec(),
     })?)?;
+    if p.kind == ResidencyKind::Park {
+        for m in &members {
+            let Some(residue) = reports
+                .iter()
+                .find(|r| r.rank == m.rank)
+                .and_then(|r| r.residue)
+            else {
+                continue;
+            };
+            let residue = super::super::parked_charge::member_residue(
+                &m.effective,
+                residue.device_bytes,
+                residue.bytes,
+            );
+            if !residue.is_empty() {
+                super::super::parked_charge::record_residue(
+                    tx,
+                    &p.deployment_id,
+                    p.revision,
+                    p.instance_index,
+                    p.generation,
+                    &m.effective,
+                    &residue,
+                    id,
+                    now,
+                )?;
+            }
+        }
+    }
+    // Read again: a park's charges now include the residues just recorded.
+    let charged = self::members(
+        tx,
+        &p.deployment_id,
+        p.revision,
+        p.instance_index,
+        p.generation,
+    )?;
     let epoch = resource_ledger::advance_completion_epoch(tx)?;
-    for m in &members {
+    for m in &charged {
         let next = match p.kind {
             ResidencyKind::Park => m.parked(),
             ResidencyKind::Restore => m.ready(),
