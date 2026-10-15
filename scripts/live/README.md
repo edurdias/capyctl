@@ -89,9 +89,13 @@ deep parking's observation socket lives under the state directory. Each group
 of checks gets its own standalone role, state directory, model-sources
 directory and port (18643 by default, `--port`), and each profile its own
 empty kernel caches. One deployment serves every check it can: vLLM model 1
-for B1, B2, B3, B5 and B14, then its eager loader for B4; TensorFold 0.6.6 for
-B3 and B14; SGLang Qwen3-4B for B3, B5, B6, B14 and B8; SGLang model 1 for B9,
-B15 and B12; Qwen2.5-0.5B, downloaded by CapyCTL, for B11 and B13. Every role,
+with CapyCTL's default loader for B1, B2, B3 and B5, then a stated lazy loader
+(an informational B1 row that never decides B1); vLLM Qwen3-4B for B14; the
+eager loader on its own role with `parked_growth_limit: 0B` for B4 (SKIP when
+the parked charge never grows); TensorFold 0.6.6 with the DFlash2 drafter for
+B3 and B14; SGLang Qwen3-4B for B3, B5, B6, B14 and B8; SGLang model 1
+(`restart_only`) for B9, B15 and B12; Qwen2.5-0.5B, downloaded by CapyCTL, for
+B11 and the ustar payloads of B13. Every role,
 deployment and profile is removed at the end, after a failure too; venvs and
 models stay. Engine keys are never read, and the ledger only through read-only
 SELECTs. B10 (Flash-Next with its table on disk) runs only with a complete

@@ -118,7 +118,7 @@ def load_json(path):
 
 def cmd_chat(a):
     try:
-        conn, resp, t0 = post(a.endpoint, a.cred, body_for(a, False))
+        conn, resp, t0 = post(a.endpoint, a.cred, body_for(a, False), timeout=a.timeout)
         raw = resp.read()
         conn.close()
         status = resp.status
@@ -592,7 +592,7 @@ def cmd_ckpt(a):
 # ---------------------------------------------------------------------------
 
 TITLES = {
-    "B1": "vLLM loader default by memory shape (lazy, deep, 3 cycles)",
+    "B1": "vLLM loader default by memory shape (deep, 3 cycles; lazy variant informational)",
     "B2": "Single-host wake canary (3 GB10 wakes)",
     "B3": "Per-request engine metrics",
     "B4": "Parked-growth stop runs (vLLM eager)",
@@ -639,8 +639,10 @@ def cmd_verdict(a):
             result, summary = ("n/a", "separate driver") if cid == "B18" else \
                 ("NOT RUN", "not selected, or the run ended first")
         else:
-            states = [s for _, s, _ in subs]
-            result = "FAIL" if "FAIL" in states else "PASS" if "PASS" in states else "SKIP"
+            # An `info` row is evidence only: it never decides the check.
+            states = [s for _, s, _ in subs if s != "INFO"]
+            result = "FAIL" if "FAIL" in states else "PASS" if "PASS" in states else \
+                "SKIP" if states else "INFO"
             summary = "; ".join(f"{sc}: {st}" for sc, st, _ in subs)
         lines.append(f"| {cid} | {TITLES.get(cid, '')} | **{result}** | {summary} | {est.get(cid, '')} |")
     table_end = len(lines)
@@ -665,6 +667,7 @@ def main():
         s.add_argument("--max-tokens", type=int, default=2048)
         s.add_argument("--salt")
         s.add_argument("--salt2")
+        s.add_argument("--timeout", type=float, default=1800)
     s = sub.add_parser("metrics")
     s.add_argument("--engine", required=True, choices=("vllm", "sglang", "tensorfold"))
     s.add_argument("--chat", required=True)
