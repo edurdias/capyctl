@@ -886,3 +886,169 @@ fn replayssm_spec_verify_keeps_a_float32_temporal_state() {
     let named = [flag, "--mamba-ssm-dtype".to_owned(), "bfloat16".to_owned()];
     assert_eq!(sglang_state_slot_bytes(dir.path(), &named), Some(halved));
 }
+
+/// RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead at
+/// 009632fef96dd349150baa780c984e62e70e91fe as CapyCTL reads it: the language
+/// model of [`qwen38_27b`] with its MTP head (`mtp_num_hidden_layers: 1`), a
+/// 248320-token vocabulary and an untied BF16 embedding and LM head (2542796800
+/// bytes each in its safetensors headers).
+fn qwen38_27b_mtp() -> Value {
+    let mut config = qwen38_27b();
+    config["architectures"] = json!(["Qwen3_5ForConditionalGeneration"]);
+    config["tie_word_embeddings"] = json!(false);
+    let text = &mut config["text_config"];
+    text["mtp_num_hidden_layers"] = json!(1);
+    text["vocab_size"] = json!(248320);
+    text["tie_word_embeddings"] = json!(false);
+    config
+}
+
+/// One BF16 table of that checkpoint: 248320 × 5120 × 2 bytes.
+const TABLE: i64 = 2_542_796_800;
+
+/// The deployment of the live run on host A (2026-10-14, SGLang 0.5.21): the
+/// checkpoint's MTP head drafting with EAGLE, `kv_cache_dtype: fp8_e4m3`, the
+/// measured weights, and `extra` appended to its arguments.
+fn mtp_eagle(extra: &[&str]) -> SglangLaunchSettings {
+    let mut deployment = fp8(settings(79 * GIB, 29 * GIB, Some(23_749_332_688)));
+    deployment.common.max_concurrent_requests = Some(22);
+    deployment.extra_args = [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--enable-linear-replayssm-spec",
+        "--max-mamba-cache-size",
+        "110",
+        "--enable-mixed-chunk",
+    ]
+    .iter()
+    .chain(extra)
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    deployment
+}
+
+/// The KV tokens SGLang 0.5.21's profile (`_profile_available_bytes`) gives
+/// the target of [`mtp_eagle`] from a static pool of `static_bytes`: what the
+/// weights, the draft's tables, the state with its ReplaySSM scratch and
+/// `overhead` leave, at 16 fp8 attention layers of 4 × 256 per token.
+fn profiled_tokens(static_bytes: i64, overhead: i64) -> i64 {
+    let state = 111 * STATE as i64 + 23 * REPLAY as i64;
+    (static_bytes - 23_749_332_688 - 2 * TABLE - state - overhead) / 32768
+}
+
+// T14 (found live 2026-10-14 on host A, SGLang 0.5.21, branch
+// fix/sglang-replayssm-state at d4b86843): EAGLE from the checkpoint's MTP
+// head. CapyCTL passed 950272 KV tokens (29 GiB at 32 KiB) and a 71 GiB
+// static pool; SGLang held 770984 and 776670, and the process took
+// 78.7-81.8 GiB at Ready. The draft worker loads its own embedding and LM
+// head before the target's profile, which charges them against the static
+// pool, and then keeps a KV pool of one layer for the same tokens outside it.
+#[test]
+fn an_mtp_draft_keeps_its_kv_layer_and_tables_in_the_static_pool() {
+    let target = qwen38_27b_mtp();
+    let weights = 23_749_332_688;
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    let state = 111 * STATE as i64 + 23 * REPLAY as i64;
+    // What d4b86843 rendered, and what SGLang's profile left the target of
+    // it: 804866 tokens with the 3 GiB overhead. The live 770984 and 776670
+    // are 0.86-1.03 GiB below: the draft runner's own allocations, which no
+    // figure here models.
+    let before = 71 * GIB;
+    assert_eq!(profiled_tokens(before, overhead), 804866);
+    assert!((770984..=776670).all(|live| live < profiled_tokens(before, overhead)));
+    assert!(profiled_tokens(before, overhead + (21 << 26)) < 770984);
+    // Now the draft's 2048-byte fp8 layer shares the KV cache, so the pool is
+    // 29 GiB / (32768 + 2048) bytes, and the static pool holds the tables.
+    let found = pool(&mtp_eagle(&[]), &target).unwrap();
+    assert_eq!(found.max_total_tokens, Some(894373));
+    let rendered = weights + 29 * GIB + state + overhead + 2 * TABLE;
+    assert_eq!(found.static_bytes, Some(rendered));
+    // SGLang's profile now reaches the tokens passed even with that extra
+    // GiB, and the draft's layer (allocated after it) fits what is left.
+    assert!(profiled_tokens(rendered, overhead + GIB) >= 894373);
+    assert!(rendered <= 79 * GIB);
+    let target_kv = 894373 * 32768;
+    let draft_kv = 894373 * 2048;
+    assert!(target_kv + draft_kv <= 29 * GIB);
+    // `NEXTN` (SGLang's alias), `EAGLE3`, and a draft KV dtype of its own.
+    for algorithm in ["NEXTN", "eagle3"] {
+        let mut named = mtp_eagle(&[]);
+        named.extra_args[1] = algorithm.to_owned();
+        assert_eq!(pool(&named, &target).unwrap(), found, "{algorithm}");
+    }
+    let bf16_draft = pool(
+        &mtp_eagle(&["--speculative-draft-kv-cache-dtype", "bfloat16"]),
+        &target,
+    )
+    .unwrap();
+    assert_eq!(bf16_draft.max_total_tokens, Some(844686));
+    // When CapyCTL sizes the state itself it counts them alike: the 79 GiB
+    // request is refused, naming them, and 82 GiB holds them.
+    let mut sized = mtp_eagle(&[]);
+    sized.extra_args.drain(9..11);
+    let refusal = pool(&sized, &target).unwrap_err();
+    assert!(
+        refusal.contains(&format!("{} bytes of weights", weights + 2 * TABLE))
+            && refusal.contains("embedding and LM head included"),
+        "{refusal}"
+    );
+    sized.memory.request_bytes = 82 * GIB;
+    let sized = pool(&sized, &target).unwrap();
+    assert_eq!(sized.max_total_tokens, Some(894373));
+    assert_eq!(sized.max_mamba_cache_size, Some(110));
+    assert_eq!(sized.static_bytes, Some(rendered));
+}
+
+// T14: only a draft from the checkpoint's own head counts its tables and KV
+// layer; every other launch of that checkpoint sizes as before.
+#[test]
+fn other_launches_of_an_mtp_checkpoint_size_as_before() {
+    let target = qwen38_27b_mtp();
+    let weights = 23_749_332_688;
+    let overhead = STATIC_OVERHEAD_BYTES as i64;
+    // No speculative decoding: the 950272 tokens, and the static pool is the
+    // request less its margin, which holds the state.
+    let mut plain = fp8(settings(79 * GIB, 29 * GIB, Some(weights)));
+    plain.common.max_concurrent_requests = Some(22);
+    plain.extra_args = ["--max-mamba-cache-size", "110"].map(String::from).to_vec();
+    let found = pool(&plain, &target).unwrap();
+    assert_eq!(found.max_total_tokens, Some(950272));
+    assert!(weights + 29 * GIB + 111 * STATE as i64 + overhead < 71 * GIB);
+    assert_eq!(found.static_bytes, Some(71 * GIB));
+    assert_eq!(found, pool(&plain, &qwen38_27b()).unwrap());
+    // A separate draft model, named in the arguments or declared, is sized
+    // from its own configuration.
+    let named = pool(
+        &mtp_eagle(&["--speculative-draft-model-path", "/drafters/eagle"]),
+        &target,
+    )
+    .unwrap();
+    assert_eq!(named.max_total_tokens, Some(950272));
+    let declared = sglang_pool(
+        &mtp_eagle(&[]),
+        &[],
+        Ok(&target),
+        Some(Ok(&dflash_drafter())),
+    )
+    .unwrap();
+    assert_eq!(declared.max_total_tokens, Some(724016));
+    // A checkpoint without an MTP head has no draft of its own to count.
+    let headless = pool(&mtp_eagle(&[]), &qwen38_27b()).unwrap();
+    assert_eq!(headless.max_total_tokens, Some(950272));
+    // Tied embeddings are one table.
+    let mut tied = target.clone();
+    tied["text_config"]["tie_word_embeddings"] = json!(true);
+    tied["tie_word_embeddings"] = json!(true);
+    let at_80 = |config: &Value| {
+        let mut deployment = mtp_eagle(&[]);
+        deployment.memory.request_bytes = 80 * GIB;
+        pool(&deployment, config).unwrap().static_bytes.unwrap()
+    };
+    assert_eq!(at_80(&target) - at_80(&tied), TABLE);
+}

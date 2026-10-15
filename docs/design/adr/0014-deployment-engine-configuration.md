@@ -978,6 +978,16 @@ Rule (unified memory; a discrete device keeps the note above):
   `--enable-linear-replayssm-spec`, `(running + 1)` ReplaySSM rings and conv windows
   instead, for the deployment's count). A state SGLang sizes itself
   (`--mamba-full-memory-ratio`, another hybrid kind) is not counted.
+- An EAGLE draft from a gated-delta-net hybrid's own MTP head (`EAGLE`, `EAGLE3` or
+  `NEXTN` without `--speculative-draft-model-path`; found live 2026-10-14 with
+  Qwen3.8-27B NVFP4, SGLang 0.5.21) adds two things SGLang 0.5.20 and 0.5.21 do not count
+  for it. Its worker loads its own embedding and LM head (in the model dtype) before the
+  target's profile, which charges them against the static pool, and frees them only once
+  the target's pool exists: the static pool holds them. Its KV pool, one full-attention
+  layer for the target's token count, is allocated after the profile: like a draft
+  model's KV layers (amendment A9), it shares the KV cache, so the tokens passed are the
+  KV cache over the target's and that layer's bytes per token. The MTP layer itself is in
+  the measured weights.
 
 Consequence: on a pool left to SGLang (a sliding-window model), SGLang's KV pool now gets
 about the KV cache the deployment states, where it got that less SGLang's own allocations;
