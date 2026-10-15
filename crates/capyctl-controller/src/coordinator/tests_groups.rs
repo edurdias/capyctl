@@ -125,6 +125,9 @@ struct HostState {
     lose_launch_replies: bool,
     /// Every Launch starts its rank, which exits at once (a launch failure).
     launch_fails: bool,
+    /// MN2 (found live): every rank tree names two processes under one role,
+    /// so its Launch reply cannot be recorded as the member's identities.
+    duplicate_roles: bool,
     launch_observer: Option<LaunchObserver>,
     /// The world's own observer of every Launch, besides a test's.
     witness: Option<LaunchObserver>,
@@ -167,6 +170,7 @@ impl GroupHost {
                 probe_fails: false,
                 lose_launch_replies: false,
                 launch_fails: false,
+                duplicate_roles: false,
                 launch_observer: None,
                 witness: None,
                 launch_env: None,
@@ -710,11 +714,15 @@ impl GroupHost {
         self.group.launch(rank);
         // ADR 0028 §4, §8: a worker's leader is reported as `worker-<r>` and
         // its children under it; the head keeps the engine's own roles.
-        let roles = if rank == 0 {
+        let mut roles = if rank == 0 {
             vec!["api".to_owned(), "worker-0".to_owned()]
         } else {
             vec![format!("worker-{rank}"), format!("worker-{rank}/worker-0")]
         };
+        if state.duplicate_roles {
+            let repeated = roles[1].clone();
+            roles.push(repeated);
+        }
         let pid = state.next_pid;
         state.next_pid += roles.len() as u32;
         let identities: Vec<ProcessIdentity> = roles
@@ -1340,6 +1348,13 @@ impl GroupWorld {
     /// `host` carries every Launch out but its replies are lost.
     pub(super) fn launch_replies_lost(self, host: &str) -> Self {
         self.host(host).state().lose_launch_replies = true;
+        self
+    }
+
+    /// MN2: `host` names two processes of every rank tree under one role, so
+    /// its Launch replies cannot be recorded for its member.
+    pub(super) fn launch_roles_duplicated(self, host: &str) -> Self {
+        self.host(host).state().duplicate_roles = true;
         self
     }
 
@@ -2938,6 +2953,72 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     );
     assert!(world.port_free("host-a", 25000));
     assert!(!world.group.alive(1));
+}
+
+// T30, T31, T33 (ADR 0028 §8, §11, R23; MN2 SGLang, found live): a worker's
+// Launch reply names two processes under one role, so its identities cannot
+// be recorded and the member stays dispatched with none. Its host's journal
+// answers the stop's Terminate of that Launch with every process it journaled
+// gone and the claim released; the store settles the member on that evidence
+// for its own Launch handle, records those processes and releases its charge,
+// and the plan frees its port. Before, the member stayed `uncertain` and
+// charged forever after every process was gone.
+#[tokio::test]
+async fn an_unrecorded_member_settles_on_its_hosts_launch_evidence() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_roles_duplicated("host-b");
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    assert!(matches!(
+        world.wait_activation(&id).await,
+        GroupActivation::Failed { failed_rank: 1, .. }
+    ));
+    world.wait_settled_generation("g", 1).await;
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_eq!(rows[1].state, MemberState::Settled);
+    let handle = rows[1].launch_handle.clone().unwrap();
+    let mut recorded = rows[1].identities.clone().unwrap();
+    let mut journaled = world.host("host-b").recorded(&handle).unwrap();
+    recorded.sort_by_key(|p| p.pid);
+    journaled.sort_by_key(|p| p.pid);
+    assert_eq!(recorded, journaled, "settled on its host's journal");
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.group.alive(1));
+}
+
+// T31, T33 (ADR 0028 §11, SPEC §11): the same unrecorded member, whose host
+// came back with an empty journal before the stop: its Terminate names no
+// process of the Launch and claims nothing, which is no evidence. The member
+// stays `uncertain` and charged, and its rank still runs.
+#[tokio::test]
+async fn an_unrecorded_member_without_launch_evidence_stays_charged() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_roles_duplicated("host-b");
+    let group = world.group.clone();
+    // The agent restarts with an empty journal right after the Launch.
+    world.host("host-b").state().launch_observer = Some(Arc::new(move |_: &MemberCommand| {
+        group.reconnect_host("host-b", JournalState::Empty);
+    }));
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_activation(&id).await;
+    world
+        .until("the head settled", || {
+            let (_, rows) = world.group_plan("g").unwrap();
+            (rows[0].state == MemberState::Settled).then_some(())
+        })
+        .await;
+    world.settle_for(Duration::from_secs(1)).await;
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_eq!(rows[1].state, MemberState::Uncertain);
+    assert_eq!(rows[1].identities, None);
+    assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
+    assert!(!world.port_free("host-a", 25000));
+    assert!(world.group.alive(1), "an empty journal signals nothing");
 }
 
 // T27, Review Focus 2 (R15): a head rendezvous port held outside CapyCTL is

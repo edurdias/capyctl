@@ -16,7 +16,7 @@ use capyctl_domain::{DeploymentId, LifecycleState, OperationId};
 use capyctl_scheduler::residency::{AdmissionContext, ResourceError};
 use capyctl_store::groups::{
     member_owner_id, parse_member_owner_id, GroupReservation, GroupSettlement, GroupStoreError,
-    MemberGone, MemberRow, MemberState,
+    LaunchGone, MemberGone, MemberRow, MemberState,
 };
 use capyctl_store::instances::instance_owner_id;
 use capyctl_store::resource_ledger::{GrantRequest, ResourceStoreError};
@@ -266,6 +266,15 @@ impl Fixture {
     ) -> Result<GroupSettlement, GroupStoreError> {
         self.open()
             .settle_member(&self.id(name), instance, generation, rank, evidence)
+    }
+    fn settle_unrecorded_member(
+        &self,
+        name: &str,
+        rank: u32,
+        evidence: LaunchGone,
+    ) -> Result<GroupSettlement, GroupStoreError> {
+        self.open()
+            .settle_unrecorded_member(&self.id(name), 0, 1, rank, evidence)
     }
     fn mark_member_uncertain(
         &self,
@@ -710,6 +719,104 @@ fn settlement_needs_the_members_own_evidence() {
     // A retried settlement is idempotent.
     assert!(matches!(
         store.settle_member("g", 0, 1, 1, exact).unwrap(),
+        GroupSettlement::Partial { .. }
+    ));
+}
+
+// T31, T33 (ADR 0028 §8, §11, R23; MN2, found live): a dispatched member whose
+// identities were never recorded settles only on its own host's gone evidence
+// for the Launch it was dispatched with, naming at least one well-formed
+// process; roles may repeat (MN2: two processes under one role). Anything
+// else keeps its charge. The processes are recorded with the settlement, and
+// a retry reports the group again.
+#[test]
+fn an_unrecorded_member_settles_only_on_evidence_for_its_own_launch() {
+    let store = two_host_store(gib(100), gib(100));
+    store
+        .reserve_group(
+            &reservation("g", &[("host-a", gib(50)), ("host-b", gib(50))]),
+            plan_for("g"),
+            ctx(),
+        )
+        .unwrap();
+    let journaled = vec![
+        ProcessIdentity {
+            role: "worker-1".into(),
+            ..process(41)
+        },
+        ProcessIdentity {
+            role: "worker-1/worker-0".into(),
+            ..process(42)
+        },
+        ProcessIdentity {
+            role: "worker-1/worker-0".into(),
+            ..process(43)
+        },
+    ];
+    let evidence = |host: &str, handle: String, identities: Vec<ProcessIdentity>| LaunchGone {
+        member: MemberKey {
+            host_id: host.into(),
+            member_id: member_id(1),
+        },
+        launch_handle: handle,
+        identities,
+    };
+    // Never dispatched: there is no Launch to have evidence for.
+    assert!(matches!(
+        store.settle_unrecorded_member(
+            "g",
+            1,
+            evidence("host-b", launch_handle(1), journaled.clone())
+        ),
+        Err(GroupStoreError::Conflict)
+    ));
+    store.mark_member_dispatching("g", 1).unwrap();
+    // MN2: these identities cannot be recorded as the member's.
+    assert!(store.mark_member_launched("g", 1, &journaled).is_err());
+    store.mark_member_uncertain("g", 0, 1, 1).unwrap();
+    // Empty gone evidence proves nothing for a dispatched member.
+    assert!(matches!(
+        store.settle_member("g", 0, 1, 1, gone("host-b", 1)),
+        Err(GroupStoreError::Conflict)
+    ));
+    let mut twice = journaled.clone();
+    twice.push(ProcessIdentity {
+        role: "worker-1/again".into(),
+        ..process(41)
+    });
+    let mut two_boots = journaled.clone();
+    two_boots[2].boot_id = "boot-other".into();
+    for refused in [
+        // Another Launch than the one it was dispatched with.
+        evidence("host-b", launch_handle(7), journaled.clone()),
+        // Another host's evidence.
+        evidence("host-a", launch_handle(1), journaled.clone()),
+        // No process: an empty journal is never gone evidence.
+        evidence("host-b", launch_handle(1), Vec::new()),
+        // One process named twice, or processes of two boots.
+        evidence("host-b", launch_handle(1), twice),
+        evidence("host-b", launch_handle(1), two_boots),
+    ] {
+        assert!(matches!(
+            store.settle_unrecorded_member("g", 1, refused),
+            Err(GroupStoreError::Conflict)
+        ));
+    }
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), gib(50));
+    let proven = evidence("host-b", launch_handle(1), journaled.clone());
+    assert!(matches!(
+        store.settle_unrecorded_member("g", 1, proven.clone()).unwrap(),
+        GroupSettlement::Partial { unsettled } if unsettled == vec![0]
+    ));
+    assert_eq!(store.owner_bytes(&member_owner_id("g", 0, 1)), 0);
+    let (_, rows) = store.group_plan("g", 0).unwrap().unwrap();
+    assert_eq!(rows[1].state, MemberState::Settled);
+    let mut recorded = rows[1].identities.clone().unwrap();
+    recorded.sort_by_key(|p| p.pid);
+    assert_eq!(recorded, journaled);
+    // A retried settlement reports the group again.
+    assert!(matches!(
+        store.settle_unrecorded_member("g", 1, proven).unwrap(),
         GroupSettlement::Partial { .. }
     ));
 }
