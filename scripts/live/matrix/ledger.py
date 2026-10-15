@@ -14,6 +14,12 @@ secrets, certificates, invitations) and binding payloads are never read.
   ledger.py evidence    --db DB --deployment NAME     the deployment's operations, lifecycle steps with
                         their recorded evidence (park/restore residency, cleanup) and journal
                         entries, with every credential-shaped field removed
+  ledger.py group       --db DB --deployment NAME     a multi-node group's plans (rendezvous, failed
+                        rank, failure code, wake canary reference), members per generation with
+                        their recorded identities, member charges and worker port leases, and
+                        `held`: what is still charged or unsettled (ADR 0028 §8, §11, §12)
+  ledger.py members     --db DB --deployment NAME     the identities of the group's unsettled members,
+                        one row each with its host id, rank and member state (MN5-MN7 faults)
 """
 
 import argparse
@@ -102,6 +108,66 @@ def accounting(db, name):
     }
 
 
+def member_owner_like(ident):
+    return f"deployment:{ident}/instance:%/member:%"
+
+
+def group_members(db, ident):
+    members = rows(db, "SELECT instance_index,generation,rank,host_id,owner_id,state,dispatched,identities_json "
+                       "FROM group_members WHERE deployment_id=? ORDER BY generation,instance_index,rank", (ident,))
+    for member in members:
+        # ADR 0028 §8: stored as sorted [role, pid, boot_id, start_ticks] tuples.
+        member["identities"] = [{"role": role, "pid": pid, "boot_id": boot, "start_ticks": ticks}
+                                for role, pid, boot, ticks in json.loads(member.pop("identities_json") or "[]")]
+    return members
+
+
+def group(db, name):
+    ident = deployment_id(db, name)
+    like = member_owner_like(ident)
+    plans = rows(db, "SELECT instance_index,generation,state,rendezvous_host,rendezvous_port,failed_rank,failure_code,"
+                     "canary_json FROM group_plans WHERE deployment_id=? ORDER BY generation,instance_index", (ident,))
+    for plan in plans:
+        # ADR 0028 §12: the wake canary's reference (fixed prompt, temperature-0 tokens).
+        plan["canary"] = json.loads(plan.pop("canary_json") or "null")
+    members = group_members(db, ident)
+    owners = [{"owner_id": o["owner_id"], "footprint": json.loads(o["footprint_json"])} for o in
+              rows(db, "SELECT owner_id,footprint_json FROM resource_owners WHERE owner_id LIKE ?", (like,))]
+    out = {
+        "deployment_id": ident,
+        "plans": plans,
+        "members": members,
+        "member_owners": owners,
+        "member_reservations": rows(db, "SELECT owner_id,domain_id,bytes,phase FROM reservations WHERE owner_id LIKE ?",
+                                    (like,)),
+        "worker_leases": rows(db, "SELECT host_id,host,port,group_owner FROM endpoint_leases WHERE group_owner LIKE ?",
+                              (like,)),
+        "checkpoint_host_digests": rows(db, "SELECT revision,host_id,digest,recorded_at_ms FROM checkpoint_host_digests "
+                                            "WHERE deployment_id=? ORDER BY revision,host_id", (ident,)),
+    }
+    out["held"] = {
+        "unsettled_plans": [p["generation"] for p in plans if p["state"] != "settled"],
+        "unsettled_members": [{"generation": m["generation"], "rank": m["rank"], "host_id": m["host_id"],
+                               "state": m["state"]} for m in members if m["state"] != "settled"],
+        "member_owners": [o["owner_id"] for o in owners],
+        "member_reservations": [r["owner_id"] for r in out["member_reservations"]],
+        "worker_leases": [(w["host_id"], w["port"]) for w in out["worker_leases"]],
+    }
+    return out
+
+
+def members(db, name):
+    ident = deployment_id(db, name)
+    result = []
+    for member in group_members(db, ident):
+        if member["state"] == "settled":
+            continue
+        for identity in member["identities"]:
+            result.append({"deployment_id": ident, "generation": member["generation"], "rank": member["rank"],
+                           "host_id": member["host_id"], "member_state": member["state"], **identity})
+    return result
+
+
 SECRETISH = ("key", "token", "secret", "password", "credential", "bearer", "authorization")
 
 
@@ -167,7 +233,7 @@ def fingerprint(db, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("cmd", choices=["snapshot", "owned", "fingerprint", "accounting", "evidence"])
+    parser.add_argument("cmd", choices=["snapshot", "owned", "fingerprint", "accounting", "evidence", "group", "members"])
     parser.add_argument("--db", required=True)
     parser.add_argument("--deployment")
     parser.add_argument("--role")
@@ -183,6 +249,10 @@ def main():
         result = accounting(db, args.deployment)
     elif args.cmd == "evidence":
         result = evidence(db, args.deployment)
+    elif args.cmd == "group":
+        result = group(db, args.deployment)
+    elif args.cmd == "members":
+        result = members(db, args.deployment)
     else:
         result = fingerprint(db, args.deployment)
     json.dump(result, sys.stdout, indent=1, sort_keys=True)

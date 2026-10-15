@@ -3,6 +3,9 @@
 #
 #   fault.sh engine <host> <deployment> <SIG> [role]   signal an owned engine process (default role api)
 #   fault.sh engine-group <host> <deployment> <SIG>     signal the owned api process's group (it must lead it)
+#   fault.sh member <host> <deployment> <SIG> [role]   signal a multi-node group member's owned engine
+#                                                        process on that host (ADR 0028; role api, else
+#                                                        the member's one non-helper role)
 #   fault.sh agent <host> <SIG>                         signal the host role started by roles.sh host-up
 #   fault.sh server <SIG>                               signal the server role started by roles.sh server-up
 #   fault.sh memhog-start <host> <GiB> <seconds>        one bounded external allocation (<= 40 GiB, <= 1800 s)
@@ -48,6 +51,39 @@ print(i["pid"], i["start_ticks"], i["boot_id"])' "$hid") || die "no single owned
   echo "$result"; record "result $result"
 }
 
+# ADR 0028 §8: a group member's identities are recorded per member, on its own
+# host (group_members), not on a runtime binding, so they come from
+# `ledger.py members`. Only a member that is not settled is a target.
+member() { # member <host> <deployment> <SIG> <role>
+  local host=$1 dep=$2 sig=$3 role=${4:-api} hid pid ticks boot chosen result
+  hid=$(host_id "$host")
+  if dry; then
+    x python3 "$MATRIX_DIR/ledger.py" members --db "$SERVER_DB" --deployment "$dep"
+    rsh "$host" "python3 $SIGNAL_OWNED --pid <pid> --ticks <start_ticks> --boot <boot_id> --signal $sig"
+    return 0
+  fi
+  read -r pid ticks boot chosen < <(python3 "$MATRIX_DIR/ledger.py" members --db "$SERVER_DB" --deployment "$dep" | python3 -c '
+import json, sys
+hid, role = sys.argv[1], sys.argv[2]
+ids = [i for i in json.load(sys.stdin) if i["host_id"] == hid]
+pick = [i for i in ids if i["role"] == role]
+if not pick and role == "api":
+    # A group worker reports the process it spawned under its member id
+    # (`worker-<r>`) and the rest of its tree as `worker-<r>/<role>` (ADR 0028
+    # §4, §8; found live 2026-10-15): the spawned process is the engine api.
+    pick = [i for i in ids if "/" not in i["role"] and not i["role"].startswith("helper-")]
+if len(pick) != 1:
+    roles = sorted(i["role"] for i in ids)
+    sys.exit("expected one %s identity of a member on host %s, found roles %s" % (role, hid, roles))
+i = pick[0]
+print(i["pid"], i["start_ticks"], i["boot_id"], "%s/rank%s/gen%s" % (i["role"], i["rank"], i["generation"]))' "$hid" "$role") \
+    || die "no single owned member identity for $dep on $host"
+  [ -n "${pid:-}" ] || die "no owned member identity for $dep on $host"
+  record "member $host $dep $chosen pid=$pid ticks=$ticks sig=$sig"
+  result=$(rsh "$host" "python3 $SIGNAL_OWNED --pid $pid --ticks $ticks --boot $boot --signal $sig") || { echo "$result"; record "result $result"; return 1; }
+  echo "$result"; record "result $result"
+}
+
 agent() {
   local host=$1 sig=$2 result
   record "agent $host sig=$sig pidfile=$RRD/host.pid"
@@ -67,7 +103,7 @@ memhog_start() {
     "$gib" "$secs" "$MEMHOG_MAX_GIB" "$MEMHOG_MAX_SECONDS" || die "memhog bounds: 0 < GiB <= $MEMHOG_MAX_GIB, 0 < seconds <= $MEMHOG_MAX_SECONDS"
   record "memhog-start $host gib=$gib seconds=$secs"
   # timeout is the outer bound: TERM at seconds+30, KILL 15 s later.
-  rsh "$host" "tmux new-session -d -s mx-memhog-$RUN timeout --signal=TERM --kill-after=15 $((secs + 30)) \
+  rsh "$host" "$MX_TMUX new-session -d -s mx-memhog-$RUN timeout --signal=TERM --kill-after=15 $((secs + 30)) \
 python3 $REMOTE_TREE/scripts/live/matrix/memhog.py --gib $gib --seconds $secs --pidfile $RRD/memhog.pid"
   # Wait until the allocation is held (pid file written and pages touched).
   rsh "$host" "for i in \$(seq 1 120); do [ -f $RRD/memhog.pid ] && break; sleep 1; done; sleep 5; grep MemAvailable /proc/meminfo"
@@ -99,10 +135,11 @@ load_run
 case $cmd in
   engine) [ $# -ge 3 ] || exit 2; engine "$1" "$2" "$3" "${4:-api}" ;;
   engine-group) [ $# -eq 3 ] || exit 2; engine "$1" "$2" "$3" api --group ;;
+  member) [ $# -ge 3 ] || exit 2; member "$1" "$2" "$3" "${4:-api}" ;;
   agent) [ $# -eq 2 ] || exit 2; agent "$@" ;;
   server) [ $# -eq 1 ] || exit 2; server "$@" ;;
   memhog-start) [ $# -eq 3 ] || exit 2; memhog_start "$@" ;;
   memhog-stop) [ $# -eq 1 ] || exit 2; memhog_stop "$@" ;;
   memhog-during) [ $# -ge 4 ] || exit 2; memhog_during "$@" ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,23p' "$0"; exit 2 ;;
 esac

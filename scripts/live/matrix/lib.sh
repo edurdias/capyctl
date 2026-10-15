@@ -40,6 +40,17 @@ REMOTE_HOME=${CAPYCTL_REMOTE_HOME:-$REMOTE_HOME}
 # hosts (the 2026-09-24 soak ran from ~/capyctl-soak beside another tree).
 REMOTE_TREE=${CAPYCTL_REMOTE_TREE:-$REMOTE_HOME/capyctl-f2}
 SERVER_IP=${CAPYCTL_SERVER_IP:-$CONTROL_HOST_ADDR}
+# The run server's loopback management and inference ports. Override when another
+# server on control-host already holds 7443/8443 (found live 2026-10-15: the
+# owner's own standalone binds both); the inference clients follow it.
+SERVER_MGMT_PORT=${CAPYCTL_SERVER_MGMT_PORT:-7443}
+SERVER_INFER_PORT=${CAPYCTL_SERVER_INFER_PORT:-8443}
+export CAPYCTL_INFER_URL=${CAPYCTL_INFER_URL:-http://127.0.0.1:$SERVER_INFER_PORT}
+# Roles run under the harness's own tmux server (socket name capyctl-mx): a session
+# added to an existing server inherits that server's limits, and on 2026-10-15 a
+# week-old tmux server on both hosts still had memlock 8 MiB, so the host roles and
+# their engines did too (NCCL "unhandled system error" at group bring-up).
+MX_TMUX="tmux -L capyctl-mx"
 MATRIX_HOSTS=("$HOST_A" "$HOST_B")
 MODELS_ROOT=$REMOTE_HOME/models
 export MODELS_ROOT
@@ -49,7 +60,9 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # Pattern bracketed so it cannot match its own argv: the pre-flight arrives on the
 # host as `bash -lc '... pgrep -af "..." ...'` (and Tailscale SSH's wrapper carries
 # the same string), so a plain pattern would match the command asking the question.
-ENGINE_PGREP='sglang[.]launch_server|sglang_entr[y]|vllm_entr[y]|vllm[ ]serve|Engine[C]ore|sglang::schedule[r]'
+# TensorFold runs as `<venv>/bin/tensorfold serve` (MN3, MN5, MN6); llama.cpp as
+# `llama-server` (LC rows).
+ENGINE_PGREP='sglang[.]launch_server|sglang_entr[y]|vllm_entr[y]|vllm[ ]serve|Engine[C]ore|sglang::schedule[r]|bin/tensorfol[d] serve|llama-serve[r]'
 
 dry() { [ "$DRY_RUN" = 1 ]; }
 # control-host's date is uutils, whose %3N is not zero-padded; bash's clock is exact.
@@ -80,6 +93,19 @@ vllm_venv() {
   case $1 in
     "$HOST_A") echo "$REMOTE_HOME/$HOST_A_VLLM_VENV_DIR" ;;
     "$HOST_B") echo "$REMOTE_HOME/$HOST_B_VLLM_VENV_DIR" ;;
+    *) die "unknown host $1" ;;
+  esac
+}
+# ADR 0028 (rows MN1-MN9): TensorFold, when hosts.local.env names its
+# environment (the same directory name on both hosts), and each host's address
+# on the direct link between the two hosts, which it declares as its group peer
+# address (resource_policy.groups.peer_address, written by roles.sh host-doc).
+TENSORFOLD_VENV=${TENSORFOLD_VENV_DIR:+$REMOTE_HOME/$TENSORFOLD_VENV_DIR}
+GROUP_RENDEZVOUS_PORTS=${GROUP_RENDEZVOUS_PORTS:-25000-25099}
+direct_addr() {
+  case $1 in
+    "$HOST_A") echo "${HOST_A_DIRECT_ADDR:-}" ;;
+    "$HOST_B") echo "${HOST_B_DIRECT_ADDR:-}" ;;
     *) die "unknown host $1" ;;
   esac
 }

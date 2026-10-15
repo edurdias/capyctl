@@ -38,6 +38,7 @@ $M/run_row.sh ENG1 --tag b -- b vb-4 sb-4
 $M/run_row.sh ENG3 --tag a -- a va-4         # remove refused in use, then --drain
 $M/run_row.sh ENG2 --no-e0 -- a                # standalone, both engines, environment profiles
 $M/run_row.sh ENG4 --no-e0 -- b                # rc.3 fallbacks; needs CAPYCTL_RC3_LOCAL/CAPYCTL_RC3_REMOTE
+$M/run_row.sh LC2 --no-e0 -- a                 # llama.cpp on GB10 (LC1-LC6); first scripts/live/llamacpp-build.sh source model
 $M/roles.sh down
 ```
 
@@ -56,7 +57,7 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 | `hosts.example.env`, `lib.sh` | Hosts, addresses, venvs and paths (from `hosts.local.env`). Also `x`/`rsh` (logged, dry-run aware), run state and the tree digest |
 | `sync.sh` | Snapshot of the worktree without `target`, `.git`, hidden directories, `*.log` or bytecode. Then tree digest, rsync with group/other write removed, digest check on each host, `bash -lc` build with `~/.local/bin` on PATH, `scripts/check-release-clean.sh` on the control host's and each host's binaries, and runtime sync and check |
 | `check_runtime.py` | Runs on the host. Checks that the required runtime files exist, that no file or ancestor is group- or other-writable, and prints their SHA-256 |
-| `roles.sh` | Preflight, then `init`/`start` the server in tmux on the control host. For each host: `init host`, device probe (`python3 -m runtime.sglang_device`), engine versions, host document, invite, `join host` with an absolute `--join-file`, then `start host` in tmux |
+| `roles.sh` | Preflight, then `init`/`start` the server in tmux on the control host. For each host: `init host`, device probe (`python3 -m runtime.sglang_device`), engine versions, host document, invite, `join host` with an absolute `--join-file`, then `start host` in tmux. Every role runs under the harness's own tmux server (`tmux -L capyctl-mx`): a session added to an older tmux server inherits that server's limits (found live 2026-10-15: memlock 8 MiB, which broke NCCL at group bring-up). The run server's loopback ports are 7443/8443 unless `CAPYCTL_SERVER_MGMT_PORT`/`CAPYCTL_SERVER_INFER_PORT` name others (when another server on the control host holds them) |
 | `templates/host.json`, `gen_host_doc.py` | Host document built from the measured GPU UUID and digest. It holds `sglang` and `vllm` profiles with the host's venvs, host-fixed `args: []`, the D10 budget and ingress on the host's private address |
 | `budgets/normal.yaml`, `budgets/tight.yaml`, `gen_budgets.py` | D10 budgets: normal is 80% limit, 10% reserve, `max_parked` 2; tight is 78 GiB, `max_parked` 1. `check` prints the fit table. `suggest` turns a measured MemAvailable drop into a P2 request |
 | `models.json`, `gen_deployment.py` | Deployment fixtures `<v\|s><92\|17>-<4\|14\|27\|27f\|30>` with a typed `engine_config` and declared `memory {request, kv_cache}`, so the phases are derived. `--co` writes each model's co-residence variant (`<name>-co`: context 8192, smaller KV cache) sized so q30+q4 and q27f+q14+q4 fit the normal budget together |
@@ -70,6 +71,8 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 | `rows/M53.sh`, `rows/M53D.sh`, `rows/M66.sh`, `rows/SGLMO.sh` | Failure and removal rows (2026-09-24). M53: a switch to a target whose engine refuses an argument fails closed with the incumbent intact; the failed target then stops, starts and fails again, and `delete deployment --stop` removes it. M53D: `delete deployment --stop` on a failed launch leaves no residue. M66: `delete deployment --stop` during a stream that outlasts the drain bound (`M66_PROMPT` overrides the prompt). SGLMO: an SGLang modelopt deployment with `residency: deep` is refused `capability_missing:deep_park` with its `restart_only` hint, and the `restart_only` variant serves and stops clean. M53D and M66 judge cleanup after the delete with `residue_check`: the ledger snapshot holds nothing for the deleted id except its tombstone |
 | `rows/M38.sh`, `rows/M73.sh`, `rows/M74.sh`, `rows/M75.sh`, `proc_probe.py` | The engine gates that replaced `live_vllm.rs`, `live_sglang.rs` and an earlier host-specific wrapper script (owner decision 2026-09-22): launch failures and recovery (M38), one lifecycle with argv, access and memory checks (M73), the `timeouts.initialize` deadline (M74) and no-engine boot (M75). `proc_probe.py` reads an owned process's argv (credential values redacted) and named, non-secret environment variables |
 | `rows/ENG1.sh`, `rows/ENG2.sh`, `rows/ENG3.sh`, `rows/ENG4.sh` | ADR 0018 engine registration rows, written and first run live 2026-09-25 (results in the status runbook). ENG1: `engine detect`/`add` of the existing vLLM and SGLang venvs on a host running under a transient systemd user unit (`roles.sh host-doc-bare`, `host-up-systemd`), `host.yaml` unchanged, both new profiles serve and stop clean. ENG2: standalone with `CAPYCTL_VLLM_BIN` and `CAPYCTL_SGLANG_BIN` both set publishes `local-vllm`/`local-sglang`; `engine remove` on one is refused (environment profile); a deployment on each serves; a registered `vllm-reg` serves with a stated context length, and the row records what a deployment without one does. ENG3 (sources ENG1.sh): `engine remove` of a profile in use is refused `profile_in_use`, then `--drain` stops the deployment through the ordinary path and removes it only on stop evidence; a start afterwards is refused, and `engine add` republishes it. ENG4 (sources ENG1.sh): the rc.3 version-skew fallbacks — a new CLI against an rc.3 agent (`agent_unreachable`, `engines.yaml` written but never read by the old agent) and a new agent against an rc.3 server (`published=restart_required`), gated on `CAPYCTL_RC3_LOCAL`/`CAPYCTL_RC3_REMOTE` naming existing rc.3 binaries. Only the existing engine venvs named in `hosts.local.env` are used; no venv is created |
+| `rows/MN1.sh` … `rows/MN8.sh`, `grouplib.sh`, `gen_group.py`, `rdma_counters.py`, `tests/test_rdma_counters.py` | Multi-node group rows (ADR 0028, design section 17.2; see "Multi-node group rows" below). `gen_group.py` writes the two-rank group fixtures `vg-30`, `sg-30` and `tg-n35` (`topology.tensor_parallel: 2`, `placement.hosts: [HOST_A, HOST_B]`, per-member memory). `grouplib.sh` holds the group checks: the read-only preflight, status and ledger views per member (`ledger.py group`, `ledger.py members`), RDMA transport, and verified cleanup on both hosts. `fault.sh member` signals a member's recorded identity. `rdma_counters.py` reads `/sys/class/infiniband` port counters (and RDMA operation counters where the driver has them) read-only; its tests run with `python3 -m unittest discover -s scripts/live/matrix/tests` |
+| `rows/LC1.sh` … `rows/LC6.sh`, `llamacpp_rows.sh`, `llamacpp_probe.py` | ADR 0029 llama.cpp rows for a GB10 host, each in a standalone role with its own state directory while the host's matrix role is down (as ENG2). `scripts/live/llamacpp-build.sh source model` builds llama-server v0.6.0 for sm_121 in the home directory and stages Qwen3-4B Q4_K_M first. LC1 `engine add`; LC2 chat, streams, tool calls, start time and memory (MemAvailable, process RSS, nvidia-smi, the GGUF's page-cache bytes) under the default mmap load and `--load-mode none`; LC3 park refused, stop, start; LC4 llama.cpp and vLLM switching under a lowered managed limit; LC5 hang-up mid-decode and mid-prefill; LC6 per-request figures and the load read under 3 streams (no MTP model). `llamacpp_probe.py` runs on the host from the synced tree. |
 
 ## Rules the harness keeps
 
@@ -77,8 +80,9 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
   The CLI reads the admin token itself. Invitation files are copied with `scp` and never
   printed. Engine-secret tables and binding payloads are never selected.
 - **Faults.** Engine PIDs come from `runtime_bindings.identities_json` for the deployment on
-  that host. Role PIDs come from the pid files `role_exec.sh` writes. A PID whose start ticks or
-  boot id differ is refused.
+  that host, and a group member's from `group_members.identities_json` for its own host.
+  Role PIDs come from the pid files `role_exec.sh` writes. A PID whose start ticks or boot id
+  differ is refused.
 - **Policy changes.** Switching a host between normal and tight means `roles.sh host-doc <host>
   tight`, then `host-down` and `host-up`. The host document's fingerprint covers the whole
   document.
@@ -142,3 +146,43 @@ The inference listener is loopback or `DGPU_LISTEN_ADDR`, always with the API ke
 never serves without the key beyond loopback. SGLang deployments name the Triton attention
 backend in their `extra_args` (an SGLang profile carries no host-fixed arguments). On exit the
 trap deletes the deployments the run created (with verified cleanup) and stops its role.
+
+## Multi-node group rows (MN1-MN8)
+
+A group here has two tensor-parallel ranks: host A is the head (rank 0, serves the API
+through the router) and host B the worker (rank 1), over the direct link. The row
+descriptions are in each script's header.
+
+| Row | Engine | What it does |
+|---|---|---|
+| MN1, MN2, MN3 | vLLM, SGLang, TensorFold | bring-up at TP 2: Ready, 20/20 routed completions, RDMA counters before and after on both hosts (`transport: rdma` or `socket` in `transport.json`), stop with verified cleanup on both hosts |
+| MN4 | vLLM, SGLang | vLLM: five deep park and wake cycles: per-member reservation and MemAvailable on each host, same processes, the wake canary's reference tokens, one `parked` and one `restored` journal entry per cycle. SGLang (groups resolve `restart_only` and refuse deep, owner 2026-10-15): status reads `restart_only`, a park stops the group, a request brings it back on a new plan; the same fixture with `residency: deep` is refused `capability_missing:deep_park` |
+| MN5, MN6 | each engine | SIGKILL of the worker's (MN5) or head's (MN6) engine from its recorded identity: the Ready plan fails at the killed rank and each host settles its own member; under the fixtures' `recovery: reconcile` the server relaunches the group on a new plan by itself (a start is sent only if it rests failed or stopped); it answers, then stops with verified cleanup on both hosts |
+| MN7 | one engine | host B's agent stopped (`roles.sh host-down b`) while Ready: rank 1 `uncertain` and still charged, then settles after `roles.sh host-up b` |
+| MN8 | vLLM or SGLang | the group and the single-rank `<v\|s>a-30` on host A alternate with `start --evict`: the evicted group releases on both hosts |
+
+Before MN1, as the owner and not through the harness: `vm.compaction_proactiveness=0`,
+unlimited memlock for the service user, read-write `/dev/infiniband/uverbs*` on both
+hosts. In `hosts.local.env`: `HOST_A_DIRECT_ADDR`/`HOST_B_DIRECT_ADDR` (each host's
+direct-link address, declared as its group peer address by `roles.sh host-doc`), the
+engine environments, `TENSORFOLD_VENV_DIR` for MN3 and TensorFold MN5/MN6, and the
+checkpoints `GROUP_MODEL_VLLM_SGLANG` and `GROUP_MODEL_TENSORFOLD`, present with the same
+files on both hosts. Every row starts with `group_preflight`, which checks read-only that
+both hosts are online and declare `engine_groups`, that each host's peer address is its
+direct-link address, that the engine's profile has one build fingerprint on both hosts,
+and that the checkpoint is on both with the same file list and sizes; it stops the row
+before anything is deployed when one is missing, and reports the host tuning.
+
+```bash
+M=scripts/live/matrix
+$M/sync.sh all && $M/roles.sh up normal
+$M/run_row.sh MN1
+$M/run_row.sh MN2
+$M/run_row.sh MN3
+$M/run_row.sh MN4 --tag vllm -- vllm
+$M/run_row.sh MN4 --tag sglang -- sglang
+$M/run_row.sh MN5 --tag vllm -- vllm          # also sglang, tensorfold
+$M/run_row.sh MN6 --tag vllm -- vllm          # also sglang, tensorfold
+$M/run_row.sh MN7 --tag vllm -- vllm
+$M/run_row.sh MN8 --tag vllm -- vllm
+```

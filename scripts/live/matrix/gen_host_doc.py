@@ -11,7 +11,10 @@ usage: gen_host_doc.py --device-json FILE --ip IP --run-root DIR --policy normal
                        --sglang-version V --vllm-version V --vllm-venv DIR
                        [--sglang-venv DIR] [--remote-tree DIR] [--models-root DIR]
                        [--ingress-port 9443] [--managed-runtime] [--no-profiles]
-                       [--hf-max-bytes SIZE] [--approve-speculation] [--cuda-home DIR] --out FILE
+                       [--hf-max-bytes SIZE] [--approve-speculation] [--cuda-home DIR]
+                       [--peer-address IP --rendezvous-ports START-END]
+                       [--tensorfold-venv DIR --tensorfold-version V [--tensorfold-cuda-home DIR]]
+                       --out FILE
 
 --hf-max-bytes and --approve-speculation (2026-09-25, single-box benchmark)
 opt the host into Hugging Face model sources with that store ceiling (ADR 0008
@@ -20,6 +23,14 @@ amendment) and approve the speculative-decoding options (vLLM
 models inside the model store; ADR 0014 section 8). --cuda-home sets every
 profile's `cuda_home` (SPEC section 13.3 as amended 2026-09-25: `<dir>/bin` joins
 the engine PATH; vLLM needs `nvcc` there for FlashInfer).
+
+--peer-address and --rendezvous-ports (ADR 0028 section 3, rows MN1-MN8) write
+`resource_policy.groups`: the address this host's group peers reach it on (its
+direct-link address) and the inclusive range a group head takes its rendezvous
+port from. --tensorfold-venv adds a `tensorfold` profile the way `capyctl engine
+add` writes one (ADR 0018, ADR 0023): `<venv>/bin/tensorfold`, the installed
+version as its build fingerprint, deep parking disabled, and cuda_home from
+--tensorfold-cuda-home when given (TensorFold compiles its kernels with nvcc).
 """
 
 import argparse
@@ -75,6 +86,11 @@ def main():
     parser.add_argument("--hf-max-bytes")
     parser.add_argument("--approve-speculation", action="store_true")
     parser.add_argument("--cuda-home")
+    parser.add_argument("--peer-address")
+    parser.add_argument("--rendezvous-ports")
+    parser.add_argument("--tensorfold-venv")
+    parser.add_argument("--tensorfold-version")
+    parser.add_argument("--tensorfold-cuda-home")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -102,6 +118,30 @@ def main():
     for path in (args.run_root, args.vllm_venv, args.sglang_venv, args.remote_tree, args.models_root):
         if not os.path.isabs(path) or "/./" in path or "/../" in path or "//" in path:
             sys.exit(f"path {path!r} must be absolute and normalized")
+    groups = None
+    if bool(args.peer_address) != bool(args.rendezvous_ports):
+        sys.exit("--peer-address and --rendezvous-ports go together")
+    if args.peer_address:
+        # ADR 0028 section 3: an IP its peers can reach, never loopback,
+        # unspecified, multicast or broadcast (groups_policy.rs refuses those).
+        peer = ipaddress.ip_address(args.peer_address)
+        if peer.is_loopback or peer.is_unspecified or peer.is_multicast or str(peer) == "255.255.255.255":
+            sys.exit(f"peer address {peer} cannot be a group peer address")
+        match = re.fullmatch(r"(\d+)-(\d+)", args.rendezvous_ports)
+        if not match or not 1024 <= int(match[1]) <= int(match[2]) <= 65535:
+            sys.exit(f"rendezvous ports {args.rendezvous_ports!r} must be START-END with 1024 <= START <= END <= 65535")
+        start, end = int(match[1]), int(match[2])
+        if start <= args.ingress_port <= end or not (end < 8100 or start > 8199):
+            sys.exit("the rendezvous range must miss the ingress port and the engine port range 8100-8199")
+        groups = {"peer_address": str(peer), "rendezvous_port_range": {"start": start, "end": end}}
+    if bool(args.tensorfold_venv) != bool(args.tensorfold_version):
+        sys.exit("--tensorfold-venv and --tensorfold-version go together")
+    if args.tensorfold_venv:
+        if not VERSION.match(args.tensorfold_version):
+            sys.exit(f"TensorFold version {args.tensorfold_version!r} is malformed")
+        for path in filter(None, (args.tensorfold_venv, args.tensorfold_cuda_home)):
+            if not os.path.isabs(path) or "/./" in path or "/../" in path or "//" in path:
+                sys.exit(f"path {path!r} must be absolute and normalized")
 
     with open(os.path.join(HERE, "budgets", args.policy + ".yaml")) as handle:
         budget = json.load(handle)
@@ -126,6 +166,29 @@ def main():
         "@MAX_PARKED@": int(budget["max_parked"]),
     }
     document = substitute(template, values)
+    if groups:
+        document["resource_policy"]["groups"] = groups
+    if args.tensorfold_venv:
+        document["environment_fingerprint"] += f"-tensorfold-{args.tensorfold_version}"
+        # registration.rs profile_document: what `engine add` writes for TensorFold.
+        tensorfold = {
+            "engine": "tensorfold",
+            "revision": 1,
+            "executable": args.tensorfold_venv.rstrip("/") + "/bin/tensorfold",
+            "build_fingerprint": args.tensorfold_version,
+            "args": [],
+            "env": {},
+            "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+            "security": {
+                "deep_park": "disabled",
+                "trust_remote_code": False,
+                "credential_ref": "secret://engine-key",
+                "admin_credential_ref": "secret://admin-key",
+            },
+        }
+        if args.tensorfold_cuda_home:
+            tensorfold["cuda_home"] = args.tensorfold_cuda_home.rstrip("/")
+        document["runtime_profiles"]["tensorfold"] = tensorfold
     if args.managed_runtime:
         del document["runtime_dir"]
     if args.hf_max_bytes:
