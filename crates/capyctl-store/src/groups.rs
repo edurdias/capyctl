@@ -162,6 +162,19 @@ pub struct MemberRow {
     pub identities: Option<Vec<ProcessIdentity>>,
 }
 
+/// ADR 0028 §11: a launched or uncertain member of an active group plan, as
+/// the supervision of its host's control session sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedMember {
+    pub deployment_id: String,
+    pub instance_index: u32,
+    pub generation: i64,
+    pub rank: u32,
+    pub host_id: String,
+    pub state: MemberState,
+    pub launch_handle: Option<String>,
+}
+
 /// SPEC §11, ADR 0028 §11: gone evidence for one member, reported by that
 /// member's own host. `identities` are the processes it proved gone; a member
 /// with identities recorded settles only when they are exactly those, a
@@ -1536,6 +1549,124 @@ impl crate::Store {
         let free = endpoint_port_free(&tx, host_id, port)?;
         tx.commit()?;
         Ok(!free)
+    }
+
+    /// ADR 0028 §11: every launched or uncertain member of an active group
+    /// plan, for the supervision of its host's control session.
+    pub fn hosted_members(&self) -> Result<Vec<HostedMember>, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        type Row = (String, u32, i64, u32, String, String, Option<String>);
+        let rows: Vec<Row> = tx
+            .prepare(
+                "SELECT m.deployment_id,m.instance_index,m.generation,m.rank,m.host_id,m.state,m.launch_handle
+                   FROM group_members m
+                   JOIN group_plans g ON g.deployment_id=m.deployment_id
+                    AND g.instance_index=m.instance_index AND g.generation=m.generation
+                  WHERE g.state='active' AND m.state IN ('launched','uncertain')
+                  ORDER BY m.deployment_id,m.instance_index,m.generation,m.rank",
+            )?
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        rows.into_iter()
+            .map(
+                |(
+                    deployment_id,
+                    instance_index,
+                    generation,
+                    rank,
+                    host_id,
+                    state,
+                    launch_handle,
+                )| {
+                    Ok(HostedMember {
+                        deployment_id,
+                        instance_index,
+                        generation,
+                        rank,
+                        host_id,
+                        state: MemberState::parse(&state)?,
+                        launch_handle,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// ADR 0028 §11: the control session of a launched member's host was
+    /// lost, so the member is `uncertain`. Its charge, dispatch fence and
+    /// identities are kept; nothing is released. Returns whether it changed:
+    /// only a `launched` member of an active plan does.
+    pub fn mark_member_unreachable(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+    ) -> Result<bool, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE group_members SET state='uncertain'
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4
+                AND state='launched'
+                AND EXISTS(SELECT 1 FROM group_plans g WHERE g.deployment_id=?1
+                       AND g.instance_index=?2 AND g.generation=?3 AND g.state='active')",
+            params![deployment_id, instance_index, generation, rank],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// ADR 0028 §11: an uncertain member's host reconnected and its
+    /// reconciled journal still claims the member's Launch `launch_handle`,
+    /// so the member is `launched` again, its recorded identities and charge
+    /// unchanged. Only a member whose uncertainty no other path owns moves:
+    /// dispatched with identities recorded, of an active plan that recorded
+    /// no failure, whose instance is not being stopped and whose status
+    /// names no unsettled stop (`group_member_uncertain`). Returns whether
+    /// it changed.
+    pub fn mark_member_reconciled(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+        rank: u32,
+        launch_handle: &str,
+    ) -> Result<bool, GroupStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE group_members SET state='launched'
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND rank=?4
+                AND state='uncertain' AND dispatched=1 AND identities_json IS NOT NULL
+                AND launch_handle=?5
+                AND EXISTS(SELECT 1 FROM group_plans g WHERE g.deployment_id=?1
+                       AND g.instance_index=?2 AND g.generation=?3 AND g.state='active'
+                       AND g.failed_rank IS NULL)
+                AND NOT EXISTS(SELECT 1 FROM deployment_instances i WHERE i.deployment_id=?1
+                       AND i.instance_index=?2 AND i.last_error='group_member_uncertain')
+                AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=?1
+                       AND r.instance_index=?2 AND r.action='stop'
+                       AND r.state IN ('queued','running'))",
+            params![
+                deployment_id,
+                instance_index,
+                generation,
+                rank,
+                launch_handle
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 }
 

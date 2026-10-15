@@ -4640,3 +4640,175 @@ async fn a_stalled_group_relaunches_under_reconcile_after_settlement() {
     world.wait_ready(&world.id("g")).await;
     assert!(world.route_open("g"));
 }
+
+/// ADR 0028 §11: the readiness supervisor's view of the world's hosts as an
+/// agent's control session presents them: a disconnected host has no current
+/// session, and a connected one claims exactly the launches its (possibly
+/// emptied) journal still holds.
+struct MemberSessions {
+    transport: Arc<WorldHosts>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl crate::remote_readiness::ReadinessHosts for MemberSessions {
+    fn current_session(&self, host: &str) -> Option<String> {
+        let scripted = WorldHosts::host(&self.transport, host)?;
+        scripted
+            .group
+            .connected(host)
+            .then(|| format!("{host}-session"))
+    }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+    fn claims_launch(&self, host: &str, _session: &str, owned_handle: &str) -> bool {
+        let Some(scripted) = WorldHosts::host(&self.transport, host) else {
+            return false;
+        };
+        if !scripted.group.connected(host) {
+            return false;
+        }
+        scripted.reconcile_journal();
+        scripted
+            .state()
+            .journal
+            .get(owned_handle)
+            .is_some_and(|r| r.claim_retained)
+    }
+    fn probe(&self, command: MemberCommand) -> crate::remote_readiness::ProbeFuture {
+        let transport = self.transport.clone();
+        let session = format!("{}-session", command.identity.member.host_id);
+        Box::pin(async move {
+            let host = WorldHosts::host(&transport, &command.identity.member.host_id)
+                .cloned()
+                .ok_or(())?;
+            host.execute(command)
+                .await
+                .map(|r| (session, r))
+                .map_err(drop)
+        })
+    }
+}
+
+impl GroupWorld {
+    /// The production readiness supervisor over [`MemberSessions`], running
+    /// its passes until the returned task is aborted.
+    fn supervise_sessions(&self) -> tokio::task::JoinHandle<()> {
+        crate::remote_readiness::RemoteReadiness::new(
+            self.owner(),
+            Arc::new(MemberSessions {
+                transport: self.transport.clone(),
+                changes: tokio::sync::watch::channel(0).0,
+            }),
+            GROUP_CONTROLLER.into(),
+            Default::default(),
+        )
+        .spawn()
+    }
+
+    /// Waits, bounded by `bound`, for rank `rank` of `name` to read `state`.
+    async fn member_reads(&self, name: &str, rank: u32, state: &str, bound: Duration) {
+        let id = self.id(name);
+        let started = std::time::Instant::now();
+        self.until(&format!("rank {rank} of {name} {state}"), || {
+            self.read_status(&id)
+                .filter(|s| {
+                    s.members
+                        .get(rank as usize)
+                        .is_some_and(|m| m.state == state)
+                })
+                .map(drop)
+        })
+        .await;
+        assert!(
+            started.elapsed() < bound,
+            "rank {rank} read {state} only after {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+// T30, T32 (ADR 0028 §11; MN7 live 0.1.3): a member whose host's control
+// session is lost reads `uncertain` within the supervision bound while its
+// engine runs on, charged, nothing released and the port held. When the host
+// reconnects with its journal still claiming the launch, the member reads
+// `launched` again with the same charge, and the group stops cleanly.
+#[tokio::test]
+async fn a_lost_member_host_reads_uncertain_until_its_journal_returns() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    let supervisor = world.supervise_sessions();
+    let owner_b = member_owner_id(&id, 0, 1);
+    let charged = world.owner_bytes_on("host-b", &owner_b);
+    assert!(charged > 0);
+    world.settle_for(Duration::from_millis(600)).await;
+    assert_eq!(world.status("g").await.member(1).state, "launched");
+
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_eq!(world.status("g").await.member(0).state, "launched");
+    assert_eq!(world.owner_bytes_on("host-b", &owner_b), charged);
+    assert!(world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)) > 0);
+    assert!(!world.port_free("host-a", 25000));
+    assert!(world.group.alive(1));
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched && rows[1].identities.is_some());
+
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world
+        .member_reads("g", 1, "launched", Duration::from_secs(2))
+        .await;
+    assert_eq!(world.owner_bytes_on("host-b", &owner_b), charged);
+    assert_eq!(world.status("g").await.last_error(), "");
+    supervisor.abort();
+    world.stop(&id).await;
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+}
+
+// T32 (ADR 0028 §11): a host back with an empty journal proves nothing of its
+// member, which stays uncertain and charged.
+#[tokio::test]
+async fn a_member_host_back_with_an_empty_journal_stays_uncertain() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    let supervisor = world.supervise_sessions();
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.group.reconnect_host("host-b", JournalState::Empty);
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.group.alive(1));
+    supervisor.abort();
+}
+
+// T30, T32 (ADR 0028 §11): a member whose engine exited while its host was
+// away reads `launched` once its journal returns, and the exit its host then
+// reports fails the group, which settles on each host's evidence.
+#[tokio::test]
+async fn a_member_that_exited_while_its_host_was_away_fails_the_group_on_return() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let supervisor = world.supervise_sessions();
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.group.exit_rank(1);
+    world.settle_for(Duration::from_secs(1)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    world.wait_last_error("g", "group_member_failed").await;
+    world.assert_release_evidence_per_member("g");
+    supervisor.abort();
+}

@@ -73,6 +73,12 @@ pub trait ReadinessHosts: Send + Sync + 'static {
     fn load(&self, _deployment_id: &str, _generation: i64) -> Option<LoadView> {
         None
     }
+    /// ADR 0028 §11: whether `host`'s reconciled `session` replayed a journal
+    /// that still claims the launch `owned_handle`. Without this evidence an
+    /// uncertain group member stays uncertain.
+    fn claims_launch(&self, _host: &str, _session: &str, _owned_handle: &str) -> bool {
+        false
+    }
 }
 impl ReadinessHosts for AgentSessions {
     fn current_session(&self, host: &str) -> Option<String> {
@@ -86,6 +92,9 @@ impl ReadinessHosts for AgentSessions {
             &InstanceKey::new(deployment_id, generation),
             capyctl_protocol::now_unix_ms(),
         )
+    }
+    fn claims_launch(&self, host: &str, session: &str, owned_handle: &str) -> bool {
+        AgentSessions::claims_launch(self, host, session, owned_handle)
     }
     fn probe(&self, command: MemberCommand) -> ProbeFuture {
         let sessions = self.clone();
@@ -178,6 +187,7 @@ impl RemoteReadiness {
     /// dispatch happens inline, before anything else can be sent; probes run as
     /// their own tasks.
     pub fn pass(self: &Arc<Self>) {
+        self.supervise_members();
         let launches = {
             let Ok(owner) = self.owner.lock() else { return };
             match owner.store().remote_ready_launches(owner.session()) {
@@ -217,6 +227,73 @@ impl RemoteReadiness {
         }
         if let Ok(mut probes) = self.probes.lock() {
             probes.retain(|binding, state| state.running || probing.contains(binding));
+        }
+    }
+
+    /// ADR 0028 §11: a group member whose host has no current session is
+    /// `uncertain` (`group_member_uncertain`) and keeps its charge; nothing
+    /// here releases it. A member this made uncertain is `launched` again
+    /// only once its host's reconciled session replays a journal that still
+    /// claims its Launch; an exit the host then reports fails the group as
+    /// any exit does. A host back with an empty journal proves nothing, so
+    /// its member stays uncertain until a stop settles it on evidence. The
+    /// store refuses the return for an uncertainty a stop, a failure or an
+    /// unanswered Launch owns.
+    fn supervise_members(&self) {
+        use capyctl_store::groups::MemberState;
+        let members = {
+            let Ok(owner) = self.owner.lock() else { return };
+            match owner.store().hosted_members() {
+                Ok(members) => members,
+                Err(_) => return,
+            }
+        };
+        for member in members {
+            // Session state is read before the coordinator's state is locked.
+            let current = self.hosts.current_session(&member.host_id);
+            let claimed = match (&current, &member.launch_handle) {
+                (Some(session), Some(handle)) => {
+                    self.hosts.claims_launch(&member.host_id, session, handle)
+                }
+                _ => false,
+            };
+            let Ok(owner) = self.owner.lock() else { return };
+            let store = owner.store();
+            let (changed, code, what) = match (member.state, &member.launch_handle) {
+                (MemberState::Launched, _) if current.is_none() => (
+                    store.mark_member_unreachable(
+                        &member.deployment_id,
+                        member.instance_index,
+                        member.generation,
+                        member.rank,
+                    ),
+                    Some("group_member_uncertain"),
+                    "its host's control session was lost; it stays charged",
+                ),
+                (MemberState::Uncertain, Some(handle)) if claimed => (
+                    store.mark_member_reconciled(
+                        &member.deployment_id,
+                        member.instance_index,
+                        member.generation,
+                        member.rank,
+                        handle,
+                    ),
+                    None,
+                    "its host reconnected with its journal still claiming the launch",
+                ),
+                _ => continue,
+            };
+            if changed.unwrap_or(false) {
+                let _ = store.record_journal(
+                    Some(&member.host_id),
+                    None,
+                    code,
+                    &format!(
+                        "deployment {} instance {} rank {}: {what}",
+                        member.deployment_id, member.instance_index, member.rank
+                    ),
+                );
+            }
         }
     }
 
