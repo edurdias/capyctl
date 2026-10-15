@@ -1,7 +1,8 @@
 # Live scripts
 
 `matrix/` is the two-host matrix harness ([its README](matrix/README.md)).
-`engine-quick-check.sh` is the per-release engine check below.
+`engine-quick-check.sh` is the per-release engine check below, and
+`release-checks/run.sh` the live checks a CapyCTL release owes.
 
 ## Engine quick check
 
@@ -68,3 +69,34 @@ The host phases run detached from the SSH session, so a dropped connection does
 not stop them. If the script itself is interrupted, run
 `bash ~/capyctl-quick-check-runs/<run>/remote.sh down` on the host to stop the role
 and delete what it created.
+
+## Release checks
+
+`release-checks/run.sh` runs the live checks a release owes (for 0.1.3: B1-B17
+of the live backlog, from the `docs/changes/` files merged since 0.1.2) on one
+GB10 host, and writes `verdict.md` with one PASS, FAIL or SKIP row per check
+and the evidence of every sub-check:
+
+```bash
+scripts/live/release-checks/run.sh --dry-run          # the whole plan and per-check estimates; no host contacted
+scripts/live/release-checks/run.sh                    # every check (about 2.5 hours on host A)
+scripts/live/release-checks/run.sh --only B4,B7       # a subset; B2 brings B1, whose cycles it rides on
+```
+
+It builds CapyCTL on the host like the quick check (tree `~/capyctl-0.1.3-live`)
+and runs the checks detached in `~/c13/<run>` there, a short path on purpose:
+deep parking's observation socket lives under the state directory. Each group
+of checks gets its own standalone role, state directory, model-sources
+directory and port (18643 by default, `--port`), and each profile its own
+empty kernel caches. One deployment serves every check it can: vLLM model 1
+for B1, B2, B3, B5 and B14, then its eager loader for B4; TensorFold 0.6.6 for
+B3 and B14; SGLang Qwen3-4B for B3, B5, B6, B14 and B8; SGLang model 1 for B9,
+B15 and B12; Qwen2.5-0.5B, downloaded by CapyCTL, for B11 and B13. Every role,
+deployment and profile is removed at the end, after a failure too; venvs and
+models stay. Engine keys are never read, and the ledger only through read-only
+SELECTs. B10 (Flash-Next with its table on disk) runs only with a complete
+checkpoint on the host or `--download-flash-next`, B17 (a role as a container's
+PID 1) only with `--container`; B16 is SKIP until gpt-oss-120b is on a host.
+Results go to `target/live/0.1.3-backlog/<run>/` in the main checkout. If the
+script is interrupted, `bash ~/c13/<run>/remote.sh down` on the host stops the
+role and deletes what it created.
