@@ -690,6 +690,7 @@ impl World {
             members,
             step_id: ulid::Ulid::new().to_string(),
             deadline_ms: capyctl_protocol::now_unix_ms() + 90_000,
+            evidence: Default::default(),
         }
     }
 
@@ -867,32 +868,30 @@ fn member_host(
     .with_host_probes(probes)
     .with_engine_cache_root(private(&path.join("engines")));
     let leader = Arc::new(OnceLock::<u32>::new());
-    match engine {
-        // ADR 0028 §12 (R12): the saver map, from this host's own
-        // observation directory.
-        GroupEngine::Sglang => {
-            executor = executor.with_saver_residency(Arc::new(StubSaver {
-                dir: private(&state.join("observation")),
-                head_marker: head_marker.to_owned(),
-            }));
-        }
-        // ADR 0007: `nvidia-smi` lists every process of the member's engine
-        // holding GPU memory, which it gives back while the group sleeps.
-        _ => {
-            let (seen, marker) = (leader.clone(), head_marker.to_owned());
-            let gpu: Arc<GpuCollector> = Arc::new(move || {
-                let leader = *seen.get()?;
-                let bytes = if marker.exists() { 0 } else { GPU_RESIDENT };
-                Some(
-                    group_pids(leader)
-                        .into_iter()
-                        .map(|pid| (pid, bytes))
-                        .collect(),
-                )
-            });
-            executor = executor.with_process_residency(ResidencySampler::with_collector(gpu));
-        }
+    // ADR 0028 §12 (R12): a SGLang member's park and wake are judged on the
+    // saver map, from this host's own observation directory.
+    if engine == GroupEngine::Sglang {
+        executor = executor.with_saver_residency(Arc::new(StubSaver {
+            dir: private(&state.join("observation")),
+            head_marker: head_marker.to_owned(),
+        }));
     }
+    // ADR 0007: `nvidia-smi` lists every process of the member's engine
+    // holding GPU memory, which it gives back while the group sleeps. Every
+    // host reports it: a vLLM member is judged on it, and every member's
+    // parked residue is read from it (ADR 0028 §12 as amended 2026-10-15).
+    let (seen, marker) = (leader.clone(), head_marker.to_owned());
+    let gpu: Arc<GpuCollector> = Arc::new(move || {
+        let leader = *seen.get()?;
+        let bytes = if marker.exists() { 0 } else { GPU_RESIDENT };
+        Some(
+            group_pids(leader)
+                .into_iter()
+                .map(|pid| (pid, bytes))
+                .collect(),
+        )
+    });
+    executor = executor.with_process_residency(ResidencySampler::with_collector(gpu));
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let startup = executor.inventory().expect("the host measures its memory");
     let (session_journal, session_executor) = (journal.clone(), executor.clone());

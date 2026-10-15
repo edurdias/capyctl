@@ -273,17 +273,20 @@ pub(super) async fn initialize(
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
     // ADR 0028 §9: readiness is the head's. A worker's health server always
-    // passes and is never probed; its step ends once its process is recorded
+    // passes and is never probed; its step ends once its tree, its ranks'
+    // schedulers included (each enrolls its saver observation), is recorded
     // and present.
     if launch.rendered.is_group_worker() {
         let receipt = format!(
             "sglang {} group worker spawned; readiness is the head's",
             adapter.fingerprint()?
         );
+        let ranks = launch.frozen.group().map_or(1, |group| group.local_ranks());
         return crate::group::worker_spawned(
             context,
             tools,
             api,
+            ranks as usize,
             builds,
             || launch_failed(adapter, debug_logs),
             receipt,

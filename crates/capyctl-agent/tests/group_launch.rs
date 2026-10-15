@@ -84,6 +84,13 @@ with open(os.path.join(here, "record.tmp"), "w") as f:
                "observation_fd": "--observation-credential-fd" in args}, f)
 os.replace(os.path.join(here, "record.tmp"), os.path.join(here, "record.json"))
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+if os.path.exists(os.path.join(here, "transient-child")):
+    # SGLang's worker first forks a short-lived child, then its rank processes
+    # (found live 2026-10-15, MN2).
+    if os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(0)
+    time.sleep(1.2)
 parent = os.getppid()
 if os.fork() == 0:
     while os.path.isdir(here):
@@ -317,6 +324,7 @@ struct FakeHost {
     engine: GroupEngine,
     ignore_sigterm: bool,
     late_children: bool,
+    transient_child: bool,
     deep: bool,
     /// Whether the substituted host holds its own peer address.
     holds_peer: bool,
@@ -451,6 +459,7 @@ impl FakeHost {
             engine: GroupEngine::Vllm,
             ignore_sigterm: false,
             late_children: false,
+            transient_child: false,
             deep: false,
             holds_peer: true,
             held: Vec::new(),
@@ -490,6 +499,12 @@ impl FakeHost {
     /// The worker forks a child 0.4 s after it starts and another after 3 s.
     fn with_late_children(mut self) -> Self {
         self.late_children = true;
+        self
+    }
+    /// The engine forks a child that exits after 0.5 s, then its lasting
+    /// child 1.2 s after it starts.
+    fn with_transient_child(mut self) -> Self {
+        self.transient_child = true;
         self
     }
     /// The engine's whole tree ignores SIGTERM (SGLang rank > 0 does).
@@ -548,6 +563,11 @@ impl FakeHost {
         let tensorfold = bin.join("tensorfold");
         fake(&vllm);
         fake(&tensorfold);
+        // ADR 0028 §10: a TensorFold group member loads the installation's
+        // libnccl, where the nvidia-nccl wheel lays it out in the venv.
+        let nccl = path.join("venv/lib/python3.12/site-packages/nvidia/nccl/lib");
+        std::fs::create_dir_all(&nccl).unwrap();
+        std::fs::write(nccl.join("libnccl.so.2"), "").unwrap();
         module(
             &runtime.join("vllm_entry.py"),
             &format!(
@@ -565,6 +585,7 @@ impl FakeHost {
         for (marker, on) in [
             ("ignore-sigterm", self.ignore_sigterm),
             ("late-children", self.late_children),
+            ("transient-child", self.transient_child),
         ] {
             if on {
                 for dir in [&bin, &runtime] {
@@ -1399,13 +1420,18 @@ fn ended(pid: u32) -> bool {
     }
 }
 
-// T31, T33 (ADR 0028 §8, §11): a child the worker starts just after its spawn
-// is in the Launch reply and the journal. With the leader dead and reaped,
-// Terminate signals recorded identities only: the recorded child ends, and a
-// child started after the tree settled (never recorded) is never signalled;
-// it keeps the stop uncertain, with the claim retained.
+// T31, T33 (ADR 0028 §8, §11; MN5 vLLM, found live): a child the worker starts
+// just after its spawn is in the Launch reply and the journal; one started
+// after the tree settled (a vLLM `Worker_TP1`) is not. When the recorded
+// leader dies first, its launcher still holds it unreaped, so the group id
+// stays this launch's: Terminate signals the whole group, the unrecorded
+// child ends with the recorded one, and the host answers gone evidence for
+// exactly the recorded identities with the claim released, which the
+// controller settles the member on. Before the hold, the leader was reaped at
+// once, the leaderless group was never signalled, and every Terminate failed
+// while the unrecorded child ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncertain() {
+async fn a_dead_worker_leaders_unrecorded_child_is_terminated_and_the_stop_settles() {
     let host = FakeHost::new("host-b")
         .with_groups_policy(WORKER_PEER)
         .with_late_children();
@@ -1442,35 +1468,83 @@ async fn late_worker_children_are_recorded_and_unrecorded_survivors_stay_uncerta
     {
         assert!(
             std::time::Instant::now() < deadline,
-            "the leader was never reaped"
+            "the leader never ended"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // (b) The unrecorded survivor makes the stop uncertain: no gone report.
-    assert!(host
+    assert!(!ended(later), "the unrecorded child outlived its leader");
+    // Gone evidence for exactly the recorded identities, the claim released.
+    let gone = host
         .terminate(&out.owned_handle, &out.processes)
         .await
-        .is_err());
-    // (a) The recorded child was signalled and ended.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ended(early) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a recorded child survived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // A leaderless group scan never authorizes a signal: it is still running.
-    assert!(!ended(later), "an unrecorded process was signalled");
-    assert!(host
+        .unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+    let named = |processes: &[pb::OwnedProcessObservation]| {
+        let mut named: Vec<_> = processes.iter().map(|p| (p.pid, p.start_ticks)).collect();
+        named.sort();
+        named
+    };
+    assert_eq!(named(&gone.result.processes), named(&out.processes));
+    // Both children ended: the recorded one and the one never recorded.
+    assert!(ended(early), "a recorded child survived");
+    assert!(
+        ended(later),
+        "the unrecorded child survived its group's stop"
+    );
+    assert!(!host
         .journal()
         .claimed_launches("")
         .unwrap()
         .iter()
         .any(|claim| claim.command.identity.command_id == out.owned_handle));
-    // The test ends the process it injected the fault into.
-    // SAFETY: kill has no memory preconditions; the pid is the fake's child.
-    unsafe { libc::kill(later as i32, libc::SIGKILL) };
+}
+
+// T31 (ADR 0028 §8, §11; found live 2026-10-15, MN2 and MN5): a worker forks a
+// short-lived child before its rank process. The child, gone before the
+// worker reports, is no recorded process of the member: the Launch reply (what
+// the controller records) names only processes alive when it reported, each
+// under its own role (MN2: two `worker-0`, a Plan error), and the processes
+// supervision watches once the group is Ready are exactly those, all alive
+// (MN5: the child's exit failed the member right after Ready). Failed before
+// the change: the reply carried the gone child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gone_transient_child_is_never_a_recorded_process_of_the_member() {
+    let host = FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_transient_child();
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    assert!(
+        out.processes.len() >= 2 && out.processes.iter().all(|p| p.presence == "alive"),
+        "the leader and its rank process, nothing gone: {:?}",
+        out.processes
+    );
+    let identities: Vec<_> = out
+        .processes
+        .iter()
+        .map(|p| capyctl_domain::completion::ProcessIdentity {
+            role: p.role.clone(),
+            pid: p.pid,
+            boot_id: p.boot_id.clone(),
+            start_ticks: p.start_ticks,
+        })
+        .collect();
+    capyctl_domain::group::validate_local_processes(&identities)
+        .unwrap_or_else(|_| panic!("every role is unique: {:?}", out.processes));
+    // What supervision watches for this member: every process alive, so no
+    // exit is reported for it.
+    let watched = host
+        .journal()
+        .ready_launches()
+        .unwrap()
+        .into_iter()
+        .find(|(command, _)| command.identity.command_id == out.owned_handle)
+        .map(|(_, processes)| processes)
+        .expect("the worker is watched from its Launch on");
+    assert_eq!(watched.len(), out.processes.len(), "{watched:?}");
+    assert!(watched.iter().all(|p| {
+        capyctl_launchers::process_absence::presence(p)
+            == capyctl_domain::completion::Presence::Alive
+    }));
 }
 
 // T31, T33: a worker terminates its own recorded tree only.

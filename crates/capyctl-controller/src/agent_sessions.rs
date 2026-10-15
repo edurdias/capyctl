@@ -682,6 +682,23 @@ impl AgentSessions {
             .filter(|s| s.view.online && s.view.reconciled && !s.draining && !s.unresponsive)
             .map(|s| s.view.session_id.clone())
     }
+    /// ADR 0028 §11: whether `host`'s live, reconciled `session` replayed a
+    /// journal that still claims the launch `owned_handle` (its command id).
+    /// An agent back with an empty journal claims nothing.
+    pub fn claims_launch(&self, host: &str, session: &str, owned_handle: &str) -> bool {
+        self.sessions.lock().ok().is_some_and(|sessions| {
+            sessions
+                .get(host)
+                .filter(|s| s.view.online && s.view.reconciled && s.view.session_id == session)
+                .is_some_and(|s| {
+                    s.history.iter().any(|record| {
+                        record.command_id == owned_handle
+                            && record.claim_retained
+                            && record.state != "tombstone"
+                    })
+                })
+        })
+    }
     /// ADR 0028 §12 (R12): the saver map `host` last reported on its live,
     /// reconciled session for the SGLang group member launch `owned_handle`:
     /// the bytes it maps and when (controller clock). `None` is no report.

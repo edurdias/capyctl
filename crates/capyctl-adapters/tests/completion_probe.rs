@@ -183,18 +183,26 @@ async fn sglang_asks_for_output_ids_on_generate() {
 }
 
 // T30 (decided 2026-10-06): TensorFold is asked in the OpenAI form without a
-// key (ADR 0023 §3); the ids come from the choice.
+// key (ADR 0023 §3). Found live 2026-10-15 (MN3, MN5, MN6): TensorFold 0.6.5
+// and 0.6.6 answer the ids `return_token_ids` asks for in their own
+// `tensorfold` block, not in the choice (src/tensorfold/cuda/http.py:240-242),
+// so `return_token_ids` stays in the request and the ids come from the block.
 #[tokio::test]
 async fn tensorfold_asks_for_token_ids_without_a_key() {
-    let (endpoint, seen) = engine(json!({"choices": [{"token_ids": [3]}]})).await;
-    let adapter = TensorfoldAdapter::new(endpoint.parse().unwrap(), "0.6.0".into(), "toy".into());
+    let (endpoint, seen) = engine(json!({
+        "id": "cmpl-0123456789abcdef01234567", "object": "text_completion", "created": 1,
+        "model": "toy", "choices": [{"index": 0, "text": " Ready", "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        "tensorfold": {"prefill_s": 0.03, "cached": 0, "token_sha": "5f1c", "token_ids": [3]}
+    }))
+    .await;
+    let adapter = TensorfoldAdapter::new(endpoint.parse().unwrap(), "0.6.5".into(), "toy".into());
     assert_eq!(
-        adapter
-            .complete_probe("toy", 1, BOUND)
-            .await
-            .unwrap()
-            .tokens,
-        vec![3]
+        adapter.complete_probe("toy", 1, BOUND).await.unwrap(),
+        ProbeAnswer {
+            tokens: vec![3],
+            text: " Ready".into()
+        }
     );
     let seen = seen.0.lock().unwrap().clone();
     let (path, key, body) = &seen[0];

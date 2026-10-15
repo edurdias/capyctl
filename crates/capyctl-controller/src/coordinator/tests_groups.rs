@@ -121,10 +121,17 @@ struct HostState {
     prepare_refusal: Option<String>,
     /// The head's completion probes generate no token.
     probe_fails: bool,
+    /// Found live 2026-10-15 (MN3, MN5, MN6): the head's completion probes
+    /// answer generated text and no token ids, as a TensorFold head read
+    /// without its `tensorfold` block's ids did.
+    probe_text_only: bool,
     /// Every Launch is carried out but its reply never reaches the server.
     lose_launch_replies: bool,
     /// Every Launch starts its rank, which exits at once (a launch failure).
     launch_fails: bool,
+    /// MN2 (found live): every rank tree names two processes under one role,
+    /// so its Launch reply cannot be recorded as the member's identities.
+    duplicate_roles: bool,
     launch_observer: Option<LaunchObserver>,
     /// The world's own observer of every Launch, besides a test's.
     witness: Option<LaunchObserver>,
@@ -132,6 +139,14 @@ struct HostState {
     launch_env: Option<BTreeMap<String, String>>,
     /// ADR 0028 §11: how long the head takes to answer a completion probe.
     probe_delay: Option<Duration>,
+    /// ADR 0007: the anonymous resident pages each rank process holds, which
+    /// its host's `process_residency` adds to its device memory and which no
+    /// park releases (found live 2026-10-15, MN4: a parked vLLM rank).
+    anonymous_bytes: u64,
+    /// Found live 2026-10-15 (MN4, MN5): every Launch reply names the
+    /// spawned process alone, as a worker whose tree settled before its
+    /// engine forked its rank process did. The rank process still runs.
+    records_leader_only: bool,
 }
 
 /// The scripted agent of one member host.
@@ -165,12 +180,16 @@ impl GroupHost {
                 next_pid: 4000,
                 prepare_refusal: None,
                 probe_fails: false,
+                probe_text_only: false,
                 lose_launch_replies: false,
                 launch_fails: false,
+                duplicate_roles: false,
                 launch_observer: None,
                 witness: None,
                 launch_env: None,
                 probe_delay: None,
+                anonymous_bytes: 0,
+                records_leader_only: false,
             }),
         }
     }
@@ -454,7 +473,7 @@ impl GroupHost {
         {
             return Err(HostError::Unauthorized);
         }
-        let tokens: Vec<u32> = if state.probe_fails {
+        let tokens: Vec<u32> = if state.probe_fails || state.probe_text_only {
             Vec::new()
         } else {
             self.group
@@ -462,6 +481,11 @@ impl GroupHost {
                 .into_iter()
                 .take(max_tokens as usize)
                 .collect()
+        };
+        let probe_text = if state.probe_text_only {
+            "Ready.".to_owned()
+        } else {
+            String::new()
         };
         // As the agent, the probe reports on the binding of the launch it
         // names.
@@ -476,6 +500,7 @@ impl GroupHost {
             processes: self.observed(&state, &launch.identities),
             claim_retained: true,
             probe_tokens: tokens,
+            probe_text,
             binding_id,
             incarnation,
             ..Self::reply(command)
@@ -542,32 +567,45 @@ impl GroupHost {
 
     /// ADR 0007, ADR 0028 §12: what this host's `process_residency` reports:
     /// the memory its rank's newest live process tree holds, keyed by the
-    /// leader's identity. A disconnected host reports nothing.
+    /// rank process (the newest of the tree, the one holding the device): its
+    /// device memory, plus its anonymous pages ([`HostState::anonymous_bytes`])
+    /// in the sum. A disconnected host reports nothing.
     fn residents(&self) -> Option<Vec<capyctl_domain::resources::ProcessResident>> {
         if !self.group.connected(&self.name) {
             return None;
         }
         let state = self.state();
+        let host_bytes = state.anonymous_bytes as i64;
         Some(
             state
                 .spawned
                 .last()
                 .filter(|spawned| self.group.alive(spawned.rank))
                 .and_then(|spawned| {
-                    spawned.identities.first().map(|leader| {
+                    spawned.identities.last().map(|rank_process| {
+                        let device_bytes = self.group.resident_bytes(spawned.rank) as i64;
                         capyctl_domain::resources::ProcessResident {
-                            pid: leader.pid,
-                            boot_id: leader.boot_id.clone(),
-                            start_ticks: leader.start_ticks,
-                            bytes: self.group.resident_bytes(spawned.rank) as i64,
-                            device_bytes: 0,
-                            host_bytes: 0,
+                            pid: rank_process.pid,
+                            boot_id: rank_process.boot_id.clone(),
+                            start_ticks: rank_process.start_ticks,
+                            bytes: device_bytes + host_bytes,
+                            device_bytes,
+                            host_bytes,
                         }
                     })
                 })
                 .into_iter()
                 .collect(),
         )
+    }
+
+    /// The process holding this host's rank of its newest launch, as its
+    /// saver enrollment names it.
+    fn rank_process(&self) -> Option<ProcessIdentity> {
+        self.state()
+            .spawned
+            .last()
+            .and_then(|spawned| spawned.identities.last().cloned())
     }
 
     /// ADR 0028 §8 (R7, R23, R29): one member launch.
@@ -710,11 +748,15 @@ impl GroupHost {
         self.group.launch(rank);
         // ADR 0028 §4, §8: a worker's leader is reported as `worker-<r>` and
         // its children under it; the head keeps the engine's own roles.
-        let roles = if rank == 0 {
+        let mut roles = if rank == 0 {
             vec!["api".to_owned(), "worker-0".to_owned()]
         } else {
             vec![format!("worker-{rank}"), format!("worker-{rank}/worker-0")]
         };
+        if state.duplicate_roles {
+            let repeated = roles[1].clone();
+            roles.push(repeated);
+        }
         let pid = state.next_pid;
         state.next_pid += roles.len() as u32;
         let identities: Vec<ProcessIdentity> = roles
@@ -731,11 +773,18 @@ impl GroupHost {
             rank,
             identities: identities.clone(),
         });
+        // Found live 2026-10-15 (MN4, MN5): a reply that settled before the
+        // engine forked its rank process names the spawned process alone.
+        let recorded = if state.records_leader_only {
+            identities[..1].to_vec()
+        } else {
+            identities
+        };
         state
             .journal
             .get_mut(&command.identity.command_id)
             .unwrap()
-            .identities = identities;
+            .identities = recorded;
     }
 
     /// ADR 0028 §9: the head waits for the whole group to form and the engine
@@ -785,10 +834,12 @@ impl GroupHost {
         }
         let (rank, identities) = (launch.rank, launch.identities.clone());
         // Only the newest tree of the rank still runs; an older one is gone.
+        // The tree is its leader's process group, signalled whole even when
+        // its reply named the leader alone ([`HostState::records_leader_only`]).
         let current = state
             .spawned
             .last()
-            .is_some_and(|spawned| spawned.identities == identities);
+            .is_some_and(|spawned| spawned.identities.first() == identities.first());
         let escalated = current && self.group.terminate_rank(rank);
         state.journal.get_mut(owned_handle).unwrap().claim_retained = false;
         let processes = self.observed(&state, &identities);
@@ -921,7 +972,10 @@ impl crate::group_activation::GroupHosts for WorldHosts {
     }
 
     /// ADR 0028 §12 (R12): the saver-map facts `member`'s own host reads
-    /// from its observation directory: the bytes its rank holds now. A
+    /// from its observation directory: the bytes its rank holds now. As the
+    /// agent's saver source does, it reads them only when the enrolled
+    /// scheduler (the rank process) is one of the member's recorded processes
+    /// (`owner_not_a_launch_member`, found live 2026-10-15, MN4). A
     /// disconnected host reports nothing.
     fn saver_mapped<'a>(
         &'a self,
@@ -932,6 +986,12 @@ impl crate::group_activation::GroupHosts for WorldHosts {
             let host = WorldHosts::host(self, &member.host_id).ok_or("no such host")?;
             if !host.group.connected(&host.name) {
                 return Err("unreachable".into());
+            }
+            if !host
+                .rank_process()
+                .is_some_and(|owner| member.identities.contains(&owner))
+            {
+                return Err("owner_not_a_launch_member".into());
             }
             let rank = host.group.rank_of(&host.name).ok_or("no rank")?;
             Ok((
@@ -1110,6 +1170,9 @@ pub(super) struct GroupWorld {
     model_stores: BTreeMap<String, String>,
     /// `recovery` of every group this world deploys.
     recovery: String,
+    /// Every group this world deploys has its phases derived from an 8 GiB
+    /// request (no declared `resources`), so a park measures its residue.
+    derived_memory: bool,
     /// Every group Launch the hosts received: its generation, and whether the
     /// instance's previous plan had fully settled when it arrived.
     witnessed: Arc<Mutex<Vec<(i64, bool)>>>,
@@ -1230,6 +1293,7 @@ impl GroupWorld {
             model_stores: BTreeMap::new(),
             // Nothing relaunches unless a test asks for `reconcile`.
             recovery: "cold_restart".into(),
+            derived_memory: false,
             witnessed,
             eligible,
             observations,
@@ -1265,6 +1329,12 @@ fn spawn_world_worker(
         Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
         CoordinatorOptions {
             retry_cooldown: Duration::from_millis(50),
+            // ADR 0028 §12: member evidence inside the test's 4 s park and
+            // wake windows; the scripted hosts' process samples are current.
+            group_member_evidence: crate::group_residency::MemberEvidence {
+                window: MEMBER_EVIDENCE_WINDOW,
+                sample_lag: Duration::ZERO,
+            },
             ..Default::default()
         },
         Arc::new(WorldBindings(transport.clone())),
@@ -1276,6 +1346,23 @@ impl GroupWorld {
     /// Every host runs `engine` (`vllm`, `sglang` or `tensorfold`).
     pub(super) fn with_engine(mut self, engine: &str) -> Self {
         self.engine = engine.into();
+        self
+    }
+
+    /// Every rank process on every host holds `bytes` of anonymous resident
+    /// pages beside its device memory, which no park releases (ADR 0007).
+    pub(super) fn with_anonymous_bytes(self, bytes: u64) -> Self {
+        for host in &self.hosts {
+            host.state().anonymous_bytes = bytes;
+        }
+        self
+    }
+
+    /// `host`'s Launch replies name the spawned process alone (found live
+    /// 2026-10-15, MN4, MN5: a worker whose tree settled before its engine
+    /// forked its rank process).
+    pub(super) fn records_leader_only(self, host: &str) -> Self {
+        self.host(host).state().records_leader_only = true;
         self
     }
 
@@ -1337,9 +1424,22 @@ impl GroupWorld {
         self
     }
 
+    /// The head's completion probes answer text and no token ids.
+    pub(super) fn probe_answers_text_only(self) -> Self {
+        self.hosts[0].state().probe_text_only = true;
+        self
+    }
+
     /// `host` carries every Launch out but its replies are lost.
     pub(super) fn launch_replies_lost(self, host: &str) -> Self {
         self.host(host).state().lose_launch_replies = true;
+        self
+    }
+
+    /// MN2: `host` names two processes of every rank tree under one role, so
+    /// its Launch replies cannot be recorded for its member.
+    pub(super) fn launch_roles_duplicated(self, host: &str) -> Self {
+        self.host(host).state().duplicate_roles = true;
         self
     }
 
@@ -1352,6 +1452,14 @@ impl GroupWorld {
     /// Every group this world deploys runs `recovery: reconcile`.
     pub(super) fn recovery_reconcile(mut self) -> Self {
         self.recovery = "reconcile".into();
+        self
+    }
+
+    /// ADR 0014 amendment A13: every group this world deploys has its phases
+    /// derived from an 8 GiB request, so its parks are charged their
+    /// measured residue.
+    pub(super) fn with_derived_memory(mut self) -> Self {
+        self.derived_memory = true;
         self
     }
 
@@ -1573,9 +1681,18 @@ impl GroupWorld {
         let mut deployment = group_document(&source["input"]["deployment"], name, &names, tp, pp);
         deployment.as_object_mut().unwrap().remove("host");
         deployment["recovery"] = serde_json::json!(self.recovery);
+        if self.derived_memory {
+            deployment.as_object_mut().unwrap().remove("resources");
+            deployment["engine_config"]["memory"] =
+                serde_json::json!({"request": "8GiB", "kv_cache": "4GiB"});
+        }
         if self.engine == "tensorfold" {
             deployment["residency"] = serde_json::json!("restart_only");
             deployment["engine_config"] = serde_json::json!({"context_length": 8192});
+        }
+        // ADR 0028 note of 2026-10-15: an SGLang group does not park in 0.1.3.
+        if self.engine == "sglang" {
+            deployment["residency"] = serde_json::json!("restart_only");
         }
         if let Some(residency) = residency {
             deployment["residency"] = serde_json::json!(residency);
@@ -2731,6 +2848,49 @@ async fn failing_readiness_probe_fails_the_activation() {
     assert_eq!(world.probe_calls(), 1);
 }
 
+// T30 (owner decision 2026-10-15; found live MN3, MN5, MN6): a TensorFold head
+// whose completion answers text and no token ids proves readiness with the
+// text: the group activates and its route opens.
+#[tokio::test]
+async fn tensorfold_readiness_passes_on_text_without_token_ids() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"])
+        .with_engine("tensorfold")
+        .probe_answers_text_only();
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_ready(&id).await;
+    assert!(world.route_open("g"));
+    assert_eq!(world.probe_calls(), 1);
+    assert_eq!(world.probes_sent_to("host-b"), 0);
+}
+
+// T30 (decided 2026-10-06, unchanged by the owner decision of 2026-10-15): a
+// vLLM or SGLang head whose completion answers text and no token ids fails
+// readiness; only a TensorFold head's text is evidence.
+#[tokio::test]
+async fn vllm_and_sglang_readiness_still_needs_token_ids() {
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine(engine)
+            .probe_answers_text_only();
+        let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+        world.group.launch_completes();
+        assert!(
+            matches!(
+                world.wait_activation(&id).await,
+                GroupActivation::Failed {
+                    failed_rank: 0,
+                    failure: LaunchFailure::MemberFailed,
+                    ..
+                }
+            ),
+            "{engine}"
+        );
+        assert!(!world.route_open("g"), "{engine}");
+        assert_eq!(world.probe_calls(), 1, "{engine}");
+    }
+}
+
 // T30 (decided 2026-10-06): a passing 1-token probe through the head opens the route; workers are never probed.
 #[tokio::test]
 async fn readiness_probe_goes_through_the_head_only() {
@@ -2743,8 +2903,9 @@ async fn readiness_probe_goes_through_the_head_only() {
     assert_eq!(world.probes_sent_to("host-b"), 0);
 }
 
-// T14 (decided 2026-10-06): a deep SGLang group whose member paths differ is refused before
-// the reservation, naming both paths; a restart-only SGLang group with the same differing paths activates.
+// T14, T22 (decided 2026-10-06; ADR 0028 note of 2026-10-15): a deep SGLang group is
+// refused at deploy (`capability_missing:deep_park`, before the path check), and nothing is
+// reserved; a restart-only SGLang group with differing member paths activates.
 #[tokio::test]
 async fn sglang_deep_group_with_differing_paths_is_refused() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -2755,17 +2916,10 @@ async fn sglang_deep_group_with_differing_paths_is_refused() {
         .try_deploy_group_with_residency("g", &["host-a", "host-b"], "deep")
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "group_model_path_mismatch");
-    assert!(err.to_string().contains("/models/a") && err.to_string().contains("/models/b"));
-    assert!(world.group_plan("g").is_none());
-    let id = world.id("g");
-    assert_eq!(
-        world.wait_settled(&id).await.last_error(),
-        "group_model_path_mismatch"
-    );
-    assert_eq!(
-        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
-        0
+    assert!(
+        err.to_string().contains("capability_missing:deep_park")
+            && err.to_string().contains("restart_only"),
+        "{err}"
     );
     assert_eq!(world.launches(), 0);
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -2938,6 +3092,72 @@ async fn a_lost_launch_reply_keeps_the_member_charged() {
     );
     assert!(world.port_free("host-a", 25000));
     assert!(!world.group.alive(1));
+}
+
+// T30, T31, T33 (ADR 0028 §8, §11, R23; MN2 SGLang, found live): a worker's
+// Launch reply names two processes under one role, so its identities cannot
+// be recorded and the member stays dispatched with none. Its host's journal
+// answers the stop's Terminate of that Launch with every process it journaled
+// gone and the claim released; the store settles the member on that evidence
+// for its own Launch handle, records those processes and releases its charge,
+// and the plan frees its port. Before, the member stayed `uncertain` and
+// charged forever after every process was gone.
+#[tokio::test]
+async fn an_unrecorded_member_settles_on_its_hosts_launch_evidence() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_roles_duplicated("host-b");
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    assert!(matches!(
+        world.wait_activation(&id).await,
+        GroupActivation::Failed { failed_rank: 1, .. }
+    ));
+    world.wait_settled_generation("g", 1).await;
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_eq!(rows[1].state, MemberState::Settled);
+    let handle = rows[1].launch_handle.clone().unwrap();
+    let mut recorded = rows[1].identities.clone().unwrap();
+    let mut journaled = world.host("host-b").recorded(&handle).unwrap();
+    recorded.sort_by_key(|p| p.pid);
+    journaled.sort_by_key(|p| p.pid);
+    assert_eq!(recorded, journaled, "settled on its host's journal");
+    assert_eq!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.port_free("host-a", 25000));
+    assert!(!world.group.alive(1));
+}
+
+// T31, T33 (ADR 0028 §11, SPEC §11): the same unrecorded member, whose host
+// came back with an empty journal before the stop: its Terminate names no
+// process of the Launch and claims nothing, which is no evidence. The member
+// stays `uncertain` and charged, and its rank still runs.
+#[tokio::test]
+async fn an_unrecorded_member_without_launch_evidence_stays_charged() {
+    let world = GroupWorld::hosts(&["host-a", "host-b"]).launch_roles_duplicated("host-b");
+    let group = world.group.clone();
+    // The agent restarts with an empty journal right after the Launch.
+    world.host("host-b").state().launch_observer = Some(Arc::new(move |_: &MemberCommand| {
+        group.reconnect_host("host-b", JournalState::Empty);
+    }));
+    let id = world.deploy_group("g", &["host-a", "host-b"]).await;
+    world.group.launch_completes();
+    world.wait_activation(&id).await;
+    world
+        .until("the head settled", || {
+            let (_, rows) = world.group_plan("g").unwrap();
+            (rows[0].state == MemberState::Settled).then_some(())
+        })
+        .await;
+    world.settle_for(Duration::from_secs(1)).await;
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched);
+    assert_eq!(rows[1].state, MemberState::Uncertain);
+    assert_eq!(rows[1].identities, None);
+    assert!(world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)) > 0);
+    assert!(!world.port_free("host-a", 25000));
+    assert!(world.group.alive(1), "an empty journal signals nothing");
 }
 
 // T27, Review Focus 2 (R15): a head rendezvous port held outside CapyCTL is
@@ -3855,6 +4075,10 @@ async fn draining_an_absent_worker_host_keeps_its_member_charged() {
 /// collective and every member's report, short enough that a silent
 /// member's wait ends within the test.
 const RESIDENCY_WINDOW_MS: i64 = 4_000;
+/// ADR 0028 §12: how long the world's coordinator awaits each member's own
+/// evidence after the head's reply, well inside [`RESIDENCY_WINDOW_MS`] so a
+/// bounded failure is told from a deadline's.
+const MEMBER_EVIDENCE_WINDOW: Duration = Duration::from_millis(1_500);
 
 impl GroupWorld {
     /// A world of `hosts` running `engine` whose group `name` is Ready.
@@ -4052,7 +4276,8 @@ impl GroupWorld {
 // T20: park settles only when every rank reports its memory released; one collective only.
 #[tokio::test]
 async fn park_needs_every_rank() {
-    for engine in ["vllm", "sglang"] {
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
         let world = GroupWorld::ready_group_with("g", &["host-a", "host-b"], engine).await;
         world.park("g").await.unwrap();
         assert_eq!(world.group.sleep_calls(), 1, "{engine}");
@@ -4067,6 +4292,104 @@ async fn park_needs_every_rank() {
             c.action,
             MemberAction::Park { .. } | MemberAction::Restore { .. }
         )));
+    }
+}
+
+// T20, T22 (ADR 0028 §12 as amended 2026-10-15; ADR 0014 amendment A13; found
+// live 2026-10-15, MN4): every rank process keeps 3 GiB of anonymous pages
+// parked, beside the 1 GiB of device memory a clean sleep leaves. The park
+// settles on each member's own host's report of what the collective released
+// (vLLM: its processes' device memory; SGLang: its saver map), and each member
+// is charged the residue its processes hold, never the 2 GiB placeholder;
+// the group then wakes and parks again on those charges. Failed before the
+// change: vLLM judged the 4 GiB sum against the 2 GiB budget and failed the
+// park `group_member_failed` at rank 0 (as live); SGLang parked at the
+// placeholder.
+#[tokio::test]
+async fn a_park_settles_on_released_device_memory_and_charges_each_members_residue() {
+    const ANONYMOUS: u64 = 3 << 30;
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine(engine)
+            .with_derived_memory()
+            .with_anonymous_bytes(ANONYMOUS)
+            .ready("g")
+            .await;
+        let g = world.id("g");
+        let residue = (world.group.parked_bytes() + ANONYMOUS) as i64;
+        for cycle in 0..2 {
+            world
+                .park("g")
+                .await
+                .unwrap_or_else(|e| panic!("{engine} park {cycle}: {e}"));
+            assert_eq!(world.state("g").await, "parked", "{engine}");
+            for (host, rank) in [("host-a", 0), ("host-b", 1)] {
+                assert_eq!(
+                    world.owner_bytes_on(host, &member_owner_id(&g, 0, rank)),
+                    residue,
+                    "{engine} park {cycle}: rank {rank} is charged its measured residue"
+                );
+            }
+            world
+                .wake("g")
+                .await
+                .unwrap_or_else(|e| panic!("{engine} wake {cycle}: {e}"));
+        }
+        assert_eq!(world.group.sleep_calls(), 2, "{engine}");
+    }
+}
+
+// T20, T32 (ADR 0028 §11, §12; found live 2026-10-15, MN4): host B's Launch
+// reply named its spawned process alone, so neither its `process_residency`
+// (vLLM) nor its saver enrollment (SGLang, `owner_not_a_launch_member`) ever
+// names a recorded process of the member. The park fails closed within the
+// member evidence window, not at the step's deadline: rank 1 is
+// `group_member_uncertain` with its full charge kept until the group stop
+// releases each member on its own host's evidence. Failed before the change:
+// the coordinator waited out the whole step.
+#[tokio::test]
+async fn a_member_without_evidence_of_its_own_fails_the_park_within_the_window() {
+    // SGLang groups do not park in 0.1.3 (ADR 0028 note of 2026-10-15).
+    for engine in ["vllm"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine(engine)
+            .records_leader_only("host-b")
+            .ready("g")
+            .await;
+        let g = world.id("g");
+        let started = std::time::Instant::now();
+        let before = world.issue_park("g");
+        let error = world.park_concluded("g", before).await.unwrap_err();
+        let took = started.elapsed();
+        assert_eq!(
+            error,
+            GroupResidencyError::MemberSilent { rank: 1 },
+            "{engine}"
+        );
+        assert_eq!(error.code(), "group_member_uncertain");
+        assert!(
+            took < Duration::from_millis(RESIDENCY_WINDOW_MS as u64)
+                - crate::group_residency::EVIDENCE_MARGIN,
+            "{engine}: the park waited {took:?}, past its evidence window"
+        );
+        assert_eq!(world.group.sleep_calls(), 1, "{engine}");
+        // Uncertainty retains accounting: rank 1 is uncertain (or already
+        // settled by the group stop on its own host's gone evidence).
+        let member = world.status("g").await.member(1).state.clone();
+        assert!(
+            member == "uncertain" || member == "settled",
+            "{engine}: {member}"
+        );
+        assert_ne!(world.state("g").await, "parked", "{engine}");
+        // The group stop then settles every member on its own evidence.
+        world.wait_settled_generation("g", 1).await;
+        world.assert_release_evidence_per_member("g");
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&g, 0, 1)),
+            0,
+            "{engine}"
+        );
     }
 }
 
@@ -4639,4 +4962,176 @@ async fn a_stalled_group_relaunches_under_reconcile_after_settlement() {
     assert!(world.generation_started_after_settlement("g", 2).await);
     world.wait_ready(&world.id("g")).await;
     assert!(world.route_open("g"));
+}
+
+/// ADR 0028 §11: the readiness supervisor's view of the world's hosts as an
+/// agent's control session presents them: a disconnected host has no current
+/// session, and a connected one claims exactly the launches its (possibly
+/// emptied) journal still holds.
+struct MemberSessions {
+    transport: Arc<WorldHosts>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl crate::remote_readiness::ReadinessHosts for MemberSessions {
+    fn current_session(&self, host: &str) -> Option<String> {
+        let scripted = WorldHosts::host(&self.transport, host)?;
+        scripted
+            .group
+            .connected(host)
+            .then(|| format!("{host}-session"))
+    }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+    fn claims_launch(&self, host: &str, _session: &str, owned_handle: &str) -> bool {
+        let Some(scripted) = WorldHosts::host(&self.transport, host) else {
+            return false;
+        };
+        if !scripted.group.connected(host) {
+            return false;
+        }
+        scripted.reconcile_journal();
+        scripted
+            .state()
+            .journal
+            .get(owned_handle)
+            .is_some_and(|r| r.claim_retained)
+    }
+    fn probe(&self, command: MemberCommand) -> crate::remote_readiness::ProbeFuture {
+        let transport = self.transport.clone();
+        let session = format!("{}-session", command.identity.member.host_id);
+        Box::pin(async move {
+            let host = WorldHosts::host(&transport, &command.identity.member.host_id)
+                .cloned()
+                .ok_or(())?;
+            host.execute(command)
+                .await
+                .map(|r| (session, r))
+                .map_err(drop)
+        })
+    }
+}
+
+impl GroupWorld {
+    /// The production readiness supervisor over [`MemberSessions`], running
+    /// its passes until the returned task is aborted.
+    fn supervise_sessions(&self) -> tokio::task::JoinHandle<()> {
+        crate::remote_readiness::RemoteReadiness::new(
+            self.owner(),
+            Arc::new(MemberSessions {
+                transport: self.transport.clone(),
+                changes: tokio::sync::watch::channel(0).0,
+            }),
+            GROUP_CONTROLLER.into(),
+            Default::default(),
+        )
+        .spawn()
+    }
+
+    /// Waits, bounded by `bound`, for rank `rank` of `name` to read `state`.
+    async fn member_reads(&self, name: &str, rank: u32, state: &str, bound: Duration) {
+        let id = self.id(name);
+        let started = std::time::Instant::now();
+        self.until(&format!("rank {rank} of {name} {state}"), || {
+            self.read_status(&id)
+                .filter(|s| {
+                    s.members
+                        .get(rank as usize)
+                        .is_some_and(|m| m.state == state)
+                })
+                .map(drop)
+        })
+        .await;
+        assert!(
+            started.elapsed() < bound,
+            "rank {rank} read {state} only after {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+// T30, T32 (ADR 0028 §11; MN7 live 0.1.3): a member whose host's control
+// session is lost reads `uncertain` within the supervision bound while its
+// engine runs on, charged, nothing released and the port held. When the host
+// reconnects with its journal still claiming the launch, the member reads
+// `launched` again with the same charge, and the group stops cleanly.
+#[tokio::test]
+async fn a_lost_member_host_reads_uncertain_until_its_journal_returns() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    let supervisor = world.supervise_sessions();
+    let owner_b = member_owner_id(&id, 0, 1);
+    let charged = world.owner_bytes_on("host-b", &owner_b);
+    assert!(charged > 0);
+    world.settle_for(Duration::from_millis(600)).await;
+    assert_eq!(world.status("g").await.member(1).state, "launched");
+
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_eq!(world.status("g").await.member(0).state, "launched");
+    assert_eq!(world.owner_bytes_on("host-b", &owner_b), charged);
+    assert!(world.owner_bytes_on("host-a", &member_owner_id(&id, 0, 0)) > 0);
+    assert!(!world.port_free("host-a", 25000));
+    assert!(world.group.alive(1));
+    let (_, rows) = world.group_plan("g").unwrap();
+    assert!(rows[1].dispatched && rows[1].identities.is_some());
+
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world
+        .member_reads("g", 1, "launched", Duration::from_secs(2))
+        .await;
+    assert_eq!(world.owner_bytes_on("host-b", &owner_b), charged);
+    assert_eq!(world.status("g").await.last_error(), "");
+    supervisor.abort();
+    world.stop(&id).await;
+    world.wait_settled_generation("g", 1).await;
+    world.assert_release_evidence_per_member("g");
+}
+
+// T32 (ADR 0028 §11): a host back with an empty journal proves nothing of its
+// member, which stays uncertain and charged.
+#[tokio::test]
+async fn a_member_host_back_with_an_empty_journal_stays_uncertain() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let id = world.id("g");
+    let supervisor = world.supervise_sessions();
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.group.reconnect_host("host-b", JournalState::Empty);
+    world.settle_for(Duration::from_secs(2)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    assert_ne!(
+        world.owner_bytes_on("host-b", &member_owner_id(&id, 0, 1)),
+        0
+    );
+    assert!(world.group.alive(1));
+    supervisor.abort();
+}
+
+// T30, T32 (ADR 0028 §11): a member whose engine exited while its host was
+// away reads `launched` once its journal returns, and the exit its host then
+// reports fails the group, which settles on each host's evidence.
+#[tokio::test]
+async fn a_member_that_exited_while_its_host_was_away_fails_the_group_on_return() {
+    let world = GroupWorld::ready_group("g", &["host-a", "host-b"]).await;
+    let supervisor = world.supervise_sessions();
+    world.group.disconnect_host("host-b");
+    world
+        .member_reads("g", 1, "uncertain", Duration::from_secs(2))
+        .await;
+    world.group.exit_rank(1);
+    world.settle_for(Duration::from_secs(1)).await;
+    assert_eq!(world.status("g").await.member(1).state, "uncertain");
+    world.group.reconnect_host("host-b", JournalState::Kept);
+    world.wait_settled_generation("g", 1).await;
+    world.wait_last_error("g", "group_member_failed").await;
+    world.assert_release_evidence_per_member("g");
+    supervisor.abort();
 }

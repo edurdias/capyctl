@@ -475,6 +475,11 @@ impl HostJournal {
         // and its bounded wait and was ended with SIGKILL. Evidence only, same
         // schema version like member_exits.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS terminate_escalations(command_id TEXT PRIMARY KEY REFERENCES commands(command_id));")?;
+        // ADR 0028 §8 (found live 2026-10-15, MN5): a process a launch step's
+        // own scan journaled that was proven gone before the step reported
+        // (SGLang's short-lived first child): history only, never one of the
+        // launch's recorded processes. Same schema version like member_exits.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS departed_processes(command_id TEXT NOT NULL REFERENCES commands(command_id),role TEXT NOT NULL,pid INTEGER NOT NULL,boot TEXT NOT NULL,ticks INTEGER NOT NULL,PRIMARY KEY(command_id,pid,boot,ticks));")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -2049,14 +2054,14 @@ fn fenced_handle(db: &Connection, handle: &str) -> Result<bool, JournalError> {
 /// recorded is a helper, whatever started it: it is recorded for cleanup, and
 /// its exit, like its presence, is not the engine's. It is numbered after every
 /// helper already recorded, so no two recorded processes share a role. Before
-/// readiness the observation's own roles stand.
+/// readiness the observation is named by [`stable_roles`].
 fn after_readiness(
     recorded: &[ProcessIdentity],
     observed: Vec<ProcessIdentity>,
     ready: bool,
 ) -> Vec<ProcessIdentity> {
     if !ready {
-        return observed;
+        return stable_roles(recorded, observed);
     }
     let known = |p: &ProcessIdentity| {
         recorded
@@ -2083,6 +2088,91 @@ fn after_readiness(
             p
         })
         .collect()
+}
+
+/// ADR 0028 §8, ADR 0027 (found live 2026-10-15, MN2): one scan's roles,
+/// stable for each process identity across scans. A group scan names a
+/// launch's processes `worker-<i>` and `helper-<i>` by start order among those
+/// alive now, so once a short-lived child exited (SGLang's worker forks one
+/// before its rank processes) the next child took its name, and the journal
+/// held two `worker-0`: the member's identities were refused as invalid and
+/// the group stopped. Here a process already recorded keeps its recorded role,
+/// and a new one takes the next index of its kind after every index recorded
+/// or taken in this scan, so no recorded index is ever reused. The roles are
+/// journaled with the processes, so a restarted host role names them the
+/// same. A launch step's own scans first set aside what departed before the
+/// step reported ([`depart_gone`]), which frees its index: the recorded
+/// processes stay `worker-0..n` with no gap, as a head's readiness requires.
+fn stable_roles(
+    recorded: &[ProcessIdentity],
+    observed: Vec<ProcessIdentity>,
+) -> Vec<ProcessIdentity> {
+    let index = |role: &str, prefix: &str| {
+        role.strip_prefix(prefix)
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let mut taken: Vec<String> = recorded.iter().map(|p| p.role.clone()).collect();
+    observed
+        .into_iter()
+        .map(|mut p| {
+            if let Some(known) = recorded.iter().find(|r| {
+                r.pid == p.pid && r.boot_id == p.boot_id && r.start_ticks == p.start_ticks
+            }) {
+                p.role = known.role.clone();
+                return p;
+            }
+            for prefix in ["worker-", capyctl_domain::completion::HELPER_ROLE_PREFIX] {
+                if index(&p.role, prefix).is_some() {
+                    let next = taken
+                        .iter()
+                        .filter_map(|role| index(role, prefix))
+                        .max()
+                        .map_or(0, |n| n + 1);
+                    p.role = format!("{prefix}{next}");
+                    break;
+                }
+            }
+            taken.push(p.role.clone());
+            p
+        })
+        .collect()
+}
+
+/// ADR 0028 §8 (found live 2026-10-15, MN5): during its own launch step, a
+/// journaled process that this scan no longer sees and that is proven gone
+/// by identity (SGLang's short-lived first child) departed before the step
+/// reported. It is moved from the launch's recorded processes to
+/// `departed_processes` (history only), so the Launch reply, the controller's
+/// record of the member and the supervision of a Ready launch never name it:
+/// recorded, its exit read as the member's own and failed the group right
+/// after it answered. The spawned leader is never set aside, and a process
+/// whose presence cannot be established stays recorded (uncertainty retains
+/// it). Returns the processes still recorded.
+fn depart_gone(
+    tx: &Connection,
+    command: &str,
+    observed: &[ProcessIdentity],
+) -> Result<Vec<ProcessIdentity>, JournalError> {
+    let same = |a: &ProcessIdentity, b: &ProcessIdentity| {
+        a.pid == b.pid && a.boot_id == b.boot_id && a.start_ticks == b.start_ticks
+    };
+    let (departed, kept): (Vec<_>, Vec<_>) =
+        record(tx, command)?.processes.into_iter().partition(|p| {
+            p.role != "api"
+                && !observed.iter().any(|o| same(o, p))
+                && capyctl_launchers::process_absence::presence(p) == Presence::Gone
+        });
+    for p in &departed {
+        tx.execute(
+            "INSERT OR IGNORE INTO departed_processes VALUES(?1,?2,?3,?4,?5)",
+            params![command, p.role, p.pid, p.boot_id, p.start_ticks as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM processes WHERE command_id=?1 AND pid=?2 AND boot=?3 AND ticks=?4",
+            params![command, p.pid, p.boot_id, p.start_ticks as i64],
+        )?;
+    }
+    Ok(kept)
 }
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
@@ -2359,20 +2449,25 @@ impl OwnedProcessLaunch for JournalLaunchTools {
             return Err(RuntimeError::Uncertain("unowned process".into()));
         }
         let observed = self.tools.observe_group(api)?;
-        let persist = || -> Result<(), JournalError> {
+        // ADR 0028 §8 (found live 2026-10-15, MN2, MN5): what departed is set
+        // aside, then each process keeps the role it was first journaled
+        // under ([`stable_roles`]).
+        let persist = || -> Result<Vec<ProcessIdentity>, JournalError> {
             self.journal.validate()?;
             let mut db = self.journal.db.lock().map_err(|_| JournalError::Storage)?;
             let tx = db.transaction()?;
-            for identity in &observed {
-                persist_process(&tx, &self.command.identity.command_id, identity)?;
+            let id = &self.command.identity.command_id;
+            let recorded = depart_gone(&tx, id, &observed)?;
+            let named = stable_roles(&recorded, observed);
+            for identity in &named {
+                persist_process(&tx, id, identity)?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(named)
         };
         persist().map_err(|_| {
             RuntimeError::Uncertain("process observation could not be retained".into())
-        })?;
-        Ok(observed)
+        })
     }
     fn terminate_owned(
         &self,
@@ -2592,7 +2687,8 @@ mod helper_tests {
     /// ADR 0027: after readiness, a process first seen on an agent restart is
     /// recorded as a helper numbered past the recorded ones, so no two recorded
     /// processes share a role; one already recorded is not recorded again.
-    /// Before readiness the observation's roles stand.
+    /// Before readiness a process keeps its recorded role and a new one takes
+    /// the next index of its kind.
     #[test]
     fn a_process_first_seen_after_readiness_is_a_new_helper() {
         let recorded = vec![
@@ -2612,8 +2708,44 @@ mod helper_tests {
             vec![p("helper-5", 9), p("helper-6", 10)]
         );
         assert_eq!(
-            after_readiness(&recorded, observed.clone(), false),
-            observed
+            after_readiness(&recorded, observed, false),
+            vec![
+                p("api", 1),
+                p("worker-0", 2),
+                p("worker-1", 9),
+                p("helper-5", 10)
+            ]
         );
+    }
+
+    /// T31 (ADR 0028 §8; found live 2026-10-15, MN2): a worker's short-lived
+    /// first child is journaled as `worker-0`; once it exits, the scan names
+    /// the next child `worker-0` too. That child takes a new index, the
+    /// journaled ones keep theirs on every later scan, and no role repeats
+    /// across everything journaled. Failed before the change: the second scan
+    /// journaled a second `worker-0`.
+    #[test]
+    fn a_child_after_a_gone_transient_one_never_takes_its_role() {
+        let mut journaled = after_readiness(&[], vec![p("api", 1), p("worker-0", 2)], false);
+        for scan in [
+            vec![p("api", 1), p("worker-0", 3), p("worker-1", 4)],
+            vec![p("api", 1), p("worker-0", 3), p("worker-1", 4)],
+        ] {
+            for named in after_readiness(&journaled, scan, false) {
+                if !journaled.iter().any(|j| j.pid == named.pid) {
+                    journaled.push(named);
+                }
+            }
+        }
+        assert_eq!(
+            journaled,
+            vec![
+                p("api", 1),
+                p("worker-0", 2),
+                p("worker-1", 3),
+                p("worker-2", 4)
+            ]
+        );
+        capyctl_domain::group::validate_local_processes(&journaled).unwrap();
     }
 }

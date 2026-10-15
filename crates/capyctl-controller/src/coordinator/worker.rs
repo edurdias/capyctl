@@ -186,6 +186,9 @@ pub struct CoordinatorOptions {
     /// leases still settle on evidence. The default matches
     /// `switching.drain_timeout`.
     pub stop_drain_timeout: Duration,
+    /// ADR 0028 §12 (found live 2026-10-15, MN4): how long a group park's or
+    /// wake's member evidence is awaited after the head's reply.
+    pub group_member_evidence: crate::group_residency::MemberEvidence,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -203,6 +206,7 @@ impl Default for CoordinatorOptions {
             max_concurrent_effects: 8,
             startup_sample_interval: Some(Duration::from_secs(1)),
             stop_drain_timeout: Duration::from_secs(30),
+            group_member_evidence: Default::default(),
         }
     }
 }
@@ -2787,6 +2791,7 @@ async fn drive_group_residency(
         members,
         step_id: work.step_id.clone(),
         deadline_ms: context.deadline_ms,
+        evidence: shared.options.group_member_evidence,
     };
     let ctx = crate::group_activation::GroupCtx {
         owner: shared.owner.clone(),

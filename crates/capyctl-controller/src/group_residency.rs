@@ -13,27 +13,34 @@
 //!   it invokes the engine's collective (`/sleep`, `/release_memory_occupation`)
 //!   through the head's loopback control endpoint. The park settles only when
 //!   every member's own host then reports the member at or below its parked
-//!   budget: a vLLM member through its host's `process_residency` for the
-//!   member's recorded processes, a SGLang member through the saver-map facts
-//!   its host reads from its own observation directory (R12; never a fallback
-//!   to process sampling). A member's charge moves to its parked budget only
-//!   on its own report.
+//!   budget: a vLLM member through the device memory its host's
+//!   `process_residency` attributes to the member's recorded processes, a
+//!   SGLang member through the saver-map facts its host reads from its own
+//!   observation directory (R12; never a fallback to process sampling).
+//!   Each member's own host also reports what the member's processes still
+//!   hold, sampled after the head's reply: the park charges each member that
+//!   residue (ADR 0028 §12 as amended 2026-10-15, ADR 0014 amendment A13).
+//!   A member's charge moves to its parked budget only on its own report.
 //! - **Wake.** The head's agent alone is sent `Restore`, once; every member's
 //!   own host must report it resident again; the head must pass the 1-token
 //!   readiness probe; and the canary (an 8-token completion through the head
 //!   at temperature 0) must match the reference recorded at the plan's first
 //!   readiness, judged by [`canary_matches`] alone.
 //!
-//! The collective is never repeated. A member that reports nothing by the
-//! step's deadline keeps its full charge and is `uncertain`
-//! (`group_member_uncertain`); a member still resident after a park, not
-//! resident after a wake, a head that fails its readiness, or a canary that
-//! differs (`group_member_failed`, `group_wake_mismatch`) fails the group.
-//! Either stops the group, each member released only on its own host's
-//! evidence (ADR 0028 §11). CPU and fake-engine tests only cover this; the
-//! live rows MN1–MN9 qualify it.
+//! The collective is never repeated. Found live 2026-10-15 (MN4): the head's
+//! collective returns once every rank released, so each member's evidence is
+//! awaited for a bounded window after the head's reply
+//! ([`MemberEvidence::window`]), never for the rest of the step's deadline. A
+//! member that reports nothing of its own by then keeps its full charge and
+//! is `uncertain` (`group_member_uncertain`); a member still resident after a
+//! park, not resident after a wake, a head that fails its readiness, or a
+//! canary that differs (`group_member_failed`, `group_wake_mismatch`) fails
+//! the group. Either stops the group, each member released only on its own
+//! host's evidence (ADR 0028 §11). CPU and fake-engine tests only cover this;
+//! the live rows MN1–MN9 qualify it.
 use crate::group_activation::{
-    probe_head, GroupCtx, HeadLaunch, READINESS_PROBE_DEADLINE, READINESS_PROBE_TOKENS,
+    probe_head, GroupCtx, HeadEvidence, HeadLaunch, READINESS_PROBE_DEADLINE,
+    READINESS_PROBE_TOKENS,
 };
 use crate::group_settlement::GroupTarget;
 use capyctl_config::effective::Residency;
@@ -44,7 +51,7 @@ use capyctl_protocol::{
 };
 use capyctl_store::{
     groups::StoredCanary,
-    ordinary_lifecycle::park::{ArmedMember, MemberResidency, ResidencyKind},
+    ordinary_lifecycle::park::{ArmedMember, MemberResidency, MemberResidue, ResidencyKind},
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -58,6 +65,32 @@ pub const CANARY_DEADLINE: Duration = READINESS_PROBE_DEADLINE;
 pub const MEMBER_EVIDENCE_POLL: Duration = Duration::from_millis(100);
 /// Time kept back from the step's deadline to record its outcome.
 pub const EVIDENCE_MARGIN: Duration = Duration::from_millis(500);
+
+/// ADR 0028 §12 (found live 2026-10-15, MN4): how long each member's own
+/// evidence is awaited once the head's collective answered, and how long
+/// after that answer a host's process sample is certainly newer than it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberEvidence {
+    /// From the head's reply. The collective returns only once every rank
+    /// acted, and every member host reports its processes every 2 s and its
+    /// saver maps every 2 s (reads bounded at 6 s): a member that says
+    /// nothing of its own for this long will not, and is uncertain.
+    pub window: Duration,
+    /// A host's `process_residency` sample is up to its `MAX_AGE` (5 s) old
+    /// when reported, and its `nvidia-smi` read up to `BOUND` (3 s) long, so a
+    /// report observed this long after the head's reply carries a sample
+    /// taken after it: the parked residue a park charges.
+    pub sample_lag: Duration,
+}
+
+impl Default for MemberEvidence {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(60),
+            sample_lag: Duration::from_secs(8),
+        }
+    }
+}
 
 /// ADR 0028 §12 (decided 2026-10-06, revisited at MN4 with live evidence):
 /// the rule a wake's canary is judged by. Today one rule exists, exact token
@@ -171,13 +204,14 @@ impl GroupResidencyError {
 }
 
 /// One armed group park or wake: the group, its armed members, the head's
-/// launch and the step it runs under.
+/// launch, the step it runs under and how its members' evidence is awaited.
 #[derive(Debug, Clone)]
 pub struct ResidencyTarget {
     pub group: GroupTarget,
     pub members: Vec<ArmedMember>,
     pub step_id: String,
     pub deadline_ms: i64,
+    pub evidence: MemberEvidence,
 }
 
 impl ResidencyTarget {
@@ -202,10 +236,11 @@ impl ResidencyTarget {
 
 /// ADR 0028 §12, SPEC §11: the lead agent invokes each collective once. A
 /// `deep` group parks: the head's agent alone is sent `Park`, once, then
-/// every member's own host must report it at or below its parked budget
-/// before the step's deadline. Returns each member's report. A
-/// `restart_only` group never reaches here: its park is a group stop (the
-/// store accepts it as one, as do switching and the idle policy).
+/// every member's own host must report it at or below its parked budget, and
+/// what its processes still hold, within the evidence window. Returns each
+/// member's report. A `restart_only` group never reaches here: its park is a
+/// group stop (the store accepts it as one, as do switching and the idle
+/// policy).
 pub async fn park_group(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -245,9 +280,15 @@ pub async fn wake_group(
     probe_head(ctx, &head, READINESS_PROBE_TOKENS, READINESS_PROBE_DEADLINE)
         .await
         .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?;
+    // ADR 0028 §12: the canary compares token ids only; an answer without
+    // them (text alone, HeadEvidence::Text) proves no wake.
     let observed = probe_head(ctx, &head, CANARY_TOKENS, CANARY_DEADLINE)
         .await
-        .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?;
+        .map_err(|error| GroupResidencyError::HeadNotReady(error.to_string()))?
+        .into_tokens()
+        .ok_or_else(|| {
+            GroupResidencyError::HeadNotReady("the canary answered no token ids".into())
+        })?;
     match canary_reference(ctx, &target.group) {
         Some(reference) if !canary_matches(&reference, &observed) => {
             Err(GroupResidencyError::CanaryMismatch)
@@ -268,7 +309,11 @@ pub async fn wake_group(
 /// that fails records nothing and the group stays ready; its next wake
 /// records the reference instead of comparing.
 pub async fn record_canary(ctx: &GroupCtx, head: &HeadLaunch, instance_index: u32) {
-    let Ok(tokens) = probe_head(ctx, head, CANARY_TOKENS, CANARY_DEADLINE).await else {
+    let Some(tokens) = probe_head(ctx, head, CANARY_TOKENS, CANARY_DEADLINE)
+        .await
+        .ok()
+        .and_then(HeadEvidence::into_tokens)
+    else {
         return;
     };
     let target = GroupTarget {
@@ -409,11 +454,16 @@ fn remaining(ctx: &GroupCtx, deadline_ms: i64) -> Duration {
 }
 
 /// ADR 0028 §12 (R12): every member's own host's report, asked again until
-/// each one settles the transition or the step's deadline (less the time to
-/// record it) passes. A park needs every member at or below its parked
-/// budget, a wake every member above it. At the deadline a member that
-/// reported but did not settle fails the group; one that reported nothing
-/// is silent.
+/// each one settles the transition or the evidence window after the head's
+/// reply ([`MemberEvidence::window`], within the step's deadline less the time
+/// to record it) passes. A park needs every member at or below its parked
+/// budget and the residue its processes hold, sampled after the head's
+/// reply; a wake every member above its parked budget. When the window ends,
+/// a member that reported but is still resident (or not resident) fails the
+/// group; one that reported nothing of its own is silent: every charge stays
+/// as it was and the group is stopped (found live 2026-10-15, MN4: a member
+/// whose evidence could not be read held the group `parking` for the whole
+/// 15-minute step).
 async fn collect(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -421,11 +471,21 @@ async fn collect(
     since: i64,
 ) -> Result<Vec<MemberResidency>, GroupResidencyError> {
     let engine = target.group.plan.engine();
-    let settles = |report: &MemberResidency, member: &ArmedMember| match kind {
+    // The head's collective answered just now: a process sample observed
+    // `sample_lag` after this was taken after it.
+    let replied = (ctx.clock)().unwrap_or(since).max(since);
+    let residue_after = replied
+        .saturating_add(i64::try_from(target.evidence.sample_lag.as_millis()).unwrap_or(i64::MAX));
+    let judged = |report: &MemberResidency, member: &ArmedMember| match kind {
         ResidencyKind::Park => report.released(member),
         ResidencyKind::Restore => report.resident(member),
     };
-    let bound = remaining(ctx, target.deadline_ms).saturating_sub(EVIDENCE_MARGIN);
+    let settles = |report: &MemberResidency, member: &ArmedMember| {
+        judged(report, member) && (kind == ResidencyKind::Restore || report.residue.is_some())
+    };
+    let bound = remaining(ctx, target.deadline_ms)
+        .saturating_sub(EVIDENCE_MARGIN)
+        .min(target.evidence.window);
     let until = tokio::time::Instant::now() + bound;
     let mut latest: BTreeMap<u32, MemberResidency> = BTreeMap::new();
     loop {
@@ -441,11 +501,17 @@ async fn collect(
                 .filter_map(|m| latest.remove(&m.rank))
                 .collect());
         }
-        let reports = futures::future::join_all(
-            pending
-                .iter()
-                .map(|m| member_report(ctx, &target.group.deployment_id, engine, m, since)),
-        )
+        let reports = futures::future::join_all(pending.iter().map(|m| {
+            member_report(
+                ctx,
+                &target.group.deployment_id,
+                engine,
+                kind,
+                m,
+                since,
+                residue_after,
+            )
+        }))
         .await;
         for report in reports.into_iter().flatten() {
             latest.insert(report.rank, report);
@@ -459,12 +525,12 @@ async fn collect(
         }
         if tokio::time::Instant::now() >= until {
             // Review Focus 4: a member proven still holding (or not holding)
-            // its memory fails the group; otherwise the first silent one.
-            let unsettled = target.members.iter().find(|m| {
-                latest
-                    .get(&m.rank)
-                    .is_some_and(|report| !settles(report, m))
-            });
+            // its memory fails the group; otherwise the first one that said
+            // nothing of its own (no report, or no residue of its processes).
+            let unsettled = target
+                .members
+                .iter()
+                .find(|m| latest.get(&m.rank).is_some_and(|report| !judged(report, m)));
             return Err(match (unsettled, kind) {
                 (Some(m), ResidencyKind::Park) => {
                     GroupResidencyError::MemberResident { rank: m.rank }
@@ -476,7 +542,7 @@ async fn collect(
                     rank: target
                         .members
                         .iter()
-                        .find(|m| !latest.contains_key(&m.rank))
+                        .find(|m| !latest.get(&m.rank).is_some_and(|r| settles(r, m)))
                         .map_or(0, |m| m.rank),
                 },
             });
@@ -485,47 +551,81 @@ async fn collect(
     }
 }
 
+/// What `member`'s own processes hold in one of its host's `process_residency`
+/// samples: `None` when the sample names none of its recorded processes.
+fn own_residue(
+    member: &ArmedMember,
+    residents: &[capyctl_domain::resources::ProcessResident],
+) -> Option<MemberResidue> {
+    let own: Vec<_> = residents
+        .iter()
+        .filter(|r| {
+            member
+                .identities
+                .iter()
+                .any(|p| p.pid == r.pid && p.boot_id == r.boot_id && p.start_ticks == r.start_ticks)
+        })
+        .collect();
+    (!own.is_empty()).then(|| MemberResidue {
+        device_bytes: own
+            .iter()
+            .map(|r| r.device_bytes)
+            .fold(0_i64, i64::saturating_add),
+        bytes: own.iter().map(|r| r.bytes).fold(0_i64, i64::saturating_add),
+    })
+}
+
 /// ADR 0028 §12 (R12): one member's residency, reported by its own host only
-/// and observed after the collective was sent. vLLM: the memory the host's
-/// `process_residency` attributes to the member's recorded processes (a
-/// sample naming none of them is no report). SGLang: the saver-map facts the
-/// host reads from its own observation directory for the member; never
-/// process sampling. TensorFold never parks.
+/// and observed after the collective was sent. vLLM: the device memory the
+/// host's `process_residency` attributes to the member's recorded processes
+/// (a sample naming none of them is no report): what the collective releases
+/// and restores, never their anonymous pages, which a parked engine keeps
+/// (found live 2026-10-15, MN4). SGLang: the saver-map facts the host reads
+/// from its own observation directory for the member; never process
+/// sampling. TensorFold never parks. For a park, the report also carries the
+/// residue the member's processes hold in a sample observed at or after
+/// `residue_after` (ADR 0014 amendment A13), which the park charges.
 async fn member_report(
     ctx: &GroupCtx,
     deployment_id: &str,
     engine: GroupEngine,
+    kind: ResidencyKind,
     member: &ArmedMember,
     since: i64,
+    residue_after: i64,
 ) -> Option<MemberResidency> {
-    let (resident_bytes, observed_at_ms) = match engine {
+    let processes = || async {
+        let (observed, residents) = tokio::time::timeout(
+            MEMBER_EVIDENCE_POLL.max(Duration::from_secs(1)),
+            ctx.observations
+                .observe_with_residents(member.host_id.clone()),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let observed_at = observed.iter().map(|o| o.sampled_at_ms).min()?;
+        Some((own_residue(member, &residents)?, observed_at))
+    };
+    let fresh_residue = |sample: Option<(MemberResidue, i64)>| {
+        sample.and_then(|(residue, at)| (at >= residue_after).then_some(residue))
+    };
+    let (resident_bytes, observed_at_ms, residue) = match engine {
         GroupEngine::Vllm => {
-            let (observed, residents) = tokio::time::timeout(
-                MEMBER_EVIDENCE_POLL.max(Duration::from_secs(1)),
-                ctx.observations
-                    .observe_with_residents(member.host_id.clone()),
-            )
-            .await
-            .ok()?
-            .ok()?;
-            let observed_at = observed.iter().map(|o| o.sampled_at_ms).min()?;
-            let own: Vec<_> = residents
-                .iter()
-                .filter(|r| {
-                    member.identities.iter().any(|p| {
-                        p.pid == r.pid && p.boot_id == r.boot_id && p.start_ticks == r.start_ticks
-                    })
-                })
-                .collect();
-            if own.is_empty() {
-                return None;
-            }
+            let (own, observed_at) = processes().await?;
             (
-                own.iter().map(|r| r.bytes).fold(0_i64, i64::saturating_add),
+                own.device_bytes,
                 observed_at,
+                fresh_residue(Some((own, observed_at))),
             )
         }
-        GroupEngine::Sglang => ctx.hosts.saver_mapped(deployment_id, member).await.ok()?,
+        GroupEngine::Sglang => {
+            let (mapped, observed_at) = ctx.hosts.saver_mapped(deployment_id, member).await.ok()?;
+            let residue = match kind {
+                ResidencyKind::Park => fresh_residue(processes().await),
+                ResidencyKind::Restore => None,
+            };
+            (mapped, observed_at, residue)
+        }
         GroupEngine::Tensorfold => return None,
     };
     (observed_at_ms >= since).then(|| MemberResidency {
@@ -533,5 +633,6 @@ async fn member_report(
         host_id: member.host_id.clone(),
         resident_bytes,
         observed_at_ms,
+        residue,
     })
 }

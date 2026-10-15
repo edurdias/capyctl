@@ -730,10 +730,19 @@ What each engine runs:
 | Tensor parallel across machines | yes | yes | `tensor_parallel: 2` only |
 | Pipeline parallel across machines | yes | yes | no |
 | Machines | any number that divides tensor × pipeline parallel | any number that divides tensor × pipeline parallel | exactly 2 |
-| Parking | deep, every rank | deep, every rank | restart only |
+| Parking | deep, every rank | restart only (0.1.3) | restart only |
 
 Any shape in the table is accepted, with no warning. Live qualification covers
 two machines only.
+
+Known issue in 0.1.3: an SGLang group restarts instead of parking. With no
+`residency` it gets `restart_only`; `deep` or `host_backed` is refused at
+deploy with `capability_missing:deep_park`, and the error says to declare
+`residency: restart_only`. In a live run (SGLang 0.5.21, tensor parallel 2
+across two GB10 machines) the group's deep park completed but its first wake,
+after reloading the head's weights for 222 s, ended `restore_uncertain` and
+the group was stopped. SGLang on one machine parks as before
+([Parking](parking.md)).
 
 ## List and remove
 

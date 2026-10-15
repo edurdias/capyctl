@@ -371,6 +371,11 @@ to the head's agent as an additive extension of the existing member probe; the a
 runs it on loopback with the per-launch key and returns the generated token ids. It
 never goes through ingress or the router, and worker hosts never receive one. One probe
 function serves readiness, the request-stall check (§11) and the wake canary (§12).
+Amended 2026-10-15 (owner decision, found live in MN3, MN5 and MN6): TensorFold answers
+the ids in its response's own `tensorfold` block, where they are read. A TensorFold
+head whose answer carries no ids passes readiness and the stall check on its non-empty
+generated text, and the controller logs that it did; a vLLM or SGLang head always
+needs the ids, and the wake canary compares ids only.
 Worker hosts never probe readiness; SGLang's nonzero-rank health server always
 answers 200 and is never read. The router routes only to the head's ingress, opens
 the route only on READY (T30), and treats a group as one replica in balancing and
@@ -390,7 +395,7 @@ configuration layer reads for the §2 checks.
 | Parallel sizes | `--tensor-parallel-size T --pipeline-parallel-size P` | `--tp-size T --pp-size P` | `--tp 2` |
 | Rank and world | `--nnodes N --node-rank r` | `--nnodes N --node-rank r` | `--rank r` |
 | Rendezvous | `--master-addr <head> --master-port <port>` | `--dist-init-addr <head>:<port>` | `--master <head> --master-port <port>` |
-| Backend | `--distributed-executor-backend mp` | default | NCCL (built in) |
+| Backend | `--distributed-executor-backend mp` | default | NCCL, loaded at run time: `TF_NCCL_LIB=<installation libnccl.so.2>` on every rank, else refused `nccl_library_missing` (amended 2026-10-15, found live) |
 | Worker | `--headless`; no host, port, key or middleware | same command, `--host 127.0.0.1 --port <worker_port>` | no host or port |
 | Own address | `VLLM_HOST_IP=<own>` | `SGLANG_HOST_IP=<own>` | none |
 | Deep park flag | `--enable-sleep-mode` on every rank | `--enable-memory-saver` on every rank | not applicable |
@@ -658,3 +663,99 @@ deploy it again for the share.
 `64 GiB x 2.25 + margin` exceeds the 97.4 GiB automatic managed limit, so such a
 deployment declares `memory.startup` (the group activation charges each member the
 cold phase its revision resolved; it has no first-start whole-host fallback).
+
+## Amendment of 2026-10-15: a member's leader is reaped only once its group ends
+
+Found live (MN5 vLLM): SIGKILL of a TP2 worker member's vLLM process left the
+`VLLM::Worker_TP1` it had forked (38 GiB of device memory) and a resource tracker
+running. A worker's tree is recorded when the tree first settles after the spawn,
+before vLLM forks its workers, so only the leader was recorded. The leader was reaped
+at once, and a leaderless process group never authorizes a signal (its id can name an
+unrelated group once the leader's pid is reused), so every `Terminate` ended
+uncertain, the member stayed charged and the stop expired unsettled.
+
+The launcher that spawned a launch's leader now waits for its exit without reaping it
+(`WNOWAIT`) and reaps it only once no other process of its group runs. While the
+leader is held, its pid, and so the group id, cannot be reused, so §11's "terminate
+its journaled process tree" signals the whole group through the held leader, live or
+dead, the processes never recorded included. A held leader that has exited reads
+gone and its exit is reported as before, with the status the wait observed. Release
+still needs gone evidence for every recorded identity and an empty group. A leader
+this process did not spawn (a launch from before a restart of the host role) is not
+held, and its leaderless group is still never signalled: that case stays uncertain and
+charged, as before.
+
+## Amendment of 2026-10-15: park evidence and the parked charge per member (owner decision)
+
+Found live at MN4 (vLLM 0.30.0 and SGLang 0.5.21, TP2 over two GB10 hosts): the
+head's collective succeeded (`POST /sleep?level=2` and `POST /release_memory_occupation`
+both 200), yet the group stayed `parking` for the whole 15-minute park step and then
+stopped. Three causes, each fixed here:
+
+- **A worker recorded its leader alone.** A worker's Launch reported its process tree
+  one second after the spawn, before the engine forked its rank process (vLLM's
+  `VLLM::Worker_TP1`, SGLang's rank scheduler) once its imports were done, so the
+  member's recorded processes were not the ones holding its device: its host's
+  `process_residency` named none of them and its saver enrollment was refused
+  (`owner_not_a_launch_member`). A worker's Launch now reports its tree only once it
+  holds a process per local rank besides the spawned one (none for a TensorFold
+  follower), bounded by the step's deadline (§8: "worker: its process tree").
+- **A vLLM member was judged on its anonymous pages.** Its host's `process_residency`
+  adds each process's anonymous resident pages to its device memory on a unified
+  host; a parked vLLM keeps more than its 2 GiB placeholder there (4.7 GiB measured on
+  one GB10 host), so no report ever settled. The park (and the wake) is now judged on
+  the device memory the driver attributes to the member's processes, which is what
+  the collective releases and restores; a SGLang member stays judged on its saver map.
+- **The wait ran to the step's deadline.** The collective returns once every rank
+  acted, so each member's own evidence is awaited for a bounded window after the head's
+  reply (60 s). A member still resident (or not resident after a wake) then fails the
+  group (`group_member_failed`); one that reported nothing of its own is
+  `group_member_uncertain` and keeps its full charge. Either stops the group, each
+  member released only on its own host's evidence (§11).
+
+**The parked charge.** §12's "parked members stay charged at their parked budget" now
+reads: a member's parked budget is its measured residue once one is recorded (ADR 0014
+amendment A13). A park of a revision whose phases CapyCTL derived needs, from each
+member's own host, the residue its processes hold in a sample taken after the head's
+reply (device memory on a discrete host's `device` domain, device memory plus
+anonymous pages on a unified pool). The residue is recorded for the revision on that
+member's host and for the launch, and the member is charged it (never below its
+placeholder, never above its Ready charge); a member reported without one leaves the
+park unsettled. A revision with declared `resources` keeps its declared parked phase.
+ADR 0014 amendment A19's growth bound applies per member, each against its own host's
+`parked_growth_limit`; a member past it turns the group's next park into a group stop.
+
+CPU and Fake-engine tests only; the MN4 rows qualify it.
+
+## Amendment of 2026-10-15: a member with no recorded identities settles on its host's journal
+
+Found live (MN2 SGLang): a worker's Launch reply named two processes under one role,
+so its identities could not be recorded and the member, dispatched, could settle on
+nothing (§11, R23: a dispatched member settles only on recorded identities). It stayed
+`uncertain` and charged after its host had stopped every process.
+
+A dispatched member with no recorded identities (its Launch reply lost, refused or
+not recordable) now settles on its own host's gone-evidence for the Launch it was
+dispatched with: the host's answer to the Terminate of that Launch's handle names every
+process its journal recorded for it, each gone, with the claim released. The store
+accepts it only for that handle and that host, with at least one well-formed process
+(roles may repeat, a process may not), and records those processes with the
+settlement. A host with an empty journal names nothing and claims nothing, which is
+no evidence: the member stays charged, as §11 requires. No protocol field is added.
+
+## Note of 2026-10-15: SGLang groups do not park in 0.1.3
+
+Found live (MN4, SGLang 0.5.21, TP2 across two GB10 hosts): with the amendment
+above, a group deep park completes, but the first wake fails. The head reloaded
+its weights from disk for 222 s, the wake canary ran, and 3 s later the wake
+went `restore_uncertain` and the group was stopped. It fails safe; group wake
+is not usable. vLLM groups pass 5/5 deep park cycles and are unchanged.
+
+Owner decision 2026-10-15, narrowing §2's support table for 0.1.3: an SGLang
+group (world size above 1) does not park. `group_support("sglang").deep_park`
+is false, so a group that states no residency resolves `restart_only`, and one
+that states `deep` or `host_backed` is refused at deploy with
+`capability_missing:deep_park` and the hint to declare `restart_only` (both
+parking tiers, for every engine whose group cannot park). A single-host SGLang
+deployment, its residency and its pinned identities are unchanged. Lift the
+rule once a live group wake passes on the installed SGLang.

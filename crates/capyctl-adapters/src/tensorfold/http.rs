@@ -114,8 +114,9 @@ impl Http {
     /// ADR 0028 §9 (decided 2026-10-06): the completion probe in TensorFold's
     /// OpenAI form, `POST /v1/completions` with `return_token_ids`, on its
     /// loopback endpoint (TensorFold takes no key, ADR 0023 §3). Bounded by
-    /// `bound`, not the short read bound. Answers `choices[0].token_ids` and
-    /// `choices[0].text`.
+    /// `bound`, not the short read bound. Answers the token ids TensorFold
+    /// puts in its `tensorfold` block and `choices[0].text`
+    /// ([`crate::completion_probe::tensorfold_answer`]).
     pub(crate) async fn complete_probe(
         &self,
         served: &str,
@@ -135,6 +136,6 @@ impl Http {
             bound,
         )
         .await?;
-        probe::openai_answer(&answer)
+        probe::tensorfold_answer(&answer)
     }
 }

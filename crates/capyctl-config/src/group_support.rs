@@ -23,7 +23,11 @@ pub fn group_support(engine: &str) -> Option<GroupSupport> {
             max_tensor_parallel: None,
             pipeline: true,
             exact_hosts: None,
-            deep_park: true,
+            // ADR 0028 note of 2026-10-15 (MN4, SGLang 0.5.21, TP2 across two
+            // GB10s): the group's first wake reloaded the head's weights for
+            // 222 s, the canary ran, and 3 s later the wake was
+            // restore_uncertain. A group restarts instead of parking in 0.1.3.
+            deep_park: false,
             worker_listens: true,
         }),
         // TensorFold 0.6.5: `--tp {1,2}`, one GPU per machine, no sleep.
@@ -64,11 +68,16 @@ pub fn check_engine_shape(
     if s.exact_hosts.is_some_and(|n| shape.hosts.len() as u32 != n) {
         return Err(unsupported("host count"));
     }
-    if residency == "deep" && !s.deep_park {
+    // Both parking tiers wake by reloading or restoring the engine, so an
+    // engine whose group cannot park refuses `deep` and `host_backed` alike.
+    if residency != "restart_only" && !s.deep_park {
         return Err(ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
             "residency",
-            "capability_missing:deep_park",
+            format!(
+                "capability_missing:deep_park: a {engine} group cannot park \
+                 (residency `{residency}`); declare `residency: restart_only`"
+            ),
         ));
     }
     Ok(())

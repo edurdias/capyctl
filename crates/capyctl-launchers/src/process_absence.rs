@@ -15,6 +15,8 @@
 //! when this role is its parent (`subreaper`), it is reaped here and then reads
 //! gone; otherwise it reads `Unknown`, and a recorded set holding one is
 //! reported as `Unreaped` rather than read as alive forever (SPEC §13.2, T12).
+//! The one exception is a launch leader its own launcher holds unreaped on
+//! purpose until its group ends (`pinned_leader`, ADR 0028 §11): it reads gone.
 //!
 //! Unlike `ExecLauncher`'s handle check, this works from a recorded identity set
 //! rather than a live handle, so it survives the restart that destroys handles.
@@ -110,15 +112,22 @@ fn observe(pid: u32) -> Observed {
 }
 
 /// The reading `presence` decides from. An exited process this role inherited
-/// is reaped first (T12), so the reading that follows proves it gone.
+/// is reaped first (T12), so the reading that follows proves it gone. A
+/// launch leader that exited and that its own launcher holds unreaped until
+/// its group ends (`pinned_leader`) is gone too: nothing of it runs, and its
+/// pid is held by this process alone, for its group's sake.
 fn assess(identity: &ProcessIdentity) -> (Presence, Observed) {
     let boot = current_boot();
     let mut observed = observe(identity.pid);
     if observed == Observed::Exited(identity.start_ticks)
         && boot.as_deref() == Some(identity.boot_id.as_str())
-        && crate::subreaper::reap_exited(identity.pid, identity.start_ticks)
     {
-        observed = observe(identity.pid);
+        if crate::pinned_leader::exited_and_held(identity) {
+            return (Presence::Gone, observed);
+        }
+        if crate::subreaper::reap_exited(identity.pid, identity.start_ticks) {
+            observed = observe(identity.pid);
+        }
     }
     (resolve(identity, boot.as_deref(), observed), observed)
 }

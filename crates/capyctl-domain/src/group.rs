@@ -180,6 +180,14 @@ impl GroupMemberArgs {
         self.node_rank == 0
     }
 
+    /// ADR 0028 §4: the ranks (devices) this member runs, one engine rank
+    /// process each: the world size spread evenly over the members.
+    pub fn local_ranks(&self) -> u32 {
+        (self.tensor_parallel * self.pipeline_parallel)
+            .checked_div(self.nnodes)
+            .unwrap_or(0)
+    }
+
     /// The `CAPYCTL_GROUP_EXPECTED` payload: the engine's own destination
     /// `fields` (a JSON object), plus `gloo_socket_ifname` when rendered.
     pub fn expected_json(&self, fields: serde_json::Value) -> String {

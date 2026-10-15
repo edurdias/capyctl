@@ -62,6 +62,7 @@ fn refusal_hint(reason: &str) -> String {
         "capability_missing:deep_park"
         | "capability_missing:core"
         | "installation_drift"
+        | "nccl_library_missing"
         | "engine_config_file" => capyctl_domain::diagnostics::operator_hint(reason)
             .map(|hint| format!(" ({hint})"))
             .unwrap_or_default(),

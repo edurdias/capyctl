@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 // ADR 0028 §12: a group instance's park and wake, member by member.
 #[path = "group_park.rs"]
 mod group;
-pub use group::{ArmedMember, GroupResidencyStop, MemberResidency};
+pub use group::{ArmedMember, GroupResidencyStop, MemberResidency, MemberResidue};
 
 /// ADR 0028 §12: each member host's parked budget when the instance's group
 /// at `generation` parks (every member host's resolution parks), keyed by

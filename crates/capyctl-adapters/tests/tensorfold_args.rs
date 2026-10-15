@@ -634,6 +634,8 @@ fn other_shapes_and_user_flags_are_refused() {
 // T21 T37: no transport, rendezvous or TF_COMM variable is rendered or inherited,
 // even with an interface known (R11 applies to the torch-gloo engines only); the
 // follower's final spawned environment holds no key material and equals the head's.
+// `TF_NCCL_LIB` is the installation's library on both ranks, never the agent's
+// (ADR 0028 §10, found live 2026-10-15, MN3).
 #[test]
 fn no_transport_variables_and_no_credentials() {
     let inherited = |name: &str| match name {
@@ -652,7 +654,7 @@ fn no_transport_variables_and_no_credentials() {
         _ => None,
     };
     let owned = |k: &String| {
-        ["NCCL_", "GLOO_", "MASTER_", "TF_COMM", "TF_NCCL"]
+        ["NCCL_", "GLOO_", "MASTER_", "TF_COMM"]
             .iter()
             .any(|p| k.starts_with(p))
     };
@@ -660,10 +662,13 @@ fn no_transport_variables_and_no_credentials() {
     for rank in [0, 1] {
         let mut input = tf_group(rank);
         input.group.as_mut().unwrap().own_interface = Some("enp1s0f0".into());
+        input.nccl_lib = Some("/opt/tf/nccl/libnccl.so.2".into());
         let cmd = render_command(&input).unwrap();
         assert!(!cmd.env.keys().any(owned), "{:?}", cmd.env);
+        assert_eq!(cmd.env["TF_NCCL_LIB"], "/opt/tf/nccl/libnccl.so.2");
         let env = engine_environment(&cmd.env, &input, &inherited, &BTreeMap::new());
         assert!(!env.keys().any(owned), "{env:?}");
+        assert_eq!(env["TF_NCCL_LIB"], "/opt/tf/nccl/libnccl.so.2");
         for absent in ["VLLM_API_KEY", "CAPYCTL_VLLM_ADMIN_KEY", "VLLM_HOST_IP"] {
             assert!(!env.contains_key(absent), "{absent}");
         }

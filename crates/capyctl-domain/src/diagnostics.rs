@@ -116,6 +116,12 @@ const HINTS: &[(&str, &str)] = &[
         "effective_args_mismatch",
         "the engine reported other slot settings than capyctl rendered (slot count, context window, or its metrics and slots endpoints); check the engine version and the end of the instance's engine log",
     ),
+    // ADR 0028 §10 (found live 2026-10-15, MN3): TensorFold loads libnccl at
+    // run time; a group member's installation must hold it.
+    (
+        "nccl_library_missing",
+        "the TensorFold installation holds no libnccl, which a multi-node group needs; install the nvidia-nccl wheel into the engine's environment (pip install nvidia-nccl-cu12, or the build matching its CUDA), then start again",
+    ),
 ];
 
 /// Text a status reader must not see quoted (lower-cased comparison).

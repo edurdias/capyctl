@@ -39,7 +39,7 @@ pub(super) type Measured = BTreeMap<String, i64>;
 
 /// Whether a measurement may replace this revision's parked phase: a parking
 /// revision whose resources CapyCTL derived.
-fn measurable(e: &EffectiveDeployment) -> bool {
+pub(super) fn measurable(e: &EffectiveDeployment) -> bool {
     super::park::parks(e)
         && e.engine_config.provenance().get("resources") == Some(&SettingSource::Derived)
 }
@@ -155,6 +155,74 @@ fn device_memory(e: &EffectiveDeployment, domain: &str) -> bool {
     matches!(
         kind(e, domain),
         Some(DomainMemory::Device | DomainMemory::Unified)
+    )
+}
+
+/// ADR 0014 amendment A13, ADR 0028 §12 (amended 2026-10-15): the residue
+/// one parked group member's own processes hold, as its own host sampled them
+/// after the park (`device_bytes` the driver attributes to them, `bytes` that
+/// plus their anonymous resident pages), on each domain its parked phase
+/// charges that holds the engine's device memory: the device figure on a
+/// discrete host's `device` domain, the sum on a unified pool, as for a
+/// single launch's residue. Empty for a revision whose parked phase is not
+/// measured (declared `resources`).
+pub(super) fn member_residue(e: &EffectiveDeployment, device_bytes: i64, bytes: i64) -> Measured {
+    if !measurable(e) {
+        return Measured::new();
+    }
+    e.resources
+        .parked
+        .allocations
+        .iter()
+        .filter_map(|allocation| {
+            let held = match kind(e, &allocation.domain)? {
+                DomainMemory::Device => device_bytes,
+                DomainMemory::Unified => bytes,
+                _ => return None,
+            };
+            (held > 0).then(|| (allocation.domain.clone(), held))
+        })
+        .collect()
+}
+
+/// ADR 0014 amendments A13, A19: record `residue`, measured after the park
+/// step `step_id` of the launch at `generation` of `instance` resolved as `e`
+/// on its host: the revision's residue there (the largest recorded is kept)
+/// and the launch's own parked charge, whose growth the host's
+/// `parked_growth_limit` bounds.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_residue(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    instance: u32,
+    generation: i64,
+    e: &EffectiveDeployment,
+    residue: &Measured,
+    step_id: &str,
+    now_ms: i64,
+) -> Result<(), LifecycleError> {
+    let installation = super::startup::installation(e);
+    for (domain, bytes) in residue {
+        tx.execute(
+            "INSERT INTO parked_measurements(deployment_id,revision,host_id,installation,domain,bytes,step_id,measured_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(deployment_id,revision,host_id,installation,domain) DO UPDATE SET
+               step_id=CASE WHEN excluded.bytes>bytes THEN excluded.step_id ELSE step_id END,
+               measured_at_ms=CASE WHEN excluded.bytes>bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
+               bytes=MAX(bytes,excluded.bytes)",
+            params![deployment_id, revision, e.host.name, installation, domain, bytes, step_id, now_ms],
+        )?;
+    }
+    record_launch_charges(
+        tx,
+        deployment_id,
+        instance,
+        generation,
+        e,
+        residue,
+        step_id,
+        now_ms,
     )
 }
 
@@ -276,7 +344,10 @@ impl Growth {
 /// parked charge that grew past its host's `parked_growth_limit` since its
 /// first measured park. Its next park is then a stop, which releases nothing
 /// before its own cleanup evidence (AGENTS.md: uncertainty retains
-/// accounting), so its next activation starts a fresh engine.
+/// accounting), so its next activation starts a fresh engine. ADR 0028 §12
+/// (amended 2026-10-15): a group's launch has one charge per member, each on
+/// its own host's domain and bounded by that host's own limit; any member
+/// past its bound stops the group.
 pub(super) fn outgrown(
     tx: &Transaction<'_>,
     p: &Plan,
@@ -286,16 +357,36 @@ pub(super) fn outgrown(
     if charges.is_empty() {
         return Ok(None);
     }
-    let limit = growth_limit(tx, &e.host.name).map_err(resource)?;
-    Ok(charges.into_iter().find_map(|c| {
-        let (over, bound) = past(limit, c.first, c.last)?;
-        over.then_some(Growth {
-            domain: c.domain,
-            first_bytes: c.first,
-            last_bytes: c.last,
-            bound_bytes: bound,
-        })
-    }))
+    // Each member host's parked domains, for a group; one host otherwise.
+    let member_hosts: BTreeMap<String, String> = super::park::group_parked_footprints(
+        tx,
+        &p.deployment_id,
+        p.revision,
+        p.instance_index,
+        p.generation,
+    )?
+    .into_iter()
+    .flatten()
+    .flat_map(|(host, parked)| {
+        parked
+            .allocations
+            .into_iter()
+            .map(move |a| (a.domain, host.clone()))
+    })
+    .collect();
+    for c in charges {
+        let host = member_hosts.get(&c.domain).unwrap_or(&e.host.name);
+        let limit = growth_limit(tx, host).map_err(resource)?;
+        if let Some((true, bound)) = past(limit, c.first, c.last) {
+            return Ok(Some(Growth {
+                domain: c.domain,
+                first_bytes: c.first,
+                last_bytes: c.last,
+                bound_bytes: bound,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Record that the bound turned a park of the launch `p` into the stop
@@ -478,19 +569,17 @@ impl crate::Store {
         // revision is charged: until the ledger is moved below, a launch whose
         // ledger entry no longer matches its footprints does not load.
         let parked = parked_launches(&tx, &p.deployment_id)?;
-        let installation = super::startup::installation(&e);
-        for (domain, bytes) in &residue {
-            tx.execute(
-                "INSERT INTO parked_measurements(deployment_id,revision,host_id,installation,domain,bytes,step_id,measured_at_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(deployment_id,revision,host_id,installation,domain) DO UPDATE SET
-                   step_id=CASE WHEN excluded.bytes>bytes THEN excluded.step_id ELSE step_id END,
-                   measured_at_ms=CASE WHEN excluded.bytes>bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
-                   bytes=MAX(bytes,excluded.bytes)",
-                params![p.deployment_id, p.revision, e.host.name, installation, domain, bytes, step_id, now_ms],
-            )?;
-        }
-        record_launch_charges(&tx, &park, &e, &residue, step_id, now_ms)?;
+        record_residue(
+            &tx,
+            &p.deployment_id,
+            p.revision,
+            park.instance,
+            park.generation,
+            &e,
+            &residue,
+            step_id,
+            now_ms,
+        )?;
         move_parked_owners(&tx, parked)?;
         tx.commit()?;
         Ok(true)
@@ -502,9 +591,12 @@ impl crate::Store {
 /// launches. A charge is the residue as a park is charged it (never below the
 /// placeholder, never above the Ready charge), what status shows. A step
 /// recorded twice counts once.
+#[allow(clippy::too_many_arguments)]
 fn record_launch_charges(
     tx: &Transaction<'_>,
-    park: &super::park::CompletedPark,
+    deployment_id: &str,
+    instance: u32,
+    generation: i64,
     e: &EffectiveDeployment,
     residue: &Measured,
     step_id: &str,
@@ -512,7 +604,7 @@ fn record_launch_charges(
 ) -> Result<(), LifecycleError> {
     tx.execute(
         "DELETE FROM parked_launch_residues WHERE deployment_id=?1 AND instance_index=?2 AND generation<?3",
-        params![park.deployment_id, park.instance, park.generation],
+        params![deployment_id, instance, generation],
     )?;
     let charged = apply(
         &phase(&e.resources.parked, ResourcePhase::Parked),
@@ -542,9 +634,9 @@ fn record_launch_charges(
                last_step_id=excluded.last_step_id,
                measured_at_ms=excluded.measured_at_ms",
             params![
-                park.deployment_id,
-                park.instance,
-                park.generation,
+                deployment_id,
+                instance,
+                generation,
                 domain,
                 bytes,
                 step_id,

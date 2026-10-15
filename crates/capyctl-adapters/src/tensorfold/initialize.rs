@@ -14,6 +14,8 @@ use super::{
 use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
+/// The closed refusal of a group member whose installation holds no libnccl.
+pub const NCCL_LIBRARY_MISSING: &str = "nccl_library_missing";
 const READINESS_POLL: Duration = Duration::from_millis(500);
 const BUILDER_MARGIN_MS: i64 = 2_000;
 
@@ -29,13 +31,22 @@ pub(super) async fn initialize(
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
     let context = &command.context;
-    let (plan, tools) = adapter.launch_parts()?;
+    let (mut plan, tools) = adapter.launch_parts()?;
     if !matches!(
         context.launch_settings,
         Some(capyctl_domain::launch::LaunchSettings::Tensorfold(_))
     ) || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
         return Err(RuntimeError::Unsupported);
+    }
+    // ADR 0028 §10 (found live 2026-10-15, MN3): a group member without the
+    // installation's libnccl would exit `libnccl not found`; refuse before
+    // any effect instead, with the closed category.
+    if plan.group.is_some() {
+        plan.nccl_lib = Some(
+            super::args::installation_nccl_lib(&plan.engine_bin)
+                .ok_or_else(|| RuntimeError::Refused(NCCL_LIBRARY_MISSING.into()))?,
+        );
     }
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let mut cmd =
@@ -67,13 +78,15 @@ pub(super) async fn initialize(
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
     // ADR 0028 §9, §10: rank 1 serves nothing and follows rank 0; readiness
     // is the head's, so it is never polled or probed. Its step ends once its
-    // process is recorded and present.
+    // process is recorded and present: a follower serves from that one
+    // process (ADR 0023 §6), so no rank process is waited for.
     if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
         let log = plan.engine_log.clone();
         return crate::group::worker_spawned(
             context,
             tools,
             api,
+            0,
             builds,
             || {
                 let tail = crate::launch_failure::log_tail(log.as_deref());
