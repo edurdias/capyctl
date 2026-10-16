@@ -18,17 +18,21 @@
 # Host document options (2026-09-25 benchmark): CAPYCTL_HF_MAX_BYTES=<size> allows
 # Hugging Face model sources; CAPYCTL_APPROVE_SPECULATION=1 approves the speculative
 # options; CAPYCTL_HOST_CUDA_HOME=<dir> sets the profiles' cuda_home (gen_host_doc.py).
+# Multi-node groups (ADR 0028, rows MN1-MN8): a host with HOST_<A|B>_DIRECT_ADDR set
+# declares it as its peer address with the GROUP_RENDEZVOUS_PORTS range (default
+# 25000-25099; CAPYCTL_GROUPS=0 leaves the groups block out), and TENSORFOLD_VENV_DIR
+# adds a `tensorfold` profile.
 . "$(dirname "$0")/lib.sh"
 
-usage() { sed -n '2,19p' "$0"; exit 2; }
+usage() { sed -n '2,24p' "$0"; exit 2; }
 
 preflight() {
   local host want
   want=$(if dry; then echo "<snapshot-digest>"; else cat "$SNAPSHOT/tree.sha256"; fi)
-  x bash -c "! ss -ltn | grep -Eq '127.0.0.1:(7443|8443)\\b'" || die "a server already listens on control-host"
+  x bash -c "! ss -ltn | grep -Eq ':($SERVER_MGMT_PORT|$SERVER_INFER_PORT)\\b'" || die "a server already listens on control-host"
   for host in "${MATRIX_HOSTS[@]}"; do
     rsh "$host" "if pgrep -af '$ENGINE_PGREP' | grep -vE 'pgrep|tailscaled|bash -c'; then echo 'an engine is running; refusing' >&2; exit 3; fi; \
-if tmux ls 2>/dev/null | grep -q '^mx-'; then echo 'a matrix tmux session exists; refusing' >&2; exit 3; fi; \
+if $MX_TMUX ls 2>/dev/null | grep -q '^mx-'; then echo 'a matrix tmux session exists; refusing' >&2; exit 3; fi; \
 test -x $REMOTE_TREE/target/release/capyctl; cd $REMOTE_TREE && test \"\$($TREE_DIGEST_SH)\" = '$want'; \
 echo \"\$(hostname) clock \$(date +%s%3N) boot \$(cat /proc/sys/kernel/random/boot_id)\"; grep MemAvailable /proc/meminfo"
     echo "control-host clock $(now_ms)"
@@ -50,12 +54,14 @@ server_init() {
   # Bootstrap and control listen on control-host's Tailscale address; management and
   # inference stay on loopback (ServerConfig::parse refuses anything else).
   # CAPYCTL_TIMING_HEADER=1 turns on `observability.timing_header` (M80, SPEC 17).
-  x python3 - "$SERVER_CFG" "$SERVER_IP" "${CAPYCTL_TIMING_HEADER:-0}" "$LRD/server-init.json" <<'PY'
+  x python3 - "$SERVER_CFG" "$SERVER_IP" "${CAPYCTL_TIMING_HEADER:-0}" "$LRD/server-init.json" "$SERVER_MGMT_PORT" "$SERVER_INFER_PORT" <<'PY'
 import json, os, sys
-path, ip, timing, init = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, ip, timing, init, mgmt, infer = sys.argv[1:7]
 doc = json.load(open(init))
 doc["listeners"]["bootstrap"]["bind"] = f"{ip}:7444"
 doc["listeners"]["control"]["bind"] = f"{ip}:7445"
+doc["listeners"]["management"]["bind"] = f"127.0.0.1:{mgmt}"
+doc["listeners"]["inference"]["bind"] = f"127.0.0.1:{infer}"
 doc["enrollment"] = {"bootstrap_address": f"https://{ip}:7444", "control_address": f"https://{ip}:7445"}
 if timing == "1":
     doc["observability"] = {"timing_header": True}
@@ -68,7 +74,7 @@ PY
 
 server_up() {
   load_run
-  x tmux new-session -d -s "mx-srv-$RUN" "$MATRIX_DIR/role_exec.sh" "$LRD/server.pid" "$LRD/server.log" \
+  x $MX_TMUX new-session -d -s "mx-srv-$RUN" "$MATRIX_DIR/role_exec.sh" "$LRD/server.pid" "$LRD/server.log" \
     "$CAPYCTL" start server --config "$SERVER_CFG"
   local i
   for i in $(seq 1 60); do
@@ -90,7 +96,7 @@ server_down() {
 }
 
 host_init() {
-  local host=$1 policy=${2:-normal} device sgv vv
+  local host=$1 policy=${2:-normal} device sgv vv tfv="" tfcuda=""
   load_run
   rsh "$host" "[ -d $RRD ] || mkdir -p -m 700 $RRD; CAPYCTL_STATE_DIR=$RRD/host $RBIN init host --output $RRD/host.yaml"
   # -B: the probe imports runtime modules, and a written __pycache__ makes the
@@ -99,22 +105,37 @@ host_init() {
     "cd $REMOTE_TREE && PYTHONDONTWRITEBYTECODE=1 python3 -B -m runtime.sglang_device")
   sgv=$(rsh_out "$host" 0.5.20 "$SGLANG_VENV/bin/python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null | tail -1")
   vv=$(rsh_out "$host" 0.29.0 "$(vllm_venv "$host")/bin/python3 -c 'import importlib.metadata as m; print(m.version(\"vllm\"))'")
+  if [ -n "$TENSORFOLD_VENV" ]; then
+    tfv=$(rsh_out "$host" 0.6.5 "$TENSORFOLD_VENV/bin/python3 -c 'import importlib.metadata as m; print(m.version(\"tensorfold\"))'")
+    # TensorFold builds its kernels with nvcc; `engine add` records the toolkit the same way.
+    tfcuda=$(rsh_out "$host" /usr/local/cuda "if [ -x /usr/local/cuda/bin/nvcc ]; then echo /usr/local/cuda; fi")
+  fi
   # The runtime tree must still pass the host's integrity rule after the probes.
   rsh "$host" "python3 -B $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime >/dev/null || { python3 -B $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime | grep FAIL >&2; exit 3; }"
   if ! dry; then
     mkdir -p "$RUNSTATE"
     printf '%s\n' "$device" >"$RUNSTATE/device-$host.json"
-    printf 'sglang=%s\nvllm=%s\n' "$sgv" "$vv" >"$RUNSTATE/versions-$host.txt"
+    printf 'sglang=%s\nvllm=%s\ntensorfold=%s\ntensorfold_cuda=%s\n' "$sgv" "$vv" "$tfv" "$tfcuda" >"$RUNSTATE/versions-$host.txt"
   fi
-  host_doc "$host" "$policy" "$sgv" "$vv"
+  host_doc "$host" "$policy" "$sgv" "$vv" "$tfv" "$tfcuda"
 }
 
 host_doc() {
-  local host=$1 policy=$2 sgv=${3:-} vv=${4:-} doc
+  local host=$1 policy=$2 sgv=${3:-} vv=${4:-} tfv=${5:-} tfcuda=${6:-} doc peer group_args=() tf_args=()
   load_run
   if [ -z "$sgv" ]; then
-    if dry; then sgv=0.5.20 vv=0.29.0; else
-      sgv=$(sed -n 's/^sglang=//p' "$RUNSTATE/versions-$host.txt"); vv=$(sed -n 's/^vllm=//p' "$RUNSTATE/versions-$host.txt"); fi
+    if dry; then sgv=0.5.20 vv=0.29.0 tfv=${TENSORFOLD_VENV:+0.6.5} tfcuda=${TENSORFOLD_VENV:+/usr/local/cuda}; else
+      sgv=$(sed -n 's/^sglang=//p' "$RUNSTATE/versions-$host.txt"); vv=$(sed -n 's/^vllm=//p' "$RUNSTATE/versions-$host.txt")
+      tfv=$(sed -n 's/^tensorfold=//p' "$RUNSTATE/versions-$host.txt"); tfcuda=$(sed -n 's/^tensorfold_cuda=//p' "$RUNSTATE/versions-$host.txt"); fi
+  fi
+  peer=$(direct_addr "$host")
+  if [ -n "$peer" ] && [ "${CAPYCTL_GROUPS:-1}" != 0 ]; then
+    group_args=(--peer-address "$peer" --rendezvous-ports "$GROUP_RENDEZVOUS_PORTS")
+  fi
+  if [ -n "$TENSORFOLD_VENV" ]; then
+    [ -n "$tfv" ] || die "no TensorFold version recorded for $host: run roles.sh host-init $host"
+    tf_args=(--tensorfold-venv "$TENSORFOLD_VENV" --tensorfold-version "$tfv")
+    if [ -n "$tfcuda" ]; then tf_args+=(--tensorfold-cuda-home "$tfcuda"); fi
   fi
   doc=$RUNSTATE/host-$host-$policy.yaml
   x python3 "$MATRIX_DIR/gen_host_doc.py" --device-json "$RUNSTATE/device-$host.json" --ip "$(host_ip "$host")" \
@@ -122,7 +143,7 @@ host_doc() {
     --vllm-venv "$(vllm_venv "$host")" --sglang-venv "$SGLANG_VENV" --remote-tree "$REMOTE_TREE" \
     --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" ${NO_PROFILES:+--no-profiles} \
     ${CAPYCTL_HF_MAX_BYTES:+--hf-max-bytes "$CAPYCTL_HF_MAX_BYTES"} ${CAPYCTL_APPROVE_SPECULATION:+--approve-speculation} \
-    ${CAPYCTL_HOST_CUDA_HOME:+--cuda-home "$CAPYCTL_HOST_CUDA_HOME"} --out "$doc"
+    ${CAPYCTL_HOST_CUDA_HOME:+--cuda-home "$CAPYCTL_HOST_CUDA_HOME"} "${group_args[@]}" "${tf_args[@]}" --out "$doc"
   rcopy "$doc" "$host:$RRD/host.yaml"
   rsh "$host" "chmod 600 $RRD/host.yaml"
   save_run_var "POLICY_$(host_short "$host")" "$policy"
@@ -149,7 +170,7 @@ enroll() {
 host_up() {
   local host=$1 debug=${2:-}
   load_run
-  rsh "$host" "tmux new-session -d -s mx-host-$RUN $REMOTE_TREE/scripts/live/matrix/role_exec.sh $RRD/host.pid $RRD/host.log $(rbin "$host") start host --config $RRD/host.yaml $debug"
+  rsh "$host" "$MX_TMUX new-session -d -s mx-host-$RUN $REMOTE_TREE/scripts/live/matrix/role_exec.sh $RRD/host.pid $RRD/host.log $(rbin "$host") start host --config $RRD/host.yaml $debug"
 }
 
 host_down() {

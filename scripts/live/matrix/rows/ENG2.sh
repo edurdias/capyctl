@@ -29,7 +29,7 @@ ENG2_DIR=
 eng2_start() { # eng2_start <host>
   local host=$1
   ENG2_DIR=$RRD/eng2-standalone
-  rsh "$host" "rm -rf $ENG2_DIR && mkdir -m 700 $ENG2_DIR && tmux new-session -d -s mx-eng2-$RUN \
+  rsh "$host" "rm -rf $ENG2_DIR && mkdir -m 700 $ENG2_DIR && $MX_TMUX new-session -d -s mx-eng2-$RUN \
 env CAPYCTL_STATE_DIR=$ENG2_DIR CAPYCTL_VLLM_BIN=$(vllm_venv "$host")/bin/vllm CAPYCTL_SGLANG_BIN=$SGLANG_VENV/bin/python3 \
 CAPYCTL_MODELS_ROOT=$MODELS_ROOT $REMOTE_TREE/scripts/live/matrix/role_exec.sh $ENG2_DIR/role.pid $ENG2_DIR/role.log \
 $(rbin "$host") start standalone --debug-engine-logs"
