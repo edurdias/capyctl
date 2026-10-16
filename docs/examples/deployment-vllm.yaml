@@ -1,4 +1,4 @@
-# Qwen3-4B on vLLM 0.29 on one machine (docs/guide/engines.md, "First model on
+# Qwen3-4B on vLLM 0.31 on one machine (docs/guide/engines.md, "First model on
 # each engine"): `capyctl deploy model --file deployment-vllm.yaml`.
 # Parsed by the product: `capyctl validate config --file docs/examples/deployment-vllm.yaml`.
 name: qwen3-4b-vllm

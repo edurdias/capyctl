@@ -1,5 +1,12 @@
 # Current implementation and launch status
 
+## 0.1.3 published — 2026-10-15
+
+The owner published `v0.1.3` (tag on `345806a5`, marked Latest) after the
+Release build workflow (run 38822609377, Rust 1.99.0), the strict packaging
+check on x86_64 and aarch64, and a live install from the draft on host A. The
+site installer then installed 0.1.3 at that commit on host B. Next: 0.1.4.
+
 ## 0.1.3 release preparation — 2026-10-15
 
 Version bumped to 0.1.3 with release notes in
@@ -8,10 +15,7 @@ by `scripts/assemble-changes.sh 0.1.3` and edited into one note (multi-node
 groups qualified on two GB10 hosts, llama.cpp as a fourth engine, TensorFold
 0.6.6 and vLLM 0.31.0 verified, the memory, request and wake fixes since
 0.1.2, and known issues). The status entries of those change files are folded
-in below. The verification result is in the release pull request. Nothing is
-built, tagged or published yet: next are the manual Release build workflow
-with Rust 1.99.0, the strict local packaging check, a draft release and the
-live check from the draft (docs/operations/releasing.md). The owner publishes.
+in below. The verification result is in the release pull request.
 
 The release PR's hosted CPU checks failed once on
 `group_observation::tests::unrelated_process_exits_during_a_scan_do_not_fail_the_observation`

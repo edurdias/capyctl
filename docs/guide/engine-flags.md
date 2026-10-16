@@ -25,7 +25,7 @@ An option that is not typed reaches the engine as written. CapyCTL does not
 count memory it makes the engine use, such as a CPU KV offload. Size
 `memory.request` to include it.
 
-## vLLM 0.30
+## vLLM 0.30 and 0.31
 
 | Need | Option | Class | CapyCTL |
 |---|---|---|---|
@@ -50,7 +50,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Weight loading | `--safetensors-load-strategy` | typed | `engine_config.vllm.safetensors_load_strategy` (`eager` or `lazy`; `eager` while parking when not set) |
 | Text only | `--language-model-only` | typed | `engine_config.language_model_only` |
 | Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
-| Log level | `--uvicorn-log-level` | reserved | CapyCTL owns the server's logging. vLLM's own level is the `VLLM_LOGGING_LEVEL` variable: set it in `engine_config.env` once the installation lists it in `security.approved_env`. |
+| Log level | `--uvicorn-log-level`, `--log-level`, `--log-config-file`, `--logging-config` | reserved | CapyCTL owns the server's logging. vLLM's own level is the `VLLM_LOGGING_LEVEL` variable: set it in `engine_config.env` once the installation lists it in `security.approved_env`. 0.31 moved its logging options under `--logging-config`; every spelling is reserved. |
 | Request and stats logging | `--enable-log-requests`, `--disable-log-requests`, `--disable-log-stats` | reserved | CapyCTL logs requests itself and reads the engine's stats for load reports. |
 | Per-request metrics | `--enable-per-request-metrics` | reserved | Always on: each answer carries vLLM's timings for the request, which CapyCTL adds to its [per-request metrics](requests.md#per-request-metrics). |
 | Cached-token count | `--enable-prompt-tokens-details` | extra | Off unless you pass it. With it, usage reports `prompt_tokens_details.cached_tokens` and the per-request metrics show `cached_tokens`. |

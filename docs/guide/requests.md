@@ -89,7 +89,7 @@ CapyCTL relays each chunk unchanged except `model`, and checks it first: a
 field never reaches a client. Fields beside `delta` in a
 choice, and `usage` with its details, are relayed as the engine sent them.
 
-| Field | Where | vLLM 0.29, 0.30 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
+| Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
 |---|---|---|---|---|---|
 | `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk) |
 | `content` | delta | yes | yes | yes | yes (`null` on the opening chunk) |
@@ -111,8 +111,8 @@ Not relayed: SGLang's `hidden_states` delta (sent only for
 `return_hidden_states`, a request field CapyCTL refuses) and vLLM's `citations`
 delta (its Cohere endpoint only). The table was read from the vLLM 0.29.0,
 SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources; vLLM 0.30's `reasoning`
-was confirmed live, and the other listed versions are assumed to match until
-run against them.
+was confirmed live, vLLM 0.31.0's streamed answers were relayed live, and the
+other listed versions are assumed to match until run against them.
 
 ## Per-request metrics
 
@@ -152,7 +152,7 @@ the prompt. A router `decode_tokens_per_second` is the completion tokens
 after the first, over the time from that first text to the last chunk. A
 figure nobody measured is left out, never shown as zero.
 
-| Figure | vLLM 0.30 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
+| Figure | vLLM 0.30, 0.31 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
 |---|---|---|---|---|
 | `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | router |
 | `queue_ms` | engine | — | — | — |

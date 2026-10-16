@@ -13,7 +13,7 @@ capyctl engine add ~/venvs/vllm
 ```
 
 ```text
-Registered vllm (vllm 0.29.0)
+Registered vllm (vllm 0.31.0)
 
   Executable     /home/me/venvs/vllm/bin/vllm
   Deep park      enabled

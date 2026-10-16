@@ -13,8 +13,8 @@ capyctl engine detect
 
 ```text
 ENGINE   VERSION   CUSTOM   ENVIRONMENT                SOURCE
-sglang   0.5.20    no       /home/me/venvs/sglang      venv
-vllm     0.29.0    no       /home/me/venvs/vllm        venv
+sglang   0.5.21    no       /home/me/venvs/sglang      venv
+vllm     0.31.0    no       /home/me/venvs/vllm        venv
 ```
 
 `detect` only reads package metadata; it runs nothing. It looks on your
@@ -31,7 +31,7 @@ capyctl engine add ~/venvs/vllm
 ```
 
 ```text
-Registered vllm (vllm 0.29.0)
+Registered vllm (vllm 0.31.0)
 
   Executable     /home/me/venvs/vllm/bin/vllm
   Deep park      enabled
@@ -71,7 +71,7 @@ capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly
 ```
 
 ```text
-Registered vllm-nightly (vllm 0.30.0rc1)
+Registered vllm-nightly (vllm 0.32.0rc1)
 
   Executable     /home/me/venvs/vllm-nightly/bin/vllm
   Deep park      enabled
@@ -138,13 +138,13 @@ still comes from the system. `engine add` checks all of this and names what is
 missing; it never uses your shell's `PATH`.
 
 ```bash
-capyctl engine add ~/tensorfold-0.6.0-venv
+capyctl engine add ~/venvs/tensorfold
 ```
 
 ```text
-Registered tensorfold (tensorfold 0.6.0)
+Registered tensorfold (tensorfold 0.6.6)
 
-  Executable     /home/me/tensorfold-0.6.0-venv/bin/tensorfold
+  Executable     /home/me/venvs/tensorfold/bin/tensorfold
   Deep park      disabled
   CUDA           /usr/local/cuda
   Engines file   /home/me/.config/capyctl/engines.yaml (revision 1)
@@ -510,7 +510,7 @@ names:
 KEY=$(sed -n 's/^api_key: //p' ~/.local/state/capyctl/identity/credentials)
 ```
 
-### vLLM 0.29: Qwen3-4B
+### vLLM 0.31: Qwen3-4B
 
 <!-- include: ../examples/deployment-vllm.yaml -->
 
@@ -519,7 +519,7 @@ capyctl engine add ~/venvs/vllm
 ```
 
 ```text
-Registered vllm (vllm 0.29.0)
+Registered vllm (vllm 0.31.0)
 
   Executable     /home/me/venvs/vllm/bin/vllm
   Deep park      enabled
@@ -533,11 +533,11 @@ capyctl deploy model --file docs/examples/deployment-vllm.yaml
 ```
 
 ```text
-Request identity: 01M3X7VR7MVTJ5DG7AMY6YA1P8 (reuse --request-id 01M3X7VR7MVTJ5DG7AMY6YA1P8 to recover this command)
+Request identity: 01M511394XJDYWP78SNPBMDWPF (reuse --request-id 01M511394XJDYWP78SNPBMDWPF to recover this command)
 Deployment qwen3-4b-vllm created (revision 1)
 
-  Deployment ID       01M3X7VR8K2W783VV2JBJ195XW
-  Operation           01M3X7VR8KYB08K0H8FXHBCM6G
+  Deployment ID       01M511395WX25N9ZWT1BQAGMX0
+  Operation           01M511395WXENKZ1KDWHMYT5Q9
   Checkpoint digest   being measured
 the checkpoint digest of qwen3-4b-vllm is being measured; `capyctl start deployment qwen3-4b-vllm --wait` waits for it and starts the deployment
 ```
@@ -547,8 +547,8 @@ capyctl start deployment qwen3-4b-vllm --wait
 ```
 
 ```text
-Request identity: 01M3X7VWFWGMFA1STYQDZ70SCQ (reuse --request-id 01M3X7VWFWGMFA1STYQDZ70SCQ to recover this command)
-Waiting for the checkpoint digest of qwen3-4b-vllm to be measured (at most 900s)
+Request identity: 01M5113969KYJNVCZ4JQQEQB32 (reuse --request-id 01M5113969KYJNVCZ4JQQEQB32 to recover this command)
+Waiting for the model source of qwen3-4b-vllm to be downloaded and verified (at most 900s)
 Started qwen3-4b-vllm: ready
 
   Ready       1/1
@@ -556,7 +556,7 @@ Started qwen3-4b-vllm: ready
   Operation   initialize succeeded
 ```
 
-It was ready 55 seconds later, the checkpoint already downloaded. `/no_think`
+It was ready 53 seconds later, the checkpoint already downloaded. `/no_think`
 turns off Qwen3's thinking for one message:
 
 ```bash
@@ -567,14 +567,17 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-<think>
 
-</think>
 
 The largest planet in our solar system is Jupiter.
 ```
 
-### SGLang 0.5.20: Qwen3-4B
+CapyCTL picks Qwen3's reasoning parser ([Tool calls and
+reasoning](#tool-calls-and-reasoning)), so the empty thinking block goes to
+the message's `reasoning` field (`reasoning_content` on SGLang) and only the
+two line breaks after it stay in `content`.
+
+### SGLang 0.5.21: Qwen3-4B
 
 <!-- include: ../examples/deployment-sglang.yaml -->
 
@@ -583,7 +586,7 @@ capyctl engine add ~/venvs/sglang
 ```
 
 ```text
-Registered sglang (sglang 0.5.20)
+Registered sglang (sglang 0.5.21)
 
   Executable     /home/me/venvs/sglang/bin/python3
   Deep park      enabled
@@ -597,11 +600,11 @@ capyctl deploy model --file docs/examples/deployment-sglang.yaml
 ```
 
 ```text
-Request identity: 01M3X7YHH59FJKZP0WG1D9C4QG (reuse --request-id 01M3X7YHH59FJKZP0WG1D9C4QG to recover this command)
+Request identity: 01M51156B1F2ZDE4GD8ZHYZXTV (reuse --request-id 01M51156B1F2ZDE4GD8ZHYZXTV to recover this command)
 Deployment qwen3-4b-sglang created (revision 1)
 
-  Deployment ID       01M3X7YHJ3Y9V6NDPSEAF48SXF
-  Operation           01M3X7YHJ36M809539GJNNS8V8
+  Deployment ID       01M51156BX5HSE082HWSF304MG
+  Operation           01M51156BX8TZ8KK2ZCYAQ181Y
   Checkpoint digest   being measured
 the checkpoint digest of qwen3-4b-sglang is being measured; `capyctl start deployment qwen3-4b-sglang --wait` waits for it and starts the deployment
 ```
@@ -611,7 +614,7 @@ capyctl start deployment qwen3-4b-sglang --wait
 ```
 
 ```text
-Request identity: 01M3X7YHJDDR6WARHDZDJEFP5N (reuse --request-id 01M3X7YHJDDR6WARHDZDJEFP5N to recover this command)
+Request identity: 01M51156C7C3FPGR5E0QEP063P (reuse --request-id 01M51156C7C3FPGR5E0QEP063P to recover this command)
 Waiting for the checkpoint digest of qwen3-4b-sglang to be measured (at most 900s)
 Started qwen3-4b-sglang: ready
 
@@ -620,7 +623,7 @@ Started qwen3-4b-sglang: ready
   Operation   initialize succeeded
 ```
 
-Ready after 61 seconds.
+Ready after 91 seconds.
 
 ```bash
 curl -s http://127.0.0.1:8443/v1/chat/completions \
@@ -630,14 +633,12 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-<think>
 
-</think>
 
 The largest planet in our solar system is Jupiter.
 ```
 
-### TensorFold 0.6.1: Nemotron 3.5 Lightning 30B-A3B 4-bit
+### TensorFold 0.6.6: Nemotron 3.5 Lightning 30B-A3B 4-bit
 
 <!-- include: ../examples/deployment-tensorfold.yaml -->
 
@@ -646,7 +647,7 @@ capyctl engine add ~/venvs/tensorfold
 ```
 
 ```text
-Registered tensorfold (tensorfold 0.6.1)
+Registered tensorfold (tensorfold 0.6.6)
 
   Executable     /home/me/venvs/tensorfold/bin/tensorfold
   Deep park      disabled
@@ -660,11 +661,11 @@ capyctl deploy model --file docs/examples/deployment-tensorfold.yaml
 ```
 
 ```text
-Request identity: 01M3X817ZABXRW67CQ2EY9KW4W (reuse --request-id 01M3X817ZABXRW67CQ2EY9KW4W to recover this command)
+Request identity: 01M5118700HSCYNZM3D0P5FF1B (reuse --request-id 01M5118700HSCYNZM3D0P5FF1B to recover this command)
 Deployment nemotron-30b created (revision 1)
 
-  Deployment ID       01M3X817ZXRQP97RZQ3JDJQJ6F
-  Operation           01M3X817ZXY1R64CTYQ51NPSHP
+  Deployment ID       01M511870J843YX6WWPYTRG6BM
+  Operation           01M511870JHJ94JDGQQVH4QMDP
   Checkpoint digest   being measured
 the checkpoint digest of nemotron-30b is being measured; `capyctl start deployment nemotron-30b --wait` waits for it and starts the deployment
 ```
@@ -674,7 +675,7 @@ capyctl start deployment nemotron-30b --wait
 ```
 
 ```text
-Request identity: 01M3X818098DHVZCS7JH936A5W (reuse --request-id 01M3X818098DHVZCS7JH936A5W to recover this command)
+Request identity: 01M511870W3RP14F3CVZXSSHXM (reuse --request-id 01M511870W3RP14F3CVZXSSHXM to recover this command)
 Waiting for the model source of nemotron-30b to be downloaded and verified (at most 1800s)
 Started nemotron-30b: ready
 
@@ -683,9 +684,10 @@ Started nemotron-30b: ready
   Operation   initialize succeeded
 ```
 
-This first start downloaded the 18.5 GB checkpoint and was ready after
-17.5 minutes; a later `start` after `stop` was ready in 10 seconds. Nemotron
-thinks before it answers and returns the thinking in `reasoning_content`:
+The 18.5 GB checkpoint was already downloaded; this first start was ready
+after 109 seconds, and a later `start` after `stop` in 12 seconds. A first
+download adds its own time (17.5 minutes on an earlier run). Nemotron thinks
+before it answers and returns the thinking in `reasoning_content`:
 
 ```bash
 curl -s http://127.0.0.1:8443/v1/chat/completions \
@@ -733,7 +735,8 @@ What each engine runs:
 | Parking | deep, every rank | restart only (0.1.3) | restart only |
 
 Any shape in the table is accepted, with no warning. Live qualification covers
-two machines only.
+two machines only, with the versions in the table header; other versions this
+release knows are expected to behave the same but were not run as groups.
 
 Known issue in 0.1.3: an SGLang group restarts instead of parking. With no
 `residency` it gets `restart_only`; `deep` or `host_backed` is refused at
@@ -752,8 +755,8 @@ capyctl engine list
 
 ```text
 PROFILE        SOURCE         ENGINE   VERSION     CUSTOM   DEEP PARK   PUBLISHED   DEPLOYMENTS
-vllm           engines.yaml   vllm     0.29.0      no       enabled     published   -
-vllm-nightly   engines.yaml   vllm     0.30.0rc1   yes      enabled     published   -
+vllm           engines.yaml   vllm     0.31.0      no       enabled     published   -
+vllm-nightly   engines.yaml   vllm     0.32.0rc1   yes      enabled     published   -
 ```
 
 `PUBLISHED` shows whether the running CapyCTL uses it (`unknown` while CapyCTL is

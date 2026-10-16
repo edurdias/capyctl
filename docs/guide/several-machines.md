@@ -164,7 +164,7 @@ capyctl engine add ~/venvs/vllm
 ```
 
 ```text
-Registered vllm (vllm 0.29.0)
+Registered vllm (vllm 0.31.0)
 
   Executable     /home/me/venvs/vllm/bin/vllm
   Deep park      enabled
@@ -196,7 +196,7 @@ capyctl list engines
 NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
 gpu-box   online   yes        0.1.3     supported       46.8 GiB / 77.2 GiB     vllm
 HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
-gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
+gpu-box   vllm      vllm     0.31.0    no       enabled     online   -
 ```
 
 ## 5. Deploy

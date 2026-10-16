@@ -584,8 +584,9 @@ The claim takes the sharing the host states for that GPU; add
 `gpuN` is the driver's index at start (`nvidia-smi -L`). The engine is started
 with only that GPU visible: `CUDA_VISIBLE_DEVICES` set to the GPU's UUID, or to
 its index with `CUDA_DEVICE_ORDER=PCI_BUS_ID` when no UUID is known. A
-deployment that names two GPUs, or asks for tensor parallelism, is refused
-(`multi_gpu_unsupported`, exit 5): one GPU per model in 0.1.0. An instance
+deployment that names two GPUs on one machine is refused
+(`multi_gpu_unsupported`, exit 5). To spread one model over machines, give it a
+`topology` ([One model across machines](../guide/several-machines.md#one-model-across-machines)). An instance
 started through a path that does not place it runs on the lowest-index GPU.
 
 **Residency tiers.** A deployment parks in one of three ways (its
@@ -652,7 +653,7 @@ development-control marks) is only in the JSON.
 
     $ capyctl list engines
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
-    gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
+    gpu-box   vllm      vllm     0.31.0    no       enabled     online   -
 
 Scripts pass `--json`: the command then prints its JSON result, the same
 document earlier releases printed (indented on a terminal, one compact line when piped or redirected), and reports errors as JSON on stderr.
@@ -713,12 +714,12 @@ at `deploy` (`profile_not_published`), naming the profile and each host; run
 `capyctl engine add <path> --name <profile>` on a host, then deploy again.
 
 An older CapyCTL that shares `engines.yaml` with a newer one may find a
-profile for an engine it does not support (for example `tensorfold`, which
-0.1.1 added). From this release on, a role skips such a profile at start and
+profile for an engine it does not support (for example `llamacpp`, which
+0.1.3 added). From 0.1.2 on, a role skips such a profile at start and
 on reload, prints a warning that names the profile and its engine, and starts
 with the rest; a deployment that names it is refused `profile_not_published`.
 The file keeps the profile. Upgrade CapyCTL to use it, or remove it with
-`capyctl engine remove <name>`. Releases before this one refuse to start
+`capyctl engine remove <name>`. Releases before 0.1.2 refuse to start
 (`invalid_config` at `runtime_profiles.engine`); remove the profile with the
 newer binary, or edit `engines.yaml`, before starting the older one.
 
