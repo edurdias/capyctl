@@ -691,6 +691,8 @@ impl World {
             step_id: ulid::Ulid::new().to_string(),
             deadline_ms: capyctl_protocol::now_unix_ms() + 90_000,
             evidence: Default::default(),
+            // The default and lab hosts' observation TTL.
+            observation_ttl: std::time::Duration::from_secs(2),
         }
     }
 

@@ -769,11 +769,28 @@ a report only while it is within its host's observation TTL (2 s by default and
 on the lab hosts). SGLang's probes right after a wake that reloaded the weights
 took longer than that, so the reports were stale at the commit, the store
 refused them (`evidence freshness`) and the group stopped `group_member_uncertain`.
-A park commits right after it reads the reports, and vLLM's probes are fast, so
-neither failed. The live failure text was not kept; the group world reproduces
-it with probes that outlast the TTL (`a_wake_whose_probes_outlast_the_observation_ttl_completes`).
+vLLM's probes are fast, so its wakes passed. The live failure text was not
+kept; the group world reproduces it with probes that outlast the TTL
+(`a_wake_whose_probes_outlast_the_observation_ttl_completes`).
 
-§12's wake now ends with one more read: once the canary passed, every member's
+A park can hit the same rule (found live 2026-10-16, the first MN4 SGLang park
+on this fix: `park_uncertain`, `evidence freshness`, 9 s after acceptance). The
+members settle at different times, each host pushing its reports on its own
+period (an SGLang member's saver map every 2 s; a park also waits for a residue
+sampled after the head's reply), and the controller kept each member's first
+settling report while it waited for the others, so the earliest one could be
+older than the TTL when the last settled. The 0.1.3 SGLang parks that passed did
+so by timing.
+
+Every report a park or wake commits is now fresh by the store's own rule: the
+controller reads the TTL the step's commit applies (the observation TTL of its
+host policy), asks every member's host again on every poll, settled members
+included, and hands the commit the reports only when each member's latest one
+settles and is younger than that TTL less a margin (300 ms, at most half the
+TTL). A member with no report that young by the end of the evidence window is
+silent (`group_member_uncertain`, its charge kept), as one with no report at all.
+
+§12's wake also ends with one more read: once the canary passed, every member's
 own host report is read again, observed after the canary, under the same rules
 (each member on its own host's report, a rank not resident fails the group at
 that rank, the bounded evidence window, no second collective), and those reports

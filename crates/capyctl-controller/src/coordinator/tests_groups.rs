@@ -147,6 +147,18 @@ struct HostState {
     /// spawned process alone, as a worker whose tree settled before its
     /// engine forked its rank process did. The rank process still runs.
     records_leader_only: bool,
+    /// ADR 0028 note of 2026-10-16 (found live at MN4, SGLang): this host
+    /// reports a change of its rank's memory only some time after it
+    /// happened, as a host pushing its reports on its own period does.
+    report_lag: Option<ReportLag>,
+}
+
+/// How long a host's reports lag its rank's memory, from the bytes it last
+/// saw and when they changed.
+struct ReportLag {
+    delay: Duration,
+    seen: u64,
+    changed: Option<std::time::Instant>,
 }
 
 /// The scripted agent of one member host.
@@ -190,12 +202,31 @@ impl GroupHost {
                 probe_delay: None,
                 anonymous_bytes: 0,
                 records_leader_only: false,
+                report_lag: None,
             }),
         }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HostState> {
         self.state.lock().unwrap()
+    }
+
+    /// Whether this host withholds its reports now: its rank's memory
+    /// changed less than its report lag ago.
+    fn withholds_reports(&self) -> bool {
+        let Some(rank) = self.group.rank_of(&self.name) else {
+            return false;
+        };
+        let bytes = self.group.resident_bytes(rank);
+        let mut state = self.state();
+        let Some(lag) = state.report_lag.as_mut() else {
+            return false;
+        };
+        if bytes != lag.seen {
+            lag.seen = bytes;
+            lag.changed = Some(std::time::Instant::now());
+        }
+        lag.changed.is_some_and(|at| at.elapsed() < lag.delay)
     }
 
     /// Something outside CapyCTL listens on `port` on this host.
@@ -569,9 +600,10 @@ impl GroupHost {
     /// the memory its rank's newest live process tree holds, keyed by the
     /// rank process (the newest of the tree, the one holding the device): its
     /// device memory, plus its anonymous pages ([`HostState::anonymous_bytes`])
-    /// in the sum. A disconnected host reports nothing.
+    /// in the sum. A disconnected host, or one whose report lags its rank's
+    /// last change ([`HostState::report_lag`]), reports nothing.
     fn residents(&self) -> Option<Vec<capyctl_domain::resources::ProcessResident>> {
-        if !self.group.connected(&self.name) {
+        if !self.group.connected(&self.name) || self.withholds_reports() {
             return None;
         }
         let state = self.state();
@@ -984,7 +1016,7 @@ impl crate::group_activation::GroupHosts for WorldHosts {
     ) -> crate::group_activation::HostFuture<'a, Result<(i64, i64), String>> {
         Box::pin(async move {
             let host = WorldHosts::host(self, &member.host_id).ok_or("no such host")?;
-            if !host.group.connected(&host.name) {
+            if !host.group.connected(&host.name) || host.withholds_reports() {
                 return Err("unreachable".into());
             }
             if !host
@@ -1173,6 +1205,8 @@ pub(super) struct GroupWorld {
     /// Every group this world deploys has its phases derived from an 8 GiB
     /// request (no declared `resources`), so a park measures its residue.
     derived_memory: bool,
+    /// Every host's `resource_policy.observation_ttl`, when a test sets one.
+    observation_ttl: Option<String>,
     /// Every group Launch the hosts received: its generation, and whether the
     /// instance's previous plan had fully settled when it arrived.
     witnessed: Arc<Mutex<Vec<(i64, bool)>>>,
@@ -1294,6 +1328,7 @@ impl GroupWorld {
             // Nothing relaunches unless a test asks for `reconcile`.
             recovery: "cold_restart".into(),
             derived_memory: false,
+            observation_ttl: None,
             witnessed,
             eligible,
             observations,
@@ -1463,6 +1498,25 @@ impl GroupWorld {
         self
     }
 
+    /// Every host's policy keeps an observation fresh for `ttl`.
+    pub(super) fn with_observation_ttl(mut self, ttl: Duration) -> Self {
+        self.observation_ttl = Some(format!("{}ms", ttl.as_millis()));
+        self
+    }
+
+    /// From now on `host` reports each change of its rank's memory only
+    /// `delay` after it happened ([`HostState::report_lag`]).
+    pub(super) fn lag_reports(&self, host: &str, delay: Duration) {
+        let host = self.host(host);
+        let rank = host.group.rank_of(&host.name).expect("a ranked host");
+        let seen = host.group.resident_bytes(rank);
+        host.state().report_lag = Some(ReportLag {
+            delay,
+            seen,
+            changed: None,
+        });
+    }
+
     /// A world of `hosts` whose group `name` over all of them is Ready.
     pub(super) async fn ready_group(name: &str, hosts: &[&str]) -> Self {
         Self::hosts(hosts).ready(name).await
@@ -1614,6 +1668,9 @@ impl GroupWorld {
         if !self.without_peer.contains(&host.name) {
             document["resource_policy"]["groups"] =
                 serde_json::json!({ "peer_address": host.peer.to_string() });
+        }
+        if let Some(ttl) = &self.observation_ttl {
+            document["resource_policy"]["observation_ttl"] = serde_json::json!(ttl);
         }
         document
     }
@@ -4635,6 +4692,47 @@ async fn a_wake_whose_probes_outlast_the_observation_ttl_completes() {
         assert_eq!(restores, 1, "{engine}: the head's collective, once");
         // The reference recorded at first readiness, and the wake's canary.
         assert_eq!(world.canary_probe_calls(), 2, "{engine}");
+    }
+}
+
+// T20 (ADR 0028 §12; ADR 0028 note of 2026-10-16, found live at MN4 with
+// SGLang): the two members' hosts report out of phase. Host B reports its
+// rank's change only some time after it happened, longer than the hosts'
+// observation TTL, so host A's first settling report is stale by the time
+// host B's settles. The park and the wake commit every member's report while
+// it is still fresh and complete, one collective each. Failed before the
+// change: host A's first settling report was kept and committed stale, the
+// store refused it (`evidence freshness`) and the park ended
+// `group_member_uncertain`, as live.
+#[tokio::test]
+async fn members_reporting_out_of_phase_park_and_wake_on_fresh_reports() {
+    // Host B lags longer than the TTL, both inside the evidence window.
+    let (ttl, lag) = (Duration::from_millis(700), Duration::from_millis(1_100));
+    assert!(ttl < lag && lag + Duration::from_millis(200) < MEMBER_EVIDENCE_WINDOW);
+    for engine in ["vllm", "sglang"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine(engine)
+            .with_observation_ttl(ttl)
+            .ready("g")
+            .await;
+        world.lag_reports("host-b", lag);
+        world
+            .park("g")
+            .await
+            .unwrap_or_else(|e| panic!("{engine}: the park failed: {e}"));
+        assert_eq!(world.state("g").await, "parked", "{engine}");
+        assert_eq!(
+            world.owner_bytes_on("host-b", &member_owner_id(&world.id("g"), 0, 1)),
+            world.member_parked_budget(),
+            "{engine}"
+        );
+        world
+            .wake("g")
+            .await
+            .unwrap_or_else(|e| panic!("{engine}: the wake failed: {e}"));
+        assert_eq!(world.state("g").await, "ready", "{engine}");
+        assert!(world.route_open("g"), "{engine}");
+        assert_eq!(world.group.sleep_calls(), 1, "{engine}");
     }
 }
 

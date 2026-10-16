@@ -67,6 +67,10 @@ pub const CANARY_DEADLINE: Duration = READINESS_PROBE_DEADLINE;
 pub const MEMBER_EVIDENCE_POLL: Duration = Duration::from_millis(100);
 /// Time kept back from the step's deadline to record its outcome.
 pub const EVIDENCE_MARGIN: Duration = Duration::from_millis(500);
+/// ADR 0028 note of 2026-10-16: how much younger than the observation TTL
+/// every report handed to the commit must be, for the time the commit takes
+/// to reach the store (at most half the TTL).
+pub const FRESHNESS_MARGIN: Duration = Duration::from_millis(300);
 
 /// ADR 0028 §12 (found live 2026-10-15, MN4): how long each member's own
 /// evidence is awaited once the head's collective answered, and how long
@@ -207,7 +211,8 @@ impl GroupResidencyError {
 }
 
 /// One armed group park or wake: the group, its armed members, the head's
-/// launch, the step it runs under and how its members' evidence is awaited.
+/// launch, the step it runs under, how its members' evidence is awaited and
+/// how long a report stays fresh for the step's commit.
 #[derive(Debug, Clone)]
 pub struct ResidencyTarget {
     pub group: GroupTarget,
@@ -215,6 +220,9 @@ pub struct ResidencyTarget {
     pub step_id: String,
     pub deadline_ms: i64,
     pub evidence: MemberEvidence,
+    /// The observation TTL the store checks each report against when it
+    /// commits the step (`Store::group_residency_observation_ttl`).
+    pub observation_ttl: Duration,
 }
 
 impl ResidencyTarget {
@@ -477,6 +485,16 @@ fn remaining(ctx: &GroupCtx, deadline_ms: i64) -> Duration {
 /// as it was and the group is stopped (found live 2026-10-15, MN4: a member
 /// whose evidence could not be read held the group `parking` for the whole
 /// 15-minute step).
+///
+/// ADR 0028 note of 2026-10-16 (found live at MN4, SGLang): the store commits
+/// a report only while it is younger than the step's observation TTL, and
+/// the members settle at different times (each host pushes its reports on
+/// its own period), so a member's first settling report could be stale by
+/// the time the last member settled. Every member is asked again on every
+/// round, settled ones included, and the reports are returned only when
+/// each member's latest one settles and is younger than the TTL less
+/// [`FRESHNESS_MARGIN`]. A member whose report never is both by the end of
+/// the window has said nothing fresh of its own: it is silent.
 async fn collect(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -489,6 +507,15 @@ async fn collect(
     let replied = (ctx.clock)().unwrap_or(since).max(since);
     let residue_after = replied
         .saturating_add(i64::try_from(target.evidence.sample_lag.as_millis()).unwrap_or(i64::MAX));
+    // The store's rule (`fresh`): observed no later than the commit, and no
+    // more than the TTL before it.
+    let max_age = i64::try_from(
+        target
+            .observation_ttl
+            .saturating_sub(FRESHNESS_MARGIN.min(target.observation_ttl / 2))
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
     let judged = |report: &MemberResidency, member: &ArmedMember| match kind {
         ResidencyKind::Park => report.released(member),
         ResidencyKind::Restore => report.resident(member),
@@ -496,25 +523,17 @@ async fn collect(
     let settles = |report: &MemberResidency, member: &ArmedMember| {
         judged(report, member) && (kind == ResidencyKind::Restore || report.residue.is_some())
     };
+    let accepted = |report: &MemberResidency, member: &ArmedMember, now: i64| {
+        let age = now.saturating_sub(report.observed_at_ms);
+        settles(report, member) && (0..=max_age).contains(&age)
+    };
     let bound = remaining(ctx, target.deadline_ms)
         .saturating_sub(EVIDENCE_MARGIN)
         .min(target.evidence.window);
     let until = tokio::time::Instant::now() + bound;
     let mut latest: BTreeMap<u32, MemberResidency> = BTreeMap::new();
     loop {
-        let pending: Vec<&ArmedMember> = target
-            .members
-            .iter()
-            .filter(|m| !latest.get(&m.rank).is_some_and(|r| settles(r, m)))
-            .collect();
-        if pending.is_empty() {
-            return Ok(target
-                .members
-                .iter()
-                .filter_map(|m| latest.remove(&m.rank))
-                .collect());
-        }
-        let reports = futures::future::join_all(pending.iter().map(|m| {
+        let reports = futures::future::join_all(target.members.iter().map(|m| {
             member_report(
                 ctx,
                 &target.group.deployment_id,
@@ -526,20 +545,34 @@ async fn collect(
             )
         }))
         .await;
-        for report in reports.into_iter().flatten() {
+        for mut report in reports.into_iter().flatten() {
+            match latest.get(&report.rank) {
+                // Never an older report over a newer one.
+                Some(kept) if kept.observed_at_ms > report.observed_at_ms => continue,
+                // A residue measured after the head's reply stays measured
+                // when this round's process sample could not be read.
+                Some(kept) if report.residue.is_none() => report.residue = kept.residue,
+                _ => {}
+            }
             latest.insert(report.rank, report);
         }
+        let now = (ctx.clock)().unwrap_or(i64::MAX);
         if target
             .members
             .iter()
-            .all(|m| latest.get(&m.rank).is_some_and(|r| settles(r, m)))
+            .all(|m| latest.get(&m.rank).is_some_and(|r| accepted(r, m, now)))
         {
-            continue;
+            return Ok(target
+                .members
+                .iter()
+                .filter_map(|m| latest.remove(&m.rank))
+                .collect());
         }
         if tokio::time::Instant::now() >= until {
             // Review Focus 4: a member proven still holding (or not holding)
             // its memory fails the group; otherwise the first one that said
-            // nothing of its own (no report, or no residue of its processes).
+            // nothing fresh of its own (no report, no residue of its
+            // processes, or none young enough to commit).
             let unsettled = target
                 .members
                 .iter()
@@ -555,7 +588,7 @@ async fn collect(
                     rank: target
                         .members
                         .iter()
-                        .find(|m| !latest.get(&m.rank).is_some_and(|r| settles(r, m)))
+                        .find(|m| !latest.get(&m.rank).is_some_and(|r| accepted(r, m, now)))
                         .map_or(0, |m| m.rank),
                 },
             });

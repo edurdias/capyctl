@@ -2780,6 +2780,17 @@ async fn drive_group_residency(
         .await?
         .map(|(plan, _)| plan)
         .ok_or_else(|| shared.fail("an armed group step has no plan at its generation"))?;
+    // ADR 0028 note of 2026-10-16: the TTL the step's commit applies, so the
+    // reports handed to it are still fresh by the store's own rule.
+    let step = work.step_id.clone();
+    let ttl = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .group_residency_observation_ttl(owner.session(), &step)
+                .map_err(|error| CoordinatorError::Service(error.to_string()))
+        })
+        .await?;
     let target = ResidencyTarget {
         group: crate::group_settlement::GroupTarget {
             deployment_id: work.deployment_id.clone(),
@@ -2792,6 +2803,7 @@ async fn drive_group_residency(
         step_id: work.step_id.clone(),
         deadline_ms: context.deadline_ms,
         evidence: shared.options.group_member_evidence,
+        observation_ttl: Duration::from_millis(u64::try_from(ttl).unwrap_or(0)),
     };
     let ctx = crate::group_activation::GroupCtx {
         owner: shared.owner.clone(),

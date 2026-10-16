@@ -863,4 +863,20 @@ impl crate::Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// ADR 0028 §12 (note of 2026-10-16): how long a member's report stays
+    /// fresh for [`Self::complete_group_residency`] of the armed step `id`:
+    /// the observation TTL of the host policy its commit checks every report
+    /// against, so the controller hands it only reports still that fresh.
+    pub fn group_residency_observation_ttl(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+    ) -> Result<i64, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let (p, _) = read(&tx, id)?;
+        let (_, e, _) = current_residency(&tx, s, &p)?;
+        Ok(policy(&tx, &e)?.controls.observation_ttl_ms)
+    }
 }
