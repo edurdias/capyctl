@@ -386,10 +386,10 @@ pub struct StartupStatus {
 /// The current revision's startup budget and its measurements. `None` for an
 /// unknown deployment or one whose revision does not decode.
 pub(crate) fn status(
-    conn: &rusqlite::Connection,
+    tx: &Transaction<'_>,
     deployment_id: &str,
 ) -> rusqlite::Result<Option<StartupStatus>> {
-    let row: Option<(String, i64)> = conn
+    let row: Option<(String, i64)> = tx
         .query_row(
             "SELECT e.effective_json,d.revision FROM deployments d JOIN effective_revisions e
               ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
@@ -406,17 +406,31 @@ pub(crate) fn status(
     let StartupBudget { bytes, provenance } = startup_budget(&e);
     // Owner decision 2026-10-07 (found live: an SGLang deployment showed its
     // 55.2 GiB placeholder after a 29.7 GiB peak was measured): the figure is
-    // the one admission reserves (`frozen_plan_startup`), so a measured peak
-    // on the revision's host and installation replaces the placeholder here
-    // too, else the placeholder recomputed with weights sized since the freeze.
-    let (bytes, provenance) = match frozen_startup(conn, deployment_id, revision, &e) {
-        Ok(Some(measured)) => (measured, StartupProvenance::Measured),
-        _ => match weighed_placeholder(conn, deployment_id, revision, &e) {
-            Ok(Some(estimate)) => (estimate, StartupProvenance::Default),
-            _ => (bytes, provenance),
-        },
+    // the one admission reserves (`frozen_plan_startup`): a measured peak on
+    // the revision's host and installation, else the whole managed limit for
+    // a solo first start (owner decision 2026-09-23; ADR 0015 amendment
+    // 2026-09-23), else the placeholder recomputed with weights sized since
+    // the freeze. Found live 2026-10-16: a parking vLLM deployment of 71 GiB
+    // of weights showed its 265.2 GiB eager-loader placeholder while every
+    // start of it reserved the 108 GiB managed limit.
+    let (bytes, provenance) = match frozen_plan_startup(tx, deployment_id, revision, &e) {
+        Ok(FrozenStartup {
+            bytes: Some(bytes),
+            whole_host,
+            estimated,
+        }) => (
+            bytes,
+            if whole_host {
+                StartupProvenance::WholeHost
+            } else if estimated {
+                StartupProvenance::Default
+            } else {
+                StartupProvenance::Measured
+            },
+        ),
+        _ => (bytes, provenance),
     };
-    let measured = conn
+    let measured = tx
         .prepare(
             "SELECT host_id,installation,peak_bytes,measured_at_ms FROM startup_measurements
               WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,installation",
