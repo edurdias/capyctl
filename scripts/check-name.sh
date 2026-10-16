@@ -12,6 +12,7 @@ allowed=(
   'docs/design/adr/002[01]-'
   'docs/design/adr/0022-rename-capyctl.md'
   'docs/runbooks/f2-current-status.md'
+  'docs/runbooks/archive/'
   'docs/operations/release-notes-0.1.0.md'
   'scripts/check-name.sh'
 )
