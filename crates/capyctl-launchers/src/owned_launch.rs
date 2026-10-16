@@ -402,7 +402,7 @@ mod tests {
         tool.terminate_owned(&members, Duration::from_secs(2))
             .unwrap();
         assert_eq!(tool.present(&api), Presence::Gone);
-        assert!(tool.observe_group(&api).unwrap().is_empty());
+        assert_group_empties(&tool, &api);
     }
 
     /// Spec §5: escalation is per recorded identity, not only per group. The head
@@ -435,12 +435,31 @@ mod tests {
 
         tool.terminate_owned(&members, Duration::from_millis(200))
             .unwrap();
-        assert!(tool.observe_group(&api).unwrap().is_empty());
+        assert_group_empties(&tool, &api);
     }
 
     /// Whether `pid` runs: an exited process (a zombie) does not.
     fn runs(pid: u32) -> bool {
         crate::subreaper::proc_stat(pid).is_some_and(|stat| !stat.exited())
+    }
+
+    /// After a Terminate the group's processes have exited, but a member that
+    /// was reparented to init (its leader died first) stays a zombie in the
+    /// group until init reaps it, which on a loaded machine is not immediate.
+    /// The group must empty within a bound, not at the very next scan.
+    fn assert_group_empties(tool: &DurableProcessLaunch, api: &ProcessIdentity) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = tool.observe_group(api).unwrap();
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the group never emptied: {left:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// ADR 0028 §11 (MN5 vLLM, found live): the leader of a group worker died
@@ -482,7 +501,7 @@ mod tests {
             .unwrap();
         assert!(!escalated, "a sleep ends on SIGTERM");
         assert!(!runs(worker.pid), "the unrecorded worker was terminated");
-        assert!(tool.observe_group(&api).unwrap().is_empty());
+        assert_group_empties(&tool, &api);
         assert_eq!(verify_gone(&[api.clone(), worker]), GoneProof::AllGone);
         // Nothing of the group runs any more, so the leader is reaped.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -601,7 +620,7 @@ mod tests {
 
         tool.terminate_owned(&members, Duration::from_secs(2))
             .unwrap();
-        assert!(tool.observe_group(&api).unwrap().is_empty());
+        assert_group_empties(&tool, &api);
     }
 
     /// A pid that now names a different process is never signalled.
