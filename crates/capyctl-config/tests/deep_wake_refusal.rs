@@ -99,3 +99,38 @@ fn the_gpt_oss_rule_leaves_restart_only_other_families_and_resident_parks() {
     settings.weight_restore = "resident".into();
     assert_eq!(resident.deep_wake_refusal(), None);
 }
+
+/// Nemotron 3.5 Super VL answers wrongly after vLLM 0.31.0 sleeps it and
+/// reloads its weights (live, host A, 2026-10-16, without CapyCTL): both
+/// parking tiers are refused on vLLM, recognised by `model_type` or, without
+/// one, by architecture; `restart_only` serves it, and the text-only Nemotron
+/// H family (`nemotron_h`) still parks.
+// T21 T22
+#[test]
+fn nemotron_super_vl_refuses_parking_on_vllm_only() {
+    for config in [
+        json!({"architectures": ["NemotronH_Omni_Reasoning_V3"], "model_type": "nemotron_h_omni"}),
+        json!({"architectures": ["NemotronH_Omni_Reasoning_V3"]}),
+        json!({"model_type": "nemotron_h_omni"}),
+    ] {
+        let dir = checkpoint(config.clone());
+        let deep = on(resolve("vllm", "deep"), &dir);
+        assert_eq!(
+            deep.deep_wake_refusal(),
+            Some("capability_missing:deep_park"),
+            "{config}"
+        );
+        let mut host_backed = deep.clone();
+        host_backed.residency = Residency::HostBacked;
+        assert_eq!(
+            host_backed.deep_wake_refusal(),
+            Some("capability_missing:deep_park"),
+            "{config}"
+        );
+        let restart = on(resolve("vllm", "restart_only"), &dir);
+        assert_eq!(restart.deep_wake_refusal(), None, "{config}");
+    }
+    let text =
+        checkpoint(json!({"architectures": ["NemotronHForCausalLM"], "model_type": "nemotron_h"}));
+    assert_eq!(on(resolve("vllm", "deep"), &text).deep_wake_refusal(), None);
+}
