@@ -512,11 +512,12 @@ fn check_domain_shape(
     Ok(())
 }
 
-/// Discrete GPU design §7: one GPU per model in 0.1.0. On a host with a device
+/// Discrete GPU design §7: one GPU per model on a machine. On a host with a device
 /// domain, a deployment claiming more than one device is refused before any
-/// phase is resolved. Tensor parallelism has no deployment field to ask for it:
-/// `--tensor-parallel-size` is a reserved engine argument (`engine_policy`), so a
-/// multi-rank launch cannot be declared at all.
+/// phase is resolved. Tensor parallelism on one machine has no deployment field
+/// to ask for it: `--tensor-parallel-size` is a reserved engine argument
+/// (`engine_policy`). A group's `topology` spreads ranks over machines, with one
+/// device per host (ADR 0028).
 pub(super) fn check_single_device(
     devices: &[DeviceClaim],
     host: &HostPolicy,
@@ -528,8 +529,8 @@ pub(super) fn check_single_device(
     if discrete && devices.len() > 1 {
         return Err(invalid(
             "devices",
-            "multi_gpu_unsupported: one GPU per model in 0.1.0; tensor-parallel and \
-             multi-device models are planned after 0.1.0",
+            "multi_gpu_unsupported: one GPU per model on a machine; to spread one model \
+             over machines, give it a `topology` and `placement.hosts`",
         ));
     }
     Ok(())

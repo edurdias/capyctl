@@ -10,7 +10,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.29.0"
+VERSION = "0.31.0"
 
 
 def arg(argv, name, default=None):

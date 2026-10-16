@@ -57,7 +57,7 @@ runtime_profiles:
     engine: vllm
     revision: 1
     executable: /opt/vllm/bin/vllm
-    build_fingerprint: "vllm 0.29.0"
+    build_fingerprint: "vllm 0.31.0"
     args: []
     cuda_home: /usr/local/cuda
     env: {}
@@ -73,7 +73,7 @@ runtime_profiles:
     engine: sglang
     revision: 1
     executable: /opt/sglang/bin/python3
-    build_fingerprint: "sglang 0.5.20"
+    build_fingerprint: "sglang 0.5.21"
     args: []
     env: {}
     log_policy:

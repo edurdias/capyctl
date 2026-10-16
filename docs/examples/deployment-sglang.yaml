@@ -1,4 +1,4 @@
-# Qwen3-4B on SGLang 0.5.20 on one machine (docs/guide/engines.md, "First model
+# Qwen3-4B on SGLang 0.5.21 on one machine (docs/guide/engines.md, "First model
 # on each engine"): `capyctl deploy model --file deployment-sglang.yaml`.
 # Parsed by the product: `capyctl validate config --file docs/examples/deployment-sglang.yaml`.
 name: qwen3-4b-sglang

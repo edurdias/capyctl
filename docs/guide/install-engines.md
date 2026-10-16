@@ -54,7 +54,7 @@ shown to get one CapyCTL knows.
    as a DGX Spark. vLLM, SGLang's kernels and PyTorch 2.13.0 publish wheels
    for both, and so does the PyTorch CUDA 13.0 index.
 
-## vLLM 0.30.0 or 0.29.0
+## vLLM 0.31.0, 0.30.0 or 0.29.0
 
 1. Create the environment:
 
@@ -62,14 +62,14 @@ shown to get one CapyCTL knows.
    uv venv --python 3.12 --seed --managed-python ~/venvs/vllm
    ```
 
-2. Install vLLM with PyTorch built for CUDA 13.0 (for 0.29.0, write
-   `vllm==0.29.0`):
+2. Install vLLM with PyTorch built for CUDA 13.0 (for an earlier version,
+   write `vllm==0.30.0` or `vllm==0.29.0`):
 
    ```bash
-   uv pip install --python ~/venvs/vllm/bin/python vllm==0.30.0 --torch-backend=cu130
+   uv pip install --python ~/venvs/vllm/bin/python vllm==0.31.0 --torch-backend=cu130
    ```
 
-   Both releases use PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take
+   All three releases use PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take
    PyTorch from its CUDA 13.0 index; `--torch-backend=auto` picks the index
    from your driver instead.
 
@@ -79,10 +79,10 @@ shown to get one CapyCTL knows.
    ~/venvs/vllm/bin/vllm --version
    ```
 
-   It prints the version, for example `0.30.0`.
+   It prints the version, for example `0.31.0`.
 
 vLLM's own guide:
-[GPU installation](https://docs.vllm.ai/en/v0.30.0/getting_started/installation/gpu/).
+[GPU installation](https://docs.vllm.ai/en/v0.31.0/getting_started/installation/gpu/).
 
 ## SGLang 0.5.21 or 0.5.20
 

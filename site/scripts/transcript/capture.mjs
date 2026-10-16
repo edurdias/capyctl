@@ -85,7 +85,7 @@ function fakeVllm(h, dir, version) {
   writeFileSync(join(v, 'pyvenv.cfg'), 'home = /usr/bin\n');
   mkdirSync(join(v, 'bin'), { recursive: true });
   const fake = join(v, 'lib/fake_vllm.py');
-  writeFileSync(fake, readFileSync(join(here, 'fake-vllm.py'), 'utf8').replace('VERSION = "0.29.0"', `VERSION = "${version}"`));
+  writeFileSync(fake, readFileSync(join(here, 'fake-vllm.py'), 'utf8').replace('VERSION = "0.31.0"', `VERSION = "${version}"`));
   writeFileSync(join(v, 'bin/vllm'), `#!/bin/sh\nexec /usr/bin/python3 ${fake} "$@"\n`, { mode: 0o755 });
   const probe = JSON.stringify({ schema: 'capyctl/engine-capabilities/v1', engine: 'vllm', capabilities: { core: [], deep_park: [], metrics: [] } });
   writeFileSync(join(v, 'bin/python3'), `#!/bin/sh
@@ -188,8 +188,8 @@ const curlChat = (port, model, stream = false, key = KEY) => `curl -s http://127
 
 async function oneMachine() {
   const h = makeHome('one');
-  fakeVllm(h, 'vllm', '0.29.0');
-  fakeVllm(h, 'vllm-nightly', '0.30.0rc1');
+  fakeVllm(h, 'vllm', '0.31.0');
+  fakeVllm(h, 'vllm-nightly', '0.32.0rc1');
   checkpoint(h, 'Qwen3-4B');
   checkpoint(h, 'Llama-3.1-8B');
   writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B'));
@@ -267,7 +267,7 @@ print()
   run('one', 'list after update', 'capyctl list deployments');
   run('one', 'delete my-model', 'capyctl delete deployment my-model --stop > /dev/null; echo exit $?');
   // A launch that fails: an engine whose process exits before it is ready.
-  fakeVllm(h, 'vllm-broken', '0.29.0');
+  fakeVllm(h, 'vllm-broken', '0.31.0');
   writeFileSync(join(h, 'venvs/vllm-broken/bin/python3'), readFileSync(join(h, 'venvs/vllm-broken/bin/python3'), 'utf8')
     .replace(/exec \/usr\/bin\/python3 [^\n]*"\$@";;/, 'echo "engine failed" >&2; exit 1;;'));
   run('one', 'engine add broken', 'capyctl engine add ~/venvs/vllm-broken --name vllm-broken > /dev/null; echo exit $?');
@@ -279,7 +279,7 @@ print()
 async function severalMachines() {
   const s = makeHome('server');
   const g = makeHome('gpu-box');
-  fakeVllm(g, 'vllm', '0.29.0');
+  fakeVllm(g, 'vllm', '0.31.0');
   checkpoint(g, 'Qwen3-4B');
   run('server', 'init server', 'capyctl init server --output server.yaml');
   // The server file is the one the guide shows, moved onto loopback ports

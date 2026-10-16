@@ -1,4 +1,4 @@
-# Nemotron 3.5 Lightning 30B-A3B 4-bit on TensorFold 0.6.1 on one GB10 machine
+# Nemotron 3.5 Lightning 30B-A3B 4-bit on TensorFold 0.6.6 on one GB10 machine
 # (docs/guide/engines.md, "First model on each engine"):
 # `capyctl deploy model --file deployment-tensorfold.yaml`.
 # Parsed by the product: `capyctl validate config --file docs/examples/deployment-tensorfold.yaml`.
