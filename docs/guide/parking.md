@@ -26,6 +26,16 @@ CapyCTL picks the way from your hardware:
 To choose yourself, set `residency: host_backed` (host RAM, discrete cards
 only), `residency: deep` or `residency: restart_only` in the deployment.
 
+Some models cannot be woken correctly by their engine, so CapyCTL refuses to
+park them (`capability_missing:deep_park`); declare `residency: restart_only`
+for them:
+
+- gpt-oss on vLLM and SGLang;
+- NVFP4 (ModelOpt) checkpoints on SGLang, unless SGLang keeps the weights in
+  memory (above);
+- Nemotron 3.5 Super VL on vLLM: after a park and a wake, vLLM 0.31.0 answers
+  wrongly.
+
 ## Park and wake
 
 ```bash

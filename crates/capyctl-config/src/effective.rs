@@ -646,6 +646,13 @@ pub struct DeepWakeBrokenFamily {
 /// `engine_error` after 778 s; `Harmony parser ended in a non-terminal
 /// state`). On SGLang 0.5.21 `update_weights_from_disk` raises `TypeError:
 /// default_weight_loader() got an unexpected keyword argument 'weight_name'`.
+///
+/// Nemotron 3.5 Super VL (`nemotron_h_omni`; recipe catalog, host A,
+/// 2026-10-16): on vLLM 0.31.0 every deep park's wake failed CapyCTL's wake
+/// canary (`wake_mismatch`), with and without a drafter. vLLM alone, with no
+/// CapyCTL, reproduces it: after `/sleep?level=2`, `/wake_up` and
+/// `reload_weights` the same greedy prompt that answered in prose before the
+/// sleep repeats `</think>` to the token limit.
 pub const DEEP_WAKE_BROKEN_FAMILIES: &[DeepWakeBrokenFamily] = &[
     DeepWakeBrokenFamily {
         engine: Engine::Vllm,
@@ -658,6 +665,12 @@ pub const DEEP_WAKE_BROKEN_FAMILIES: &[DeepWakeBrokenFamily] = &[
         model_types: &["gpt_oss"],
         architectures: &["GptOssForCausalLM"],
         observed_on: "SGLang 0.5.21",
+    },
+    DeepWakeBrokenFamily {
+        engine: Engine::Vllm,
+        model_types: &["nemotron_h_omni"],
+        architectures: &["NemotronH_Omni_Reasoning_V3"],
+        observed_on: "vLLM 0.31.0",
     },
 ];
 
@@ -705,7 +718,8 @@ impl EffectiveDeployment {
     ///   the declared quantization method. vLLM is not affected.
     /// - A checkpoint of a model family in [`DEEP_WAKE_BROKEN_FAMILIES`] for
     ///   the launch's engine (gpt-oss on vLLM 0.30.0 and SGLang 0.5.21,
-    ///   recipe catalog, host B, 2026-10-07). Keyed on the checkpoint's
+    ///   recipe catalog, host B, 2026-10-07; Nemotron 3.5 Super VL on vLLM
+    ///   0.31.0, host A, 2026-10-16). Keyed on the checkpoint's
     ///   `config.json`, read where this machine sees the checkpoint.
     ///
     /// Lift a rule once a probe or a live run proves the wake works on the
