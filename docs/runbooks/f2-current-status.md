@@ -5,7 +5,14 @@
 The owner published `v0.1.3` (tag on `345806a5`, marked Latest) after the
 Release build workflow (run 38822609377, Rust 1.99.0), the strict packaging
 check on x86_64 and aarch64, and a live install from the draft on host A. The
-site installer then installed 0.1.3 at that commit on host B. Next: 0.1.4.
+site installer then installed 0.1.3 at that commit on host B.
+
+Evidence loss, 2026-10-16: the local row evidence of the LC1–LC6 and MN1–MN8
+runs (`target/live/matrix/LC*/`, `MN*/` and `0.1.3-summary.md`, cited below)
+was deleted with the worktree it was written in during the post-release
+cleanup. The per-run directories remain under `~/capyctl-runs/matrix-*` on
+host A, host B and the control host; the results are as recorded in the
+entries below.
 
 ## 0.1.3 release preparation — 2026-10-15
 
