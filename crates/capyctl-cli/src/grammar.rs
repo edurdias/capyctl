@@ -189,6 +189,8 @@ pub enum Command {
         env: Vec<(String, String)>,
         /// ADR 0028 §2.1: `--approve-env GLOB`, `security.approved_env`.
         approved_env: Vec<String>,
+        /// Spec §3, ADR 0014 §8: `--allow-remote-code`, `security.trust_remote_code`.
+        allow_remote_code: bool,
     },
     /// ADR 0018 §1: this machine's runtime profiles.
     EngineList,
@@ -510,6 +512,11 @@ enum EngineArgs {
         /// (`GLOB;GLOB`), used only when no --approve-env is given.
         #[arg(long = "approve-env", value_name = "GLOB")]
         approved_env: Vec<String>,
+        /// Let deployments set engine_config.trust_remote_code: true, which
+        /// runs the Python a checkpoint ships with (vLLM and SGLang only).
+        /// Written as security.trust_remote_code.
+        #[arg(long)]
+        allow_remote_code: bool,
     },
     /// This machine's runtime profiles and whether the server accepted them.
     List,
@@ -1192,6 +1199,7 @@ impl From<CliCommand> for Command {
                     approved_paths,
                     env,
                     approved_env,
+                    allow_remote_code,
                 } => Command::EngineAdd {
                     path,
                     name,
@@ -1202,6 +1210,7 @@ impl From<CliCommand> for Command {
                     approved_paths,
                     env,
                     approved_env,
+                    allow_remote_code,
                 },
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },

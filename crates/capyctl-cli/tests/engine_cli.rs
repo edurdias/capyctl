@@ -108,7 +108,23 @@ fn add(path: &Path) -> Command {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     }
+}
+
+/// [`add`] with `--allow-remote-code` and, when given, `--name`.
+fn add_allowing_remote_code(path: &Path, profile: Option<&str>) -> Command {
+    let mut command = add(path);
+    if let Command::EngineAdd {
+        name,
+        allow_remote_code,
+        ..
+    } = &mut command
+    {
+        *name = profile.map(Into::into);
+        *allow_remote_code = true;
+    }
+    command
 }
 
 // T07 (ADR 0018 §1–§3): add writes the profile into engines.yaml beside the
@@ -160,6 +176,7 @@ async fn add_records_approved_options_and_paths() {
         approved_paths: vec!["/srv/drafters".into()],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     execute(&approving, Some(&document), dir.path())
         .await
@@ -181,6 +198,7 @@ async fn add_records_approved_options_and_paths() {
         approved_paths: vec!["drafters".into()],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     let error = execute(&relative, Some(&document), dir.path())
         .await
@@ -192,6 +210,95 @@ async fn add_records_approved_options_and_paths() {
         error.message
     );
     assert!(!engines_of(&document).profiles.contains_key("relative"));
+}
+
+/// Validates `deployment` against the golden host document with the
+/// engines.yaml `engine add` wrote beside `document` copied beside it.
+fn validate_on_registered(document: &Path, deployment: &Value) -> (i32, Value, String) {
+    let dir = private_dir();
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut host = golden["input"]["host"].clone();
+    host["state_dir"] = json!(dir.path().join("s"));
+    host["identity_dir"] = json!(dir.path().join("s/identity"));
+    let host_file = dir.path().join("host.yaml");
+    std::fs::write(&host_file, host.to_string()).unwrap();
+    std::fs::copy(engines_beside(document), engines_beside(&host_file)).unwrap();
+    let deployment_file = dir.path().join("deployment.yaml");
+    std::fs::write(&deployment_file, deployment.to_string()).unwrap();
+    let out = support::capyctl()
+        .args(["validate", "config", "--file"])
+        .arg(&deployment_file)
+        .arg("--host")
+        .arg(&host_file)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let value = serde_json::from_str(stdout.trim())
+        .or_else(|_| serde_json::from_str(stderr.trim()))
+        .unwrap_or(Value::Null);
+    (
+        out.status.code().unwrap(),
+        value,
+        format!("{stdout}{stderr}"),
+    )
+}
+
+// T37 (Spec §3, ADR 0014 §8): `--allow-remote-code` writes
+// `security.trust_remote_code: true`, so a deployment on that profile with
+// `engine_config.trust_remote_code: true` resolves; a profile added without it
+// refuses the deployment, and the refusal names the option.
+#[tokio::test]
+async fn add_allows_checkpoint_code_only_when_asked() {
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let allowing = add_allowing_remote_code(&env, Some("trusted"));
+    let out = execute(&allowing, Some(&document), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out["trust_remote_code"], true);
+    execute(&add(&env), Some(&document), dir.path())
+        .await
+        .unwrap();
+    let engines = engines_of(&document);
+    assert_eq!(
+        engines.profiles["trusted"]["security"]["trust_remote_code"],
+        true
+    );
+    assert_eq!(
+        engines.profiles["vllm"]["security"]["trust_remote_code"],
+        false
+    );
+
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut deployment = golden["input"]["deployment"].clone();
+    deployment["engine_config"]["trust_remote_code"] = json!(true);
+    deployment["runtime_profile"] = json!("trusted");
+    // Both profiles were just registered, at their first revision.
+    deployment["runtime_profile_revision"] = json!(1);
+    let (code, value, raw) = validate_on_registered(&document, &deployment);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["valid"], true, "{raw}");
+
+    deployment["runtime_profile"] = json!("vllm");
+    let (code, value, raw) = validate_on_registered(&document, &deployment);
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "invalid_config", "{raw}");
+    let message = value["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("engine_config.trust_remote_code")
+            && message.contains("--allow-remote-code"),
+        "{raw}"
+    );
 }
 
 // T03 (owner decision 2026-09-25): a name registered already, or declared in
@@ -225,6 +332,7 @@ async fn add_refuses_an_existing_name() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     assert_eq!(
         execute(&named, Some(&document), dir.path())
@@ -373,6 +481,7 @@ async fn add_disables_deep_park_when_the_probe_reports_it_missing() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     execute(&asked, Some(&document), dir.path()).await.unwrap();
     assert_eq!(
@@ -401,6 +510,7 @@ async fn add_without_a_path_needs_a_terminal() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     assert_eq!(
         execute(&command, Some(&document), dir.path())
@@ -975,12 +1085,25 @@ async fn add_registers_tensorfold_with_deep_park_disabled() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     let error = execute(&asked, Some(&document), dir.path())
         .await
         .unwrap_err();
     assert_eq!(error.code, "capability_missing");
     assert!(!engines_of(&document).profiles.contains_key("tf-deep"));
+    // ADR 0023 §4: TensorFold runs no checkpoint code, so allowing it is refused.
+    let remote = add_allowing_remote_code(&env, Some("tf-remote"));
+    let error = execute(&remote, Some(&document), dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "capability_missing");
+    assert!(
+        error.message.contains("--allow-remote-code"),
+        "{}",
+        error.message
+    );
+    assert!(!engines_of(&document).profiles.contains_key("tf-remote"));
 }
 
 // T41 T07: 0.6.1 to 0.6.3, 0.6.5 and 0.6.6 are verified beside 0.6.0; 0.6.4,
@@ -1141,8 +1264,14 @@ async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     let error = add_llamacpp(&deep, &document, &root).await.unwrap_err();
+    assert_eq!(error.code, "capability_missing", "{error:?}");
+    assert!(!marker.exists(), "refused before anything runs");
+    // ADR 0029 §5: llama.cpp runs no checkpoint code, so allowing it is refused.
+    let remote = add_allowing_remote_code(&binary, None);
+    let error = add_llamacpp(&remote, &document, &root).await.unwrap_err();
     assert_eq!(error.code, "capability_missing", "{error:?}");
     assert!(!marker.exists(), "refused before anything runs");
     let with_args = Command::EngineAdd {
@@ -1155,6 +1284,7 @@ async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
         approved_paths: vec![],
         env: vec![],
         approved_env: vec![],
+        allow_remote_code: false,
     };
     let error = add_llamacpp(&with_args, &document, &root)
         .await

@@ -42,6 +42,7 @@ fn register(document: &std::path::Path, name: &str) {
             approved_paths: vec![],
             env: Default::default(),
             approved_env: vec![],
+            trust_remote_code: false,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -573,6 +574,7 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             approved_paths: vec![],
             env: Default::default(),
             approved_env: vec![],
+            trust_remote_code: false,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

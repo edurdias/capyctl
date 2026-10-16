@@ -622,24 +622,23 @@ pub fn apply_to_host_with(
             Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args.clone(),
             Engine::Sglang => Vec::new(),
         };
-        let mut profile =
-            crate::registration::profile_document(&crate::registration::ProfileSpec {
-                engine,
-                executable,
-                build_fingerprint,
-                // ADR 0023 §6, ADR 0029 §2: TensorFold and llama.cpp never park,
-                // whatever local_engine.deep_park says.
-                deep_park: settings.deep_park
-                    && !matches!(engine, Engine::Tensorfold | Engine::Llamacpp),
-                installation_drift: settings.installation_drift,
-                args,
-                cuda_home: settings.cuda_home.clone(),
-                approved_options: Vec::new(),
-                approved_paths: Vec::new(),
-                env: Default::default(),
-                approved_env: Vec::new(),
-            });
-        profile["security"]["trust_remote_code"] = json!(settings.trust_remote_code);
+        let profile = crate::registration::profile_document(&crate::registration::ProfileSpec {
+            engine,
+            executable,
+            build_fingerprint,
+            // ADR 0023 §6, ADR 0029 §2: TensorFold and llama.cpp never park,
+            // whatever local_engine.deep_park says.
+            deep_park: settings.deep_park
+                && !matches!(engine, Engine::Tensorfold | Engine::Llamacpp),
+            installation_drift: settings.installation_drift,
+            args,
+            cuda_home: settings.cuda_home.clone(),
+            approved_options: Vec::new(),
+            approved_paths: Vec::new(),
+            env: Default::default(),
+            approved_env: Vec::new(),
+            trust_remote_code: settings.trust_remote_code,
+        });
         crate::registration::check_profile(name, &profile)?;
         profiles.insert(name.to_owned(), profile);
     }

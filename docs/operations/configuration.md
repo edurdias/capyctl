@@ -184,7 +184,7 @@ block.
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
 | Deep parking | `local_engine.deep_park: on\|off` | `--deep-park on\|off` | `CAPYCTL_DEEP_PARK` | `on` | host, standalone |
-| Run checkpoint-supplied Python (`trust_remote_code`) | `local_engine.trust_remote_code` | `--trust-remote-code true\|false` | `CAPYCTL_TRUST_REMOTE_CODE` (`1` or `true`) | `false` | host, standalone |
+| Run checkpoint-supplied Python (`trust_remote_code`) in the role's own engine (an `engine add` profile takes `--allow-remote-code`) | `local_engine.trust_remote_code` | `--trust-remote-code true\|false` | `CAPYCTL_TRUST_REMOTE_CODE` (`1` or `true`) | `false` | host, standalone |
 | When the installation's files change | `local_engine.installation_drift: warn\|refuse` | `--installation-drift warn\|refuse` | `CAPYCTL_INSTALLATION_DRIFT` | `warn` | host, standalone |
 | CapyCTL's runtime directory | `runtime_dir` | `--runtime-dir <dir>` | `CAPYCTL_RUNTIME_DIR` | the managed copy in `<state dir>/runtime` | host, standalone |
 | Engine port range (loopback) | `resource_policy.endpoint_port_range` (`start`, `end`) | `--engine-ports <start-end>` | `CAPYCTL_ENGINE_PORTS` (`CAPYCTL_STANDALONE_ENGINE_PORTS` still read, with a warning) | `8100-8199` | host, standalone |
@@ -325,7 +325,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
 | Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
-| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`; they write `engines.yaml`, which a host and standalone read alike) |
+| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`, `--allow-remote-code`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
 

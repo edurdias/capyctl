@@ -468,6 +468,10 @@ pub struct ProfileSpec {
     /// ADR 0028 §2.1: the names and globs deployments may set
     /// (`--approve-env`), written as `security.approved_env`.
     pub approved_env: Vec<String>,
+    /// Spec §3, ADR 0014 §8: whether deployments may set
+    /// `engine_config.trust_remote_code: true` and run the Python a checkpoint
+    /// ships (`--allow-remote-code`), written as `security.trust_remote_code`.
+    pub trust_remote_code: bool,
 }
 
 /// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
@@ -526,7 +530,7 @@ pub fn detect_cuda_home_in(
 pub fn profile_document(spec: &ProfileSpec) -> Value {
     let mut security = serde_json::json!({
         "deep_park": if spec.deep_park { "enabled" } else { "disabled" },
-        "trust_remote_code": false,
+        "trust_remote_code": spec.trust_remote_code,
         "credential_ref": "secret://engine-key",
         "admin_credential_ref": "secret://admin-key",
     });

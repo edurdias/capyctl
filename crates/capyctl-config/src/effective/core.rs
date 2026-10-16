@@ -104,7 +104,8 @@ pub(super) fn normalize_profile(
         return Err(invalid(
             "runtime_profiles.security.trust_remote_code",
             "`--trust-remote-code` executes code shipped with the checkpoint; it \
-             requires security.trust_remote_code: true on this profile",
+             requires security.trust_remote_code: true on this profile (`capyctl \
+             engine add --allow-remote-code`)",
         ));
     }
     // ADR 0023 §6, SPEC §9.3: TensorFold has no park path whatever its
