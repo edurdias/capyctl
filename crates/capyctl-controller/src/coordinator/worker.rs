@@ -2780,6 +2780,17 @@ async fn drive_group_residency(
         .await?
         .map(|(plan, _)| plan)
         .ok_or_else(|| shared.fail("an armed group step has no plan at its generation"))?;
+    // ADR 0028 note of 2026-10-16: the TTL the step's commit applies, so the
+    // reports handed to it are still fresh by the store's own rule.
+    let step = work.step_id.clone();
+    let ttl = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .group_residency_observation_ttl(owner.session(), &step)
+                .map_err(|error| CoordinatorError::Service(error.to_string()))
+        })
+        .await?;
     let target = ResidencyTarget {
         group: crate::group_settlement::GroupTarget {
             deployment_id: work.deployment_id.clone(),
@@ -2792,6 +2803,7 @@ async fn drive_group_residency(
         step_id: work.step_id.clone(),
         deadline_ms: context.deadline_ms,
         evidence: shared.options.group_member_evidence,
+        observation_ttl: Duration::from_millis(u64::try_from(ttl).unwrap_or(0)),
     };
     let ctx = crate::group_activation::GroupCtx {
         owner: shared.owner.clone(),
@@ -2845,7 +2857,7 @@ async fn drive_group_residency(
                                 "the head's collective, then every member's own host's residency report"
                             }
                             ResidencyKind::Restore => {
-                                "the head's collective, every member's own host's residency report, the head's readiness probe and the canary"
+                                "the head's collective, the head's readiness probe and the canary, then every member's own host's residency report observed after them"
                             }
                         },
                         now,
@@ -3196,7 +3208,7 @@ async fn execute_residency(
                     )
                 })
             } else {
-                CanaryCheck::Passed
+                CanaryCheck::Passed(None)
             };
             match canary {
                 CanaryCheck::Unanswered(reason) => Some((WAKE_UNCERTAIN, reason)),
@@ -3206,27 +3218,32 @@ async fn execute_residency(
                      readiness"
                         .to_owned(),
                 )),
-                CanaryCheck::Passed => {
-                    let step = step.clone();
-                    let completed = shared
-                        .read(move |owner, now| {
-                            owner.store().complete_residency(
-                                owner.session(),
-                                &step,
-                                &observation,
-                                now,
-                            )
-                        })
-                        .await;
-                    match completed {
-                        Ok(()) => None,
-                        Err(error) if !shared.accepting.load(Ordering::Acquire) => {
-                            return Err(error)
+                CanaryCheck::Passed(answered) => {
+                    match after_canary(driver, observation, answered) {
+                        Err(reason) => Some((WAKE_UNCERTAIN, reason)),
+                        Ok(observation) => {
+                            let step = step.clone();
+                            let completed = shared
+                                .read(move |owner, now| {
+                                    owner.store().complete_residency(
+                                        owner.session(),
+                                        &step,
+                                        &observation,
+                                        now,
+                                    )
+                                })
+                                .await;
+                            match completed {
+                                Ok(()) => None,
+                                Err(error) if !shared.accepting.load(Ordering::Acquire) => {
+                                    return Err(error)
+                                }
+                                Err(error) => Some((
+                                    WAKE_UNCERTAIN,
+                                    format!("its evidence was not accepted: {error}"),
+                                )),
+                            }
                         }
-                        Err(error) => Some((
-                            WAKE_UNCERTAIN,
-                            format!("its evidence was not accepted: {error}"),
-                        )),
                     }
                 }
             }
@@ -3283,14 +3300,36 @@ async fn execute_residency(
 
 /// Owner decision 2026-10-09: what a wake's canary proved.
 enum CanaryCheck {
-    /// It matched the launch's reference, recorded one, or the engine has no
-    /// canary (TensorFold, an older host).
-    Passed,
+    /// It matched the launch's reference or recorded one, its answer observed
+    /// at the time it carries; or the engine has no canary (TensorFold, an
+    /// older host), `None`.
+    Passed(Option<i64>),
     /// The probe was not answered, or the reference could not be read: the
     /// wake's outcome is unknown, as after a failed fresh probe.
     Unanswered(String),
     /// The model answered differently than at its first readiness.
     Differs,
+}
+
+/// ADR 0028 note of 2026-10-16: what a wake commits once its canary passed.
+/// The store accepts evidence only within the host's observation TTL and a
+/// canary can outlast it, so the restore's own evidence, observed before the
+/// canary, would be stale by the commit (the cause of the 2026-10-15 MN4
+/// group wake failure, and the same order here). The wake commits it as
+/// observed with the canary's answer (`answered`): the canary ran on the
+/// launch's own key, a remote host's answer names the launch's engine alive
+/// ([`crate::remote_execution`]), and an embedded engine's processes are
+/// checked alive here. An engine without a canary keeps the restore's own.
+fn after_canary(
+    driver: &Driver,
+    mut observation: capyctl_domain::completion::EffectObservation,
+    answered: Option<i64>,
+) -> Result<capyctl_domain::completion::EffectObservation, String> {
+    if let Some(observed_at_ms) = answered {
+        engine_processes_alive(driver, &mut observation.identities)?;
+        observation.observed_at_ms = observed_at_ms;
+    }
+    Ok(observation)
 }
 
 fn service(error: impl std::fmt::Display) -> CoordinatorError {
@@ -3317,7 +3356,7 @@ async fn record_wake_canary(
     )
     .await
     {
-        store_wake_canary(shared, instance, context, &answer).await;
+        store_wake_canary(shared, instance, context, &answer.answer).await;
     }
 }
 
@@ -3371,7 +3410,7 @@ async fn wake_canary_check(
         .await
     {
         Ok(answer) => answer,
-        Err(RuntimeError::Unsupported) => return CanaryCheck::Passed,
+        Err(RuntimeError::Unsupported) => return CanaryCheck::Passed(None),
         Err(error) => {
             return CanaryCheck::Unanswered(format!("the wake canary was not answered: {error}"))
         }
@@ -3398,14 +3437,14 @@ async fn wake_canary_check(
             ))
         }
     };
-    match verdict(stored.as_ref(), &answer) {
-        Verdict::Matches => CanaryCheck::Passed,
+    match verdict(stored.as_ref(), &answer.answer) {
+        Verdict::Matches => CanaryCheck::Passed(Some(answer.observed_at_ms)),
         Verdict::Differs => CanaryCheck::Differs,
         // The first readiness recorded none: this wake's answer becomes the
         // reference, as at first readiness (ADR 0028 §12's rule for groups).
         Verdict::Unreferenced => {
-            store_wake_canary(shared, work.instance, context, &answer).await;
-            CanaryCheck::Passed
+            store_wake_canary(shared, work.instance, context, &answer.answer).await;
+            CanaryCheck::Passed(Some(answer.observed_at_ms))
         }
     }
 }
@@ -3554,26 +3593,36 @@ async fn residency_effect(
         }
         observation.token = context.token.clone();
     }
-    if driver.tools.is_some() {
-        // ADR 0027: the engine's own processes; a helper may have exited, and
-        // the evidence then names only what is alive.
-        observation.identities.retain(|identity| {
-            !identity.is_helper()
-                || capyctl_launchers::process_absence::presence(identity)
-                    == capyctl_domain::completion::Presence::Alive
-        });
-        for identity in &observation.identities {
-            if capyctl_launchers::process_absence::presence(identity)
-                != capyctl_domain::completion::Presence::Alive
-            {
-                return Err(RuntimeError::Uncertain(format!(
-                    "recorded {} process {} is not the one alive",
-                    identity.role, identity.pid
-                )));
-            }
-        }
-    }
+    engine_processes_alive(driver, &mut observation.identities).map_err(RuntimeError::Uncertain)?;
     Ok(observation)
+}
+
+/// SPEC §13.2: an embedded engine's evidence still names every recorded
+/// engine process, each the one alive; ADR 0027: a helper may have exited,
+/// and the evidence then names only what is alive. A remote host's evidence
+/// is its own, unchanged here.
+fn engine_processes_alive(
+    driver: &Driver,
+    identities: &mut Vec<capyctl_domain::completion::ProcessIdentity>,
+) -> Result<(), String> {
+    if driver.tools.is_none() {
+        return Ok(());
+    }
+    identities.retain(|identity| {
+        !identity.is_helper()
+            || capyctl_launchers::process_absence::presence(identity)
+                == capyctl_domain::completion::Presence::Alive
+    });
+    match identities.iter().find(|identity| {
+        capyctl_launchers::process_absence::presence(identity)
+            != capyctl_domain::completion::Presence::Alive
+    }) {
+        Some(identity) => Err(format!(
+            "recorded {} process {} is not the one alive",
+            identity.role, identity.pid
+        )),
+        None => Ok(()),
+    }
 }
 
 /// SPEC §6.5 (W5): advance open preinitializes and, at most once a second,

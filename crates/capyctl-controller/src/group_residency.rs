@@ -25,19 +25,21 @@
 //!   own host must report it resident again; the head must pass the 1-token
 //!   readiness probe; and the canary (an 8-token completion through the head
 //!   at temperature 0) must match the reference recorded at the plan's first
-//!   readiness, judged by [`canary_matches`] alone.
+//!   readiness, judged by [`canary_matches`] alone. The wake then commits
+//!   each member's own report observed after the canary passed (ADR 0028
+//!   note of 2026-10-16), never one observed before its probes.
 //!
 //! The collective is never repeated. Found live 2026-10-15 (MN4): the head's
 //! collective returns once every rank released, so each member's evidence is
-//! awaited for a bounded window after the head's reply
-//! ([`MemberEvidence::window`]), never for the rest of the step's deadline. A
-//! member that reports nothing of its own by then keeps its full charge and
-//! is `uncertain` (`group_member_uncertain`); a member still resident after a
-//! park, not resident after a wake, a head that fails its readiness, or a
-//! canary that differs (`group_member_failed`, `group_wake_mismatch`) fails
-//! the group. Either stops the group, each member released only on its own
-//! host's evidence (ADR 0028 §11). CPU and fake-engine tests only cover this;
-//! the live rows MN1–MN9 qualify it.
+//! awaited for a bounded window after the head's reply, and for a wake again
+//! after its canary ([`MemberEvidence::window`]), never for the rest of the
+//! step's deadline. A member that reports nothing of its own by then keeps
+//! its full charge and is `uncertain` (`group_member_uncertain`); a member
+//! still resident after a park, not resident after a wake, a head that fails
+//! its readiness, or a canary that differs (`group_member_failed`,
+//! `group_wake_mismatch`) fails the group. Either stops the group, each
+//! member released only on its own host's evidence (ADR 0028 §11). CPU and
+//! fake-engine tests only cover this; the live rows MN1–MN9 qualify it.
 use crate::group_activation::{
     probe_head, GroupCtx, HeadEvidence, HeadLaunch, READINESS_PROBE_DEADLINE,
     READINESS_PROBE_TOKENS,
@@ -65,16 +67,21 @@ pub const CANARY_DEADLINE: Duration = READINESS_PROBE_DEADLINE;
 pub const MEMBER_EVIDENCE_POLL: Duration = Duration::from_millis(100);
 /// Time kept back from the step's deadline to record its outcome.
 pub const EVIDENCE_MARGIN: Duration = Duration::from_millis(500);
+/// ADR 0028 note of 2026-10-16: how much younger than the observation TTL
+/// every report handed to the commit must be, for the time the commit takes
+/// to reach the store (at most half the TTL).
+pub const FRESHNESS_MARGIN: Duration = Duration::from_millis(300);
 
 /// ADR 0028 §12 (found live 2026-10-15, MN4): how long each member's own
 /// evidence is awaited once the head's collective answered, and how long
 /// after that answer a host's process sample is certainly newer than it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemberEvidence {
-    /// From the head's reply. The collective returns only once every rank
-    /// acted, and every member host reports its processes every 2 s and its
-    /// saver maps every 2 s (reads bounded at 6 s): a member that says
-    /// nothing of its own for this long will not, and is uncertain.
+    /// From the head's reply, and for the reports a wake commits from its
+    /// canary. The collective returns only once every rank acted, and every
+    /// member host reports its processes every 2 s and its saver maps every
+    /// 2 s (reads bounded at 6 s): a member that says nothing of its own for
+    /// this long will not, and is uncertain.
     pub window: Duration,
     /// A host's `process_residency` sample is up to its `MAX_AGE` (5 s) old
     /// when reported, and its `nvidia-smi` read up to `BOUND` (3 s) long, so a
@@ -204,7 +211,8 @@ impl GroupResidencyError {
 }
 
 /// One armed group park or wake: the group, its armed members, the head's
-/// launch, the step it runs under and how its members' evidence is awaited.
+/// launch, the step it runs under, how its members' evidence is awaited and
+/// how long a report stays fresh for the step's commit.
 #[derive(Debug, Clone)]
 pub struct ResidencyTarget {
     pub group: GroupTarget,
@@ -212,6 +220,9 @@ pub struct ResidencyTarget {
     pub step_id: String,
     pub deadline_ms: i64,
     pub evidence: MemberEvidence,
+    /// The observation TTL the store checks each report against when it
+    /// commits the step (`Store::group_residency_observation_ttl`).
+    pub observation_ttl: Duration,
 }
 
 impl ResidencyTarget {
@@ -260,6 +271,7 @@ pub async fn park_group(
 /// head must pass its readiness probe; and the canary must match the
 /// reference recorded at first readiness. With no reference recorded (its
 /// recording failed at first readiness) this wake records one and passes.
+/// Returns each member's own report observed after the canary passed.
 pub async fn wake_group(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -275,7 +287,9 @@ pub async fn wake_group(
     // activation (`group_model_path_mismatch`, `check_member_paths`).
     let reply = head_residency(ctx, target, ResidencyKind::Restore).await?;
     expect(&reply, ResidencyKind::Restore)?;
-    let reports = collect(ctx, target, ResidencyKind::Restore, since).await?;
+    // Every member resident on its own host's report before the head is
+    // probed: a rank still asleep fails the group at that rank.
+    collect(ctx, target, ResidencyKind::Restore, since).await?;
     let head = target.head()?;
     probe_head(ctx, &head, READINESS_PROBE_TOKENS, READINESS_PROBE_DEADLINE)
         .await
@@ -291,16 +305,22 @@ pub async fn wake_group(
         })?;
     match canary_reference(ctx, &target.group) {
         Some(reference) if !canary_matches(&reference, &observed) => {
-            Err(GroupResidencyError::CanaryMismatch)
+            return Err(GroupResidencyError::CanaryMismatch)
         }
-        Some(_) => Ok(reports),
-        None => {
-            // The first readiness recorded none: this wake's output becomes
-            // the reference, as at first readiness.
-            store_canary(ctx, &target.group, observed);
-            Ok(reports)
-        }
+        Some(_) => {}
+        // The first readiness recorded none: this wake's output becomes the
+        // reference, as at first readiness.
+        None => store_canary(ctx, &target.group, observed),
     }
+    // ADR 0028 note of 2026-10-16 (found live 2026-10-15, MN4): the store
+    // commits reports observed within each host's observation TTL (2 s by
+    // default), and the probes can outlast it (an SGLang head right after
+    // reloading its weights), so the reports read before them were stale at
+    // the commit and the wake ended uncertain. The wake commits each
+    // member's own report observed after its canary passed, under the same
+    // rules and window as the first.
+    let since = (ctx.clock)().unwrap_or_default();
+    collect(ctx, target, ResidencyKind::Restore, since).await
 }
 
 /// ADR 0028 §12 (decided 2026-10-06): record the canary's reference at the
@@ -453,10 +473,11 @@ fn remaining(ctx: &GroupCtx, deadline_ms: i64) -> Duration {
     Duration::from_millis(u64::try_from(deadline_ms.saturating_sub(now)).unwrap_or(0))
 }
 
-/// ADR 0028 §12 (R12): every member's own host's report, asked again until
-/// each one settles the transition or the evidence window after the head's
-/// reply ([`MemberEvidence::window`], within the step's deadline less the time
-/// to record it) passes. A park needs every member at or below its parked
+/// ADR 0028 §12 (R12): every member's own host's report observed at or after
+/// `since`, asked again until each one settles the transition or the evidence
+/// window (from the head's reply, or from a wake's canary;
+/// [`MemberEvidence::window`], within the step's deadline less the time to
+/// record it) passes. A park needs every member at or below its parked
 /// budget and the residue its processes hold, sampled after the head's
 /// reply; a wake every member above its parked budget. When the window ends,
 /// a member that reported but is still resident (or not resident) fails the
@@ -464,6 +485,16 @@ fn remaining(ctx: &GroupCtx, deadline_ms: i64) -> Duration {
 /// as it was and the group is stopped (found live 2026-10-15, MN4: a member
 /// whose evidence could not be read held the group `parking` for the whole
 /// 15-minute step).
+///
+/// ADR 0028 note of 2026-10-16 (found live at MN4, SGLang): the store commits
+/// a report only while it is younger than the step's observation TTL, and
+/// the members settle at different times (each host pushes its reports on
+/// its own period), so a member's first settling report could be stale by
+/// the time the last member settled. Every member is asked again on every
+/// round, settled ones included, and the reports are returned only when
+/// each member's latest one settles and is younger than the TTL less
+/// [`FRESHNESS_MARGIN`]. A member whose report never is both by the end of
+/// the window has said nothing fresh of its own: it is silent.
 async fn collect(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -476,6 +507,15 @@ async fn collect(
     let replied = (ctx.clock)().unwrap_or(since).max(since);
     let residue_after = replied
         .saturating_add(i64::try_from(target.evidence.sample_lag.as_millis()).unwrap_or(i64::MAX));
+    // The store's rule (`fresh`): observed no later than the commit, and no
+    // more than the TTL before it.
+    let max_age = i64::try_from(
+        target
+            .observation_ttl
+            .saturating_sub(FRESHNESS_MARGIN.min(target.observation_ttl / 2))
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
     let judged = |report: &MemberResidency, member: &ArmedMember| match kind {
         ResidencyKind::Park => report.released(member),
         ResidencyKind::Restore => report.resident(member),
@@ -483,25 +523,17 @@ async fn collect(
     let settles = |report: &MemberResidency, member: &ArmedMember| {
         judged(report, member) && (kind == ResidencyKind::Restore || report.residue.is_some())
     };
+    let accepted = |report: &MemberResidency, member: &ArmedMember, now: i64| {
+        let age = now.saturating_sub(report.observed_at_ms);
+        settles(report, member) && (0..=max_age).contains(&age)
+    };
     let bound = remaining(ctx, target.deadline_ms)
         .saturating_sub(EVIDENCE_MARGIN)
         .min(target.evidence.window);
     let until = tokio::time::Instant::now() + bound;
     let mut latest: BTreeMap<u32, MemberResidency> = BTreeMap::new();
     loop {
-        let pending: Vec<&ArmedMember> = target
-            .members
-            .iter()
-            .filter(|m| !latest.get(&m.rank).is_some_and(|r| settles(r, m)))
-            .collect();
-        if pending.is_empty() {
-            return Ok(target
-                .members
-                .iter()
-                .filter_map(|m| latest.remove(&m.rank))
-                .collect());
-        }
-        let reports = futures::future::join_all(pending.iter().map(|m| {
+        let reports = futures::future::join_all(target.members.iter().map(|m| {
             member_report(
                 ctx,
                 &target.group.deployment_id,
@@ -513,20 +545,34 @@ async fn collect(
             )
         }))
         .await;
-        for report in reports.into_iter().flatten() {
+        for mut report in reports.into_iter().flatten() {
+            match latest.get(&report.rank) {
+                // Never an older report over a newer one.
+                Some(kept) if kept.observed_at_ms > report.observed_at_ms => continue,
+                // A residue measured after the head's reply stays measured
+                // when this round's process sample could not be read.
+                Some(kept) if report.residue.is_none() => report.residue = kept.residue,
+                _ => {}
+            }
             latest.insert(report.rank, report);
         }
+        let now = (ctx.clock)().unwrap_or(i64::MAX);
         if target
             .members
             .iter()
-            .all(|m| latest.get(&m.rank).is_some_and(|r| settles(r, m)))
+            .all(|m| latest.get(&m.rank).is_some_and(|r| accepted(r, m, now)))
         {
-            continue;
+            return Ok(target
+                .members
+                .iter()
+                .filter_map(|m| latest.remove(&m.rank))
+                .collect());
         }
         if tokio::time::Instant::now() >= until {
             // Review Focus 4: a member proven still holding (or not holding)
             // its memory fails the group; otherwise the first one that said
-            // nothing of its own (no report, or no residue of its processes).
+            // nothing fresh of its own (no report, no residue of its
+            // processes, or none young enough to commit).
             let unsettled = target
                 .members
                 .iter()
@@ -542,7 +588,7 @@ async fn collect(
                     rank: target
                         .members
                         .iter()
-                        .find(|m| !latest.get(&m.rank).is_some_and(|r| settles(r, m)))
+                        .find(|m| !latest.get(&m.rank).is_some_and(|r| accepted(r, m, now)))
                         .map_or(0, |m| m.rank),
                 },
             });

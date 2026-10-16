@@ -129,7 +129,7 @@ fn world_size_one_keeps_single_host_rules() {
 }
 
 // T03, T22: engine shape support: TensorFold is TP 2 on 2 hosts and restart-only;
-// vLLM and SGLang take PP and deep park.
+// vLLM and SGLang take PP and deep park (ADR 0028 note of 2026-10-16).
 #[test]
 fn engine_shape_support() {
     let shape = |tp, pp, hosts: &[&str]| {
@@ -143,22 +143,20 @@ fn engine_shape_support() {
     };
     let two = shape(2, 1, &["a", "b"]);
     let pp4 = shape(2, 2, &["a", "b", "c", "d"]);
-    assert!(check_engine_shape("vllm", &two, "deep").is_ok());
-    assert!(check_engine_shape("vllm", &pp4, "deep").is_ok());
-    // ADR 0028 note of 2026-10-15: an SGLang group runs, but only restart_only.
-    assert!(check_engine_shape("sglang", &two, "restart_only").is_ok());
-    assert!(check_engine_shape("sglang", &pp4, "restart_only").is_ok());
-    for tier in ["deep", "host_backed"] {
-        let err = check_engine_shape("sglang", &two, tier).unwrap_err();
-        assert!(err.to_string().contains("capability_missing:deep_park"));
+    for engine in ["vllm", "sglang"] {
+        assert!(check_engine_shape(engine, &two, "deep").is_ok());
+        assert!(check_engine_shape(engine, &pp4, "deep").is_ok());
     }
     assert!(check_engine_shape("tensorfold", &two, "restart_only").is_ok());
     let err = check_engine_shape("tensorfold", &pp4, "restart_only").unwrap_err();
     assert!(err
         .to_string()
         .contains("group_shape_unsupported:tensorfold"));
-    let err = check_engine_shape("tensorfold", &two, "deep").unwrap_err();
-    assert!(err.to_string().contains("capability_missing:deep_park"));
+    // Both parking tiers wake the engine, so a group that cannot park refuses both.
+    for tier in ["deep", "host_backed"] {
+        let err = check_engine_shape("tensorfold", &two, tier).unwrap_err();
+        assert!(err.to_string().contains("capability_missing:deep_park"));
+    }
     assert!(group_support("sglang").unwrap().worker_listens);
     assert!(!group_support("vllm").unwrap().worker_listens);
 }
@@ -206,39 +204,31 @@ fn tensorfold_group_resolves_restart_only_and_refuses_deep() {
     );
 }
 
-// T03, T22: a vLLM TP2 group resolves with its default residency, which
-// parks (ADR 0028 note of 2026-10-15 leaves vLLM groups unchanged).
+// T03, T22: a vLLM or SGLang TP2 group resolves with its default residency,
+// which parks (ADR 0028 note of 2026-10-16: SGLang groups park again), and
+// takes a stated `deep` or `restart_only`.
 #[test]
-fn vllm_group_resolves_with_default_residency() {
+fn vllm_and_sglang_groups_resolve_deep_by_default() {
     use capyctl_config::effective::{resolve_effective, Residency};
-    let (mut deployment, host) = group_fixture("vllm");
-    assert_eq!(
-        resolve_effective(&deployment, &host).unwrap().residency,
-        Residency::Deep
-    );
-    deployment["residency"] = "deep".into();
-    resolve_effective(&deployment, &host).unwrap();
-}
-
-// T03, T22 (ADR 0028 note of 2026-10-15, MN4): an SGLang group resolves
-// restart_only when it states no residency, and refuses `deep` and
-// `host_backed` with capability_missing:deep_park and the restart_only hint.
-#[test]
-fn sglang_group_resolves_restart_only_and_refuses_parking() {
-    use capyctl_config::effective::{resolve_effective, Residency};
-    let (mut deployment, host) = group_fixture("sglang");
-    let resolved = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(resolved.residency, Residency::RestartOnly);
-    for tier in ["deep", "host_backed"] {
-        deployment["residency"] = tier.into();
-        let err = resolve_effective(&deployment, &host)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("capability_missing:deep_park"), "{err}");
-        assert!(err.contains("restart_only"), "{err}");
+    for engine in ["vllm", "sglang"] {
+        let (mut deployment, host) = group_fixture(engine);
+        assert_eq!(
+            resolve_effective(&deployment, &host).unwrap().residency,
+            Residency::Deep,
+            "{engine}"
+        );
+        for (stated, resolved) in [
+            ("deep", Residency::Deep),
+            ("restart_only", Residency::RestartOnly),
+        ] {
+            deployment["residency"] = stated.into();
+            assert_eq!(
+                resolve_effective(&deployment, &host).unwrap().residency,
+                resolved,
+                "{engine} {stated}"
+            );
+        }
     }
-    deployment["residency"] = "restart_only".into();
-    resolve_effective(&deployment, &host).unwrap();
 }
 
 // T03, T22: a single-host SGLang deployment keeps its parking default.

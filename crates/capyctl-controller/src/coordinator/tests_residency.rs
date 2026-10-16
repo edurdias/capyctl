@@ -42,6 +42,8 @@ struct Residency {
     canary: Mutex<Option<ProbeAnswer>>,
     /// The wake canary is asked but never answered.
     canary_hangs: std::sync::atomic::AtomicBool,
+    /// How long (test clock, ms) the engine takes to answer the wake canary.
+    canary_takes: AtomicI64,
     /// (incarnation, generation) of every wake canary asked.
     canaries: Mutex<Vec<(String, i64)>>,
 }
@@ -62,6 +64,7 @@ impl Residency {
             residents: Mutex::new(vec![]),
             canary: Mutex::new(None),
             canary_hangs: std::sync::atomic::AtomicBool::new(false),
+            canary_takes: AtomicI64::new(0),
             canaries: Mutex::new(vec![]),
         })
     }
@@ -174,7 +177,7 @@ impl EngineAdapter for Residency {
         context: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         _: Duration,
-    ) -> Result<ProbeAnswer, RuntimeError> {
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
         assert_eq!(max_tokens, crate::wake_canary::CANARY_TOKENS);
         self.canaries
             .lock()
@@ -183,11 +186,19 @@ impl EngineAdapter for Residency {
         if self.canary_hangs.load(Ordering::SeqCst) {
             return std::future::pending().await;
         }
-        self.canary
+        // The answer comes `canary_takes` later, and is observed then.
+        let takes = self.canary_takes.load(Ordering::SeqCst);
+        let observed_at_ms = self.clock.fetch_add(takes, Ordering::SeqCst) + takes;
+        let answer = self
+            .canary
             .lock()
             .unwrap()
             .clone()
-            .ok_or(RuntimeError::Unsupported)
+            .ok_or(RuntimeError::Unsupported)?;
+        Ok(capyctl_adapters::completion_probe::CanaryAnswer {
+            answer,
+            observed_at_ms,
+        })
     }
 }
 
@@ -1118,6 +1129,63 @@ async fn a_new_launch_records_a_new_reference() {
     let wake = park_and_wake(&w, &dir, &next).await;
     until("woken", || operation(&owner, &wake).0 == "succeeded").await;
     w.shutdown().await.unwrap();
+}
+
+// T20 (owner decision 2026-10-09; ADR 0028 note of 2026-10-16): a wake whose
+// canary is answered only after the host's observation TTL has passed since
+// the restore's evidence completes and serves, on evidence observed with the
+// canary's answer, for a remote (compound) and a stepwise restore alike.
+// Failed before the change: the restore's own evidence, observed before the
+// canary, was committed after it, stale; the store refused it and the wake
+// ended `wake_uncertain` and stopped the instance.
+#[tokio::test]
+async fn a_wake_whose_canary_outlasts_the_observation_ttl_completes() {
+    for compound in [true, false] {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::new(compound, clock.clone());
+        engine.generates(&[1, 2, 3]);
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        ready(&w, &fence).await;
+        // The fixture's own host, `lab`.
+        let ttl = {
+            let o = owner.lock().unwrap();
+            o.store()
+                .resource_policy("lab")
+                .unwrap()
+                .expect("the host's policy")
+                .controls
+                .observation_ttl_ms
+        };
+        engine.canary_takes.store(ttl + 1_000, Ordering::SeqCst);
+        for _ in 0..2 {
+            let wake = park_and_wake(&w, &dir, &fence).await;
+            until("the wake concluded", || {
+                operation(&owner, &wake).0 == "succeeded"
+                    || last_error(&dir, &fence.deployment_id).is_some()
+            })
+            .await;
+            assert_eq!(
+                last_error(&dir, &fence.deployment_id),
+                None,
+                "compound {compound}"
+            );
+            until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+            let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+            assert_eq!(
+                (state.as_str(), open),
+                ("ready", true),
+                "compound {compound}"
+            );
+        }
+        w.shutdown().await.unwrap();
+    }
 }
 
 /// Park, then wake with a deadline half a second past the frozen test clock,

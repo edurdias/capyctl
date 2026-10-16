@@ -5,7 +5,7 @@ keep all model weights resident. The primary audience is home users and prosumer
 running models on GPU machines they own.
 
 Current phase: 0.1.3 on `main` (multi-node groups qualified on two hosts: vLLM
-with deep parking, SGLang groups restart only, TensorFold TP2). Releases are
+and SGLang with deep parking, TensorFold TP2). Releases are
 published as GitHub releases; release candidates as
 pre-releases.
 

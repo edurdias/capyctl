@@ -759,3 +759,48 @@ that states `deep` or `host_backed` is refused at deploy with
 parking tiers, for every engine whose group cannot park). A single-host SGLang
 deployment, its residency and its pinned identities are unchanged. Lift the
 rule once a live group wake passes on the installed SGLang.
+
+## Note of 2026-10-16: the SGLang group wake failure was stale evidence; SGLang groups park again
+
+The cause of the MN4 failure above was in the controller. A wake read every
+member's own host report (each host's observation time), then ran the head's
+readiness probe and the canary, then committed those reports; the store accepts
+a report only while it is within its host's observation TTL (2 s by default and
+on the lab hosts). SGLang's probes right after a wake that reloaded the weights
+took longer than that, so the reports were stale at the commit, the store
+refused them (`evidence freshness`) and the group stopped `group_member_uncertain`.
+vLLM's probes are fast, so its wakes passed. The live failure text was not
+kept; the group world reproduces it with probes that outlast the TTL
+(`a_wake_whose_probes_outlast_the_observation_ttl_completes`).
+
+A park can hit the same rule (found live 2026-10-16, the first MN4 SGLang park
+on this fix: `park_uncertain`, `evidence freshness`, 9 s after acceptance). The
+members settle at different times, each host pushing its reports on its own
+period (an SGLang member's saver map every 2 s; a park also waits for a residue
+sampled after the head's reply), and the controller kept each member's first
+settling report while it waited for the others, so the earliest one could be
+older than the TTL when the last settled. The 0.1.3 SGLang parks that passed did
+so by timing.
+
+Every report a park or wake commits is now fresh by the store's own rule: the
+controller reads the TTL the step's commit applies (the observation TTL of its
+host policy), asks every member's host again on every poll, settled members
+included, and hands the commit the reports only when each member's latest one
+settles and is younger than that TTL less a margin (300 ms, at most half the
+TTL). A member with no report that young by the end of the evidence window is
+silent (`group_member_uncertain`, its charge kept), as one with no report at all.
+
+§12's wake also ends with one more read: once the canary passed, every member's
+own host report is read again, observed after the canary, under the same rules
+(each member on its own host's report, a rank not resident fails the group at
+that rank, the bounded evidence window, no second collective), and those reports
+are the ones the wake commits. A single launch's wake had the same order (the
+restore's evidence, then the canary, then the commit); it now commits that
+evidence with the canary's answer as its observation, the launch's engine
+processes checked alive with it.
+
+The note of 2026-10-15 is lifted: `group_support("sglang").deep_park` is true
+again, an SGLang group that states no residency resolves `deep`, and `deep` is
+accepted at deploy. The refusal of both parking tiers stays for an engine whose
+group cannot park (TensorFold). The branch merges once the MN4 SGLang row (deep
+park and wake cycles on both lab hosts) passes live.

@@ -23,16 +23,8 @@
 #           `restored` entry per cycle (the head's one collective each way).
 # Then stop with verified cleanup on both hosts; delete.
 #
-# SGLang (owner decision 2026-10-15, after the deep wake failed live twice): SGLang
-# groups resolve restart_only and refuse deep, so `MN4 -- sglang` runs
-# restart_only_row instead:
-#   a  the fixture declares no residency: status reads restart_only (deployment
-#      and each member); a park stops the group (parked or stopped, no engine
-#      process on either host); a routed request brings it back Ready on a new
-#      plan generation and is answered; stop with verified cleanup; delete.
-#   b  the same fixture declaring `residency: deep` (variant sg-30-deep) is refused
-#      at deploy `capability_missing:deep_park` with the restart_only hint, and no
-#      deployment is left.
+# SGLang runs the same cycles: ADR 0028 note of 2026-10-16 lifts the 0.1.3
+# restart_only rule for SGLang groups, so the fixture (no residency) resolves deep.
 # shellcheck source=scripts/live/matrix/grouplib.sh
 . "$MATRIX_DIR/grouplib.sh"
 
@@ -112,91 +104,9 @@ wake() { # wake <deployment>
     infer "$1" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024; fi
 }
 
-# residency_check <deployment> <label>: status-<dep>-<label>.json reads
-# restart_only for the deployment and every member.
-residency_check() {
-  dry && return 0
-  python3 - "$EVID/status-$1-$2.json" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1])); d = d.get("deployment", d)
-dep = (d.get("development_controls") or {}).get("residency")
-members = [m.get("residency") for i in d.get("instances", []) for m in i.get("members", [])]
-ok = dep == "restart_only" and members and all(m == "restart_only" for m in members)
-print(json.dumps({"deployment_residency": dep, "member_residency": members, "restart_only": bool(ok)}))
-sys.exit(0 if ok else 1)
-PY
-}
-
-# plan_advanced <deployment> <before-label> <after-label>: a later plan generation.
-plan_advanced() {
-  dry && return 0
-  python3 - "$EVID/group-$1-$2.json" "$EVID/group-$1-$3.json" <<'PY'
-import json, sys
-a, b = ((json.load(open(p))["plans"] or [{}])[-1].get("generation") for p in sys.argv[1:])
-print(json.dumps({"plan_generation": [a, b], "new_plan": a is not None and b is not None and b > a}))
-sys.exit(0 if a is not None and b is not None and b > a else 1)
-PY
-}
-
-restart_only_row() {
-  local dep host rc=0
-  dep=$(group_fixture_name sglang)
-  echo "engine sglang deployment $dep restart_only park, then a deep variant refused" | tee -a "$EVID/timeline.txt"
-  step preflight group_preflight sglang || return 1
-  for host in "${GROUP_HOSTS[@]}"; do step "idle-$(host_short "$host")" host_idle "$host" || return 1; done
-  step fixture group_fixture sglang || return 1
-  dry || cp "$RUNSTATE/fixtures/$dep.yaml" "$EVID/fixture-$dep.json"
-
-  step deploy timed deploy deploy "$dep" --activate --wait || {
-    step status-failed group_status "$dep" failed
-    for host in "${GROUP_HOSTS[@]}"; do step "errors-$(host_short "$host")" engine_errors "$host"; done
-    return 1
-  }
-  step ready keep_group "$dep" ready
-  step ready-check group_ready_check "$dep" ready || rc=1
-  step residency residency_check "$dep" ready || rc=1
-  step infer infer "$dep" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
-
-  step park timed park park_dep "$dep" || rc=1
-  step parked timed parked wait_states "$dep" "parked stopped" 600 || rc=1
-  step keep-parked keep_group "$dep" parked
-  for host in "${GROUP_HOSTS[@]}"; do step "no-engine-$(host_short "$host")" host_idle "$host" || rc=1; done
-  step mem-parked mem_both parked
-  step evidence-parked evidence "$dep" parked
-
-  step wake timed wake infer "$dep" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
-  step woken wait_states "$dep" ready 600 || rc=1
-  step keep-woken keep_group "$dep" woken
-  step new-plan plan_advanced "$dep" ready woken || rc=1
-  step infer-woken infer "$dep" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
-
-  group_stop_settle "$dep" stopped || rc=1
-  step evidence evidence "$dep" stopped
-  step journal journal_hosts "$dep" stopped
-  sleep 3
-  step cleanup group_cleanup_check "$dep" stopped woken || rc=1
-  step delete delete_dep "$dep" || rc=1
-
-  step fixture-deep group_fixture sglang --variant deep --document-json '{"residency": "deep"}' || return 1
-  step deploy-deep-refused deep_refused "$dep" || rc=1
-  return "$rc"
-}
-
-# deep_refused <deployment>: deploying <dep>-deep is refused capability_missing:deep_park
-# naming restart_only, and leaves no deployment.
-deep_refused() {
-  local dep=$1 out rc=0
-  out=$(FIXTURE_VARIANT=deep refused_with capability_missing:deep_park deploy "$dep" --activate) || rc=1
-  printf '%s\n' "$out"
-  dry && return 0
-  case $out in *restart_only*) echo "hint names restart_only" ;; *) echo "UNEXPECTED: no restart_only hint"; rc=1 ;; esac
-  if status_dep "$dep-deep" >/dev/null 2>&1; then echo "UNEXPECTED: $dep-deep exists"; rc=1; else echo "no deployment $dep-deep"; fi
-  return "$rc"
-}
-
 row_main() {
   local engine=${1:?engine: vllm or sglang} dep host n rc=0 base_p=0 base_r=0
-  case $engine in vllm) ;; sglang) restart_only_row; return ;; *) echo "MN4 parks vllm or sglang groups (TensorFold has no deep park)"; return 1 ;; esac
+  case $engine in vllm | sglang) ;; *) echo "MN4 parks vllm or sglang groups (TensorFold has no deep park)"; return 1 ;; esac
   dep=$(group_fixture_name "$engine")
   echo "engine $engine deployment $dep cycles $MN4_CYCLES wake $MN4_WAKE" | tee -a "$EVID/timeline.txt"
   step preflight group_preflight "$engine" || return 1

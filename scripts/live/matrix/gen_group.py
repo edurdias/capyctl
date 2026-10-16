@@ -5,8 +5,8 @@ One fixture per engine, a two-rank tensor-parallel group with host A as the head
 (rank 0, serving the API) and host B as the worker (rank 1):
 
   vg-30   vLLM, Qwen3-30B-A3B, residency deep
-  sg-30   SGLang, the same checkpoint, no residency (SGLang groups resolve
-          restart_only and refuse deep, owner decision 2026-10-15)
+  sg-30   SGLang, the same checkpoint, no residency (resolves deep: SGLang groups
+          park again, ADR 0028 note of 2026-10-16)
   tg-n35  TensorFold, Nemotron 3.5 Lightning 30B-A3B MLX 4-bit, restart_only
           (TensorFold has no deep park), its memory stated in `resources`
 

@@ -34,6 +34,18 @@ pub struct ProbeAnswer {
     pub text: String,
 }
 
+/// Owner decision 2026-10-09: a single launch's wake canary as its engine
+/// answered it, and when the answer was observed (Unix ms, on the clock of
+/// whoever ran the probe: this host for an embedded engine, the host's agent
+/// for a remote launch). ADR 0028 note of 2026-10-16: a wake commits its
+/// evidence as observed then, since the canary can outlast the observation
+/// TTL that the restore's own evidence is checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanaryAnswer {
+    pub answer: ProbeAnswer,
+    pub observed_at_ms: i64,
+}
+
 /// vLLM, TensorFold and llama.cpp: OpenAI `/v1/completions` asking for the
 /// token ids (`return_token_ids`). vLLM answers them in
 /// `choices[0].token_ids`; TensorFold in its own block ([`tensorfold_answer`]).
