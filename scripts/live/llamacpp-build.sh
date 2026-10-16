@@ -29,8 +29,13 @@
 
 LLAMACPP_TAG=${LLAMACPP_TAG:-v0.6.0}
 LLAMACPP_VERSION=${LLAMACPP_TAG#v}
-# The tag's commit (design note: d812350; the laptop build printed d81235049).
-LLAMACPP_COMMIT=d812350
+# The tag's commit: v0.6.0 is d812350 (the laptop build printed d81235049); v0.7.0
+# (owner approval 2026-10-16, both hosts) is 620d222.
+case $LLAMACPP_TAG in
+  v0.6.0) LLAMACPP_COMMIT=d812350 ;;
+  v0.7.0) LLAMACPP_COMMIT=620d222 ;;
+  *) echo "llamacpp-build: no approved commit for $LLAMACPP_TAG" >&2; exit 2 ;;
+esac
 LLAMACPP_PREBUILT=b11429
 CUDA_ARCH=${LLAMACPP_CUDA_ARCH:-121a-real}
 LC_SRC=$REMOTE_HOME/llamacpp-$LLAMACPP_TAG
