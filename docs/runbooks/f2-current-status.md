@@ -1,5 +1,47 @@
 # Current implementation and launch status
 
+## 0.1.4 in progress — 2026-10-16
+
+Merged on `main` since 0.1.3, each with `ci-local` and the deep workspace suite
+passing locally and hosted CI green (details in each change file):
+
+- #134: the entries up to 2026-09-30 moved unchanged to
+  [archive/f2-status-2026-09.md](archive/f2-status-2026-09.md).
+- #135: `capyctl engine add --allow-remote-code` writes
+  `security.trust_remote_code`.
+- #136: `status` shows the startup reservation admission holds; a parking
+  vLLM deployment whose placeholder exceeds the managed limit reads
+  `whole_host` (it showed 265 GiB `default` for Nemotron 3.5 Super VL while
+  admission held the 108 GiB limit).
+- #137: `capyctl version` prints the build commit; standalone records engine
+  latency histograms.
+- #138: Nemotron 3.5 Super VL (`nemotron_h_omni`) is refused deep and
+  host-backed parking on vLLM. vLLM 0.31.0 alone reproduces the broken wake.
+- #139: group parks and wakes commit only member reports still within the
+  observation TTL; SGLang groups park again. Live on both lab hosts: MN4
+  SGLang and MN4 vLLM 5/5 deep park and wake cycles, M28 SGLang and M29 vLLM
+  single-machine park and wake pass (the first MN4 SGLang run, before the
+  `collect` change, failed its first park with `evidence freshness`).
+
+Recipe rechecks on vLLM 0.31.0 (host A, 2026-10-16, vLLM alone with sleep
+level 2 and `reload_weights`): gpt-oss-20b still fails its reload (24
+`OAIAttention` warnings, then the engine fails its first request); Gemma 4
+26B-A4B NVFP4 still answers garbled text; the BF16 Gemma 4 E2B answers
+identically before and after. The recipes stay `restart_only`; the gpt-oss
+family rule records 0.31.0. No Gemma rule was added: the fault is specific
+to the NVFP4 checkpoint and the wake canary catches it.
+
+Owner attention:
+
+- The placeholder startup factor for a parking vLLM deployment with eager
+  loading is 3.6 × weights (ADR 0014 A21); Super VL measured 1.33 ×. Left
+  unchanged pending a decision.
+- Probe checkpoints on host A in `~/probe-models` (gpt-oss-20b, Gemma 4
+  26B-A4B NVFP4, about 57 GB) and the Nemotron 3.5 files on both hosts are
+  kept until the owner decides.
+
+CPU and Fake-engine tests are not qualification.
+
 ## 0.1.3 published — 2026-10-15
 
 The owner published `v0.1.3` (tag on `345806a5`, marked Latest) after the
