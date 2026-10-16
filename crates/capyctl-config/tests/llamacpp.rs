@@ -43,6 +43,7 @@ fn spec(deep_park: bool) -> ProfileSpec {
         approved_paths: vec![],
         env: Default::default(),
         approved_env: vec![],
+        trust_remote_code: false,
     }
 }
 

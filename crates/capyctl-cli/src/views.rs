@@ -317,6 +317,15 @@ fn engine_add(value: &Value) -> String {
     ))
     .row("Executable", s(&value["executable"]))
     .row("Deep park", s(&value["deep_park"]))
+    // Spec §3: shown only when allowed, so a default registration reads as before.
+    .row(
+        "Remote code",
+        if value["trust_remote_code"] == true {
+            "allowed"
+        } else {
+            ""
+        },
+    )
     .row("CUDA", s(&value["cuda_home"]))
     .row("Engines file", engines_file(value))
     .row("Published", published(value))
@@ -559,6 +568,7 @@ mod tests {
             approved_paths: vec![],
             env: vec![],
             approved_env: vec![],
+            allow_remote_code: false,
         };
         let value = json!({"profile": "vllm", "engine": "vllm", "version": "0.29.0", "executable": "/v/bin/vllm",
             "deep_park": "enabled", "cuda_home": "/usr/local/cuda", "engines_file": "/c/engines.yaml",
@@ -695,6 +705,7 @@ mod tests {
                 approved_paths: vec![],
                 env: vec![],
                 approved_env: vec![],
+                allow_remote_code: false,
             },
             Command::EngineList,
             Command::EngineRemove {

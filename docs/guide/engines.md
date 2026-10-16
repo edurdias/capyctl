@@ -101,6 +101,25 @@ SGLang's draft model is `--approve-option=--speculative-draft-model-path`.
 They are written to `engines.yaml` as `security.approved_options` and
 `security.approved_paths`, which you can also edit there.
 
+Some checkpoints ship their own Python (a model class or a configuration the
+engine does not have yet), and the engine runs it only with
+`trust_remote_code`. A deployment asks for it with
+`engine_config.trust_remote_code: true`, and CapyCTL refuses that unless the
+engine allows it. `--allow-remote-code` allows it:
+
+```bash
+capyctl engine add ~/venvs/vllm --name vllm-remote-code --allow-remote-code
+```
+
+It is written to `engines.yaml` as `security.trust_remote_code: true`, and
+`capyctl engine add` shows `Remote code   allowed`. The code runs as the
+engine's user with everything that user can reach, so allow it only for
+checkpoints you trust, and keep it on its own engine name so your other
+deployments do not get it. vLLM and SGLang take it; TensorFold and llama.cpp run
+no code from a checkpoint, so `engine add` refuses it for them. For the role's
+own engine (`--vllm-bin` and the others), the setting is `--trust-remote-code
+true` on `capyctl start` ([Configuration](../operations/configuration.md)).
+
 CapyCTL counts a draft model when it sizes a deployment: its weights in the
 memory request, its CUDA graphs in the memory reserved for the first start,
 and its KV cache layers in the context it fits to the KV cache.

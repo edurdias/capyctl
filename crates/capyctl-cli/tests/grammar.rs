@@ -545,7 +545,8 @@ fn engine_commands_parse() {
             "--approve-path",
             "/srv/drafters",
             "--approve-path",
-            "/srv/other"
+            "/srv/other",
+            "--allow-remote-code"
         ])
         .unwrap(),
         Command::EngineAdd {
@@ -558,6 +559,7 @@ fn engine_commands_parse() {
             approved_paths: vec!["/srv/drafters".into(), "/srv/other".into()],
             env: vec![],
             approved_env: vec![],
+            allow_remote_code: true,
         }
     );
     assert_eq!(
@@ -572,6 +574,7 @@ fn engine_commands_parse() {
             approved_paths: vec![],
             env: vec![],
             approved_env: vec![],
+            allow_remote_code: false,
         }
     );
     assert_eq!(

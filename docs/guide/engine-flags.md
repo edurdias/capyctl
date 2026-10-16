@@ -49,7 +49,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Quantization | `--quantization` | typed | `engine_config.quantization` |
 | Weight loading | `--safetensors-load-strategy` | typed | `engine_config.vllm.safetensors_load_strategy` (`eager` or `lazy`; `eager` while parking when not set) |
 | Text only | `--language-model-only` | typed | `engine_config.language_model_only` |
-| Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
+| Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it: `capyctl engine add --allow-remote-code`) |
 | Log level | `--uvicorn-log-level`, `--log-level`, `--log-config-file`, `--logging-config` | reserved | CapyCTL owns the server's logging. vLLM's own level is the `VLLM_LOGGING_LEVEL` variable: set it in `engine_config.env` once the installation lists it in `security.approved_env`. 0.31 moved its logging options under `--logging-config`; every spelling is reserved. |
 | Request and stats logging | `--enable-log-requests`, `--disable-log-requests`, `--disable-log-stats` | reserved | CapyCTL logs requests itself and reads the engine's stats for load reports. |
 | Per-request metrics | `--enable-per-request-metrics` | reserved | Always on: each answer carries vLLM's timings for the request, which CapyCTL adds to its [per-request metrics](requests.md#per-request-metrics). |
@@ -86,7 +86,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Quantize at load | `--quantize-and-serve`, `--modelopt-quant` | reserved | Not supported. Serve a quantized checkpoint instead. |
 | Tokenizer workers | `--tokenizer-worker-num` | typed | `engine_config.sglang.tokenizer_workers` |
 | Text only | `--language-model-only` | typed | `engine_config.language_model_only` |
-| Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it) |
+| Remote code | `--trust-remote-code` | typed | `engine_config.trust_remote_code` (the installation must allow it: `capyctl engine add --allow-remote-code`) |
 | Log level | `--log-level`, `--log-level-http` | reserved | CapyCTL sets them and reads the engine's log. |
 | Request logging | `--log-requests`, `--log-requests-target` | reserved | CapyCTL logs requests itself. |
 | Metrics | `--enable-metrics` | reserved | Always on: CapyCTL reads them for load reports. |

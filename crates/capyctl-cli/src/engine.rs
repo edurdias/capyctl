@@ -102,6 +102,7 @@ pub async fn execute_with(
             approved_paths,
             env: env_flags,
             approved_env,
+            allow_remote_code,
         } => {
             // ADR 0028 §2.1: refused before anything runs or is written.
             let (profile_env, approved_env) = engine_add_env(env_flags, approved_env, env)
@@ -119,6 +120,7 @@ pub async fn execute_with(
                     paths: approved_paths,
                     env: profile_env,
                     approved_env,
+                    remote_code: *allow_remote_code,
                 },
                 Toolchain {
                     cuda_home_env: env("CUDA_HOME"),
@@ -315,7 +317,7 @@ fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64,
 
 /// What `engine add` writes beside the installation: host-fixed args
 /// (`--arg`) and, ADR 0014 §8, what it approves (`--approve-option`,
-/// `--approve-path`).
+/// `--approve-path`, `--allow-remote-code`).
 struct Extras<'a> {
     args: &'a [String],
     options: &'a [String],
@@ -323,6 +325,8 @@ struct Extras<'a> {
     /// ADR 0028 §2.1: `--env` and `--approve-env`, merged with their variables.
     env: BTreeMap<String, String>,
     approved_env: Vec<String>,
+    /// Spec §3: `security.trust_remote_code`.
+    remote_code: bool,
 }
 
 /// ADR 0028 §2.1 and R9: `--env` with `CAPYCTL_ENGINE_ADD_ENV`, `--approve-env`
@@ -432,6 +436,24 @@ async fn add(
             )
         }
     };
+    // ADR 0023 §4, ADR 0029 §5: TensorFold and llama.cpp have no remote-code
+    // option, so a deployment on them may never set trust_remote_code: true;
+    // allowing it would approve nothing.
+    if extras.remote_code {
+        if let Some(family) = match resolved.engine {
+            Engine::Tensorfold => Some("TensorFold"),
+            Engine::Llamacpp => Some("llama.cpp"),
+            Engine::Vllm | Engine::Sglang => None,
+        } {
+            return Err(error(
+                "capability_missing",
+                format!(
+                    "{family} runs no code shipped with a checkpoint, so --allow-remote-code \
+                     is refused and nothing was written"
+                ),
+            ));
+        }
+    }
     if resolved.engine == Engine::Tensorfold {
         // ADR 0023 §2: TensorFold has no park path; refuse a request for one
         // before anything runs or is written.
@@ -511,6 +533,7 @@ async fn add(
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
+        trust_remote_code: extras.remote_code,
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
@@ -523,6 +546,7 @@ async fn add(
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
         "engines_file": target.engines, "revision": revision,
         "cuda_home": spec.cuda_home,
+        "trust_remote_code": spec.trust_remote_code,
     });
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {

@@ -1289,12 +1289,15 @@ pub(super) fn normalize_engine_config(
     )?;
     let trust_remote_code = raw.trust_remote_code.unwrap_or(false);
     // Spec §3: remote code executes Python shipped with the checkpoint. The
-    // host installation keeps its switch (ADR 0014 §8).
+    // host installation keeps its switch (ADR 0014 §8); the refusal names the
+    // two ways an operator sets it (`engine add`, or the role's own engine).
     if trust_remote_code && !inputs.security.trust_remote_code {
         return Err(invalid(
             "engine_config.trust_remote_code",
             "trust_remote_code executes code shipped with the checkpoint; it requires \
-             security.trust_remote_code: true on the installation",
+             security.trust_remote_code: true on the installation (register it with \
+             `capyctl engine add --allow-remote-code`, or start the role with \
+             `--trust-remote-code true` for its own engine)",
         ));
     }
 

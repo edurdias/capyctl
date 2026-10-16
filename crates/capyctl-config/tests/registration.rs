@@ -216,6 +216,7 @@ fn spec(engine: Engine) -> ProfileSpec {
         approved_paths: vec![],
         env: Default::default(),
         approved_env: vec![],
+        trust_remote_code: false,
     }
 }
 
