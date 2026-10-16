@@ -23,11 +23,11 @@ pub fn group_support(engine: &str) -> Option<GroupSupport> {
             max_tensor_parallel: None,
             pipeline: true,
             exact_hosts: None,
-            // ADR 0028 note of 2026-10-15 (MN4, SGLang 0.5.21, TP2 across two
-            // GB10s): the group's first wake reloaded the head's weights for
-            // 222 s, the canary ran, and 3 s later the wake was
-            // restore_uncertain. A group restarts instead of parking in 0.1.3.
-            deep_park: false,
+            // ADR 0028 note of 2026-10-16: the group wake that failed live at
+            // MN4 committed member reports observed before its readiness
+            // probe and canary; a wake now commits reports observed after its
+            // canary, and an SGLang group parks again.
+            deep_park: true,
             worker_listens: true,
         }),
         // TensorFold 0.6.5: `--tp {1,2}`, one GPU per machine, no sleep.

@@ -1353,14 +1353,6 @@ pub fn resolve_effective_with_checkpoint(
     // request, startup peak, recurrent state, host copy, residency) applies
     // to that share as on a single host. Declared `resources` are the
     // member's as written, and the timeouts keep the whole checkpoint.
-    // ADR 0028 §2 (note of 2026-10-15): whether this launch is one member of
-    // a group of more than one host, for the engines that refuse to park one.
-    let in_group = instance_spec
-        .group
-        .as_ref()
-        .map(|group| group.topology)
-        .or(facts.member_of)
-        .is_some_and(|topology| topology.world_size() > 1);
     let member_of = instance_spec
         .group
         .as_ref()
@@ -1449,14 +1441,9 @@ pub fn resolve_effective_with_checkpoint(
             .filter(|_| !sglang_speculative)
             .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
         // ADR 0023 §6, ADR 0029 §1: TensorFold and llama.cpp never park, so
-        // their default is restart_only. ADR 0028 §2 (note of 2026-10-15): nor
-        // does a group of an engine whose group wake is unproven (SGLang).
-        let group_parks = !in_group
-            || crate::group_support::group_support(raw_profile.engine.name())
-                .is_some_and(|support| support.deep_park);
+        // their default is restart_only.
         crate::deployment_defaults::default_residency(
             raw_profile.security.deep_park.is_enabled()
-                && group_parks
                 && !matches!(raw_profile.engine, Engine::Tensorfold | Engine::Llamacpp),
             discrete,
         )

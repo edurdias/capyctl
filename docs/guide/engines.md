@@ -751,20 +751,19 @@ What each engine runs:
 | Tensor parallel across machines | yes | yes | `tensor_parallel: 2` only |
 | Pipeline parallel across machines | yes | yes | no |
 | Machines | any number that divides tensor × pipeline parallel | any number that divides tensor × pipeline parallel | exactly 2 |
-| Parking | deep, every rank | restart only (0.1.3) | restart only |
+| Parking | deep, every rank | deep, every rank | restart only |
 
 Any shape in the table is accepted, with no warning. Live qualification covers
 two machines only, with the versions in the table header; other versions this
 release knows are expected to behave the same but were not run as groups.
 
-Known issue in 0.1.3: an SGLang group restarts instead of parking. With no
-`residency` it gets `restart_only`; `deep` or `host_backed` is refused at
-deploy with `capability_missing:deep_park`, and the error says to declare
-`residency: restart_only`. In a live run (SGLang 0.5.21, tensor parallel 2
-across two GB10 machines) the group's deep park completed but its first wake,
-after reloading the head's weights for 222 s, ended `restore_uncertain` and
-the group was stopped. SGLang on one machine parks as before
-([Parking](parking.md)).
+SGLang groups park and wake again. In 0.1.3 they restarted instead: in a live
+run (SGLang 0.5.21, tensor parallel 2 across two GB10 machines) a group's
+first wake reloaded the head's weights, then failed `restore_uncertain` and
+stopped the group. CapyCTL had read each machine's memory report before
+checking the woken model, and by the time those checks finished the reports
+were too old to record. A wake now records reports read after its checks.
+With no `residency`, an SGLang group gets `deep`.
 
 ## List and remove
 

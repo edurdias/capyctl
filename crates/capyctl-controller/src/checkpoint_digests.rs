@@ -904,7 +904,7 @@ impl EngineAdapter for CheckpointGate {
         context: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
-    ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, RuntimeError> {
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
         self.inner.wake_canary(context, max_tokens, bound).await
     }
 }

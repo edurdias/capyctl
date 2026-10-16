@@ -551,20 +551,37 @@ impl EngineAdapter for VllmAdapter {
         Ok(CancellationOutcome::Uncertain)
     }
     /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
-    /// completion probe on this engine's own loopback endpoint and key.
+    /// completion probe on this engine's own loopback endpoint and key,
+    /// observed when its answer arrived.
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
-    ) -> Result<crate::completion_probe::ProbeAnswer, RuntimeError> {
-        crate::traits::ChatForward::complete_probe(self, self.served_model(), max_tokens, bound)
-            .await
-            .map_err(|e| {
-                RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
-                    "vLLM did not answer the wake canary: {e}"
-                )))
-            })
+    ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
+        let answer = crate::traits::ChatForward::complete_probe(
+            self,
+            self.served_model(),
+            max_tokens,
+            bound,
+        )
+        .await
+        .map_err(|e| {
+            RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                "vLLM did not answer the wake canary: {e}"
+            )))
+        })?;
+        let observed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .ok_or_else(|| {
+                RuntimeError::Uncertain("the system clock is before the epoch".into())
+            })?;
+        Ok(crate::completion_probe::CanaryAnswer {
+            answer,
+            observed_at_ms,
+        })
     }
 }
 #[async_trait]

@@ -379,14 +379,15 @@ pub trait EngineAdapter: Send + Sync {
     /// Owner decision 2026-10-09: the single-launch wake canary. One
     /// completion probe ([`ChatForward::complete_probe`]) of at most
     /// `max_tokens` tokens against the retained launch `context` names, bounded
-    /// by `bound`. `Unsupported` means this engine has no canary and nothing
-    /// was sent; any other error is a probe that was not answered.
+    /// by `bound`, and when its answer was observed. `Unsupported` means this
+    /// engine has no canary and nothing was sent; any other error is a probe
+    /// that was not answered.
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         _max_tokens: u32,
         _bound: Duration,
-    ) -> Result<crate::completion_probe::ProbeAnswer, RuntimeError> {
+    ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
 }

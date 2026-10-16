@@ -25,19 +25,21 @@
 //!   own host must report it resident again; the head must pass the 1-token
 //!   readiness probe; and the canary (an 8-token completion through the head
 //!   at temperature 0) must match the reference recorded at the plan's first
-//!   readiness, judged by [`canary_matches`] alone.
+//!   readiness, judged by [`canary_matches`] alone. The wake then commits
+//!   each member's own report observed after the canary passed (ADR 0028
+//!   note of 2026-10-16), never one observed before its probes.
 //!
 //! The collective is never repeated. Found live 2026-10-15 (MN4): the head's
 //! collective returns once every rank released, so each member's evidence is
-//! awaited for a bounded window after the head's reply
-//! ([`MemberEvidence::window`]), never for the rest of the step's deadline. A
-//! member that reports nothing of its own by then keeps its full charge and
-//! is `uncertain` (`group_member_uncertain`); a member still resident after a
-//! park, not resident after a wake, a head that fails its readiness, or a
-//! canary that differs (`group_member_failed`, `group_wake_mismatch`) fails
-//! the group. Either stops the group, each member released only on its own
-//! host's evidence (ADR 0028 §11). CPU and fake-engine tests only cover this;
-//! the live rows MN1–MN9 qualify it.
+//! awaited for a bounded window after the head's reply, and for a wake again
+//! after its canary ([`MemberEvidence::window`]), never for the rest of the
+//! step's deadline. A member that reports nothing of its own by then keeps
+//! its full charge and is `uncertain` (`group_member_uncertain`); a member
+//! still resident after a park, not resident after a wake, a head that fails
+//! its readiness, or a canary that differs (`group_member_failed`,
+//! `group_wake_mismatch`) fails the group. Either stops the group, each
+//! member released only on its own host's evidence (ADR 0028 §11). CPU and
+//! fake-engine tests only cover this; the live rows MN1–MN9 qualify it.
 use crate::group_activation::{
     probe_head, GroupCtx, HeadEvidence, HeadLaunch, READINESS_PROBE_DEADLINE,
     READINESS_PROBE_TOKENS,
@@ -71,10 +73,11 @@ pub const EVIDENCE_MARGIN: Duration = Duration::from_millis(500);
 /// after that answer a host's process sample is certainly newer than it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemberEvidence {
-    /// From the head's reply. The collective returns only once every rank
-    /// acted, and every member host reports its processes every 2 s and its
-    /// saver maps every 2 s (reads bounded at 6 s): a member that says
-    /// nothing of its own for this long will not, and is uncertain.
+    /// From the head's reply, and for the reports a wake commits from its
+    /// canary. The collective returns only once every rank acted, and every
+    /// member host reports its processes every 2 s and its saver maps every
+    /// 2 s (reads bounded at 6 s): a member that says nothing of its own for
+    /// this long will not, and is uncertain.
     pub window: Duration,
     /// A host's `process_residency` sample is up to its `MAX_AGE` (5 s) old
     /// when reported, and its `nvidia-smi` read up to `BOUND` (3 s) long, so a
@@ -260,6 +263,7 @@ pub async fn park_group(
 /// head must pass its readiness probe; and the canary must match the
 /// reference recorded at first readiness. With no reference recorded (its
 /// recording failed at first readiness) this wake records one and passes.
+/// Returns each member's own report observed after the canary passed.
 pub async fn wake_group(
     ctx: &GroupCtx,
     target: &ResidencyTarget,
@@ -275,7 +279,9 @@ pub async fn wake_group(
     // activation (`group_model_path_mismatch`, `check_member_paths`).
     let reply = head_residency(ctx, target, ResidencyKind::Restore).await?;
     expect(&reply, ResidencyKind::Restore)?;
-    let reports = collect(ctx, target, ResidencyKind::Restore, since).await?;
+    // Every member resident on its own host's report before the head is
+    // probed: a rank still asleep fails the group at that rank.
+    collect(ctx, target, ResidencyKind::Restore, since).await?;
     let head = target.head()?;
     probe_head(ctx, &head, READINESS_PROBE_TOKENS, READINESS_PROBE_DEADLINE)
         .await
@@ -291,16 +297,22 @@ pub async fn wake_group(
         })?;
     match canary_reference(ctx, &target.group) {
         Some(reference) if !canary_matches(&reference, &observed) => {
-            Err(GroupResidencyError::CanaryMismatch)
+            return Err(GroupResidencyError::CanaryMismatch)
         }
-        Some(_) => Ok(reports),
-        None => {
-            // The first readiness recorded none: this wake's output becomes
-            // the reference, as at first readiness.
-            store_canary(ctx, &target.group, observed);
-            Ok(reports)
-        }
+        Some(_) => {}
+        // The first readiness recorded none: this wake's output becomes the
+        // reference, as at first readiness.
+        None => store_canary(ctx, &target.group, observed),
     }
+    // ADR 0028 note of 2026-10-16 (found live 2026-10-15, MN4): the store
+    // commits reports observed within each host's observation TTL (2 s by
+    // default), and the probes can outlast it (an SGLang head right after
+    // reloading its weights), so the reports read before them were stale at
+    // the commit and the wake ended uncertain. The wake commits each
+    // member's own report observed after its canary passed, under the same
+    // rules and window as the first.
+    let since = (ctx.clock)().unwrap_or_default();
+    collect(ctx, target, ResidencyKind::Restore, since).await
 }
 
 /// ADR 0028 §12 (decided 2026-10-06): record the canary's reference at the
@@ -453,10 +465,11 @@ fn remaining(ctx: &GroupCtx, deadline_ms: i64) -> Duration {
     Duration::from_millis(u64::try_from(deadline_ms.saturating_sub(now)).unwrap_or(0))
 }
 
-/// ADR 0028 §12 (R12): every member's own host's report, asked again until
-/// each one settles the transition or the evidence window after the head's
-/// reply ([`MemberEvidence::window`], within the step's deadline less the time
-/// to record it) passes. A park needs every member at or below its parked
+/// ADR 0028 §12 (R12): every member's own host's report observed at or after
+/// `since`, asked again until each one settles the transition or the evidence
+/// window (from the head's reply, or from a wake's canary;
+/// [`MemberEvidence::window`], within the step's deadline less the time to
+/// record it) passes. A park needs every member at or below its parked
 /// budget and the residue its processes hold, sampled after the head's
 /// reply; a wake every member above its parked budget. When the window ends,
 /// a member that reported but is still resident (or not resident) fails the

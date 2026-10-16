@@ -652,13 +652,18 @@ impl EngineAdapter for RemoteEngine {
     /// which the host's agent runs on loopback against its retained launch
     /// with the launch's own key, never through ingress or the router. A host
     /// whose session does not declare completion probes (`engine_groups`) is
-    /// sent nothing (`Unsupported`): it keeps the wake checks it had.
+    /// sent nothing (`Unsupported`): it keeps the wake checks it had. ADR 0028
+    /// note of 2026-10-16: a wake commits its evidence as observed with the
+    /// canary, so for a retained launch the answer counts only with the host
+    /// reporting, at the time it observed it, the claim retained and the
+    /// launch's engine alive (every recorded engine process and no other; a
+    /// helper may be gone, ADR 0027), as a restore's result must.
     async fn wake_canary(
         &self,
         c: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
-    ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, RuntimeError> {
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
         let b = &self.binding;
         if c.binding_id != b.plan.binding_id || c.incarnation != b.plan.incarnation {
             return Err(RuntimeError::StaleRevision);
@@ -711,9 +716,26 @@ impl EngineAdapter for RemoteEngine {
                 "the engine generated nothing for the wake canary".into(),
             ));
         }
-        Ok(capyctl_adapters::completion_probe::ProbeAnswer {
-            tokens: result.probe_tokens,
-            text: result.probe_text,
+        if let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities {
+            let alive: Vec<_> = result
+                .processes
+                .iter()
+                .filter(|p| p.presence == "alive")
+                .map(process)
+                .collect();
+            if !result.claim_retained || !capyctl_domain::completion::same_engine(recorded, &alive)
+            {
+                return Err(RuntimeError::Uncertain(
+                    "the host did not report the launch's engine alive with the wake canary".into(),
+                ));
+            }
+        }
+        Ok(capyctl_adapters::completion_probe::CanaryAnswer {
+            answer: capyctl_adapters::completion_probe::ProbeAnswer {
+                tokens: result.probe_tokens,
+                text: result.probe_text,
+            },
+            observed_at_ms: result.observed_at_unix_ms,
         })
     }
 }
