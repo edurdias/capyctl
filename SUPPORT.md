@@ -11,7 +11,8 @@ have tried and the relevant version and configuration.
 
 For a useful bug report, include:
 
-- `capyctl --version`, Linux distribution and architecture.
+- `capyctl version` (the version and the commit it was built from), Linux
+  distribution and architecture.
 - GPU model and memory, driver version, and engine name and exact version.
 - Standalone or server/host setup, model identifier and relevant deployment fields.
 - Minimal steps, expected behavior, actual behavior and relevant redacted errors.

@@ -62,6 +62,15 @@ pub fn render(command: &Command, value: &Value, context: &Context) -> String {
                 .unwrap_or_default();
             record(format!("{kind} {name}").trim_end(), value)
         }
+        // The `--version` line first, so a script reading one line reads the
+        // same thing from either.
+        Command::Version => format!(
+            "capyctl {}\ncommit: {}\n",
+            s(&value["version"]),
+            value["commit"]
+                .as_str()
+                .unwrap_or("not recorded in this build")
+        ),
     }
 }
 

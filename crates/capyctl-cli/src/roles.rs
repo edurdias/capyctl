@@ -2144,21 +2144,9 @@ async fn start_standalone_in(
             memory_warnings: memory_warnings.clone(),
         },
     );
-    // SPEC §17 (M80): the router's per-request latency distributions. The
-    // embedded engine has no host ingress, and the engine histograms its load
-    // samples carry are not read here, so only the router tier is measured.
+    // SPEC §17 (M80): the router's per-request latency distributions.
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     inflight.latency.set_timing_header(timing_header);
-    let latency_view = {
-        let recorder = inflight.latency.clone();
-        capyctl_management::metrics::latency_router(
-            capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-                .map_err(|_| StartError::MissingCredentials)?,
-            Arc::new(move |deployment: Option<&str>| {
-                capyctl_router::timing::latency_report(&recorder, &[], deployment)
-            }),
-        )
-    };
     // SPEC §§10, 17 (D9, owner decision 2026-10-08): the embedded engines'
     // load, sampled in process as a host agent samples its own (loopback
     // `/metrics` each second, SGLang's running limit once per launch) under the
@@ -2176,6 +2164,27 @@ async fn start_standalone_in(
         .map_err(|error| StartError::Deploy(error.to_string()))?
     };
     let engine_load = embedded_load.table();
+    // SPEC §17 (M80): the engine histograms the embedded samples carry, read
+    // with the router's series as a server reads a host's (found live
+    // 2026-10-10: standalone showed router series only). The embedded engine
+    // has no host ingress, so there is no ingress tier. The timing header
+    // names the engine family from the same table.
+    let engine_latency = embedded_load.latency_table();
+    inflight.latency.set_host_latency(engine_latency.clone());
+    let latency_view = {
+        let recorder = inflight.latency.clone();
+        capyctl_management::metrics::latency_router(
+            capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+                .map_err(|_| StartError::MissingCredentials)?,
+            Arc::new(move |deployment: Option<&str>| {
+                capyctl_router::timing::latency_report(
+                    &recorder,
+                    &engine_latency.snapshot(deployment),
+                    deployment,
+                )
+            }),
+        )
+    };
     supervision.supervise(embedded_load.spawn_until(supervision.cancel_signal()));
     let load_view = crate::remote_roles::load_view(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)

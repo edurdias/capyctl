@@ -22,6 +22,9 @@ release's checksums. Make sure `~/.local/bin` is on your `PATH`, then check:
 capyctl --version
 ```
 
+It prints `capyctl <version>`. `capyctl version` prints the same line and the
+commit the release was built from, which is worth including in a bug report.
+
 Next: if you have no engine yet, [Install an engine](install-engines.md);
 then [Run on one machine](one-machine.md).
 

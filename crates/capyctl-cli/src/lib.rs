@@ -1,3 +1,5 @@
+// The version and build commit `capyctl version` prints.
+pub mod build_info;
 pub mod client;
 // Owner decision 2026-09-25: the minimal deployment file as the CLI reads it.
 mod client_journal;

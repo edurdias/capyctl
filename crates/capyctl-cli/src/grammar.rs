@@ -197,6 +197,9 @@ pub enum Command {
         name: String,
         drain: bool,
     },
+    /// This build's version and the commit it was built from
+    /// (`build_info`); `--version` prints the version line only.
+    Version,
 }
 
 impl Command {
@@ -276,6 +279,7 @@ impl Command {
             Command::EngineAdd { .. } => "engine add".into(),
             Command::EngineList => "engine list".into(),
             Command::EngineRemove { name, .. } => format!("engine remove {name}"),
+            Command::Version => "version".into(),
         }
     }
 }
@@ -455,6 +459,9 @@ enum CliCommand {
         #[command(subcommand)]
         action: EngineArgs,
     },
+    /// Print this build's version and, for a release build, the commit it was
+    /// built from. `--version` prints the version line only.
+    Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -1206,6 +1213,7 @@ impl From<CliCommand> for Command {
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },
             },
+            CliCommand::Version => Command::Version,
         }
     }
 }
