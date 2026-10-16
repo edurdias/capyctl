@@ -646,6 +646,9 @@ pub struct DeepWakeBrokenFamily {
 /// `engine_error` after 778 s; `Harmony parser ended in a non-terminal
 /// state`). On SGLang 0.5.21 `update_weights_from_disk` raises `TypeError:
 /// default_weight_loader() got an unexpected keyword argument 'weight_name'`.
+/// Rechecked on vLLM 0.31.0 (host A, 2026-10-16, vLLM alone): the same 24
+/// warnings after `/sleep?level=2`, `/wake_up` and `reload_weights`, then the
+/// engine failed on its first request.
 ///
 /// Nemotron 3.5 Super VL (`nemotron_h_omni`; recipe catalog, host A,
 /// 2026-10-16): on vLLM 0.31.0 every deep park's wake failed CapyCTL's wake
@@ -658,7 +661,7 @@ pub const DEEP_WAKE_BROKEN_FAMILIES: &[DeepWakeBrokenFamily] = &[
         engine: Engine::Vllm,
         model_types: &["gpt_oss"],
         architectures: &["GptOssForCausalLM"],
-        observed_on: "vLLM 0.30.0",
+        observed_on: "vLLM 0.30.0 and 0.31.0",
     },
     DeepWakeBrokenFamily {
         engine: Engine::Sglang,
