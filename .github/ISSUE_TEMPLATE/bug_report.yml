@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: CapyCTL version
-      description: Output of capyctl --version, or commit if built from source.
+      description: Output of capyctl version, or the commit if built from source.
     validations:
       required: true
   - type: textarea

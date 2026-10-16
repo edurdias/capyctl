@@ -103,3 +103,33 @@ fn command_notices_are_text_not_json() {
     let first = stderr.lines().next().unwrap_or_default();
     assert!(first.starts_with("notice: "), "{stderr}");
 }
+
+// `--version` is the one line the installer and the packaging check compare
+// whole, so it stays exactly `capyctl <version>`. `capyctl version` starts with
+// that line and adds the commit the build recorded (none for a test build
+// unless CAPYCTL_BUILD_COMMIT was set for it); `--json` carries the same.
+#[test]
+fn version_keeps_the_installer_line_and_adds_the_build_commit() {
+    let dir = state();
+    let line = format!("capyctl {}", env!("CARGO_PKG_VERSION"));
+    let flag = run(dir.path(), &["--version"]);
+    assert!(flag.status.success(), "{flag:?}");
+    assert_eq!(String::from_utf8(flag.stdout).unwrap(), format!("{line}\n"));
+
+    let text = run(dir.path(), &["version"]);
+    assert!(text.status.success(), "{text:?}");
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert_eq!(stdout.lines().next(), Some(line.as_str()), "{stdout}");
+    let recorded = option_env!("CAPYCTL_BUILD_COMMIT").filter(|c| !c.is_empty());
+    if let Some(commit) = recorded {
+        assert!(stdout.contains(commit), "{stdout}");
+    }
+
+    let json = run(dir.path(), &["version", "--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"), "{value}");
+    assert_eq!(value["commit"], serde_json::json!(recorded), "{value}");
+    // Nothing is created: the command reads no state.
+    assert!(!dir.path().join("s").exists());
+}

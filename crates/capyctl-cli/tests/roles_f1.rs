@@ -104,9 +104,10 @@ async fn router_serves_models_and_chat_over_http() {
 }
 
 /// An SGLang engine at the launch's recorded endpoint that answers only its
-/// load reads, with the launch's key: `/metrics` with 3 running, 1 waiting and
-/// a quarter of the KV pool in use, and `/v1/loads?include=core` with a running
-/// limit of 24 over two data-parallel ranks (SGLang 0.5.20 shapes).
+/// load reads, with the launch's key: `/metrics` with 3 running, 1 waiting, a
+/// quarter of the KV pool in use and two requests in its time-to-first-token
+/// histogram, and `/v1/loads?include=core` with a running limit of 24 over two
+/// data-parallel ranks (SGLang 0.5.20 shapes).
 async fn sglang_load_engine(
     runtime: &capyctl_controller::RuntimeEndpoint,
 ) -> tokio::task::JoinHandle<()> {
@@ -139,7 +140,13 @@ async fn sglang_load_engine(
                  # TYPE sglang:num_queue_reqs gauge\n\
                  sglang:num_queue_reqs{model_name=\"m\"} 1.0\n\
                  # TYPE sglang:token_usage gauge\n\
-                 sglang:token_usage{model_name=\"m\"} 0.25\n",
+                 sglang:token_usage{model_name=\"m\"} 0.25\n\
+                 # TYPE sglang:time_to_first_token_seconds histogram\n\
+                 sglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"m\"} 1.0\n\
+                 sglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"m\"} 2.0\n\
+                 sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"m\"} 2.0\n\
+                 sglang:time_to_first_token_seconds_sum{model_name=\"m\"} 0.55\n\
+                 sglang:time_to_first_token_seconds_count{model_name=\"m\"} 2.0\n",
             )
         })
     };
@@ -160,6 +167,102 @@ async fn sglang_load_engine(
     })
 }
 
+/// A standalone role with one Ready deployment named `name`, the SGLang load
+/// engine at its recorded endpoint, and its management API served on
+/// loopback.
+struct SampledStandalone {
+    app: capyctl_cli::roles::App,
+    id: String,
+    address: std::net::SocketAddr,
+    admin: String,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SampledStandalone {
+    async fn start(dir: &std::path::Path, name: &str) -> Self {
+        let app = boot(dir).await;
+        let id = app
+            .deploy(
+                name,
+                ModelSource::Local {
+                    path: format!("/models/{name}"),
+                },
+            )
+            .unwrap();
+        let op = app
+            .controller
+            .request_transition(&id, capyctl_domain::LifecycleAction::Start)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.controller.wait_terminal(&op).await.unwrap(),
+            capyctl_domain::LifecycleState::Ready
+        );
+        let runtime = app
+            .controller
+            .runtime_endpoint(&id)
+            .unwrap()
+            .expect("a ready deployment has a recorded runtime");
+        let engine = sglang_load_engine(&runtime).await;
+
+        let credentials = std::fs::read_to_string(dir.join("identity/credentials")).unwrap();
+        let admin = credentials
+            .lines()
+            .find_map(|line| line.strip_prefix("admin_token: "))
+            .unwrap()
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = app.management_router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        Self {
+            app,
+            id,
+            address,
+            admin,
+            tasks: vec![engine, server],
+        }
+    }
+
+    /// The first instance of the deployment in the management read `view`
+    /// (`load` or `latency`), polled until `ready` holds or ten seconds pass.
+    /// The embedded host samples once a second; a few periods is ample.
+    async fn instance(
+        &self,
+        view: &str,
+        ready: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let response = reqwest::Client::new()
+                .get(format!(
+                    "http://{}/management/v1/metrics/{view}?deployment={}",
+                    self.address, self.id
+                ))
+                .bearer_auth(&self.admin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let instance = response.json::<serde_json::Value>().await.unwrap()["deployments"][0]
+                ["instances"][0]
+                .clone();
+            if ready(&instance) || std::time::Instant::now() > deadline {
+                return instance;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for SampledStandalone {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 // T18 (SPEC §§10, 17, owner decision 2026-10-08): standalone samples its own
 // engine as a host agent does, so the management load read shows a fresh
 // sample with the engine's gauges and its reported running limit (`source:
@@ -168,63 +271,10 @@ async fn sglang_load_engine(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_reports_its_engine_load() {
     let dir = safe_state_dir();
-    let app = boot(dir.path()).await;
-    let id = app
-        .deploy(
-            "loaded-m",
-            ModelSource::Local {
-                path: "/models/loaded-m".into(),
-            },
-        )
-        .unwrap();
-    let op = app
-        .controller
-        .request_transition(&id, capyctl_domain::LifecycleAction::Start)
-        .await
-        .unwrap();
-    assert_eq!(
-        app.controller.wait_terminal(&op).await.unwrap(),
-        capyctl_domain::LifecycleState::Ready
-    );
-    let runtime = app
-        .controller
-        .runtime_endpoint(&id)
-        .unwrap()
-        .expect("a ready deployment has a recorded runtime");
-    let engine = sglang_load_engine(&runtime).await;
-
-    let credentials = std::fs::read_to_string(dir.path().join("identity/credentials")).unwrap();
-    let admin = credentials
-        .lines()
-        .find_map(|line| line.strip_prefix("admin_token: "))
-        .unwrap()
-        .to_owned();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let read = || async {
-        let response = reqwest::Client::new()
-            .get(format!(
-                "http://{address}/management/v1/metrics/load?deployment={id}"
-            ))
-            .bearer_auth(&admin)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        response.json::<serde_json::Value>().await.unwrap()["deployments"][0]["instances"][0]
-            .clone()
-    };
-    // The embedded host samples once a second; a few periods is ample.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let instance = loop {
-        let instance = read().await;
-        if !instance["sample"].is_null() || std::time::Instant::now() > deadline {
-            break instance;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    let role = SampledStandalone::start(dir.path(), "loaded-m").await;
+    let instance = role
+        .instance("load", |instance| !instance["sample"].is_null())
+        .await;
     let sample = &instance["sample"];
     assert_eq!(sample["fresh"], true, "{instance}");
     assert_eq!(
@@ -239,14 +289,47 @@ async fn standalone_reports_its_engine_load() {
     );
 
     // The router's candidate for the instance carries the same engine load.
-    let serving = app
+    let serving = role
+        .app
         .controller
-        .serving_instances(&id)
+        .serving_instances(&role.id)
         .unwrap()
         .expect("the coordinator reports serving instances");
     let (gauges, _) = capyctl_router::balance::usable_load(&serving[0])
         .expect("the router scores the embedded instance on its engine's load");
     assert_eq!((gauges.running, gauges.waiting), (3, 1));
-    server.abort();
-    engine.abort();
+}
+
+// T40 (SPEC §17, M80; found live 2026-10-10): the engine histograms
+// standalone's own samples carry reach its latency read, as a host's reach a
+// server's: the instance names the engine family and carries the engine's
+// time-to-first-token distribution with `tier: engine`, `source: engine`.
+// Before, standalone's latency read held router series only. Fake engine;
+// not qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_reports_its_engine_latency() {
+    let dir = safe_state_dir();
+    let role = SampledStandalone::start(dir.path(), "timed-m").await;
+    let engine_series = |instance: &serde_json::Value| {
+        instance["series"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|series| series["source"] == "engine")
+            .cloned()
+    };
+    let instance = role
+        .instance("latency", |instance| engine_series(instance).is_some())
+        .await;
+    let series = engine_series(&instance).unwrap_or_else(|| panic!("no engine series: {instance}"));
+    assert_eq!(instance["engine"], "sglang", "{instance}");
+    assert_eq!(
+        (&series["name"], &series["tier"], &series["count"]),
+        (
+            &serde_json::json!("engine_time_to_first_token"),
+            &serde_json::json!("engine"),
+            &serde_json::json!(2)
+        ),
+        "{instance}"
+    );
 }

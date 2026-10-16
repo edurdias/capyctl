@@ -54,6 +54,16 @@ fn main() -> ExitCode {
         names: &HostNames::default(),
         deployment_name: deployment_name(&invocation.command),
     };
+    // This build's version and commit: no state, runtime or network.
+    if invocation.command == Command::Version {
+        emit(
+            &invocation.command,
+            &capyctl_cli::build_info::json(),
+            format,
+            &context,
+        );
+        return ExitCode::SUCCESS;
+    }
     if capyctl_cli::remote_roles::supports(&invocation.command) {
         // SPEC §13.3: only a local startup flag enables full native output.
         // Clear inherited permission before creating runtime threads.

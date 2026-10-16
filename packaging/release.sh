@@ -16,7 +16,8 @@
 #                            per OS/architecture supplies every role). capyctl's
 #                            Python runtime helpers are compiled into it and
 #                            written to <state_dir>/runtime at role start
-#                            (decided 2026-09-24; SPEC §3.3).
+#                            (decided 2026-09-24; SPEC §3.3). `capyctl version`
+#                            reports the commit BUILDINFO records.
 #   packaging/systemd/       system and user service units (SPEC §4.3)
 #   LICENSE                  Apache-2.0 license
 #   BUILDINFO                version, commit, target, toolchain, build time,
@@ -74,6 +75,14 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ] ||
 fi
 
 commit=$(git rev-parse HEAD)
+# `capyctl version` reports the commit BUILDINFO records (`-dirty` for a dirty
+# tree); `capyctl --version` stays `capyctl <version>`. Exported, so the
+# shipped-binary check's rebuild sees the same value and stays a no-op.
+if [ "$dirty" = true ]; then
+  export CAPYCTL_BUILD_COMMIT="$commit-dirty"
+else
+  export CAPYCTL_BUILD_COMMIT="$commit"
+fi
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct HEAD)}
 version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
 if [ -z "$version" ]; then

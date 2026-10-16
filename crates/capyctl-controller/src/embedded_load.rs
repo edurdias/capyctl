@@ -10,7 +10,11 @@
 //! per launch. Each report is validated and accepted exactly as a host's
 //! (`LoadReport::try_from`, [`LoadTable::accept`]) under the embedded host's
 //! name. A sample stays a routing hint and a status figure: never readiness,
-//! admission or release evidence, and never journaled.
+//! admission or release evidence, and never journaled. SPEC §17 (M80): the
+//! engine latency histograms each report carries are added to the role's own
+//! [`LatencyTable`] ([`LatencyTable::accept`]), as a server adds a host's, so
+//! the latency read shows `source: engine` series on standalone too.
+use crate::latency_table::LatencyTable;
 use crate::load_table::LoadTable;
 use crate::ownership::SharedCoordinatorState;
 use capyctl_agent::ingress::{IngressScope, LoadTarget};
@@ -105,10 +109,12 @@ impl LoadSource for EmbeddedTargets {
     }
 }
 
-/// Samples the embedded engines and records them in its own [`LoadTable`].
+/// Samples the embedded engines and records them in its own [`LoadTable`] and
+/// [`LatencyTable`].
 pub struct EmbeddedLoad {
     reporter: LoadReporter,
     table: Arc<LoadTable>,
+    latency: Arc<LatencyTable>,
     host_id: String,
 }
 
@@ -128,6 +134,7 @@ impl EmbeddedLoad {
         Ok(Self {
             reporter: LoadReporter::new(source, host_id.clone())?,
             table: Arc::new(LoadTable::new()),
+            latency: Arc::new(LatencyTable::new()),
             host_id,
         })
     }
@@ -137,15 +144,23 @@ impl EmbeddedLoad {
         self.table.clone()
     }
 
-    /// One tick: sample every Ready embedded launch and record the samples.
+    /// SPEC §17 (M80): the engine latency the embedded engines reported, for
+    /// the management latency read and the timing header's engine family.
+    pub fn latency_table(&self) -> Arc<LatencyTable> {
+        self.latency.clone()
+    }
+
+    /// One tick: sample every Ready embedded launch and record its sample and
+    /// engine latency, as a server records a host's report (latency first,
+    /// then load, `agent_sessions`).
     pub async fn tick(&self) {
         for report in self.reporter.reports().await {
             let Ok(report) = capyctl_protocol::reports::LoadReport::try_from(report) else {
                 continue;
             };
-            let _ = self
-                .table
-                .accept(&self.host_id, report, capyctl_protocol::now_unix_ms());
+            let now = capyctl_protocol::now_unix_ms();
+            self.latency.accept(&self.host_id, &report, now);
+            let _ = self.table.accept(&self.host_id, report, now);
         }
     }
 

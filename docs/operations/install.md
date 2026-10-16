@@ -173,7 +173,10 @@ runs `scripts/check-release-clean.sh` (no test engine may reach the shipped
 binary), ships only files tracked by git, refuses untracked files under
 `runtime/` (the build embeds every `runtime/*.py` it finds), and stamps
 entries with the commit time so a rebuild of the same commit and toolchain
-gives the same archive. It copies `install.sh` beside the tarball and writes
+gives the same archive. It records the commit in `BUILDINFO` and in the
+binary, where `capyctl version` prints it (`-dirty` appended for a tree with
+uncommitted changes); `capyctl --version` prints `capyctl <version>` only,
+the line `install.sh` checks. It copies `install.sh` beside the tarball and writes
 `SHA256SUMS`. Build on each architecture, gather the tarballs in one
 directory and run `packaging/release.sh --sums DIR` there to write the
 release's `SHA256SUMS`. `scripts/verify-packaging.sh` checks the units, the

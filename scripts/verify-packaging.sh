@@ -14,7 +14,8 @@
 #    exactly, with the expected owners and modes (no runtime files: the
 #    runtime is compiled into the binary; no bytecode, no symlinks);
 #    SHA256SUMS and the .sha256 must verify; the binary must be stripped,
-#    report BUILDINFO's version and carry BUILDINFO's runtime manifest.
+#    report BUILDINFO's version (`--version`) and commit (`capyctl version`)
+#    and carry BUILDINFO's runtime manifest.
 # 5. No builder-identifying paths in bin/capyctl (the builder's $HOME,
 #    $CARGO_HOME or the checkout path), no lab host identifiers (when known;
 #    see scripts/live/matrix/hosts.local.env), and no match of any pattern
@@ -295,6 +296,17 @@ if [ "$("$pkg/bin/capyctl" --version)" = "capyctl $version" ]; then
   pass "bin/capyctl --version reports $version"
 else
   fail "bin/capyctl --version does not report BUILDINFO version $version"
+fi
+# `capyctl version` reports the commit BUILDINFO records, `-dirty` for a dirty
+# tree (packaging/release.sh).
+commit=$(sed -n 's/^commit: //p' "$pkg/BUILDINFO")
+if [ "$(sed -n 's/^dirty: //p' "$pkg/BUILDINFO")" = true ]; then
+  commit="$commit-dirty"
+fi
+if [ -n "$commit" ] && [ "$("$pkg/bin/capyctl" version | sed -n 2p)" = "commit: $commit" ]; then
+  pass "bin/capyctl version reports commit $commit"
+else
+  fail "bin/capyctl version does not report BUILDINFO commit '$commit'"
 fi
 # SPEC §3.3 / ADR 0001: the runtime the binary embeds is the tracked one.
 manifest=$(sed -n 's/^runtime_manifest: //p' "$pkg/BUILDINFO")
