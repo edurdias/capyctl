@@ -561,6 +561,22 @@ pub trait ChatForward: Send + Sync {
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward_chat(body).await
     }
+    /// ADR 0030 §2: one decision request (`POST /v1/systemone`), sent as one
+    /// JSON body with `model` replaced by the served name, answered whole with
+    /// `model` replaced by the public name. The answer is completion evidence
+    /// only when it is a whole JSON object with an `answers` object; an
+    /// engine 400, 413 or 422 with a complete JSON body is
+    /// [`AdapterError::Rejected`]; anything else that may follow a sent
+    /// request is [`AdapterError::Uncertain`]. There is no first-token event:
+    /// the caller bounds the whole exchange (SPEC §10: the request deadline),
+    /// and this method adds no wall-clock cap of its own. The default is a
+    /// forwarder that cannot carry decisions, refused before sending.
+    async fn forward_decision(
+        &self,
+        _body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(

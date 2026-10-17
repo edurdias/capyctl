@@ -545,3 +545,107 @@ async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway
         native_task.abort();
     }
 }
+
+// T43 T21 (ADR 0030 §2, SPEC §10): the ingress forwards exactly
+// `POST /v1/systemone` besides chat completions, each with its own body
+// contract and fixed upstream path, for the registered served name only. A
+// decision body on the chat path, a chat body on the decision path, another
+// model, or any other path never reaches the engine; an engine's invalid
+// decision is relayed as `engine_rejected`.
+#[tokio::test]
+async fn decision_requests_pass_only_on_their_own_path_and_contract() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let body = axum::body::to_bytes(request.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push(path);
+            let (status, answer) = if value["state"] == "reject me" {
+                (400, r#"{"error":{"code":400,"message":"questions.q: \"instructions\" must be provided","type":"invalid_request_error"}}"#)
+            } else {
+                (200, r#"{"model":"model","answers":{"q":{"type":"noul","noul":0.6}},"usage":{"input_tokens":9,"output_tokens":0}}"#)
+            };
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(answer))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::new().unwrap();
+    let live = scope(1);
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress.open(&live).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let post = |path: &'static str, body: serde_json::Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    };
+    let decision = |model: &str, state: &str| {
+        serde_json::json!({"model": model, "state": state,
+            "questions": {"q": {"type": "noul", "instructions": "Angry?"}}})
+    };
+    let response = post("/v1/systemone", decision("model", "hi")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["answers"]["q"]["noul"], 0.6);
+    assert_eq!(seen.lock().unwrap().as_slice(), ["/v1/systemone"]);
+
+    let chat = serde_json::json!({"model": "model", "messages": []});
+    let mut extended = decision("model", "hi");
+    extended["chat_template_kwargs"] = serde_json::json!({});
+    for (path, body) in [
+        ("/v1/systemone", decision("other", "hi")),
+        ("/v1/systemone", chat.clone()),
+        ("/v1/systemone", extended),
+        ("/v1/chat/completions", decision("model", "hi")),
+    ] {
+        assert_eq!(
+            post(path, body.clone()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{path} {body}"
+        );
+    }
+    for path in [
+        "/v1/systemone/",
+        "/v1/systemone?stream=true",
+        "/v1/completions",
+    ] {
+        assert!(
+            !post(path, decision("model", "hi"))
+                .await
+                .status()
+                .is_success(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "nothing else reached the engine"
+    );
+
+    let response = post("/v1/systemone", decision("model", "reject me")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["error"]["code"], "engine_rejected", "{answer}");
+    assert!(answer["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("must be provided"));
+    task.abort();
+    native_task.abort();
+}

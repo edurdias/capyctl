@@ -365,13 +365,15 @@ impl Ingress {
     }
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/chat/completions", post(forward))
+            .route(Kind::Chat.path(), post(forward_chat))
+            // ADR 0030 §2: decision requests, exactly this path besides chat.
+            .route(Kind::Decision.path(), post(forward_decision))
             .fallback(|| async { failure(StatusCode::NOT_FOUND) })
             .method_not_allowed_fallback(|| async { failure(StatusCode::METHOD_NOT_ALLOWED) })
             .with_state(self)
     }
-    fn authorize(&self, request: &Request) -> Result<Arc<Entry>, IngressError> {
-        if request.uri().path() != "/v1/chat/completions"
+    fn authorize(&self, request: &Request, kind: Kind) -> Result<Arc<Entry>, IngressError> {
+        if request.uri().path() != kind.path()
             || request.uri().query().is_some()
             || request.headers().contains_key(header::CONTENT_ENCODING)
         {
@@ -400,6 +402,41 @@ impl Ingress {
         let entry = found.ok_or(IngressError)?;
         entry.current.fetch_add(1, Ordering::SeqCst);
         Ok(entry)
+    }
+}
+/// SPEC §10, ADR 0030 §2: the inference requests the ingress forwards, each on
+/// its own fixed path with its own closed body contract. Nothing else crosses.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// `POST /v1/chat/completions`.
+    Chat,
+    /// `POST /v1/systemone`, a decision request.
+    Decision,
+}
+impl Kind {
+    /// The one path this kind is accepted on and forwarded to.
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Chat => "/v1/chat/completions",
+            Self::Decision => "/v1/systemone",
+        }
+    }
+    /// SPEC §10 / T19 T21: the supported payload only; an engine-internal
+    /// field (request id, adapter path, hidden states, custom logit
+    /// processor, disaggregation bootstrap, KV transfer, engine extras,
+    /// priority) is refused before anything reaches the engine. ADR 0030 §2:
+    /// a decision request has its own contract, never the chat one.
+    fn allowed(self, body: &serde_json::Value) -> bool {
+        match self {
+            Self::Chat => capyctl_adapters::forward::chat_request_allowed(body),
+            Self::Decision => capyctl_adapters::forward::decision_request_allowed(body),
+        }
+    }
+    /// Whether the engine's answer has a media type this kind relays: a chat
+    /// completion is JSON or a stream, a decision is whole JSON.
+    fn relays(self, content: &str) -> bool {
+        content.starts_with("application/json")
+            || (matches!(self, Self::Chat) && content.starts_with("text/event-stream"))
     }
 }
 struct InFlight {
@@ -452,13 +489,19 @@ async fn engine_rejection(response: reqwest::Response) -> Response {
     )
         .into_response()
 }
-async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
+async fn forward_chat(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
+    forward(ingress, request, Kind::Chat).await
+}
+async fn forward_decision(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
+    forward(ingress, request, Kind::Decision).await
+}
+async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Response {
     // SPEC §17 (M80): the ingress clock starts when the request reaches it.
     let received = Instant::now();
     let Ok(capacity) = ingress.capacity.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS);
     };
-    let Ok(entry) = ingress.authorize(&request) else {
+    let Ok(entry) = ingress.authorize(&request, kind) else {
         return failure(StatusCode::FORBIDDEN);
     };
     let guard = InFlight {
@@ -475,6 +518,7 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
     ) {
         return failure(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
+    // ADR 0030 §2: one bound for every kind; a decision's images count in it.
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
         to_bytes(request.into_body(), 8 * 1024 * 1024),
@@ -491,11 +535,7 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
     if value.get("model").and_then(serde_json::Value::as_str) != Some(entry.model.as_str()) {
         return failure(StatusCode::BAD_REQUEST);
     }
-    // SPEC §10 / T19 T21: the supported chat payload only; an engine-internal
-    // field (request id, adapter path, hidden states, custom logit processor,
-    // disaggregation bootstrap, KV transfer, engine extras, priority) is
-    // refused before anything reaches the engine.
-    if !capyctl_adapters::forward::chat_request_allowed(&value) {
+    if !kind.allowed(&value) {
         return failure(StatusCode::BAD_REQUEST);
     }
     if !entry.open.load(Ordering::SeqCst) {
@@ -512,7 +552,7 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
         Duration::from_secs(900),
         ingress
             .client
-            .post(format!("http://{}/v1/chat/completions", entry.target))
+            .post(format!("http://{}{}", entry.target, kind.path()))
             .bearer_auth(hex::encode(entry.native))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
@@ -537,7 +577,7 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !(content.starts_with("application/json") || content.starts_with("text/event-stream")) {
+    if !kind.relays(content) {
         return failure(StatusCode::BAD_GATEWAY);
     }
     entry.record(Mark::Headers, received);

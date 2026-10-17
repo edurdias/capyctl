@@ -215,9 +215,10 @@ async fn delete_of_a_stopped_deployment_removes_its_route_and_keeps_its_history(
         .lock()
         .unwrap()
         .store()
-        .list_enabled_route_ids()
+        .list_enabled_routes()
         .unwrap()
-        .contains(&"ordinary".to_string()));
+        .iter()
+        .any(|route| route.id == "ordinary"));
     assert!(!listed(&s.owner, &s.id));
     assert!(
         listed(&s.owner, &s.other),

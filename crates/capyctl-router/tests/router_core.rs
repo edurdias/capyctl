@@ -382,8 +382,20 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
     {
         Ok((route == self.route).then(|| self.row()))
     }
-    fn list_enabled_route_ids(&self) -> Result<Vec<String>, capyctl_controller::LifecycleFault> {
-        Ok(vec![self.route.clone()])
+    fn list_enabled_routes(
+        &self,
+    ) -> Result<Vec<capyctl_store::deployments::PublicRoute>, capyctl_controller::LifecycleFault>
+    {
+        Ok(vec![capyctl_store::deployments::PublicRoute {
+            id: self.route.clone(),
+            api: capyctl_config::effective::DeploymentApi::Chat,
+        }])
+    }
+    fn deployment_api(
+        &self,
+        _deployment: &str,
+    ) -> Result<capyctl_config::effective::DeploymentApi, capyctl_controller::LifecycleFault> {
+        Ok(capyctl_config::effective::DeploymentApi::Chat)
     }
     fn get_deployment(
         &self,

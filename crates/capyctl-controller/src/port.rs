@@ -14,8 +14,9 @@
 use crate::fault::LifecycleFault;
 use async_trait::async_trait;
 use capyctl_adapters::traits::WorkObservation;
+use capyctl_config::effective::DeploymentApi;
 use capyctl_domain::LifecycleState;
-use capyctl_store::deployments::{DeploymentRow, OperationRow};
+use capyctl_store::deployments::{DeploymentRow, OperationRow, PublicRoute};
 
 use crate::operations::{Controller, ControllerError, OperationHandle};
 use capyctl_domain::LifecycleAction;
@@ -100,8 +101,13 @@ pub trait LifecyclePort: Send + Sync {
         route: &str,
     ) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
-    /// Public route ids currently eligible for admission.
-    fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault>;
+    /// Public routes currently eligible for admission, each with the API its
+    /// deployment answers (ADR 0030 §5).
+    fn list_enabled_routes(&self) -> Result<Vec<PublicRoute>, LifecycleFault>;
+
+    /// ADR 0030 §2: the API a deployment's current revision serves. The
+    /// router refuses the other endpoint for it before any activation.
+    fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault>;
 
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
@@ -284,12 +290,19 @@ impl LifecyclePort for Controller {
             .find_deployment_by_route(route)
             .map_err(Into::into)
     }
-    fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault> {
+    fn list_enabled_routes(&self) -> Result<Vec<PublicRoute>, LifecycleFault> {
         self.store_ref()
             .lock()
             .unwrap()
-            .list_enabled_route_ids()
+            .list_enabled_routes()
             .map_err(Into::into)
+    }
+    fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .deployment_api(deployment)?
+            .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
     }
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
         self.store_ref()

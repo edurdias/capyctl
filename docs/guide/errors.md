@@ -110,6 +110,22 @@ A deployment on one machine can show these codes the same way:
   CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
   differently from llama.cpp v0.6.0.
 
+The inference endpoint answers HTTP errors with a JSON body holding `code` and
+`message` ([Make a request](requests.md); waiting errors are listed under
+[Errors while waiting](parking.md#errors-while-waiting)). For decision models:
+
+- `api_mismatch` (400): the request went to the endpoint the model does not
+  answer: a chat model asked on `POST /v1/systemone`, or a decision model
+  (`api: decisions`) asked on `POST /v1/chat/completions`. The message names
+  the endpoint to use; nothing was woken or sent. `GET /v1/models` shows each
+  model's API under `capyctl.api`
+  ([Decision requests](requests.md#decision-requests)).
+- `invalid_request` (400) on `POST /v1/systemone`: the body is outside the
+  decision request's fields or shapes; the message says which.
+- `engine_rejected` (400, 413 or 422): the engine refused the request as
+  invalid, for example a `choice` question without options; the message is
+  the engine's.
+
 ## Troubleshooting
 
 **A model does not start.** `capyctl status deployment <name>` shows it in

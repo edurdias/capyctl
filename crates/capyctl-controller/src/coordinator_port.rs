@@ -14,8 +14,9 @@
 
 use async_trait::async_trait;
 use capyctl_adapters::traits::WorkObservation;
+use capyctl_config::effective::DeploymentApi;
 use capyctl_domain::{LifecycleAction, LifecycleState};
-use capyctl_store::deployments::{DeploymentRow, OperationRow};
+use capyctl_store::deployments::{DeploymentRow, OperationRow, PublicRoute};
 
 use crate::coordinator::CoordinatorCommands;
 use crate::fault::LifecycleFault;
@@ -690,8 +691,14 @@ impl LifecyclePort for CoordinatorLifecycle {
             .read(|store| store.find_deployment_by_route(route))
     }
 
-    fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault> {
-        self.commands.read(|store| store.list_enabled_route_ids())
+    fn list_enabled_routes(&self) -> Result<Vec<PublicRoute>, LifecycleFault> {
+        self.commands.read(|store| store.list_enabled_routes())
+    }
+
+    fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
+        self.commands
+            .read(|store| store.deployment_api(deployment))?
+            .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
     }
 
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
