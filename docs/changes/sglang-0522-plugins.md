@@ -68,10 +68,15 @@ on the previous guard. `runtime/tests/test_sglang_entry.py` (the entry's
 (the rendered and spawned environments carry the selection);
 `capyctl-config` `engine_env` (the names are reserved; the Rust selection
 matches the guard's); `capyctl-agent` installation (only the SGLang probe
-carries it). CPU and Fake-engine tests only; not qualification. The live
-check still needed: an SGLang 0.5.22 launch on host A reaching readiness, its
-log showing `Skipping plugin smg-servicer (not in SGLANG_PLUGINS)` and
-`Skipping plugin smg-zmq`, and a 0.5.21 launch unchanged.
+carries it). CPU and Fake-engine tests only; not qualification.
+
+Live on host A, 2026-10-17, this branch built there, an isolated standalone: Clef-Flash
+(`Cloudflare/clef-flash@8b2e5fd1`, BF16) on SGLang 0.5.22 as an `api: decisions` deployment
+was ready in 165 s; its engine log shows `Skipping plugin smg-servicer (not in SGLANG_PLUGINS)`
+and `Skipping plugin smg-zmq (not in SGLANG_PLUGINS)`; a decision through the router answered in
+0.11 s, and capyctl-bench's decisions run completed (AG News 89.4%, BoolQ 89.6% on its pinned 500
+rows each). Qwen3-4B on SGLang 0.5.21 as a chat deployment was ready in 108 s and answered,
+unchanged.
 
 # Release note: Engines
 
