@@ -290,9 +290,8 @@ whatever an approval says (`engine_env_reserved:<name>`):
 CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
 a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
 installs plugins of its own (from `smg-grpc-servicer`, which it requires);
-those are left unloaded, and a launch refuses a plugin from any other package
-(ADR 0008, amendment of 2026-10-17). `SMG_*` names configure that package, which
-CapyCTL does not run.
+those are left unloaded, and a launch refuses a plugin from any other package.
+`SMG_*` names configure that package, which CapyCTL does not run.
 
 Names are compared upper-cased. `RUST_LOG`, `TOKENIZERS_PARALLELISM`,
 `PYTHONUNBUFFERED`, `MAX_JOBS` and `FLASHINFER_NVCC_THREADS` need no approval.
