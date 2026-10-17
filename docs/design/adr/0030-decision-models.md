@@ -1,11 +1,11 @@
 # ADR 0030 — Decision models (`api: decisions`, `POST /v1/systemone`)
 
-**Status:** Proposed. Owner decisions 2026-10-17: the deployment field is `api: decisions`;
+**Status:** Accepted (owner decisions 2026-10-17). The deployment field is `api: decisions`;
 decision models are the 0.1.5 release; every engine is upgraded to a version that serves
 them (SGLang 0.5.22 approved and installed; llama.cpp v0.7.0 already serves them; vLLM and
 TensorFold follow as below); the release ships recipes for Clef-Flash, Clef, Kev-4B and
-one of Julia-1 or Laya. Section 7 records three scope limits recommended for the first
-version and awaiting the owner's confirmation.
+one of Julia-1 or Laya; and the first version keeps the three scope limits of section 7.
+Nothing is implemented yet.
 **Amends:** `SPEC.md` §6.1 (readiness of a model that generates no text), §10 (the
 inference surface), §15.1/§16 (a deployment field), §20 (T43); ADR 0028 §§9, 11, 12 only
 by excluding decision deployments from groups (§7.1); ADR 0024 §1 (parsers apply to chat
@@ -122,7 +122,7 @@ so a client can tell which endpoint a model answers.
 - **TensorFold 1.0:** a separate change (a new engine integration for its native binary);
   decision models follow it.
 
-### 7. Scope of the first version (recommended, awaiting confirmation)
+### 7. Scope of the first version (owner decision 2026-10-17)
 
 1. **One machine only.** A decisions deployment with a `topology` is refused. Group
    readiness, stall detection and the group canary would each need a decision form; the
