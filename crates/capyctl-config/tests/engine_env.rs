@@ -83,6 +83,11 @@ fn owned_names_are_never_settable() {
         "CUDA_DEVICE_ORDER",
         "HF_HUB_OFFLINE",
         "TRANSFORMERS_OFFLINE",
+        // ADR 0008 amendment 2026-10-17: SGLang's plugin selection is
+        // CapyCTL's, and smg-grpc-servicer's settings are closed.
+        "SGLANG_PLUGINS",
+        "SGLANG_PLATFORM",
+        "SMG_SGLANG_ZMQ_HANDSHAKE",
     ] {
         let e = resolve_engine_env(&map(&[]), &a, &map(&[(name, "x")])).unwrap_err();
         assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
@@ -99,6 +104,29 @@ fn owned_names_are_never_settable() {
             assert!(resolve_engine_env(&map(&[(name, "x")]), approval, &map(&[])).is_err());
         }
     }
+}
+
+// T21, ADR 0008 amendment 2026-10-17: the selection CapyCTL renders is the
+// one the runtime guard accepts, and no approval reaches smg's settings.
+#[test]
+fn the_sglang_plugin_selection_matches_the_runtime_guard() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../runtime/sglang_startup_guards.py");
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(source.contains(&format!(
+        "\nNO_PLUGINS_SELECTION = \"{SGLANG_NO_PLUGINS}\"\n"
+    )));
+    assert!(matches!(
+        ApprovedEnv::parse(&["SMG_*".to_string()]),
+        Err(EnvRefusal::Reserved(_))
+    ));
+    let e = resolve_engine_env(
+        &map(&[]),
+        &approved(&["SGLANG_*", "S*"]),
+        &map(&[(SGLANG_PLUGINS, SGLANG_NO_PLUGINS)]),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), "engine_env_reserved:SGLANG_PLUGINS");
 }
 
 // T03: approval entries are validated; a bare glob and owned-only entries are refused.

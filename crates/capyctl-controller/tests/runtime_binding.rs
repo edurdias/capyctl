@@ -440,7 +440,16 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
     .unwrap()
     .unwrap();
     let command = handoff.command();
-    assert!(command.env.is_empty());
+    // T21, ADR 0008 amendment 2026-10-17: the only rendered variable is the
+    // plugin selection that loads no SGLang plugin.
+    assert_eq!(
+        command.env,
+        [(
+            "SGLANG_PLUGINS".to_owned(),
+            "capyctl-loads-no-plugins".to_owned()
+        )]
+        .into()
+    );
     assert_eq!(
         &command.argv[1..4],
         [

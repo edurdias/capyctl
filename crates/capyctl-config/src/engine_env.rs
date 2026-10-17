@@ -13,7 +13,22 @@ use std::collections::BTreeMap;
 /// ADR 0028 §2.1 rule 1: whole families CapyCTL renders or closes.
 /// `PYTHON` takes every interpreter switch (`PYTHONHOME`, `PYTHONSTARTUP`, ...);
 /// the safe name `PYTHONUNBUFFERED` is the one exception ([`is_owned`]).
-pub const OWNED_PREFIXES: &[&str] = &["NCCL_", "GLOO_", "MASTER_", "CAPYCTL_", "LD_", "PYTHON"];
+/// `SMG_` closes smg-grpc-servicer's settings (ADR 0008 amendment 2026-10-17):
+/// its SGLang plugin activates on `SMG_SGLANG_ZMQ_HANDSHAKE`.
+pub const OWNED_PREFIXES: &[&str] = &[
+    "NCCL_", "GLOO_", "MASTER_", "CAPYCTL_", "LD_", "PYTHON", "SMG_",
+];
+
+/// ADR 0008 amendment 2026-10-17, SPEC §13.3 / T21: SGLang's plugin
+/// selection, rendered into every SGLang process CapyCTL starts.
+pub const SGLANG_PLUGINS: &str = "SGLANG_PLUGINS";
+
+/// The [`SGLANG_PLUGINS`] value: a whitelist naming no entry point, so
+/// SGLang's loader (0.5.20 to 0.5.22) skips every installed plugin unloaded.
+/// SGLang 0.5.22 requires smg-grpc-servicer, which installs two. The runtime
+/// guard (`runtime/sglang_startup_guards.py` `NO_PLUGINS_SELECTION`) accepts
+/// installed plugins only under exactly this value.
+pub const SGLANG_NO_PLUGINS: &str = "capyctl-loads-no-plugins";
 
 /// ADR 0028 §2.1 rule 1: single names CapyCTL renders or closes, across all
 /// three engines.
@@ -36,6 +51,9 @@ pub const OWNED_NAMES: &[&str] = &[
     "HF_HUB_OFFLINE",
     "TRANSFORMERS_OFFLINE",
     "VLLM_PLUGINS",
+    // ADR 0008 amendment 2026-10-17: SGLang's plugin and platform selection.
+    "SGLANG_PLUGINS",
+    "SGLANG_PLATFORM",
     "VLLM_SERVER_DEV_MODE",
     "VLLM_API_KEY",
     // TensorFold reads this key (`server/authentication.py`) and then refuses

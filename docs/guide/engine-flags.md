@@ -92,7 +92,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | Metrics | `--enable-metrics` | reserved | Always on: CapyCTL reads them for load reports. |
 | Cached-token report | `--enable-cache-report` | reserved | Always on: usage reports `prompt_tokens_details.cached_tokens`, which the [per-request metrics](requests.md#per-request-metrics) show. |
 | KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
-| Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. |
+| Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. `SGLANG_PLUGINS` is set by CapyCTL and cannot be changed: SGLang loads no plugin. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |
 
 **`--enable-linear-replayssm-spec`.** This option exists in SGLang 0.5.21.

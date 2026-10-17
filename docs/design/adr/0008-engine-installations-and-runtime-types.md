@@ -316,3 +316,38 @@ separate drafter digest is recorded beside the WE3 checkpoint digest: a
 remote drafter's bytes are verified against their pin when materialized, and
 its weight bytes are re-sized at every launch with the checkpoint's; a local
 drafter, like an approved-path one, is not digested.
+
+## Amendment 2026-10-17: SGLang's own plugins, closed by selection
+
+SGLang 0.5.22 requires `smg-grpc-servicer` (`Requires-Dist:
+smg-grpc-servicer>=0.9.0`). Version 0.14.0 of that package, installed with
+it, registers two `sglang.srt.plugins` entry points: `smg-servicer` (adds a
+`--servicer-impl` option by wrapping `ServerArgs.add_cli_args`) and `smg-zmq`
+(hooks the scheduler's IPC and request intake when `SMG_SGLANG_ZMQ_HANDSHAKE`
+is set). The plugin closure of the 2026-09-23 decision refused any installed
+SGLang plugin, so every 0.5.22 launch failed `plugin_closure_failed`; found
+live on host A on 2026-10-17. SGLang 0.5.21 had none (its `smg-grpc-servicer`
+0.13.0 registers no entry point).
+
+The intent stays: no external plugin code runs in an SGLang process CapyCTL
+starts (SPEC §13.3, T21). SGLang's loader (`load_plugins_by_group`; its
+whitelist lines read the same in 0.5.20, 0.5.21 and 0.5.22) takes a nonempty
+`SGLANG_PLUGINS` as a comma-separated whitelist of entry-point names and skips
+every entry point not in it before loading it. So:
+
+- CapyCTL renders `SGLANG_PLUGINS=capyctl-loads-no-plugins` into every SGLang
+  launch, group ranks included (inherited by SGLang's spawned processes), and
+  into the capability probe. The value names no plugin.
+- `SGLANG_PLUGINS`, `SGLANG_PLATFORM` and every `SMG_*` name are CapyCTL's
+  (ADR 0028 §2.1 rule 1): neither a profile nor a deployment sets them.
+- The runtime guard, in the entry and in every spawned interpreter, accepts
+  installed general plugins only under exactly that selection, and only when
+  each comes from a distribution SGLang itself requires (`smg-grpc-servicer`)
+  and none is named as the selection. It still refuses any other selection,
+  any `SGLANG_PLATFORM`, any `SMG_*` variable, any installed platform entry
+  point, a plugin from any other distribution, a late guard and an inventory
+  it cannot read.
+
+The distribution name is the installed metadata's claim; the registered
+fingerprint and drift flag attest it, as they attest the rest of the
+installation. CPU tests only; this is not qualification.

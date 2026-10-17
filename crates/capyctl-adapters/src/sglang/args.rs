@@ -230,10 +230,16 @@ impl SglangLaunch {
                 observation.to_string(),
             ]);
         }
-        Ok(RenderedCommand {
-            argv,
-            env: Default::default(),
-        })
+        // ADR 0008 amendment 2026-10-17, SPEC §13.3 / T21: a plugin selection
+        // naming no entry point, so SGLang loads none of the plugins its own
+        // dependencies install (0.5.22: smg-grpc-servicer); spawned ranks
+        // inherit it, and the entry's guard refuses any other value.
+        let env = [(
+            capyctl_config::engine_env::SGLANG_PLUGINS.to_owned(),
+            capyctl_config::engine_env::SGLANG_NO_PLUGINS.to_owned(),
+        )]
+        .into();
+        Ok(RenderedCommand { argv, env })
     }
 
     /// ADR 0028 §10: whether this launch is a group worker (node_rank > 0),

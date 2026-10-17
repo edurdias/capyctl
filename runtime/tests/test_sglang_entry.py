@@ -872,6 +872,36 @@ class StartupTests(LaunchFixture, unittest.TestCase):
                 self.assertEqual((result, error.getvalue()),
                                  (1, "sglang_startup_failed: " + expected + "\n"))
 
+    # T21, ADR 0008 amendment 2026-10-17: found live on host A, every SGLang
+    # 0.5.22 launch failed `plugin_closure_failed` on the plugins SGLang itself
+    # requires (smg-grpc-servicer). Under CapyCTL's selection the entry
+    # launches; without it, and for another distribution's plugin, it refuses.
+    def test_sglang_required_plugins_launch_only_under_capyctl_selection(self):
+        from types import SimpleNamespace
+
+        def point(name, dist):
+            return SimpleNamespace(name=name, dist=SimpleNamespace(name=dist))
+        smg = (point("smg-servicer", "smg-grpc-servicer"), point("smg-zmq", "smg_grpc_servicer"))
+        refused = (1, "sglang_startup_failed: plugin_closure_failed\n")
+        cases = ((guards.NO_PLUGINS_SELECTION, smg, (0, "")),
+                 (None, smg, refused),
+                 (guards.NO_PLUGINS_SELECTION, smg + (point("private", "fixture"),), refused))
+        for selection, plugins, expected in cases:
+            with self.subTest(selection=selection, plugins=len(plugins)):
+                environment = {name: value for name, value in os.environ.items()
+                               if name not in ("SGLANG_PLUGINS", "SGLANG_PLATFORM")}
+                if selection is not None:
+                    environment["SGLANG_PLUGINS"] = selection
+                installed = {"sglang.srt.plugins": plugins, "sglang.srt.platforms": ()}
+                error = io.StringIO()
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        mock.patch.object(guards.importlib.metadata, "entry_points",
+                                          side_effect=lambda group: installed[group]), \
+                        mock.patch.object(entry, "_import_and_launch") as launch:
+                    result = entry.main(self.argv(), self.payloads().__getitem__, error)
+                self.assertEqual((result, error.getvalue()), expected)
+                self.assertEqual(launch.called, expected[0] == 0)
+
     def test_composition_denial_category_renders_from_main(self):
         # compose's own categories pass through the conversion verbatim; the
         # placement category is unreachable from today's invocation (the

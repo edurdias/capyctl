@@ -553,6 +553,12 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
         env.get("CAPYCTL_EXTRA_APPROVALS").map(String::as_str),
         Some(r#"{"options":[],"paths":[],"trust_remote_code":false}"#)
     );
+    // T21, ADR 0008 amendment 2026-10-17: SGLang 0.5.22 installs plugins of
+    // its own; the launch's selection names none of them, so none loads.
+    assert_eq!(
+        env.get("SGLANG_PLUGINS").map(String::as_str),
+        Some("capyctl-loads-no-plugins")
+    );
     let rendered = argv.join(" ");
     for secret in [INFERENCE, ADMIN] {
         assert!(!rendered.contains(secret), "a credential reached argv");
