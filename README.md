@@ -23,17 +23,17 @@ mutual TLS. [How it works](docs/guide/how-it-works.md) has a picture.
 
 ## Status
 
-0.1.3 is the latest release (0.1.0 was the first). It is early software: expect rough edges and
+0.1.4 is the latest release (0.1.0 was the first). It is early software: expect rough edges and
 breaking changes between minor versions while the version starts with 0.
 
-What works in 0.1.3:
+What works in 0.1.4:
 
 - vLLM, SGLang, TensorFold and llama.cpp engines, one GPU per model, on unified-memory
   machines and on discrete NVIDIA cards, where CapyCTL counts the card's memory apart from
   host RAM and picks the GPU on a machine with several.
 - One machine (standalone) or a server with several GPU hosts.
 - One model across two machines (`tensor_parallel: 2` over a direct link) with vLLM,
-  SGLang (restart only) and TensorFold.
+  SGLang and TensorFold (restart only).
 - Parking, waking and switching models under a memory budget; on a discrete
   card, parking into host RAM.
 - An OpenAI-compatible API (`/v1/models`, `/v1/chat/completions`), with
@@ -66,7 +66,7 @@ capyctl --version
 
 The installer checks every download against the release's `SHA256SUMS` and
 refuses on a mismatch. To install a particular release, add
-`-s -- --version v0.1.3`. See [`docs/guide/install.md`](docs/guide/install.md)
+`-s -- --version v0.1.4`. See [`docs/guide/install.md`](docs/guide/install.md)
 to get started, and [`docs/operations/install.md`](docs/operations/install.md)
 for services, upgrades and rollback. Building from source needs stable Rust
 and `protoc` (`sudo apt install protobuf-compiler`), on ARM64 too:
@@ -83,7 +83,7 @@ capyctl start standalone          # inference on 0.0.0.0:8443, API key required
 ```
 
 ```text
-capyctl 0.1.3 standalone ready
+capyctl 0.1.4 standalone ready
 
   Inference     0.0.0.0:8443 (API key required)
   Management    127.0.0.1:7443
@@ -208,7 +208,7 @@ capyctl park deployment <name>
 ```text
 $ capyctl list hosts
 NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.3     supported       46.5 GiB / 77.2 GiB     vllm
+gpu-box   online   yes        0.1.4     supported       46.5 GiB / 77.2 GiB     vllm
 
 $ capyctl list deployments
 NAME           STATE    READY   REVISION   HOSTS

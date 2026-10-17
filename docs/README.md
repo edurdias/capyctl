@@ -1,6 +1,6 @@
 # capyctl documentation
 
-This directory holds the user documentation for capyctl 0.1.3 and the design and
+This directory holds the user documentation for capyctl 0.1.4 and the design and
 process records its contributors work from. The project overview and
 quickstart are in the repository [`README.md`](../README.md).
 
@@ -15,6 +15,7 @@ quickstart are in the repository [`README.md`](../README.md).
 | [`operations/release-notes-0.1.1.md`](operations/release-notes-0.1.1.md) | Release notes for 0.1.1. |
 | [`operations/release-notes-0.1.2.md`](operations/release-notes-0.1.2.md) | Release notes for 0.1.2. |
 | [`operations/release-notes-0.1.3.md`](operations/release-notes-0.1.3.md) | Release notes for 0.1.3. |
+| [`operations/release-notes-0.1.4.md`](operations/release-notes-0.1.4.md) | Release notes for 0.1.4. |
 | [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management, inference on all interfaces behind the API key, networked enrollment and control listeners. |
 | [`examples/host.yaml`](examples/host.yaml) | Host role document: private ingress, unified-memory resource policy, placement labels, and vLLM and SGLang installations. |
 | [`examples/host-discrete.yaml`](examples/host-discrete.yaml) | Host role document for a discrete-GPU host (one 24 GB NVIDIA card): a `system` host-RAM domain and a `gpu0` device domain. |
