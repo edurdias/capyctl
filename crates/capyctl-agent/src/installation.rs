@@ -611,6 +611,14 @@ pub fn probe_capabilities(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
+    // ADR 0008 amendment 2026-10-17: the probe's guard runs the launch's plugin
+    // closure, which accepts SGLang's own plugins only under this selection.
+    if matches!(engine, Engine::Sglang) {
+        command.env(
+            capyctl_config::engine_env::SGLANG_PLUGINS,
+            capyctl_config::engine_env::SGLANG_NO_PLUGINS,
+        );
+    }
     // SPEC §13.2: its own group, so registered with the role's reaper, which
     // leaves its exit status to the wait below.
     let mut child = capyctl_launchers::subreaper::spawn_direct(&mut command).ok()?;
@@ -1119,6 +1127,44 @@ mod tests {
             None,
             "a probe that does not answer in time is unknown"
         );
+    }
+
+    // T21, ADR 0008 amendment 2026-10-17: the SGLang probe's plugin closure
+    // sees the launch's plugin selection (SGLang 0.5.22 installs plugins of
+    // its own); no other engine's probe is given it.
+    #[test]
+    fn only_the_sglang_probe_carries_the_plugin_selection() {
+        for (engine, expected) in [
+            (
+                Engine::Sglang,
+                capyctl_config::engine_env::SGLANG_NO_PLUGINS,
+            ),
+            (Engine::Vllm, "unset"),
+        ] {
+            let dir = venv(engine, "0.5.22");
+            let runtime = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let script = runtime.path().join(PROBE_SCRIPT);
+            std::fs::write(&script, "# helper\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let executable = dir.path().join("bin/python3");
+            let seen = dir.path().join("seen");
+            capyctl_config::test_support::write_executable(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"${{SGLANG_PLUGINS-unset}}\" > '{}'\n",
+                    seen.display()
+                ),
+                0o755,
+            )
+            .unwrap();
+            assert_eq!(
+                probe_capabilities(engine, &executable, runtime.path(), PROBE_TIMEOUT),
+                None
+            );
+            assert_eq!(std::fs::read_to_string(&seen).unwrap(), expected);
+        }
     }
 
     /// A llama.cpp binary in `bin` with a shared library beside it.

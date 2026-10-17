@@ -89,9 +89,14 @@ flag is process-local and is not persisted. Plugin, capability, checkpoint, and
 placement checks remain enforced in either mode.
 
 `enforce_closed_plugins()` rejects already imported `sglang`, `torch`,
-`transformers`, or `torch_memory_saver` roots and submodules, nonempty
-plugin/platform environment selectors, and installed entry points in either
-SGLang plugin group without loading their targets. Run it before imports in
+`transformers`, or `torch_memory_saver` roots and submodules, any
+`SGLANG_PLATFORM`, any `SGLANG_PLUGINS` other than CapyCTL's
+`capyctl-loads-no-plugins` selection, any `SMG_*` variable, installed platform
+entry points, and installed general plugins, without loading their targets.
+Under exactly that selection, which names no entry point so SGLang's loader
+skips every plugin, it accepts general plugins from the distributions SGLang
+itself requires (`smg-grpc-servicer`, a dependency of SGLang 0.5.22) and no
+others. Run it before imports in
 every spawned Python interpreter under trusted immutable package/metadata/search
 paths. The no-site isolated launch disables automatic `site` initialization;
 production composition still needs explicit verified package roots, without

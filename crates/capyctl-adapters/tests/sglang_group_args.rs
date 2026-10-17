@@ -225,6 +225,12 @@ fn only_the_worker_command_carries_no_credentials() {
             "4"
         ]
     );
+    // T21, ADR 0008 amendment 2026-10-17: every rank's interpreter loads no
+    // SGLang plugin.
+    assert_eq!(
+        command.env.get("SGLANG_PLUGINS").map(String::as_str),
+        Some("capyctl-loads-no-plugins")
+    );
     // A worker is never handed API credential descriptors, and a deep one is
     // never rendered without its observation credential.
     for fds in [
@@ -285,6 +291,10 @@ fn only_the_worker_command_carries_no_credentials() {
                 "--admin-credential-fd",
                 "5"
             ]
+        );
+        assert_eq!(
+            command.env.get("SGLANG_PLUGINS").map(String::as_str),
+            Some("capyctl-loads-no-plugins")
         );
     }
     assert!(ProtectedDescriptorFds::for_worker(2, None).is_err());

@@ -31,15 +31,32 @@ Pinned plugin contract 94602c9c2b7cbdb8efd5c52802dac6a1c180089e:
 plugins.load_plugins_by_group discovers importlib.metadata entry_points for both
 sglang.srt.plugins and sglang.srt.platforms. platforms._resolve_platform also has
 a direct entry_points(...).load() path when SGLANG_PLATFORM is selected. Empty
-SGLANG_PLUGINS means unrestricted, NOT disabled. Reject BOTH installed groups and
-nonempty selectors without importing entry-point targets. Thus the engine's
-load_plugins and platform defaults have no external plugin to execute, provided
-the installed metadata is what the host registered. This does not deny built-in
-hooks, arbitrary package imports, or unreviewed/new loader paths. ADR 0008
-(owner decision 2026-09-23): no pinned source audit backs this any more; the
-installation's registered fingerprint and drift flag, and the launch-time
-capability probes (engine_capabilities.py), take its place, and neither attests
-the complete import graph.
+SGLANG_PLUGINS means unrestricted, NOT disabled. Reject the installed platforms
+group and a nonempty SGLANG_PLATFORM without importing entry-point targets. Thus
+the engine's load_plugins and platform defaults have no external plugin to
+execute, provided the installed metadata is what the host registered. This does
+not deny built-in hooks, arbitrary package imports, or unreviewed/new loader
+paths. ADR 0008 (owner decision 2026-09-23): no pinned source audit backs this
+any more; the installation's registered fingerprint and drift flag, and the
+launch-time capability probes (engine_capabilities.py), take its place, and
+neither attests the complete import graph.
+
+ADR 0008 amendment 2026-10-17: SGLang 0.5.22 requires smg-grpc-servicer
+(Requires-Dist smg-grpc-servicer>=0.9.0), whose 0.14.0 registers two
+sglang.srt.plugins entry points (smg-servicer, smg-zmq), so every 0.5.22
+installation has plugins. Read on an installed 0.5.22 that day,
+sglang/srt/plugins/__init__.py::load_plugins_by_group (0.5.20 and 0.5.21 read
+the same): a nonempty SGLANG_PLUGINS is a comma-separated whitelist of
+entry-point names, and an entry point whose name is not in it is skipped
+before ep.load(); the diffusion loader reads the same variable. CapyCTL renders
+SGLANG_PLUGINS=NO_PLUGINS_SELECTION into every SGLang process it starts, a name
+no entry point may carry, so the loader imports none. Installed general
+plugins are accepted only under exactly that selection, and only when each
+comes from a distribution SGLang itself requires (REQUIRED_PLUGIN_DISTRIBUTIONS);
+an unknown distribution's plugin is still refused. Any SMG_* variable is
+refused too: smg's zmq plugin activates on SMG_SGLANG_ZMQ_HANDSHAKE. The
+distribution name is the installed metadata's claim, attested only as far as
+the registered fingerprint attests the installation.
 """
 
 import importlib.metadata
@@ -61,8 +78,27 @@ class StartupGuardError(Exception):
         super().__init__(code)
 
 
+# ADR 0008 amendment 2026-10-17: the SGLANG_PLUGINS value CapyCTL renders
+# (`capyctl_config::engine_env::SGLANG_NO_PLUGINS`); a whitelist naming no
+# entry point, so SGLang's loader loads none.
+NO_PLUGINS_SELECTION = "capyctl-loads-no-plugins"
+# Distributions SGLang requires that register sglang.srt.plugins entry points
+# (SGLang 0.5.22: Requires-Dist smg-grpc-servicer>=0.9.0). Normalized names.
+REQUIRED_PLUGIN_DISTRIBUTIONS = frozenset({"smg-grpc-servicer"})
+# smg's own settings; its zmq plugin activates on SMG_SGLANG_ZMQ_HANDSHAKE.
+_PLUGIN_SETTING_PREFIX = "SMG_"
+
+
+def _required_plugin(point):
+    """Whether an installed general plugin is one SGLang itself requires."""
+    if point.name.strip() == NO_PLUGINS_SELECTION or point.dist is None:
+        return False
+    name = re.sub(r"[-_.]+", "-", point.dist.name).lower()
+    return name in REQUIRED_PLUGIN_DISTRIBUTIONS
+
+
 def enforce_closed_plugins():
-    """Preimport observation of no external plugins, not an enduring capability.
+    """Preimport observation of no loadable external plugin, not an enduring capability.
 
     Metadata enumeration loads no entry-point targets. Failure to enumerate is a
     denial. Caller must independently attest immutable packages, source and search
@@ -75,12 +111,18 @@ def enforce_closed_plugins():
     if any(name == root or name.startswith(root + ".")
            for name in sys.modules for root in native_roots):
         raise StartupGuardError("native_already_imported") from None
-    if any(os.environ.get(name) for name in ("SGLANG_PLUGINS", "SGLANG_PLATFORM")):
+    selection = os.environ.get("SGLANG_PLUGINS")
+    if (os.environ.get("SGLANG_PLATFORM")
+            or (selection and selection != NO_PLUGINS_SELECTION)
+            or any(name.upper().startswith(_PLUGIN_SETTING_PREFIX) for name in os.environ)):
         raise StartupGuardError("external_plugin_selection") from None
     try:
-        for group in ("sglang.srt.platforms", "sglang.srt.plugins"):
-            if tuple(importlib.metadata.entry_points(group=group)):
-                raise StartupGuardError("external_plugins_present")
+        if tuple(importlib.metadata.entry_points(group="sglang.srt.platforms")):
+            raise StartupGuardError("external_plugins_present")
+        plugins = tuple(importlib.metadata.entry_points(group="sglang.srt.plugins"))
+        if plugins and (selection != NO_PLUGINS_SELECTION
+                        or not all(_required_plugin(point) for point in plugins)):
+            raise StartupGuardError("external_plugins_present")
     except StartupGuardError:
         raise
     except Exception:

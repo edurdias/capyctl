@@ -11,6 +11,9 @@ import venv
 
 
 ROOT = str(Path(__file__).resolve().parents[2])
+# ADR 0008 amendment 2026-10-17: the SGLANG_PLUGINS selection CapyCTL renders
+# (runtime/sglang_startup_guards.py NO_PLUGINS_SELECTION).
+NO_PLUGINS_SELECTION = "capyctl-loads-no-plugins"
 
 
 class StartupGuardsTests(unittest.TestCase):
@@ -108,6 +111,113 @@ class StartupGuardsTests(unittest.TestCase):
                     raise AssertionError("selection accepted")
             ''')
             self.assertEqual(child.returncode, 0, child.stderr)
+
+    # SGLang 0.5.22's smg-grpc-servicer 0.14.0 entry points, as installed.
+    SMG_PLUGINS = ("[sglang.srt.plugins]\n"
+                   "smg-servicer = smg_grpc_servicer.sglang.plugin:register\n"
+                   "smg-zmq = smg_grpc_servicer.sglang.zmq_plugin:register\n")
+
+    @staticmethod
+    def install(root, name, entry_points):
+        dist = Path(root, name.replace("-", "_") + "-1.0.dist-info")
+        dist.mkdir()
+        (dist / "METADATA").write_text(f"Name: {name}\nVersion: 1.0\n")
+        (dist / "entry_points.txt").write_text(entry_points)
+
+    def closure(self, root, environment, expected):
+        """Run the guard in a fresh child over `root`'s installed metadata."""
+        child = self.child(f'''
+            from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError
+            import os
+            sys.path.insert(0, {root!r})
+            for name in ("SGLANG_PLUGINS", "SGLANG_PLATFORM"):
+                os.environ.pop(name, None)
+            os.environ.update({environment!r})
+            try:
+                enforce_closed_plugins()
+                outcome = None
+            except StartupGuardError as error:
+                outcome = str(error)
+            assert not any(n.startswith(("smg_grpc_servicer", "module_that_must_not_load"))
+                           for n in sys.modules)
+            assert outcome == {expected!r}, outcome
+        ''')
+        self.assertEqual(child.returncode, 0, child.stderr)
+
+    # T21, ADR 0008 amendment 2026-10-17: SGLang 0.5.22 requires
+    # smg-grpc-servicer, whose plugins are installed with every 0.5.22. Under
+    # CapyCTL's selection, which names none of them, SGLang loads none; found
+    # live on host A, where every 0.5.22 launch failed plugin_closure_failed.
+    def test_sglang_required_plugins_pass_only_under_capyctl_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.install(root, "smg-grpc-servicer", self.SMG_PLUGINS)
+            self.closure(root, {"SGLANG_PLUGINS": NO_PLUGINS_SELECTION}, None)
+            for environment in ({}, {"SGLANG_PLUGINS": ""}):
+                with self.subTest(environment=environment):
+                    self.closure(root, environment, "external_plugins_present")
+
+    def test_unknown_distribution_plugin_refused_under_capyctl_selection(self):
+        selected = {"SGLANG_PLUGINS": NO_PLUGINS_SELECTION}
+        for required in (False, True):
+            with self.subTest(required=required), tempfile.TemporaryDirectory() as root:
+                if required:
+                    self.install(root, "smg-grpc-servicer", self.SMG_PLUGINS)
+                self.install(root, "fixture",
+                             "[sglang.srt.plugins]\nprivate = module_that_must_not_load:run\n")
+                self.closure(root, selected, "external_plugins_present")
+        # A required distribution's plugin named as the selection would load.
+        with tempfile.TemporaryDirectory() as root:
+            self.install(root, "smg-grpc-servicer",
+                         f"[sglang.srt.plugins]\n{NO_PLUGINS_SELECTION} = "
+                         "module_that_must_not_load:run\n")
+            self.closure(root, selected, "external_plugins_present")
+
+    def test_platform_entry_point_refused_under_capyctl_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.install(root, "smg-grpc-servicer",
+                         "[sglang.srt.platforms]\nprivate = module_that_must_not_load:run\n")
+            self.closure(root, {"SGLANG_PLUGINS": NO_PLUGINS_SELECTION},
+                         "external_plugins_present")
+
+    def test_other_selections_and_smg_settings_refused(self):
+        selected = {"SGLANG_PLUGINS": NO_PLUGINS_SELECTION}
+        with tempfile.TemporaryDirectory() as root:
+            self.install(root, "smg-grpc-servicer", self.SMG_PLUGINS)
+            for environment in (
+                    {"SGLANG_PLUGINS": "smg-zmq"},
+                    {"SGLANG_PLUGINS": NO_PLUGINS_SELECTION + ",smg-zmq"},
+                    {"SGLANG_PLUGINS": " " + NO_PLUGINS_SELECTION},
+                    {**selected, "SGLANG_PLATFORM": "cuda"},
+                    {**selected, "SMG_SGLANG_ZMQ_HANDSHAKE": "tcp://127.0.0.1:1"},
+                    {**selected, "SMG_SGLANG_ZMQ_ENGINE_INDEX": "0"},
+                    {**selected, "smg_sglang_servicer_impl": "rust"}):
+                with self.subTest(environment=environment):
+                    self.closure(root, environment, "external_plugin_selection")
+
+    def test_capyctl_selection_reaches_spawned_interpreters_and_their_guard(self):
+        # The scheduler children inherit the selection; their __mp_main__
+        # guard runs over the same installed metadata before unpickling.
+        for handshake in (False, True):
+            with self.subTest(handshake=handshake), tempfile.TemporaryDirectory() as root:
+                self.install(root, "smg-grpc-servicer", self.SMG_PLUGINS)
+                child = self.child(f'''
+                    import multiprocessing, os
+                    sys.path.insert(0, {root!r})
+                    os.environ.pop("SGLANG_PLATFORM", None)
+                    os.environ["SGLANG_PLUGINS"] = {NO_PLUGINS_SELECTION!r}
+                    if {handshake!r}:
+                        os.environ["SMG_SGLANG_ZMQ_HANDSHAKE"] = "tcp://127.0.0.1:1"
+                    sys.modules["__main__"].__file__ = {str(Path(ROOT, "runtime/sglang_entry.py"))!r}
+                    process = multiprocessing.get_context("spawn").Process(target=id, args=(0,))
+                    process.start()
+                    process.join(5)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(2)
+                        raise AssertionError("spawn did not finish")
+                    assert process.exitcode == {1 if handshake else 0}, process.exitcode
+                ''')
+                self.assertEqual(child.returncode, 0, child.stderr)
 
     def test_debug_opt_in_preserves_output_but_still_rejects_plugins(self):
         child = self.child("""

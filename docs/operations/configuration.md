@@ -277,15 +277,22 @@ CapyCTL owns these names; neither a profile nor a deployment can set them,
 whatever an approval says (`engine_env_reserved:<name>`):
 
 - prefixes `NCCL_`, `GLOO_`, `MASTER_`, `CAPYCTL_`, `LD_`, `PYTHON` (except
-  `PYTHONUNBUFFERED`);
+  `PYTHONUNBUFFERED`), `SMG_`;
 - `VLLM_HOST_IP`, `SGLANG_HOST_IP`, `HOST_IP`, `SGLANG_LOCAL_IP_NIC`,
   `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`, `TF_COMM_BACKEND`, `TF_NCCL_LIB`,
   `PATH`, `PYTHONPATH`, `CUDA_HOME`, `CUDA_VISIBLE_DEVICES`, `HOME`,
   `CUDA_DEVICE_ORDER`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`,
-  `VLLM_PLUGINS`, `VLLM_SERVER_DEV_MODE`, `VLLM_API_KEY`,
-  `TORCH_EXTENSIONS_DIR`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`,
+  `VLLM_PLUGINS`, `SGLANG_PLUGINS`, `SGLANG_PLATFORM`, `VLLM_SERVER_DEV_MODE`,
+  `VLLM_API_KEY`, `TORCH_EXTENSIONS_DIR`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`,
   `TENSORFOLD_NO_UPDATE_CHECK`, `VLLM_PORT`,
   `VLLM_ALLOW_INSECURE_SERIALIZATION`.
+
+CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
+a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
+installs plugins of its own (from `smg-grpc-servicer`, which it requires);
+those are left unloaded, and a launch refuses a plugin from any other package
+(ADR 0008, amendment of 2026-10-17). `SMG_*` names configure that package, which
+CapyCTL does not run.
 
 Names are compared upper-cased. `RUST_LOG`, `TOKENIZERS_PARALLELISM`,
 `PYTHONUNBUFFERED`, `MAX_JOBS` and `FLASHINFER_NVCC_THREADS` need no approval.

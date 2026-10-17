@@ -86,7 +86,16 @@ fn public_args(launch: &SglangLaunch) -> Value {
             "5"
         ]
     );
-    assert!(command.env.is_empty());
+    // T21, ADR 0008 amendment 2026-10-17: the only rendered variable is the
+    // plugin selection that loads no SGLang plugin.
+    assert_eq!(
+        command.env,
+        [(
+            "SGLANG_PLUGINS".to_owned(),
+            "capyctl-loads-no-plugins".to_owned()
+        )]
+        .into()
+    );
     serde_json::from_str(&command.argv[4]).unwrap()
 }
 
