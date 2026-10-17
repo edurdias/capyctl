@@ -94,6 +94,13 @@ pub const CHECKPOINT_TABLES: &str = "checkpoint_tables";
 /// `host_capability_missing:checkpoint_gguf` for such a launch before
 /// anything is sent; every other launch needs nothing.
 pub const CHECKPOINT_GGUF: &str = "checkpoint_gguf";
+/// ADR 0030 §1: the host serves decision models (`api: decisions`): it
+/// resolves the field, proves such a deployment ready with a decision rather
+/// than generated text, and forwards `/v1/systemone`. The server places a
+/// decisions deployment only on a host that declared it; any other host is
+/// refused `host_capability_missing:decisions` before anything is sent, so an
+/// older host never receives a deployment whose checks it would run as chat.
+pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -137,6 +144,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (ENGINE_LOG_TAIL, Direction::ServerToHost),
     (CHECKPOINT_TABLES, Direction::ServerToHost),
     (CHECKPOINT_GGUF, Direction::ServerToHost),
+    (DECISIONS, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -298,6 +306,12 @@ pub fn is_gate_refusal(reason: &str) -> bool {
 /// calls this before it sends anything for the group.
 pub fn group_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
     (!host_capabilities.contains(ENGINE_GROUPS)).then(|| missing(ENGINE_GROUPS))
+}
+
+/// ADR 0030 §1: the typed refusal for placing a decisions deployment on a
+/// host that did not declare `decisions`, or `None` when it may be placed.
+pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(DECISIONS)).then(|| missing(DECISIONS))
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state

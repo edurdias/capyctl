@@ -692,6 +692,8 @@ fn registry_targets(
     fail_fast: bool,
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, config_json)?;
+    let decisions = capyctl_config::decisions::check_document(&config)?
+        == capyctl_config::effective::DeploymentApi::Decisions;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
     let group = spec.group.as_ref();
     let allowed: Vec<String> = match &spec.placement.hosts {
@@ -791,6 +793,32 @@ fn registry_targets(
                 &mut refusals,
             ));
             continue;
+        }
+        // ADR 0030 §1: a decisions deployment is never placed on a host that
+        // did not declare `decisions` (ADR 0017); such a host is recorded
+        // refused, typed, and is sent nothing.
+        if decisions {
+            let declared: std::collections::BTreeSet<String> = store
+                .host_version(&publication.host_id)
+                .map_err(|_| ConfigurationFailure::Internal)?
+                .map(|version| version.capabilities.into_iter().collect())
+                .unwrap_or_default();
+            if let Some(code) = capyctl_protocol::capabilities::decisions_refusal(&declared) {
+                single = Some(refuse(
+                    capyctl_config::ConfigError::new(
+                        capyctl_config::ConfigErrorCode::UnsupportedCombination,
+                        "api",
+                        format!(
+                            "{code}: host `{selector}` cannot serve decision models; \
+                             upgrade its agent"
+                        ),
+                    )
+                    .into(),
+                    &code,
+                    &mut refusals,
+                ));
+                continue;
+            }
         }
         let Ok(trusted) =
             capyctl_config::remote_resources::scope_host_document(&publication.host_id, &original)

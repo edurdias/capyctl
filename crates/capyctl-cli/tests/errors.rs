@@ -339,6 +339,10 @@ fn group_codes_map_to_exits() {
         // ADR 0023 §2, ADR 0028 §16: an existing code keeps its exit when a
         // configuration refusal carries it (it was classed invalid_config).
         ("capability_missing:deep_park", 5),
+        // T43 (ADR 0030 §1): an installation or a host that cannot serve
+        // decision models.
+        ("capability_missing:decisions", 5),
+        ("host_capability_missing:decisions", 5),
     ];
     for (code, exit) in cases {
         let direct = StructuredError {

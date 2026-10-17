@@ -252,6 +252,12 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0030 §1: a host too old to serve decision models.
+    (
+        "host_capability_missing:decisions",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0023 §2: an existing code keeps its exit when a configuration
     // refusal carries it (`capability_missing:deep_park`).
     (

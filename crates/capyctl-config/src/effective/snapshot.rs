@@ -99,6 +99,11 @@ pub(super) fn snapshot_inputs(
         "request_deadline": quantity(&value["request_deadline_ms"], "ms")?,
         "engine_config": engine_config,
     });
+    // ADR 0030 §1: the API is frozen only when it is not the default; a
+    // revision that states none serves chat, as every revision did before.
+    if let Some(api) = value.get("api") {
+        deployment["api"] = api.clone();
+    }
     // ADR 0028 §2.1: the deployment's engine environment is stored with its
     // values in `engine_env`; its deployment entries are restated as declared,
     // and the exact-equality check below proves the claim.

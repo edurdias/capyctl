@@ -80,6 +80,41 @@ Add a field to choose something yourself, for example:
 
 Every other field is in [Configuration files](configuration.md).
 
+## Decision models
+
+A decision model answers typed questions about an input with a probability
+for every option, instead of generating text. It is served at
+`POST /v1/systemone` rather than at chat completions. Say so with `api`:
+
+```yaml title="decider.yaml"
+name: decider
+engine: llamacpp
+model: Clef-Flash-GGUF
+api: decisions
+engine_config:
+  context_length: 8192
+```
+
+`api` is `chat` when you leave it out. It is part of the deployment's
+revision: the same weights served as `chat` and as `decisions` are two
+revisions. In this release a `decisions` deployment:
+
+- needs llama.cpp 0.7.0 or newer, or SGLang 0.5.22 or newer, registered with
+  `capyctl engine add` (which records the engine's version). vLLM and
+  TensorFold are refused with `capability_missing:decisions`
+  ([Exit codes and errors](errors.md));
+- runs on one machine: a `topology` is refused;
+- restarts instead of parking: `residency` is `restart_only`, and `deep` or
+  `host_backed` is refused;
+- has no tool-call or reasoning parser: `tool_call_parser`,
+  `reasoning_parser` and those options in `extra_args` are refused;
+- runs only on machines whose CapyCTL serves decision models; an older one is
+  never chosen, and naming it is refused with
+  `host_capability_missing:decisions`.
+
+`capyctl status deployment <name>` shows an `API` line for it (`"api":
+"decisions"` with `--json`); a chat deployment has neither.
+
 ## Deploy and start
 
 ```bash

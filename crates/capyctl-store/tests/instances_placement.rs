@@ -54,12 +54,19 @@ fn two_hosts(managed_limit: &str) -> TwoHosts {
 }
 
 fn two_hosts_sharing(managed_limit: &str, sharing: &str) -> TwoHosts {
+    two_hosts_with(golden(), managed_limit, sharing)
+}
+
+fn two_hosts_with(
+    (mut config, mut host): (Value, Value),
+    managed_limit: &str,
+    sharing: &str,
+) -> TwoHosts {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("instances.sqlite3");
     let store = Store::open(&path).unwrap();
     let sql = Connection::open(&path).unwrap();
     let session = store.begin_coordinator_session().unwrap();
-    let (mut config, mut host) = golden();
     host["resource_policy"]["domains"]["unified"]["managed_limit"] = json!(managed_limit);
     host["resource_policy"]["devices"]["gpu0"]["sharing"] = json!(sharing);
     host["resource_policy"]["device_sharing"] = json!(sharing);
@@ -2261,5 +2268,80 @@ fn an_abandoned_retirement_expires_at_its_deadline() {
     assert_eq!(
         t.store.profile_candidates("host-a", "local").unwrap().len(),
         1
+    );
+}
+
+/// The SGLang golden as a decisions deployment on SGLang 0.5.22 (ADR 0030).
+fn decisions_golden() -> (Value, Value) {
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-sglang-golden.json"
+    ))
+    .unwrap();
+    let (mut deployment, mut host) = (
+        golden["input"]["deployment"].clone(),
+        golden["input"]["host"].clone(),
+    );
+    host["runtime_profiles"]["local"]["build_fingerprint"] = json!("0.5.22");
+    deployment.as_object_mut().unwrap().remove("residency");
+    deployment["api"] = json!("decisions");
+    (deployment, host)
+}
+
+impl TwoHosts {
+    /// `host` declared `capabilities` on its latest session (ADR 0017).
+    fn declared(&self, host: &str, capabilities: &[&str]) {
+        self.store
+            .record_host_version(
+                host,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.1.5".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+                    recorded_at_ms: NOW,
+                },
+            )
+            .unwrap();
+    }
+}
+
+/// ADR 0030 §1: a decisions deployment is placed only on a host that
+/// declared `decisions`; the host that would otherwise win (spread, ties by
+/// host id) is passed over. A chat deployment on the same hosts is placed as
+/// before, and status names the api only for decisions.
+// T43 T34
+#[test]
+fn a_decisions_deployment_is_never_placed_on_a_host_without_the_capability() {
+    let t = two_hosts_with(decisions_golden(), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups"]);
+    t.declared("host-b", &["engine_groups", "decisions"]);
+    let id = t.deploy("deploy", json!({})).deployment_id;
+    assert_eq!(
+        t.status(&id).api,
+        capyctl_config::effective::DeploymentApi::Decisions
+    );
+    t.start(&id, "start", StartScope::All, None);
+    let planned = t.planned(&id);
+    assert_eq!(
+        planned
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-b")],
+    );
+
+    let t = two_hosts_with(decisions_golden(), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups"]);
+    t.declared("host-b", &["engine_groups", "decisions"]);
+    let id = t.deploy("deploy", json!({"api": "chat"})).deployment_id;
+    let status = serde_json::to_value(t.status(&id)).unwrap();
+    assert!(status.get("api").is_none(), "{status}");
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(
+        t.planned(&id)
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-a")],
     );
 }

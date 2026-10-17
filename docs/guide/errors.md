@@ -38,6 +38,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `group_instances_unsupported` | `instances` above 1 with a `topology`. | Deploy one group per deployment. |
 | 5 | `group_drift:<field>` | The engine changed a multi-machine setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
 | 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
+| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM, TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, or an installation whose registered build names no version. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add` ([Decision models](deploy.md#decision-models)). |
+| 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
 | 7 | `device_conflict` | Another deployment holds the GPU exclusively. | Stop that deployment or choose another device. |
 | 8 | `category_limit` | A host limit on how many models of this kind may run was reached. | Stop one, or raise the limit in the host document. |

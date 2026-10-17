@@ -416,6 +416,10 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
     let object = deployment
         .as_object()
         .ok_or_else(|| invalid("deployment", "must be a mapping"))?;
+    // ADR 0030 §7: a decisions deployment's document-level refusals (one
+    // machine, no parking), here so every path that validates the document's
+    // shape refuses them first, before any group or placement rule.
+    crate::decisions::check_document(deployment)?;
     let instances = match object.get("instances") {
         None | Some(Value::Null) => 1,
         Some(value) => bounded_count(value, "instances", MAX_INSTANCES)?,

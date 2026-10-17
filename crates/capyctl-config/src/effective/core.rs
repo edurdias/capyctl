@@ -15,6 +15,8 @@ pub(super) struct NormalizedProfile {
 }
 
 pub(super) struct NormalizedRecipe {
+    /// ADR 0030 §1: the API the revision serves, part of its identity.
+    pub(super) api: DeploymentApi,
     pub(super) model: ModelIdentity,
     pub(super) recipe: String,
     pub(super) residency: Residency,
@@ -851,6 +853,11 @@ pub(super) fn recipe_fingerprint(
     #[derive(Serialize)]
     struct Recipe<'a> {
         model: &'a ModelIdentity,
+        // ADR 0030 §1: the same checkpoint served as chat and as decisions
+        // are two revisions. Absent while `chat`, so every existing
+        // fingerprint keeps its identity.
+        #[serde(skip_serializing_if = "DeploymentApi::is_chat")]
+        api: DeploymentApi,
         recipe: &'a str,
         residency: Residency,
         recovery: Recovery,
@@ -886,6 +893,7 @@ pub(super) fn recipe_fingerprint(
         environment_fingerprint: &'a str,
     }
     let material = Recipe {
+        api: d.api,
         model: &d.model,
         recipe: &d.recipe,
         residency: d.residency,

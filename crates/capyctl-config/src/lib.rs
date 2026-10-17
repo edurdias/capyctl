@@ -6,6 +6,8 @@ pub mod checkpoint_layout;
 // ADR 0014 §5 (owner decision 2026-09-25): context fitted to the KV grant.
 pub mod context_fit;
 pub mod defaults;
+// ADR 0030 §1, §7: what a deployment serving decision models may resolve to.
+pub mod decisions;
 // Owner decision 2026-09-25 (ADR 0014 amendment): the minimal deployment file
 // and the defaults that complete it, shared by every role.
 pub mod deployment_defaults;
