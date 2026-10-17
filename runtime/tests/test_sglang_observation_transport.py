@@ -473,13 +473,23 @@ class ObservationTransportTests(unittest.TestCase):
         def no_safe_point():
             client, thread, _ = self.connect(transport)
             client.sendall(self.frame(request_id="request-slow", timeout_ms=50))
-            self.assertIsNone(self.read_response(client))
+            replies.append(self.read_response(client))
             thread.join(3)
+        replies = []
         [line] = self.served_lines(no_safe_point)
         # The bridge expires the slot at the same deadline the transport sends
-        # by, so its uncertain frame never goes out: the stop is at `send`.
-        self.assertEqual((line["outcome"], line["stage"], line["frame"], line["timeout_ms"]),
-                         ("uncertain", "send", False, 50))
+        # by. Usually that deadline passes first and no frame goes out: the stop
+        # is at `send`. When the bridge's expiry is seen just before it, its
+        # correlated uncertain frame is sent instead (found failing once under
+        # load, 2026-10-16). Either way the outcome is uncertain and nothing
+        # claims an observation.
+        [reply] = replies
+        if reply is None:
+            self.assertEqual((line["stage"], line["frame"]), ("send", False))
+        else:
+            self.assertEqual((reply["status"], reply["request_id"]), ("uncertain", "request-slow"))
+            self.assertEqual((line["stage"], line["frame"]), (None, True))
+        self.assertEqual((line["outcome"], line["timeout_ms"]), ("uncertain", 50))
         self.assertEqual((line["ticks"], line["wait_ms"], line["stored"]), (0, None, None))
         # Asked, and at most the bridge's own expiry came back.
         self.assertIsInstance(line["request_ms"], int)
