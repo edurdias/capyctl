@@ -1,5 +1,323 @@
 # Current implementation and launch status
 
+## 0.1.4 release preparation — 2026-10-17
+
+Version bumped to 0.1.4 with release notes in
+`docs/operations/release-notes-0.1.4.md`, assembled from the 13 change files by
+`scripts/assemble-changes.sh 0.1.4` and edited into one note (SGLang groups park again,
+`engine add --allow-remote-code`, the startup reservation in `status`, `capyctl version`
+with the commit, engine latency in standalone, Nemotron 3.5 Super VL refused parking on
+vLLM, and known issues). The owner decided on 2026-10-17 to release what is merged as
+0.1.4 and to make decision models (`api: decisions`, `POST /v1/systemone`) 0.1.5.
+
+Owner approval 2026-10-17: SGLang 0.5.22 on both hosts, for decision models
+(`~/sglang-0.5.22-venv`: sglang 0.5.22, torch 2.14.1+cu130 with the GPU visible,
+`torch_memory_saver` 0.0.10, `/v1/systemone` with Clef's joint schema head). Installed;
+not yet run through CapyCTL, and not listed as supported in the guides.
+
+Open for the owner: recipes PR #30 (Super VL with prefix caching off and the long-prompt
+table), and the 3.6 × weights startup placeholder for a parking vLLM deployment (Super VL
+measured 1.33 ×). CPU and Fake-engine tests are not qualification.
+
+## SGLang observation transport test accepts both outcomes of its deadline race — 2026-10-17 (branch `test/observation-transport-deadline-race`)
+
+`test_each_connection_reports_where_it_stopped_and_what_the_scheduler_did` failed once in a local
+`ci-local` run (2026-10-16) and passed on reruns. In its first case the bridge expires the
+request's slot at the same deadline the transport sends by. Usually the transport's deadline
+passes first and no frame goes out (stage `send`); when the bridge's expiry is polled just
+before it, the transport sends the correlated `uncertain` frame instead, which the transport's
+contract allows ("valid observer failures may receive a correlated uncertain frame"). The test
+asserted only the first. It now accepts either, and in both requires the outcome `uncertain`,
+no observation, and a frame (if any) correlated to the request. Evidence: 120 runs on one core
+under six busy-loop processes gave 103 runs without a frame and 17 with the uncertain frame
+(each of those would have failed before), no failures. No product code changed.
+
+## gpt-oss wake rechecked on vLLM 0.31.0; 0.1.4 status entry — 2026-10-16 (branch `fix/deep-wake-families-vllm-031`)
+
+gpt-oss-20b was served by vLLM 0.31.0 alone on host A with sleep mode, put to sleep at level 2, woken and its weights reloaded (the deep park and wake CapyCTL performs). The reload logged `OAIAttention: Failed to load weights` for each of the 24 attention layers, as on 0.30.0, and the engine failed its first request and shut down. The gpt-oss family rule in `DEEP_WAKE_BROKEN_FAMILIES` now records both vLLM versions; its behavior is unchanged. The same check of Gemma 4 26B-A4B NVFP4 still answered garbled text after the wake, while the BF16 Gemma 4 E2B answered identically before and after, so no family rule was added for Gemma: the fault is with that checkpoint and the wake canary catches it. The status runbook gains the 0.1.4 progress entry.
+
+## Group parks and wakes commit only fresh member reports; SGLang groups park again — 2026-10-16 (branch `fix/sglang-group-wake`)
+
+Found live 2026-10-15 at MN4 (SGLang 0.5.21, TP2 across two GB10 hosts): a group deep park completed, but the wake failed twice. The head reloaded its weights for 186-222 s, the readiness probe and the 8-token canary ran, and the restore went `restore_uncertain` and the group stopped. For 0.1.3 SGLang groups were made `restart_only` (ADR 0028 note of 2026-10-15). The live failure text was not kept.
+
+Cause, found in the controller (ADR 0028 note of 2026-10-16): `wake_group` read every member's own host report, then ran the head's readiness probe and the canary, then the worker committed those reports. The store accepts a report only while it is within its host's observation TTL (`fresh`, 2 s by default and on the lab hosts), so probes that took longer than that made the reports stale at the commit: `Rejected("evidence freshness")`, `group_member_uncertain`, group stop. vLLM's probes are fast, so its wakes passed. The group world reproduces it with head probes that outlast the TTL.
+
+A park can hit the same rule. Found live 2026-10-16 on this branch's first MN4 SGLang run: the first park went `park_uncertain` with `evidence freshness` 9 s after acceptance and the group was stopped. The members settle at different times (each host pushes its reports on its own period; an SGLang member's saver map about every 2 s, and a park also waits for a residue sampled after the head's reply), and `collect` kept each member's first settling report while it waited for the others, so the earliest could be older than the TTL when the last settled. The two 0.1.3 SGLang parks that passed did so by timing.
+
+- `collect` hands the commit only reports that are fresh by the store's rule. The worker reads the TTL the step's commit applies (`Store::group_residency_observation_ttl`: the observation TTL of the host policy `complete_group_residency` checks against) into `ResidencyTarget::observation_ttl`. Every poll asks every member's host again, settled members included (never keeping an older report over a newer one, and keeping a residue already measured after the head's reply when a round's process sample cannot be read), and returns only when each member's latest report settles and is between 0 and the TTL less `FRESHNESS_MARGIN` (300 ms, at most half the TTL) old by the controller's clock, the one the commit uses. A member with no report that young by the end of the evidence window is silent (`group_member_uncertain`, charge kept); one still resident (or asleep) still fails the group at its rank. Park and wake, vLLM and SGLang.
+- `wake_group` (`crates/capyctl-controller/src/group_residency.rs`) keeps its first read of every member's report (a rank not resident still fails the group at that rank before the head is probed), and once the canary passed reads every member's own report again with a fresh `since`, observed after the canary, and returns those for the commit. Same rules: each member on its own host's report, the bounded evidence window (from the canary), the collective sent once.
+- A single launch's deep wake had the same order: the restore's evidence, then the canary, then `complete_residency` against the same TTL. `EngineAdapter::wake_canary` now answers a `CanaryAnswer` (the probe's answer and when it was observed: this host's clock for an embedded vLLM or SGLang engine, the host agent's for a remote launch). Once the canary passed, the worker commits the restore's evidence as observed with the canary's answer; an embedded engine's processes are checked alive again first, and a remote canary counts only when the host's reply has the claim retained and names the launch's engine alive (`same_engine`, as a restore's result must). An engine without a canary keeps the restore's own evidence.
+- SGLang groups park again: `group_support("sglang").deep_park` is true, `resolve_effective_with_checkpoint`'s group-member `restart_only` default is removed (an SGLang group with no residency resolves `deep`), and `deep` is accepted at deploy. `check_engine_shape` still refuses both parking tiers for an engine whose group cannot park (TensorFold).
+- Docs: `docs/guide/engines.md` (groups table, the 0.1.3 note replaced) and `docs/guide/several-machines.md` (park and wake) say SGLang groups park and wake again. ADR 0028 keeps its note of 2026-10-15 and adds one of 2026-10-16. The live row MN4 runs the deep cycles for SGLang again (`scripts/live/matrix/rows/MN4.sh`, `gen_group.py`, the matrix README).
+
+Tests (T20, T03, T22). Group world (`crates/capyctl-controller/src/coordinator/tests_groups.rs`): `a_wake_whose_probes_outlast_the_observation_ttl_completes` (vLLM and SGLang, each head probe a little over half the TTL) failed before the change with `group_member_uncertain: the members' reports were not accepted: ... evidence freshness` and passes now. `members_reporting_out_of_phase_park_and_wake_on_fresh_reports` (vLLM and SGLang; a 700 ms TTL, host B reporting each change of its rank 1.1 s after it, so host A's first settling report is stale when host B's settles) failed before the `collect` change with `vllm: the park failed: group_member_uncertain: the members' reports were not accepted: ... evidence freshness` and passes now. `park_needs_every_rank`, `a_park_settles_on_released_device_memory_and_charges_each_members_residue`, `a_member_without_evidence_of_its_own_fails_the_park_within_the_window`, `wake_canary_mismatch_stops_the_group` and `repeated_cycles_are_clean` run SGLang deep groups beside vLLM ones; `sglang_deep_group_with_differing_paths_is_refused` expects `group_model_path_mismatch` again. Single launch (`tests_residency.rs`): `a_wake_whose_canary_outlasts_the_observation_ttl_completes` (compound and stepwise restore, the canary answered one TTL and a second later) failed before with `wake_uncertain` and passes now. Config (`crates/capyctl-config/tests/topology.rs`): `vllm_and_sglang_groups_resolve_deep_by_default` replaces `sglang_group_resolves_restart_only_and_refuses_parking`; `engine_shape_support` accepts SGLang `deep` and still refuses TensorFold `deep` and `host_backed`. CPU and Fake-engine tests are not qualification.
+
+Live, 2026-10-16, both lab hosts, server on the control host (SGLang 0.5.21, vLLM 0.31.0, the two GB10 hosts over the direct link). The first MN4 SGLang run (commit `2e9e7d14`, before the `collect` change) failed its first park with `evidence freshness`, as described above. With the `collect` change (`23744456`): MN4 SGLang (TP2, Qwen3-30B-A3B) passed five deep park and wake cycles, five `parked` and five `restored` journal entries, the same processes and the canary matching on every wake; parks settled in about 15 s and wakes, which reload the weights from disk, took about 190 s. MN4 vLLM passed its five cycles unchanged. On this branch rebased onto `main` (`38330292`), the single-machine rows passed on host A: M29 vLLM (deep park, a wake on request in 81 s, the same processes, the reference answer with a log-probability difference of 0.0) and M28 SGLang (the same, the wake in 196 s). The final stop of each group needed SIGKILL after SIGTERM for its members (`group_member_escalated`), as in 0.1.3; every process was gone. CPU and Fake-engine tests are not qualification; these live rows are the evidence for this change.
+
+## Nemotron 3.5 Super VL is not parked on vLLM — 2026-10-16 (branch `fix/supervl-deep-wake-refusal`)
+
+In the recipe runs for Nemotron 3.5 Super VL (NVFP4) on vLLM 0.31.0, every deep park's wake
+failed CapyCTL's wake canary (`wake_mismatch`), with and without a drafter, so the model was
+stopped after each wake. vLLM alone reproduces it on host A, with no CapyCTL: served with
+`--enable-sleep-mode` (8k context, one sequence), a greedy prompt answered the same prose twice;
+after `/sleep?level=2`, `/wake_up` and `reload_weights` (the deep park and wake CapyCTL performs)
+the same prompt repeated `</think>` to the token limit, twice. The defect is in vLLM's sleep and
+reload of this model, not in CapyCTL; the canary caught it as designed.
+
+The checkpoint's family (`model_type: nemotron_h_omni`, architecture
+`NemotronH_Omni_Reasoning_V3`) joins gpt-oss in `DEEP_WAKE_BROKEN_FAMILIES` for vLLM, so a
+parking deployment of it is refused at deploy with `capability_missing:deep_park` instead of
+failing at its first wake. `residency: restart_only` serves it, as the recipe does. The
+text-only Nemotron H family (`nemotron_h`) is not affected by the rule. The parking guide now
+lists the models CapyCTL refuses to park.
+
+Test (T21, T22): `nemotron_super_vl_refuses_parking_on_vllm_only` in
+`crates/capyctl-config/tests/deep_wake_refusal.rs` (fails before, passes after). CPU tests only;
+not qualification.
+
+## `capyctl version` reports the build commit; standalone records engine latency — 2026-10-16 (branch `fix/version-commit-and-standalone-latency`)
+
+Two small 0.1.4 items.
+
+**Build commit.** `capyctl --version` printed only `capyctl 0.1.3`, while the
+release tarball's BUILDINFO records the commit (`commit: 345806a5…`), so a
+binary could not say which commit it came from. `packaging/release.sh` now
+exports `CAPYCTL_BUILD_COMMIT` for the compile (the BUILDINFO commit, `-dirty`
+appended for a tree built with `CAPYCTL_RELEASE_ALLOW_DIRTY=1`), and a new
+`capyctl version` command prints `capyctl <version>` and then `commit: <sha>`
+(`--json`: `{"name", "version", "commit"}`, `commit` null for a build that
+recorded none, such as a plain `cargo build`). `capyctl --version` is
+unchanged on purpose: `packaging/install.sh` compares its whole output with
+`capyctl <version>`, as do `scripts/verify-packaging.sh` and
+`scripts/test-install.sh`, and an installer from an earlier release would
+refuse a newer binary whose `--version` grew a second line. Keeping that line
+and adding a subcommand changes no consumer. The commit is fixed for a given
+commit, so rebuilding it stays byte-identical, and the shipped-binary check's
+rebuild sees the same exported value. `scripts/verify-packaging.sh` now also
+checks that `capyctl version` reports BUILDINFO's commit. The install guide,
+SUPPORT.md, the bug report template and the release build section of
+`docs/operations/install.md` say where the commit is.
+
+**Standalone engine latency.** Found live 2026-10-10: standalone's latency
+read (`GET /management/v1/metrics/latency`, and `latency` in `capyctl status
+deployment --json`) carried router series only. `EmbeddedLoad::tick` accepted
+each report's load sample into its load table but dropped the engine latency
+histograms the same reports carry, so `source: engine` series were absent on
+standalone for every engine. A server records a host's reports into its
+latency table before the load table (`agent_sessions`); `EmbeddedLoad` now
+does the same into its own `LatencyTable` (SPEC §17, M80), and standalone
+reads that table in its latency view and for the timing header's engine
+family, as a server reads its hosts'. There is still no ingress tier on
+standalone: it has no host ingress.
+
+Tests: `standalone_reports_its_engine_latency` (T40, `roles_f1`) boots
+standalone with an SGLang-shaped Fake engine at the launch's endpoint whose
+`/metrics` carries a time-to-first-token histogram; the latency read shows
+the instance as `sglang` with an `engine_time_to_first_token` series, `tier:
+engine`, `source: engine`, count 2. It failed before the change (no instance
+in the read at all). `version_keeps_the_installer_line_and_adds_the_build_commit`
+(`terminal_output`) checks that `--version` is exactly `capyctl <version>`,
+that `capyctl version` starts with that line and that its JSON carries the
+recorded commit; it passes with and without `CAPYCTL_BUILD_COMMIT` set for the
+build. CPU and Fake-engine tests are not qualification; the live check still
+needed is a standalone run on a native vLLM or SGLang engine reading engine
+series from the latency view.
+
+## Status shows the whole-host startup reservation of an unmeasured model — 2026-10-16 (branch `fix/startup-placeholder-deep`)
+
+Found live 2026-10-16 (Nemotron 3.5 Super VL 120B-A12B NVFP4 on vLLM 0.31.0, one GB10 of
+121 GiB, standalone managed limit raised to 108 GiB): every new parking deployment
+(`residency: deep`, the default) of the model, `engine_config.memory.request: 96GiB`, showed
+`startup` 284713418881 bytes (265.2 GiB, provenance `default`) in `status deployment`, more
+than the machine has. The checkpoint weighs 76328140836 bytes with the LiLiCorr drafter's
+files (75010188240 without, which showed 260.7 GiB for the MTP deployments).
+
+The figure is the placeholder exactly as specified, not an arithmetic fault. A parking vLLM
+deployment gets `--safetensors-load-strategy eager`, so its placeholder uses
+`VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6, ADR 0014 amendment A21):
+`max(request + graphs, weights × 3.6 + 8 GiB)` = 76328140836 × 18 / 5 + 8 GiB =
+282.4e9 bytes, plus the 1.25 GiB CUDA context placeholder every derived cold phase carries:
+284713418881. With `residency: restart_only` the loader stays vLLM's default and the factor
+is 2.25 (about 169 GiB); those deployments showed 97.2 GiB only because their first start
+had already been measured.
+
+What was wrong is the status figure, not admission. Owner decision 2026-09-23 (solo first
+start, ADR 0015 amendment of 2026-09-23): an unmeasured placeholder above the managed limit,
+with a steady request that fits, makes the start reserve the whole managed limit, alone on
+its host, provenance `whole_host`. `frozen_plan_startup` did that for every start here (the
+265 GiB cold phase could not have passed the arm against a 108 GiB limit; the session always
+started on an emptied host). But the deployment's `startup` in status
+(`ordinary_lifecycle/startup.rs`, `status`) re-implemented only the measured and
+weighed-placeholder branches of `frozen_plan_startup` and never its whole-host branch, so it
+showed the placeholder as `default`, contrary to the owner decision of 2026-10-07 that status
+shows the figure admission reserves. Only an instance still starting showed `whole_host`.
+`status` now calls `frozen_plan_startup` itself, so the two cannot drift again: such a
+deployment shows `bytes` = the managed limit, provenance `whole_host`, until a first start is
+measured.
+
+Measurement of deep first starts: they are recorded. Decoding the commands' request
+identities against `measured_at_ms` shows the peaks of `supervl-vllm`, `-nosr`, `-nospec` and
+`-nopc` (deep) and of `-ro7` and `nemotron-super-vl` (restart only) recorded within a second or
+three of Ready (the later stop requests of the session followed Ready immediately, which made
+some look recorded at stop). The five deployments with no row (`-lc5`, `-lc5-4seq`,
+`-lc7-4seq`, `-mtp3`, `-mtp5`) are the configurations started for the first time with a new
+speculative or concurrency shape, whose starts took 308 to 892 s against 166 to 188 s for the
+same shapes once warm. [INFERENCE] Their samples fell inside reported kernel builds, which
+ADR 0014 amendment A12 leaves out, or the start was contended; the engine logs that would
+show which were not kept. Status lists every recorded row, so it is not a display issue, and
+each such start keeps reserving the whole managed limit until one is measured, as specified.
+
+Open for the owner, not changed here: the measured eager-loader peak of this model on deep
+park was 101695578112 bytes (94.7 GiB, 1.33 × the weights), against the 3.6 × the weights
+amendment A21 derived from one Qwen3.6-35B-A3B NVFP4 run.
+
+Tests: `status_shows_the_whole_host_a_start_above_the_managed_limit_reserves`
+(`capyctl-controller`, `coordinator/tests_startup.rs`) resolves the live shape (parking
+vLLM, request 96 GiB, 76328140836 bytes of weights, managed limit 108 GiB), checks the
+placeholder is 284713418881 and that status shows `whole_host` 108 GiB, the same figure the
+start then holds; it failed before the fix (status `default`, 284713418881).
+`an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measured` and
+`weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start` asserted the old
+status figure and now assert `whole_host` at the managed limit. CPU and Fake-engine tests
+only; not qualification. Live check still needed: a new parking deployment of a model whose
+placeholder is above the managed limit shows `whole_host` at the limit before and during its
+first start, and `measured` after it.
+
+## `engine add --allow-remote-code` — 2026-10-16 (branch `feat/engine-add-remote-code`)
+
+A deployment with `engine_config.trust_remote_code: true` is refused unless its
+installation has `security.trust_remote_code: true` (Spec §3, ADR 0014 §8), and
+`capyctl engine add` always wrote `false`. Serving Nemotron 3.5 Super VL on vLLM
+needed checkpoint code, so `engines.yaml` had to be edited by hand and the role
+restarted.
+
+`capyctl engine add` now takes `--allow-remote-code`, which writes
+`security.trust_remote_code: true` for the new profile (`ProfileSpec` carries the
+switch, so the environment profiles built from `local_engine.trust_remote_code`
+use the same field instead of patching the document afterwards). The result
+reports `trust_remote_code`, and the text view adds `Remote code   allowed` when
+it is set. TensorFold and llama.cpp have no remote-code option and already refuse
+`trust_remote_code: true` in a deployment (ADR 0023 §4, ADR 0029 §5), so
+`engine add --allow-remote-code` is refused for them with `capability_missing`
+before anything runs or is written. The deploy-time refusal keeps its text and
+now names `capyctl engine add --allow-remote-code` (and `--trust-remote-code true`
+for the role's own engine); the refusal of a profile argument
+`--trust-remote-code` names the option too.
+
+Tests: `add_allows_checkpoint_code_only_when_asked` (engine_cli) adds one vLLM
+profile with the option and one without, then validates a deployment with
+`trust_remote_code: true` against each through `capyctl validate config`: the
+first resolves, the second is refused naming `--allow-remote-code`. The
+TensorFold and llama.cpp add tests assert the refusal and that nothing is
+written or run. CPU and Fake-engine tests are not qualification; the live check
+still needed is registering the vLLM installation on a lab host with
+`--allow-remote-code` and deploying Nemotron 3.5 Super VL on it without editing
+`engines.yaml`.
+
+## Runbook: September entries archived — 2026-10-16 (branch `docs/runbook-archive-2026-09`)
+
+`docs/runbooks/f2-current-status.md` had grown to 6,815 lines, half of them entries up to
+2026-09-30 and planning sections written before the rename to CapyCTL (milestones, open
+questions, owner attention items such as a September driver question on host A) that no
+longer describe the current state. They move unchanged to
+`docs/runbooks/archive/f2-status-2026-09.md` (a byte-for-byte split, checked with `cmp`; two
+relative ADR links adjusted for the new directory), and the runbook ends with a pointer to
+them. The runbook keeps every entry from the 0.1.0 release candidate (2026-10-01) on.
+
+## llama.cpp v0.7.0 build approved on both hosts — 2026-10-16 (branch `feat/nemotron-3.5-llamacpp-070`)
+
+Owner approval 2026-10-16: a llama.cpp v0.7.0 build (tag commit `620d222`) in the home
+directory of host A and host B, for Nemotron 3.5 Bolt 74B-A9B 24GB and Nemotron 3.5 Super VL
+120B-A12B. v0.7.0 adds both architectures and the LiLiCorr drafter; v0.6.0 has neither.
+AGENTS.md lists the build. `scripts/live/llamacpp-build.sh` takes `LLAMACPP_TAG=v0.7.0`
+and checks the tag's commit as it does for v0.6.0; any other tag is refused. Built on both
+hosts on 2026-10-16: `version: 0.7.0 (build 1, commit 620d222)`, fingerprint `0.7.0+620d222`,
+byte-identical binaries and libraries on the two hosts (`llama-server` sha256 `af2ea2c8…`).
+CapyCTL 0.1.3 registers it unchanged (custom, as every llama.cpp build) and runs Bolt and Super VL
+with stated `resources`, the LiLiCorr drafter through the approved `--spec-draft-model`, vision
+through `llamacpp.mmproj_file`; text, tool calls, images and streaming pass through the router.
+
+## Docs show the current engine versions — 2026-10-16 (branch `docs/current-engine-versions`)
+
+The guides still showed the engine versions of their first writing (vLLM 0.29.0, SGLang 0.5.20,
+TensorFold 0.6.0 and 0.6.1) after 0.1.3 verified vLLM 0.31.0 and TensorFold 0.6.6. All three
+stay supported; the docs now lead with the newest.
+
+- **"First model on each engine" was re-run live** on host A with the published 0.1.3
+  binary (isolated config, state and prefix; checkpoints from the shared cache), vLLM 0.31.0,
+  SGLang 0.5.21 and TensorFold 0.6.6. Ready in 53 s, 91 s and 109 s (TensorFold restart
+  after stop: 12 s); every chat answered. The output blocks are that run's. The Qwen3 answers no
+  longer carry `<think></think>` in `content`: the reasoning parser CapyCTL picks moves it to
+  `reasoning` (vLLM) or `reasoning_content` (SGLang). Everything was removed afterwards.
+  Evidence: `target/live/docs-walkthrough-0.1.3/`.
+- **Install an engine:** the vLLM steps pin 0.31.0 (0.30.0 and 0.29.0 named as alternatives,
+  all on PyTorch 2.13.0) and link vLLM's 0.31.0 guide.
+- **Engine options:** the vLLM table covers 0.30 and 0.31 and lists 0.31's logging options
+  (`--log-level`, `--log-config-file`, `--logging-config`) as reserved, which the deploy-time
+  policy already does; `engine_flag_table` checks the row.
+- **Requests:** the streamed-field and per-request-metrics tables include vLLM 0.31.
+- **Illustrative output** (engine detect, add and list, the example host documents'
+  `build_fingerprint`): vLLM 0.31.0, SGLang 0.5.21, TensorFold 0.6.6, and a 0.32.0rc1 nightly
+  for the custom-build example. The site's transcript capture uses the same versions; its
+  one-machine part was rerun with the 0.1.3 binary and printed these lines.
+- **Stale release references:** `multi_gpu_unsupported` no longer says "one GPU per model in
+  0.1.0 ... planned after 0.1.0" (in the error and in the install guide); it points to
+  `topology` for a model across machines. The `engines.yaml` compatibility note dates the
+  skip of an unknown engine's profile to 0.1.2 instead of "this release".
+- The groups table says its versions are the ones the two-machine live runs used.
+
+Measured figures attributed to a version (wake times, memory, sources read) keep the version
+they were measured on.
+
+## Launcher tests wait for reparented zombies to be reaped — 2026-10-16 (branch `test/launchers-orphan-zombie`)
+
+`owned_launch::tests::an_unrecorded_worker_of_a_dead_held_leader_is_terminated` failed once in
+hosted CI (PR #130): right after `terminate_escalating` returned, `observe_group` still listed the
+terminated worker. The worker had exited (`runs` read false), but its leader died first, so it
+was reparented to init and stayed a zombie in the process group until init reaped it, which on a
+loaded runner is not immediate. Four tests asserted an empty group at the very next scan; they
+now go through `assert_group_empties`, which allows up to 5 s for the group to empty. The
+product path is unchanged: Terminate already treats an exited process as gone. Test only;
+`cargo test -p capyctl-launchers --lib owned_launch` passed 6 of 6 times under 4 cores.
+
+## Live rows: the harness files #126 left out — 2026-10-15 (branch `test/live-rows-harness-followup`)
+
+PR #126 (MN1–MN8 and LC1–LC6) merged without eight of the harness files the rows ran with, which
+stayed uncommitted when the change was ported to a clean branch. This adds them exactly as they
+ran in the three live sessions (identical to `test/live-rows-0.1.3`):
+
+- `lib.sh`: the run server's loopback ports (`CAPYCTL_SERVER_MGMT_PORT` and
+  `CAPYCTL_SERVER_INFER_PORT`, for a control host already serving 7443/8443), and the harness's
+  own tmux server (`tmux -L capyctl-mx`; an old tmux server passed an 8 MiB memlock to the host
+  roles, which broke NCCL at group bring-up).
+- `roles.sh` and `gen_host_doc.py`: each host document declares `resource_policy.groups` (its
+  direct-link peer address and rendezvous ports) and a TensorFold profile when
+  `TENSORFOLD_VENV_DIR` is set.
+- `ledger.py`: the read-only `group` and `members` views.
+- `fault.sh member`: signals a group member's spawned process by its recorded identity.
+- `hosts.example.env`, `README.md`, `rows/ENG2.sh`: the new variables, the MN and LC rows,
+  and the `local` profile name.
+
+Harness only; no product change. Checks: `bash -n`, `scripts/ci-local.sh --only shellcheck`,
+`python3 -m unittest discover -s scripts/live/matrix/tests`.
+
+## Releasing: per-architecture packaging checks and installing a draft — 2026-10-15 (branch `docs/releasing-draft-install`)
+
+Found while releasing 0.1.3. `releasing.md` step 3 suggested passing both tarballs to
+`scripts/verify-packaging.sh`; the script checks only the first and runs its binary, so the
+aarch64 tarball failed on an x86_64 machine (`Exec format error`, and the install tests looked
+for a tarball of the host's architecture). Each architecture is now checked on a machine of that
+architecture (0.1.3: x86_64 on a maintainer machine, aarch64 on a GB10, 24 checks each, no SKIP),
+with a temporary `SHELLCHECK` binary where none is installed.
+
+Step 5 said a draft installs with `gh auth login` or `GITHUB_TOKEN`. GitHub's release-by-tag API
+returns 404 for a draft, so `install.sh` with only a token reports the release as not found. The
+step now gives the two ways that work: `gh` logged in on the host, or the draft's assets copied
+into a directory and `CAPYCTL_INSTALL_BASE_URL=file://...` (the installer still verifies
+`SHA256SUMS`), with `PREFIX` to keep the check apart from an installed capyctl. It also names
+the several-machines guide for the server and host (both on one machine), since the one-machine
+guide covers standalone only. Docs only; no behaviour changed.
+
 ## 0.1.4 in progress — 2026-10-16
 
 Merged on `main` since 0.1.3, each with `ci-local` and the deep workspace suite

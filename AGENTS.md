@@ -4,7 +4,7 @@ Rust controller for managing inference-engine deployments on hardware that canno
 keep all model weights resident. The primary audience is home users and prosumers
 running models on GPU machines they own.
 
-Current phase: 0.1.3 on `main` (multi-node groups qualified on two hosts: vLLM
+Current phase: 0.1.4 on `main` (multi-node groups qualified on two hosts: vLLM
 and SGLang with deep parking, TensorFold TP2). Releases are
 published as GitHub releases; release candidates as
 pre-releases.
@@ -120,8 +120,9 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-10-16):
-  - both hosts: SGLang 0.5.21, vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
+  environments in use, all owner-approved (list updated 2026-10-17):
+  - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
+    models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
     owner approval; 0.6.6 approved 2026-10-14), and a llama.cpp v0.7.0 build in the
     home directory (approved 2026-10-16, for Nemotron 3.5 Bolt and Super VL);
