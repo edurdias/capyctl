@@ -566,6 +566,23 @@ message ExecuteMember {
   // in `MemberExecutionResult.probe_tokens`. Zero is the readiness probe,
   // which encodes exactly as before.
   uint32 probe_max_tokens = 16;
+  // ADR 0030 §4 (additive): with `probe_owned_handle` only, and never with
+  // `probe_max_tokens`, the decision probe of a decisions launch. The host
+  // sends the deployment's fixed `/v1/systemone` decision request to the
+  // retained launch, on loopback with the launch's own key, and answers in
+  // `MemberExecutionResult.probe_decision`. False encodes exactly as before.
+  bool probe_decision = 18;
+}
+// ADR 0030 §4 (additive): one option's probability in a decision probe's answer.
+message DecisionProbability {
+  string option = 1;
+  double probability = 2;
+}
+// ADR 0030 §4 (additive): the answer to the fixed decision probe.
+message DecisionProbeEvidence {
+  uint32 probe_version = 1;
+  string choice = 2;
+  repeated DecisionProbability probabilities = 3;
 }
 // ADR 0016: one process identity as the server recorded it.
 message RecordedProcess {
@@ -661,6 +678,9 @@ message MemberExecutionResult {
   // launch's wake canary compare text when the engine answers no token ids.
   // Empty otherwise, which encodes exactly as before.
   string probe_text = 19;
+  // ADR 0030 §4 (additive): a completed decision probe only, the answer it
+  // returned. Absent otherwise, which encodes exactly as before.
+  DecisionProbeEvidence probe_decision = 20;
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;

@@ -31,6 +31,12 @@ pub(crate) struct LifecycleState {
     /// Such a Fake also follows the embedded vLLM residency contract: Park
     /// without a prior Drain, and a readiness Probe after a wake.
     pub(crate) members_override: Option<Vec<ProcessIdentity>>,
+    /// ADR 0030 §3: a decision model's `/v1/systemone` response, set by the
+    /// Fake before each step; its ordinary Initialize is then proven ready by
+    /// the fixed decision probe instead of a chat answer.
+    pub(crate) decisions: Option<serde_json::Value>,
+    /// Decision probes the last step sent, collected by the Fake.
+    pub(crate) decision_probes: u64,
 }
 impl LifecycleState {
     pub(crate) fn cleanup(
@@ -352,15 +358,23 @@ impl LifecycleState {
                     && self.weights
                     && self.cache =>
             {
-                let model = format!("candidate-{}", c.token.deployment_id);
-                let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: CAPYCTL_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
-                let result = self.forward(&body).map_err(|_| {
-                    RuntimeError::Uncertain("Fake wake readiness probe failed".into())
-                })?;
-                if result["choices"][0]["message"]["content"] != "CAPYCTL_READY_13" {
-                    return Err(RuntimeError::Uncertain(
-                        "Fake wake readiness probe failed".into(),
-                    ));
+                // ADR 0030 §3: a decision model answers the fixed decision.
+                if let Some(response) = &self.decisions {
+                    self.decision_probes += 1;
+                    capyctl_adapters::decision_probe::answer(response).map_err(|_| {
+                        RuntimeError::Uncertain("Fake wake decision probe failed".into())
+                    })?;
+                } else {
+                    let model = format!("candidate-{}", c.token.deployment_id);
+                    let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: CAPYCTL_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
+                    let result = self.forward(&body).map_err(|_| {
+                        RuntimeError::Uncertain("Fake wake readiness probe failed".into())
+                    })?;
+                    if result["choices"][0]["message"]["content"] != "CAPYCTL_READY_13" {
+                        return Err(RuntimeError::Uncertain(
+                            "Fake wake readiness probe failed".into(),
+                        ));
+                    }
                 }
                 vec![Milestone::ModelUsable]
             }
@@ -368,17 +382,28 @@ impl LifecycleState {
         };
         if ordinary {
             let model = format!("candidate-{}", c.token.deployment_id);
-            let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: CAPYCTL_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
-            let result = self.forward(&body).map_err(|_| {
-                RuntimeError::Uncertain("ordinary Fake readiness probe failed".into())
-            })?;
-            if result["model"] != model
-                || result["choices"][0]["message"]["content"] != "CAPYCTL_READY_13"
-                || result["choices"][0]["finish_reason"] != "stop"
-            {
-                return Err(RuntimeError::Uncertain(
-                    "ordinary Fake readiness probe failed".into(),
-                ));
+            if let Some(response) = &self.decisions {
+                // ADR 0030 §3, SPEC §6.1: a decision model is ready only on a
+                // complete, well-formed answer to the fixed decision; it is
+                // never sent a chat probe.
+                self.decision_probes += 1;
+                self.work_sequence += 1;
+                capyctl_adapters::decision_probe::answer(response).map_err(|_| {
+                    RuntimeError::Uncertain("ordinary Fake decision probe failed".into())
+                })?;
+            } else {
+                let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: CAPYCTL_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
+                let result = self.forward(&body).map_err(|_| {
+                    RuntimeError::Uncertain("ordinary Fake readiness probe failed".into())
+                })?;
+                if result["model"] != model
+                    || result["choices"][0]["message"]["content"] != "CAPYCTL_READY_13"
+                    || result["choices"][0]["finish_reason"] != "stop"
+                {
+                    return Err(RuntimeError::Uncertain(
+                        "ordinary Fake readiness probe failed".into(),
+                    ));
+                }
             }
             facts.push(Milestone::ModelUsable);
         }

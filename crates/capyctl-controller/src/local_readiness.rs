@@ -11,6 +11,9 @@
 //!   route, using the per-launch key sealed when it launched — a key only that
 //!   launch was ever given, so an answer is from that engine and not from whatever
 //!   else might hold the port;
+//! - ADR 0030 §3: a decisions deployment also answers the fixed decision probe,
+//!   complete and well-formed, on the same key (it generates no text, and its
+//!   readiness is a decision, never a model list alone);
 //! - every recorded process is still alive after the answer.
 //!
 //! Only then does the store reopen dispatch, with a readiness receipt in the
@@ -37,6 +40,9 @@ use tokio::time::Instant;
 const PASS_INTERVAL: Duration = Duration::from_millis(250);
 /// The bound on one authenticated model-list probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// ADR 0030 §3: the bound on the fixed decision probe of an adopted
+/// decisions launch (an engine's first decision can be slow).
+const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
 /// The first wait after a failed proof, doubled per failure up to the cap.
 const FIRST_RETRY: Duration = Duration::from_millis(500);
 const MAX_RETRY: Duration = Duration::from_secs(60);
@@ -74,6 +80,8 @@ struct Target {
     url: reqwest::Url,
     key: Option<String>,
     served: String,
+    /// ADR 0030 §1: the API the deployment serves.
+    decisions: bool,
 }
 
 pub struct LocalReadiness {
@@ -242,7 +250,25 @@ impl LocalReadiness {
             .into_iter()
             .next()
             .ok_or_else(|| "the deployment serves no route".to_owned())?;
-        Ok(Target { url, key, served })
+        // ADR 0030 §1: the frozen revision's API; omitted is chat, and a
+        // value this build cannot read proves nothing.
+        let api = store
+            .effective_configuration(&launch.fence.deployment_id)
+            .map_err(|error| format!("the deployment's revision is unreadable: {error}"))?
+            .map(|configuration| configuration.effective["api"].clone())
+            .unwrap_or(serde_json::Value::Null);
+        let decisions = match api {
+            serde_json::Value::Null => false,
+            api => !serde_json::from_value::<capyctl_config::effective::DeploymentApi>(api)
+                .map_err(|_| "the deployment's api is unreadable".to_owned())?
+                .is_chat(),
+        };
+        Ok(Target {
+            url,
+            key,
+            served,
+            decisions,
+        })
     }
 
     async fn prove(&self, launch: &LocalReadyLaunch) -> Result<(), String> {
@@ -277,6 +303,19 @@ impl LocalReadiness {
         if !serves {
             return Err("the engine's model list does not name the deployment's route".into());
         }
+        // ADR 0030 §3, SPEC §6.1: a decision model is usable only once it
+        // answers the fixed decision; the model list alone is not readiness.
+        if target.decisions {
+            capyctl_adapters::decision_probe::probe_keyed(
+                &self.client,
+                &target.url,
+                target.key.as_deref(),
+                &target.served,
+                DECISION_TIMEOUT,
+            )
+            .await
+            .map_err(|error| format!("the engine did not answer the decision probe: {error}"))?;
+        }
         // SPEC §6.1: the answer must come from the recorded group, so the group is
         // proven alive on both sides of it.
         let live = alive(&launch.identities)?;
@@ -290,8 +329,13 @@ impl LocalReadiness {
             observed_at_ms,
             receipt: format!(
                 "every recorded engine process alive with its recorded start ticks and boot; \
-                 the engine answered an authenticated model list naming {}",
-                target.served
+                 the engine answered an authenticated model list naming {}{}",
+                target.served,
+                if target.decisions {
+                    " and the fixed decision probe"
+                } else {
+                    ""
+                }
             ),
         };
         let owner = self

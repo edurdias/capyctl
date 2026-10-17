@@ -418,6 +418,9 @@ impl EngineBindings for ProfileBindings {
                         .rendezvous
                         .as_ref()
                         .and_then(|root| root.launch_dir(work.incarnation())),
+                    // ADR 0030 §3: readiness and the canary follow the
+                    // deployment's API.
+                    api: effective.api,
                 })
             }
             Engine::Tensorfold => {
@@ -454,6 +457,9 @@ impl EngineBindings for ProfileBindings {
                     // Readiness waits for the route the deployment serves.
                     model_id: launch.served_model_name.clone(),
                     launch: Some(launch),
+                    // ADR 0030 §3: readiness and the canary follow the
+                    // deployment's API.
+                    api: effective.api,
                 })
             }
         }

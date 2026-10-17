@@ -394,6 +394,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
             terminate_recorded_processes: Vec::new(),
             group_member_launch: None,
             probe_max_tokens: 0,
+            probe_decision: false,
         })),
     })
     .unwrap();

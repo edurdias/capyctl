@@ -213,6 +213,23 @@ impl ControlHttp {
         probe::sglang_answer(&answer)
     }
 
+    /// ADR 0030 §3: the fixed decision probe, `POST /v1/systemone`, on this
+    /// engine's loopback endpoint with its inference key, answering the
+    /// served model.
+    pub(super) async fn decision_probe(
+        &self,
+        bound: Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        crate::decision_probe::probe(
+            &self.client,
+            &self.base,
+            Some(&self.inference),
+            &self.model,
+            bound,
+        )
+        .await
+    }
+
     /// Served model ids from `/v1/models`, guarded by the inference key the
     /// engine was launched with. Presence of the served name is the readiness
     /// signal; a connect refusal is the engine still staging weights.

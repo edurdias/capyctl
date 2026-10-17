@@ -37,6 +37,98 @@ pub struct StoredWakeCanary {
     pub text: String,
 }
 
+/// ADR 0030 §4: the comparison rule of a decision reference: the same
+/// choice, and every probability within this absolute distance of the
+/// reference's.
+pub const DECISION_TOLERANCE: f64 = 0.05;
+
+/// ADR 0030 §4: a decision launch's canary reference: the fixed decision
+/// probe's version, the choice it answered, one probability per option in
+/// the order answered, and the comparison rule's tolerance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDecisionCanary {
+    pub probe_version: u32,
+    pub choice: String,
+    pub probabilities: Vec<(String, f64)>,
+    pub tolerance: f64,
+}
+
+/// ADR 0030 §4: one launch's canary reference, by the probe that proved its
+/// readiness: a greedy completion, or a decision.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WakeCanaryReference {
+    Completion(StoredWakeCanary),
+    Decision(StoredDecisionCanary),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionJson {
+    choice: String,
+    probabilities: Vec<(String, f64)>,
+}
+
+/// The stored columns of a reference: kind, probe version, prompt,
+/// tokens_json, text, decision_json and tolerance. A malformed reference
+/// records nothing (`Conflict`).
+type Columns = (
+    &'static str,
+    u32,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<f64>,
+);
+
+fn columns(reference: &WakeCanaryReference) -> Result<Columns, StoreError> {
+    match reference {
+        WakeCanaryReference::Completion(c) => {
+            if c.tokens.is_empty() && c.text.is_empty() {
+                return Err(StoreError::Conflict);
+            }
+            let tokens = serde_json::to_string(&c.tokens).map_err(|_| StoreError::Conflict)?;
+            Ok((
+                "completion",
+                1,
+                c.prompt.clone(),
+                tokens,
+                c.text.clone(),
+                None,
+                None,
+            ))
+        }
+        WakeCanaryReference::Decision(d) => {
+            // ADR 0030 §4: a reference the comparison rule could not use
+            // records nothing.
+            let probability_ok = |p: f64| p.is_finite() && (0.0..=1.0).contains(&p);
+            if d.probe_version < 1
+                || d.probabilities.is_empty()
+                || !d.probabilities.iter().any(|(name, _)| *name == d.choice)
+                || !d.probabilities.iter().all(|(_, p)| probability_ok(*p))
+                || !d.tolerance.is_finite()
+                || d.tolerance < 0.0
+            {
+                return Err(StoreError::Conflict);
+            }
+            let json = serde_json::to_string(&DecisionJson {
+                choice: d.choice.clone(),
+                probabilities: d.probabilities.clone(),
+            })
+            .map_err(|_| StoreError::Conflict)?;
+            Ok((
+                "decision",
+                d.probe_version,
+                format!("decision/v{}", d.probe_version),
+                "[]".into(),
+                String::new(),
+                Some(json),
+                Some(d.tolerance),
+            ))
+        }
+    }
+}
+
 /// A single-launch instance whose wake ended uncertain and whose stop is
 /// still owed: the wake is at its current generation and it still reads
 /// desired ready (an accepted stop draws a new generation).
@@ -56,20 +148,18 @@ impl Store {
     /// of another launch at the same generation is replaced, and every
     /// reference of an earlier generation of the instance is dropped. A
     /// generation that is not the instance's current one records nothing
-    /// (`Conflict`), nor does an empty answer.
+    /// (`Conflict`), nor does an empty completion answer or a malformed
+    /// decision reference (ADR 0030 §4).
     pub fn record_wake_canary(
         &self,
         deployment_id: &str,
         instance_index: u32,
         generation: i64,
         incarnation: &str,
-        reference: &StoredWakeCanary,
+        reference: &WakeCanaryReference,
         now: i64,
     ) -> Result<bool, StoreError> {
-        if reference.tokens.is_empty() && reference.text.is_empty() {
-            return Err(StoreError::Conflict);
-        }
-        let tokens = serde_json::to_string(&reference.tokens).map_err(|_| StoreError::Conflict)?;
+        let (kind, probe_version, prompt, tokens, text, decision, tolerance) = columns(reference)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let current: Option<i64> = tx
             .query_row(
@@ -87,11 +177,13 @@ impl Store {
         )?;
         let recorded = tx.execute(
             "INSERT INTO wake_canaries(deployment_id,instance_index,generation,incarnation,prompt,
-                tokens_json,text,recorded_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                tokens_json,text,recorded_at_ms,kind,probe_version,decision_json,tolerance)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(deployment_id,instance_index,generation) DO UPDATE SET
                 incarnation=excluded.incarnation,prompt=excluded.prompt,
                 tokens_json=excluded.tokens_json,text=excluded.text,
+                kind=excluded.kind,probe_version=excluded.probe_version,
+                decision_json=excluded.decision_json,tolerance=excluded.tolerance,
                 recorded_at_ms=excluded.recorded_at_ms,mismatch_operation_id=NULL
              WHERE wake_canaries.incarnation<>excluded.incarnation",
             params![
@@ -99,10 +191,14 @@ impl Store {
                 instance_index,
                 generation,
                 incarnation,
-                reference.prompt,
+                prompt,
                 tokens,
-                reference.text,
-                now.max(0)
+                text,
+                now.max(0),
+                kind,
+                probe_version,
+                decision,
+                tolerance
             ],
         )? == 1;
         tx.commit()?;
@@ -117,24 +213,47 @@ impl Store {
         instance_index: u32,
         generation: i64,
         incarnation: &str,
-    ) -> Result<Option<StoredWakeCanary>, StoreError> {
-        let row: Option<(String, String, String)> = self
+    ) -> Result<Option<WakeCanaryReference>, StoreError> {
+        type Row = (
+            String,
+            u32,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+        );
+        let row: Option<Row> = self
             .conn
             .query_row(
-                "SELECT prompt,tokens_json,text FROM wake_canaries
+                "SELECT kind,probe_version,prompt,tokens_json,text,decision_json,tolerance FROM wake_canaries
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND incarnation=?4",
                 params![deployment_id, instance_index, generation, incarnation],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
             .optional()?;
-        row.map(|(prompt, tokens, text)| {
-            Ok(StoredWakeCanary {
+        let Some((kind, probe_version, prompt, tokens, text, decision, tolerance)) = row else {
+            return Ok(None);
+        };
+        let reference = match (kind.as_str(), decision, tolerance) {
+            ("completion", _, _) => WakeCanaryReference::Completion(StoredWakeCanary {
                 prompt,
                 tokens: serde_json::from_str(&tokens).map_err(|_| StoreError::Conflict)?,
                 text,
-            })
-        })
-        .transpose()
+            }),
+            ("decision", Some(decision), Some(tolerance)) => {
+                let d: DecisionJson =
+                    serde_json::from_str(&decision).map_err(|_| StoreError::Conflict)?;
+                WakeCanaryReference::Decision(StoredDecisionCanary {
+                    probe_version,
+                    choice: d.choice,
+                    probabilities: d.probabilities,
+                    tolerance,
+                })
+            }
+            _ => return Err(StoreError::Conflict),
+        };
+        Ok(Some(reference))
     }
 
     /// The wake `operation_id` of the launch at `generation` answered its
@@ -250,12 +369,85 @@ mod tests {
             .unwrap();
     }
 
-    fn reference(tokens: &[u32], text: &str) -> StoredWakeCanary {
-        StoredWakeCanary {
+    fn reference(tokens: &[u32], text: &str) -> WakeCanaryReference {
+        WakeCanaryReference::Completion(StoredWakeCanary {
             prompt: "Say ready.".into(),
             tokens: tokens.to_vec(),
             text: text.into(),
+        })
+    }
+
+    fn decision(choice: &str, probabilities: &[(&str, f64)]) -> WakeCanaryReference {
+        WakeCanaryReference::Decision(StoredDecisionCanary {
+            probe_version: 1,
+            choice: choice.into(),
+            probabilities: probabilities
+                .iter()
+                .map(|(name, p)| (name.to_string(), *p))
+                .collect(),
+            tolerance: DECISION_TOLERANCE,
+        })
+    }
+
+    // T43, T20 (ADR 0030 §4): a decision reference round-trips with its
+    // choice, probabilities in order, version and tolerance, scoped to its
+    // launch and generation, and is recorded once per launch.
+    #[test]
+    fn a_decision_reference_round_trips_once_per_launch() {
+        let store = store_with_instance(1);
+        let first = decision("yes", &[("yes", 0.75), ("no", 0.25)]);
+        assert!(store
+            .record_wake_canary("d", 0, 1, "inc-1", &first, 10)
+            .unwrap());
+        assert!(!store
+            .record_wake_canary("d", 0, 1, "inc-1", &decision("no", &[("no", 1.0)]), 11)
+            .unwrap());
+        assert_eq!(
+            store.wake_canary("d", 0, 1, "inc-1").unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.wake_canary("d", 0, 1, "inc-2").unwrap(), None);
+        assert_eq!(store.wake_canary("d", 0, 0, "inc-1").unwrap(), None);
+        // Another launch replaces it, also with another kind of reference.
+        assert!(store
+            .record_wake_canary("d", 0, 1, "inc-1b", &reference(&[1], ""), 12)
+            .unwrap());
+        assert_eq!(store.wake_canary("d", 0, 1, "inc-1").unwrap(), None);
+        assert!(store
+            .record_wake_canary("d", 0, 1, "inc-1c", &first, 13)
+            .unwrap());
+        assert_eq!(store.wake_canary("d", 0, 1, "inc-1c").unwrap(), Some(first));
+    }
+
+    // T43 (ADR 0030 §4): a decision reference the comparison rule could not
+    // use records nothing.
+    #[test]
+    fn a_malformed_decision_reference_is_refused() {
+        let store = store_with_instance(1);
+        let with = |f: fn(&mut StoredDecisionCanary)| {
+            let WakeCanaryReference::Decision(mut d) =
+                decision("yes", &[("yes", 0.6), ("no", 0.4)])
+            else {
+                unreachable!()
+            };
+            f(&mut d);
+            WakeCanaryReference::Decision(d)
+        };
+        for bad in [
+            with(|d| d.probabilities.clear()),
+            with(|d| d.choice = "maybe".into()),
+            with(|d| d.probabilities[1].1 = f64::NAN),
+            with(|d| d.probabilities[1].1 = 1.5),
+            with(|d| d.probabilities[1].1 = -0.1),
+            with(|d| d.tolerance = f64::INFINITY),
+            with(|d| d.tolerance = -0.01),
+        ] {
+            assert!(matches!(
+                store.record_wake_canary("d", 0, 1, "inc-1", &bad, 10),
+                Err(StoreError::Conflict)
+            ));
         }
+        assert_eq!(store.wake_canary("d", 0, 1, "inc-1").unwrap(), None);
     }
 
     // T20 (owner decision 2026-10-09): one reference per launch; the first

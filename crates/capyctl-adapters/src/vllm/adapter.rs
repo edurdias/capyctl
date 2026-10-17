@@ -579,7 +579,7 @@ impl EngineAdapter for VllmAdapter {
                 RuntimeError::Uncertain("the system clock is before the epoch".into())
             })?;
         Ok(crate::completion_probe::CanaryAnswer {
-            answer,
+            answer: crate::completion_probe::CanaryEvidence::Generated(answer),
             observed_at_ms,
         })
     }

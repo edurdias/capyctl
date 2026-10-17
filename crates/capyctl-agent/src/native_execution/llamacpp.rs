@@ -54,7 +54,9 @@ impl NativeHostExecution {
             effective.profile.build_fingerprint.clone(),
             served.into(),
         )
-        .with_system_root(self.llamacpp_system_root.clone()))
+        .with_system_root(self.llamacpp_system_root.clone())
+        // ADR 0030 §3: readiness follows the deployment's API.
+        .with_api(effective.api))
     }
 
     /// ADR 0029 §6: a llama.cpp launch on a machine where

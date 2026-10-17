@@ -421,6 +421,7 @@ impl GroupHost {
             MemberAction::Probe {
                 owned_handle,
                 max_tokens: Some(max_tokens),
+                decision: _,
             } => self.probe(&decoded, owned_handle, *max_tokens)?,
             // ADR 0028 §12, SPEC §11: the head's agent alone takes Park and
             // Restore and invokes the collective once; a readiness probe of a

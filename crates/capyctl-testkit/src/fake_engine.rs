@@ -4,11 +4,17 @@
 //! adapters must honor: slow startup (liveness is not readiness), park levels
 //! with distinct memory-retention signatures, ambiguous outcomes (effect
 //! applied, ack lost), the deep-park policy gate, and crash injection.
+//!
+//! ADR 0030: [`FakeEngine::with_decisions`] makes it a decision model that
+//! answers `/v1/systemone` (as scripted: well formed, malformed, another
+//! pick or other probabilities) and refuses chat, so CPU tests cover
+//! readiness, re-proof and the wake canary of a decisions deployment.
 
 use async_trait::async_trait;
 use capyctl_adapters::traits::*;
 use capyctl_adapters::ParkPolicy;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +55,14 @@ pub struct FakeEngine {
     knobs: Mutex<Knobs>,
     states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
+    /// ADR 0030: the `/v1/systemone` mode. `Some` is a decision model, whose
+    /// every `/v1/systemone` request is answered with this engine response
+    /// (well formed or not, as a test scripts it) and whose chat requests
+    /// are refused; `None` is a chat model.
+    decisions: Mutex<Option<serde_json::Value>>,
+    /// Chat requests and `/v1/systemone` requests this engine was sent.
+    chat_requests: AtomicU64,
+    decision_requests: AtomicU64,
 }
 
 impl std::fmt::Debug for FakeEngine {
@@ -71,7 +85,81 @@ impl FakeEngine {
             }),
             states: Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
+            decisions: Mutex::new(None),
+            chat_requests: AtomicU64::new(0),
+            decision_requests: AtomicU64::new(0),
         }
+    }
+
+    /// ADR 0030: a decision model. Every `/v1/systemone` request is answered
+    /// with a well-formed answer to the fixed probe question (billing picked
+    /// at 0.95); chat requests are refused, so readiness, the wake canary
+    /// and re-proofs can only pass on decisions.
+    pub fn with_decisions(self) -> Self {
+        self.set_decision(Self::decision_answer("billing", [0.95, 0.02, 0.03]));
+        self
+    }
+
+    /// ADR 0030: the response the next `/v1/systemone` requests get, raw as
+    /// an engine sends it: [`Self::decision_answer`], or anything malformed.
+    pub fn set_decision(&self, response: serde_json::Value) {
+        *self.decisions.lock().unwrap() = Some(response);
+    }
+
+    /// An engine's answer to the fixed decision probe
+    /// (`capyctl_adapters::decision_probe`) picking `choice`, with the
+    /// billing, shipping and technical probabilities in that order.
+    pub fn decision_answer(choice: &str, probabilities: [f64; 3]) -> serde_json::Value {
+        use capyctl_adapters::decision_probe::{OPTIONS, QUESTION};
+        let probabilities: serde_json::Map<String, serde_json::Value> = OPTIONS
+            .iter()
+            .zip(probabilities)
+            .map(|((option, _), p)| ((*option).to_owned(), serde_json::json!(p)))
+            .collect();
+        serde_json::json!({
+            "model": "fake",
+            "answers": {QUESTION: {"type": "choice", "choice": choice,
+                "probabilities": probabilities, "confidence": 0.9}},
+            "usage": {"input_tokens": 32, "output_tokens": 0}
+        })
+    }
+
+    /// How many chat completions this engine was sent.
+    pub fn chat_requests(&self) -> u64 {
+        self.chat_requests.load(Ordering::SeqCst)
+    }
+
+    /// How many `/v1/systemone` requests this engine was sent.
+    pub fn decision_requests(&self) -> u64 {
+        self.decision_requests.load(Ordering::SeqCst)
+    }
+
+    /// ADR 0030: the engine's answer to one `/v1/systemone` request, `model`
+    /// named back as asked. A chat model has no such endpoint.
+    pub fn decision_response(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.decision_requests.fetch_add(1, Ordering::SeqCst);
+        let mut response = self
+            .decisions
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        if response.get("model").is_some() {
+            response["model"] = body["model"].clone();
+        }
+        Ok(response)
+    }
+
+    /// A chat request: counted, and refused by a decision model.
+    fn chat(&self) -> Result<(), AdapterError> {
+        self.chat_requests.fetch_add(1, Ordering::SeqCst);
+        if self.decisions.lock().unwrap().is_some() {
+            return Err(AdapterError::PolicyDenied);
+        }
+        Ok(())
     }
 
     /// Opt in to the separate persisted lifecycle state machine.
@@ -287,12 +375,15 @@ impl EngineAdapter for FakeEngine {
         &self,
         command: &RuntimeCommand,
     ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
-        self.lifecycle
-            .lock()
-            .unwrap()
-            .as_mut()
-            .ok_or(RuntimeError::Unsupported)?
-            .execute_with_clock(command, self.lifecycle_clock.as_deref())
+        let decisions = self.decisions.lock().unwrap().clone();
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        let state = lifecycle.as_mut().ok_or(RuntimeError::Unsupported)?;
+        // ADR 0030 §3: a decision model's readiness is its fixed decision.
+        state.decisions = decisions;
+        let result = state.execute_with_clock(command, self.lifecycle_clock.as_deref());
+        self.decision_requests
+            .fetch_add(std::mem::take(&mut state.decision_probes), Ordering::SeqCst);
+        result
     }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         let st = self.member(member);
@@ -445,6 +536,28 @@ impl EngineAdapter for FakeEngine {
     async fn engine_quiescent(&self, _member: &MemberRef, _after_ms: i64) -> bool {
         !self.knobs.lock().unwrap().engine_busy
     }
+    /// ADR 0030 §4: a decision model's wake canary is its fixed decision
+    /// probe; a chat Fake has no canary.
+    async fn wake_canary(
+        &self,
+        context: &capyctl_domain::completion::StepExecutionContext,
+        _max_tokens: u32,
+        bound: Duration,
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
+        if self.decisions.lock().unwrap().is_none() {
+            return Err(RuntimeError::Unsupported);
+        }
+        let answer = ChatForward::decision_probe(self, "fake", bound)
+            .await
+            .map_err(|e| RuntimeError::Uncertain(format!("Fake decision probe: {e}")))?;
+        Ok(capyctl_adapters::completion_probe::CanaryAnswer {
+            answer: capyctl_adapters::completion_probe::CanaryEvidence::Decision(answer),
+            observed_at_ms: match self.lifecycle_clock.as_deref() {
+                Some(clock) => clock()?,
+                None => context.issued_at_ms,
+            },
+        })
+    }
 }
 
 #[async_trait]
@@ -454,6 +567,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
+        self.chat()?;
         // Lifecycle fault streams retain their explicit synchronous
         // collector contract. Never buffer that generator to fake async support.
         if self.lifecycle.lock().unwrap().is_some() {
@@ -471,10 +585,19 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         // This ordinary fake generates no external work to reconcile.
         Ok(capyctl_adapters::traits::StreamEnded::Completed)
     }
+    /// ADR 0030 §2: the public `/v1/systemone` route's forwarding, answered
+    /// as the engine would (a chat model has no such endpoint).
+    async fn forward_decision(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.decision_response(body)
+    }
     async fn forward_chat(
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
+        self.chat()?;
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             return state.forward(body);
         }
@@ -491,6 +614,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
+        self.chat()?;
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             return state.stream(body, on_chunk);
         }
@@ -500,5 +624,17 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         ));
         on_chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string());
         Ok(capyctl_adapters::traits::StreamEnded::Completed)
+    }
+
+    /// ADR 0030 §3: the fixed decision probe, judged by the same validator
+    /// the real adapters use.
+    async fn decision_probe(
+        &self,
+        served: &str,
+        _bound: Duration,
+    ) -> Result<capyctl_adapters::decision_probe::DecisionAnswer, AdapterError> {
+        let response =
+            self.decision_response(&capyctl_adapters::decision_probe::request(served))?;
+        capyctl_adapters::decision_probe::answer(&response)
     }
 }

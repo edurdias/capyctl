@@ -251,6 +251,11 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     if command.probe_max_tokens != 0 {
         needs.push(ENGINE_GROUPS);
     }
+    // ADR 0030 §1, ADR 0017: an older host would drop the decision flag and
+    // answer a readiness probe instead.
+    if command.probe_decision {
+        needs.push(DECISIONS);
+    }
     // ADR 0014 amendment A20: a group member's own launch carries the tables
     // as a single launch does.
     if command

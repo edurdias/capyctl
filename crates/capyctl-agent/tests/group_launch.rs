@@ -883,6 +883,7 @@ impl FakeHost {
             MemberAction::Probe {
                 owned_handle,
                 max_tokens,
+                decision: _,
             } => {
                 self.send_probe(&self.probe_command(owned_handle, max_tokens))
                     .await
@@ -907,6 +908,7 @@ impl FakeHost {
             action: MemberAction::Probe {
                 owned_handle,
                 max_tokens,
+                decision: false,
             },
         };
         command.identity.payload_digest = command.canonical_digest();
@@ -1699,6 +1701,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
             .execute(MemberAction::Probe {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: Some(2),
+                decision: false,
             })
             .await
             .unwrap();
@@ -1712,6 +1715,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
             .execute(MemberAction::Probe {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: Some(1),
+                decision: false,
             })
             .await
             .unwrap();
@@ -1721,6 +1725,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
             .execute(MemberAction::Probe {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: None,
+                decision: false,
             })
             .await
             .unwrap();
@@ -1747,6 +1752,7 @@ async fn a_worker_answers_no_completion_probe() {
         .execute(MemberAction::Probe {
             owned_handle: out.owned_handle.clone(),
             max_tokens: Some(2),
+            decision: false,
         })
         .await
         .unwrap();

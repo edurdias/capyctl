@@ -1033,6 +1033,38 @@ CREATE TABLE IF NOT EXISTS wake_canaries(
 );
 "#;
 
+/// v49 (ADR 0030 §4): the wake canary reference gains its probe kind and
+/// version, and a decision reference its answer (`decision_json`: the choice
+/// and one probability per option) and comparison rule (`tolerance`). A
+/// decision reference stores its probe identity as `prompt` and no tokens or
+/// text. SQLite cannot drop a CHECK, so the table is rebuilt; every existing
+/// row is copied as a version 1 completion reference. Additive in meaning,
+/// forward-only.
+pub const SCHEMA_V49: &str = r#"
+CREATE TABLE wake_canaries_v49(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  incarnation TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  tokens_json TEXT NOT NULL,
+  text TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  mismatch_operation_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('completion','decision')),
+  probe_version INTEGER NOT NULL CHECK(probe_version>=1),
+  decision_json TEXT,
+  tolerance REAL,
+  CHECK((kind='completion' AND decision_json IS NULL AND tolerance IS NULL AND (tokens_json<>'[]' OR text<>''))
+     OR (kind='decision' AND decision_json IS NOT NULL AND tolerance IS NOT NULL AND tokens_json='[]' AND text='')),
+  PRIMARY KEY(deployment_id,instance_index,generation)
+);
+INSERT INTO wake_canaries_v49(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance)
+  SELECT deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,'completion',1,NULL,NULL FROM wake_canaries;
+DROP TABLE wake_canaries;
+ALTER TABLE wake_canaries_v49 RENAME TO wake_canaries;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

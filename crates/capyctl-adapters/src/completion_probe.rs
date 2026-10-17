@@ -40,10 +40,19 @@ pub struct ProbeAnswer {
 /// for a remote launch). ADR 0028 note of 2026-10-16: a wake commits its
 /// evidence as observed then, since the canary can outlast the observation
 /// TTL that the restore's own evidence is checked against.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CanaryAnswer {
-    pub answer: ProbeAnswer,
+    pub answer: CanaryEvidence,
     pub observed_at_ms: i64,
+}
+
+/// What a wake canary's probe answered: what a chat deployment generated, or
+/// (ADR 0030 §4) a decisions deployment's answer to the fixed decision probe.
+/// The two are never compared with each other.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CanaryEvidence {
+    Generated(ProbeAnswer),
+    Decision(crate::decision_probe::DecisionAnswer),
 }
 
 /// vLLM, TensorFold and llama.cpp: OpenAI `/v1/completions` asking for the
@@ -132,7 +141,19 @@ pub(crate) async fn post(
     body: &Value,
     bound: std::time::Duration,
 ) -> Result<Value, AdapterError> {
-    let failed = |what: &str| AdapterError::Uncertain(format!("completion probe: {what}"));
+    post_json(client, url, key, body, bound, "completion probe").await
+}
+
+/// [`post`] for any fixed probe, its errors named by `what`.
+pub(crate) async fn post_json(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    key: Option<&reqwest::header::HeaderValue>,
+    body: &Value,
+    bound: std::time::Duration,
+    what: &str,
+) -> Result<Value, AdapterError> {
+    let failed = |detail: &str| AdapterError::Uncertain(format!("{what}: {detail}"));
     let mut request = client.post(url).json(body).timeout(bound);
     if let Some(key) = key {
         request = request.header(reqwest::header::AUTHORIZATION, key);

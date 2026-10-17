@@ -225,10 +225,24 @@ fn every_post_baseline_field_names_its_capability() {
                 MemberAction::Probe {
                     owned_handle: handle(),
                     max_tokens: None,
+                    decision: false,
                 },
                 0,
             ),
             vec![],
+        ),
+        // T34, T43 (ADR 0030 §4): an older host would answer a readiness probe
+        // instead; only a host with `decisions` is sent a decision probe.
+        (
+            wire(
+                MemberAction::Probe {
+                    owned_handle: handle(),
+                    max_tokens: None,
+                    decision: true,
+                },
+                0,
+            ),
+            vec![DECISIONS],
         ),
         (
             wire(
@@ -376,6 +390,7 @@ fn the_gate_refuses_typed_before_anything_is_sent() {
         MemberAction::Probe {
             owned_handle: "h".into(),
             max_tokens: None,
+            decision: false,
         },
         0,
     );

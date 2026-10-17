@@ -357,6 +357,7 @@ pub fn probe_command(
         action: MemberAction::Probe {
             owned_handle: head.owned_handle.clone(),
             max_tokens: Some(max_tokens),
+            decision: false,
         },
     };
     command.identity.payload_digest = command.canonical_digest();

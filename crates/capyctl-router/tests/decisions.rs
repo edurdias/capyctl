@@ -27,6 +27,10 @@ struct Authority {
     activations: AtomicUsize,
     endpoint: String,
     leases: Mutex<Vec<Option<LeaseEnd>>>,
+    /// ADR 0030 §3: an engine whose activation is proven by the fixed
+    /// decision probe, as an adapter's Initialize proves it; `None` is ready
+    /// on activation.
+    fake: Option<Arc<capyctl_testkit::FakeEngine>>,
 }
 
 impl Authority {
@@ -177,6 +181,12 @@ impl capyctl_controller::LifecyclePort for Authority {
     async fn activate_for_request(&self, deployment: &str) -> Result<(), LifecycleFault> {
         assert_eq!(deployment, DEPLOYMENT);
         self.activations.fetch_add(1, Ordering::SeqCst);
+        if let Some(fake) = &self.fake {
+            use capyctl_adapters::traits::ChatForward;
+            fake.decision_probe(SERVED, Duration::from_secs(5))
+                .await
+                .map_err(|_| refuse("prove the decision model ready"))?;
+        }
         self.ready.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -288,6 +298,7 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         activations: AtomicUsize::new(0),
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
+        fake: None,
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let deps = RouterDeps {
@@ -303,6 +314,51 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
     };
     let router = capyctl_router::serve_router(deps.clone());
     (authority, deps, router)
+}
+
+// T43 (ADR 0030 §§2-3): a decisions deployment on the Fake engine becomes
+// ready on its fixed decision (never a chat request) and answers
+// `POST /v1/systemone` through the router, its lease closed completed.
+#[tokio::test]
+async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
+    let fake = Arc::new(capyctl_testkit::FakeEngine::new().with_decisions());
+    let authority = Arc::new(Authority {
+        api: DeploymentApi::Decisions,
+        ready: AtomicBool::new(false),
+        activations: AtomicUsize::new(0),
+        endpoint: "http://127.0.0.1:9".into(),
+        leases: Mutex::new(Vec::new()),
+        fake: Some(fake.clone()),
+    });
+    let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
+    let forward = fake.clone() as Arc<dyn capyctl_adapters::traits::ChatForward>;
+    let router = capyctl_router::serve_router(RouterDeps {
+        controller: port,
+        forwards: Arc::new(capyctl_router::forwarders::StaticForwarders(
+            std::collections::HashMap::from([(DEPLOYMENT.to_owned(), forward)]),
+        )),
+        limits: QueueLimits {
+            max_requests_per_deployment: 4,
+            max_buffered_bytes_total: 1 << 20,
+        },
+        api_key: None,
+        inflight: Arc::new(capyctl_router::admission::InFlight::default()),
+        activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+    });
+    let (status, body) = send(
+        &router,
+        "/v1/systemone",
+        serde_json::to_vec(&decision_body()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["answers"]["route"]["type"], "choice");
+    assert_eq!(authority.activations.load(Ordering::SeqCst), 1);
+    assert!(authority.ready.load(Ordering::SeqCst));
+    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed)]);
+    // One decision proved readiness, one answered the request; no chat.
+    assert_eq!(fake.decision_requests(), 2);
+    assert_eq!(fake.chat_requests(), 0);
 }
 
 async fn send(router: &axum::Router, path: &str, body: Vec<u8>) -> (StatusCode, Value) {

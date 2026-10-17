@@ -46,4 +46,17 @@ impl ChatForward for SglangAdapter {
             .ok_or(AdapterError::UnsupportedCapability)?;
         http.complete_probe(max_tokens, bound).await
     }
+    /// ADR 0030 §3: through the keyed control client, as the completion
+    /// probe; an adapter built without the launch's credentials cannot probe.
+    async fn decision_probe(
+        &self,
+        _served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        http.decision_probe(bound).await
+    }
 }

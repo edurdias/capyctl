@@ -79,8 +79,12 @@ struct Gate {
 }
 impl Gate {
     fn new(panic: bool) -> Arc<Self> {
+        Self::with_engine(panic, FakeEngine::with_lifecycle())
+    }
+    /// ADR 0030: a gate over a given Fake (a decision model, for one).
+    fn with_engine(panic: bool, engine: FakeEngine) -> Arc<Self> {
         Arc::new(Self {
-            engine: FakeEngine::with_lifecycle(),
+            engine,
             calls: Mutex::new(vec![]),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
@@ -203,6 +207,16 @@ impl EngineAdapter for Gate {
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
+    }
+    /// ADR 0030 §4: the Fake's own canary (a decision model's fixed decision;
+    /// none for a chat Fake).
+    async fn wake_canary(
+        &self,
+        context: &capyctl_domain::completion::StepExecutionContext,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
+        self.engine.wake_canary(context, max_tokens, bound).await
     }
 }
 

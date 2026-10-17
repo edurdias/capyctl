@@ -31,6 +31,7 @@ fn wire(instance_index: u32) -> pb::ExecuteMember {
         terminate_recorded_processes: Vec::new(),
         group_member_launch: None,
         probe_max_tokens: 0,
+        probe_decision: false,
     }
 }
 

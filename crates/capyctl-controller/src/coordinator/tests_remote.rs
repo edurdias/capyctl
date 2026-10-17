@@ -552,6 +552,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             probe_tokens: Vec::new(),
             engine_log: None,
             probe_text: String::new(),
+            probe_decision: None,
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }
@@ -645,6 +646,7 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
         capyctl_protocol::execution::MemberAction::Probe {
             owned_handle: launch.step_id.clone(),
             max_tokens: None,
+            decision: false,
         }
     );
     assert_eq!(probe.identity.expected_state, "ready");
