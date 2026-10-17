@@ -668,17 +668,30 @@ impl EngineAdapter for RemoteEngine {
     /// reporting, at the time it observed it, the claim retained and the
     /// launch's engine alive (every recorded engine process and no other; a
     /// helper may be gone, ADR 0027), as a restore's result must.
+    ///
+    /// ADR 0030 §4: a decisions launch's canary is the fixed decision probe,
+    /// sent only to a host whose session declares `decisions` (every host
+    /// that took the launch did); its answer is judged well-formed again
+    /// here. It never answers `Unsupported`, which would pass a wake
+    /// unchecked: a host without the capability is a canary not answered.
     async fn wake_canary(
         &self,
         c: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
     ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
+        use capyctl_adapters::completion_probe::CanaryAnswer;
         let b = &self.binding;
         if c.binding_id != b.plan.binding_id || c.incarnation != b.plan.incarnation {
             return Err(RuntimeError::StaleRevision);
         }
-        if !self
+        if b.decisions {
+            if !self.sessions.supports(&b.host_id, capabilities::DECISIONS) {
+                return Err(RuntimeError::Uncertain(
+                    "the host no longer declares decisions; the decision probe was not sent".into(),
+                ));
+            }
+        } else if !self
             .sessions
             .supports(&b.host_id, capabilities::ENGINE_GROUPS)
         {
@@ -707,7 +720,8 @@ impl EngineAdapter for RemoteEngine {
             },
             action: MemberAction::Probe {
                 owned_handle: b.launch_command_id.clone(),
-                max_tokens: Some(max_tokens),
+                max_tokens: (!b.decisions).then_some(max_tokens),
+                decision: b.decisions,
             },
         };
         command.identity.payload_digest = command.canonical_digest();
@@ -719,13 +733,7 @@ impl EngineAdapter for RemoteEngine {
             .map_err(|_| {
                 RuntimeError::Uncertain("the host did not answer the wake canary".into())
             })?;
-        if result.state != "completed"
-            || (result.probe_tokens.is_empty() && result.probe_text.is_empty())
-        {
-            return Err(RuntimeError::Uncertain(
-                "the engine generated nothing for the wake canary".into(),
-            ));
-        }
+        let answer = canary_evidence(b.decisions, &result)?;
         if let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities {
             let alive: Vec<_> = result
                 .processes
@@ -740,14 +748,56 @@ impl EngineAdapter for RemoteEngine {
                 ));
             }
         }
-        Ok(capyctl_adapters::completion_probe::CanaryAnswer {
-            answer: capyctl_adapters::completion_probe::ProbeAnswer {
-                tokens: result.probe_tokens,
-                text: result.probe_text,
-            },
+        Ok(CanaryAnswer {
+            answer,
             observed_at_ms: result.observed_at_unix_ms,
         })
     }
+}
+
+/// What a host's answer to a wake canary probe proves: generated tokens or
+/// text for a chat launch (owner decision 2026-10-09), and for a decisions
+/// launch (ADR 0030 §4) only its decision answer, of this build's probe
+/// version and judged well-formed again here, never generated text.
+fn canary_evidence(
+    decisions: bool,
+    result: &pb::MemberExecutionResult,
+) -> Result<capyctl_adapters::completion_probe::CanaryEvidence, RuntimeError> {
+    use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer};
+    use capyctl_adapters::decision_probe;
+    if result.state != "completed" {
+        return Err(RuntimeError::Uncertain(
+            "the host did not complete the wake canary".into(),
+        ));
+    }
+    if !decisions {
+        if result.probe_tokens.is_empty() && result.probe_text.is_empty() {
+            return Err(RuntimeError::Uncertain(
+                "the engine generated nothing for the wake canary".into(),
+            ));
+        }
+        return Ok(CanaryEvidence::Generated(ProbeAnswer {
+            tokens: result.probe_tokens.clone(),
+            text: result.probe_text.clone(),
+        }));
+    }
+    let evidence = result.probe_decision.as_ref().ok_or_else(|| {
+        RuntimeError::Uncertain(
+            "the engine did not answer the decision probe for the wake canary".into(),
+        )
+    })?;
+    let probabilities: Vec<(String, f64)> = evidence
+        .probabilities
+        .iter()
+        .map(|p| (p.option.clone(), p.probability))
+        .collect();
+    (evidence.probe_version == decision_probe::VERSION)
+        .then(|| decision_probe::well_formed(&evidence.choice, &probabilities).ok())
+        .flatten()
+        .map(CanaryEvidence::Decision)
+        .ok_or_else(|| {
+            RuntimeError::Uncertain("the host relayed a malformed decision probe answer".into())
+        })
 }
 async fn cleanup(
     sessions: &AgentSessions,
@@ -1384,6 +1434,56 @@ mod tests {
             observed_at_unix_ms: 5,
             ..Default::default()
         }
+    }
+
+    /// ADR 0030 §4: a decisions launch's wake canary counts only the
+    /// decision answer the host relayed, of this probe version and well
+    /// formed; generated text never stands in for it, and a chat launch's
+    /// canary is unchanged.
+    // T43 T34
+    #[test]
+    fn a_decision_canary_counts_only_a_well_formed_relayed_decision() {
+        use capyctl_adapters::completion_probe::CanaryEvidence;
+        let decided = |choice: &str, ps: [f64; 3], version: u32| {
+            let mut r = result(vec![observed("api", 10, "alive")]);
+            r.probe_decision = Some(pb::DecisionProbeEvidence {
+                probe_version: version,
+                choice: choice.into(),
+                probabilities: ["billing", "shipping", "technical"]
+                    .iter()
+                    .zip(ps)
+                    .map(|(option, probability)| pb::DecisionProbability {
+                        option: (*option).into(),
+                        probability,
+                    })
+                    .collect(),
+            });
+            r
+        };
+        let version = capyctl_adapters::decision_probe::VERSION;
+        let good = decided("billing", [0.95, 0.02, 0.03], version);
+        assert!(matches!(
+            canary_evidence(true, &good),
+            Ok(CanaryEvidence::Decision(answer)) if answer.choice == "billing"
+        ));
+        let mut text_only = result(vec![observed("api", 10, "alive")]);
+        text_only.probe_text = "Ready.".into();
+        let mut pending = good.clone();
+        pending.state = "attempted".into();
+        for refused in [
+            text_only.clone(),
+            pending,
+            decided("billing", [0.95, 0.2, 0.03], version),
+            decided("other", [0.95, 0.02, 0.03], version),
+            decided("billing", [0.95, 0.02, 0.03], version + 1),
+        ] {
+            assert!(canary_evidence(true, &refused).is_err(), "{refused:?}");
+        }
+        assert!(matches!(
+            canary_evidence(false, &text_only),
+            Ok(CanaryEvidence::Generated(_))
+        ));
+        assert!(canary_evidence(false, &good).is_err());
     }
 
     /// ADR 0014 amendment A12: the host's kernel builds reach the coordinator

@@ -4,9 +4,11 @@
 //! probe; an embedded vLLM-shaped one answers each persisted step separately.
 //! CPU only: nothing here qualifies an engine or a host.
 use super::*;
-use capyctl_adapters::completion_probe::ProbeAnswer;
+use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer};
+use capyctl_adapters::decision_probe::DecisionAnswer;
 use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milestone};
 use capyctl_store::ordinary_lifecycle::park::{IdlePolicy, WakeScope};
+use capyctl_store::wake_canary::WakeCanaryReference;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 
 /// How the scripted engine answers one residency action.
@@ -37,9 +39,10 @@ struct Residency {
     /// What the host samples the engine's processes holding (none unless a
     /// test scripts it).
     residents: Mutex<Vec<capyctl_domain::resources::ProcessResident>>,
-    /// Owner decision 2026-10-09: what the engine generates for the wake
-    /// canary; `None` is an engine without one.
-    canary: Mutex<Option<ProbeAnswer>>,
+    /// Owner decision 2026-10-09: what the engine answers the wake canary
+    /// (generated text, or ADR 0030 §4's decision); `None` is an engine
+    /// without one.
+    canary: Mutex<Option<CanaryEvidence>>,
     /// The wake canary is asked but never answered.
     canary_hangs: std::sync::atomic::AtomicBool,
     /// How long (test clock, ms) the engine takes to answer the wake canary.
@@ -50,7 +53,16 @@ struct Residency {
 
 impl Residency {
     fn new(compound: bool, clock: Arc<AtomicI64>) -> Arc<Self> {
-        let gate = Gate::new(false);
+        Self::over(Gate::new(false), compound, clock)
+    }
+    /// ADR 0030: an engine whose Initialize is the Fake decision model,
+    /// answering `/v1/systemone` with `response` and refusing chat.
+    fn decision_model(response: serde_json::Value, clock: Arc<AtomicI64>) -> Arc<Self> {
+        let fake = capyctl_testkit::fake_engine::FakeEngine::with_lifecycle().with_decisions();
+        fake.set_decision(response);
+        Self::over(Gate::with_engine(false, fake), true, clock)
+    }
+    fn over(gate: Arc<Gate>, compound: bool, clock: Arc<AtomicI64>) -> Arc<Self> {
         gate.release.add_permits(64);
         Arc::new(Self {
             gate,
@@ -72,10 +84,80 @@ impl Residency {
         self.calls.lock().unwrap().iter().map(|c| c.0).collect()
     }
     fn generates(&self, tokens: &[u32]) {
-        *self.canary.lock().unwrap() = Some(ProbeAnswer {
+        *self.canary.lock().unwrap() = Some(CanaryEvidence::Generated(ProbeAnswer {
             tokens: tokens.to_vec(),
             text: "Ready.".into(),
-        });
+        }));
+    }
+    /// ADR 0030 §4: a decisions engine's answer to the fixed decision probe.
+    fn decides(&self, choice: &str, billing: f64, shipping: f64, technical: f64) {
+        *self.canary.lock().unwrap() = Some(CanaryEvidence::Decision(DecisionAnswer {
+            choice: choice.into(),
+            probabilities: vec![
+                ("billing".into(), billing),
+                ("shipping".into(), shipping),
+                ("technical".into(), technical),
+            ],
+        }));
+    }
+}
+
+// T43 (ADR 0030 §3, SPEC §6.1): a decisions launch is ready only on a
+// complete, well-formed answer to the fixed decision; a malformed one leaves
+// the start unproven and dispatch closed. No chat probe is ever sent.
+#[tokio::test]
+async fn a_decisions_launch_is_ready_only_on_a_well_formed_decision() {
+    use capyctl_testkit::fake_engine::FakeEngine;
+    let mut no_pick = FakeEngine::decision_answer("billing", [0.95, 0.02, 0.03]);
+    no_pick["answers"]["route"]
+        .as_object_mut()
+        .unwrap()
+        .remove("choice");
+    let cases = [
+        (
+            FakeEngine::decision_answer("billing", [0.95, 0.02, 0.03]),
+            true,
+        ),
+        // Not the option the state names: still a well-formed answer.
+        (
+            FakeEngine::decision_answer("shipping", [0.2, 0.7, 0.1]),
+            true,
+        ),
+        (
+            FakeEngine::decision_answer("billing", [0.95, 0.2, 0.03]),
+            false,
+        ),
+        (
+            FakeEngine::decision_answer("refunds", [0.95, 0.02, 0.03]),
+            false,
+        ),
+        (no_pick, false),
+        (serde_json::json!({"error": {"code": 400}}), false),
+    ];
+    for (response, well_formed) in cases {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::decision_model(response.clone(), clock.clone());
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        let start = w.start(&fence, 100_000).unwrap();
+        let status = start.wait(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            status == InitializeStatus::Completed,
+            well_formed,
+            "{response}: {status:?}"
+        );
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!(open, well_formed, "{response}");
+        assert_eq!(state == "ready", well_formed, "{response}");
+        assert_eq!(engine.gate.engine.chat_requests(), 0);
+        assert!(engine.gate.engine.decision_requests() >= 1);
+        w.shutdown().await.unwrap();
     }
 }
 
@@ -973,7 +1055,7 @@ fn reference(
     dir: &tempfile::TempDir,
     engine: &Residency,
     deployment: &str,
-) -> Option<capyctl_store::wake_canary::StoredWakeCanary> {
+) -> Option<WakeCanaryReference> {
     let generation = instance(dir, deployment).2;
     let incarnation = engine
         .canaries
@@ -987,6 +1069,14 @@ fn reference(
     o.store()
         .wake_canary(deployment, 0, generation, &incarnation)
         .unwrap()
+}
+
+/// The token ids a completion reference records.
+fn tokens(reference: WakeCanaryReference) -> Vec<u32> {
+    match reference {
+        WakeCanaryReference::Completion(reference) => reference.tokens,
+        WakeCanaryReference::Decision(_) => panic!("a decision reference"),
+    }
 }
 
 async fn park_and_wake(
@@ -1039,7 +1129,7 @@ async fn a_matching_wake_canary_completes_the_wake() {
         );
         ready(&w, &fence).await;
         assert_eq!(
-            reference(&owner, &dir, &engine, &fence.deployment_id).map(|r| r.tokens),
+            reference(&owner, &dir, &engine, &fence.deployment_id).map(tokens),
             Some(vec![1, 2, 3])
         );
         for _ in 0..3 {
@@ -1094,6 +1184,108 @@ async fn a_differing_wake_canary_fails_the_wake_and_stops_the_instance() {
     w.shutdown().await.unwrap();
 }
 
+/// A launch made ready with `first` setting its first canary answer, then
+/// parked and woken once with `wake` setting the wake's: the wake's operation.
+async fn decide_then_wake(
+    first: impl Fn(&Residency),
+    wake: impl Fn(&Residency),
+) -> (
+    tempfile::TempDir,
+    SharedCoordinatorState,
+    DeploymentFence,
+    Arc<Residency>,
+    OwnedCoordinator,
+    String,
+) {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(true, clock.clone());
+    first(&engine);
+    let w = residency_worker(
+        owner.clone(),
+        observations,
+        engine.clone(),
+        clock,
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    wake(&engine);
+    let operation = park_and_wake(&w, &dir, &fence).await;
+    (dir, owner, fence, engine, w, operation)
+}
+
+// T43 T20 (ADR 0030 §4): the first readiness records the decision probe's
+// answer with its version and rule; a wake that picks the same option with
+// every probability within 0.05 of it completes and serves.
+#[tokio::test]
+async fn a_decision_canary_within_tolerance_completes_the_wake() {
+    let (dir, owner, fence, engine, w, wake) = decide_then_wake(
+        |engine| engine.decides("billing", 0.95, 0.02, 0.03),
+        |engine| engine.decides("billing", 0.91, 0.05, 0.04),
+    )
+    .await;
+    until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+    let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+    assert_eq!((state.as_str(), open), ("ready", true));
+    assert_eq!(last_error(&dir, &fence.deployment_id), None);
+    let Some(WakeCanaryReference::Decision(recorded)) =
+        reference(&owner, &dir, &engine, &fence.deployment_id)
+    else {
+        panic!("no decision reference");
+    };
+    assert_eq!(recorded.choice, "billing");
+    assert_eq!(
+        recorded.probe_version,
+        capyctl_adapters::decision_probe::VERSION
+    );
+    assert_eq!(recorded.tolerance, crate::wake_canary::DECISION_TOLERANCE);
+    assert_eq!(recorded.probabilities[0], ("billing".to_owned(), 0.95));
+    w.shutdown().await.unwrap();
+}
+
+// T43 T20 (ADR 0030 §4): a wake that picks another option, or moves any
+// probability by more than 0.05, fails `wake_mismatch` and the instance is
+// stopped, as a differing chat canary is.
+#[tokio::test]
+async fn a_changed_pick_or_a_moved_probability_fails_the_wake() {
+    let changes: [fn(&Residency); 2] = [
+        |engine| engine.decides("technical", 0.30, 0.10, 0.60),
+        |engine| engine.decides("billing", 0.89, 0.08, 0.03),
+    ];
+    for change in changes {
+        let (dir, owner, fence, _engine, w, wake) =
+            decide_then_wake(|engine| engine.decides("billing", 0.95, 0.02, 0.03), change).await;
+        until("released", || phase(&owner, &fence.deployment_id).is_none()).await;
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!((state.as_str(), open), ("stopped", false));
+        assert_eq!(
+            last_error(&dir, &fence.deployment_id).as_deref(),
+            Some("wake_mismatch")
+        );
+        assert_ne!(operation(&owner, &wake).0, "succeeded");
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T43 (ADR 0030 §4): a chat reference is never compared with a decision
+// answer: the wake finds no usable reference, and the launch's recorded
+// reference stays the one it recorded.
+#[tokio::test]
+async fn a_chat_reference_is_never_compared_with_a_decision_answer() {
+    let (dir, owner, fence, engine, w, wake) = decide_then_wake(
+        |engine| engine.generates(&[1, 2, 3]),
+        |engine| engine.decides("shipping", 0.1, 0.8, 0.1),
+    )
+    .await;
+    until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+    assert_eq!(last_error(&dir, &fence.deployment_id), None);
+    assert_eq!(
+        reference(&owner, &dir, &engine, &fence.deployment_id).map(tokens),
+        Some(vec![1, 2, 3])
+    );
+    w.shutdown().await.unwrap();
+}
+
 // T20 (owner decision 2026-10-09): a new launch records its own reference;
 // the earlier launch's answer never judges it.
 #[tokio::test]
@@ -1123,7 +1315,7 @@ async fn a_new_launch_records_a_new_reference() {
     *slot.lock().unwrap() = engine.clone();
     ready(&w, &next).await;
     assert_eq!(
-        reference(&owner, &dir, &engine, &fence.deployment_id).map(|r| r.tokens),
+        reference(&owner, &dir, &engine, &fence.deployment_id).map(tokens),
         Some(vec![4, 5])
     );
     let wake = park_and_wake(&w, &dir, &next).await;

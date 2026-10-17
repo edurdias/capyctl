@@ -603,4 +603,16 @@ pub trait ChatForward: Send + Sync {
     ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    /// ADR 0030 §3: the fixed decision probe ([`crate::decision_probe`]) of a
+    /// decisions deployment, through this engine's own loopback endpoint and
+    /// launch key, answering the served model `served`. Bounded by `bound`.
+    /// Only a complete, well-formed answer is `Ok`. Never a chat request: an
+    /// engine that cannot answer it is `UnsupportedCapability`.
+    async fn decision_probe(
+        &self,
+        _served: &str,
+        _bound: std::time::Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
 }

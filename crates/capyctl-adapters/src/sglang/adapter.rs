@@ -207,6 +207,10 @@ pub struct SglangAdapter {
     /// decoding): release and resume name the KV cache alone, and the reload
     /// step has nothing to send.
     resident_weights: bool,
+    /// ADR 0030 §1: the API the deployment serves, which decides how
+    /// readiness and the wake canary are proven (§§3, 4). Set by whoever
+    /// resolved the deployment; `chat` unless set.
+    api: capyctl_config::effective::DeploymentApi,
 }
 
 impl SglangAdapter {
@@ -253,7 +257,19 @@ impl SglangAdapter {
             launched: Mutex::new(None),
             cpu_weight_backup: frozen.settings().cpu_weight_backup,
             resident_weights: frozen.settings().weight_restore == "resident",
+            api: capyctl_config::effective::DeploymentApi::Chat,
         })
+    }
+
+    /// ADR 0030 §1: the API the deployment serves.
+    pub fn with_api(mut self, api: capyctl_config::effective::DeploymentApi) -> Self {
+        self.api = api;
+        self
+    }
+
+    /// ADR 0030 §3: whether readiness is the fixed decision probe.
+    pub(super) fn decisions(&self) -> bool {
+        !self.api.is_chat()
     }
 
     /// SPEC §9.2: the host's private directory (0700, service-owned) where a
@@ -592,11 +608,16 @@ impl SglangAdapter {
         let host_restored = command.action == RuntimeAction::ReloadWeights
             && (self.cpu_weight_backup || self.resident_weights);
         if command.action != RuntimeAction::Drain && !host_restored {
-            self.http
-                .as_ref()
-                .ok_or_else(uncertain)?
-                .execute(command.action, timeout)
-                .await?;
+            let http = self.http.as_ref().ok_or_else(uncertain)?;
+            if command.action == RuntimeAction::Probe && self.decisions() {
+                // ADR 0030 §3, SPEC §6.1: a decisions launch is usable after
+                // a wake only on the fixed decision, never a chat answer.
+                http.decision_probe(timeout)
+                    .await
+                    .map_err(|_| uncertain())?;
+            } else {
+                http.execute(command.action, timeout).await?;
+            }
         }
         let after = observer
             .observe_step(command, true, &access)
@@ -786,16 +807,30 @@ impl EngineAdapter for SglangAdapter {
     }
     /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
     /// completion probe on this engine's own loopback endpoint and key,
-    /// observed when its answer arrived.
+    /// observed when its answer arrived. ADR 0030 §4: a decisions launch's
+    /// canary is the fixed decision probe instead, and it never answers
+    /// `Unsupported` (that would pass a wake unchecked).
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
+        use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
+        if self.decisions() {
+            return match ChatForward::decision_probe(self, &self.served_name, bound).await {
+                Ok(answer) => Ok(CanaryAnswer {
+                    answer: CanaryEvidence::Decision(answer),
+                    observed_at_ms: clock_ms()?,
+                }),
+                Err(e) => Err(RuntimeError::Uncertain(format!(
+                    "SGLang did not answer the decision probe: {e}"
+                ))),
+            };
+        }
         match ChatForward::complete_probe(self, "", max_tokens, bound).await {
-            Ok(answer) => Ok(crate::completion_probe::CanaryAnswer {
-                answer,
+            Ok(answer) => Ok(CanaryAnswer {
+                answer: CanaryEvidence::Generated(answer),
                 observed_at_ms: clock_ms()?,
             }),
             Err(AdapterError::UnsupportedCapability) => Err(RuntimeError::Unsupported),

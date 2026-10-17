@@ -1810,6 +1810,8 @@ impl HostJournal {
             // SPEC §13.3: an engine log tail is never journaled either.
             engine_log: None,
             probe_text: String::new(),
+            // ADR 0030 §4: nor a decision probe's answer.
+            probe_decision: None,
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or

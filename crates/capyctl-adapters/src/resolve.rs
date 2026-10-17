@@ -88,6 +88,9 @@ pub enum AdapterSpec {
         /// host's private root, removed on gone evidence. `None`: the entry
         /// makes its own temporary one.
         rendezvous: Option<std::path::PathBuf>,
+        /// ADR 0030 §1: the API the deployment serves, which decides how
+        /// readiness and the wake canary are proven.
+        api: capyctl_config::effective::DeploymentApi,
     },
     /// ADR 0023: TensorFold talks plain HTTP on loopback and has no key; an
     /// owned launch carries its plan.
@@ -107,6 +110,8 @@ pub enum AdapterSpec {
         fingerprint: String,
         model_id: String,
         launch: Option<crate::llamacpp::PlanInputLlamacpp>,
+        /// ADR 0030 §1: the API the deployment serves.
+        api: capyctl_config::effective::DeploymentApi,
     },
 }
 
@@ -179,6 +184,7 @@ pub fn resolve(
             session,
             extra_approvals,
             rendezvous,
+            api,
         } => {
             let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
                 .map_err(|error| match error {
@@ -192,7 +198,8 @@ pub fn resolve(
                     other => other,
                 })?
                 .with_launch(*frozen)
-                .with_credentials(inference, admin);
+                .with_credentials(inference, admin)
+                .with_api(api);
             if let Some(wrapper) = wrapper {
                 adapter = adapter.with_wrapper(wrapper);
             }
@@ -236,9 +243,11 @@ pub fn resolve(
             fingerprint,
             model_id,
             launch,
+            api,
         } => {
             let mut adapter =
-                crate::llamacpp::LlamacppAdapter::new(endpoint, fingerprint, model_id);
+                crate::llamacpp::LlamacppAdapter::new(endpoint, fingerprint, model_id)
+                    .with_api(api);
             if let Some(launch) = launch {
                 adapter = adapter.with_launch(launch);
             }

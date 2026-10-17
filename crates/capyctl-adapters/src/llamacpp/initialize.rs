@@ -109,28 +109,49 @@ pub(super) async fn initialize(
         tokio::time::sleep(READINESS_POLL).await;
     }
     verify_rendered(adapter, &plan).await?;
-    let body = json!({
-        "model": plan.served_model_name,
-        "messages": [{"role": "user", "content": "Say ready."}],
-        "max_tokens": 8,
-        "temperature": 0,
-    });
     let budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
-    let answer = crate::forward::startup_probe(adapter, &body, budget)
+    if adapter.decisions() {
+        // ADR 0030 §3, SPEC §6.1: a decision model generates nothing; it is
+        // ready when it answers the fixed decision completely and
+        // well-formed. Never a chat probe in its place.
+        tokio::time::timeout(
+            budget,
+            adapter
+                .http()
+                .decision_probe(&plan.served_model_name, budget),
+        )
         .await
-        .ok_or_else(|| {
+        .map_err(|_| {
             RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
         })?
         .map_err(|e| {
             RuntimeError::Uncertain(redact_text(&format!(
-                "engine listed the model but did not answer: {e}"
+                "engine listed the model but did not answer the decision probe: {e}"
             )))
         })?;
-    // ADR 0029 §10: a non-empty `content` or `reasoning_content` answers.
-    if !crate::forward::probe_answered(&answer) {
-        return Err(RuntimeError::Uncertain(
-            "engine answered with empty content".into(),
-        ));
+    } else {
+        let body = json!({
+            "model": plan.served_model_name,
+            "messages": [{"role": "user", "content": "Say ready."}],
+            "max_tokens": 8,
+            "temperature": 0,
+        });
+        let answer = crate::forward::startup_probe(adapter, &body, budget)
+            .await
+            .ok_or_else(|| {
+                RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+            })?
+            .map_err(|e| {
+                RuntimeError::Uncertain(redact_text(&format!(
+                    "engine listed the model but did not answer: {e}"
+                )))
+            })?;
+        // ADR 0029 §10: a non-empty `content` or `reasoning_content` answers.
+        if !crate::forward::probe_answered(&answer) {
+            return Err(RuntimeError::Uncertain(
+                "engine answered with empty content".into(),
+            ));
+        }
     }
     let group_tools = tools.clone();
     let led_by = api.clone();

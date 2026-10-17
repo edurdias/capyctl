@@ -176,6 +176,16 @@ const MAX_PRE_ADMISSIONS: usize = 256;
 trait NativeEngine: EngineAdapter + ChatForward {}
 impl<T: EngineAdapter + ChatForward> NativeEngine for T {}
 
+/// What a completion or decision probe of a retained launch needs: the
+/// adapter that can only question it, its deployment's API (ADR 0030 §1), the
+/// served name and the probe's bound.
+type RetainedProbe = (
+    Box<dyn NativeEngine>,
+    capyctl_config::effective::DeploymentApi,
+    String,
+    Duration,
+);
+
 /// The engine-specific half of a launch, built from local policy before the
 /// durable attempt begins. Building it has no effect.
 enum PreparedLaunch {
@@ -1304,8 +1314,10 @@ impl NativeHostExecution {
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
         Ok(match prepared {
             PreparedLaunch::Sglang(frozen) => {
-                let mut adapter =
-                    SglangAdapter::from_frozen(&frozen, None).map_err(|_| SessionError)?;
+                // ADR 0030 §3: readiness follows the deployment's API.
+                let mut adapter = SglangAdapter::from_frozen(&frozen, None)
+                    .map_err(|_| SessionError)?
+                    .with_api(effective.api);
                 // SPEC §9.2: a memory-saver launch enrolls its saver
                 // observation in this host's private directory.
                 if let Some(dir) = self.saver.as_ref().and_then(|s| s.observation_dir()) {
@@ -1391,7 +1403,8 @@ impl NativeHostExecution {
                     None,
                 )
                 .map_err(|_| SessionError)?
-                .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin)),
+                .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin))
+                .with_api(effective.api),
             ),
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
@@ -1545,7 +1558,8 @@ impl NativeHostExecution {
     ///
     /// The journaled group must still be exactly the one whose readiness the
     /// launch recorded (PID, boot and start identity), and the engine must answer
-    /// a fresh `/v1/models` read and chat probe with the launch's own native key.
+    /// a fresh `/v1/models` read and the deployment's own probe (a chat
+    /// completion, or ADR 0030 §3's fixed decision) with the launch's own native key.
     /// Only then is the result persisted and the gate reopened for this session.
     /// Any failure leaves the gate closed and claims nothing; ownership stays.
     async fn reprobe(
@@ -1583,6 +1597,7 @@ impl NativeHostExecution {
             adapter.as_ref(),
             &member,
             &served,
+            effective.api,
             command.identity.deadline_ms - PROBE_MARGIN_MS,
         )
         .await?;
@@ -1615,6 +1630,50 @@ impl NativeHostExecution {
         owned_handle: &str,
         max_tokens: u32,
     ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, SessionError> {
+        let (adapter, _, served, bound) = self.retained_probe(command, owned_handle).await?;
+        let answer =
+            tokio::time::timeout(bound, adapter.complete_probe(&served, max_tokens, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|_| SessionError)?;
+        if answer.tokens.len() > max_tokens as usize
+            || answer.text.len() > capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES
+        {
+            return Err(SessionError);
+        }
+        Ok(answer)
+    }
+
+    /// ADR 0030 §4: the decision probe of a retained decisions launch, as
+    /// [`Self::complete`] runs a completion: the launch must still be the
+    /// live, ready group its readiness recorded, and the engine answers the
+    /// fixed decision on loopback with the launch's own key. Nothing is
+    /// recorded and no gate moves. A launch that is not a decisions
+    /// deployment is never asked (it would answer as chat); any failure or
+    /// malformed answer is an error, which the result reports as no answer.
+    async fn decide(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+    ) -> Result<capyctl_adapters::decision_probe::DecisionAnswer, SessionError> {
+        let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
+        if api.is_chat() {
+            return Err(SessionError);
+        }
+        tokio::time::timeout(bound, adapter.decision_probe(&served, bound))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)
+    }
+
+    /// The retained launch a completion or decision probe names, bound by
+    /// the journal's `probe_target`, as an adapter that can only question
+    /// it, with its deployment's API, served name and the probe's bound.
+    async fn retained_probe(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+    ) -> Result<RetainedProbe, SessionError> {
         let owned = self
             .journal
             .retained_command(owned_handle)
@@ -1640,17 +1699,7 @@ impl NativeHostExecution {
             )
             .unwrap_or(0),
         );
-        let answer =
-            tokio::time::timeout(bound, adapter.complete_probe(&served, max_tokens, bound))
-                .await
-                .map_err(|_| SessionError)?
-                .map_err(|_| SessionError)?;
-        if answer.tokens.len() > max_tokens as usize
-            || answer.text.len() > capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES
-        {
-            return Err(SessionError);
-        }
-        Ok(answer)
+        Ok((adapter, effective.api, served, bound))
     }
 
     /// SPEC §13 / §13.3: the terminal refusal of a command, and for a launch
@@ -1784,6 +1833,8 @@ impl NativeHostExecution {
         let mut launch_failed: Option<String> = None;
         // ADR 0028 §9 (decided 2026-10-06): what a completion probe generated.
         let mut probe = capyctl_adapters::completion_probe::ProbeAnswer::default();
+        // ADR 0030 §4: what a decision probe answered.
+        let mut decided: Option<capyctl_adapters::decision_probe::DecisionAnswer> = None;
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -1808,18 +1859,27 @@ impl NativeHostExecution {
             // nothing and moves no gate, so running it twice is harmless; a
             // reply without tokens would read as a failed probe and tear a
             // healthy group down.
-            Acceptance::Replay(_) => {
-                if let MemberAction::Probe {
+            Acceptance::Replay(_) => match &command.action {
+                MemberAction::Probe {
                     owned_handle,
                     max_tokens: Some(max_tokens),
-                } = &command.action
-                {
+                    ..
+                } => {
                     probe = self
                         .complete(&command, owned_handle, *max_tokens)
                         .await
                         .unwrap_or_default();
                 }
-            }
+                // ADR 0030 §4: a decision probe likewise records nothing.
+                MemberAction::Probe {
+                    owned_handle,
+                    decision: true,
+                    ..
+                } => {
+                    decided = self.decide(&command, owned_handle).await.ok();
+                }
+                _ => {}
+            },
             Acceptance::Fresh(ticket) => match &command.action {
                 MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
                     // SPEC §§6.1, 13.2: a launch that fails (an engine that
@@ -1861,6 +1921,7 @@ impl NativeHostExecution {
                 MemberAction::Probe {
                     owned_handle,
                     max_tokens,
+                    decision,
                 } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
@@ -1880,6 +1941,11 @@ impl NativeHostExecution {
                                 .complete(&command, owned_handle, *max_tokens)
                                 .await
                                 .unwrap_or_default();
+                        }
+                        // ADR 0030 §4: likewise a decision probe that fails or
+                        // answers malformed carries no answer.
+                        None if *decision => {
+                            decided = self.decide(&command, owned_handle).await.ok();
                         }
                         // An engine that does not answer is ordinary evidence:
                         // the result below reports it unusable with ownership
@@ -1911,6 +1977,18 @@ impl NativeHostExecution {
         if result.state == "completed" {
             result.probe_tokens = probe.tokens;
             result.probe_text = probe.text;
+            result.probe_decision = decided.map(|answer| pb::DecisionProbeEvidence {
+                probe_version: capyctl_adapters::decision_probe::VERSION,
+                choice: answer.choice,
+                probabilities: answer
+                    .probabilities
+                    .into_iter()
+                    .map(|(option, probability)| pb::DecisionProbability {
+                        option,
+                        probability,
+                    })
+                    .collect(),
+            });
         }
         if command.action.launch_plan().is_some()
             && result.state == "launched"
@@ -2079,11 +2157,14 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
 /// SPEC §6.1: a fresh native model probe, the same evidence a launch's readiness
 /// rests on. The served name must be listed, and the model must answer a short
 /// completion through the same authenticated path inference uses. HTTP liveness
-/// alone is never readiness.
+/// alone is never readiness. ADR 0030 §3: a decisions deployment answers the
+/// fixed decision instead, complete and well-formed, and is never sent a
+/// chat probe.
 async fn fresh_probe(
     engine: &dyn NativeEngine,
     member: &MemberRef,
     served: &str,
+    api: capyctl_config::effective::DeploymentApi,
     stop_at_ms: i64,
 ) -> Result<(), SessionError> {
     let remaining = || {
@@ -2100,6 +2181,14 @@ async fn fresh_probe(
     .map_err(|_| SessionError)?;
     if listed != Readiness::Ready {
         return Err(SessionError);
+    }
+    if !api.is_chat() {
+        let bound = remaining().min(PROBE_CHAT_TIMEOUT);
+        return tokio::time::timeout(bound, engine.decision_probe(served, bound))
+            .await
+            .map_err(|_| SessionError)?
+            .map(|_| ())
+            .map_err(|_| SessionError);
     }
     let body = serde_json::json!({
         "model": served,
@@ -2570,6 +2659,53 @@ mod tests {
         let directory = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
+    }
+    // T43 (ADR 0030 §3, SPEC §6.1): a host re-proves a decisions launch (after
+    // a reconnect or a restore) with the fixed decision only: a well-formed
+    // answer passes, a malformed one or an engine without `/v1/systemone`
+    // fails, and no chat probe is ever sent. A chat launch keeps its chat probe.
+    #[tokio::test]
+    async fn a_decisions_reproof_is_the_fixed_decision_never_chat() {
+        use capyctl_config::effective::DeploymentApi;
+        use capyctl_testkit::FakeEngine;
+        let member = MemberRef {
+            deployment_id: "d".into(),
+            member_id: "b".into(),
+        };
+        let stop = || capyctl_protocol::now_unix_ms() + 10_000;
+        let decisions = FakeEngine::new().with_decisions();
+        fresh_probe(
+            &decisions,
+            &member,
+            "served",
+            DeploymentApi::Decisions,
+            stop(),
+        )
+        .await
+        .unwrap();
+        decisions.set_decision(FakeEngine::decision_answer("billing", [0.9, 0.3, 0.1]));
+        assert!(fresh_probe(
+            &decisions,
+            &member,
+            "served",
+            DeploymentApi::Decisions,
+            stop()
+        )
+        .await
+        .is_err());
+        assert_eq!(decisions.decision_requests(), 2);
+        assert_eq!(decisions.chat_requests(), 0);
+        let chat = FakeEngine::new();
+        assert!(
+            fresh_probe(&chat, &member, "served", DeploymentApi::Decisions, stop())
+                .await
+                .is_err()
+        );
+        assert_eq!(chat.chat_requests(), 0);
+        fresh_probe(&chat, &member, "served", DeploymentApi::Chat, stop())
+            .await
+            .unwrap();
+        assert_eq!(chat.chat_requests(), 1);
     }
     // T37: the host document's `load_report_interval` sets the period of the
     // agent's engine load reports; omitted, it is the 1 s default.

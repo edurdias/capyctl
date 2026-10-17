@@ -493,9 +493,17 @@ pub enum MemberAction {
     /// tokens against the retained launch, on loopback with its own key, whose
     /// generated token ids the result carries (`probe_tokens`). `None` is the
     /// readiness probe and encodes and digests exactly as before.
+    ///
+    /// ADR 0030 §4 (additive): with `decision`, the decision probe of a
+    /// decisions launch: the host's agent sends the deployment's fixed
+    /// `/v1/systemone` decision request to the retained launch on loopback with
+    /// its own key, and the result carries the answer in `probe_decision`.
+    /// It never carries `max_tokens`. `false` is the readiness or completion
+    /// probe and encodes and digests exactly as before.
     Probe {
         owned_handle: String,
         max_tokens: Option<u32>,
+        decision: bool,
     },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
@@ -735,6 +743,15 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         {
             return Err(GroupIdentityError);
         }
+        // ADR 0030 §4: the decision flag rides a probe only, never a completion
+        // probe.
+        if command.probe_decision
+            && (probe_max_tokens.is_some()
+                || !matches!(command.action, Some(Action::ProbeOwnedHandle(_))))
+        {
+            return Err(GroupIdentityError);
+        }
+        let probe_decision = command.probe_decision;
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
             Action::Launch(plan) => MemberAction::Launch {
@@ -757,6 +774,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
                 MemberAction::Probe {
                     owned_handle,
                     max_tokens: probe_max_tokens.take(),
+                    decision: probe_decision,
                 }
             }
             Action::ParkOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -871,6 +889,8 @@ impl MemberCommand {
                 MemberAction::Probe { max_tokens, .. } => max_tokens.unwrap_or(0),
                 _ => 0,
             },
+            // ADR 0030 §4: false (every other probe) is not encoded.
+            probe_decision: matches!(self.action, MemberAction::Probe { decision: true, .. }),
         }
     }
 
@@ -947,6 +967,32 @@ pub const MAX_PROBE_TOKENS: u32 = 64;
 /// Owner decision 2026-10-09: the longest generated text a completion probe
 /// result may carry, in bytes (the adapters' `completion_probe::MAX_TEXT`).
 pub const PROBE_TEXT_MAX_BYTES: usize = 4096;
+
+/// ADR 0030 §4: the most options a decision probe's answer may carry.
+pub const DECISION_PROBE_MAX_OPTIONS: usize = 16;
+
+/// ADR 0030 §4: the longest option name in a decision probe's answer, in bytes.
+pub const DECISION_PROBE_OPTION_MAX_BYTES: usize = 64;
+
+/// ADR 0030 §4: the version of the fixed decision probe this protocol knows.
+pub const DECISION_PROBE_VERSION: u32 = 1;
+
+/// ADR 0030 §4: a decision probe's answer is well-formed: this probe version,
+/// 1..=16 unique, non-empty, bounded option names, each probability finite
+/// within [0, 1], and the choice one of the options.
+fn decision_evidence_ok(evidence: &pb::DecisionProbeEvidence) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    evidence.probe_version == DECISION_PROBE_VERSION
+        && (1..=DECISION_PROBE_MAX_OPTIONS).contains(&evidence.probabilities.len())
+        && evidence.probabilities.iter().all(|p| {
+            !p.option.is_empty()
+                && p.option.len() <= DECISION_PROBE_OPTION_MAX_BYTES
+                && p.probability.is_finite()
+                && (0.0..=1.0).contains(&p.probability)
+                && seen.insert(p.option.as_str())
+        })
+        && seen.contains(evidence.choice.as_str())
+}
 
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
@@ -1025,6 +1071,16 @@ pub fn validate_result(
             && result.probe_text.len() <= PROBE_TEXT_MAX_BYTES)
     {
         return Err(GroupIdentityError);
+    }
+    // ADR 0030 §4: a decision answer belongs to a completed decision probe
+    // only, and must be well-formed.
+    if let Some(evidence) = &result.probe_decision {
+        if !(matches!(command.action, MemberAction::Probe { decision: true, .. })
+            && result.state == "completed"
+            && decision_evidence_ok(evidence))
+        {
+            return Err(GroupIdentityError);
+        }
     }
     // A probe, park or restore reports on exactly the launch it names, whatever
     // the outcome.

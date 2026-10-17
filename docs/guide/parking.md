@@ -68,6 +68,13 @@ wrong answers ([Errors](errors.md)). A wake whose weight reload fails
 (`wake_uncertain`) stops the model the same way; the next request loads it
 fresh.
 
+A [decision model](deploy.md#decision-models) is checked the same way with its
+fixed decision instead of a prompt: the wake passes when it picks the same
+option with every probability within 0.05 of the first answer, and fails with
+`wake_mismatch` otherwise. Decision models restart instead of parking in this
+release, and every restart records a new first answer, so today the check has
+nothing to compare.
+
 ## Switch between models
 
 When a model needs memory that another one holds, CapyCTL parks the idle one.

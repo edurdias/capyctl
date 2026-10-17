@@ -33,6 +33,7 @@ fn base() -> MemberCommand {
             terminate_recorded_processes: Vec::new(),
             group_member_launch: None,
             probe_max_tokens: 0,
+            probe_decision: false,
         })),
     })
     .unwrap()
@@ -105,6 +106,7 @@ fn park_and_restore_roundtrip_and_are_digest_bound() {
         with_action(MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: None,
+            decision: false,
         })
         .canonical_digest(),
         with_action(MemberAction::Terminate {
@@ -227,6 +229,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         probe_tokens: Vec::new(),
         engine_log: None,
         probe_text: String::new(),
+        probe_decision: None,
     }
 }
 
@@ -339,6 +342,7 @@ fn residency_evidence_is_refused_on_other_actions() {
         MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: None,
+            decision: false,
         },
         MemberAction::Terminate {
             owned_handle: "launch".into(),
@@ -585,6 +589,7 @@ fn a_policy_refused_park_is_unchanged_with_a_closed_reason() {
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: None,
+        decision: false,
     });
     let mut result = parked_result(&probe);
     result.residency = None;
@@ -749,11 +754,13 @@ fn completion_probe_is_additive() {
     let plain = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: None,
+        decision: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: Some(8),
+        decision: false,
     });
     assert_ne!(probe.canonical_digest(), plain.canonical_digest());
     assert_eq!(
@@ -798,6 +805,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: Some(2),
+        decision: false,
     });
     validate_result(&probe, &answer(&probe, vec![7, 8])).unwrap();
     validate_result(&probe, &answer(&probe, Vec::new())).unwrap();
@@ -805,6 +813,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
     let plain = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: None,
+        decision: false,
     });
     validate_result(&plain, &answer(&plain, Vec::new())).unwrap();
     assert!(validate_result(&plain, &answer(&plain, vec![7])).is_err());
@@ -830,6 +839,7 @@ fn probe_text_answers_a_completion_probe_only() {
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: Some(8),
+        decision: false,
     });
     validate_result(&probe, &answer(&probe, "Ready.".into())).unwrap();
     let max = capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES;
@@ -838,6 +848,143 @@ fn probe_text_answers_a_completion_probe_only() {
     let plain = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: None,
+        decision: false,
     });
     assert!(validate_result(&plain, &answer(&plain, "Ready.".into())).is_err());
+}
+
+fn decision_probe() -> MemberCommand {
+    with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: true,
+    })
+}
+
+// T43, T34 (ADR 0030 §4): the decision probe is additive; a plain probe
+// encodes and digests as before, and only a host with `decisions` is sent one.
+#[test]
+fn decision_probe_is_additive() {
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: false,
+    });
+    assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
+    let probe = decision_probe();
+    assert_ne!(probe.canonical_digest(), plain.canonical_digest());
+    assert_eq!(
+        decode(&probe.to_wire().encode_to_vec()).unwrap().action,
+        probe.action
+    );
+    probe.verify_digest().unwrap();
+    let mut wire = probe.to_wire();
+    assert!(wire.probe_decision);
+    wire.probe_decision = false;
+    assert_eq!(decode(&wire.encode_to_vec()).unwrap().action, plain.action);
+    // The flag rides a probe only, and never a completion probe.
+    let mut inspect = with_action(MemberAction::Inspect).to_wire();
+    inspect.probe_decision = true;
+    assert!(decode(&inspect.encode_to_vec()).is_err());
+    let mut both = probe.to_wire();
+    both.probe_max_tokens = 8;
+    assert!(decode(&both.encode_to_vec()).is_err());
+    use capyctl_protocol::capabilities::{required, DECISIONS};
+    assert_eq!(required(&probe.to_wire()), vec![DECISIONS]);
+    assert!(required(&plain.to_wire()).is_empty());
+}
+
+// T43 (ADR 0030 §4): a decision answer belongs to a completed decision probe
+// only, and must be well-formed.
+#[test]
+fn decision_answer_belongs_to_a_completed_decision_probe_only() {
+    use capyctl_protocol::execution::{
+        DECISION_PROBE_MAX_OPTIONS, DECISION_PROBE_OPTION_MAX_BYTES, DECISION_PROBE_VERSION,
+    };
+    let evidence = |choice: &str, options: &[(&str, f64)]| pb::DecisionProbeEvidence {
+        probe_version: DECISION_PROBE_VERSION,
+        choice: choice.into(),
+        probabilities: options
+            .iter()
+            .map(|(option, probability)| pb::DecisionProbability {
+                option: (*option).into(),
+                probability: *probability,
+            })
+            .collect(),
+    };
+    let answer =
+        |command: &MemberCommand, decision: pb::DecisionProbeEvidence| pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            owned_handle: "launch".into(),
+            observed_at_unix_ms: 1,
+            claim_retained: true,
+            binding_id: "binding".into(),
+            incarnation: "incarnation".into(),
+            probe_decision: Some(decision),
+            ..Default::default()
+        };
+    let good = evidence("yes", &[("yes", 0.75), ("no", 0.25)]);
+    let probe = decision_probe();
+    validate_result(&probe, &answer(&probe, good.clone())).unwrap();
+    let mut bare = answer(&probe, good.clone());
+    bare.probe_decision = None;
+    validate_result(&probe, &bare).unwrap();
+    let mut failed = answer(&probe, good.clone());
+    failed.state = "attempted".into();
+    assert!(validate_result(&probe, &failed).is_err());
+    for other in [
+        MemberAction::Probe {
+            owned_handle: "launch".into(),
+            max_tokens: None,
+            decision: false,
+        },
+        MemberAction::Probe {
+            owned_handle: "launch".into(),
+            max_tokens: Some(8),
+            decision: false,
+        },
+    ] {
+        let other = with_action(other);
+        assert!(validate_result(&other, &answer(&other, good.clone())).is_err());
+    }
+    let parked = park("launch");
+    assert!(validate_result(&parked, &answer(&parked, good.clone())).is_err());
+    // A decision probe never carries a completion probe's answer.
+    let mut tokens = answer(&probe, good.clone());
+    tokens.probe_tokens = vec![7];
+    assert!(validate_result(&probe, &tokens).is_err());
+    let mut text = answer(&probe, good.clone());
+    text.probe_text = "Ready.".into();
+    assert!(validate_result(&probe, &text).is_err());
+    // Bounds: the most options and the longest name pass; one more fails.
+    let long = "x".repeat(DECISION_PROBE_OPTION_MAX_BYTES);
+    validate_result(&probe, &answer(&probe, evidence(&long, &[(&long, 1.0)]))).unwrap();
+    let names: Vec<String> = (0..=DECISION_PROBE_MAX_OPTIONS)
+        .map(|i| format!("o{i}"))
+        .collect();
+    let many: Vec<(&str, f64)> = names.iter().map(|n| (n.as_str(), 0.0)).collect();
+    validate_result(
+        &probe,
+        &answer(&probe, evidence("o0", &many[..DECISION_PROBE_MAX_OPTIONS])),
+    )
+    .unwrap();
+    let longer = "x".repeat(DECISION_PROBE_OPTION_MAX_BYTES + 1);
+    let mut wrong_version = good.clone();
+    wrong_version.probe_version = DECISION_PROBE_VERSION + 1;
+    for malformed in [
+        evidence("yes", &[("yes", f64::NAN), ("no", 0.25)]),
+        evidence("yes", &[("yes", f64::INFINITY)]),
+        evidence("yes", &[("yes", 1.5), ("no", 0.25)]),
+        evidence("yes", &[("yes", -0.1)]),
+        evidence("yes", &[("yes", 0.5), ("yes", 0.5)]),
+        evidence("maybe", &[("yes", 0.75), ("no", 0.25)]),
+        evidence("", &[("", 1.0)]),
+        evidence(&longer, &[(&longer, 1.0)]),
+        evidence("yes", &[]),
+        evidence("o0", &many),
+        wrong_version,
+    ] {
+        assert!(validate_result(&probe, &answer(&probe, malformed)).is_err());
+    }
 }

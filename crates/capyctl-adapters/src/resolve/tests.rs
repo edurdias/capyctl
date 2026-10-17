@@ -111,6 +111,7 @@ fn llamacpp() -> AdapterSpec {
         fingerprint: "0.6.0+d812350".into(),
         model_id: "m".into(),
         launch: None,
+        api: capyctl_config::effective::DeploymentApi::Chat,
     }
 }
 

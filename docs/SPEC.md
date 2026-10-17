@@ -202,6 +202,10 @@ Adoption is a separate authorized transfer of ownership, not an attachment flag 
 
 `FAILED`, loss of connectivity, or expiration of a command lease MUST NOT release a resource reservation without evidence. Liveness of an HTTP server is not model readiness.
 
+> **Amended by [ADR 0030](design/adr/0030-decision-models.md)** (owner decisions 2026-10-17).
+
+A model that generates no text (a deployment with `api: decisions`) is ready when it answers one fixed decision completely and well-formed, where a chat model would generate text: one `POST /v1/systemone` request with a short text state and one `choice` question of three options, one of which the state names, answered with a probability for every option and no other, each finite and between 0 and 1, summing to 1 within 1e-3, and a pick that is one of the options. It need not pick the named option. This holds at start, after a wake, and when a host or a restarted standalone role re-proves a retained launch; `/health` and `/v1/models` alone are never its readiness, and it is never sent a chat probe in place of the decision. Its wake check records the first such answer, with the probe's version and the comparison rule, for the launch (deployment, instance, generation and launch incarnation) and passes a later answer only when it picks the same option with every probability within 0.05 of the reference; a reference of another kind or probe version is never compared with it. A decisions deployment resolves `restart_only` and never parks, so no transition compares today: each restart is a new launch that records its own reference.
+
 Normal transitions:
 
 ```text
@@ -1066,7 +1070,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
-- 2026-10-17, [ADR 0030](design/adr/0030-decision-models.md): decision models, a deployment's `api` (`chat` or `decisions`), refused on an engine, topology, residency or parser it cannot use, and the host capability `decisions` (§15.1, §16, T43); `POST /v1/systemone` for decisions deployments, its closed request contract, completion evidence, the `api_mismatch` refusal and `capyctl.api` in `/v1/models` (§10, T43).
+- 2026-10-17, [ADR 0030](design/adr/0030-decision-models.md): decision models, a deployment's `api` (`chat` or `decisions`), refused on an engine, topology, residency or parser it cannot use, and the host capability `decisions` (§15.1, §16, T43); `POST /v1/systemone` for decisions deployments, its closed request contract, completion evidence, the `api_mismatch` refusal and `capyctl.api` in `/v1/models` (§10, T43); readiness of a model that generates no text is a fixed well-formed decision, and its wake check compares probabilities within 0.05 (§6.1).
 - 2026-10-09, [ADR 0029](design/adr/0029-llamacpp-engine.md): llama.cpp's `llama-server` as the fourth engine, `restart_only`, one model per deployment (§1, §9.4, T42).
 - 2026-10-05, [ADR 0028](design/adr/0028-multi-node-engine-groups.md): multi-node engine groups for vLLM, SGLang and TensorFold (§11, §15, §16.4, §20).
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).

@@ -213,6 +213,16 @@ impl Http {
         .await?;
         probe::openai_answer(&answer)
     }
+
+    /// ADR 0030 §3: the fixed decision probe, `POST /v1/systemone`, on the
+    /// loopback endpoint (no key, ADR 0029 §4).
+    pub(crate) async fn decision_probe(
+        &self,
+        served: &str,
+        bound: Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        crate::decision_probe::probe(&self.client, &self.base, None, served, bound).await
+    }
 }
 
 /// One unlabelled sample of `name` in a Prometheus text exposition, as

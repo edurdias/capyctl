@@ -123,6 +123,8 @@ struct Reported {
     /// `/metrics` never answers.
     hung_metrics: AtomicBool,
     reasoning_only: AtomicBool,
+    /// ADR 0030: what `/v1/systemone` answers (a decision model).
+    decision: std::sync::Mutex<Option<Value>>,
 }
 
 /// Take one from `counter` while it is positive.
@@ -138,6 +140,7 @@ struct Stub {
     reported: Arc<Reported>,
     health_reads: Arc<AtomicUsize>,
     chats: Arc<AtomicUsize>,
+    decisions: Arc<AtomicUsize>,
 }
 
 impl Stub {
@@ -268,6 +271,23 @@ async fn chat(State(stub): State<Stub>, Json(body): Json<Value>) -> axum::respon
         .into_response()
 }
 
+async fn systemone(State(stub): State<Stub>, Json(body): Json<Value>) -> axum::response::Response {
+    stub.decisions.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        body["model"], stub.model,
+        "the probe names the served model"
+    );
+    assert_eq!(body["questions"]["route"]["type"], "choice");
+    match stub.reported.decision.lock().unwrap().clone() {
+        Some(answer) => Json(answer).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"code": 404, "message": "File Not Found"}})),
+        )
+            .into_response(),
+    }
+}
+
 fn reported() -> Reported {
     let reported = Reported::default();
     reported.total_slots.store(4, SeqCst);
@@ -293,6 +313,7 @@ async fn stub_engine(change: impl FnOnce(&Reported)) -> (Stub, u16) {
         reported: Arc::new(state),
         health_reads: Arc::default(),
         chats: Arc::default(),
+        decisions: Arc::default(),
     };
     let app = axum::Router::new()
         .route("/health", get(health))
@@ -300,6 +321,7 @@ async fn stub_engine(change: impl FnOnce(&Reported)) -> (Stub, u16) {
         .route("/props", get(props))
         .route("/metrics", get(metrics))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/systemone", post(systemone))
         .with_state(stub.clone());
     let port = serve(app).await;
     (stub, port)
@@ -455,6 +477,51 @@ async fn a_reasoning_only_probe_answer_is_an_answer() {
         .execute_persisted(&initialize_command(30_000))
         .await
         .unwrap();
+}
+
+fn decision(choice: &str, billing: f64, shipping: f64, technical: f64) -> Value {
+    json!({"model": "qwen", "answers": {"route": {"type": "choice", "choice": choice,
+        "probabilities": {"billing": billing, "shipping": shipping, "technical": technical},
+        "confidence": 0.9}}, "usage": {"input_tokens": 40, "output_tokens": 0}})
+}
+
+// T43 (ADR 0030 §3, SPEC §6.1): a decisions launch is ready only on a
+// complete, well-formed answer to the fixed decision, whatever it picks,
+// and is never sent a chat probe; its canary is that decision.
+#[tokio::test]
+async fn a_decisions_launch_is_ready_only_on_a_well_formed_decision() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::effective::DeploymentApi;
+    let cases = [
+        (Some(decision("billing", 0.9503, 0.0157, 0.034)), true),
+        (Some(decision("technical", 0.2, 0.2, 0.6)), true),
+        (Some(decision("billing", 0.9, 0.2, 0.1)), false),
+        (Some(decision("other", 0.9503, 0.0157, 0.034)), false),
+        (
+            Some(json!({"answers": {"route": {"type": "noul", "noul": 0.6}}})),
+            false,
+        ),
+        (None, false),
+    ];
+    for (answer, ready) in cases {
+        let (stub, port) = stub_engine(|r| *r.decision.lock().unwrap() = answer.clone()).await;
+        let root = tempfile::tempdir().unwrap();
+        let adapter = launching(port, root.path(), ScriptedTool::new(Presence::Alive))
+            .with_api(DeploymentApi::Decisions);
+        let command = initialize_command(30_000);
+        let result = adapter.execute_persisted(&command).await;
+        assert_eq!(result.is_ok(), ready, "{answer:?}: {result:?}");
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0, "{answer:?}: no chat");
+        assert!(stub.decisions.load(Ordering::SeqCst) >= 1, "{answer:?}");
+        if ready {
+            let canary = adapter
+                .wake_canary(&command.context, 8, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(matches!(canary.answer, CanaryEvidence::Decision(_)));
+            assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+        }
+    }
 }
 
 // T42 (SPEC §6.4): an engine that exits before readiness fails the launch

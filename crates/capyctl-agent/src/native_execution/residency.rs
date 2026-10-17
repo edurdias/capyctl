@@ -763,9 +763,16 @@ impl NativeHostExecution {
                     deployment_id: owner.identity.deployment_id.clone(),
                     member_id: plan.binding_id.clone(),
                 };
-                if fresh_probe(probe.as_ref(), &member, &served, run.stop_at_ms)
-                    .await
-                    .is_err()
+                // ADR 0030 §3: a decisions launch answers the fixed decision.
+                if fresh_probe(
+                    probe.as_ref(),
+                    &member,
+                    &served,
+                    effective.api,
+                    run.stop_at_ms,
+                )
+                .await
+                .is_err()
                 {
                     return uncertain(milestones);
                 }

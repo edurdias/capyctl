@@ -3364,7 +3364,7 @@ async fn store_wake_canary(
     shared: &Arc<Shared>,
     instance: u32,
     context: &capyctl_domain::completion::StepExecutionContext,
-    answer: &capyctl_adapters::completion_probe::ProbeAnswer,
+    answer: &capyctl_adapters::completion_probe::CanaryEvidence,
 ) {
     let reference = crate::wake_canary::reference(answer);
     let (deployment, generation, incarnation) = (

@@ -115,6 +115,16 @@ revisions. In this release a `decisions` deployment:
 `capyctl status deployment <name>` shows an `API` line for it (`"api":
 "decisions"` with `--json`); a chat deployment has neither.
 
+A decision model generates no text, so CapyCTL proves it ready with a decision
+instead: it asks one fixed question (which team handles a ticket about a
+double charge, with three options) and waits for a complete answer, a
+probability for every option that sums to 1. It does not have to pick the
+obvious team; it has to answer. A model that answers malformed, or not at all,
+never becomes ready, and CapyCTL never sends it a chat request in place of the
+decision. The same check runs when a machine reconnects or CapyCTL restarts
+with the model still running. The first answer is recorded for the wake check
+([Parking](parking.md#park-and-wake)).
+
 ## Deploy and start
 
 ```bash

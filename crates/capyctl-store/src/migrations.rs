@@ -10,7 +10,8 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -72,6 +73,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V47,
     // Owner decision 2026-10-09: each single launch's wake canary reference.
     SCHEMA_V48,
+    // ADR 0030 §4: wake canary probe kind and version, and decision references.
+    SCHEMA_V49,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -1234,5 +1237,54 @@ mod tests {
                 "INSERT INTO model_sources VALUES('a',1,'lab','elsewhere/d','pending',0,0,NULL,0,9);"
             )
             .is_err());
+    }
+
+    // T20, T43 (ADR 0030 §4): a v48 completion reference is carried to v49
+    // unchanged, as a version 1 completion; the rebuilt table still refuses
+    // an empty completion answer and a decision row without its answer.
+    #[test]
+    fn v49_carries_completion_canaries_and_types_decision_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 48).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id)
+             VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let row: (String, String, Option<String>, String, Option<f64>) = conn
+            .query_row(
+                "SELECT incarnation||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms,
+                        kind||'|'||probe_version,mismatch_operation_id,coalesce(decision_json,''),tolerance
+                   FROM wake_canaries WHERE deployment_id='a' AND instance_index=0 AND generation=3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "inc|Say ready.|[1,2]|ok|7".into(),
+                "completion|1".into(),
+                Some("op-w".into()),
+                String::new(),
+                None
+            )
+        );
+        assert!(conn
+            .execute_batch(
+                "INSERT INTO wake_canaries VALUES('a',0,4,'i','p','[]','',1,NULL,'completion',1,NULL,NULL);"
+            )
+            .is_err());
+        assert!(conn
+            .execute_batch(
+                "INSERT INTO wake_canaries VALUES('a',0,4,'i','decision/v1','[]','',1,NULL,'decision',1,NULL,0.05);"
+            )
+            .is_err());
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,4,'i','decision/v1','[]','',1,NULL,'decision',1,'{}',0.05);",
+        )
+        .unwrap();
     }
 }
