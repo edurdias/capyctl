@@ -3,7 +3,8 @@
 CapyCTL serves the OpenAI chat API on port 8443 of the machine that runs it (the
 server, with several machines), on every interface, with an API key. On that
 machine the endpoint is `http://127.0.0.1:8443/v1`. Send the deployment's
-`name` as `model`.
+`name` as `model`. A decision model answers
+[decision requests](#decision-requests) on the same port instead of chat.
 
 ## The API key
 
@@ -27,11 +28,12 @@ curl -s http://127.0.0.1:8443/v1/models -H "Authorization: Bearer $KEY"
 ```
 
 ```text
-{"data":[{"id":"my-model","object":"model"}],"object":"list"}
+{"data":[{"capyctl":{"api":"chat"},"id":"my-model","object":"model"}],"object":"list"}
 ```
 
 Listing never wakes a model. A request without the key, or with a wrong one,
-is answered `401`.
+is answered `401`. `capyctl.api` is the endpoint the model answers: `chat`
+for `/v1/chat/completions`, `decisions` for `/v1/systemone`.
 
 ## Chat
 
@@ -236,6 +238,60 @@ without `cache_salt` is served.
 
 ```text
 {"code":"cache_salt_unsupported","message":"this deployment's engine does not partition its prefix cache by cache_salt"}
+```
+
+## Decision requests
+
+A deployment with `api: decisions` ([Decision models](deploy.md#decision-models))
+answers typed questions about an input instead of generating text, on
+`POST /v1/systemone` (the System One API). It answers nothing else, and a chat
+model does not answer it.
+
+```bash
+curl -s http://127.0.0.1:8443/v1/systemone \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "my-decider",
+       "state": "I was charged twice for my order last week.",
+       "questions": {
+         "route": {"type": "choice", "instructions": "Which team should handle this?",
+                   "criteria": {"billing": "payments and refunds", "shipping": null, "technical": null}},
+         "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+         "urgency": {"type": "score", "instructions": "How urgent is this?",
+                     "criteria": ["can wait", "this week", "today"]}}}'
+```
+
+```text
+{"answers":{"angry":{"noul":0.6226,"type":"noul"},"route":{"choice":"billing","confidence":0.9255,"probabilities":{"billing":0.9503,"shipping":0.0157,"technical":0.0339},"type":"choice"},"urgency":{"confidence":0.48,"legend":{"0":"can wait","1":"this week","2":"today"},"probabilities":{"0":0.08,"1":0.71,"2":0.21},"score":1.1224,"type":"score"}},"model":"my-decider","usage":{"input_tokens":87,"output_tokens":0}}
+```
+
+The probabilities come from your model; these are an example, and they can
+move slightly between identical requests. The request takes these fields and
+no others:
+
+- `model`: the deployment's name.
+- `state`: the input, as text, a JSON object, or an array of chat messages.
+- `questions`: one or more questions, keyed by an id you choose. Each has a
+  `type` (`noul` for yes or no, `choice` for one of named options, `score`
+  for an ordered scale), `instructions`, and `criteria`: for `choice` an
+  object of option to description, for `noul` optional `true` and `false`
+  descriptions, for `score` a list of levels from low to high.
+- `images`, `files`: lists of strings (data URIs), for models that take them.
+  With several machines the whole body must fit in 8 MiB.
+
+Any other field (an engine's own extension included) is answered
+`400 invalid_request` before the model is woken; the engine judges the rest
+(how many questions or options, required `instructions`) and its refusal comes
+back as `engine_rejected` with its status. A decision is never streamed. The
+answer is the engine's, with `model` set to the name you sent and its `usage`
+as the engine reported it; it carries no `capyctl.metrics`, since time to first
+token and decode speed describe generated text. A parked or stopped decision
+model wakes or starts for the request, as a chat model does.
+
+Sent to the other endpoint, a request is answered `400 api_mismatch` without
+waking anything; the message names the endpoint to use:
+
+```text
+{"code":"api_mismatch","message":"model my-decider serves the decisions API, which /v1/chat/completions does not answer; send its requests to POST /v1/systemone"}
 ```
 
 ## When the model is parked

@@ -58,6 +58,34 @@ pub struct DeploymentRow {
     pub current_generation: i64,
 }
 
+/// One public route `/v1/models` lists, with the API its deployment answers
+/// (ADR 0030 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRoute {
+    pub id: String,
+    pub api: capyctl_config::effective::DeploymentApi,
+}
+
+/// ADR 0030 §1: the frozen revision's `api` (`e` is its `effective_revisions`
+/// row), absent while `chat`. Evaluated lazily, so an undecodable document
+/// reads as absent rather than failing the query.
+const API_COLUMN: &str = "CASE WHEN json_valid(e.effective_json) THEN \
+     CASE WHEN json_type(e.effective_json,'$.api')='text' \
+     THEN json_extract(e.effective_json,'$.api') END END";
+
+/// The API an [`API_COLUMN`] value names. A value no revision can carry is
+/// corruption, never read as either API.
+fn api_column(
+    value: Option<String>,
+) -> Result<capyctl_config::effective::DeploymentApi, StoreError> {
+    use capyctl_config::effective::DeploymentApi;
+    match value.as_deref() {
+        None | Some("chat") => Ok(DeploymentApi::Chat),
+        Some("decisions") => Ok(DeploymentApi::Decisions),
+        Some(_) => Err(invalid_column("api")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationRow {
     pub generation: i64,
@@ -759,26 +787,63 @@ impl crate::Store {
         Ok(engine.flatten())
     }
 
-    /// All enabled route ids for `/v1/models` (F1 design §5): enabled
-    /// routes are listed without waking anything.
-    pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {
-        self.conn
-            .prepare(
-                // A managed configuration records its routes in `deployment_routes`
-                // and clears the column, so both have to be read. The gate is the
-                // same for either: admission open and the deployment not suspended.
-                "SELECT route FROM (\
-                   SELECT route_model_id AS route, id AS deployment_id FROM deployments \
-                     WHERE route_model_id IS NOT NULL \
-                   UNION \
-                   SELECT route, deployment_id FROM deployment_routes\
-                 ) r JOIN deployments d ON d.id = r.deployment_id \
-                 WHERE d.admission_enabled = 1 AND d.suspended = 0 \
-                 ORDER BY route",
-            )?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+    /// All enabled routes for `/v1/models` (F1 design §5), each with the API
+    /// its deployment's current revision serves (ADR 0030 §5): enabled routes
+    /// are listed without waking anything.
+    pub fn list_enabled_routes(&self) -> Result<Vec<PublicRoute>, StoreError> {
+        let sql = format!(
+            // A managed configuration records its routes in `deployment_routes`
+            // and clears the column, so both have to be read. The gate is the
+            // same for either: admission open and the deployment not suspended.
+            "SELECT r.route, {API_COLUMN} FROM (\
+               SELECT route_model_id AS route, id AS deployment_id FROM deployments \
+                 WHERE route_model_id IS NOT NULL \
+               UNION \
+               SELECT route, deployment_id FROM deployment_routes\
+             ) r JOIN deployments d ON d.id = r.deployment_id \
+             LEFT JOIN effective_revisions e ON e.deployment_id = d.id AND e.revision = d.revision \
+             WHERE d.admission_enabled = 1 AND d.suspended = 0 \
+             ORDER BY r.route"
+        );
+        let rows = self
+            .conn
+            .prepare(&sql)?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, api)| {
+                Ok(PublicRoute {
+                    id,
+                    api: api_column(api)?,
+                })
+            })
+            .collect()
+    }
+
+    /// ADR 0030 §2: the API `deployment_id`'s current revision serves, which
+    /// decides the inference endpoint that answers for it. `chat` for a
+    /// deployment without a frozen effective configuration (created before
+    /// managed configuration); `None` when no such deployment exists.
+    pub fn deployment_api(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<capyctl_config::effective::DeploymentApi>, StoreError> {
+        let api: Option<Option<String>> = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {API_COLUMN} FROM deployments d \
+                     LEFT JOIN effective_revisions e \
+                       ON e.deployment_id = d.id AND e.revision = d.revision \
+                     WHERE d.id = ?1"
+                ),
+                [deployment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        api.map(api_column).transpose()
     }
 
     /// Alias resolution: route_model_id → the deployment serving it (no
@@ -1188,8 +1253,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.list_enabled_route_ids().unwrap(),
-            vec!["managed-route".to_string()],
+            store.list_enabled_routes().unwrap(),
+            vec![PublicRoute {
+                id: "managed-route".to_string(),
+                api: capyctl_config::effective::DeploymentApi::Chat,
+            }],
             "a managed route is listed"
         );
         let found = store
@@ -1219,10 +1287,50 @@ mod tests {
         ] {
             store.conn.execute(sql, [&id]).unwrap();
             assert!(
-                store.list_enabled_route_ids().unwrap().is_empty(),
+                store.list_enabled_routes().unwrap().is_empty(),
                 "a closed or suspended deployment offers no route"
             );
         }
+    }
+
+    // T43 (ADR 0030 §§2, 5): a route carries the API of its deployment's
+    // current revision, so the router can tell which endpoint answers it
+    // without waking anything; a revision change moves it.
+    #[test]
+    fn a_route_names_the_api_of_the_current_revision() {
+        use capyctl_config::effective::DeploymentApi;
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE deployments SET admission_enabled=1 WHERE id='{id}';
+                 INSERT INTO deployment_routes(route,deployment_id) VALUES('r',  '{id}');
+                 INSERT INTO effective_revisions VALUES('{id}',1,'{{\"api\":\"decisions\"}}','f1'),
+                                                       ('{id}',2,'{{\"name\":\"chat\"}}','f2'),
+                                                       ('{id}',3,'not json','f3');"
+            ))
+            .unwrap();
+        let api = |store: &Store| {
+            let listed = store.list_enabled_routes().unwrap();
+            assert_eq!(listed.len(), 1);
+            let api = store.deployment_api(&id).unwrap().unwrap();
+            assert_eq!(listed[0].api, api, "listing and lookup agree");
+            api
+        };
+        assert_eq!(api(&store), DeploymentApi::Decisions);
+        for (revision, expected) in [(2, DeploymentApi::Chat), (3, DeploymentApi::Chat)] {
+            store
+                .conn
+                .execute(
+                    "UPDATE deployments SET revision=?1 WHERE id=?2",
+                    params![revision, id],
+                )
+                .unwrap();
+            assert_eq!(api(&store), expected, "revision {revision}");
+        }
+        assert_eq!(store.deployment_api("absent").unwrap(), None);
     }
 
     /// SPEC §3: the engine is launched to answer to the frozen revision's first

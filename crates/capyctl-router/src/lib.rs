@@ -1,13 +1,16 @@
 //! Router crate: public inference surface (F1 design §5). The router owns
 //! admission, queue bounds, and dispatch; it never chooses models or runs a
 //! second scheduler (SPEC §10), and never imports engine crates — dispatch
-//! reaches engines through adapters behind `ChatForward`.
+//! reaches engines through adapters behind `ChatForward`. It answers chat
+//! completions and, for decisions deployments, decision requests (ADR 0030).
 
 pub mod admission;
 pub mod balance;
 // SPEC §§10, 17 (owner decision 2026-10-08): the management load read.
 pub mod capacity;
 pub mod chat;
+// ADR 0030 §2: the inference endpoints and the API each answers.
+pub mod endpoint;
 pub mod forwarders;
 // SPEC §10 step 1 (W10): bounded waiting for a deployment to become servable.
 pub mod queue;
@@ -67,6 +70,8 @@ pub fn serve_router(deps: RouterDeps) -> axum::Router {
     axum::Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        // ADR 0030 §2: decision requests, for `api: decisions` deployments.
+        .route("/v1/systemone", post(systemone))
         .layer(axum::middleware::map_response(retry_after))
         .with_state(state)
 }
@@ -127,6 +132,8 @@ async fn retry_after(mut response: axum::response::Response) -> axum::response::
 const RETRY_AFTER_SECONDS: &str = "1";
 
 /// `GET /v1/models` — lists enabled public ids; NEVER wakes a deployment.
+/// ADR 0030 §5: each entry names the API its deployment answers, so a client
+/// can tell which endpoint serves it.
 async fn list_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,31 +141,50 @@ async fn list_models(
     if !authorized(&headers, &state.deps) {
         return Err(err_json("unauthorized", "missing or invalid api key"));
     }
-    let ids = state
+    let routes = state
         .deps
         .controller
-        .list_enabled_route_ids()
+        .list_enabled_routes()
         .map_err(|e| err_json("internal", &format!("store: {e}")))?;
-    let data: Vec<serde_json::Value> = ids
+    let data: Vec<serde_json::Value> = routes
         .into_iter()
-        .map(|id| serde_json::json!({"id": id, "object": "model"}))
+        .map(|route| {
+            serde_json::json!({
+                "id": route.id,
+                "object": "model",
+                "capyctl": {"api": route.api.name()},
+            })
+        })
         .collect();
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
-/// `POST /v1/chat/completions` — authenticate → resolve → admit → dispatch.
-#[axum::debug_handler]
-async fn chat_completions(
-    state: axum::extract::State<AppState>,
-    headers: HeaderMap,
+/// One inference request read and checked before anything else is touched.
+struct Received {
+    /// SPEC §10: when the request arrived; its deadline counts from here.
+    at: tokio::time::Instant,
+    timing: timing::RequestTiming,
+    request: serde_json::Value,
+    model: String,
+    /// The size of the body as received.
+    body_bytes: usize,
+}
+
+/// Authenticate, read the body under its bound, parse it and validate it
+/// against `endpoint`'s contract, before any accounting, activation or engine
+/// is touched (SPEC §10, T19 T21; ADR 0030 §2).
+async fn receive(
+    deps: &RouterDeps,
+    headers: &HeaderMap,
     body: axum::body::Body,
-) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    endpoint: endpoint::Endpoint,
+) -> Result<Received, (StatusCode, Json<serde_json::Value>)> {
     // SPEC §10: a stream's first event is due by the request deadline,
     // counted from arrival, so activation is included.
-    let received = tokio::time::Instant::now();
+    let at = tokio::time::Instant::now();
     // SPEC §17 (M80): the router's clock starts when the handler does.
-    let mut timing = timing::RequestTiming::start(state.deps.inflight.latency.clone());
-    if !authorized(&headers, &state.deps) {
+    let timing = timing::RequestTiming::start(deps.inflight.latency.clone());
+    if !authorized(headers, deps) {
         return Err(err_json(
             "unauthorized",
             "missing or valid api key required",
@@ -169,20 +195,42 @@ async fn chat_completions(
     // multimodal body the configured bound admits (with a plain-text 413) and
     // ignore a smaller one. An oversized declared length is refused before
     // any of it is read; the request is buffered once, then parsed.
-    let body = axum::body::to_bytes(body, state.deps.limits.max_buffered_bytes_total)
+    let body = axum::body::to_bytes(body, deps.limits.max_buffered_bytes_total)
         .await
         .map_err(|_| err_json("request_too_large", "request exceeds buffered-bytes bound"))?;
-    let v: serde_json::Value = serde_json::from_slice(&body)
+    let request: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
-    let Some(model) = v["model"].as_str().map(str::to_owned) else {
+    let Some(model) = request["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
     };
     // SPEC §10, T19 T21: a request that can never be forwarded is refused
     // before any accounting, activation or engine is touched.
-    chat::validate_request(&v)?;
-    let body_bytes = body.len();
-    // The raw bytes are no longer needed; only the parsed request is held.
-    drop(body);
+    endpoint.validate(&request)?;
+    // The raw bytes drop here; only the parsed request is held from now on.
+    Ok(Received {
+        at,
+        timing,
+        request,
+        model,
+        body_bytes: body.len(),
+    })
+}
+
+/// `POST /v1/chat/completions` — authenticate → resolve → admit → dispatch.
+#[axum::debug_handler]
+async fn chat_completions(
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let endpoint = endpoint::Endpoint::ChatCompletions;
+    let Received {
+        at: received,
+        mut timing,
+        request: v,
+        model,
+        body_bytes,
+    } = receive(&state.deps, &headers, body, endpoint).await?;
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
         // SPEC §10 step 1 and T19: a request that must wait holds its body's
@@ -190,8 +238,15 @@ async fn chat_completions(
         // slot in arrival order within its deadline. Accounting is registered
         // before the response is built; the stream guard releases when the
         // backend stream ends.
-        let (deployment_id, guard) =
-            chat::admit_timed(&state.deps, &model, body_bytes, received, &mut timing).await?;
+        let (deployment_id, guard) = chat::admit_timed(
+            &state.deps,
+            endpoint,
+            &model,
+            body_bytes,
+            received,
+            &mut timing,
+        )
+        .await?;
         // ADR 0013 §10 (I3): choose an instance; SPEC §10: its durable lease is
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
@@ -213,15 +268,57 @@ async fn chat_completions(
         }
         return Ok(response);
     }
-    let (mut json, timing) =
-        chat::dispatch_timed(&state.deps, &model, v, body_bytes, received, timing).await?;
+    let (mut json, timing) = chat::dispatch_timed(
+        &state.deps,
+        endpoint,
+        &model,
+        v,
+        body_bytes,
+        received,
+        timing,
+    )
+    .await?;
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
     engine_metrics::attach(&mut json, &timing);
-    let mut response = Json(json).into_response();
+    Ok(with_timing(Json(json).into_response(), &timing))
+}
+
+/// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
+/// and settled exactly as a chat completion, for `api: decisions` deployments
+/// only. It is never streamed. The answer is the engine's, with `model` the
+/// public name and its `usage` as the engine sent it; it carries no
+/// `capyctl.metrics`, since time to first token and decode speed describe
+/// generated text and a decision generates none. Its timings are recorded
+/// like any request's.
+async fn systemone(
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let endpoint = endpoint::Endpoint::Decisions;
+    let received = receive(&state.deps, &headers, body, endpoint).await?;
+    let (json, timing) = chat::dispatch_timed(
+        &state.deps,
+        endpoint,
+        &received.model,
+        received.request,
+        received.body_bytes,
+        received.at,
+        received.timing,
+    )
+    .await?;
+    Ok(with_timing(Json(json).into_response(), &timing))
+}
+
+/// SPEC §17: the request's timing header, when the operator enabled it.
+fn with_timing(
+    mut response: axum::response::Response,
+    timing: &timing::RequestTiming,
+) -> axum::response::Response {
     if timing.header_enabled() {
         if let Ok(value) = timing.header_value().parse() {
             response.headers_mut().insert(timing::TIMING_HEADER, value);
         }
     }
-    Ok(response)
+    response
 }

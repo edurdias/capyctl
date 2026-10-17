@@ -195,8 +195,172 @@ pub fn validate_chat_request(body: &Value) -> Result<(), ChatRequestRefusal> {
     Ok(())
 }
 
+/// ADR 0030 §2, SPEC §10: the top-level fields of a decision request
+/// (`POST /v1/systemone`), the System One contract llama.cpp v0.7.0 and SGLang
+/// 0.5.22 serve: the input `state`, the typed `questions`, and the `images` and
+/// `files` some models accept. The list is closed. An engine-specific
+/// extension (SGLang's `chat_template_kwargs`, which llama.cpp does not read)
+/// is refused, never forwarded to an engine that would silently ignore it.
+pub const DECISION_REQUEST_FIELDS: &[&str] = &["model", "state", "questions", "images", "files"];
+
+/// ADR 0030 §2: the fields of one question.
+pub const DECISION_QUESTION_FIELDS: &[&str] = &["type", "instructions", "criteria"];
+
+/// ADR 0030 §2: the question types (`noul`: yes or no, `choice`: one of
+/// named options, `score`: an ordered scale).
+pub const DECISION_QUESTION_TYPES: &[&str] = &["noul", "choice", "score"];
+
+/// Why a decision request is refused before anything is sent to an engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecisionRequestRefusal {
+    /// Not a JSON object, no non-empty `model`, or a field of the wrong shape.
+    Malformed(&'static str),
+    /// A top-level field outside [`DECISION_REQUEST_FIELDS`]. Refused, never
+    /// dropped.
+    Field(String),
+}
+
+impl std::fmt::Display for DecisionRequestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(what) => write!(f, "malformed decision request: {what}"),
+            Self::Field(name) => write!(f, "decision request field `{name}` is not accepted"),
+        }
+    }
+}
+
+impl From<DecisionRequestRefusal> for AdapterError {
+    fn from(refusal: DecisionRequestRefusal) -> Self {
+        match refusal {
+            DecisionRequestRefusal::Field(_) => AdapterError::PolicyDenied,
+            DecisionRequestRefusal::Malformed(_) => AdapterError::UnsupportedCapability,
+        }
+    }
+}
+
+/// ADR 0030 §2: validate a decision request against its own closed contract
+/// before anything is sent, so every refusal is a deterministic client error
+/// with nothing reaching an engine (SPEC §10, T43). Shapes only: the counts
+/// an engine bounds (options, levels, questions, images) and the semantics of
+/// each question are the engine's to judge, and its invalid-request answer
+/// is relayed. Nothing here builds a prompt or reads the state (SPEC §10).
+pub fn validate_decision_request(body: &Value) -> Result<(), DecisionRequestRefusal> {
+    use DecisionRequestRefusal::Malformed;
+    let Some(fields) = body.as_object() else {
+        return Err(Malformed("the body is not a JSON object"));
+    };
+    if let Some(name) = fields
+        .keys()
+        .find(|name| !DECISION_REQUEST_FIELDS.contains(&name.as_str()))
+    {
+        return Err(DecisionRequestRefusal::Field(name.clone()));
+    }
+    if !fields
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.is_empty())
+    {
+        return Err(Malformed("model is required"));
+    }
+    // Text, a JSON object the engine gives the model as JSON text, or chat
+    // messages; null is passed for the engine to judge.
+    if !fields.get("state").is_some_and(|state| {
+        state.is_string() || state.is_object() || state.is_array() || state.is_null()
+    }) {
+        return Err(Malformed(
+            "state is required: a string, an object or an array of messages",
+        ));
+    }
+    let questions = fields
+        .get("questions")
+        .and_then(Value::as_object)
+        .filter(|questions| !questions.is_empty())
+        .ok_or(Malformed(
+            "questions must be a non-empty object of question id to question",
+        ))?;
+    for question in questions.values() {
+        let question = question
+            .as_object()
+            .ok_or(Malformed("each question must be an object"))?;
+        if question
+            .keys()
+            .any(|name| !DECISION_QUESTION_FIELDS.contains(&name.as_str()))
+        {
+            return Err(Malformed(
+                "a question carries only type, instructions and criteria",
+            ));
+        }
+        let kind = question
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| DECISION_QUESTION_TYPES.contains(kind))
+            .ok_or(Malformed("a question's type must be noul, choice or score"))?;
+        if question
+            .get("instructions")
+            .is_some_and(|text| !(text.is_string() || text.is_object() || text.is_array()))
+        {
+            return Err(Malformed(
+                "a question's instructions must be a string, an object or an array",
+            ));
+        }
+        // The System One forms: a `choice` names its options in an object
+        // (option to description), a `noul` may describe `true` and `false`
+        // in an object, and a `score` lists its levels low to high.
+        let criteria_shaped = match question.get("criteria") {
+            None => true,
+            Some(criteria) if kind == "score" => criteria.is_array(),
+            Some(criteria) => criteria.is_object(),
+        };
+        if !criteria_shaped {
+            return Err(Malformed(
+                "criteria must be an object for choice and noul questions and an array for score questions",
+            ));
+        }
+    }
+    for field in ["images", "files"] {
+        if fields.get(field).is_some_and(|items| {
+            !items
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
+        }) {
+            return Err(Malformed("images and files must be arrays of strings"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `body` is a decision request the host ingress may forward.
+pub fn decision_request_allowed(body: &Value) -> bool {
+    validate_decision_request(body).is_ok()
+}
+
+/// ADR 0030 §2: completion evidence for a decision request: an `answers`
+/// object holding at least one answer, each an object naming its `type`.
+/// Loose on purpose: what each answer carries differs by type and engine (a
+/// `noul` answer carries only its probability), and the router relays it.
+pub fn decision_answered(answer: &Value) -> bool {
+    answer
+        .get("answers")
+        .and_then(Value::as_object)
+        .is_some_and(|answers| {
+            !answers.is_empty()
+                && answers
+                    .values()
+                    .all(|answer| answer.get("type").is_some_and(Value::is_string))
+        })
+}
+
+/// ADR 0030 §2: the largest decision answer read, the same bound as a
+/// collected chat answer's stream ([`STREAM_LIMIT`]). An answer is a few
+/// probabilities per question, so a larger one is not an answer.
+pub const DECISION_RESPONSE_LIMIT: usize = STREAM_LIMIT;
+
 fn uncertain() -> AdapterError {
     AdapterError::Uncertain("chat terminal result unverified".into())
+}
+
+fn decision_uncertain() -> AdapterError {
+    AdapterError::Uncertain("decision answer unverified".into())
 }
 
 /// The only upstream paths a forwarder may reach on an engine.
@@ -206,7 +370,8 @@ fn uncertain() -> AdapterError {
 /// and reaching any of it on a client's behalf would put engine control behind the
 /// inference port, where none of the lifecycle authority's accounting applies. The
 /// list is closed rather than filtered so a new path has to be added deliberately.
-const FORWARDED_PATHS: [&str; 2] = ["/v1/models", "/v1/chat/completions"];
+/// ADR 0030 §2 adds the decision endpoint, for decisions deployments.
+const FORWARDED_PATHS: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/systemone"];
 
 /// Resolve one upstream URL, or refuse the path.
 ///
@@ -223,6 +388,8 @@ fn upstream(base: &reqwest::Url, path: &str) -> Option<reqwest::Url> {
 /// Intentionally no Debug implementation: credentials must never be formatted.
 pub(crate) struct ChatHttp {
     endpoint: reqwest::Url,
+    /// ADR 0030 §2: the engine's decision endpoint.
+    decisions: reqwest::Url,
     model: String,
     key: Option<String>,
     client: reqwest::Client,
@@ -248,6 +415,7 @@ impl ChatHttp {
     ) -> Self {
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
+            decisions: upstream(&base, "/v1/systemone").expect("a forwarded path"),
             model,
             key,
             honours_cache_salt,
@@ -523,6 +691,80 @@ impl ChatHttp {
         self.stream_inner(body, sink, None).await
     }
 
+    /// Send one request to `url` and screen the answer's status: a connection
+    /// never established, or a role's `shutting_down` refusal, carried nothing
+    /// (`NotAccepted`); an engine's complete invalid-request answer is
+    /// `Rejected`. Any other transport error is `unverified()`. The caller
+    /// judges every other response.
+    async fn post(
+        &self,
+        url: &reqwest::Url,
+        request: &Value,
+        unverified: fn() -> AdapterError,
+    ) -> Result<reqwest::Response, AdapterError> {
+        let mut send = self.client.post(url.clone()).json(request);
+        if let Some(key) = &self.key {
+            send = send.bearer_auth(key);
+        }
+        let response = send.send().await.map_err(|error| {
+            // SPEC §10, ADR 0013 §10: a connection that was never established
+            // carried no request, so nothing can be running for it and the
+            // router may fail over. Any other transport error may follow a sent
+            // request and stays uncertain.
+            if error.is_connect() {
+                AdapterError::NotAccepted("the connection to the serving host was refused".into())
+            } else {
+                unverified()
+            }
+        })?;
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(refused_before_forwarding(response).await);
+        }
+        // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
+        // engine's complete reply, relayed as such rather than as uncertainty.
+        if rejection_status(response.status().as_u16()) {
+            return Err(rejected_by_engine(response).await);
+        }
+        Ok(response)
+    }
+
+    /// ADR 0030 §2: forward one decision request and read its answer whole.
+    /// The request goes as one JSON body with `model` replaced by the served
+    /// name; the answer comes back with `model` replaced by the public name.
+    /// Only a complete JSON object of at most [`DECISION_RESPONSE_LIMIT`]
+    /// bytes with an `answers` object ([`decision_answered`]) is completion;
+    /// a truncated, oversized, ambiguous or malformed body stays uncertain,
+    /// since the engine may have run the request. No wall-clock bound of its
+    /// own: the router bounds the whole exchange by the request deadline.
+    pub(crate) async fn decide(&self, body: &Value) -> Result<Value, AdapterError> {
+        validate_decision_request(body)?;
+        let public = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        let mut request = body.clone();
+        request["model"] = json!(self.model);
+        let response = self
+            .post(&self.decisions, &request, decision_uncertain)
+            .await?;
+        if !response.status().is_success() || !content_type_is(&response, "application/json") {
+            return Err(decision_uncertain());
+        }
+        let body = read_whole(response, DECISION_RESPONSE_LIMIT)
+            .await
+            .ok_or_else(decision_uncertain)?;
+        // Identity and evidence must have one interpretation: a duplicated
+        // key is not an answer.
+        let StrictValue(mut answer) =
+            serde_json::from_slice(&body).map_err(|_| decision_uncertain())?;
+        if !decision_answered(&answer) {
+            return Err(decision_uncertain());
+        }
+        answer["model"] = json!(public);
+        Ok(answer)
+    }
+
     async fn stream_inner(
         &self,
         body: &Value,
@@ -547,36 +789,8 @@ impl ChatHttp {
         let mut request = body.clone();
         request["model"] = json!(self.model);
         request["stream"] = json!(true);
-        let mut send = self.client.post(self.endpoint.clone()).json(&request);
-        if let Some(key) = &self.key {
-            send = send.bearer_auth(key);
-        }
-        let response = send.send().await.map_err(|error| {
-            // SPEC §10, ADR 0013 §10: a connection that was never established
-            // carried no request, so nothing can be running for it and the
-            // router may fail over. Any other transport error may follow a sent
-            // request and stays uncertain.
-            if error.is_connect() {
-                AdapterError::NotAccepted("the connection to the serving host was refused".into())
-            } else {
-                uncertain()
-            }
-        })?;
-        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(refused_before_forwarding(response).await);
-        }
-        // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
-        // engine's complete reply, relayed as such rather than as uncertainty.
-        if rejection_status(response.status().as_u16()) {
-            return Err(rejected_by_engine(response).await);
-        }
-        if !response.status().is_success()
-            || response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|h| h.to_str().ok())
-                .is_none_or(|h| h.split(';').next().unwrap_or("").trim() != "text/event-stream")
-        {
+        let response = self.post(&self.endpoint, &request, uncertain).await?;
+        if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
         }
         let mut stream = response.bytes_stream();
@@ -674,9 +888,11 @@ pub const REJECTION_BODY_LIMIT: usize = 16 * 1024;
 const REJECTION_MESSAGE_LIMIT: usize = 512;
 
 /// The message of an engine's invalid-request answer: vLLM's `error.message`,
-/// SGLang's top-level `message`, or a relayed `engine_rejected` body, cut to
-/// a bounded length on a character boundary. `None` when the body is not a JSON
-/// object, which leaves the answer unproven.
+/// SGLang's top-level `message`, a relayed `engine_rejected` body, or the
+/// first `msg` of a validation `detail` array (SGLang 0.5.22 answers an
+/// invalid decision request with FastAPI's 422, found live 2026-10-17), cut
+/// to a bounded length on a character boundary. `None` when the body is not a
+/// JSON object, which leaves the answer unproven.
 pub fn rejection_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let object = value.as_object()?;
@@ -685,6 +901,12 @@ pub fn rejection_message(body: &[u8]) -> Option<String> {
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .or_else(|| object.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            let detail = object.get("detail")?;
+            detail
+                .as_str()
+                .or_else(|| detail.get(0)?.get("msg")?.as_str())
+        })
         .unwrap_or("the engine rejected the request as invalid");
     let mut end = message.len().min(REJECTION_MESSAGE_LIMIT);
     while !message.is_char_boundary(end) {
@@ -693,33 +915,47 @@ pub fn rejection_message(body: &[u8]) -> Option<String> {
     Some(message[..end].to_owned())
 }
 
+/// A response body read whole, or `None` when it is longer than `limit` (by
+/// its declared length or as read) or its transfer fails, a truncated body
+/// included. No time bound of its own.
+async fn read_whole(response: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if body.len() + chunk.len() > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
+/// Whether `response` declares the media type `media` (parameters ignored).
+fn content_type_is(response: &reqwest::Response, media: &str) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.split(';').next().unwrap_or("").trim() == media)
+}
+
 /// Read an invalid-request answer in full (bounded in size and time). Only a
 /// complete JSON body is evidence; anything else stays uncertain.
 async fn rejected_by_engine(response: reqwest::Response) -> AdapterError {
     let status = response.status().as_u16();
-    if response
-        .content_length()
-        .is_some_and(|length| length > REJECTION_BODY_LIMIT as u64)
-    {
-        return uncertain();
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    let read = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| ())?;
-            if body.len() + chunk.len() > REJECTION_BODY_LIMIT {
-                return Err(());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(())
-    })
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_whole(response, REJECTION_BODY_LIMIT),
+    )
     .await;
-    if !matches!(read, Ok(Ok(()))) {
-        return uncertain();
-    }
-    match rejection_message(&body) {
+    match read.ok().flatten().as_deref().and_then(rejection_message) {
         Some(message) => AdapterError::Rejected { status, message },
         None => uncertain(),
     }
@@ -736,28 +972,11 @@ const REFUSAL_LIMIT: usize = 4 * 1024;
 /// request. Any other 503, an oversized or unreadable body, or a slow one, stays
 /// uncertain: an engine's own 503 can arrive after it accepted work.
 async fn refused_before_forwarding(response: reqwest::Response) -> AdapterError {
-    if response
-        .content_length()
-        .is_some_and(|length| length > REFUSAL_LIMIT as u64)
-    {
+    let read =
+        tokio::time::timeout(Duration::from_secs(5), read_whole(response, REFUSAL_LIMIT)).await;
+    let Some(body) = read.ok().flatten() else {
         return uncertain();
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    let read = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| ())?;
-            if body.len() + chunk.len() > REFUSAL_LIMIT {
-                return Err(());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(())
-    })
-    .await;
-    if !matches!(read, Ok(Ok(()))) {
-        return uncertain();
-    }
+    };
     let refusal = serde_json::from_slice::<Value>(&body).ok();
     match refusal.as_ref().map(|v| &v["error"]) {
         Some(error)
@@ -793,6 +1012,9 @@ impl crate::traits::ChatForward for EngineForward {
         observer: &mut dyn ChatSink,
     ) -> Result<Value, AdapterError> {
         self.0.collect_observed(body, observer, None).await
+    }
+    async fn forward_decision(&self, body: &Value) -> Result<Value, AdapterError> {
+        self.0.decide(body).await
     }
     async fn forward_chat_stream(
         &self,
@@ -1911,7 +2133,8 @@ mod tests {
     #[test]
     fn a_forwarder_reaches_the_chat_and_model_paths_and_refuses_every_other() {
         let base: reqwest::Url = "http://127.0.0.1:8000".parse().unwrap();
-        for path in ["/v1/models", "/v1/chat/completions"] {
+        // T43 (ADR 0030 §2): the decision endpoint, for decisions deployments.
+        for path in ["/v1/models", "/v1/chat/completions", "/v1/systemone"] {
             assert_eq!(
                 upstream(&base, path).map(String::from),
                 Some(format!("http://127.0.0.1:8000{path}")),
@@ -1931,12 +2154,124 @@ mod tests {
             "/",
             "/v1/models/",
             "/v1/chat/completions?x=1",
+            "/v1/systemone/",
+            "/v1/systemone?x=1",
         ] {
             assert!(
                 upstream(&base, path).is_none(),
                 "{path} must not be reachable through a forwarder"
             );
         }
+    }
+
+    fn decision(extra: Value) -> Value {
+        let mut body = json!({
+            "model": "m",
+            "state": "I was charged twice.",
+            "questions": {
+                "route": {"type": "choice", "instructions": "Which team?",
+                          "criteria": {"billing": "payments", "shipping": null}},
+                "urgency": {"type": "score", "instructions": "How urgent?",
+                            "criteria": ["can wait", "today"]},
+                "angry": {"type": "noul", "instructions": "Angry?",
+                          "criteria": {"true": "yes", "false": "no"}},
+            },
+        });
+        for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+            body[key] = value;
+        }
+        body
+    }
+
+    // T43 (ADR 0030 §2): a decision request is held to its own closed
+    // contract: the System One forms pass, anything else is refused before
+    // sending, and the chat contract never stands in for it.
+    #[test]
+    fn a_decision_request_is_held_to_its_own_closed_contract() {
+        use super::{validate_chat_request, validate_decision_request, DecisionRequestRefusal};
+        for accepted in [
+            decision(json!({})),
+            decision(json!({"state": {"ticket": "x", "plan": "pro"}})),
+            decision(json!({"state": [{"role": "user", "content": "hi"}]})),
+            decision(json!({"images": ["data:image/png;base64,AAAA"], "files": []})),
+            decision(json!({"questions": {"q": {"type": "noul"}}})),
+        ] {
+            assert_eq!(validate_decision_request(&accepted), Ok(()), "{accepted}");
+        }
+        for (field, value) in [
+            ("chat_template_kwargs", json!({})),
+            ("messages", json!([])),
+            ("stream", json!(true)),
+        ] {
+            assert_eq!(
+                validate_decision_request(&decision(json!({ field: value }))),
+                Err(DecisionRequestRefusal::Field(field.into())),
+                "{field}"
+            );
+        }
+        let malformed = [
+            json!([]),
+            json!({"state": "x", "questions": {"q": {"type": "noul"}}}),
+            decision(json!({"model": ""})),
+            decision(json!({"state": 3})),
+            decision(json!({"questions": {}})),
+            decision(json!({"questions": []})),
+            decision(json!({"questions": {"q": "noul"}})),
+            decision(json!({"questions": {"q": {"type": "unknown"}}})),
+            decision(json!({"questions": {"q": {"instructions": "x"}}})),
+            decision(json!({"questions": {"q": {"type": "noul", "weight": 2}}})),
+            decision(json!({"questions": {"q": {"type": "noul", "instructions": 1}}})),
+            decision(json!({"questions": {"q": {"type": "choice", "criteria": ["a", "b"]}}})),
+            decision(json!({"questions": {"q": {"type": "score", "criteria": {"0": "a"}}}})),
+            decision(json!({"images": "data:image/png;base64,AAAA"})),
+            decision(json!({"files": [1]})),
+        ];
+        for body in malformed {
+            assert!(
+                matches!(
+                    validate_decision_request(&body),
+                    Err(DecisionRequestRefusal::Malformed(_))
+                ),
+                "{body}"
+            );
+        }
+        let mut without_state = decision(json!({}));
+        without_state.as_object_mut().unwrap().remove("state");
+        assert!(validate_decision_request(&without_state).is_err());
+        assert!(validate_chat_request(&decision(json!({}))).is_err());
+    }
+
+    // T43 (ADR 0030 §2): only an `answers` object of typed answers is
+    // completion evidence, in the shapes llama.cpp v0.7.0 and SGLang 0.5.22
+    // answer (a `noul` answer carries only its probability).
+    #[test]
+    fn only_typed_answers_are_decision_evidence() {
+        use super::decision_answered;
+        assert!(decision_answered(&json!({"model": "m", "answers": {
+            "route": {"type": "choice", "choice": "billing",
+                      "probabilities": {"billing": 0.95, "shipping": 0.05}, "confidence": 0.9},
+            "angry": {"type": "noul", "noul": 0.62},
+        }, "usage": {"input_tokens": 40, "output_tokens": 0}})));
+        for body in [
+            json!({}),
+            json!({"answers": {}}),
+            json!({"answers": []}),
+            json!({"answers": {"q": 0.5}}),
+            json!({"answers": {"q": {"noul": 0.5}}}),
+            json!({"error": {"message": "x"}}),
+        ] {
+            assert!(!decision_answered(&body), "{body}");
+        }
+    }
+
+    // T43 (found live 2026-10-17): SGLang 0.5.22 refuses an invalid decision
+    // request with FastAPI's 422 `detail` array; its message is relayed.
+    #[test]
+    fn a_validation_detail_is_the_rejection_message() {
+        let body = br#"{"detail":[{"type":"union_tag_invalid","loc":["body","questions","q"],"msg":"Input tag 'unknown' found using 'type' does not match any of the expected tags","input":{}}]}"#;
+        assert!(super::rejection_message(body)
+            .unwrap()
+            .contains("does not match any of the expected tags"));
     }
 
     /// Counts the progress reports and the chunks a forward delivers.

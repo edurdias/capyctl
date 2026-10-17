@@ -96,7 +96,12 @@ fn catalog_survives_runtime_gate_closure() {
     let deployment = ready_deployment(&store, "a");
     store.close_dispatch(&session, &deployment, 1, 1).unwrap();
     assert_eq!(
-        store.list_enabled_route_ids().unwrap(),
+        store
+            .list_enabled_routes()
+            .unwrap()
+            .into_iter()
+            .map(|route| route.id)
+            .collect::<Vec<_>>(),
         vec!["a".to_string()]
     );
     assert!(store.find_deployment_by_route("a").unwrap().is_some());

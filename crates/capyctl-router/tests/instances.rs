@@ -203,8 +203,19 @@ impl capyctl_controller::LifecyclePort for Authority {
     ) -> Result<Option<capyctl_store::deployments::DeploymentRow>, LifecycleFault> {
         Ok((route == ROUTE).then(|| self.row()))
     }
-    fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault> {
-        Ok(vec![ROUTE.into()])
+    fn list_enabled_routes(
+        &self,
+    ) -> Result<Vec<capyctl_store::deployments::PublicRoute>, LifecycleFault> {
+        Ok(vec![capyctl_store::deployments::PublicRoute {
+            id: ROUTE.into(),
+            api: capyctl_config::effective::DeploymentApi::Chat,
+        }])
+    }
+    fn deployment_api(
+        &self,
+        _deployment: &str,
+    ) -> Result<capyctl_config::effective::DeploymentApi, LifecycleFault> {
+        Ok(capyctl_config::effective::DeploymentApi::Chat)
     }
     fn get_deployment(
         &self,

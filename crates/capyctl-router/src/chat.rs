@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use crate::admission::StaticStreamGuard;
+use crate::endpoint::Endpoint;
 use crate::forwarders::ForwarderError;
 use crate::timing::RequestTiming;
 use crate::RouterDeps;
@@ -52,18 +53,27 @@ pub async fn resolve_timed(
     body_bytes: usize,
     timing: &mut RequestTiming,
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    resolve_held(deps, model, body_bytes, tokio::time::Instant::now(), timing)
-        .await
-        .map(|(deployment, _)| deployment)
+    resolve_held(
+        deps,
+        model,
+        Endpoint::ChatCompletions,
+        body_bytes,
+        tokio::time::Instant::now(),
+        timing,
+    )
+    .await
+    .map(|(deployment, _)| deployment)
 }
 
-/// As [`resolve_timed`], returning the waiting-queue ticket the request took
-/// if it had to wait, so a request that goes on to wait for an in-flight slot
-/// keeps its place against the queue's bounds. The wait ends at the request's
-/// queue deadline counted from `received` (SPEC §10: activation included).
+/// As [`resolve_timed`] for `endpoint`, returning the waiting-queue ticket the
+/// request took if it had to wait, so a request that goes on to wait for an
+/// in-flight slot keeps its place against the queue's bounds. The wait ends
+/// at the request's queue deadline counted from `received` (SPEC §10:
+/// activation included).
 async fn resolve_held(
     deps: &RouterDeps,
     model: &str,
+    endpoint: Endpoint,
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
@@ -79,6 +89,9 @@ async fn resolve_held(
             )
         })?;
     let deployment_id = row.id.clone();
+    // ADR 0030 §2: the endpoint that does not serve the deployment's API is
+    // refused here, before the request waits or anything activates.
+    crate::endpoint::check_api(deps, &deployment_id, model, endpoint)?;
     timing.resolved(&deployment_id, &row.kind);
     if serves_now(deps, &deployment_id, row.observed_state)? {
         timing.queued(std::time::Duration::ZERO, None);
@@ -174,20 +187,23 @@ fn enter_queue(
         })
 }
 
-/// SPEC §10 steps 1–2 and T19: resolve the route, wait for the deployment to
-/// be servable, then take one of its in-flight slots. A request that finds the
+/// SPEC §10 steps 1–2 and T19: resolve the route, refuse an `endpoint` the
+/// deployment does not answer (ADR 0030 §2), wait for the deployment to be
+/// servable, then take one of its in-flight slots. A request that finds the
 /// bound reached waits for a slot in arrival order, holding its place in the
 /// bounded waiting queue, until its queue deadline counted from `received`;
 /// it is never refused at once after having waited, and a fresh arrival never
 /// takes a slot ahead of a request already waiting for one.
 pub async fn admit_timed(
     deps: &RouterDeps,
+    endpoint: Endpoint,
     model: &str,
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
 ) -> Result<(String, StaticStreamGuard), (StatusCode, Json<serde_json::Value>)> {
-    let (deployment_id, ticket) = resolve_held(deps, model, body_bytes, received, timing).await?;
+    let (deployment_id, ticket) =
+        resolve_held(deps, model, endpoint, body_bytes, received, timing).await?;
     let max = deps.limits.max_requests_per_deployment;
     if let Some(guard) = deps.inflight.try_guard_arc(&deployment_id, max) {
         return Ok((deployment_id, guard));
@@ -266,6 +282,7 @@ pub async fn dispatch(
     let bytes = body.to_string().len();
     dispatch_timed(
         deps,
+        Endpoint::ChatCompletions,
         model,
         body.clone(),
         bytes,
@@ -276,12 +293,17 @@ pub async fn dispatch(
     .map(|(response, _)| response)
 }
 
-/// As [`dispatch`], timing the request (SPEC §17). Returns the response with
-/// the request's completed clock, for its timing header. `body_bytes` is the
-/// size of the request as received and `received` when it arrived: the queue
-/// deadline and the backend's first-event bound count from it (SPEC §10).
+/// As [`dispatch`], for `endpoint`, timing the request (SPEC §17). Returns the
+/// response with the request's completed clock, for its timing header.
+/// `body_bytes` is the size of the request as received and `received` when it
+/// arrived: the queue deadline and the backend's first-event bound count from
+/// it (SPEC §10).
+///
+/// ADR 0030 §2: a decision request is admitted, leased and settled exactly as
+/// a chat completion; only its forward differs.
 pub async fn dispatch_timed(
     deps: &RouterDeps,
+    endpoint: Endpoint,
     model: &str,
     body: serde_json::Value,
     body_bytes: usize,
@@ -290,7 +312,7 @@ pub async fn dispatch_timed(
 ) -> Result<(serde_json::Value, RequestTiming), (StatusCode, Json<serde_json::Value>)> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
     let (deployment_id, guard) =
-        admit_timed(deps, model, body_bytes, received, &mut timing).await?;
+        admit_timed(deps, endpoint, model, body_bytes, received, &mut timing).await?;
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its
     // forwarder. Nothing has been sent yet: a refusal releases the guard on drop.
     let started = std::time::Instant::now();
@@ -301,7 +323,9 @@ pub async fn dispatch_timed(
     timing.leased(started.elapsed());
     // SPEC §10: the collected response is bounded like a relayed stream (the
     // request deadline for its first backend event, then the idle bound), not
-    // by a fixed wall-clock cap.
+    // by a fixed wall-clock cap. ADR 0030 §2: a decision has no first-token
+    // event and reports no progress, so its whole answer, head and complete
+    // body, is due by the request deadline.
     let bounds =
         crate::stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
     // From the first poll onward the engine may have accepted work. Dropping
@@ -317,13 +341,26 @@ pub async fn dispatch_timed(
             // ADR 0028 §11: a request to a group's head is watched for its
             // first token; the watch holds nothing of the response.
             let stall = attempt.stall.take();
-            let bounded = crate::stream::bounded(
-                attempt.forward.forward_chat_observed(&body, &mut observer),
-                &progress,
-                &bounds,
-                stall,
-            )
-            .await;
+            let bounded = match endpoint {
+                Endpoint::ChatCompletions => {
+                    crate::stream::bounded(
+                        attempt.forward.forward_chat_observed(&body, &mut observer),
+                        &progress,
+                        &bounds,
+                        stall,
+                    )
+                    .await
+                }
+                Endpoint::Decisions => {
+                    crate::stream::bounded(
+                        attempt.forward.forward_decision(&body),
+                        &progress,
+                        &bounds,
+                        stall,
+                    )
+                    .await
+                }
+            };
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
             // closes the engine connection, so the lease is cancelling, as for
             // a stream whose client hung up.
@@ -335,6 +372,8 @@ pub async fn dispatch_timed(
             });
             if result.is_ok() {
                 timing.response();
+                // SPEC §17: the first generated text, for time to first token
+                // and decode speed; a decision generates none (ADR 0030 §2).
                 if let Some(at) = observer.generated {
                     timing.generated_at(at);
                 }
@@ -528,9 +567,11 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
         match code {
             "unknown_model" => StatusCode::NOT_FOUND,
             // SPEC §14: a request that can never be forwarded is the client's.
-            "invalid_request" | "unsupported_parameter" | "cache_salt_unsupported" => {
-                StatusCode::BAD_REQUEST
-            }
+            // ADR 0030 §2: the endpoint does not answer the deployment's API.
+            "invalid_request"
+            | "unsupported_parameter"
+            | "cache_salt_unsupported"
+            | "api_mismatch" => StatusCode::BAD_REQUEST,
             // SPEC §10 (T19): a full queue is transient; 413 is for body size.
             "queue_full" => StatusCode::TOO_MANY_REQUESTS,
             "unsupported" => StatusCode::NOT_IMPLEMENTED,

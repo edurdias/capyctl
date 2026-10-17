@@ -75,9 +75,10 @@ async fn standalone_deploys_starts_and_serves_one_inference() {
     // also proves the router reads the form the CLI actually writes.
     assert!(
         app.controller
-            .list_enabled_route_ids()
+            .list_enabled_routes()
             .expect("routes are readable")
-            .contains(&"gate-m".to_string()),
+            .iter()
+            .any(|route| route.id == "gate-m"),
         "a ready deployment offers its route"
     );
 
