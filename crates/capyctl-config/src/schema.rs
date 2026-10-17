@@ -556,6 +556,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
+                // ADR 0030 §1: the API the deployment serves, `chat` (the
+                // default) or `decisions`.
+                ("api", SCALAR),
                 // ADR 0013 §2: `host` is shorthand for `placement.hosts: [host]`.
                 ("host", SCALAR),
                 ("instances", SCALAR),

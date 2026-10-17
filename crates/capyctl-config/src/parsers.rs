@@ -375,8 +375,13 @@ pub fn parsers_for_launch(
 }
 
 /// The parsers of the effective deployment, reading its checkpoint where this
-/// machine sees it.
+/// machine sees it. `None` for a decisions deployment: ADR 0030 §1 (amending
+/// ADR 0024 §1) gives parsers to chat deployments only, so none is chosen or
+/// rendered.
 pub fn parsers_for_effective(effective: &crate::effective::EffectiveDeployment) -> Option<Parsers> {
+    if !effective.api.is_chat() {
+        return None;
+    }
     parsers_for_launch(
         effective.profile.engine,
         &effective.engine_config,
@@ -387,10 +392,14 @@ pub fn parsers_for_effective(effective: &crate::effective::EffectiveDeployment) 
 
 /// The parsers as a server sees a deployment whose checkpoint is on a remote
 /// host: a declared or overridden choice is known here; `auto` is chosen by
-/// the host from its own copy at launch.
+/// the host from its own copy at launch. `None` for a decisions deployment,
+/// as [`parsers_for_effective`].
 pub fn parsers_on_remote_host(
     effective: &crate::effective::EffectiveDeployment,
 ) -> Option<Parsers> {
+    if !effective.api.is_chat() {
+        return None;
+    }
     let settings = &effective.engine_config;
     declared(settings, Kind::ToolCall)?;
     let on_host = || {

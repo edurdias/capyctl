@@ -337,6 +337,7 @@ fn every_post_baseline_field_names_its_capability() {
             ENGINE_LOG_TAIL,
             CHECKPOINT_TABLES,
             CHECKPOINT_GGUF,
+            DECISIONS,
         ]
         .contains(name)
         {
@@ -526,6 +527,31 @@ fn live_profile_update_is_declared_both_ways() {
     assert_eq!(
         pb::ServerToAgent::decode(retire.encode_to_vec().as_slice()).unwrap(),
         retire
+    );
+}
+
+// T43 T34 (ADR 0030 §1): `decisions` is a capability every current agent
+// declares. It is no placement requirement for other deployments: only a
+// decisions deployment is refused, typed, on a host without it.
+#[test]
+fn decisions_gates_only_decision_deployments() {
+    use capabilities::*;
+    assert_eq!(DECISIONS, "decisions");
+    assert!(CATALOGUE.contains(&(DECISIONS, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&DECISIONS.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&DECISIONS));
+    assert!(is_gate_refusal(&missing(DECISIONS)));
+    let older: BTreeSet<String> = agent_capabilities()
+        .into_iter()
+        .filter(|name| name != DECISIONS)
+        .collect();
+    assert_eq!(
+        decisions_refusal(&older).as_deref(),
+        Some("host_capability_missing:decisions")
+    );
+    assert_eq!(
+        decisions_refusal(&agent_capabilities().into_iter().collect()),
+        None
     );
 }
 

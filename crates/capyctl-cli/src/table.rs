@@ -673,6 +673,14 @@ fn status(value: &Value, names: &HostNames) -> String {
         }
         out.push_str(&line);
     }
+    // ADR 0030 §1: a deployment serving decision models says so; chat, the
+    // default, adds no line.
+    if let Some(api) = d["api"].as_str() {
+        if !(d["engine"].is_string() || d["installation"].is_object() || d["parsers"].is_object()) {
+            out.push('\n');
+        }
+        out.push_str(&format!("API     {}\n", clean(api)));
+    }
     // ADR 0014 amendment A14: a hybrid model's state cache holds fewer
     // running requests than the deployment asked for.
     if let Some(limit) = d["context"]["running_limit"].as_u64() {
@@ -1064,6 +1072,24 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    // T43 (ADR 0030 §1): status names the API of a decisions deployment, under
+    // the engine when there is one; a chat deployment, the default, adds
+    // nothing.
+    #[test]
+    fn status_names_a_decisions_api() {
+        let chat = json!({"name": "m", "observed_state": "ready", "instances": []});
+        let out = render(View::Status, &chat, &HostNames::new());
+        assert!(!out.contains("API"), "{out}");
+        let mut d = chat.clone();
+        d["api"] = json!("decisions");
+        d["installation"] = json!({"profile": "llamacpp", "version": "0.7.0",
+            "executable": "/opt/llama.cpp/bin/llama-server"});
+        let out = render(View::Status, &d, &HostNames::new());
+        let engine = out.find("Engine").expect("the engine line");
+        let api = out.find("API").expect("the api line");
+        assert!(api > engine && out[api..].contains("decisions"), "{out}");
     }
 
     // T14: ADR 0014 amendment A14. Status says when a hybrid model's state

@@ -1724,6 +1724,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             ingress_gate_key: [7; 32],
             instance_index: 0,
             device_memory: false,
+            decisions: false,
         },
         Default::default(),
     ));
@@ -1858,6 +1859,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             ingress_gate_key: [7; 32],
             instance_index: 0,
             device_memory: false,
+            decisions: false,
         },
         Default::default(),
     ));

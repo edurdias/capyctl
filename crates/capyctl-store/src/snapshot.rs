@@ -154,6 +154,10 @@ pub struct DeploymentSnapshot {
     /// for an engine without a parser setting or a revision that does not decode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsers: Option<capyctl_config::parsers::Parsers>,
+    /// ADR 0030 §1: the API the current revision serves. Additive; absent
+    /// for `chat` and for a revision that does not decode.
+    #[serde(skip_serializing_if = "capyctl_config::effective::DeploymentApi::is_chat")]
+    pub api: capyctl_config::effective::DeploymentApi,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
@@ -163,25 +167,29 @@ pub struct DeploymentSnapshot {
 type LaunchStatus = (
     Option<capyctl_config::context_fit::ContextFit>,
     Option<capyctl_config::parsers::Parsers>,
+    capyctl_config::effective::DeploymentApi,
 );
 
 /// ADR 0024: the parsers are chosen where the context is fitted, the same way.
+/// ADR 0030 §1: the revision's API is read from the same decode.
 fn context_status(
     conn: &rusqlite::Connection,
     deployment_id: &str,
 ) -> rusqlite::Result<LaunchStatus> {
     let Some((effective, remote)) = current_effective(conn, deployment_id)? else {
-        return Ok((None, None));
+        return Ok((None, None, Default::default()));
     };
     Ok(if remote {
         (
             Some(capyctl_config::context_fit::fit_on_remote_host(&effective)),
             capyctl_config::parsers::parsers_on_remote_host(&effective),
+            effective.api,
         )
     } else {
         (
             Some(capyctl_config::context_fit::fit_for_effective(&effective)),
             capyctl_config::parsers::parsers_for_effective(&effective),
+            effective.api,
         )
     })
 }
@@ -771,6 +779,7 @@ impl Store {
                 latest_operation: None,
                 context: None,
                 parsers: None,
+                api: Default::default(),
             })
         })?;
         let mut deployments = deployments;
@@ -807,7 +816,7 @@ impl Store {
             entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
             entry.parked = crate::ordinary_lifecycle::parked_charge::status(&tx, &entry.id)?;
-            (entry.context, entry.parsers) = context_status(&tx, &entry.id)?;
+            (entry.context, entry.parsers, entry.api) = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
             if crate::switch_state::is_explicit_activation(&tx, &entry.id)? {

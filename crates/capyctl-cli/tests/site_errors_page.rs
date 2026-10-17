@@ -126,6 +126,15 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:engine_groups",
             "host_capability_missing:engine_groups",
         ),
+        // T43 (ADR 0030 §1).
+        (
+            "capability_missing:decisions",
+            "capability_missing:decisions",
+        ),
+        (
+            "host_capability_missing:decisions",
+            "host_capability_missing:decisions",
+        ),
     ] {
         let exit = StructuredError {
             code: "invalid_config",

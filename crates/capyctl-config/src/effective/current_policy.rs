@@ -77,6 +77,11 @@ pub fn deployment_command_fingerprint(
     if let Some(identity) = instance_spec.command_identity() {
         semantic["instances"] = identity;
     }
+    // ADR 0030 §1: the API is part of what the command asks for. `chat`, the
+    // default, adds nothing, so every earlier command keeps its fingerprint.
+    if !input.api.is_chat() {
+        semantic["api"] = json!(input.api);
+    }
     // ADR 0014 amendment A1: declared timeouts are part of what the command
     // asks for. Omitted, they add nothing, so older commands keep their
     // fingerprint.

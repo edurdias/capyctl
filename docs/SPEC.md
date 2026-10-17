@@ -646,6 +646,10 @@ CapyCTL never rewrites an administrator document. ADR 0019 had sanctioned a one-
 
 A deployment gains `topology` (`tensor_parallel`, `pipeline_parallel`) with exact `placement.hosts`, and `engine_config.env` with `capyctl deploy --engine-env`. A host document gains `resource_policy.groups` (`peer_address`, `rendezvous_port_range`, `require_rdma`; flags `--peer-address`, `--rendezvous-ports`, `--require-rdma`; environment `CAPYCTL_PEER_ADDRESS`, `CAPYCTL_RENDEZVOUS_PORTS`, `CAPYCTL_REQUIRE_RDMA`). A profile gains `env` and `security.approved_env` (`capyctl engine add --env`, `--approve-env`).
 
+> **Amended by [ADR 0030](design/adr/0030-decision-models.md)** (owner decisions 2026-10-17).
+
+A deployment gains `api`: `chat` (the default) or `decisions`, the API it serves (`POST /v1/chat/completions` or `POST /v1/systemone`). It is part of the frozen revision and of its identity; a revision that omits it serves chat and keeps the fingerprint it had. Resolution refuses `api: decisions` on an installation that cannot serve it (`capability_missing:decisions`: llama.cpp 0.7.0 or newer and SGLang 0.5.22 or newer serve it, read from the installation's registered build; vLLM and TensorFold do not yet), with a `topology`, with a declared `deep` or `host_backed` residency (it resolves `restart_only`), and with a stated tool-call or reasoning parser (parsers apply to chat deployments, amending ADR 0024 §1). A host declares the capability `decisions` (ADR 0017); a server never places a decisions deployment on a host without it (`host_capability_missing:decisions`).
+
 ### 15.2 No-config behavior
 
 | Situation | Behavior |
@@ -861,6 +865,10 @@ engine_config:
 
 `integration: none` disables a CapyCTL-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified. `engine_config` is validated for shape; whether the engine supports the combination on this checkpoint is the user's responsibility (ADR 0011).
 
+> **Amended by [ADR 0030](design/adr/0030-decision-models.md)** (owner decisions 2026-10-17).
+
+A deployment that serves a decision model adds `api: decisions` to this shape, on one machine, without `topology`, with `residency: restart_only` (or none) and no parser setting (§15.1).
+
 ### 16.4 Two-host engine group (one TP2 instance) with private host-cache and persistent storage
 
 ```yaml
@@ -1042,6 +1050,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
 | T41 | TensorFold conformance | Detection reads metadata only; `engine add` refuses a missing toolchain on the closed PATH; launch arguments and reserved flags; readiness from `/health` and the model list; drain waits for `requests_running: 0` and `busy: false`, signals an exited, not listening or unanswering engine, and leaves one still answering busy unsignalled; `restart_only` park and wake; `deep` refused; a drafter repository id refused; `local_engine.tensorfold` three ways (ADR 0023). |
 | T42 | llama.cpp conformance | Detection executes nothing; `engine add` reads the version from standard error and refuses a machine with `/etc/llama.cpp/config.ini`; launch arguments and reserved options in every alias, negative form and `_` spelling; the KV layout; readiness and the check of the rendered values; the `/metrics` idle gate; `restart_only` park and wake; `deep` refused; `cache_salt` refused; a draft model outside the approved paths refused; `local_engine.llamacpp` three ways (ADR 0029). |
+| T43 | Decision models | `api` resolves and round-trips through the frozen revision, and a revision without it keeps its fingerprint; it is refused on an engine without the capability (`capability_missing:decisions`), with a `topology`, a parking residency or a stated parser; `POST /v1/systemone` is validated, routed, admitted, leased and settled like chat; the mismatched endpoint is refused before activation; a decisions deployment becomes ready only on a well-formed fixed decision; the canary passes within tolerance and fails on a changed pick; an old host never receives a decisions deployment (`host_capability_missing:decisions`) (ADR 0030). |
 
 Multi-node live rows MN1–MN9 (ADR 0028) supplement T16, T20, T22, T30–T32 on two hosts.
 
@@ -1055,6 +1064,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
+- 2026-10-17, [ADR 0030](design/adr/0030-decision-models.md): decision models, a deployment's `api` (`chat` or `decisions`), refused on an engine, topology, residency or parser it cannot use, and the host capability `decisions` (§15.1, §16, T43).
 - 2026-10-09, [ADR 0029](design/adr/0029-llamacpp-engine.md): llama.cpp's `llama-server` as the fourth engine, `restart_only`, one model per deployment (§1, §9.4, T42).
 - 2026-10-05, [ADR 0028](design/adr/0028-multi-node-engine-groups.md): multi-node engine groups for vLLM, SGLang and TensorFold (§11, §15, §16.4, §20).
 - 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by CapyCTL, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).

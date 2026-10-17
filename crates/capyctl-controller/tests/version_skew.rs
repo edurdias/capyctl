@@ -514,6 +514,7 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
             ingress_gate_key: [7; 32],
             instance_index: 0,
             device_memory: false,
+            decisions: false,
         },
         readiness.clone(),
     );
@@ -1063,6 +1064,7 @@ async fn device_domains_need_the_capability() {
             ingress_gate_key: [7; 32],
             instance_index: 0,
             device_memory: true,
+            decisions: false,
         },
         Default::default(),
     );
@@ -1114,6 +1116,110 @@ async fn device_domains_need_the_capability() {
     assert_eq!(
         refused.message(),
         "host_capability_missing:device_memory_domains"
+    );
+    h.server.abort();
+}
+
+// T43 T34 (ADR 0030 §1): a host without `decisions` stays placeable for
+// every other deployment, but a launch, park or wake of a decisions
+// deployment there is refused `host_capability_missing:decisions` before
+// anything is sent.
+#[tokio::test]
+async fn a_decisions_launch_needs_the_capability() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::DECISIONS);
+    let (_send, mut stream) = h
+        .published(declared, inventory(&h.host))
+        .await
+        .expect("the host connects");
+    assert!(h.sessions.inspect(&h.host).unwrap().eligible);
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "sglang-0.5.22".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+            decisions: true,
+        },
+        Default::default(),
+    );
+    for (action, identities) in [
+        (
+            RuntimeAction::Park,
+            ExecutionIdentities::Retained(vec![recorded()]),
+        ),
+        (
+            RuntimeAction::Restore,
+            ExecutionIdentities::Retained(vec![recorded()]),
+        ),
+    ] {
+        let command = RuntimeCommand {
+            action,
+            context: StepExecutionContext {
+                token: TransitionToken {
+                    deployment_id: "deployment".into(),
+                    revision: 1,
+                    generation: 1,
+                    operation_id: "01K00000000000000000000006".into(),
+                    step_id: "01K00000000000000000000007".into(),
+                },
+                binding_id: binding_id.clone(),
+                incarnation: incarnation.clone(),
+                issued_at_ms: 1,
+                deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+                identities,
+                completion_target: None,
+                grant_id: None,
+                launch_settings: None,
+            },
+        };
+        assert_eq!(
+            engine.execute_persisted(&command).await.unwrap_err(),
+            RuntimeError::Refused("host_capability_missing:decisions".into())
+        );
+    }
+    let launch = RuntimeCommand {
+        action: RuntimeAction::Initialize,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "01K00000000000000000000006".into(),
+                step_id: "01K00000000000000000000005".into(),
+            },
+            binding_id,
+            incarnation,
+            issued_at_ms: 1,
+            deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+            identities: ExecutionIdentities::OwnedLaunch,
+            completion_target: None,
+            grant_id: Some("grant".into()),
+            launch_settings: None,
+        },
+    };
+    assert_eq!(
+        engine.execute_persisted(&launch).await.unwrap_err(),
+        RuntimeError::Refused("host_capability_missing:decisions".into())
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
     );
     h.server.abort();
 }

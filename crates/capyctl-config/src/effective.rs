@@ -175,6 +175,11 @@ pub enum Sharing {
 pub struct EffectiveDeployment {
     pub schema_version: u32,
     pub name: String,
+    /// ADR 0030 §1: the API the deployment serves. Part of the revision and
+    /// its identity; omitted while `chat`, so every revision frozen before the
+    /// field existed serializes, and fingerprints, exactly as before.
+    #[serde(skip_serializing_if = "DeploymentApi::is_chat")]
+    pub api: DeploymentApi,
     pub model: ModelIdentity,
     pub routes: Vec<String>,
     pub recipe: String,
@@ -306,6 +311,34 @@ impl Residency {
     /// Whether this tier parks at all, as opposed to stopping and starting again.
     pub fn parks(self) -> bool {
         matches!(self, Self::HostBacked | Self::Deep)
+    }
+}
+
+/// ADR 0030 §1: the API a deployment serves. `chat` answers
+/// `POST /v1/chat/completions`; `decisions` answers `POST /v1/systemone`
+/// (decision models: typed questions answered with probabilities, no
+/// generated text). The same checkpoint served both ways is two revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentApi {
+    #[default]
+    Chat,
+    Decisions,
+}
+
+impl DeploymentApi {
+    /// Whether this is the default, which a document and a frozen revision
+    /// may leave unstated.
+    pub fn is_chat(&self) -> bool {
+        *self == Self::Chat
+    }
+
+    /// The value as a document writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Decisions => "decisions",
+        }
     }
 }
 
@@ -895,6 +928,9 @@ struct DeploymentInput {
     schema_version: u32,
     kind: String,
     name: String,
+    /// ADR 0030 §1: optional; `chat` when omitted.
+    #[serde(default)]
+    api: DeploymentApi,
     model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
@@ -1309,6 +1345,11 @@ pub fn resolve_effective_with_checkpoint(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
+    // ADR 0030 §1: only an installation that serves `/v1/systemone` takes a
+    // decisions deployment, refused before anything else is resolved.
+    if d.api == DeploymentApi::Decisions {
+        crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?;
+    }
     // ADR 0023 §4: TensorFold has no memory cap, so its reservation is the
     // operator's explicit statement.
     if raw_profile.engine == Engine::Tensorfold && d.resources.is_none() {
@@ -1438,6 +1479,10 @@ pub fn resolve_effective_with_checkpoint(
     };
     let device_sizing = core::derived_device_sizing(&devices, &host);
     let residency = d.residency.unwrap_or_else(|| {
+        // ADR 0030 §7: a decisions deployment restarts instead of parking.
+        if d.api == DeploymentApi::Decisions {
+            return Residency::RestartOnly;
+        }
         // A17: a speculative SGLang deployment never defaults to the host-RAM
         // tier, so it is sized as on a unified host (`deep`).
         let discrete = device_sizing
@@ -1544,6 +1589,10 @@ pub fn resolve_effective_with_checkpoint(
             draft_declared: model.draft.is_some(),
         },
     )?;
+    // ADR 0030 §1 (amending ADR 0024 §1): parsers apply to chat deployments.
+    if d.api == DeploymentApi::Decisions {
+        crate::decisions::check_parsers(&engine_config)?;
+    }
     if let Some(topology) = member_of {
         let known = facts.weights_bytes.is_some();
         engine_config.memory_mut().member = Some(capyctl_domain::member_weights::MemberWeights {
@@ -1613,6 +1662,7 @@ pub fn resolve_effective_with_checkpoint(
         host.queue.request_deadline_ms
     };
     let recipe = core::NormalizedRecipe {
+        api: d.api,
         model,
         recipe: d.recipe,
         residency,
@@ -1638,6 +1688,7 @@ pub fn resolve_effective_with_checkpoint(
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
+        api: recipe.api,
         model: recipe.model,
         routes: d.routes,
         recipe: recipe.recipe,

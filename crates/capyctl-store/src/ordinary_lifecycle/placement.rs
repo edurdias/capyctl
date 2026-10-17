@@ -208,6 +208,18 @@ pub(super) fn candidates(
             super::startup::startup_footprint(tx, deployment_id, revision, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
+        // ADR 0030 §1: a decisions revision is placed only on a host that
+        // declared `decisions` (ADR 0017), as its latest session recorded it;
+        // the live session's own declaration still gates the launch before
+        // anything is sent. The embedded host is this build and serves them.
+        let serves_api = e.api.is_chat()
+            || tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
+                     OR EXISTS(SELECT 1 FROM host_versions v, json_each(v.capabilities_json) c
+                                WHERE v.host_id=?1 AND c.value=?2)",
+                params![host, capyctl_config::decisions::HOST_CAPABILITY],
+                |r| r.get::<_, bool>(0),
+            )?;
         candidates.push(HostCandidate {
             device_options,
             preferred_device,
@@ -216,7 +228,8 @@ pub(super) fn candidates(
             // ADR 0018 §4: nor while the deployment's profile is retiring on
             // this host, or absent from the host's current approved document.
             // Exclusion only: nothing already placed is stopped or released.
-            eligible: eligible.is_none_or(|set| set.contains(&host))
+            eligible: serves_api
+                && eligible.is_none_or(|set| set.contains(&host))
                 && match &profile {
                     Some(profile) => {
                         crate::profile_retirement::profile_placeable(tx, &host, profile)?

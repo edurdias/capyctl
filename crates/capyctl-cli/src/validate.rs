@@ -355,6 +355,8 @@ fn resolve_on_host(
         "effective": {
             "name": effective.name,
             "routes": effective.routes,
+            // ADR 0030 §1: the API the deployment serves.
+            "api": effective.api,
             "runtime_profile": source["runtime_profile"],
             "runtime_profile_revision": effective.profile.revision,
             "selected_devices": effective.selected_devices,
