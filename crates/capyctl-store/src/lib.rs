@@ -122,9 +122,19 @@ impl Store {
     }
 }
 
+/// SPEC §17 (bounded work per request): the router reads the store several
+/// times per request and the request ledger writes it twice. Those statements
+/// are prepared once per connection and reused (`prepare_cached`); the cache
+/// holds them all with room for the coordinator's own cached statements, so
+/// they do not evict each other. A cached statement is reset after each use
+/// and re-prepared by SQLite after a schema change, so its results are those
+/// of a freshly prepared one.
+const STATEMENT_CACHE_CAPACITY: usize = 64;
+
 fn set_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     Ok(())
 }
 

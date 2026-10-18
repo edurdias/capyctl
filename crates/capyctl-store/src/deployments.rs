@@ -707,14 +707,13 @@ impl crate::Store {
     pub fn effective_routes(&self, deployment_id: &str) -> Result<Vec<String>, StoreError> {
         let frozen: Option<String> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT e.effective_json FROM deployments d \
                  JOIN effective_revisions e \
                    ON e.deployment_id=d.id AND e.revision=d.revision \
                  WHERE d.id=?1",
-                params![deployment_id],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![deployment_id], |row| row.get(0))
             .optional()?;
         if let Some(effective_json) = frozen {
             let effective: serde_json::Value =
@@ -775,14 +774,13 @@ impl crate::Store {
     ) -> Result<Option<String>, StoreError> {
         let engine: Option<Option<String>> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT CASE WHEN json_valid(effective_json) \
                    AND json_type(effective_json,'$.profile.engine')='text' \
                    THEN json_extract(effective_json,'$.profile.engine') END \
                  FROM effective_revisions WHERE deployment_id=?1 AND revision=?2",
-                params![deployment_id, revision],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![deployment_id, revision], |row| row.get(0))
             .optional()?;
         Ok(engine.flatten())
     }
@@ -830,18 +828,18 @@ impl crate::Store {
         &self,
         deployment_id: &str,
     ) -> Result<Option<capyctl_config::effective::DeploymentApi>, StoreError> {
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "SELECT {API_COLUMN} FROM deployments d \
+                 LEFT JOIN effective_revisions e \
+                   ON e.deployment_id = d.id AND e.revision = d.revision \
+                 WHERE d.id = ?1"
+            )
+        });
         let api: Option<Option<String>> = self
             .conn
-            .query_row(
-                &format!(
-                    "SELECT {API_COLUMN} FROM deployments d \
-                     LEFT JOIN effective_revisions e \
-                       ON e.deployment_id = d.id AND e.revision = d.revision \
-                     WHERE d.id = ?1"
-                ),
-                [deployment_id],
-                |row| row.get(0),
-            )
+            .prepare_cached(&SQL)?
+            .query_row([deployment_id], |row| row.get(0))
             .optional()?;
         api.map(api_column).transpose()
     }
@@ -854,7 +852,7 @@ impl crate::Store {
     ) -> Result<Option<DeploymentRow>, StoreError> {
         let raw: Option<RawDeploymentRow> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 // Either route form resolves to the same deployment. Managed
                 // creation refuses a route already claimed elsewhere, so a route
                 // cannot name two deployments across the two tables.
@@ -865,20 +863,19 @@ impl crate::Store {
                     OR EXISTS(SELECT 1 FROM deployment_routes
                               WHERE route = ?1 AND deployment_id = d.id)
                  ORDER BY d.updated_at DESC LIMIT 1",
-                [route],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
+            )?
+            .query_row([route], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
             .optional()?;
         raw.map(
             |(

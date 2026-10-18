@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use crate::admission::StaticStreamGuard;
+use crate::balance::InstanceView;
 use crate::endpoint::Endpoint;
 use crate::forwarders::ForwarderError;
 use crate::timing::RequestTiming;
@@ -65,11 +66,19 @@ pub async fn resolve_timed(
     .map(|(deployment, _)| deployment)
 }
 
+/// How [`resolve_held`] found the deployment servable.
+enum Resolution {
+    /// At once, on this read of its instances.
+    Now(InstanceView),
+    /// After waiting, holding this place in the waiting queue.
+    Waited(crate::queue::WaitTicket),
+}
+
 /// As [`resolve_timed`] for `endpoint`, returning the waiting-queue ticket the
 /// request took if it had to wait, so a request that goes on to wait for an
-/// in-flight slot keeps its place against the queue's bounds. The wait ends
-/// at the request's queue deadline counted from `received` (SPEC §10:
-/// activation included).
+/// in-flight slot keeps its place against the queue's bounds, or the instance
+/// view that found it servable at once. The wait ends at the request's queue
+/// deadline counted from `received` (SPEC §10: activation included).
 async fn resolve_held(
     deps: &RouterDeps,
     model: &str,
@@ -77,7 +86,7 @@ async fn resolve_held(
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
-) -> Result<(String, Option<crate::queue::WaitTicket>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(String, Resolution), (StatusCode, Json<serde_json::Value>)> {
     let row = deps
         .controller
         .find_deployment_by_route(model)
@@ -93,9 +102,9 @@ async fn resolve_held(
     // refused here, before the request waits or anything activates.
     crate::endpoint::check_api(deps, &deployment_id, model, endpoint)?;
     timing.resolved(&deployment_id, &row.kind);
-    if serves_now(deps, &deployment_id, row.observed_state)? {
+    if let Some(view) = serves_now(deps, &deployment_id, row.observed_state)? {
         timing.queued(std::time::Duration::ZERO, None);
-        return Ok((deployment_id, None));
+        return Ok((deployment_id, Resolution::Now(view)));
     }
     // SPEC §10 (owner decision 2026-10-08): with no waiting allowed the request
     // is refused at once, but it still starts (or joins) the one activation a
@@ -125,7 +134,7 @@ async fn resolve_held(
     match tokio::time::timeout_at(deadline, joined).await {
         Ok(Ok(_)) => {
             timing.queued(waited.elapsed(), Some(joined_at.elapsed()));
-            Ok((deployment_id, Some(ticket)))
+            Ok((deployment_id, Resolution::Waited(ticket)))
         }
         Ok(Err(refusal)) => Err(refusal),
         // The activation keeps running for whoever waits next; this request
@@ -194,6 +203,12 @@ fn enter_queue(
 /// bounded waiting queue, until its queue deadline counted from `received`;
 /// it is never refused at once after having waited, and a fresh arrival never
 /// takes a slot ahead of a request already waiting for one.
+///
+/// A request that waited for nothing also returns the instance view that
+/// found its deployment servable, for [`crate::balance::Plan::new`] to rank
+/// rather than read again (ADR 0013 §10: the lease grant re-checks the gate,
+/// so a view is only ever a hint). After any wait it returns none, and the
+/// planner reads the instances afresh.
 pub async fn admit_timed(
     deps: &RouterDeps,
     endpoint: Endpoint,
@@ -201,12 +216,17 @@ pub async fn admit_timed(
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
-) -> Result<(String, StaticStreamGuard), (StatusCode, Json<serde_json::Value>)> {
-    let (deployment_id, ticket) =
+) -> Result<(String, StaticStreamGuard, Option<InstanceView>), (StatusCode, Json<serde_json::Value>)>
+{
+    let (deployment_id, resolution) =
         resolve_held(deps, model, endpoint, body_bytes, received, timing).await?;
+    let (ticket, view) = match resolution {
+        Resolution::Now(view) => (None, Some(view)),
+        Resolution::Waited(ticket) => (Some(ticket), None),
+    };
     let max = deps.limits.max_requests_per_deployment;
     if let Some(guard) = deps.inflight.try_guard_arc(&deployment_id, max) {
-        return Ok((deployment_id, guard));
+        return Ok((deployment_id, guard, view));
     }
     let _ticket = match ticket {
         Some(ticket) => ticket,
@@ -227,7 +247,7 @@ pub async fn admit_timed(
         .acquire_arc(&deployment_id, max, deadline)
         .await
     {
-        Some(guard) => Ok((deployment_id, guard)),
+        Some(guard) => Ok((deployment_id, guard, None)),
         None => Err(err(
             "queue_full",
             &format!(
@@ -240,29 +260,31 @@ pub async fn admit_timed(
 /// Whether a request can go straight to dispatch: the deployment is READY and,
 /// when the authority reports instances, one of them is open or closed for a
 /// reason waiting would not fix (a lost or frozen host, an exited engine —
-/// those are answered by the instance planner as before).
+/// those are answered by the instance planner as before). When it can, the
+/// instance view that decided it.
 fn serves_now(
     deps: &RouterDeps,
     deployment: &str,
     observed: capyctl_domain::LifecycleState,
-) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Option<InstanceView>, (StatusCode, Json<serde_json::Value>)> {
     if observed != capyctl_domain::LifecycleState::Ready {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(instances) = deps
         .controller
         .serving_instances(deployment)
         .map_err(map_controller)?
     else {
-        return Ok(true);
+        return Ok(Some(InstanceView(None)));
     };
     // SPEC §6.1: every instance closed only by its own gate (DRAINING,
     // PARKING, a switch) queues; any other state dispatches or is refused
     // by the planner.
-    Ok(!instances.is_empty()
+    let serves = !instances.is_empty()
         && instances
             .iter()
-            .any(|i| i.dispatch_open || i.host_unresponsive || i.engine_exited || !i.host_live))
+            .any(|i| i.dispatch_open || i.host_unresponsive || i.engine_exited || !i.host_live);
+    Ok(serves.then_some(InstanceView(Some(instances))))
 }
 
 /// Non-streaming dispatch: resolve + forward through the deployment's
@@ -311,12 +333,12 @@ pub async fn dispatch_timed(
     mut timing: RequestTiming,
 ) -> Result<(serde_json::Value, RequestTiming), (StatusCode, Json<serde_json::Value>)> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
-    let (deployment_id, guard) =
+    let (deployment_id, guard, view) =
         admit_timed(deps, endpoint, model, body_bytes, received, &mut timing).await?;
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its
     // forwarder. Nothing has been sent yet: a refusal releases the guard on drop.
     let started = std::time::Instant::now();
-    let mut plan = crate::balance::Plan::new(deps, &deployment_id)?;
+    let mut plan = crate::balance::Plan::new(deps, &deployment_id, view)?;
     timing.selected(started.elapsed());
     let started = std::time::Instant::now();
     let first = plan.next().await?;

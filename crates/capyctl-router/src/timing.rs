@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `router_queue_wait` | held in the W10 waiting queue (0 when the deployment served at once) |
 //! | `router_activation_wait` | awaiting the joined activation; only requests that waited for one |
-//! | `router_selection` | reading and ranking the deployment's instances |
+//! | `router_selection` | ranking the deployment's instances, and reading them when admission did not |
 //! | `router_lease_grant` | opening request leases and resolving forwarders, failovers included |
 //! | `router_pre_forward` | `received` to the start of the forward that was accepted |
 //! | `router_upstream_first_byte` | that forward's start to its first upstream chunk (streaming) |

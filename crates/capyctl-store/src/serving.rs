@@ -58,8 +58,10 @@ impl crate::Store {
         &self,
         deployment_id: &str,
     ) -> Result<Vec<ServingInstanceRow>, LifecycleError> {
-        let sql = format!(
-            "SELECT i.instance_index,i.generation,i.revision,b.id,b.incarnation,i.host_id,r.host_id,
+        // SPEC §17: read on every request; prepared once (`prepare_cached`).
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "SELECT i.instance_index,i.generation,i.revision,b.id,b.incarnation,i.host_id,r.host_id,
                     (SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
                       WHERE s.binding_id=b.id AND o.kind='initialize' AND s.state='completed'
                       ORDER BY s.id DESC LIMIT 1),
@@ -76,8 +78,9 @@ impl crate::Store {
                LEFT JOIN remote_binding_ingress r ON r.binding_id=b.id
               WHERE i.deployment_id=?1 AND i.generation IS NOT NULL AND i.revision IS NOT NULL
               ORDER BY i.instance_index LIMIT ?2"
-        );
-        let mut statement = self.conn.prepare(&sql)?;
+            )
+        });
+        let mut statement = self.conn.prepare_cached(&SQL)?;
         let rows = statement
             .query_map(params![deployment_id, MAX_SERVING_INSTANCES as i64], |r| {
                 Ok(ServingInstanceRow {
@@ -107,20 +110,22 @@ impl crate::Store {
         deployment_id: &str,
         generation: i64,
     ) -> Result<Option<(StoredRuntimeBinding, bool)>, LifecycleError> {
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "SELECT b.id,{OPEN}
+                   FROM deployment_instances i
+                   JOIN deployments d ON d.id=i.deployment_id
+                   JOIN runtime_bindings b ON b.deployment_id=i.deployment_id
+                        AND b.instance_index=i.instance_index AND b.state!='released'
+                  WHERE i.deployment_id=?1 AND i.generation=?2"
+            )
+        });
         let chosen: Option<(String, bool)> = self
             .conn
-            .query_row(
-                &format!(
-                    "SELECT b.id,{OPEN}
-                       FROM deployment_instances i
-                       JOIN deployments d ON d.id=i.deployment_id
-                       JOIN runtime_bindings b ON b.deployment_id=i.deployment_id
-                            AND b.instance_index=i.instance_index AND b.state!='released'
-                      WHERE i.deployment_id=?1 AND i.generation=?2"
-                ),
-                params![deployment_id, generation],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached(&SQL)?
+            .query_row(params![deployment_id, generation], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?;
         let Some((id, open)) = chosen else {
             return Ok(None);

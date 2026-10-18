@@ -1138,11 +1138,11 @@ impl crate::Store {
         type Row = (String, String, i64, String, String, String, String, String);
         let row: Option<Row> = self
             .conn
-            .query_row(
-                &format!(
-                    "SELECT id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state
+            .prepare_cached(&format!(
+                "SELECT id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state
                  FROM runtime_bindings WHERE state!='released' AND {predicate}"
-                ),
+            ))?
+            .query_row(
                 [key],
                 |r| {
                     Ok((

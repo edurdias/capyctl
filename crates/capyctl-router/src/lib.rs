@@ -238,7 +238,7 @@ async fn chat_completions(
         // slot in arrival order within its deadline. Accounting is registered
         // before the response is built; the stream guard releases when the
         // backend stream ends.
-        let (deployment_id, guard) = chat::admit_timed(
+        let (deployment_id, guard, view) = chat::admit_timed(
             &state.deps,
             endpoint,
             &model,
@@ -251,7 +251,7 @@ async fn chat_completions(
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
         let started = std::time::Instant::now();
-        let mut plan = balance::Plan::new(&state.deps, &deployment_id)?;
+        let mut plan = balance::Plan::new(&state.deps, &deployment_id, view)?;
         timing.selected(started.elapsed());
         let started = std::time::Instant::now();
         let first = plan.next().await?;
