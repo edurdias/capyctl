@@ -309,7 +309,10 @@ pub fn stream_planned_timed(
             report: Default::default(),
         };
         let mut attempt = first;
-        let mut durable;
+        let mut durable = false;
+        // SPEC §10 (owner decision 2026-10-18): a completed stream's attempt,
+        // whose lease is closed only after the client has the whole stream.
+        let mut completed = None;
         let (result, refusal) = loop {
             let generation = attempt.generation;
             sink.timing.forwarding(attempt.instance, generation);
@@ -321,6 +324,10 @@ pub fn stream_planned_timed(
                 stall,
             )
             .await;
+            if matches!(result, Ok(Ok(StreamEnded::Completed))) {
+                completed = Some(attempt);
+                break (result, None);
+            }
             let end = stream_lease_end(&result);
             durable = attempt.settle(end).await;
             // SPEC §10, T19: a deterministic refusal decided before sending is
@@ -393,8 +400,18 @@ pub fn stream_planned_timed(
             return;
         }
         if matches!(result, Ok(Ok(StreamEnded::Completed))) {
-            // Backend completion and downstream delivery are separate facts.
-            guard.release();
+            // SPEC §10 (owner decision 2026-10-18): the stream's last lines go
+            // out without waiting for its lease close, which commits beside
+            // them; the slot is released once the close is written, never
+            // before, and a stalled client does not hold it.
+            if let Some(attempt) = completed {
+                tokio::spawn(async move {
+                    attempt
+                        .settle(capyctl_controller::LeaseEnd::Completed)
+                        .await;
+                    guard.release();
+                });
+            }
             sink.timing.finish();
             if !sink.failed && sink.timing.header_enabled() {
                 // SPEC §17 (M80): an SSE comment, ignored by SSE clients.

@@ -402,7 +402,31 @@ impl crate::Store {
     /// one fsync for the whole group. Each write's refusal is its own and leaves
     /// the others untouched; a storage failure fails the batch as a whole, and
     /// then nothing in it was written.
+    ///
+    /// SPEC §10 (owner decision 2026-10-18): under
+    /// [`crate::RequestLedgerSync::LocalEnginesOnly`] the batch commits with
+    /// `synchronous=NORMAL` and the connection returns to `FULL` before anything
+    /// else uses it. In WAL mode the commit order is kept, so the next `FULL`
+    /// commit of any other write makes the batch durable with it.
     pub fn apply_request_lease_batch(
+        &self,
+        session: &CoordinatorSession,
+        writes: &[LeaseWrite],
+    ) -> Result<Vec<Result<LeaseWriteOutcome, DispatchError>>, DispatchError> {
+        if self.request_ledger_sync == crate::RequestLedgerSync::Full {
+            return self.apply_request_lease_batch_in(session, writes);
+        }
+        self.conn
+            .prepare_cached("PRAGMA synchronous=NORMAL")?
+            .execute([])?;
+        let applied = self.apply_request_lease_batch_in(session, writes);
+        self.conn
+            .prepare_cached("PRAGMA synchronous=FULL")?
+            .execute([])?;
+        applied
+    }
+
+    fn apply_request_lease_batch_in(
         &self,
         session: &CoordinatorSession,
         writes: &[LeaseWrite],

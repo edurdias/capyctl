@@ -87,6 +87,17 @@ impl OwnedCoordinatorState {
         })
     }
 
+    /// SPEC §10 (owner decision 2026-10-18): a standalone role, whose engines
+    /// all run on this machine, commits its request ledger with
+    /// `synchronous=NORMAL` ([`capyctl_store::RequestLedgerSync`]). A server
+    /// with remote hosts never calls this: an engine on a surviving host
+    /// would run a request whose lease a power loss here had erased.
+    pub fn with_local_engines_only(mut self) -> Self {
+        self.store
+            .set_request_ledger_sync(capyctl_store::RequestLedgerSync::LocalEnginesOnly);
+        self
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }

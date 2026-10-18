@@ -1065,6 +1065,15 @@ DROP TABLE wake_canaries;
 ALTER TABLE wake_canaries_v49 RENAME TO wake_canaries;
 "#;
 
+/// v50 (SPEC §17, owner decision 2026-10-18): the router's read of a
+/// deployment's serving instances finds each binding's initialize steps and
+/// their journal entries through these indexes instead of scanning the two
+/// history tables, which are never pruned. Results are unchanged.
+pub const SCHEMA_V50: &str = r#"
+CREATE INDEX IF NOT EXISTS lifecycle_steps_binding ON lifecycle_steps(binding_id);
+CREATE INDEX IF NOT EXISTS journal_entries_operation ON journal_entries(operation_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

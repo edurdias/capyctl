@@ -353,9 +353,14 @@ pub async fn dispatch_timed(
     // From the first poll onward the engine may have accepted work. Dropping
     // this request or receiving an uncertain transport error cannot free it.
     let guard = guard.abandon();
-    let dispatched = tokio::spawn(async move {
+    // SPEC §10 (owner decision 2026-10-18): a completed answer is handed back
+    // before its lease close is committed; the dispatch task then closes the
+    // lease and only after that releases the in-flight slot, so the
+    // deployment's bound counts the request until the ledger no longer does.
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
         let mut attempt = first;
-        loop {
+        let refused = loop {
             let generation = attempt.generation;
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
@@ -392,24 +397,36 @@ pub async fn dispatch_timed(
                     "the backend missed the request's deadline or idle bound".into(),
                 ))
             });
-            if result.is_ok() {
-                timing.response();
-                // SPEC §17: the first generated text, for time to first token
-                // and decode speed; a decision generates none (ADR 0030 §2).
-                if let Some(at) = observer.generated {
-                    timing.generated_at(at);
+            let error = match result {
+                Ok(response) => {
+                    timing.response();
+                    // SPEC §17: the first generated text, for time to first
+                    // token and decode speed; a decision generates none (ADR
+                    // 0030 §2).
+                    if let Some(at) = observer.generated {
+                        timing.generated_at(at);
+                    }
+                    timing.finish();
+                    let _ = reply.send(Ok((response, timing)));
+                    // SPEC §10: closed on completion evidence. A crash before
+                    // this commit leaves the lease charged for the quiescence
+                    // cleanup.
+                    attempt.settle(LeaseEnd::Completed).await;
+                    guard.release();
+                    return;
                 }
-            }
+                Err(error) => error,
+            };
             let end = if cut {
                 LeaseEnd::Cancelling
             } else {
-                lease_end(result.as_ref().err())
+                lease_end(Some(&error))
             };
             let durable = attempt.settle(end).await;
-            match result {
+            match error {
                 // SPEC §10, T38: nothing reached the engine, so the request may
                 // be offered to the next instance; never after acceptance.
-                Err(AdapterError::NotAccepted(reason)) => {
+                AdapterError::NotAccepted(reason) => {
                     plan.refused(generation, &reason);
                     let started = std::time::Instant::now();
                     let next = plan.next().await;
@@ -418,38 +435,33 @@ pub async fn dispatch_timed(
                         Ok(next) => attempt = next,
                         Err(refusal) => {
                             guard.release();
-                            return Err(Refused::Before(refusal));
+                            break Refused::Before(refusal);
                         }
                     }
-                }
-                Ok(response) => {
-                    guard.release();
-                    timing.finish();
-                    return Ok((response, timing));
                 }
                 // SPEC §10, T19 (found live 2026-09-24): the engine answered the
                 // request as invalid. That answer is complete, so the lease closed
                 // as completed; another instance would reject it the same way.
-                Err(AdapterError::Rejected { status, message }) => {
+                AdapterError::Rejected { status, message } => {
                     guard.release();
-                    return Err(Refused::Before(engine_rejection(status, &message)));
+                    break Refused::Before(engine_rejection(status, &message));
                 }
                 // SPEC §10 (amended 2026-10-17, found live): the engine answered
                 // with an error. The request reached an engine, so it is not
                 // offered to another instance. Its lease is cancelling: the
                 // ledger keeps the charge until the engine reports quiescence,
                 // so the in-memory slot is released as for an uncertain end.
-                Err(AdapterError::EngineError { message, .. }) => {
+                AdapterError::EngineError { message, .. } => {
                     if durable {
                         guard.release();
                     }
-                    return Err(Refused::Engine(engine_failure(&message)));
+                    break Refused::Engine(engine_failure(&message));
                 }
                 // SPEC §10, T19: refused deterministically before sending;
                 // another instance would refuse it the same way.
-                Err(error) if refused_before_sending(&error) => {
+                error if refused_before_sending(&error) => {
                     guard.release();
-                    return Err(Refused::Before(adapter_refusal(&error)));
+                    break Refused::Before(adapter_refusal(&error));
                 }
                 // Anything else may have been accepted. SPEC §10, T17: the
                 // durable lease keeps the conservative charge (uncertain until
@@ -457,22 +469,25 @@ pub async fn dispatch_timed(
                 // count — is released; left taken, every uncertain end would
                 // shrink the deployment's bound for the life of the process.
                 // Only an authority with no durable ledger keeps it taken.
-                Err(_) => {
+                _ => {
                     if durable {
                         guard.release();
                     }
-                    return Err(Refused::Uncertain);
+                    break Refused::Uncertain;
                 }
             }
-        }
+        };
+        let _ = reply.send(Err(refused));
     });
-    match dispatched.await {
+    match answer.await {
         Ok(Ok(response)) => Ok(response),
         // T17 T38: every offer was refused before forwarding (a host shutting
         // down, a refused connection, a gate that closed). Nothing reached an
         // engine, so this is a retryable 503 with each lease already closed.
         // An engine's error answer is relayed as it is.
         Ok(Err(Refused::Before(answer) | Refused::Engine(answer))) => Err(answer),
+        // The task ended without answering (it panicked): the engine may have
+        // accepted the request.
         Ok(Err(Refused::Uncertain)) | Err(_) => {
             Err(err("engine_error", "backend completion unverified"))
         }

@@ -1860,8 +1860,12 @@ async fn start_standalone_in(
     let secrets = SecretsKey::load_or_create(&state_dir.join("identity").join("secrets.key"))?;
     // The coordinator opens the durable state itself and holds the controller lock
     // for as long as it runs, so nothing else may act as an authority over it.
+    // SPEC §10 (owner decision 2026-10-18): standalone is one machine, so an OS
+    // crash or power loss that loses the last request-lease commits also ends
+    // the engine work they account for.
     let owner = Arc::new(std::sync::Mutex::new(
-        OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?,
+        OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?
+            .with_local_engines_only(),
     ));
     // SPEC §8.2 / T21 (owner decision 2026-09-25): the private rendezvous root,
     // swept of directories no retained launch owns before any launch runs.

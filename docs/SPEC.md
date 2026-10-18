@@ -486,6 +486,8 @@ Normal switches do not kill live requests. A drain timeout fails the switch by d
 
 Management operations are durable; queued inference bodies and open streams are not promised to survive a server crash. Requests may fail during a router/server outage. Do not imply that a durable deployment ID makes inference exactly-once or resumable.
 
+Note (owner decision 2026-10-18): a completed request's answer reaches the client before its lease close is committed: the whole collected answer, or a stream's last lines through `[DONE]`. The close follows on the same completion evidence, and the request's in-flight slot is released only once the close is written, so a client's next request can briefly find the previous one still counted against the deployment's bound. A crash between the answer and the commit leaves the lease charged until the quiescence path settles it. On a standalone role, whose engines all run on its own machine, request-lease grants and closes are committed with SQLite `synchronous=NORMAL`: a process crash loses none of them, and an OS crash or power loss that loses the last ones also ends the engine work they account for. Every other write, and every request-lease write on a server with remote hosts, is on disk before it is reported written.
+
 ## 11. Multi-node groups and failure coordination
 
 Use an agent on every host directly supervised by CapyCTL. Only the API-facing group member needs ingress. The group may expose one inference endpoint while owning workers on both Sparks. vLLM's documented native multi-node topology includes an API-facing node and headless workers [S10]. CapyCTL manages the deployment; the engine implements distributed inference.
