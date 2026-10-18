@@ -420,17 +420,14 @@ impl Store {
         Ok(())
     }
     pub fn remote_ingress_endpoint(&self, binding_id: &str) -> Result<Option<String>, StoreError> {
-        let row: Option<(String,Option<String>,Option<String>)> = self.conn.query_row("SELECT COALESCE(i.host_id,json_extract(e.effective_json,'$.host.name')),r.host_id,r.endpoint FROM runtime_bindings b JOIN effective_revisions e ON e.deployment_id=b.deployment_id AND e.revision=b.revision LEFT JOIN deployment_instances i ON i.deployment_id=b.deployment_id AND i.instance_index=b.instance_index LEFT JOIN remote_binding_ingress r ON r.binding_id=b.id WHERE b.id=?1",[binding_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let row: Option<(String,Option<String>,Option<String>)> = self.conn.prepare_cached("SELECT COALESCE(i.host_id,json_extract(e.effective_json,'$.host.name')),r.host_id,r.endpoint FROM runtime_bindings b JOIN effective_revisions e ON e.deployment_id=b.deployment_id AND e.revision=b.revision LEFT JOIN deployment_instances i ON i.deployment_id=b.deployment_id AND i.instance_index=b.instance_index LEFT JOIN remote_binding_ingress r ON r.binding_id=b.id WHERE b.id=?1")?.query_row([binding_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let Some((expected, host, endpoint)) = row else {
             return Err(StoreError::Conflict);
         };
         let revoked: Option<bool> = self
             .conn
-            .query_row(
-                "SELECT revoked FROM enrolled_hosts WHERE host_id=?1",
-                [&expected],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT revoked FROM enrolled_hosts WHERE host_id=?1")?
+            .query_row([&expected], |r| r.get(0))
             .optional()?;
         if revoked == Some(true) {
             return Err(StoreError::Conflict);

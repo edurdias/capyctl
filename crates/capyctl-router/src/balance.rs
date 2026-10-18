@@ -11,6 +11,9 @@
 //! remote instance, its host has a live control session (SPEC §13.2). The gate
 //! is re-checked by the lease grant in its own transaction, so a stale view
 //! costs a failover, never a dispatch to a closed instance (SPEC §10, T18).
+//! That is also why a request admitted without waiting is ranked on the view
+//! admission read to find its deployment servable ([`InstanceView`]) rather
+//! than on a second read of the same rows.
 //!
 //! # Score
 //!
@@ -376,6 +379,11 @@ enum Route {
     },
 }
 
+/// The serving instances a request was admitted on (`None` from an authority
+/// with no instance view), handed to [`Plan::new`] so the store is not read
+/// twice for one request.
+pub struct InstanceView(pub(crate) Option<Vec<ServingInstance>>);
+
 /// The offers one request may make, in order.
 pub struct Plan {
     deps: RouterDeps,
@@ -385,13 +393,21 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Read the deployment's serving instances and rank them. Logs the
-    /// selection with its inputs.
-    pub fn new(deps: &RouterDeps, deployment: &str) -> Result<Self, Refusal> {
-        let instances = deps
-            .controller
-            .serving_instances(deployment)
-            .map_err(crate::chat::map_controller)?;
+    /// Rank the deployment's serving instances: `view` when admission read
+    /// them for this request, otherwise a fresh read. Logs the selection with
+    /// its inputs.
+    pub fn new(
+        deps: &RouterDeps,
+        deployment: &str,
+        view: Option<InstanceView>,
+    ) -> Result<Self, Refusal> {
+        let instances = match view {
+            Some(InstanceView(instances)) => instances,
+            None => deps
+                .controller
+                .serving_instances(deployment)
+                .map_err(crate::chat::map_controller)?,
+        };
         let route = match instances {
             None => Route::Whole { offered: false },
             Some(instances) => {

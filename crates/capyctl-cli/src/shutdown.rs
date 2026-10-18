@@ -345,11 +345,26 @@ pub async fn serve(
     router: Router,
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router)
+    axum::serve(no_delay(listener), router)
         .with_graceful_shutdown(async move {
             let _ = stop.wait_for(|stopped| *stopped).await;
         })
         .await
+}
+
+/// SPEC §17: every accepted connection has Nagle's algorithm off. A response
+/// or stream event written while an earlier segment is unacknowledged would
+/// otherwise wait for the client's delayed acknowledgement (up to 40 ms on
+/// Linux), which is the order of a whole decision request. axum 0.8 no longer
+/// sets `TCP_NODELAY` itself. A socket that refuses the option is served as
+/// it is.
+fn no_delay(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|stream| {
+        let _ = stream.set_nodelay(true);
+    })
 }
 
 /// Wait for served listeners to wind down after `stop`, never longer than
@@ -439,6 +454,23 @@ pub fn elapsed_ms(started: Instant) -> u64 {
 mod tests {
     use super::*;
     use axum::routing::get;
+
+    // SPEC §17: a role listener accepts every connection with Nagle's
+    // algorithm off, so a small write never waits for a delayed ACK.
+    #[tokio::test]
+    async fn served_connections_have_nagle_off() {
+        use axum::serve::Listener as _;
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = bound.local_addr().unwrap();
+        let mut listener = no_delay(bound);
+        let client = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert!(
+            !client.nodelay().unwrap(),
+            "the client side is left as it is"
+        );
+        let (accepted, _) = listener.accept().await;
+        assert!(accepted.nodelay().unwrap());
+    }
 
     // T33 (ADR 0015 invariant 6): a joined supervision cancels every
     // supervisor, lets one that honours the signal finish the work it is in,

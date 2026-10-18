@@ -193,8 +193,10 @@ impl crate::Store {
     ) -> Result<Option<[u8; 32]>, StoreError> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT nonce,ciphertext FROM engine_secrets WHERE binding_id=?1 AND incarnation=?2 AND role=?3",
+            )?
+            .query_row(
                 params![binding_id, incarnation, role.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

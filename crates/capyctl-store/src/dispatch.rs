@@ -86,11 +86,9 @@ pub(crate) fn check_session(
     conn: &Connection,
     session: &CoordinatorSession,
 ) -> Result<(), DispatchError> {
-    let current: (i64, String) = conn.query_row(
-        "SELECT epoch,session_id FROM coordinator_session WHERE singleton=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let current: (i64, String) = conn
+        .prepare_cached("SELECT epoch,session_id FROM coordinator_session WHERE singleton=1")?
+        .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     if session.epoch <= 0 || session.id.is_empty() || current != (session.epoch, session.id.clone())
     {
         return Err(DispatchError::StaleSession);
@@ -193,11 +191,9 @@ impl crate::Store {
 }
 
 fn outstanding(conn: &Connection, deployment: &str) -> Result<usize, DispatchError> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
-        [deployment],
-        |r| r.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1")?
+        .query_row([deployment], |r| r.get(0))?;
     usize::try_from(count).map_err(|_| DispatchError::Invalid)
 }
 
@@ -239,29 +235,35 @@ fn grant_in(
     // whose gate is open.
     let row: Option<(i64, i64, String, i64, i64, u32)> = match fence {
         GrantFence::Instance(generation) => transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT revision,current_generation,observed_state,
                 CASE WHEN admission_enabled=1 AND dispatch_enabled=1 THEN 1 ELSE 0 END,suspended,instance_index
              FROM instance_runtime WHERE id=?1 AND revision IS NOT NULL AND current_generation=?2",
+            )?
+            .query_row(
                 params![deployment_id, generation],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?,
         GrantFence::Exact(revision, generation) => transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT revision,current_generation,observed_state,
                 CASE WHEN admission_enabled=1 AND dispatch_enabled=1 THEN 1 ELSE 0 END,suspended,instance_index
              FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3",
+            )?
+            .query_row(
                 params![deployment_id, revision, generation],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?,
         GrantFence::Current => transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT revision,current_generation,observed_state,
                 CASE WHEN admission_enabled=1 AND dispatch_enabled=1 THEN 1 ELSE 0 END,suspended,instance_index
              FROM instance_runtime WHERE id=?1 AND revision IS NOT NULL AND current_generation IS NOT NULL
              ORDER BY (observed_state='ready' AND admission_enabled=1 AND dispatch_enabled=1) DESC, instance_index LIMIT 1",
+            )?
+            .query_row(
                 [deployment_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
@@ -275,8 +277,9 @@ fn grant_in(
     if state != "ready" || enabled != 1 || suspended != 0 {
         return Err(DispatchError::Closed);
     }
-    let total: i64 =
-        transaction.query_row("SELECT COUNT(*) FROM request_leases", [], |r| r.get(0))?;
+    let total: i64 = transaction
+        .prepare_cached("SELECT COUNT(*) FROM request_leases")?
+        .query_row([], |r| r.get(0))?;
     if outstanding(transaction, deployment_id)? >= max_per_deployment
         || usize::try_from(total).map_err(|_| DispatchError::Invalid)? >= max_total
     {
@@ -289,9 +292,10 @@ fn grant_in(
         generation,
         session_id: session.id.clone(),
     };
-    transaction.execute("INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index)
-        VALUES (?1,?2,?3,?4,?5,'inflight',?6)",
-        params![ticket.id, ticket.deployment_id, ticket.revision, ticket.generation, ticket.session_id, instance])?;
+    transaction
+        .prepare_cached("INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index)
+        VALUES (?1,?2,?3,?4,?5,'inflight',?6)")?
+        .execute(params![ticket.id, ticket.deployment_id, ticket.revision, ticket.generation, ticket.session_id, instance])?;
     Ok(ticket)
 }
 
@@ -312,16 +316,13 @@ fn settle_in(
         "UPDATE request_leases SET disposition='uncertain' WHERE id=?1 AND deployment_id=?2
          AND revision=?3 AND generation=?4 AND session_id=?5"
     };
-    let changed = transaction.execute(
-        sql,
-        params![
-            ticket.id,
-            ticket.deployment_id,
-            ticket.revision,
-            ticket.generation,
-            ticket.session_id
-        ],
-    )?;
+    let changed = transaction.prepare_cached(sql)?.execute(params![
+        ticket.id,
+        ticket.deployment_id,
+        ticket.revision,
+        ticket.generation,
+        ticket.session_id
+    ])?;
     Ok(changed == 1)
 }
 
@@ -340,19 +341,20 @@ fn cancel_in(
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    let changed = transaction.execute(
-        "INSERT OR IGNORE INTO request_lease_cancellations(lease_id,cancelled_at_ms)
+    let changed = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO request_lease_cancellations(lease_id,cancelled_at_ms)
          SELECT id,?6 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3
          AND generation=?4 AND session_id=?5 AND disposition='inflight'",
-        params![
+        )?
+        .execute(params![
             ticket.id,
             ticket.deployment_id,
             ticket.revision,
             ticket.generation,
             ticket.session_id,
             now
-        ],
-    )?;
+        ])?;
     Ok(changed == 1)
 }
 
