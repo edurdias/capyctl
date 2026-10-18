@@ -190,6 +190,15 @@ pub struct MemoryRequest {
     /// before the allowance existed, which re-derives without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_graphs_bytes: Option<i64>,
+    /// ADR 0014 amendment A22 (owner decision 2026-10-18): the most vLLM's
+    /// eager safetensors loader adds over the weights in a derived startup
+    /// placeholder. Recorded beside `startup_graphs_bytes` exactly where the
+    /// placeholder sizes an eager load (`renders_eager_loader`), so a snapshot
+    /// re-derives it. Absent wherever no eager placeholder is derived, and in
+    /// a revision frozen before the cap existed, which re-derives uncapped
+    /// (amendment A21, weights × 3.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_eager_cap_bytes: Option<i64>,
     /// ADR 0014 amendment A16: one request slot of a hybrid model's recurrent
     /// state on SGLang, a checkpoint fact the host measured from
     /// `config.json` beside the weights. Recorded so a snapshot re-derives

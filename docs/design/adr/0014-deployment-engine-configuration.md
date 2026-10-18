@@ -1584,7 +1584,8 @@ Decision:
    `renders_eager_loader` is true: scaled from `STARTUP_WEIGHTS_FACTOR` by the evidence's
    loading-peak ratio (54.2 / 34.5 ≈ 1.57×) and rounded up for headroom, the same way
    `STARTUP_WEIGHTS_FACTOR` itself was rounded up over its own measured ratio (amendment A8).
-   A placeholder, not a measurement.
+   A placeholder, not a measurement. Amendment A22 (2026-10-18) caps what it adds over the
+   weights at 32 GiB for new revisions.
 3. The command fingerprint (`deployment_command_fingerprint`, which hashes only what the
    deployment declared) is unaffected: it never saw the capyctl default before this amendment
    and does not see it now.
@@ -1633,3 +1634,79 @@ loader default. Tests: `the_default_load_strategy_is_eager_on_every_memory_shape
 `an_undeclared_strategy_stays_unset_without_parking`,
 `an_omitted_load_strategy_keeps_existing_identities`,
 `the_startup_placeholder_follows_the_effective_loader`.
+
+## Amendment A22: the eager loader's startup transient is capped (owner decision 2026-10-18)
+
+Problem: amendment A21 sized an unmeasured vLLM deployment that renders
+`--safetensors-load-strategy eager` (`VllmLaunchSettings::renders_eager_loader`, every parking
+deployment by default) at `max(request + graphs, weights × 3.6 + margin)`, from one
+Qwen3.6-35B-A3B NVFP4 run. For large checkpoints that is far above the machine: Nemotron 3.5
+Super VL 120B-A12B NVFP4 showed a 265.2 GiB startup placeholder on a GB10, more than the
+machine has. The owner agreed to lower it for large checkpoints once mid-size ones were
+measured (option b of the question the status runbook left open on 2026-10-16).
+
+Evidence: CapyCTL's own measured startup peak (`startup.measured`), vLLM 0.30.0, `eager`,
+GB10 host A:
+
+| Checkpoint | Weights (bytes) | Measured peak (bytes) | Peak / weights | Peak − weights |
+|---|---|---|---|---|
+| Qwen3.8-27B NVFP4, KV 4 GiB, 2026-10-18 | 23749332688 | 56220348416 | 2.37 | 30.2 GiB |
+| Qwen3-14B BF16, KV 4 GiB, 2026-10-18 | 29536665640 | 44531412992 | 1.51 | 13.9 GiB |
+| Qwen3-30B-A3B BF16, KV 4 GiB, 2026-10-18 | 61066575648 | 76076666880 | 1.25 | 14.0 GiB |
+| Qwen3.8-27B BF16, KV 4 GiB, 2026-10-18 | 55563006776 | 68840255488 | 1.24 | 12.4 GiB |
+| Nemotron 3.5 Super VL 120B-A12B NVFP4, 2026-10-16 | 76328140836 | 101695578112 | 1.33 | 23.6 GiB |
+
+What the loader adds over the weights is bounded (12 to 30 GiB, the KV cache included), not
+proportional to them.
+
+Decision:
+
+1. The eager load term becomes `weights + min(weights × 13/5, cap)` with
+   [`VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES`](../../../crates/capyctl-config/src/effective/engine_config.rs)
+   = 32 GiB, so the placeholder is `max(request + graphs, weights + min(weights × 13/5, 32 GiB)
+   + margin)`. In integer bytes `weights × 18/5` is exactly `weights + weights × 13/5`, so the
+   term is `min(weights × 3.6, weights + 32 GiB)`: a checkpoint up to 13215283988 bytes (about
+   12.3 GiB) keeps amendment A21's figure to the byte, and a larger one is capped.
+   `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR` (3.6) stays the factor below the cap. A placeholder, not
+   a measurement; a first start's measured peak still replaces it.
+2. Every measured peak stays covered. The placeholder below takes the load term (each
+   request plus the graph allowance is lower); the cold phase adds the 1.25 GiB CUDA context
+   on top:
+
+   | Checkpoint | A21 placeholder (bytes) | A22 placeholder (bytes) | Measured peak | Headroom |
+   |---|---|---|---|---|
+   | Qwen3.8-27B NVFP4 | 94087532268 (87.6 GiB) | 66699005648 (62.1 GiB) | 52.4 GiB | 9.8 GiB |
+   | Qwen3-14B BF16 | 114921930896 (107.0 GiB) | 72486338600 (67.5 GiB) | 41.5 GiB | 26.0 GiB |
+   | Qwen3-30B-A3B BF16 | 228429606924 (212.7 GiB) | 104016248608 (96.9 GiB) | 70.9 GiB | 26.0 GiB |
+   | Qwen3.8-27B BF16 | 208616758985 (194.3 GiB) | 98512679736 (91.7 GiB) | 64.1 GiB | 27.6 GiB |
+   | Super VL 120B-A12B NVFP4 | 283371241601 (263.9 GiB) | 119277813796 (111.1 GiB) | 94.7 GiB | 16.4 GiB |
+   | Qwen3.6-35B-A3B NVFP4 (A21's run, 23.5 GB) | about 86.8 GiB | about 61.9 GiB | 54.2 GiB | 7.7 GiB |
+
+   The Qwen3.6 weights are the download size the 2026-09-25 single-box benchmark recorded;
+   its peak is the loading peak amendment A21 cites. Super VL's cold phase becomes 120619991076
+   bytes (112.3 GiB, from 284713418881), still above a 108 GiB managed limit, so its unmeasured
+   first start still runs alone and reserves the whole managed limit (owner decision
+   2026-09-23, solo first start) until it is measured.
+3. The cap is recorded as `startup_eager_cap_bytes` beside `startup_graphs_bytes` wherever a
+   derived placeholder sizes an eager load, so a snapshot re-derives it and a claimed cap
+   other than the derived one is refused. The store's solo-first-start recomputation for a
+   revision frozen before its weights were known (`weighed_placeholder`) uses the recorded
+   cap.
+4. A revision frozen under amendment A21 records no cap and keeps `weights × 3.6`, exactly as
+   it was frozen (`CheckpointFacts::legacy_eager_startup`). This follows amendment A8, whose
+   owner decision kept 1.6 for revisions frozen before it (`LEGACY_STARTUP_WEIGHTS_FACTOR`),
+   and the freezing rule every snapshot obeys: a frozen revision re-resolves to the exact
+   bytes it was accepted with, so re-deriving it with the cap would make it fail to decode.
+   The cost is bounded: the larger figure lasts only until that revision's first start is
+   measured, and any new revision of the deployment takes the cap. A revision frozen before
+   amendment A8 keeps 1.6 and records no cap. The non-eager factor (2.25) is unchanged.
+
+Evidence: CPU tests cover the boundary below and above the cap
+(`the_eager_placeholder_keeps_3_6_below_the_cap_and_caps_above_it`), every measured row
+(`the_capped_eager_placeholder_covers_every_measured_peak`), the recorded cap and a forged one
+(`the_startup_placeholder_follows_the_effective_loader`), a revision frozen under amendment
+A21 (`a_revision_frozen_before_the_eager_cap_keeps_its_placeholder`) and the Super VL figure
+with its whole-host first start
+(`status_shows_the_whole_host_a_start_above_the_managed_limit_reserves`). Not qualification:
+the measurements cover vLLM 0.30.0 on GB10 with `eager`; another engine build, a discrete GPU
+or a much larger KV cache should be measured before the cap is trusted there.

@@ -762,9 +762,9 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     let (dir, owner, fence, observations) = setup().await;
     // Weights 20 GiB, KV 4 GiB: request 20 + 4 + 8 (margin) = 32 GiB; the
     // parking deployment's undeclared loader is `eager` (ADR 0014 amendment
-    // A21, note of 2026-10-15), so the placeholder peak is 20 × 3.6 + 8 =
-    // 80 GiB (amendment A8 with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR`), above
-    // the 36 GiB limit.
+    // A21, note of 2026-10-15), so the placeholder peak is 20 + min(20 × 2.6,
+    // 32) + 8 = 60 GiB (amendment A22's capped eager load), above the 36 GiB
+    // limit.
     managed_limit(&owner, &observations, 36 * GIB);
     let big = {
         let o = owner.lock().unwrap();
@@ -1051,15 +1051,18 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
 /// Owner decision 2026-09-23 (solo first start), found live 2026-10-16 on a
 /// GB10 whose managed limit was raised to 108 GiB: a parking vLLM deployment
 /// requesting 96 GiB, its checkpoint 76328140836 bytes, has the eager-loader
-/// placeholder of ADR 0014 amendment A21, `weights × 3.6 + 8 GiB` plus the
-/// engine's CUDA context, 284713418881 bytes (265.2 GiB). A start reserves
-/// the whole managed limit; status showed the placeholder as `default`
-/// instead. Status names what a start reserves, and the start agrees.
+/// placeholder, since ADR 0014 amendment A22 `weights + min(weights × 2.6,
+/// 32 GiB) + 8 GiB` plus the engine's CUDA context: 120619991076 bytes
+/// (112.3 GiB; amendment A21's uncapped `weights × 3.6` gave 284713418881,
+/// 265.2 GiB). Still above the limit, so a start reserves the whole managed
+/// limit; status showed the placeholder as `default` instead. Status names
+/// what a start reserves, and the start agrees.
 // T14 T26 T29
 #[tokio::test]
 async fn status_shows_the_whole_host_a_start_above_the_managed_limit_reserves() {
     use capyctl_config::effective::{
-        default_startup_bytes, VLLM_EAGER_STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
+        default_startup_bytes, EagerStartup, VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES,
+        VLLM_OVERHEAD_MARGIN_BYTES,
     };
     const WEIGHTS: i64 = 76_328_140_836;
     const LIMIT: i64 = 108 * GIB;
@@ -1068,11 +1071,12 @@ async fn status_shows_the_whole_host_a_start_above_the_managed_limit_reserves() 
         Some(WEIGHTS),
         VLLM_OVERHEAD_MARGIN_BYTES,
         Some(GRAPHS),
-        Some(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
+        Some(EagerStartup::Capped(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES)),
     )
     .unwrap()
         + OVERHEAD;
-    assert_eq!(placeholder, 284_713_418_881);
+    assert_eq!(placeholder, 120_619_991_076);
+    assert!(placeholder > LIMIT);
 
     let (_dir, owner, _fence, observations) = setup().await;
     managed_limit(&owner, &observations, LIMIT);

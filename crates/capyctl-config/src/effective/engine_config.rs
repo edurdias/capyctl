@@ -91,8 +91,32 @@ pub const LEGACY_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (8, 5);
 /// host A, deep park): eager's loading peak was 54.2 GiB against lazy's
 /// 34.5 GiB, 1.57× it. Applied to `STARTUP_WEIGHTS_FACTOR` (2.25) and
 /// rounded up for headroom, as that factor was itself rounded up over its own
-/// measured ratio. A placeholder, not a measurement.
+/// measured ratio. A placeholder, not a measurement. Since amendment A22 the
+/// factor holds only below [`VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES`]; a revision
+/// frozen before A22 keeps it uncapped.
 pub const VLLM_EAGER_STARTUP_WEIGHTS_FACTOR: (i64, i64) = (18, 5);
+
+/// ADR 0014 amendment A22 (owner decision 2026-10-18): the most the eager
+/// loader's transient may add over the weights in a derived vLLM startup
+/// placeholder, which becomes `weights + min(weights × 13/5, cap)`, i.e.
+/// `min(weights × 3.6, weights + cap)`. Measured on GB10 (vLLM 0.30.0,
+/// eager, CapyCTL's own `startup.measured`), the peak over the weights was
+/// bounded, 12.4 to 30.2 GiB with the KV cache included, from 22 to 71 GiB of
+/// weights, not proportional to them. Checkpoints under about 12.3 GiB keep
+/// exactly the 3.6 factor. A placeholder, not a measurement.
+pub const VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES: i64 = 32 << 30;
+
+/// ADR 0014 amendments A21 and A22: how a derived startup placeholder sizes
+/// vLLM's eager safetensors loader (`VllmLaunchSettings::renders_eager_loader`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EagerStartup {
+    /// Amendment A22: `min(weights × 3.6, weights + cap)`, the cap recorded as
+    /// `startup_eager_cap_bytes`.
+    Capped(i64),
+    /// Amendment A21, kept by a revision frozen before A22 (it records no
+    /// cap): `weights × 3.6`.
+    Uncapped,
+}
 
 /// ADR 0014 amendment A8 (found live 2026-10-02): the first-start graph
 /// allowance, per model whose CUDA graphs the engine captures (the checkpoint,
@@ -118,32 +142,41 @@ pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
 
 /// Owner decision 2026-09-23: the placeholder startup peak for a request,
 /// the checkpoint's weights (when known), the family margin and (amendment
-/// A8) the graph allowance: `max(request + graphs, weights × factor + margin)`.
-/// `factor` is `weights_factor` when given (amendment A21, owner decision
-/// 2026-10-09: vLLM's eager safetensors loader), else
-/// [`STARTUP_WEIGHTS_FACTOR`]. `graphs` is `None` for a revision frozen before
-/// amendment A8, which keeps `max(request, weights × 1.6 + margin)` whatever
-/// `weights_factor` says.
+/// A8) the graph allowance: `max(request + graphs, load + margin)`. `load` is
+/// `weights × 2.25` ([`STARTUP_WEIGHTS_FACTOR`]) unless vLLM loads `eager`
+/// (`eager` given): then `min(weights × 3.6, weights + cap)` (amendment A22,
+/// owner decision 2026-10-18), or `weights × 3.6` uncapped for a revision
+/// frozen before A22 (amendment A21). `graphs` is `None` for a revision frozen
+/// before amendment A8, which keeps `max(request, weights × 1.6 + margin)`
+/// whatever `eager` says.
 pub fn default_startup_bytes(
     request: i64,
     weights: Option<i64>,
     margin: i64,
     graphs: Option<i64>,
-    weights_factor: Option<(i64, i64)>,
+    eager: Option<EagerStartup>,
 ) -> Option<i64> {
     let floor = request.checked_add(graphs.unwrap_or(0))?;
     let Some(weights) = weights else {
         return Some(floor);
     };
-    let (numerator, denominator) = if graphs.is_some() {
-        weights_factor.unwrap_or(STARTUP_WEIGHTS_FACTOR)
-    } else {
-        LEGACY_STARTUP_WEIGHTS_FACTOR
+    let scale = |(numerator, denominator): (i64, i64)| {
+        weights
+            .checked_mul(numerator)
+            .map(|scaled| scaled / denominator)
     };
-    weights
-        .checked_mul(numerator)
-        .map(|scaled| scaled / denominator)
-        .and_then(|scaled| scaled.checked_add(margin))
+    let load = match (graphs, eager) {
+        (None, _) => scale(LEGACY_STARTUP_WEIGHTS_FACTOR),
+        (Some(_), None) => scale(STARTUP_WEIGHTS_FACTOR),
+        (Some(_), Some(EagerStartup::Uncapped)) => scale(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
+        // `weights + min(weights × 13/5, cap)`: in integers `weights × 18/5`
+        // is exactly `weights + weights × 13/5`, so below the cap this is the
+        // uncapped figure to the byte.
+        (Some(_), Some(EagerStartup::Capped(cap))) => scale(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR)
+            .zip(weights.checked_add(cap))
+            .map(|(scaled, capped)| scaled.min(capped)),
+    };
+    load.and_then(|load| load.checked_add(margin))
         .map(|peak| peak.max(floor))
 }
 
@@ -219,6 +252,11 @@ pub struct CheckpointFacts {
     /// re-resolves exactly as it was, without it. Never set for a new
     /// resolution.
     pub legacy_startup_graphs: bool,
+    /// ADR 0014 amendment A22: a snapshot frozen before the eager loader's
+    /// transient was capped records no `startup_eager_cap_bytes`; an eager
+    /// placeholder re-resolves exactly as it was, weights × 3.6 uncapped
+    /// (amendment A21). Never set for a new resolution.
+    pub legacy_eager_startup: bool,
     /// A snapshot that records the engine family's margin (8 GiB) re-resolves
     /// with it, exactly as it was: beside a request declared for a discrete
     /// GPU it was sized before the device margin (weights x 0.10, ADR 0019 §3,
@@ -808,6 +846,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             device_total_bytes: None,
             overhead_bytes: None,
             startup_graphs_bytes: None,
+            startup_eager_cap_bytes: None,
             state_slot_bytes: None,
             state_bytes: None,
             member: None,
@@ -834,7 +873,7 @@ pub fn resolve_startup(
     facts: CheckpointFacts,
     margin: i64,
     graphs: Option<i64>,
-    weights_factor: Option<(i64, i64)>,
+    eager: Option<EagerStartup>,
 ) -> Result<(Option<i64>, Option<SettingSource>), ConfigError> {
     const PATH: &str = "engine_config.memory.startup";
     if let Some(peak) = declared {
@@ -864,7 +903,7 @@ pub fn resolve_startup(
         memory.weights_bytes,
         margin,
         graphs,
-        weights_factor,
+        eager,
     )
     .ok_or_else(|| invalid(PATH, "memory arithmetic overflows"))?;
     Ok((Some(peak), Some(SettingSource::Derived)))
@@ -1741,6 +1780,14 @@ pub(super) fn normalize_engine_config(
             inputs.draft_declared || crate::engine_policy::draft_model_path(engine, &all).is_some(),
         ))
     };
+    // ADR 0014 amendment A22 (owner decision 2026-10-18): the eager loader's
+    // transient over the weights is capped; a revision frozen before the cap
+    // records none and re-derives uncapped, as amendment A21 froze it.
+    let eager = vllm_renders_eager.then_some(if inputs.facts.legacy_eager_startup {
+        EagerStartup::Uncapped
+    } else {
+        EagerStartup::Capped(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES)
+    });
     let (startup, startup_source) = resolve_startup(
         declared_startup,
         &memory,
@@ -1748,7 +1795,7 @@ pub(super) fn normalize_engine_config(
         inputs.facts,
         overhead_margin(engine),
         graphs,
-        vllm_renders_eager.then_some(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
+        eager,
     )?;
     memory.startup_bytes = startup;
     if let Some(source) = startup_source {
@@ -1756,6 +1803,11 @@ pub(super) fn normalize_engine_config(
         // Only the placeholder default is derived here; a device request's
         // startup was set above as declared.
         memory.startup_graphs_bytes = graphs;
+        // A revision frozen before amendment A8 sizes no eager load (1.6).
+        memory.startup_eager_cap_bytes = match (graphs, eager) {
+            (Some(_), Some(EagerStartup::Capped(cap))) => Some(cap),
+            _ => None,
+        };
     }
 
     let mut common = CommonEngineSettings {

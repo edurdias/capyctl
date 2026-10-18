@@ -228,10 +228,11 @@ fn a_single_host_deployment_is_unchanged() {
     // leaves a single host untouched. Re-pinned again for amendment A21
     // (note of 2026-10-15): the fixture parks, so its effective
     // configuration carries the defaulted `eager` loader, its provenance
-    // entry and the eager startup placeholder.
+    // entry and the eager startup placeholder; and for amendment A22
+    // (2026-10-18): that placeholder is capped and records its cap.
     assert_eq!(
         single.recipe_fingerprint,
-        "50a8f976977b50613eb3fef4b3b59253825e5392776db0a3e5f54408ef7625bc"
+        "012dee58e4e4d3b4eeb0efe5727b455ca4f58734b4a7c83c682f555da7aab357"
     );
 }
 

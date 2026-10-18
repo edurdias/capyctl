@@ -15,7 +15,10 @@
 //!    published memory availability while an uncontended Initialize ran,
 //!    recorded per (revision, host, engine installation) when it reached Ready;
 //! 3. the placeholder `max(request + graphs, weights × 2.25 + margin)` the
-//!    revision was resolved with (ADR 0014 amendment A8 adds the graphs) (`capyctl_config::effective::default_startup_bytes`).
+//!    revision was resolved with (ADR 0014 amendment A8 adds the graphs;
+//!    amendments A21 and A22 size vLLM's eager loader as
+//!    `min(weights × 3.6, weights + 32 GiB)` instead of `weights × 2.25`)
+//!    (`capyctl_config::effective::default_startup_bytes`).
 //!
 //! A start freezes the measured peak it will reserve into its plan when it is
 //! accepted, so every later check of that start (arm, cleanup, release) sees
@@ -83,12 +86,13 @@ pub(super) fn frozen_startup(
 }
 
 /// Owner decision 2026-09-23 (solo first start): the placeholder startup peak
-/// `max(request + graphs, weights × factor + margin)` recomputed with the
-/// weights recorded for the revision since it was frozen, when it was frozen
-/// without them and the recomputed value is larger. `factor` follows ADR 0014
-/// amendment A21 (owner decision 2026-10-09) exactly as the original
-/// resolution picked it: higher while vLLM actually gets
-/// `--safetensors-load-strategy eager`. Found live 2026-09-23: a revision
+/// `max(request + graphs, load + margin)` recomputed with the weights
+/// recorded for the revision since it was frozen, when it was frozen without
+/// them and the recomputed value is larger. The load follows ADR 0014
+/// amendments A21 and A22 exactly as the original resolution picked it:
+/// larger while vLLM actually gets `--safetensors-load-strategy eager`,
+/// capped as the revision recorded (`startup_eager_cap_bytes`), uncapped for
+/// a revision frozen before the cap. Found live 2026-09-23: a revision
 /// accepted while its checkpoint digest was pending was frozen with the
 /// request as its placeholder, so its startup estimate never exceeded the
 /// managed limit and the solo first start never triggered. The weights are
@@ -122,11 +126,14 @@ fn weighed_placeholder(
     // The derived cold phase carries the engine's CUDA context and graphs
     // beside the startup peak (re-review parity rule), so the recomputed
     // estimate does too.
-    let weights_factor = match &e.engine_config {
+    let eager = match &e.engine_config {
         capyctl_domain::launch::LaunchSettings::Vllm(settings)
             if settings.renders_eager_loader() =>
         {
-            Some(capyctl_config::effective::VLLM_EAGER_STARTUP_WEIGHTS_FACTOR)
+            Some(match memory.startup_eager_cap_bytes {
+                Some(cap) => capyctl_config::effective::EagerStartup::Capped(cap),
+                None => capyctl_config::effective::EagerStartup::Uncapped,
+            })
         }
         _ => None,
     };
@@ -137,7 +144,7 @@ fn weighed_placeholder(
                 Some(weights),
                 memory.margin_bytes,
                 memory.startup_graphs_bytes,
-                weights_factor,
+                eager,
             )
         })
         .and_then(|estimate| {

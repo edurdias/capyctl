@@ -7,7 +7,8 @@
 use capyctl_config::effective::{
     decode_effective_snapshot, default_startup_bytes, deployment_command_fingerprint,
     resolve_effective, resolve_effective_with_checkpoint, startup_budget, CheckpointFacts,
-    StartupProvenance, VLLM_EAGER_STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
+    EagerStartup, StartupProvenance, VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES,
+    VLLM_EAGER_STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 use capyctl_config::{parse_strict, ConfigKind};
 use capyctl_domain::launch::SettingSource;
@@ -169,42 +170,62 @@ fn an_undeclared_startup_peak_is_the_placeholder_default() {
     );
 }
 
-/// ADR 0014 amendment A21 (owner decision 2026-10-09; note of 2026-10-15):
-/// the startup placeholder scales with `VLLM_EAGER_STARTUP_WEIGHTS_FACTOR`
-/// exactly when CapyCTL will actually pass `--safetensors-load-strategy
-/// eager` to vLLM, declared or defaulted (a parking deployment's undeclared
-/// default is `eager` on unified memory too), never with a declared `lazy`
-/// loader on the same (unified) host.
+/// ADR 0014 amendment A21 (owner decision 2026-10-09; note of 2026-10-15)
+/// and amendment A22 (owner decision 2026-10-18): the startup placeholder
+/// sizes vLLM's eager load, `min(weights × 3.6, weights + 32 GiB)`, exactly
+/// when CapyCTL will actually pass `--safetensors-load-strategy eager` to
+/// vLLM, declared or defaulted (a parking deployment's undeclared default is
+/// `eager` on unified memory too), never with a declared `lazy` loader on the
+/// same (unified) host. The cap is recorded beside the placeholder.
 // T14 T26
 #[test]
 fn the_startup_placeholder_follows_the_effective_loader() {
     let (mut deployment, host) = fixture();
     deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
-    let expected = 30 * GIB / 5 * 18 + VLLM_OVERHEAD_MARGIN_BYTES;
-    assert_eq!(expected, 116 * GIB);
+    // 30 GiB × 2.6 = 78 GiB is above the cap: 30 + 32 + 8 GiB.
+    let expected = 30 * GIB + VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES + VLLM_OVERHEAD_MARGIN_BYTES;
+    assert_eq!(expected, 70 * GIB);
+    let eager_cap = Some(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES);
 
     // Undeclared on a parking deployment (the fixture parks on unified
-    // memory): the defaulted `eager` takes the eager factor.
+    // memory): the defaulted `eager` takes the eager load.
     let defaulted =
         resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     assert_eq!(cold(&defaulted), expected + OVERHEAD);
+    assert_eq!(
+        defaulted.engine_config.memory().startup_eager_cap_bytes,
+        eager_cap
+    );
 
     deployment["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "eager"});
     let eager = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
     assert_eq!(cold(&eager), expected + OVERHEAD);
+    assert_eq!(
+        eager.engine_config.memory().startup_eager_cap_bytes,
+        eager_cap
+    );
     assert_eq!(
         default_startup_bytes(
             40 * GIB,
             Some(30 * GIB),
             VLLM_OVERHEAD_MARGIN_BYTES,
             Some(GRAPHS),
-            Some(VLLM_EAGER_STARTUP_WEIGHTS_FACTOR),
+            Some(EagerStartup::Capped(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES)),
         ),
         Some(expected)
     );
+    let snapshot = serde_json::to_value(&eager).unwrap();
+    assert_eq!(
+        decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+        eager
+    );
+    // A claimed cap other than the derived one is refused.
+    let mut forged = snapshot.clone();
+    forged["engine_config"]["memory"]["startup_eager_cap_bytes"] = json!(64 * GIB);
+    assert!(decode_effective_snapshot(&forged.to_string()).is_err());
 
     // Declared `lazy` on the same unified host keeps the lighter factor
-    // (amendment A8's `STARTUP_WEIGHTS_FACTOR`, 2.25).
+    // (amendment A8's `STARTUP_WEIGHTS_FACTOR`, 2.25) and records no cap.
     let mut lazy = deployment.clone();
     lazy["engine_config"]["vllm"] = json!({"safetensors_load_strategy": "lazy"});
     let lazy_effective =
@@ -213,6 +234,122 @@ fn the_startup_placeholder_follows_the_effective_loader() {
         cold(&lazy_effective),
         30 * GIB * 9 / 4 + VLLM_OVERHEAD_MARGIN_BYTES + OVERHEAD
     );
+    assert_eq!(
+        lazy_effective
+            .engine_config
+            .memory()
+            .startup_eager_cap_bytes,
+        None
+    );
+}
+
+/// ADR 0014 amendment A22 (owner decision 2026-10-18): the eager load is
+/// `weights + min(weights × 13/5, 32 GiB)`. Up to the last checkpoint whose
+/// extra fits under the cap (13215283988 bytes, about 12.3 GiB) it is
+/// amendment A21's `weights × 3.6` to the byte; one byte above, the cap
+/// holds. A 10 GiB checkpoint resolves exactly as it did under A21.
+// T14 T26
+#[test]
+fn the_eager_placeholder_keeps_3_6_below_the_cap_and_caps_above_it() {
+    let capped = Some(EagerStartup::Capped(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES));
+    let uncapped = Some(EagerStartup::Uncapped);
+    let margin = VLLM_OVERHEAD_MARGIN_BYTES;
+    let placeholder = |weights: i64, eager| {
+        default_startup_bytes(weights, Some(weights), margin, Some(GRAPHS), eager).unwrap()
+    };
+    let below = 13_215_283_988;
+    assert!(below * 13 / 5 <= VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES);
+    assert_eq!(placeholder(below, capped), placeholder(below, uncapped));
+    assert_eq!(placeholder(below, capped), below * 18 / 5 + margin);
+    let above = below + 1;
+    assert!(above * 13 / 5 > VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES);
+    assert_eq!(
+        placeholder(above, capped),
+        above + VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES + margin
+    );
+    assert!(placeholder(above, capped) < placeholder(above, uncapped));
+    assert_eq!(
+        VLLM_EAGER_STARTUP_WEIGHTS_FACTOR,
+        (18, 5),
+        "the factor below the cap is A21's"
+    );
+
+    // Through resolution: the parking fixture loads `eager` by default.
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
+    let small = resolve_effective_with_checkpoint(&deployment, &host, weights(10 * GIB)).unwrap();
+    assert_eq!(cold(&small), 10 * GIB * 18 / 5 + margin + OVERHEAD);
+    assert_eq!(cold(&small), 44 * GIB + OVERHEAD);
+}
+
+/// ADR 0014 amendment A22: every eager startup peak CapyCTL measured on GB10
+/// (vLLM 0.30.0, `startup.measured`) sits under the capped placeholder, even
+/// with the smallest request a checkpoint can have (its weights). Weights and
+/// peaks in bytes; the Super VL placeholder is about 111 GiB.
+// T14 T26
+#[test]
+fn the_capped_eager_placeholder_covers_every_measured_peak() {
+    let capped = Some(EagerStartup::Capped(VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES));
+    for (model, weights, peak, placeholder) in [
+        // Qwen3.8-27B NVFP4, KV 4 GiB, 2026-10-18.
+        (
+            "qwen3.8-27b-nvfp4",
+            23_749_332_688,
+            56_220_348_416,
+            66_699_005_648,
+        ),
+        // Qwen3-14B BF16, KV 4 GiB, 2026-10-18.
+        (
+            "qwen3-14b-bf16",
+            29_536_665_640,
+            44_531_412_992,
+            72_486_338_600,
+        ),
+        // Qwen3-30B-A3B BF16, KV 4 GiB, 2026-10-18.
+        (
+            "qwen3-30b-a3b-bf16",
+            61_066_575_648,
+            76_076_666_880,
+            104_016_248_608,
+        ),
+        // Qwen3.8-27B BF16, KV 4 GiB, 2026-10-18.
+        (
+            "qwen3.8-27b-bf16",
+            55_563_006_776,
+            68_840_255_488,
+            98_512_679_736,
+        ),
+        // Nemotron 3.5 Super VL 120B-A12B NVFP4, 2026-10-16.
+        (
+            "super-vl-nvfp4",
+            76_328_140_836,
+            101_695_578_112,
+            119_277_813_796,
+        ),
+    ] {
+        let derived = default_startup_bytes(
+            weights,
+            Some(weights),
+            VLLM_OVERHEAD_MARGIN_BYTES,
+            Some(GRAPHS),
+            capped,
+        )
+        .unwrap();
+        assert_eq!(derived, placeholder, "{model}");
+        assert!(derived >= peak, "{model}: {derived} < {peak}");
+    }
+    // Amendment A21's own evidence, Qwen3.6-35B-A3B NVFP4 (23.5 GB): a
+    // 54.2 GiB eager loading peak.
+    let weights = 23_500_000_000;
+    let derived = default_startup_bytes(
+        weights,
+        Some(weights),
+        VLLM_OVERHEAD_MARGIN_BYTES,
+        Some(GRAPHS),
+        capped,
+    )
+    .unwrap();
+    assert!(derived >= 54 * GIB + GIB / 5, "{derived}");
 }
 
 /// A revision frozen before the startup budget has no startup peak: it still
@@ -344,10 +481,11 @@ fn the_placeholder_startup_covers_the_first_starts_graphs() {
     }
     // Large weights: the load term still wins when it is larger. This parking
     // vLLM deployment loads `eager` by default (ADR 0014 amendment A21, note
-    // of 2026-10-15): 30 GiB × 3.6 + the 8 GiB margin.
+    // of 2026-10-15), capped by amendment A22: 30 GiB + 32 GiB + the 8 GiB
+    // margin.
     let (deployment, host) = speculative("vllm", true);
     let heavy = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
-    assert_eq!(cold(&heavy), 116 * GIB + OVERHEAD);
+    assert_eq!(cold(&heavy), 70 * GIB + OVERHEAD);
     // A declared startup peak is the operator's and carries no allowance.
     let (mut declared, host) = speculative("vllm", true);
     declared["engine_config"]["memory"]["startup"] = json!("45GiB");
@@ -400,5 +538,75 @@ fn a_revision_frozen_before_the_graph_allowance_keeps_its_placeholder() {
     assert_eq!(
         default_startup_bytes(40 * GIB, Some(30 * GIB), 8 * GIB, None, None),
         Some(56 * GIB)
+    );
+}
+
+/// ADR 0014 amendment A22 (owner decision 2026-10-18): a revision frozen
+/// under amendment A21 records no eager cap; it still decodes, with the
+/// uncapped `weights × 3.6` placeholder it was frozen with, as amendment A8
+/// let earlier revisions keep 1.6. Its first start's measurement replaces
+/// it, and a new revision takes the cap. A snapshot that drops the cap but
+/// keeps the capped figure is refused.
+// T14 T34
+#[test]
+fn a_revision_frozen_before_the_eager_cap_keeps_its_placeholder() {
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["memory"] = json!({"request": "40GiB", "kv_cache": "8GiB"});
+    // What the previous release wrote: the parking fixture's default `eager`
+    // at 30 GiB × 3.6 + 8 GiB, and no cap.
+    let frozen = CheckpointFacts {
+        weights_bytes: Some(30 * GIB),
+        legacy_eager_startup: true,
+        ..Default::default()
+    };
+    let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
+    assert_eq!(cold(&old), 116 * GIB + OVERHEAD);
+    let snapshot = serde_json::to_value(&old).unwrap();
+    assert!(snapshot["engine_config"]["memory"]
+        .get("startup_eager_cap_bytes")
+        .is_none());
+    assert_eq!(
+        snapshot["engine_config"]["memory"]["startup_bytes"],
+        json!(30 * GIB * 18 / 5 + VLLM_OVERHEAD_MARGIN_BYTES)
+    );
+    let decoded = decode_effective_snapshot(&snapshot.to_string()).unwrap();
+    assert_eq!(decoded, old);
+    assert_eq!(cold(&decoded), 116 * GIB + OVERHEAD);
+    assert_eq!(
+        default_startup_bytes(
+            40 * GIB,
+            Some(30 * GIB),
+            VLLM_OVERHEAD_MARGIN_BYTES,
+            Some(GRAPHS),
+            Some(EagerStartup::Uncapped),
+        ),
+        Some(116 * GIB)
+    );
+
+    // The same deployment resolved now takes the cap; dropping the recorded
+    // cap from its snapshot does not pass for a frozen revision.
+    let new = resolve_effective_with_checkpoint(&deployment, &host, weights(30 * GIB)).unwrap();
+    assert_eq!(cold(&new), 70 * GIB + OVERHEAD);
+    let mut forged = serde_json::to_value(&new).unwrap();
+    forged["engine_config"]["memory"]
+        .as_object_mut()
+        .unwrap()
+        .remove("startup_eager_cap_bytes");
+    assert!(decode_effective_snapshot(&forged.to_string()).is_err());
+
+    // Below the cap the frozen and the new placeholder are the same bytes.
+    let small = CheckpointFacts {
+        weights_bytes: Some(10 * GIB),
+        legacy_eager_startup: true,
+        ..Default::default()
+    };
+    let old_small = resolve_effective_with_checkpoint(&deployment, &host, small).unwrap();
+    let new_small =
+        resolve_effective_with_checkpoint(&deployment, &host, weights(10 * GIB)).unwrap();
+    assert_eq!(cold(&old_small), cold(&new_small));
+    let snapshot = serde_json::to_value(&old_small).unwrap();
+    assert_eq!(
+        decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+        old_small
     );
 }

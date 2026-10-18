@@ -59,6 +59,7 @@ fn settings(request: i64, kv: i64, weights: Option<i64>) -> SglangLaunchSettings
             device_total_bytes: None,
             overhead_bytes: None,
             startup_graphs_bytes: None,
+            startup_eager_cap_bytes: None,
             state_slot_bytes: None,
             state_bytes: None,
             member: None,
