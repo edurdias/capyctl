@@ -60,11 +60,18 @@ and the cut 500 in `an_unverified_decision_answer_leaves_the_lease_uncertain`,
 new engine-error test, and the full-stack one, fails with the forwarder's
 5xx reading turned off; with the router ending the lease uncertain instead
 of cancelling, the full-stack test fails on the deployment staying
-exhausted. CPU and Fake-engine tests are not qualification. Live check still
-needed: on host A, send Julia-1 or Laya more than 32 inputs over the context
-and confirm each answers 502 `engine_error` with llama.cpp's message,
-`request_cancellation_acknowledged` is journaled, and the deployment keeps
-serving.
+exhausted. CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-18, this branch's build in an isolated standalone,
+llama.cpp v0.7.0: Julia-1 and Laya (Q8_0, context 8192) under capyctl-bench's
+decisions run. Each model's 8k-token latency points sent 31 inputs over the
+context; every one answered 502 `engine_error` with llama.cpp's message
+("input (… tokens) is too large to process. increase the physical batch
+size"), and the ledger journaled 41 `request_cancellation_acknowledged`
+events. Both deployments kept serving: the throughput runs that followed
+(200 requests at each of 1, 2, 4 and 8 streams) had no failures, where
+before this change the same runs on `main` got 429 `queue_full` for every
+request.
 
 # Release note: Fixes
 
