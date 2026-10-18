@@ -80,6 +80,21 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
+/// How the request ledger's commits reach the disk (SPEC §10, owner decision
+/// 2026-10-18). Every other write is always `synchronous=FULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLedgerSync {
+    /// Each lease grant and close is flushed to disk before it is reported
+    /// written. Required whenever an engine can outlive this machine's OS.
+    Full,
+    /// Lease grants and closes are committed with `synchronous=NORMAL`: a
+    /// process crash loses none of them, but an OS crash or power loss can
+    /// lose the last ones. Only for a store whose every engine runs on this
+    /// machine (standalone), so whatever loses a lease write also ends the
+    /// engine work it accounts for, and no request runs unaccounted.
+    LocalEnginesOnly,
+}
+
 /// File-backed or in-memory (for tests) durable store.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -87,6 +102,7 @@ pub struct Store {
     // caller installs one with `set_secrets_key`; engine-key reads and writes fail
     // closed (`StoreError::Conflict`) until then.
     pub(crate) secrets: Option<secrets::SecretsKey>,
+    pub(crate) request_ledger_sync: RequestLedgerSync,
 }
 
 impl Store {
@@ -107,6 +123,7 @@ impl Store {
         Ok(Store {
             conn,
             secrets: None,
+            request_ledger_sync: RequestLedgerSync::Full,
         })
     }
 
@@ -118,7 +135,15 @@ impl Store {
         Ok(Store {
             conn,
             secrets: None,
+            request_ledger_sync: RequestLedgerSync::Full,
         })
+    }
+
+    /// SPEC §10 (owner decision 2026-10-18): relax the request ledger's
+    /// commits on a store whose engines all run on this machine. A store opens
+    /// with [`RequestLedgerSync::Full`].
+    pub fn set_request_ledger_sync(&mut self, sync: RequestLedgerSync) {
+        self.request_ledger_sync = sync;
     }
 }
 
@@ -133,6 +158,9 @@ const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 fn set_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // SPEC §6.4, §10: every commit is on disk before it is reported written,
+    // stated here rather than left to the SQLite build's WAL default.
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     Ok(())

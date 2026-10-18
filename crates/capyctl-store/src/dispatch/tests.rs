@@ -330,3 +330,36 @@ fn a_lease_batch_from_a_stale_session_is_refused_whole() {
     ));
     assert!(store.pending_dispatches(&deployment).unwrap().is_empty());
 }
+
+// T17 (owner decision 2026-10-18): a standalone store relaxes only its lease
+// batches. Whether a batch commits or is refused whole, the connection is back
+// to synchronous=FULL for every other write, such as a deployment's acceptance.
+#[test]
+fn a_local_lease_batch_leaves_other_writes_fully_synchronous() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("store.sqlite3")).unwrap();
+    store.set_request_ledger_sync(crate::RequestLedgerSync::LocalEnginesOnly);
+    let old = store.begin_coordinator_session().unwrap();
+    let deployment = ready_deployment(&store, "a");
+    let grant = || LeaseWrite::Grant {
+        deployment_id: deployment.clone(),
+        max_per_deployment: 2,
+        max_total: 8,
+    };
+    let synchronous = |store: &Store| -> i64 {
+        store
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(synchronous(&store), 2);
+    let granted = store.apply_request_lease_batch(&old, &[grant()]).unwrap();
+    assert!(matches!(granted[0], Ok(LeaseWriteOutcome::Granted(_))));
+    assert_eq!(synchronous(&store), 2);
+    let _current = store.begin_coordinator_session().unwrap();
+    assert!(matches!(
+        store.apply_request_lease_batch(&old, &[grant()]),
+        Err(DispatchError::StaleSession)
+    ));
+    assert_eq!(synchronous(&store), 2);
+}
