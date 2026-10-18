@@ -331,6 +331,14 @@ pub fn stream_planned_timed(
                 let message = message.clone();
                 break (result, Some(("engine_rejected".to_owned(), message)));
             }
+            // SPEC §10 (amended 2026-10-17, found live): the engine's error
+            // answer before the stream started, relayed in-band; not
+            // retryable, and never offered to another instance. Its lease is
+            // cancelling.
+            if let Ok(Err(AdapterError::EngineError { message, .. })) = &result {
+                let message = message.clone();
+                break (result, Some(("engine_error".to_owned(), message)));
+            }
             if let Ok(Err(error)) = &result {
                 if crate::chat::refused_before_sending(error) {
                     let (_, Json(answer)) = crate::chat::adapter_refusal(error);
@@ -365,11 +373,15 @@ pub fn stream_planned_timed(
             }
         };
         if let Some((code, reason)) = refusal {
-            // Nothing reached any engine; say so in-band, retryably.
-            guard.release();
+            // Nothing reached any engine, or the engine answered completely;
+            // say so in-band. An engine's error answer leaves its lease
+            // cancelling, so the slot is released only as for an uncertain end.
+            if code != "engine_error" || durable {
+                guard.release();
+            }
             let retryable = !matches!(
                 code.as_str(),
-                "invalid_request" | "unsupported" | "engine_rejected"
+                "invalid_request" | "unsupported" | "engine_rejected" | "engine_error"
             );
             let refusal = serde_json::json!({"error": {
                 "code": code, "message": reason, "retryable": retryable}});

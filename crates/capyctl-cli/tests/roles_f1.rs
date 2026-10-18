@@ -333,3 +333,167 @@ async fn standalone_reports_its_engine_latency() {
         "{instance}"
     );
 }
+
+/// llama.cpp v0.7.0's answer to an input over its batch size (found live
+/// 2026-10-17 on host A, decision deployments at context 8192).
+const LLAMA_TOO_LARGE: &str = r#"{"error":{"code":500,"message":"input (8195 tokens) is too large to process. increase the physical batch size","type":"server_error"}}"#;
+
+/// A standalone role with one Ready deployment named `name`, an engine at its
+/// recorded endpoint that answers every chat completion with a 500 and
+/// [`LLAMA_TOO_LARGE`] (only its first half, then a failed transfer, when
+/// `cut`), and the router served on loopback. Returns the role, the router's
+/// address and the count of requests that reached the engine.
+async fn erring_standalone(
+    state_dir: &std::path::Path,
+    name: &str,
+    cut: bool,
+) -> (
+    capyctl_cli::roles::App,
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let app = boot(state_dir).await;
+    let id = app
+        .deploy(
+            name,
+            ModelSource::Local {
+                path: format!("/models/{name}"),
+            },
+        )
+        .unwrap();
+    let op = app
+        .controller
+        .request_transition(&id, capyctl_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
+    app.controller.wait_terminal(&op).await.unwrap();
+    let runtime = app.controller.runtime_endpoint(&id).unwrap().unwrap();
+    let url: reqwest::Url = runtime.endpoint.parse().unwrap();
+    let address = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let chat = axum::routing::post(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let body = if cut {
+                axum::body::Body::from_stream(tokio_stream::iter([
+                    Ok(axum::body::Bytes::from_static(
+                        &LLAMA_TOO_LARGE.as_bytes()[..LLAMA_TOO_LARGE.len() / 2],
+                    )),
+                    Err(std::io::Error::other("the engine went away")),
+                ]))
+            } else {
+                axum::body::Body::from(LLAMA_TOO_LARGE)
+            };
+            axum::response::Response::builder()
+                .status(500)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        }
+    });
+    let engine = tokio::net::TcpListener::bind(&address)
+        .await
+        .unwrap_or_else(|error| panic!("the recorded endpoint {address} is bindable: {error}"));
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            engine,
+            axum::Router::new().route("/v1/chat/completions", chat),
+        )
+        .await;
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let router = listener.local_addr().unwrap();
+    let served = app.router();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    (app, router, hits)
+}
+
+/// One chat completion through the router: its status and JSON answer.
+async fn chat_once(
+    app: &capyctl_cli::roles::App,
+    router: std::net::SocketAddr,
+    name: &str,
+) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{router}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {}", app.api_key()))
+        .json(&serde_json::json!({"model": name, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+// T17 T19 (SPEC §10, amended 2026-10-17; found live 2026-10-17 on host A):
+// an engine answering every request with a 500 and its complete JSON error
+// used to leave each lease uncertain for the life of the session, so after
+// the outstanding-request bound the deployment refused everything with 429
+// `queue_full` until it was deleted. Each such answer is now relayed as a
+// 502 `engine_error` with the engine's message and its lease is cancelling,
+// closed by the real coordinator once the engine reads quiescent, so three
+// times the bound in answers still reach the engine. Fake engine; not
+// qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_error_answers_never_exhaust_the_deployment() {
+    let dir = safe_state_dir();
+    let (app, router, hits) = erring_standalone(dir.path(), "erring-m", false).await;
+    let bound = capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut answered = 0;
+    while answered < 3 * bound {
+        let (status, body) = chat_once(&app, router, "erring-m").await;
+        if status == 429 {
+            // The bound is reached until the engine's quiescence settles the
+            // cancelling leases; it must not stay reached.
+            assert_eq!(body["code"], "queue_full", "{body}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deployment stayed exhausted after {answered} engine errors"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(body["code"], "engine_error", "{body}");
+        assert_eq!(body["retryable"], false, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("input (8195 tokens) is too large to process"),
+            "{body}"
+        );
+        answered += 1;
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        answered,
+        "never replayed"
+    );
+}
+
+// T17 T19 (SPEC §10, amended 2026-10-17): a 500 whose body is cut short is no
+// answer, so its lease stays uncertain: the engine's quiescence does not
+// settle it, and past the bound the deployment refuses with 429 `queue_full`
+// rather than release a reservation without evidence. Fake engine; not
+// qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_engine_error_answer_stays_uncertain() {
+    let dir = safe_state_dir();
+    let (app, router, hits) = erring_standalone(dir.path(), "cut-m", true).await;
+    let bound = capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize;
+    for _ in 0..bound {
+        let (status, body) = chat_once(&app, router, "cut-m").await;
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(body["code"], "engine_error", "{body}");
+        assert_eq!(body["message"], "backend completion unverified", "{body}");
+    }
+    // Several quiescence questions later, every lease is still charged.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let (status, body) = chat_once(&app, router, "cut-m").await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["code"], "queue_full", "{body}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), bound);
+}

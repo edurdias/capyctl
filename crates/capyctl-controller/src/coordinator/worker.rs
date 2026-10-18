@@ -3673,11 +3673,12 @@ async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError
     Ok(changed)
 }
 
-/// The receipt a local engine's quiescence leaves on a cancelling lease.
-const LOCAL_CANCELLATION_RECEIPT: &str =
-    "the engine's own counters read no running and no waiting request after the client hung up";
+/// The receipt a local engine's quiescence leaves on a cancelling lease: a
+/// client hang-up, a cut, or (SPEC §10, amended 2026-10-17) an engine's error
+/// answer.
+const LOCAL_CANCELLATION_RECEIPT: &str = "the engine's own counters read no running and no waiting request after the request was cancelled or answered with an error";
 /// The receipt a remote host's load report leaves on a cancelling lease.
-const REMOTE_CANCELLATION_RECEIPT: &str = "the host reported the launch's engine with 0 running and 0 waiting and 0 in flight at its ingress after the client hung up";
+const REMOTE_CANCELLATION_RECEIPT: &str = "the host reported the launch's engine with 0 running and 0 waiting and 0 in flight at its ingress after the request was cancelled or answered with an error";
 /// One quiescence question may take no longer than this.
 const QUIESCENCE_QUESTION_BOUND: Duration = Duration::from_secs(3);
 

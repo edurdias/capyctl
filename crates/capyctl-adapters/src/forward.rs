@@ -694,8 +694,9 @@ impl ChatHttp {
     /// Send one request to `url` and screen the answer's status: a connection
     /// never established, or a role's `shutting_down` refusal, carried nothing
     /// (`NotAccepted`); an engine's complete invalid-request answer is
-    /// `Rejected`. Any other transport error is `unverified()`. The caller
-    /// judges every other response.
+    /// `Rejected`, and its complete error answer is `EngineError`. Any other
+    /// transport error is `unverified()`. The caller judges every other
+    /// response.
     async fn post(
         &self,
         url: &reqwest::Url,
@@ -722,8 +723,15 @@ impl ChatHttp {
         }
         // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
         // engine's complete reply, relayed as such rather than as uncertainty.
-        if rejection_status(response.status().as_u16()) {
+        let status = response.status().as_u16();
+        if rejection_status(status) {
             return Err(rejected_by_engine(response).await);
+        }
+        // SPEC §10 (amended 2026-10-17, found live): an engine's complete
+        // error answer is relayed with its message; the request is cancelling
+        // rather than uncertain, so the engine's quiescence settles it.
+        if engine_error_status(status) {
+            return Err(failed_by_engine(response, unverified).await);
         }
         Ok(response)
     }
@@ -877,15 +885,32 @@ pub fn opens_reply_only(chunk: &str) -> bool {
 /// request as invalid before running it (a prompt over its context, an argument
 /// or tool choice it cannot serve, a body too large). With a JSON body read in
 /// full they are the engine's complete answer, so nothing runs on the request's
-/// behalf. Every other error status stays uncertain: a 5xx, a 408 or a 499 can
-/// follow accepted work, and a 401/403 is not the engine judging the request.
+/// behalf. A 5xx error answer is [`engine_error_status`]; every other error
+/// status stays uncertain: a 408 or a 499 can follow accepted work, and a
+/// 401/403 is not the engine judging the request.
 pub fn rejection_status(status: u16) -> bool {
     matches!(status, 400 | 413 | 422)
+}
+
+/// SPEC §10 (amended 2026-10-17, found live): the statuses of an engine's
+/// error answer, every 5xx but 503. With a JSON object body read in full
+/// (llama.cpp v0.7.0 answers an input over its batch size with a 500 and its
+/// complete JSON error) the engine has answered, but the answer does not
+/// prove it stopped, so the request is cancelling: charged until the engine
+/// reports quiescence. A 503 keeps its own reading: a role's `shutting_down`
+/// refusal is not accepted, any other 503 stays uncertain.
+pub fn engine_error_status(status: u16) -> bool {
+    (500..600).contains(&status) && status != 503
 }
 
 /// The largest rejection body read, and the longest message kept from it.
 pub const REJECTION_BODY_LIMIT: usize = 16 * 1024;
 const REJECTION_MESSAGE_LIMIT: usize = 512;
+
+/// The code a host ingress answers its own failures with: a 502 when the
+/// engine could not be reached or its answer could not be relayed whole. It
+/// is not the engine's answer, so it stays uncertain.
+pub const INGRESS_FAILURE_CODE: &str = "inference_unavailable";
 
 /// The message of an engine's invalid-request answer: vLLM's `error.message`,
 /// SGLang's top-level `message`, a relayed `engine_rejected` body, or the
@@ -894,8 +919,42 @@ const REJECTION_MESSAGE_LIMIT: usize = 512;
 /// to a bounded length on a character boundary. `None` when the body is not a
 /// JSON object, which leaves the answer unproven.
 pub fn rejection_message(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let object = value.as_object()?;
+    let object = json_object(body)?;
+    Some(answer_message(
+        &object,
+        "the engine rejected the request as invalid",
+    ))
+}
+
+/// SPEC §10 (amended 2026-10-17): the message of an engine's error answer,
+/// read and bounded as [`rejection_message`] reads a rejection's (llama.cpp's
+/// `error.message`, a relayed `engine_error` body). `None` when the body is
+/// not a JSON object, or is a host ingress's own failure
+/// ([`INGRESS_FAILURE_CODE`]), which leaves the answer unproven.
+pub fn engine_error_message(body: &[u8]) -> Option<String> {
+    let object = json_object(body)?;
+    if object
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        == Some(INGRESS_FAILURE_CODE)
+    {
+        return None;
+    }
+    Some(answer_message(&object, "the engine answered with an error"))
+}
+
+/// `body` parsed as one JSON object, or `None`.
+fn json_object(body: &[u8]) -> Option<serde_json::Map<String, Value>> {
+    match serde_json::from_slice(body).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
+    }
+}
+
+/// The engine's message in its answer `object`, or `fallback` when it names
+/// none, cut to [`REJECTION_MESSAGE_LIMIT`] bytes on a character boundary.
+fn answer_message(object: &serde_json::Map<String, Value>, fallback: &str) -> String {
     let message = object
         .get("error")
         .and_then(|error| error.get("message"))
@@ -907,12 +966,12 @@ pub fn rejection_message(body: &[u8]) -> Option<String> {
                 .as_str()
                 .or_else(|| detail.get(0)?.get("msg")?.as_str())
         })
-        .unwrap_or("the engine rejected the request as invalid");
+        .unwrap_or(fallback);
     let mut end = message.len().min(REJECTION_MESSAGE_LIMIT);
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    Some(message[..end].to_owned())
+    message[..end].to_owned()
 }
 
 /// A response body read whole, or `None` when it is longer than `limit` (by
@@ -946,18 +1005,48 @@ fn content_type_is(response: &reqwest::Response, media: &str) -> bool {
         .is_some_and(|h| h.split(';').next().unwrap_or("").trim() == media)
 }
 
+/// An engine's answer body read whole, bounded in size
+/// ([`REJECTION_BODY_LIMIT`]) and time, or `None` when it is not.
+async fn read_answer(response: reqwest::Response) -> Option<Vec<u8>> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        read_whole(response, REJECTION_BODY_LIMIT),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Read an invalid-request answer in full (bounded in size and time). Only a
 /// complete JSON body is evidence; anything else stays uncertain.
 async fn rejected_by_engine(response: reqwest::Response) -> AdapterError {
     let status = response.status().as_u16();
-    let read = tokio::time::timeout(
-        Duration::from_secs(5),
-        read_whole(response, REJECTION_BODY_LIMIT),
-    )
-    .await;
-    match read.ok().flatten().as_deref().and_then(rejection_message) {
+    match read_answer(response)
+        .await
+        .as_deref()
+        .and_then(rejection_message)
+    {
         Some(message) => AdapterError::Rejected { status, message },
         None => uncertain(),
+    }
+}
+
+/// SPEC §10 (amended 2026-10-17): read an engine's error answer in full,
+/// within the same bounds as a rejection. Only a complete JSON object is the
+/// engine's answer; a truncated, oversized, slow or non-JSON body stays
+/// `unverified()`.
+async fn failed_by_engine(
+    response: reqwest::Response,
+    unverified: fn() -> AdapterError,
+) -> AdapterError {
+    let status = response.status().as_u16();
+    match read_answer(response)
+        .await
+        .as_deref()
+        .and_then(engine_error_message)
+    {
+        Some(message) => AdapterError::EngineError { status, message },
+        None => unverified(),
     }
 }
 
@@ -1128,16 +1217,25 @@ impl<'a> Parser<'a> {
         // its KV pool after the stream opened and answers with one error event.
         // Before any chunk, that event is the engine's complete invalid-request
         // answer, as a 400 body would be; anything later stays uncertain.
+        // SPEC §10 (amended 2026-10-17): one with a 5xx code but 503 is its
+        // complete error answer, as a 500 body would be.
         if self.id.is_none() {
             if let Some(status) = chunk["error"]["code"]
                 .as_u64()
                 .and_then(|code| u16::try_from(code).ok())
-                .filter(|status| rejection_status(*status))
             {
-                return Err(match rejection_message(data.as_bytes()) {
-                    Some(message) => AdapterError::Rejected { status, message },
-                    None => uncertain(),
-                });
+                if rejection_status(status) {
+                    return Err(match rejection_message(data.as_bytes()) {
+                        Some(message) => AdapterError::Rejected { status, message },
+                        None => uncertain(),
+                    });
+                }
+                if engine_error_status(status) {
+                    return Err(match engine_error_message(data.as_bytes()) {
+                        Some(message) => AdapterError::EngineError { status, message },
+                        None => uncertain(),
+                    });
+                }
             }
         }
         if chunk["model"].as_str() != Some(self.backend)
@@ -1462,7 +1560,8 @@ mod tests {
 
     // T17 T38: a host ingress that is shutting down refuses before forwarding;
     // that exact answer is evidence of non-acceptance. Any other 503 stays
-    // uncertain, because an engine can answer 503 after accepting work.
+    // uncertain, because an engine can answer 503 after accepting work, and
+    // the same body with a 500 is an engine's error answer, never a refusal.
     #[tokio::test]
     async fn only_a_shutting_down_refusal_proves_the_engine_never_saw_the_request() {
         let request = serde_json::json!({"model":"m","messages":[]});
@@ -1494,7 +1593,7 @@ mod tests {
             crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None, true);
         assert!(matches!(
             forward.forward_chat(&request).await,
-            Err(AdapterError::Uncertain(_))
+            Err(AdapterError::EngineError { status: 500, .. })
         ));
     }
 
@@ -1504,7 +1603,8 @@ mod tests {
     // evidence and carries the engine's own message, from vLLM's
     // `error.message`, SGLang's top-level `message`, or the host ingress's
     // relayed `engine_rejected` body. A rejection that cannot be read as
-    // JSON, and every other status, stays uncertain.
+    // JSON, and every other status but an engine error answer, stays
+    // uncertain.
     #[tokio::test]
     async fn an_invalid_request_rejection_is_terminal_and_keeps_the_engine_message() {
         let request = serde_json::json!({"model":"m","messages":[]});
@@ -1558,7 +1658,7 @@ mod tests {
         for (status, body) in [
             (400, serde_json::json!("not an object")),
             (401, serde_json::json!({"error":{"message":"Unauthorized"}})),
-            (500, serde_json::json!({"error":{"message":"boom"}})),
+            (500, serde_json::json!("not an object")),
         ] {
             let forward = crate::forward::engine_forwarder(
                 answering(status, body).await,
@@ -1573,6 +1673,124 @@ mod tests {
                 ),
                 "status {status}"
             );
+        }
+    }
+
+    /// How [`replying`] answers every path.
+    enum Raw {
+        /// The whole body.
+        Whole(Vec<u8>),
+        /// These bytes of a body, then a failed transfer.
+        Truncated(Vec<u8>),
+    }
+
+    /// An engine answering `status` with a JSON body on every path.
+    async fn replying(status: u16, raw: Raw) -> reqwest::Url {
+        let status = axum::http::StatusCode::from_u16(status).unwrap();
+        let raw = std::sync::Arc::new(raw);
+        let router = axum::Router::new().fallback(move || {
+            let raw = raw.clone();
+            async move {
+                let body = match &*raw {
+                    Raw::Whole(bytes) => axum::body::Body::from(bytes.clone()),
+                    Raw::Truncated(bytes) => {
+                        axum::body::Body::from_stream(futures::stream::iter([
+                            Ok(axum::body::Bytes::from(bytes.clone())),
+                            Err(std::io::Error::other("the engine went away")),
+                        ]))
+                    }
+                };
+                axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}").parse().unwrap()
+    }
+
+    // T17 T19 T43 (SPEC §10, amended 2026-10-17, found live): llama.cpp v0.7.0
+    // answers an input over its batch size with a 500 and its complete JSON
+    // error. Every 5xx but 503 whose body is read whole as a JSON object is
+    // the engine's error answer on the chat, stream and decision paths alike,
+    // carrying the engine's bounded message. A truncated, oversized or
+    // non-JSON body stays uncertain.
+    #[tokio::test]
+    async fn an_engine_error_answer_carries_the_engine_message() {
+        use super::{engine_forwarder, REJECTION_BODY_LIMIT};
+        let llama = br#"{"error":{"code":500,"message":"input (8195 tokens) is too large to process. increase the physical batch size","type":"server_error"}}"#;
+        let chat = json!({"model":"p","messages":[]});
+        let decision = json!({"model":"p","state":"s",
+            "questions":{"q":{"type":"noul","instructions":"x"}}});
+        for status in [500, 502, 504] {
+            let forward = engine_forwarder(
+                replying(status, Raw::Whole(llama.to_vec())).await,
+                "m".into(),
+                None,
+                true,
+            );
+            let mut relayed = Vec::new();
+            for result in [
+                forward.forward_chat(&chat).await.map(|_| ()),
+                forward
+                    .forward_chat_stream(&chat, &mut |chunk| relayed.push(chunk))
+                    .await
+                    .map(|_| ()),
+                forward.forward_decision(&decision).await.map(|_| ()),
+            ] {
+                match result {
+                    Err(AdapterError::EngineError {
+                        status: got,
+                        message,
+                    }) => {
+                        assert_eq!(got, status);
+                        assert!(message.starts_with("input (8195 tokens)"), "{message}");
+                    }
+                    other => panic!("status {status}: {other:?}"),
+                }
+            }
+            assert!(relayed.is_empty(), "{relayed:?}");
+        }
+        let long = json!({"error":{"message":"é".repeat(4000)}}).to_string();
+        let forward = engine_forwarder(
+            replying(500, Raw::Whole(long.into_bytes())).await,
+            "m".into(),
+            None,
+            true,
+        );
+        match forward.forward_chat(&chat).await {
+            Err(AdapterError::EngineError { message, .. }) => {
+                assert!(message.len() <= 512, "{}", message.len())
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        let oversized = json!({"error":{"message":"x".repeat(REJECTION_BODY_LIMIT)}}).to_string();
+        // A host ingress's own failure is not the engine's answer.
+        let ingress = json!({"error":{"code":super::INGRESS_FAILURE_CODE,
+            "message":"Inference request is not authorized or could not complete"}});
+        for (status, raw) in [
+            (500, Raw::Truncated(llama[..llama.len() / 2].to_vec())),
+            (500, Raw::Whole(llama[..llama.len() / 2].to_vec())),
+            (500, Raw::Whole(oversized.into_bytes())),
+            (500, Raw::Whole(b"[\"not an object\"]".to_vec())),
+            (502, Raw::Whole(ingress.to_string().into_bytes())),
+            // A 503 keeps its own reading: not a shutting-down refusal.
+            (503, Raw::Whole(llama.to_vec())),
+        ] {
+            let forward = engine_forwarder(replying(status, raw).await, "m".into(), None, true);
+            for result in [
+                forward.forward_chat(&chat).await.map(|_| ()),
+                forward.forward_decision(&decision).await.map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(AdapterError::Uncertain(_))),
+                    "{status}: {result:?}"
+                );
+            }
         }
     }
 
@@ -1991,8 +2209,10 @@ mod tests {
     /// KV pool after the stream opened and answers with one error event, then
     /// `[DONE]`. Before any chunk that event is the engine's complete
     /// invalid-request answer, so it is relayed as a rejection (a 400, or an
-    /// in-band `engine_rejected`), not as an unverified completion. An error
-    /// event after output, or with any other code, stays uncertain.
+    /// in-band `engine_rejected`), not as an unverified completion. SPEC §10
+    /// (amended 2026-10-17): one with a 5xx code but 503 is the engine's
+    /// complete error answer. An error event after output, or with any other
+    /// code, stays uncertain.
     // T19
     #[tokio::test]
     async fn an_error_event_before_any_output_is_the_engine_rejection() {
@@ -2034,8 +2254,8 @@ mod tests {
                 "data: [DONE]\n\n".to_owned(),
             ]
             .concat(),
-            // A server error may follow accepted work.
-            [error(500), "data: [DONE]\n\n".to_owned()].concat(),
+            // A 503 keeps its own reading; in-band it proves nothing.
+            [error(503), "data: [DONE]\n\n".to_owned()].concat(),
         ] {
             let (url, _) = recording(sse).await;
             let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
@@ -2046,6 +2266,19 @@ mod tests {
                 result.map(|_| ())
             );
         }
+        let sse = [error(500), "data: [DONE]\n\n".to_owned()].concat();
+        let (url, _) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let mut relayed = Vec::new();
+        let streamed = forward
+            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .await;
+        assert!(
+            matches!(streamed, Err(AdapterError::EngineError { status: 500, .. })),
+            "{:?}",
+            streamed.map(|_| ())
+        );
+        assert!(relayed.is_empty(), "{relayed:?}");
     }
 
     /// SPEC §10, T19: a malformed `tool_calls` delta is not relayed as success.

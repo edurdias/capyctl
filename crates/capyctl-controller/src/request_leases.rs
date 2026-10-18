@@ -91,7 +91,8 @@ pub enum LeaseEnd {
     Uncertain,
     /// SPEC §10 (amended 2026-10-01): the client hung up and the engine
     /// connection was closed; the lease stays charged until the engine
-    /// reports quiescence.
+    /// reports quiescence. Amended 2026-10-17 (found live): the same for an
+    /// engine's complete error answer, which does not prove it stopped.
     Cancelling,
 }
 

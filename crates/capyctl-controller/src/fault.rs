@@ -143,6 +143,9 @@ impl From<AdapterError> for LifecycleFault {
             AdapterError::NotAccepted(_) => Self::Unavailable(text),
             // The engine answered the request as invalid: deterministic.
             AdapterError::Rejected { .. } => Self::Blocked(text),
+            // SPEC §10 (amended 2026-10-17): the engine answered with an error,
+            // which does not prove it stopped; the work stays to be reconciled.
+            AdapterError::EngineError { .. } => Self::Uncertain(text),
             // A request this engine cannot isolate: deterministic, never sent.
             AdapterError::CacheSaltUnsupported => Self::Blocked(text),
         }

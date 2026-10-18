@@ -909,6 +909,51 @@ async fn an_unverified_failure_keeps_the_lease_charged() {
     .expect("the in-memory slots are released");
 }
 
+// T17 T19 (SPEC §10, amended 2026-10-17, found live): an engine's complete
+// error answer (llama.cpp v0.7.0's 500 for an input over its batch size) is
+// relayed as a 502 `engine_error` with the engine's message, not retryable,
+// collected and streamed alike, and never sent to another instance. The
+// lease is cancelling, not uncertain, so the engine's quiescence settles it.
+#[tokio::test]
+async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
+    let error = serde_json::json!({"error":{"code":500,
+        "message":"input (8195 tokens) is too large to process. increase the physical batch size",
+        "type":"server_error"}});
+    let (endpoint, hits) = scripted_engine(500, "application/json", error.to_string()).await;
+    let (authority, deps) = stub_router(&endpoint);
+    let router = capyctl_router::serve_router(deps.clone());
+    let bound = deps.limits.max_requests_per_deployment;
+    for _ in 0..bound + 2 {
+        let (status, body) = chat_once(&router, "public-alias").await;
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(body["code"], "engine_error");
+        assert_eq!(body["retryable"], false);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("too large to process"),
+            "{body}"
+        );
+    }
+    let (status, text) = chat_stream(&router, "public-alias").await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("engine_error") && text.contains("too large to process"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"retryable\":false") && !text.contains("[DONE]"),
+        "{text}"
+    );
+    assert_eq!(
+        ends(&authority),
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling); bound + 3]
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), bound + 3);
+    assert_eq!(deps.inflight.current("dep-1"), 0);
+}
+
 // T18: when the ledger refuses because the gate closed (a host draining, a
 // readiness re-proof), nothing reaches the engine and the client gets a
 // retryable 503, not a 500.
