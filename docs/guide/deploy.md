@@ -91,9 +91,23 @@ name: decider
 engine: llamacpp
 model: Clef-Flash-GGUF
 api: decisions
+resources: {gpu: 16GiB, ram: 2GiB}
 engine_config:
-  context_length: 8192
+  context_length: 16384
+  llamacpp: {gguf_file: Clef-Flash-Q8_0.gguf}
+  accept_extra_args: true
+  extra_args: [--batch-size, "16384", --ubatch-size, "16384"]
 ```
+
+llama.cpp reads a decision request's whole input in one batch, so set both
+batch sizes to the context. With llama.cpp's defaults (2,048 and 512 tokens) a
+longer input is refused with `502 engine_error` and llama.cpp's message,
+"increase the physical batch size". The batch costs memory: state it in
+`resources`, as above, from the peak CapyCTL measures
+(`capyctl status deployment decider --json`, `startup.measured`).
+[CapyCTL's recipes](https://github.com/edurdias/capyctl-recipes) have measured
+files for Clef-Flash, Clef, Kev-4B and Julia-1 on llama.cpp and Clef-Flash and
+Clef on SGLang, and a comparison of six decision models on one GB10.
 
 `api` is `chat` when you leave it out. It is part of the deployment's
 revision: the same weights served as `chat` and as `decisions` are two
