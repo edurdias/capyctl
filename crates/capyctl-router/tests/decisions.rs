@@ -546,24 +546,22 @@ async fn an_engine_rejection_is_relayed_and_closes_the_lease() {
 
 // T43 T17 (ADR 0030 §2, SPEC §10): an answer that is not a whole, unambiguous
 // JSON object with typed answers proves nothing about what the engine ran,
-// so the lease stays charged as uncertain and nothing is replayed.
+// so the lease stays charged as uncertain and nothing is replayed. An engine
+// error answer whose body is cut short is no answer either.
 #[tokio::test]
 async fn an_unverified_decision_answer_leaves_the_lease_uncertain() {
     let truncated = answer().to_string();
     let truncated = truncated[..truncated.len() / 2].to_owned();
     let duplicated =
         r#"{"model":"served-clef","answers":{"q":{"type":"noul","noul":0.5}},"answers":{}}"#;
+    let cut_error = LLAMA_TOO_LARGE[..LLAMA_TOO_LARGE.len() / 2].to_owned();
     for reply in [
         Reply::Answer(200, "application/json", truncated),
         Reply::Answer(200, "application/json", r#"{"model":"served-clef"}"#.into()),
         Reply::Answer(200, "application/json", r#"{"answers":{"q":0.5}}"#.into()),
         Reply::Answer(200, "application/json", duplicated.into()),
         Reply::Answer(200, "text/plain", answer().to_string()),
-        Reply::Answer(
-            500,
-            "application/json",
-            r#"{"error":{"message":"boom"}}"#.into(),
-        ),
+        Reply::Answer(500, "application/json", cut_error),
         Reply::Broken,
     ] {
         let (endpoint, seen) = engine(reply).await;
@@ -581,6 +579,39 @@ async fn an_unverified_decision_answer_leaves_the_lease_uncertain() {
         .await
         .expect("the in-memory slot is released; the durable lease keeps the charge");
     }
+}
+
+/// llama.cpp v0.7.0's answer to a decision input over its batch size
+/// (observed live 2026-10-17 on host A).
+const LLAMA_TOO_LARGE: &str = r#"{"error":{"code":500,"message":"input (8195 tokens) is too large to process. increase the physical batch size","type":"server_error"}}"#;
+
+// T43 T17 (SPEC §10, amended 2026-10-17, found live): an engine's complete
+// error answer is relayed as a 502 `engine_error` with the engine's message,
+// not retryable and never replayed; its lease is cancelling, charged until
+// the engine reports quiescence, and the in-memory slot is released.
+#[tokio::test]
+async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
+    let (endpoint, seen) = engine(Reply::Answer(
+        500,
+        "application/json",
+        LLAMA_TOO_LARGE.into(),
+    ))
+    .await;
+    let (authority, deps, router) = stack(DeploymentApi::Decisions, &endpoint);
+    let (status, answer) = decide(&router, &decision_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
+    assert_eq!(answer["code"], "engine_error");
+    assert_eq!(answer["retryable"], false);
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("input (8195 tokens) is too large to process"),
+        "{answer}"
+    );
+    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Cancelling)]);
+    assert_eq!(seen.lock().unwrap().len(), 1, "never replayed");
+    assert_eq!(deps.inflight.current(DEPLOYMENT), 0);
 }
 
 // T43 T19 (ADR 0030 §2, SPEC §10): a decision has no first-token event, so its

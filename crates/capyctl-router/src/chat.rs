@@ -412,6 +412,17 @@ pub async fn dispatch_timed(
                     guard.release();
                     return Err(Refused::Before(engine_rejection(status, &message)));
                 }
+                // SPEC §10 (amended 2026-10-17, found live): the engine answered
+                // with an error. The request reached an engine, so it is not
+                // offered to another instance. Its lease is cancelling: the
+                // ledger keeps the charge until the engine reports quiescence,
+                // so the in-memory slot is released as for an uncertain end.
+                Err(AdapterError::EngineError { message, .. }) => {
+                    if durable {
+                        guard.release();
+                    }
+                    return Err(Refused::Engine(engine_failure(&message)));
+                }
                 // SPEC §10, T19: refused deterministically before sending;
                 // another instance would refuse it the same way.
                 Err(error) if refused_before_sending(&error) => {
@@ -438,7 +449,8 @@ pub async fn dispatch_timed(
         // T17 T38: every offer was refused before forwarding (a host shutting
         // down, a refused connection, a gate that closed). Nothing reached an
         // engine, so this is a retryable 503 with each lease already closed.
-        Ok(Err(Refused::Before(refusal))) => Err(refusal),
+        // An engine's error answer is relayed as it is.
+        Ok(Err(Refused::Before(answer) | Refused::Engine(answer))) => Err(answer),
         Ok(Err(Refused::Uncertain)) | Err(_) => {
             Err(err("engine_error", "backend completion unverified"))
         }
@@ -451,6 +463,9 @@ enum Refused {
     Before((StatusCode, Json<serde_json::Value>)),
     /// The engine may have accepted it.
     Uncertain,
+    /// SPEC §10 (amended 2026-10-17): the engine answered with an error, with
+    /// the answer to give; its lease is cancelling.
+    Engine((StatusCode, Json<serde_json::Value>)),
 }
 
 /// SPEC §10: the client answer for an engine's invalid-request rejection: the
@@ -466,6 +481,16 @@ pub(crate) fn engine_rejection(
     )
 }
 
+/// SPEC §10 (amended 2026-10-17, found live): the client answer for an
+/// engine's error answer: 502 `engine_error` with the engine's bounded
+/// message, not retryable, since the request reached an engine.
+pub(crate) fn engine_failure(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({ "code": "engine_error", "message": message, "retryable": false })),
+    )
+}
+
 /// The router's error answer, for the instance planner.
 pub(crate) fn refusal(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     err(code, message)
@@ -478,6 +503,9 @@ pub(crate) fn lease_end(error: Option<&AdapterError>) -> LeaseEnd {
         Some(AdapterError::NotAccepted(_)) => LeaseEnd::NotAccepted,
         // SPEC §10: the engine's complete invalid-request answer ends the work.
         Some(AdapterError::Rejected { .. }) => LeaseEnd::Completed,
+        // SPEC §10 (amended 2026-10-17, found live): an engine's error answer
+        // does not prove it stopped; charged until it reports quiescence.
+        Some(AdapterError::EngineError { .. }) => LeaseEnd::Cancelling,
         // SPEC §10: a request the forwarder refused by policy or capability was
         // never sent; that is evidence of non-acceptance, not uncertainty.
         Some(error) if refused_before_sending(error) => LeaseEnd::NotAccepted,

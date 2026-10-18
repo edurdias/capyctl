@@ -301,6 +301,15 @@ pub enum AdapterError {
     /// nothing runs on the request's behalf; another instance would reject it
     /// the same way. `message` is the engine's own, bounded.
     Rejected { status: u16, message: String },
+    /// SPEC §10 (amended 2026-10-17, found live): the engine answered the
+    /// request with an error (HTTP 5xx other than 503, with a JSON object body
+    /// read in full, or, before any output, a stream error event with such a
+    /// code), for example llama.cpp's 500 for an input over its batch size.
+    /// The answer is complete, but it does not prove the engine stopped, so
+    /// the request is cancelling: charged until the engine reports
+    /// quiescence. It reached an engine, so it is never offered to another
+    /// instance. `message` is the engine's own, bounded.
+    EngineError { status: u16, message: String },
     /// SPEC §10 (`cache_salt_unsupported`): the request asks for a prefix-cache
     /// partition (`cache_salt`) and this engine would ignore it, so forwarding
     /// would silently share its cache. Refused before anything is sent.
@@ -326,6 +335,9 @@ impl std::fmt::Display for AdapterError {
             AdapterError::NotAccepted(reason) => write!(f, "not accepted: {reason}"),
             AdapterError::Rejected { status, message } => {
                 write!(f, "the engine rejected the request ({status}): {message}")
+            }
+            AdapterError::EngineError { status, message } => {
+                write!(f, "the engine answered with an error ({status}): {message}")
             }
             AdapterError::CacheSaltUnsupported => f.write_str(
                 "this deployment's engine does not partition its prefix cache by cache_salt",
@@ -566,11 +578,13 @@ pub trait ChatForward: Send + Sync {
     /// `model` replaced by the public name. The answer is completion evidence
     /// only when it is a whole JSON object with an `answers` object; an
     /// engine 400, 413 or 422 with a complete JSON body is
-    /// [`AdapterError::Rejected`]; anything else that may follow a sent
-    /// request is [`AdapterError::Uncertain`]. There is no first-token event:
-    /// the caller bounds the whole exchange (SPEC §10: the request deadline),
-    /// and this method adds no wall-clock cap of its own. The default is a
-    /// forwarder that cannot carry decisions, refused before sending.
+    /// [`AdapterError::Rejected`]; an engine 5xx other than 503 with a
+    /// complete JSON body is [`AdapterError::EngineError`]; anything else that
+    /// may follow a sent request is [`AdapterError::Uncertain`]. There is no
+    /// first-token event: the caller bounds the whole exchange (SPEC §10: the
+    /// request deadline), and this method adds no wall-clock cap of its own.
+    /// The default is a forwarder that cannot carry decisions, refused before
+    /// sending.
     async fn forward_decision(
         &self,
         _body: &serde_json::Value,

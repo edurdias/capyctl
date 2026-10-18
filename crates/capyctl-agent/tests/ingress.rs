@@ -478,38 +478,66 @@ async fn answering_native(
 // for) has answered it completely; nothing runs on its behalf. The ingress
 // relays that rejection as `engine_rejected` with the engine's own message,
 // instead of flattening it into a 502 the router must treat as uncertain.
-// Any other engine error, or a rejection whose body cannot be read as JSON,
-// stays a 502.
+// SPEC §10 (amended 2026-10-17, found live): an engine's complete error
+// answer (a 5xx but 503 with a JSON object body, llama.cpp's 500 for an input
+// over its batch size) is relayed the same way as `engine_error`. Any other
+// engine status, or an answer whose body cannot be read as a JSON object,
+// stays a 502 of the ingress's own.
 #[tokio::test]
-async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway() {
-    let cases: [(u16, &'static str, &'static str, u16); 5] = [
+async fn engine_answers_are_relayed_and_other_engine_errors_stay_bad_gateway() {
+    let cases = [
         (
             400,
             "application/json",
             r#"{"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}"#,
             400,
+            "engine_rejected",
+            "maximum context length",
         ),
         (
             422,
             "application/json",
             r#"{"object":"error","message":"tool_choice requires a parser","code":422}"#,
             422,
+            "engine_rejected",
+            "tool_choice",
         ),
-        (400, "text/plain", "bad", 502),
+        (400, "text/plain", "bad", 502, "inference_unavailable", ""),
         (
             500,
             "application/json",
-            r#"{"error":{"message":"boom"}}"#,
+            r#"{"error":{"code":500,"message":"input (8195 tokens) is too large to process. increase the physical batch size","type":"server_error"}}"#,
+            500,
+            "engine_error",
+            "too large to process",
+        ),
+        (
+            504,
+            "application/json",
+            r#"{"message":"upstream timed out"}"#,
+            504,
+            "engine_error",
+            "upstream timed out",
+        ),
+        (500, "text/plain", "boom", 502, "inference_unavailable", ""),
+        (
+            503,
+            "application/json",
+            r#"{"error":{"message":"loading model"}}"#,
             502,
+            "inference_unavailable",
+            "",
         ),
         (
             401,
             "application/json",
             r#"{"error":{"message":"Unauthorized"}}"#,
             502,
+            "inference_unavailable",
+            "",
         ),
     ];
-    for (engine_status, content_type, body, want) in cases {
+    for (engine_status, content_type, body, want, code, needle) in cases {
         let (native, native_task) = answering_native(engine_status, content_type, body).await;
         let ingress = Ingress::new().unwrap();
         let first = scope(1);
@@ -531,16 +559,9 @@ async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway
             "engine {engine_status} {body}"
         );
         let answer: serde_json::Value = response.json().await.unwrap();
-        if want == 502 {
-            assert_eq!(answer["error"]["code"], "inference_unavailable");
-        } else {
-            assert_eq!(answer["error"]["code"], "engine_rejected", "{answer}");
-            let message = answer["error"]["message"].as_str().unwrap();
-            assert!(
-                message.contains("maximum context length") || message.contains("tool_choice"),
-                "{answer}"
-            );
-        }
+        assert_eq!(answer["error"]["code"], code, "{answer}");
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(message.contains(needle), "{answer}");
         task.abort();
         native_task.abort();
     }

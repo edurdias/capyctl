@@ -112,7 +112,20 @@ A deployment on one machine can show these codes the same way:
 
 The inference endpoint answers HTTP errors with a JSON body holding `code` and
 `message` ([Make a request](requests.md); waiting errors are listed under
-[Errors while waiting](parking.md#errors-while-waiting)). For decision models:
+[Errors while waiting](parking.md#errors-while-waiting)).
+
+- `engine_error` (502): the engine answered the request with an error, for
+  example llama.cpp refusing an input longer than its batch; the message is
+  the engine's and `retryable` is `false`. On a stream it arrives as an error
+  event. The request is not sent to another instance, and it counts against
+  the model's 32 running requests until the engine reports it is idle.
+- `engine_error` (500) with the message `backend completion unverified`:
+  CapyCTL could not tell what the engine did with the request (the connection
+  failed, or the answer was cut short or unreadable). The request stays
+  counted until CapyCTL has evidence that it ended, so many of these in a row
+  can fill the model's running requests (`429 queue_full`).
+
+For decision models:
 
 - `api_mismatch` (400): the request went to the endpoint the model does not
   answer: a chat model asked on `POST /v1/systemone`, or a decision model

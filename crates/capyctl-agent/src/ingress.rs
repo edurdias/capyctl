@@ -448,12 +448,21 @@ impl Drop for InFlight {
         self.entry.current.fetch_sub(1, Ordering::SeqCst);
     }
 }
+/// The ingress's own failure. Its code tells the router's forwarder that the
+/// answer is not the engine's (SPEC §10, amended 2026-10-17).
 fn failure(status: StatusCode) -> Response {
-    (status,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"error":{"code":"inference_unavailable","message":"Inference request is not authorized or could not complete"}}))).into_response()
+    (status,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"error":{"code":capyctl_adapters::forward::INGRESS_FAILURE_CODE,"message":"Inference request is not authorized or could not complete"}}))).into_response()
 }
-/// Relay an engine's invalid-request answer, read in full within bounds; any
-/// body that cannot be read or is not JSON stays a 502.
-async fn engine_rejection(response: reqwest::Response) -> Response {
+/// Relay an engine's complete answer, read in full within bounds, as `code`
+/// with the engine's status and its message as `message_of` reads it: an
+/// invalid-request answer as `engine_rejected`, an error answer as
+/// `engine_error`. Any body that cannot be read or is not a JSON object stays
+/// a 502.
+async fn engine_answer(
+    response: reqwest::Response,
+    code: &'static str,
+    message_of: fn(&[u8]) -> Option<String>,
+) -> Response {
     let status = response.status();
     let limit = capyctl_adapters::forward::REJECTION_BODY_LIMIT;
     if response
@@ -476,7 +485,7 @@ async fn engine_rejection(response: reqwest::Response) -> Response {
     })
     .await;
     let message = match read {
-        Ok(Ok(())) => capyctl_adapters::forward::rejection_message(&body),
+        Ok(Ok(())) => message_of(&body),
         _ => None,
     };
     let (Some(message), Ok(status)) = (message, StatusCode::from_u16(status.as_u16())) else {
@@ -485,7 +494,7 @@ async fn engine_rejection(response: reqwest::Response) -> Response {
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({"error":{"code":"engine_rejected","message":message}})),
+        Json(serde_json::json!({"error":{"code":code,"message":message}})),
     )
         .into_response()
 }
@@ -568,7 +577,25 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         Ok(Ok(response))
             if capyctl_adapters::forward::rejection_status(response.status().as_u16()) =>
         {
-            return engine_rejection(response).await;
+            return engine_answer(
+                response,
+                "engine_rejected",
+                capyctl_adapters::forward::rejection_message,
+            )
+            .await;
+        }
+        // SPEC §10 (amended 2026-10-17, found live): the engine's complete
+        // error answer is relayed as `engine_error` with its status and bounded
+        // message, so the router can tell it from a failure of this ingress.
+        Ok(Ok(response))
+            if capyctl_adapters::forward::engine_error_status(response.status().as_u16()) =>
+        {
+            return engine_answer(
+                response,
+                "engine_error",
+                capyctl_adapters::forward::engine_error_message,
+            )
+            .await;
         }
         _ => return failure(StatusCode::BAD_GATEWAY),
     };

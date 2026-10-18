@@ -1030,8 +1030,13 @@ impl ExecTask {
     }
 }
 
+/// SPEC §10 (amended 2026-10-17): an engine's error answer does not prove the
+/// engine stopped, so it is uncertain like the adapter's own uncertainty.
 fn is_uncertain(err: &AdapterError) -> bool {
-    matches!(err, AdapterError::Uncertain(_))
+    matches!(
+        err,
+        AdapterError::Uncertain(_) | AdapterError::EngineError { .. }
+    )
 }
 
 fn adapter_code(err: &AdapterError) -> String {
@@ -1043,6 +1048,7 @@ fn adapter_code(err: &AdapterError) -> String {
         AdapterError::UnsupportedCombination => "unsupported_combination".to_string(),
         AdapterError::NotAccepted(detail) => format!("not_accepted:{detail}"),
         AdapterError::Rejected { status, .. } => format!("engine_rejected:{status}"),
+        AdapterError::EngineError { status, .. } => format!("engine_error:{status}"),
         AdapterError::CacheSaltUnsupported => "cache_salt_unsupported".to_string(),
     }
 }

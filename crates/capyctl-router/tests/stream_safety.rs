@@ -606,7 +606,9 @@ async fn a_hung_up_stream_without_a_ledger_keeps_its_slot() {
 // T17 T38, SPEC §10 (amended): the lease of a stream whose client hung up
 // is cancelling, never completed. A stream the router cut for missing its
 // bounds is cancelled the same way (found live 2026-10-02): dropping the
-// forward closed the engine connection, so it is cancelling too.
+// forward closed the engine connection, so it is cancelling too. So is one
+// the engine answered with an error before it started (amended 2026-10-17);
+// a body that proves nothing stays uncertain.
 #[test]
 fn a_hung_up_stream_closes_its_lease_as_cancelling() {
     use capyctl_controller::LeaseEnd;
@@ -620,4 +622,15 @@ fn a_hung_up_stream_closes_its_lease_as_cancelling() {
         LeaseEnd::Completed
     );
     assert_eq!(stream_lease_end(&Err(())), LeaseEnd::Cancelling);
+    assert_eq!(
+        stream_lease_end(&Ok(Err(AdapterError::EngineError {
+            status: 500,
+            message: "input (8195 tokens) is too large to process".into(),
+        }))),
+        LeaseEnd::Cancelling
+    );
+    assert_eq!(
+        stream_lease_end(&Ok(Err(AdapterError::Uncertain("cut short".into())))),
+        LeaseEnd::Uncertain
+    );
 }
