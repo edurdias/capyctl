@@ -80,6 +80,11 @@ an impossible startup estimate before its first start.
   the weights (112 GiB for Super VL), which still covers every peak measured on a GB10. Models
   under about 12 GiB keep the same estimate. A deployment revision accepted before this
   release keeps its old estimate until its first start is measured or a new revision replaces it.
+- **SGLang 0.5.22 finds its `cutlass` package.** SGLang 0.5.22 imports
+  `cutlass` from nvidia-cutlass-dsl, which only a `.pth` hook puts on Python's
+  path, and CapyCTL never runs those hooks; serving a dense BF16 model failed
+  with `No module named 'cutlass'`. CapyCTL now adds that one directory inside
+  the installation to the engine's path itself, still without running the hook.
 
 ## Known issues
 
