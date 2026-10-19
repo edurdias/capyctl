@@ -351,3 +351,38 @@ every entry point not in it before loading it. So:
 The distribution name is the installed metadata's claim; the registered
 fingerprint and drift flag attest it, as they attest the rest of the
 installation. CPU tests only; this is not qualification.
+
+## Amendment 2026-10-19: nvidia-cutlass-dsl's package path, without its hook
+
+SGLang 0.5.22 requires `nvidia-cutlass-dsl` (4.8.0 on host A). That
+distribution installs its `cutlass` package under
+`<site-packages>/nvidia_cutlass_dsl/dsl_packages/` and puts that directory on
+the search path only through a code hook, `nvidia_cutlass_dsl_packages.pth`:
+`import sys, os, nvidia_cutlass_dsl; sys.path.insert(0, ...)`. CapyCTL starts
+SGLang under `python -IS` and composes the search path itself (SPEC §9.2),
+so the hook never runs, and the scheduler of a dense BF16 chat model failed
+`No module named 'cutlass'` from SGLang's dual GEMM mode selection; found live
+on host A on 2026-10-19 with Qwen3-4B-Instruct. The same installation launched
+directly worked. SGLang 0.5.21 has the same hook but its paths did not import
+`cutlass`.
+
+The composition (`runtime/sglang_startup_guards.py::trusted_search_path`, used
+by the entry, the spawned children it starts and the SGLang capability probe)
+now appends that one directory after the launcher-selected site-packages when
+`nvidia_cutlass_dsl` and `dsl_packages` are both real directories (neither a
+symlink, so the entry stays inside the verified tree). This is safe for the
+reasons the rest of the composition is:
+
+- It is a path inside the installation the registered fingerprint and drift
+  flag attest, not code: no `.pth` file is read or executed, nothing is
+  imported to compute it, and `site.main()` still never runs.
+- It is appended, so the standard library, CapyCTL's protected runtime package
+  and the installation's own top-level modules keep precedence; it can only
+  add the names it holds (`cutlass`, `iket`).
+- The plugin closure enumerates its metadata like any other entry.
+- CPython spawn hands each child the parent's `sys.path` before the protected
+  main script runs, so SGLang's scheduler and detokenizer import from the
+  same composition and run the same guard.
+
+No other `.pth` path is honoured; a further one needs its own amendment. CPU
+tests only; this is not qualification.

@@ -406,8 +406,16 @@ def main(argv=None):
     try:
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
-        if search not in sys.path:
-            sys.path.append(search)
+        # SPEC §9.2: an SGLang probe imports through the entry's composition
+        # (sglang_startup_guards.trusted_search_path), no .pth hook run.
+        if engine == "sglang":
+            from runtime.sglang_startup_guards import trusted_search_path
+            entries = trusted_search_path(search)
+        else:
+            entries = (search,)
+        for entry in entries:
+            if entry not in sys.path:
+                sys.path.append(entry)
         try:
             report = _run(engine)
         except BaseException:

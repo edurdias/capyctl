@@ -18,10 +18,14 @@ network, syslog or explicitly reopened terminal channel is intercepted here.
 The renderer disables automatic site initialization with -IS: -I alone still
 executes installed .pth and sitecustomize hooks before this module can guard them.
 Before plugin inventory and native imports, startup must explicitly establish
-the trusted package/metadata paths without executing .pth files or site.main().
+the trusted package/metadata paths without executing .pth files or site.main()
+(trusted_search_path: the verified site-packages and one named data directory
+inside it).
 An empty metadata inventory under -S does not attest the installed environment.
 Do not enable native file/request/crash logging. Spawned interpreters must run the
 same preimport plugin check; the fd 1/2 pipe to the log writer is inherited by them.
+CPython spawn hands each child the parent's sys.path before it runs the main
+script, so the composed search path reaches the scheduler and detokenizer.
 The protected sglang_entry script repeats these guards during CPython spawn's
 __mp_main__ preparation, before native Process arguments are unpickled. Keeping
 that exact protected main path and spawn method is a startup composition duty;
@@ -63,6 +67,7 @@ import importlib.metadata
 import logging
 import os
 import re
+import stat
 import sys
 
 
@@ -87,6 +92,39 @@ NO_PLUGINS_SELECTION = "capyctl-loads-no-plugins"
 REQUIRED_PLUGIN_DISTRIBUTIONS = frozenset({"smg-grpc-servicer"})
 # smg's own settings; its zmq plugin activates on SMG_SGLANG_ZMQ_HANDSHAKE.
 _PLUGIN_SETTING_PREFIX = "SMG_"
+# ADR 0008 amendment 2026-10-19: nvidia-cutlass-dsl (SGLang 0.5.22 requires
+# it) installs its `cutlass` package under
+# <site-packages>/nvidia_cutlass_dsl/dsl_packages and reaches it only through
+# a .pth code hook (`nvidia_cutlass_dsl_packages.pth`), which -IS never runs.
+CUTLASS_DSL_PACKAGES = ("nvidia_cutlass_dsl", "dsl_packages")
+
+
+def trusted_search_path(site_packages):
+    """The search entries composed for a verified site-packages, in append order.
+
+    SPEC §9.2, ADR 0008 amendment 2026-10-19: the tree itself, then its
+    nvidia-cutlass-dsl package directory, the one entry a vendor .pth hook
+    would add that SGLang needs (0.5.22's dual GEMM imports `cutlass`). It is
+    added only when both components are real directories (lstat: neither is a
+    symlink, so the entry cannot leave the verified tree), and it is a path,
+    never code: no .pth file is read or run and nothing is imported here.
+    Appended after the tree, it shadows neither the standard library, the
+    protected runtime package nor the tree's own modules; the plugin closure
+    enumerates its metadata like any other entry. No other .pth path is
+    honoured.
+    """
+    entries = [site_packages]
+    path = site_packages
+    for part in CUTLASS_DSL_PACKAGES:
+        path = os.path.join(path, part)
+        try:
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                return entries
+        except OSError:
+            return entries
+    entries.append(path)
+    return entries
+
 
 
 def _required_plugin(point):

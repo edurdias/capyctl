@@ -1,5 +1,6 @@
 """CPU-only subprocess tests; never import SGLang or touch a device."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -448,6 +449,149 @@ class StartupGuardsTests(unittest.TestCase):
                                                    b"PRIVATE-UNPICKLE-ERROR")
                 self.assertEqual((child.stdout, child.stderr), probe)
                 self.assertEqual(marker.exists(), not denied)
+
+
+class CutlassDslSearchPathTests(unittest.TestCase):
+    """SPEC §9.2, ADR 0008 amendment 2026-10-19: nvidia-cutlass-dsl's `cutlass`
+    is reachable under the entry's -IS composition, its .pth hook never runs.
+
+    Found live on host A 2026-10-19: SGLang 0.5.22's scheduler failed
+    `No module named 'cutlass'` serving a dense BF16 model; the package sits
+    under <site-packages>/nvidia_cutlass_dsl/dsl_packages, added to the path
+    only by `nvidia_cutlass_dsl_packages.pth`. CPU fakes only; never evidence
+    a build serves.
+    """
+
+    ENTRY = str(Path(ROOT, "runtime", "sglang_entry.py"))
+
+    @staticmethod
+    def cutlass_package(directory, records):
+        """A fake `cutlass` that records where and under which flags it loaded."""
+        package = Path(directory, "cutlass")
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "import os, sys\nfrom pathlib import Path\n"
+            f"Path({str(records)!r}, str(os.getpid())).write_text("
+            "__file__ + ' ' + str(sys.flags.isolated) + str(sys.flags.no_site))\n")
+
+    def installation(self, root, symlinked):
+        """A fresh stdlib-only venv laid out as nvidia-cutlass-dsl installs, hook included."""
+        environment = Path(root, "python")
+        venv.EnvBuilder(with_pip=False).create(environment)
+        python = str(environment / "bin" / "python")
+        site = Path(subprocess.run(
+            [python, "-I", "-B", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            capture_output=True, text=True, timeout=15, check=True).stdout.strip())
+        records = Path(root, "records")
+        records.mkdir()
+        dsl = site / "nvidia_cutlass_dsl" / "dsl_packages"
+        if symlinked:
+            outside = Path(root, "outside")
+            self.cutlass_package(outside, records)
+            dsl.parent.mkdir()
+            dsl.symlink_to(outside, target_is_directory=True)
+        else:
+            self.cutlass_package(dsl, records)
+            # Appended after the stdlib, it cannot shadow a stdlib module.
+            (dsl / "colorsys.py").write_text("raise AssertionError('stdlib shadowed')\n")
+        marker = Path(root, "pth-hook-executed")
+        # nvidia-cutlass-dsl 4.8.0's hook, with a marker write added.
+        (site / "nvidia_cutlass_dsl_packages.pth").write_text(
+            "import sys, os, pathlib, nvidia_cutlass_dsl; "
+            f"pathlib.Path({str(marker)!r}).write_text('executed'); "
+            "sys.path.insert(0, os.path.join(nvidia_cutlass_dsl.__path__[0], 'dsl_packages'))\n")
+        return python, site, dsl, records, marker
+
+    def composed(self, python, expect_cutlass):
+        """Run the entry's own composition under -IS, then a real spawn child."""
+        body = textwrap.dedent(f'''
+            import importlib, json, multiprocessing, os, sys, types
+            assert (sys.flags.isolated, sys.flags.no_site) == (1, 1)
+            package = types.ModuleType("runtime")
+            package.__path__ = [{str(Path(ROOT, "runtime"))!r}]
+            sys.modules["runtime"] = package
+            from runtime import sglang_entry as entry
+            before = list(sys.path)
+            entry._compose_search_path()
+            assert sys.path[:len(before)] == before, sys.path
+            print(json.dumps(sys.path[len(before):]))
+            import colorsys
+            try:
+                import cutlass
+            except ModuleNotFoundError:
+                assert not {expect_cutlass!r}
+                raise SystemExit(0)
+            assert "nvidia_cutlass_dsl" not in sys.modules
+            # SGLang's scheduler and detokenizer: spawned, the entry as main.
+            os.environ.pop("SGLANG_PLATFORM", None)
+            os.environ.pop("SGLANG_PLUGINS", None)
+            sys.modules["__main__"].__file__ = {self.ENTRY!r}
+            process = multiprocessing.get_context("spawn").Process(
+                target=importlib.import_module, args=("cutlass",))
+            process.start()
+            process.join(10)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+                raise AssertionError("spawn did not finish")
+            assert process.exitcode == 0, process.exitcode
+        ''')
+        child = subprocess.run([python, "-IS", "-B", "-c", body], capture_output=True,
+                               text=True, timeout=30,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        self.assertEqual(child.returncode, 0, child.stderr)
+        return json.loads(child.stdout)
+
+    # T21
+    def test_cutlass_imports_under_the_entry_composition_and_its_pth_never_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            python, site, dsl, records, marker = self.installation(root, symlinked=False)
+            # Positive control: without -S the vendor hook runs and adds the path.
+            control = subprocess.run([python, "-I", "-B", "-c", "import cutlass"],
+                                     capture_output=True, timeout=15)
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.exists(), "positive control did not execute the hook")
+            marker.unlink()
+            for record in records.iterdir():
+                record.unlink()
+            self.assertEqual(self.composed(python, expect_cutlass=True), [str(site), str(dsl)])
+            self.assertFalse(marker.exists(), "the .pth hook ran under the entry")
+            # The entry's process and its spawned child both loaded this one
+            # package, both under -IS.
+            loaded = sorted(record.read_text() for record in records.iterdir())
+            self.assertEqual(loaded, [str(dsl / "cutlass" / "__init__.py") + " 11"] * 2)
+
+    # T21
+    def test_symlinked_dsl_packages_leaving_the_tree_is_not_added(self):
+        with tempfile.TemporaryDirectory() as root:
+            python, site, _, records, marker = self.installation(root, symlinked=True)
+            self.assertEqual(self.composed(python, expect_cutlass=False), [str(site)])
+            self.assertFalse(marker.exists(), "the .pth hook ran under the entry")
+            self.assertEqual(list(records.iterdir()), [])
+
+    # T21
+    def test_only_real_directories_inside_the_tree_are_composed(self):
+        sys.path.insert(0, ROOT)
+        self.addCleanup(sys.path.remove, ROOT)
+        from runtime.sglang_startup_guards import trusted_search_path
+        with tempfile.TemporaryDirectory() as root:
+            site = Path(root, "site-packages")
+            outside = Path(root, "outside", "dsl_packages")
+            outside.mkdir(parents=True)
+            site.mkdir()
+            self.assertEqual(trusted_search_path(str(site)), [str(site)])
+            vendor = site / "nvidia_cutlass_dsl"
+            # The vendor directory itself a symlink out of the tree.
+            vendor.symlink_to(outside.parent, target_is_directory=True)
+            self.assertEqual(trusted_search_path(str(site)), [str(site)])
+            vendor.unlink()
+            vendor.mkdir()
+            (vendor / "dsl_packages").write_text("not a directory")
+            self.assertEqual(trusted_search_path(str(site)), [str(site)])
+            (vendor / "dsl_packages").unlink()
+            (vendor / "dsl_packages").mkdir()
+            self.assertEqual(trusted_search_path(str(site)),
+                             [str(site), str(vendor / "dsl_packages")])
 
 
 if __name__ == "__main__":
