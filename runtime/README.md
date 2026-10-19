@@ -100,7 +100,12 @@ others. Run it before imports in
 every spawned Python interpreter under trusted immutable package/metadata/search
 paths. The no-site isolated launch disables automatic `site` initialization;
 production composition still needs explicit verified package roots, without
-executing `.pth` hooks or calling `site.main()`. An empty `SGLANG_PLUGINS` selector
+executing `.pth` hooks or calling `site.main()`. `trusted_search_path()` gives
+the entry's composition: the launcher-selected site-packages, then
+`nvidia_cutlass_dsl/dsl_packages` inside it when both components are real
+directories (SGLang 0.5.22 imports `cutlass` from there; the vendor `.pth` hook
+that would add it never runs). Spawned children receive this `sys.path` from
+CPython spawn. An empty `SGLANG_PLUGINS` selector
 is not an upstream disable switch. An empty no-site metadata search is not proof
 that the eventual native package environment contains no plugins.
 

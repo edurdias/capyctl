@@ -524,6 +524,26 @@ def _trusted_package_root():
                         "site-packages", "sglang", "srt")
 
 
+def _compose_search_path():
+    """Append the verified installation's search entries, never site.main().
+
+    SPEC §9.2, ADR 0008 amendment 2026-10-19: the launcher-selected
+    site-packages and, when it is a real directory inside that tree, its
+    nvidia-cutlass-dsl package directory (sglang_startup_guards
+    .trusted_search_path), the one path a vendor .pth hook adds that SGLang
+    needs; the hook itself never runs. Appended, so the stdlib and this
+    protected package keep precedence over the verified tree. SGLang's
+    scheduler and detokenizer are spawned, and CPython spawn hands each child
+    this sys.path before it runs the protected main script, so they import
+    from the same composition.
+    """
+    from runtime.sglang_startup_guards import trusted_search_path
+    site_packages = os.path.dirname(os.path.dirname(_trusted_package_root()))
+    for search in trusted_search_path(site_packages):
+        if search not in sys.path:
+            sys.path.append(search)
+
+
 def _placement_mapping(spec, digest):
     """Assemble the service-supplied placement inputs for the digest, or None.
 
@@ -566,9 +586,7 @@ def _verified_native_contract(spec):
     from runtime import sglang_native_composition as composition
     # SPEC §9.2: enumerate the selected installation's plugin metadata too.
     # -IS omits it; no .pth processing or native imports are performed here.
-    search = os.path.dirname(os.path.dirname(_trusted_package_root()))
-    if search not in sys.path:
-        sys.path.append(search)
+    _compose_search_path()
     try:
         if spec._placement_digest is None:
             return composition.compose(spec, trusted_mapping=None, placement_digest=None)
@@ -596,9 +614,7 @@ def _guarded_engine_import():
     precedence over the verified tree. Tests substitute this seam; a failed
     import leaves through main's closed startup category.
     """
-    search = os.path.dirname(os.path.dirname(_trusted_package_root()))
-    if search not in sys.path:
-        sys.path.append(search)
+    _compose_search_path()
     from runtime.sglang_startup_guards import preimport_guard
     preimport_guard()
     from sglang.srt.entrypoints import http_server as launch
