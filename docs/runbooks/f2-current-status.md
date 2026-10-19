@@ -1,5 +1,569 @@
 # Current implementation and launch status
 
+## The eager loader's startup placeholder is capped at 32 GiB over the weights — 2026-10-18 (branch `fix/eager-placeholder-cap`)
+
+Owner decision 2026-10-18 (ADR 0014 amendment A22, option b of the question left open on
+2026-10-16 about the 3.6 × weights placeholder). An unmeasured vLLM deployment that renders
+`--safetensors-load-strategy eager` (every parking deployment by default) had the startup
+placeholder `max(request + graphs, weights × 3.6 + margin)` (amendment A21). It is now
+`max(request + graphs, weights + min(weights × 13/5, 32 GiB) + margin)`
+(`VLLM_EAGER_STARTUP_EXTRA_CAP_BYTES`), which is `min(weights × 3.6, weights + 32 GiB)` to
+the byte: a checkpoint up to 13215283988 bytes (about 12.3 GiB) keeps exactly the old figure,
+a larger one is capped. The non-eager factor (2.25) is unchanged; a measured peak still
+replaces the placeholder.
+
+Evidence (CapyCTL's `startup.measured`, vLLM 0.30.0, `eager`, GB10 host A): the peak over the
+weights was 12.4 to 30.2 GiB, KV cache included, from 22 to 71 GiB of weights. Placeholder
+before and after, against the measured peak:
+
+| Checkpoint | Before (A21) | After (A22) | Measured peak |
+|---|---|---|---|
+| Qwen3.8-27B NVFP4, KV 4 GiB | 94087532268 (87.6 GiB) | 66699005648 (62.1 GiB) | 56220348416 (52.4 GiB) |
+| Qwen3-14B BF16, KV 4 GiB | 114921930896 (107.0 GiB) | 72486338600 (67.5 GiB) | 44531412992 (41.5 GiB) |
+| Qwen3-30B-A3B BF16, KV 4 GiB | 228429606924 (212.7 GiB) | 104016248608 (96.9 GiB) | 76076666880 (70.9 GiB) |
+| Qwen3.8-27B BF16, KV 4 GiB | 208616758985 (194.3 GiB) | 98512679736 (91.7 GiB) | 68840255488 (64.1 GiB) |
+| Nemotron 3.5 Super VL 120B-A12B NVFP4 | 283371241601 (263.9 GiB) | 119277813796 (111.1 GiB) | 101695578112 (94.7 GiB) |
+| Qwen3.6-35B-A3B NVFP4 (A21's run, 23.5 GB) | about 86.8 GiB | about 61.9 GiB | 54.2 GiB |
+
+Every row stays covered. The derived cold phase adds the 1.25 GiB CUDA context: Super VL's
+is 120619991076 bytes (112.3 GiB, from 284713418881), still above a 108 GiB managed limit, so
+its unmeasured first start still runs alone on the machine and reserves the whole managed
+limit.
+
+The cap is recorded in the revision as `startup_eager_cap_bytes`, beside
+`startup_graphs_bytes`, and re-derived when a snapshot decodes; the store's solo-first-start
+recomputation uses it. A revision frozen under amendment A21 records none and keeps
+`weights × 3.6` exactly as it was frozen, as amendment A8 let earlier revisions keep 1.6: a
+frozen revision must re-resolve to its own bytes. It holds the larger figure only until its
+first start is measured; a new revision takes the cap.
+
+Tests (`capyctl-config` `startup_budget`):
+`the_eager_placeholder_keeps_3_6_below_the_cap_and_caps_above_it` (the last byte below the
+cap and the first above, a 10 GiB checkpoint unchanged),
+`the_capped_eager_placeholder_covers_every_measured_peak` (each row above),
+`a_revision_frozen_before_the_eager_cap_keeps_its_placeholder` (a frozen A21 revision decodes
+with 116 GiB, a new one gets 70 GiB, a snapshot that drops its cap is refused), and
+`the_startup_placeholder_follows_the_effective_loader` (the recorded cap, a forged one refused)
+and `the_placeholder_startup_covers_the_first_starts_graphs` updated from 116 to 70 GiB for
+30 GiB of weights. `capyctl-controller`
+`status_shows_the_whole_host_a_start_above_the_managed_limit_reserves` now pins Super VL's
+120619991076 and still expects `whole_host` at 108 GiB. CPU and Fake-engine tests are not
+qualification. Live check still needed: a first start of an unmeasured large eager checkpoint
+whose capped placeholder fits beside other work, to confirm its peak stays under it; the
+measurements cover vLLM 0.30.0 on GB10 only.
+
+## Request ledger commits off the answer's path — 2026-10-18 (branch `perf/ledger-commits`)
+
+Owner decision 2026-10-18 (SPEC §10 note of that date), following the
+router-overhead measurements: two synchronous SQLite commits per request
+(lease grant, lease close) were most of what CapyCTL added to a decision
+request. One commit on host A's NVMe took 4.6 ms p50 and 6.8 ms p95 with
+`synchronous=FULL`, and 0.01 ms with `NORMAL`. The owner chose three
+changes:
+
+- **Answer before the lease close** (`capyctl-router`). A completed
+  non-streamed answer (chat or `POST /v1/systemone`) is handed to the client
+  before its lease close is committed; the dispatch task then closes the lease
+  on the same completion evidence and only after that releases the request's
+  in-flight slot. A completed stream sends its timing and metrics comments and
+  `[DONE]` while the close commits beside them, so a stalled client does not
+  hold the slot. Refusals, engine errors, uncertain ends and failover are
+  unchanged: their leases are settled before the answer, as before. Cost: a
+  client's next request can briefly find the previous one still counted
+  against the deployment's bound, and a crash between answer and commit
+  leaves the lease charged for the quiescence path.
+- **`synchronous=NORMAL` for the standalone request ledger**
+  (`capyctl-store`, `capyctl-controller`, `capyctl-cli`). The store states
+  `synchronous=FULL` when it opens. A standalone role opens its owned state
+  `with_local_engines_only()`, and its request-lease batches alone commit
+  with `NORMAL`; the connection is back to `FULL` before any other write uses
+  it, whether the batch commits or is refused. In WAL mode the commit order
+  holds, so the next `FULL` commit makes earlier batches durable too. A
+  process crash loses no lease write; an OS crash or power loss that loses the
+  last ones also ends the engines on that machine whose work they account
+  for. The control-plane server, whose engines run on other hosts, keeps
+  `FULL` for every write. Test: `a_local_lease_batch_leaves_other_writes_fully_synchronous`.
+- **History indexes** (store schema v50): `lifecycle_steps(binding_id)` and
+  `journal_entries(operation_id)`. The router's serving-instance read now
+  searches both instead of scanning them (checked with `EXPLAIN QUERY PLAN`);
+  results are unchanged. Without them the read cost about 1.2 ms per 1000
+  past activations. v49 (ADR 0030) already makes this release's store
+  unreadable by 0.1.4, so v50 adds no new downgrade limit.
+
+Measured on the laptop reproduction (i9-14900HX, ext4 on NVMe, release
+build, standalone role on the Fake installation with an HTTP stub engine,
+decision requests one at a time), three alternating rounds of 400 requests
+per case: the router's added p50 went from 4.2–4.8 ms (PR #150 alone) to
+1.8–2.0 ms. Over 100 requests per case the process made 78 `fsync` calls
+instead of 1117.
+
+The ledger durability is recorded as an amendment to ADR 0002 and in the
+SPEC's amendment list and T17 row. Tests (CPU, tagged T17 or T33):
+
+- `the_standalone_ledger_commits_for_local_engines_only` and
+  `the_server_ledger_commits_fully_synchronously` (`capyctl-cli`): each
+  role opens its store through one function (`standalone_owned_state`,
+  `server_owned_state`), and only the standalone one relaxes the ledger.
+- `a_completed_answer_reaches_the_client_before_its_lease_close`
+  (`capyctl-router`): with the close held back, a collected answer and a
+  stream through `[DONE]` both reach the client while the lease is still
+  open and the request still holds its slot; the close then ends the lease
+  completed and frees the slot.
+- `a_client_that_leaves_after_its_answer_still_has_its_lease_closed`: over
+  a real connection, a client that hangs up right after its whole answer,
+  collected or streamed, does not stop the close.
+- `a_crash_between_answer_and_close_leaves_the_lease_charged` (router: the
+  runtime dies with the close pending, the lease is never closed) and
+  `a_local_grant_survives_a_crash_before_its_close` (store: a grant
+  committed with `NORMAL` on a connection abandoned without closing is read
+  back by the next session as an uncertain, charged lease).
+- `v50_indexes_the_history_the_instance_read_searches`: a v49 store gains
+  both indexes, keeps its rows, and the lookups by binding and operation
+  use them.
+
+`scripts/ci-local.sh --deep` passes. CPU and Fake-engine tests are not
+qualification. Live check still needed: repeat the host A decision-request
+comparison (Julia-1 and Clef-Flash, one and three questions, about 200 and
+2k tokens of state) with this build.
+
+## Router per-request overhead trimmed; ledger unchanged — 2026-10-18 (branch `perf/router-overhead`)
+
+Measured live on host A on 2026-10-18 (llama.cpp v0.7.0, decision requests
+one at a time): CapyCTL's router added about 12–26 ms per `POST /v1/systemone`
+over the same engine addressed directly. Reproduced on a laptop
+(i9-14900HX, ext4 on NVMe, release build) with a standalone role on the Fake
+installation and an HTTP stub engine at the launch's recorded endpoint that
+answers at once, through the production listener, admission gate, router,
+request ledger and engine forwarder; the router added 5.8–6.0 ms (p50).
+Per-phase timings on that reproduction (p50, before):
+
+| phase | ms |
+|---|---|
+| request lease grant: one group commit (fsync ≈ 1.1 ms) plus the writer thread round trip | 1.66 |
+| request lease close, before the answer is returned: one commit | 1.42 |
+| store reads: route, `serving_instances` read twice, forwarder endpoint (engine key, routes, ingress, engine) | ≈ 2.1 |
+| forward to the engine over the pooled keep-alive connection | ≈ 0 over direct |
+| body read and parse, strict answer parse, spawn and join, timing, selection log line | < 0.1 |
+
+Connection reuse to the engine works (the forwarder is cached per
+incarnation, reqwest pools the connection; llama.cpp's HTTP server sets
+`TCP_NODELAY`, and a keep-alive connection to a local llama-server was
+measured faster than a fresh one). The router answers in one `writev`, so
+Nagle's algorithm costs nothing on loopback today.
+
+What changed, with no change to what the ledger records, when, or with what
+durability (SPEC §10, T17, T38):
+
+- **Store** (`capyctl-store`): the statements the router reads on every
+  request and the request-ledger statements are prepared once per connection
+  (`prepare_cached`, cache capacity 64). A cached statement is reset after
+  use and re-prepared by SQLite after a schema change.
+- **Router** (`capyctl-router`): a request admitted without waiting is
+  ranked on the instance view admission already read (`InstanceView`), not
+  on a second read of the same rows. The lease grant still re-checks the
+  gate in its own transaction (T18), and any request that waited reads the
+  instances afresh. `router_selection` now times the read only when it
+  happens.
+- **Listeners** (`capyctl-cli` `shutdown::serve`): every accepted inference,
+  management and host-ingress connection has `TCP_NODELAY` set; axum 0.8 no
+  longer sets it. Test: `served_connections_have_nagle_off`.
+
+After, on the same reproduction: three alternating rounds of 400 requests
+per case on a quiet machine, the router's added p50 went from 3.20–4.08 ms
+(mean 3.66) to 3.00–3.50 ms (mean 3.28); in earlier runs on a busier
+machine, from 5.6–6.4 ms to 4.25–4.85 ms. Planning a request now costs
+0.05 ms instead of 0.5 ms, and the store reads on the way 0.9 ms instead of
+2.1 ms. The remaining overhead is the two synchronous ledger commits (about
+1.1 ms each here, one `fsync` of the write-ahead log) and their writer round
+trips. The owner took all three options on 2026-10-18 (see "Request ledger
+commits off the answer's path"): `synchronous=NORMAL` for the standalone
+request ledger, closing the lease after the answer is sent, and indexes on
+`lifecycle_steps(binding_id)` and `journal_entries(operation_id)` (the
+instance read scanned both tables, about 1.2 ms per 1000 initialize
+operations of history).
+
+CPU and Fake-engine tests are not qualification. Live check still needed:
+repeat the host A decision-request comparison (Julia-1 and Clef-Flash, one
+and three questions, about 200 and 2k tokens of state) with this build.
+
+## Decision models measured on one GB10; the guide's llama.cpp example — 2026-10-18 (branch `docs/decision-models-guide`)
+
+Live on host A, 2026-10-17 to 2026-10-18, `main` at `075023d7` and `8824b622`, isolated
+standalone, managed limit 108 GiB: eight decision deployments (Clef, Clef-Flash, Kev-4B,
+lev, Julia-1 and Laya on llama.cpp v0.7.0; Clef and Clef-Flash on SGLang 0.5.22) became
+ready, answered `POST /v1/systemone` through the router, and ran capyctl-bench 0.3.0's
+decisions suites (about 4,200 requests each: latency grid, cache, throughput at 1 to 8
+streams, AG News, BoolQ, Typed Decisions, and the Decision Index components API-Bank,
+GPQA Diamond and Home appliances). Published scores reproduce: Clef 91.9% on API-Bank,
+Clef-Flash 93.1% (SGLang), Julia-1 73.0% on Typed Decisions. The results, six recipes and
+the comparison are in capyctl-recipes (`comparisons/decision-models-gb10`).
+
+Findings for CapyCTL:
+
+- llama.cpp v0.7.0 reads a decision request's whole input in one batch; with its default
+  batch sizes a longer input is refused (HTTP 500, "increase the physical batch size").
+  Every measured llama.cpp deployment sets `--batch-size` and `--ubatch-size` to the
+  context. The guide's example (`docs/guide/deploy.md`) now does too and states
+  `resources`.
+- Decisions/s does not rise with concurrent requests on llama.cpp (flat from 1 to 8) and
+  rises 7% to 18% on SGLang. A repeated input is at most 5% faster on either engine.
+- CapyCTL's endpoint adds 12 to 26 ms per decision request against llama-server launched
+  directly with the same arguments (Julia-1: 19.1 against 7.5 ms at one question about a
+  200-token input); at 8 concurrent requests the throughput is the same.
+- Measured peaks (`startup.measured`) of the recipes: Julia-1 1.4 GiB, Clef-Flash 15.8 GiB,
+  Kev-4B 25.9 GiB and Clef 35.4 GiB on llama.cpp (16,384-token context and batch; 8,192 for
+  Julia-1); Clef-Flash 51.9 GiB and Clef 87.5 GiB on SGLang, whose pool follows the
+  reservation.
+
+Documentation only; no code changed. These are live measurements of the listed engines and
+checkpoints, not qualification of other recipes.
+
+## Engine error answers end cancelling, not uncertain — 2026-10-17 (branch `fix/engine-error-answers`)
+
+Found live on 2026-10-17 on host A (llama.cpp v0.7.0, decision deployments
+Julia-1 and Laya, context 8192): an input over the context got llama.cpp's
+complete JSON error with HTTP 500 (`input (8195 tokens) is too large to
+process. increase the physical batch size`). The forwarder read every 5xx but
+a `shutting_down` 503 as uncertain, the router ended the request lease
+uncertain, and an uncertain lease stays charged for the life of the session,
+so after about 56 such answers the deployment refused every request with 429
+`queue_full` ("outstanding request bound reached") until it was deleted.
+Clients saw only `engine_error` "backend completion unverified".
+
+Spec §10 is amended (2026-10-17, with the T17 row and the amendment list):
+an engine's complete error answer, HTTP 5xx other than 503 with a JSON object
+body read whole within the bounds a rejection is read with (16 KiB, 5 s), or,
+before any output, a stream error event with such a code, is relayed to the
+client as HTTP 502 `engine_error` with the engine's bounded message,
+`retryable: false`, in-band on a stream, and never offered to another
+instance. Uncertainty still retains accounting: the answer does not prove the
+engine stopped, so the lease ends `cancelling`, charged until the instance's
+adapter reports engine-wide quiescence, exactly as after a client hang-up
+(the coordinator's existing settlement; its receipt now reads "after the
+request was cancelled or answered with an error"). That settlement already
+covers local llama.cpp (`/metrics` `requests_processing` and
+`requests_deferred` both 0), SGLang and vLLM (their running and waiting
+gauges) and remote launches (the host's load report, including the ingress's
+in-flight count). A truncated, oversized, unreadable or non-JSON 5xx body,
+and every 503 but a role's `shutting_down` refusal, stays uncertain.
+
+- **Forwarder** (`capyctl-adapters` `forward.rs`): `engine_error_status`,
+  `engine_error_message` and a new `AdapterError::EngineError { status,
+  message }`, on every path: decisions, collected and streamed chat, and the
+  in-band error event before any chunk.
+- **Host ingress**: relays such an answer with the engine's status as
+  `engine_error` and its message; its own failures keep the code
+  `inference_unavailable` (`INGRESS_FAILURE_CODE`), which the forwarder never
+  reads as the engine's answer.
+- **Router**: `EngineError` ends the lease `cancelling` and answers 502
+  `engine_error` (collected, decisions) or an in-band `engine_error` event
+  (streams); the in-memory slot is released as for an uncertain end, since
+  the ledger keeps the charge.
+- **Controller**: `EngineError` is `Uncertain` in fault classification and
+  operations (`engine_error:<status>`).
+
+Tests (T17, T19, T43): `capyctl-cli`
+`roles_f1` `engine_error_answers_never_exhaust_the_deployment` (a standalone
+role with the real coordinator and ledger; an engine answering every request
+with llama.cpp's 500 gets three times the outstanding bound of answers
+through, each a 502 with the engine's message, never replayed) and
+`a_cut_engine_error_answer_stays_uncertain` (a 500 whose body is cut short
+leaves its lease uncertain and the bound refuses with 429 after several
+quiescence questions, as before the change); `capyctl-adapters` forwarder unit tests
+`an_engine_error_answer_carries_the_engine_message` and the updated status
+and in-band event tests; `capyctl-router` `router_core`
+`an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling`,
+`decisions` `an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling`
+and the cut 500 in `an_unverified_decision_answer_leaves_the_lease_uncertain`,
+`stream_safety` lease ends; `capyctl-agent` ingress
+`engine_answers_are_relayed_and_other_engine_errors_stay_bad_gateway`. Every
+new engine-error test, and the full-stack one, fails with the forwarder's
+5xx reading turned off; with the router ending the lease uncertain instead
+of cancelling, the full-stack test fails on the deployment staying
+exhausted. CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-18, this branch's build in an isolated standalone,
+llama.cpp v0.7.0: Julia-1 and Laya (Q8_0, context 8192) under capyctl-bench's
+decisions run. Each model's 8k-token latency points sent 31 inputs over the
+context; every one answered 502 `engine_error` with llama.cpp's message
+("input (… tokens) is too large to process. increase the physical batch
+size"), and the ledger journaled 41 `request_cancellation_acknowledged`
+events. Both deployments kept serving: the throughput runs that followed
+(200 requests at each of 1, 2, 4 and 8 streams) had no failures, where
+before this change the same runs on `main` got 429 `queue_full` for every
+request.
+
+## SGLang 0.5.22 launches: its own plugins closed by selection — 2026-10-17 (branch `fix/sglang-0522-plugins`)
+
+Found live on host A on 2026-10-17 with the approved SGLang 0.5.22
+environment: every launch failed `sglang_startup_failed:
+plugin_closure_failed`. SGLang 0.5.22 requires `smg-grpc-servicer`
+(`Requires-Dist: smg-grpc-servicer>=0.9.0` in its `METADATA`); the installed
+0.14.0 registers two `sglang.srt.plugins` entry points, `smg-servicer ->
+smg_grpc_servicer.sglang.plugin:register` and `smg-zmq ->
+smg_grpc_servicer.sglang.zmq_plugin:register`. The runtime guard
+(`runtime/sglang_startup_guards.py::enforce_closed_plugins`) refused any
+installed plugin, so it raised `external_plugins_present`. SGLang 0.5.21's
+`smg-grpc-servicer` 0.13.0 registers no entry point. Recorded as an ADR 0008
+amendment (2026-10-17); the plugin closure's intent (owner decision
+2026-09-23, SPEC §13.3, T21) is unchanged.
+
+SGLang's loader, read on host A
+(`sglang/srt/plugins/__init__.py::load_plugins_by_group`; the 0.5.20 and
+0.5.21 environments have the same whitelist lines):
+
+```python
+    allowed_set: set[str] | None = None
+    allowed_str = envs.SGLANG_PLUGINS.get()
+    if allowed_str:
+        allowed_set = {x.strip() for x in allowed_str.split(",") if x.strip()}
+    ...
+    for ep in discovered:
+        if allowed_set is not None and ep.name not in allowed_set:
+            logger.info("Skipping plugin %s (not in SGLANG_PLUGINS)", ep.name)
+            continue
+        ...
+        try:
+            func = ep.load()
+```
+
+`load_plugins()` (scheduler, detokenizer, data-parallel controller, engine)
+goes through it; the diffusion loader reads the same variable. The platform
+path loads directly only when `SGLANG_PLATFORM` is set.
+
+- **Selection.** `SglangLaunch::render_for_launcher` renders
+  `SGLANG_PLUGINS=capyctl-loads-no-plugins` (`capyctl_config::engine_env::
+  SGLANG_NO_PLUGINS`) into every SGLang command, single launches and group
+  ranks, the adapter's and the controller's native handoff alike; SGLang's
+  spawned processes inherit it. The agent's SGLang capability probe gets it
+  too, since its guard runs the same closure.
+- **Reserved names.** `SGLANG_PLUGINS`, `SGLANG_PLATFORM` and the `SMG_`
+  prefix are owned names (`engine_env_reserved:<name>`), so neither a profile
+  nor a deployment sets them; an approval glob `SMG_*` is refused.
+- **Guard.** Installed general plugins are accepted only when
+  `SGLANG_PLUGINS` is exactly that selection and each comes from a
+  distribution SGLang requires (`smg-grpc-servicer`, name normalized) and
+  none is named as the selection. Still refused: any other `SGLANG_PLUGINS`,
+  any `SGLANG_PLATFORM`, any `SMG_*` variable (smg's zmq plugin activates on
+  `SMG_SGLANG_ZMQ_HANDSHAKE`), any `sglang.srt.platforms` entry point, a
+  plugin from another distribution, `native_already_imported`, an unreadable
+  inventory. The module docstring records the 0.5.22 contract.
+
+Tests: `runtime/tests/test_sglang_startup_guards.py` (smg-grpc-servicer's two
+entry points pass under the selection and are refused without it or with an
+empty one; an unknown distribution's plugin, alone or beside smg's, a plugin
+named as the selection and a platform entry point are refused under it;
+other selections, `SGLANG_PLATFORM` and `SMG_*` variables are refused; a real
+spawn's `__mp_main__` guard passes with the inherited selection and refuses
+with the handshake variable; no plugin target is imported); four of them fail
+on the previous guard. `runtime/tests/test_sglang_entry.py` (the entry's
+`main` launches with smg's plugins under the selection and renders
+`plugin_closure_failed` without it or beside another distribution's plugin).
+`capyctl-adapters` `sglang_args`, `sglang_group_args`, `sglang_initialize`
+(the rendered and spawned environments carry the selection);
+`capyctl-config` `engine_env` (the names are reserved; the Rust selection
+matches the guard's); `capyctl-agent` installation (only the SGLang probe
+carries it). CPU and Fake-engine tests only; not qualification.
+
+Live on host A, 2026-10-17, this branch built there, an isolated standalone: Clef-Flash
+(`Cloudflare/clef-flash@8b2e5fd1`, BF16) on SGLang 0.5.22 as an `api: decisions` deployment
+was ready in 165 s; its engine log shows `Skipping plugin smg-servicer (not in SGLANG_PLUGINS)`
+and `Skipping plugin smg-zmq (not in SGLANG_PLUGINS)`; a decision through the router answered in
+0.11 s, and capyctl-bench's decisions run completed (AG News 89.4%, BoolQ 89.6% on its pinned 500
+rows each). Qwen3-4B on SGLang 0.5.21 as a chat deployment was ready in 108 s and answered,
+unchanged.
+
+## Decision models, slice C: readiness and the wake check — 2026-10-17 (branch `feat/decisions-readiness`)
+
+ADR 0030 (accepted, owner decisions 2026-10-17) §3 and §4; SPEC §6.1 is
+amended and the amendment log gains the entry. Depends on slice A (the `api`
+field, #144); the `/v1/systemone` route is slice B.
+
+- **The fixed decision probe** (`capyctl_adapters::decision_probe`, kind
+  `decision`, version 1): one `POST /v1/systemone` with the state "The ticket
+  says: my card was charged twice." and one `choice` question (billing,
+  shipping, technical, each with a description, and the instructions every
+  engine requires). Ready when the answer is complete and well-formed: the
+  question answered as a `choice`, a probability for every option and no
+  other, each finite in [0, 1], summing to 1 within 1e-3, the pick one of
+  the options (not necessarily billing).
+- **Where it runs instead of a chat probe** for a decisions deployment: the
+  llama.cpp and SGLang Initialize (bounded by the remaining startup window,
+  since SGLang's first decision took 36 s live), SGLang's post-wake Probe
+  step, the host agent's re-proof after a reconnect and after a restore
+  (`fresh_probe`), and a restarted standalone role's re-proof of an adopted
+  launch (which for chat stays a model list, unchanged). A decisions
+  deployment is never sent a chat probe; vLLM and TensorFold cannot run one
+  (slice A) and are unchanged.
+- **The wake check:** the first readiness records the decision answer as
+  the launch's reference (deployment, instance, generation, launch
+  incarnation, as the chat canary), with the probe's version and the rule:
+  same pick and every probability within 0.05. Store schema v49 rebuilds
+  `wake_canaries` with `kind`, `probe_version`, `decision_json` and
+  `tolerance`; existing references migrate as `completion`. A reference of
+  another kind or probe version is never compared: the answer finds no
+  usable reference. A wake that picks differently or moves a probability by
+  more than 0.05 is `wake_mismatch` with the existing stop. The
+  `Unsupported => passed` escape is never taken for a decisions launch (the
+  adapters and the remote binding answer uncertain instead).
+- **Which transitions compare today: none.** A decisions deployment
+  resolves `restart_only`, so it never parks and never wakes; every restart
+  (idle stop then start, operator restart, crash) is a new generation and
+  launch that records its own reference. A host reconnect and a standalone
+  restart keep the launch but re-prove readiness only (well-formedness), as
+  for chat. The comparison is implemented in the wake path and tested
+  there; it becomes live when parking a decisions deployment is allowed.
+- **Protocol** (ADR 0017): `ExecuteMember.probe_decision` (field 18) asks a
+  host for the decision probe of a retained decisions launch and needs the
+  `decisions` capability; `MemberExecutionResult.probe_decision` (field 20)
+  carries the answer, accepted only for a completed decision probe and only
+  well formed. Both encode nothing when unset, so every existing command
+  digests as before. The controller judges a relayed answer well-formed
+  again before it counts.
+- **Fake engine:** `FakeEngine::with_decisions`/`set_decision` answer
+  `/v1/systemone` as scripted (well formed, malformed, another pick, other
+  probabilities) and refuse chat, counting both; its lifecycle Initialize is
+  proven by the decision, and its wake canary is the decision.
+  Its `forward_decision` serves the public `/v1/systemone` route (#145),
+  so the Fake answers a decision request end to end.
+
+Tests (T43, with T20, T34): `decision_probe` unit tests (request shape,
+well-formed and malformed answers, the 1e-3 sum); llama.cpp
+`a_decisions_launch_is_ready_only_on_a_well_formed_decision` against a stub
+engine (no chat request, the canary is a decision); controller
+`a_decisions_launch_is_ready_only_on_a_well_formed_decision` (Fake),
+`a_decision_canary_within_tolerance_completes_the_wake`,
+`a_changed_pick_or_a_moved_probability_fails_the_wake`,
+`a_chat_reference_is_never_compared_with_a_decision_answer`, the
+`wake_canary` unit tests, and
+`a_decision_canary_counts_only_a_well_formed_relayed_decision`; agent
+`a_decisions_reproof_is_the_fixed_decision_never_chat`; store round trip,
+refusals and the v48 to v49 migration; protocol encoding, validation and
+capability tests; router
+`a_fake_decision_model_becomes_ready_and_answers_through_the_router` (ready
+on the decision, answered through the router, lease closed completed, no
+chat request). CPU and Fake-engine tests are not qualification. Live
+check still needed: a decisions deployment on llama.cpp 0.7.0 and SGLang
+0.5.22 becomes ready on the probe, and re-proves after a host reconnect.
+
+## Decision models, slice B: `POST /v1/systemone` — 2026-10-17 (branch `feat/decisions-route`)
+
+ADR 0030 (accepted, owner decisions 2026-10-17) §2 and §5. Spec §10 gains
+the decision endpoint (note and amendment log entry). Readiness and the wake
+check for decisions deployments (ADR 0030 §§3–4) are another slice.
+
+- **Router.** `POST /v1/systemone` shares the chat endpoint's API key, body
+  bound, JSON parse, lookup by `model`, waiting, activation, admission,
+  instance selection, request lease and settlement (one dispatch path,
+  `chat::dispatch_timed`, with an `Endpoint`). The request is validated
+  against its own closed contract before anything is touched: `model`,
+  `state` (required: string, object, array, or null passed to the engine),
+  `questions` (non-empty object; each `type` `noul`, `choice` or `score`,
+  optional `instructions` string, object or array, optional `criteria`: an
+  object for `choice` and `noul`, an array for `score`), optional `images` and
+  `files` (arrays of strings), nothing else. SGLang's `chat_template_kwargs`
+  is refused, since llama.cpp does not read it. Shapes only: counts and
+  semantics are the engine's.
+- **`api_mismatch`.** A chat deployment asked on `/v1/systemone`, or a
+  decisions deployment asked on `/v1/chat/completions` (streaming or not), is
+  HTTP 400 `api_mismatch` naming the endpoint to use, after the route lookup
+  and before waiting, activation or a slot. The router reads the API from the
+  deployment's current revision (`LifecyclePort::deployment_api`, store
+  `deployment_api`).
+- **Forwarding.** The engine forwarder's path allowlist gains exactly
+  `/v1/systemone`; `ChatForward::forward_decision` sends one JSON body with
+  `model` replaced by the served name and reads the answer whole (at most
+  16 MiB, the chat collection bound), returning it with the public name. A
+  whole, unambiguous JSON object whose `answers` is a non-empty object of
+  objects each naming a `type` is completion; an engine 400, 413 or 422 with
+  a complete JSON body is `engine_rejected` (SGLang's 422 validation
+  `detail` now gives its message); anything else, a truncated or duplicated
+  body included, is uncertain and never replayed. There is no first-token
+  event: the whole answer is due by the request deadline, and a cut there
+  is cancelling, as for chat.
+- **Host ingress.** Exactly `POST /v1/systemone` besides chat completions,
+  with its own body check (the decision contract), its fixed upstream path,
+  JSON-only answers, and the same keys, gate, 8 MiB bound, guard and timings.
+- **Metrics.** Generic timings and lease accounting are unchanged; a decision
+  records no time to first token or decode speed and its answer carries no
+  `capyctl.metrics`; the engine's `usage` passes through. No new labels.
+- **`/v1/models`.** Each entry carries `capyctl.api` (`chat` or
+  `decisions`), read from the store without waking anything
+  (`LifecyclePort::list_enabled_routes` replaces `list_enabled_route_ids`).
+
+Tests (T43): `capyctl-router/tests/decisions.rs` (admitted, forwarded and
+settled like chat through the real forwarder; contract refusals and
+`api_mismatch` both ways before activation, lease or engine; engine 400 and
+SGLang 422 relayed with the lease completed; truncated, partial, ambiguous,
+non-JSON and failed answers leave the lease uncertain without replay; the
+request deadline bounds a stalled engine; `/v1/models` names the API);
+`capyctl-agent/tests/ingress.rs` (path, contract and model checks, engine
+rejection relayed); forward unit tests (contract, answer evidence, path
+allowlist, validation detail); store test (the API follows the current
+revision). CPU and engine-double tests only; not qualification. The live
+check still needed: a decision request through the router and a host ingress
+to llama.cpp v0.7.0 and SGLang 0.5.22, and whether SGLang's running and
+waiting gauges count decision requests.
+
+## Decision models, slice A: the `api` deployment field — 2026-10-17 (branch `feat/decisions-api-field`)
+
+ADR 0030 (accepted, owner decisions 2026-10-17) §1 and §7, the part that
+resolves or refuses a deployment's API. Spec §15.1 and §16 gain the field and
+§20 gains T43; the readiness, routing and canary parts of ADR 0030 (§§2–5,
+spec §6.1 and §10) are other slices.
+
+- **`api: chat | decisions`** on a deployment, `chat` when omitted, in the
+  strict schema. It is frozen in the revision, part of its recipe fingerprint
+  and of the command fingerprint only when it is `decisions`, and round-trips
+  through the frozen snapshot. Every existing revision keeps its fingerprint:
+  the golden vLLM and SGLang revisions decode unchanged, and `api: chat`
+  resolves to exactly the revision that omits it.
+- **Resolution refusals**, all before anything is stored or launched
+  (`capyctl_config::decisions`): an installation that cannot serve decision
+  models is `capability_missing:decisions` (vLLM and TensorFold always;
+  llama.cpp below 0.7.0 and SGLang below 0.5.22, read from the profile's
+  registered `build_fingerprint`; a fingerprint that names no version is
+  refused, so it fails closed). The server checks it against the profile the
+  host published and the host checks it again at launch against the same
+  profile. From the document alone, with the instance spec: a `topology` of
+  any shape and a declared `deep` or `host_backed` residency are refused; an
+  undeclared residency resolves `restart_only`. A stated parser
+  (`engine_config.<engine>.tool_call_parser`/`reasoning_parser` other than
+  `auto`, or the options in `extra_args`) is refused, and parser selection
+  returns none for a decisions deployment (ADR 0024 applies to chat only).
+- **Host capability `decisions`** (ADR 0017): every current agent declares it.
+  At deploy, a host whose latest session did not declare it is recorded
+  refused `host_capability_missing:decisions` (a single named host refuses the
+  deploy); placement passes such a host over; and a launch, park or wake of a
+  decisions deployment on a live session without it is refused typed before
+  anything is sent.
+- **Status:** `capyctl status deployment` shows an `API` line and `"api":
+  "decisions"` in JSON for a decisions deployment; `validate config --host`
+  shows `effective.api`. Both new codes exit 5 and are in the errors page.
+
+Tests (T43, with T14, T34, T39): `capyctl-config` `tests/decisions.rs` (round
+trip and default, fingerprints of the golden revisions unchanged, each engine
+and version refused or accepted, topology and parking residency refused,
+parsers refused and none chosen) and the version parser's unit test;
+`capyctl-protocol` `decisions_gates_only_decision_deployments`;
+`capyctl-store` `a_decisions_deployment_is_never_placed_on_a_host_without_the_capability`;
+`capyctl-management` `a_host_without_decisions_never_takes_a_decisions_deployment`;
+`capyctl-controller` `a_decisions_launch_needs_the_capability`; the CLI's exit
+codes, errors page and status rendering. CPU and Fake-engine tests are not
+qualification. No live check yet: a decisions deployment cannot become ready
+until the readiness slice lands.
+
+## ADR 0030 accepted: decision models — 2026-10-17 (branch `docs/adr-0030-decision-models`)
+
+ADR 0030 records the owner's decisions of 2026-10-17 for decision models in 0.1.5: a deployment
+field `api: decisions`, the inference route `POST /v1/systemone`, engines (llama.cpp v0.7.0 and
+SGLang 0.5.22 first; vLLM once a release ships the endpoint; TensorFold 1.0 as its own change),
+and recipes for Clef-Flash, Clef, Kev-4B and one of Julia-1 or Laya. It proposes readiness by
+one fixed, well-formed decision and a wake check that compares probabilities within 0.05, and
+three scope limits for the first version, confirmed by the owner (one machine,
+restart instead of park, no readout in CapyCTL). Nothing is implemented yet. The SPEC
+amendments it lists land with the implementation.
+
 ## 0.1.4 release preparation — 2026-10-17
 
 Version bumped to 0.1.4 with release notes in

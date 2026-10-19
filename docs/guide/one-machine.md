@@ -34,7 +34,7 @@ capyctl start standalone
 ```
 
 ```text
-capyctl 0.1.4 standalone ready
+capyctl 0.1.5 standalone ready
 
   Inference     0.0.0.0:8443 (API key required)
   Management    127.0.0.1:7443
