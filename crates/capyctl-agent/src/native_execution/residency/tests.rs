@@ -187,6 +187,7 @@ fn frozen_restoring(endpoint: String, executable: &str, weight_restore: &str) ->
                 device_total_bytes: None,
                 overhead_bytes: None,
                 startup_graphs_bytes: None,
+                startup_eager_cap_bytes: None,
                 state_slot_bytes: None,
                 state_bytes: None,
                 member: None,

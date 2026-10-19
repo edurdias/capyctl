@@ -241,8 +241,11 @@ whole (embeddings, output head, norms and routers, read from the checkpoint's
 safetensors headers; a tenth of the weights when they cannot be read), plus
 the KV cache and margin you would get on one machine. A 126 GiB checkpoint at
 `tensor_parallel: 2` reserves about 64 GiB of weights on each machine.
-CapyCTL's placeholder for the startup peak is 2.25 times that share, so on two
-128 GB machines state `memory.startup` (for example `90GiB`) for such a model.
+CapyCTL's placeholder for the startup peak is 2.25 times that share plus 8 GiB;
+on vLLM loading `eager` (the default while a deployment parks) it is the share
+plus up to 32 GiB, plus 8 GiB (about 104 GiB here). Both are close to or above
+what a 128 GB machine has, so on two such machines state `memory.startup` (for
+example `90GiB`) for such a model.
 
 ## 6. Send a request
 
