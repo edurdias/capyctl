@@ -206,7 +206,7 @@ curl -fsSL https://edurdias.github.io/capyctl/install.sh | sudo sh -s -- --syste
 A downloaded copy takes the same options: `sh install.sh --version <version>`.
 
 **Choosing a release.** `--version` is optional (for example
-`--version v0.1.4`; the leading `v` is optional). GitHub's "latest release"
+`--version v0.1.5`; the leading `v` is optional). GitHub's "latest release"
 never resolves to a pre-release or a draft, so a release candidate is
 installed only by naming it.
 

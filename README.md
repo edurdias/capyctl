@@ -23,10 +23,10 @@ mutual TLS. [How it works](docs/guide/how-it-works.md) has a picture.
 
 ## Status
 
-0.1.4 is the latest release (0.1.0 was the first). It is early software: expect rough edges and
+0.1.5 is the latest release (0.1.0 was the first). It is early software: expect rough edges and
 breaking changes between minor versions while the version starts with 0.
 
-What works in 0.1.4:
+What works in 0.1.5:
 
 - vLLM, SGLang, TensorFold and llama.cpp engines, one GPU per model, on unified-memory
   machines and on discrete NVIDIA cards, where CapyCTL counts the card's memory apart from
@@ -38,6 +38,8 @@ What works in 0.1.4:
   card, parking into host RAM.
 - An OpenAI-compatible API (`/v1/models`, `/v1/chat/completions`), with
   streaming and tool calls, on the network with an API key.
+- Decision models (`api: decisions`) on llama.cpp and SGLang, answering
+  `POST /v1/systemone` with probabilities (one machine, restart only).
 - Linux on x86-64 and ARM64, NVIDIA GPUs.
 
 Not there yet:
@@ -66,7 +68,7 @@ capyctl --version
 
 The installer checks every download against the release's `SHA256SUMS` and
 refuses on a mismatch. To install a particular release, add
-`-s -- --version v0.1.4`. See [`docs/guide/install.md`](docs/guide/install.md)
+`-s -- --version v0.1.5`. See [`docs/guide/install.md`](docs/guide/install.md)
 to get started, and [`docs/operations/install.md`](docs/operations/install.md)
 for services, upgrades and rollback. Building from source needs stable Rust
 and `protoc` (`sudo apt install protobuf-compiler`), on ARM64 too:
@@ -83,7 +85,7 @@ capyctl start standalone          # inference on 0.0.0.0:8443, API key required
 ```
 
 ```text
-capyctl 0.1.4 standalone ready
+capyctl 0.1.5 standalone ready
 
   Inference     0.0.0.0:8443 (API key required)
   Management    127.0.0.1:7443
@@ -208,7 +210,7 @@ capyctl park deployment <name>
 ```text
 $ capyctl list hosts
 NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.4     supported       46.5 GiB / 77.2 GiB     vllm
+gpu-box   online   yes        0.1.5     supported       46.5 GiB / 77.2 GiB     vllm
 
 $ capyctl list deployments
 NAME           STATE    READY   REVISION   HOSTS
