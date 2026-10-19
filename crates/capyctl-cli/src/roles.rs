@@ -1634,6 +1634,22 @@ async fn start_standalone_inner(
     .await
 }
 
+/// The standalone role's durable state, under `state_dir/server`.
+///
+/// SPEC §10 (owner decision 2026-10-18): standalone is one machine, so an OS
+/// crash or power loss that loses the last request-lease commits also ends
+/// the engine work they account for; its request ledger commits with
+/// `synchronous=NORMAL` ([`capyctl_store::RequestLedgerSync::LocalEnginesOnly`]).
+fn standalone_owned_state(
+    state_dir: &Path,
+    secrets: SecretsKey,
+) -> Result<OwnedCoordinatorState, capyctl_controller::OwnedStateError> {
+    Ok(
+        OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?
+            .with_local_engines_only(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_standalone_in(
     state_dir: &Path,
@@ -1860,13 +1876,9 @@ async fn start_standalone_in(
     let secrets = SecretsKey::load_or_create(&state_dir.join("identity").join("secrets.key"))?;
     // The coordinator opens the durable state itself and holds the controller lock
     // for as long as it runs, so nothing else may act as an authority over it.
-    // SPEC §10 (owner decision 2026-10-18): standalone is one machine, so an OS
-    // crash or power loss that loses the last request-lease commits also ends
-    // the engine work they account for.
-    let owner = Arc::new(std::sync::Mutex::new(
-        OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?
-            .with_local_engines_only(),
-    ));
+    let owner = Arc::new(std::sync::Mutex::new(standalone_owned_state(
+        state_dir, secrets,
+    )?));
     // SPEC §8.2 / T21 (owner decision 2026-09-25): the private rendezvous root,
     // swept of directories no retained launch owns before any launch runs.
     {
@@ -2397,6 +2409,24 @@ pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T17 (SPEC §10, owner decision 2026-10-18): the standalone role's
+    // request ledger commits with synchronous=NORMAL, since every engine it
+    // accounts for runs on its own machine.
+    #[test]
+    fn the_standalone_ledger_commits_for_local_engines_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = root.path().join("server");
+        std::fs::create_dir(&server).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owned = standalone_owned_state(root.path(), SecretsKey::generate_ephemeral()).unwrap();
+        assert_eq!(
+            owned.store().request_ledger_sync(),
+            capyctl_store::RequestLedgerSync::LocalEnginesOnly
+        );
+    }
 
     // T41 T03 (ADR 0023 §2): only TensorFold's version is its last word, as
     // `engine add` records it; vLLM and SGLang publish what they print, so

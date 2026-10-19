@@ -487,6 +487,19 @@ pub(crate) fn load_view(
     )
 }
 
+/// The control-plane server's durable state.
+///
+/// SPEC §10 (owner decision 2026-10-18): its engines run on other hosts,
+/// which an OS crash or power loss here does not stop, so its request ledger
+/// keeps every commit `synchronous=FULL`: a lost grant would leave an engine
+/// running a request no lease accounts for.
+fn server_owned_state(
+    state_dir: &Path,
+    secrets: capyctl_store::secrets::SecretsKey,
+) -> Result<OwnedCoordinatorState, capyctl_controller::OwnedStateError> {
+    OwnedCoordinatorState::open_with_secrets(state_dir, secrets)
+}
+
 async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     let storage = IdentityDirectory::open(&config.identity_dir).map_err(|e| {
         identity_refused(
@@ -510,15 +523,13 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     )
     .map_err(|_| unavailable())?;
     let owner = Arc::new(Mutex::new(
-        OwnedCoordinatorState::open_with_secrets(&config.state_dir, secrets).map_err(
-            |failure| match failure {
-                // SPEC §13.2 / T33: say what happened and how to recover.
-                capyctl_controller::OwnedStateError::Store(
-                    newer @ capyctl_store::StoreError::FromNewerVersion { .. },
-                ) => from_newer_version(newer.to_string()),
-                _ => error("Controller state is unsafe or already owned"),
-            },
-        )?,
+        server_owned_state(&config.state_dir, secrets).map_err(|failure| match failure {
+            // SPEC §13.2 / T33: say what happened and how to recover.
+            capyctl_controller::OwnedStateError::Store(
+                newer @ capyctl_store::StoreError::FromNewerVersion { .. },
+            ) => from_newer_version(newer.to_string()),
+            _ => error("Controller state is unsafe or already owned"),
+        })?,
     ));
     let ca_pem = ca.certificate_pem().to_owned();
     let authority = Arc::new(EnrollmentAuthority::new(owner.clone(), ca));
@@ -1780,5 +1791,28 @@ mod banner_tests {
         let named = banner(json!({"runtime_profiles": {"sglang": {}, "vllm": {}}}));
         assert!(named.contains("sglang, vllm"), "{named}");
         assert!(!named.contains("engine add"), "{named}");
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    // T17 (SPEC §10, owner decision 2026-10-18): the server's request ledger
+    // stays fully synchronous, since its engines outlive this machine's OS.
+    #[test]
+    fn the_server_ledger_commits_fully_synchronously() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owned = server_owned_state(
+            root.path(),
+            capyctl_store::secrets::SecretsKey::generate_ephemeral(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned.store().request_ledger_sync(),
+            capyctl_store::RequestLedgerSync::Full
+        );
     }
 }

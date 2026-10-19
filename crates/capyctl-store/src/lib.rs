@@ -145,6 +145,11 @@ impl Store {
     pub fn set_request_ledger_sync(&mut self, sync: RequestLedgerSync) {
         self.request_ledger_sync = sync;
     }
+
+    /// How this store commits its request ledger (SPEC §10).
+    pub fn request_ledger_sync(&self) -> RequestLedgerSync {
+        self.request_ledger_sync
+    }
 }
 
 /// SPEC §17 (bounded work per request): the router reads the store several

@@ -47,11 +47,12 @@ machine, from 5.6–6.4 ms to 4.25–4.85 ms. Planning a request now costs
 0.05 ms instead of 0.5 ms, and the store reads on the way 0.9 ms instead of
 2.1 ms. The remaining overhead is the two synchronous ledger commits (about
 1.1 ms each here, one `fsync` of the write-ahead log) and their writer round
-trips; changing them is an owner decision (the PR lists the options with
-their measured gains): `synchronous=NORMAL`, closing the lease after the
-answer is sent, and an index on `lifecycle_steps(binding_id)` and
-`journal_entries(operation_id)` (the instance read scans both tables, about
-1.2 ms per 1000 initialize operations of history).
+trips. The owner took all three options on 2026-10-18 (see "Request ledger
+commits off the answer's path"): `synchronous=NORMAL` for the standalone
+request ledger, closing the lease after the answer is sent, and indexes on
+`lifecycle_steps(binding_id)` and `journal_entries(operation_id)` (the
+instance read scanned both tables, about 1.2 ms per 1000 initialize
+operations of history).
 
 CPU and Fake-engine tests are not qualification. Live check still needed:
 repeat the host A decision-request comparison (Julia-1 and Clef-Flash, one
