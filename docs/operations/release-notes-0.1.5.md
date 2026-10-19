@@ -85,9 +85,12 @@ an impossible startup estimate before its first start.
 
 - **Decision models run restart only, on one machine.** A deployment with
   `api: decisions` cannot park and cannot span machines.
-- **llama.cpp can starve slots under several concurrent decision requests.** With several
-  decision requests at once, some llama.cpp slots can wait without being served; this
-  reproduces on llama.cpp without CapyCTL.
+- **llama.cpp can starve a decision request when several run at once.** With 4 or 8
+  concurrent decision requests on llama.cpp v0.7.0, a few waited until every other request
+  had finished (Clef-Flash: 149 s against a 3.7 s median); llama-server alone does the same,
+  without CapyCTL. Concurrent requests add almost no decision throughput on llama.cpp, so
+  set `engine_config: {max_concurrent_requests: 1}` there, or use SGLang when several
+  clients share one decision model.
 - **vLLM has no decision support yet.** A decisions deployment on vLLM is refused
   `capability_missing:decisions`.
 - **A standalone request ledger trades durability for latency.** On a standalone machine
