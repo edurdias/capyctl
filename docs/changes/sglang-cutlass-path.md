@@ -36,9 +36,15 @@ same name in `dsl_packages` does not shadow the stdlib, and the marker is never
 written. A `dsl_packages` symlinked outside the tree is not added and
 `import cutlass` fails, as it did for every installation before this change;
 a symlinked `nvidia_cutlass_dsl` or a `dsl_packages` that is a file is not
-added either. CPU and Fake-engine tests are not qualification. Live check still
-needed: SGLang 0.5.22 serving Qwen3-4B-Instruct (BF16) through CapyCTL on
-host A.
+added either. CPU and Fake-engine tests are not qualification.
+
+Found and checked live on host A, 2026-10-19: before this change, Qwen3-4B-Instruct (BF16)
+on SGLang 0.5.22 through CapyCTL `main` (`07ee2ea6`) failed to start (scheduler
+`ModuleNotFoundError: No module named 'cutlass'` from `sglang/srt/layers/dual_gemm.py`),
+while the same venv launched directly served it. With this branch (`e63dd670`) the
+deployment initialized and served 4 concurrent streams; when their clients hung up, SGLang's
+`num_running_reqs` went from 4 to 0 within 0.15 s (0.13 to 0.14 s for SGLang launched
+directly), and CapyCTL recorded the cancellation as acknowledged once the engine was idle.
 
 # Release note: Fixes
 
