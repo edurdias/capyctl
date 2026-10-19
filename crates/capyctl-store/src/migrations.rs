@@ -1290,4 +1290,58 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// v50 (SPEC §17, owner decision 2026-10-18): a v49 store gains the two
+    /// history indexes the router's serving-instance read searches, keeping
+    /// its rows, and the lookups by binding and by operation use them.
+    // T33
+    #[test]
+    fn v50_indexes_the_history_the_instance_read_searches() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 49).unwrap();
+        let indexes = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='index'
+                 AND name IN ('lifecycle_steps_binding','journal_entries_operation') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        assert!(indexes(&conn).is_empty());
+        conn.execute_batch(
+            "INSERT INTO journal_entries(id,host_id,operation_id,state,evidence)
+             VALUES('j','h','op','running','{}');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            indexes(&conn),
+            ["journal_entries_operation", "lifecycle_steps_binding"]
+        );
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal_entries WHERE id='j'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        let plan = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("; ")
+        };
+        let steps = plan("SELECT id FROM lifecycle_steps WHERE binding_id='b'");
+        assert!(steps.contains("lifecycle_steps_binding"), "{steps}");
+        let journal = plan("SELECT 1 FROM journal_entries WHERE operation_id='op'");
+        assert!(journal.contains("journal_entries_operation"), "{journal}");
+    }
 }

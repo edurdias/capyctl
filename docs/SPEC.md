@@ -1032,7 +1032,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T14 | Reserved flags/profile change | Conflicts fail; effective config shows provenance; a superseded binding identity is not reused. |
 | T15 | Simultaneous activation requests | Single activation operation and one group; no duplicate processes. |
 | T16 | A -> B -> A | Correct generations, model readiness, release evidence, and resource retention. |
-| T17 | Active streaming during swap | Drain honors completion/cancellation; a client hang-up closes the engine connection and stays charged until engine quiescence, as does an engine's complete error answer; no premature park or response replay. |
+| T17 | Active streaming during swap | Drain honors completion/cancellation; a client hang-up closes the engine connection and stays charged until engine quiescence, as does an engine's complete error answer; a completed answer may reach the client before its lease close is committed, which still ends the lease completed (a client leaving after its answer does not stop it; a crash before it leaves the lease charged); no premature park or response replay. |
 | T18 | Late ingress request | Stale generation/admission token rejected after closure. |
 | T19 | Fairness and queue bounds | Busy A cannot reset the window forever; byte/count limits and deadlines enforced. |
 | T20 | Park/reload timeout or partial failure | No blind repeated collective; reconcile, quarantine, or verified restart. |
@@ -1072,6 +1072,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
+- 2026-10-18 (owner decision, measured live): a completed answer reaches the client before its request-lease close is committed, and the request's in-flight slot is released only after the close; a standalone role commits its request ledger with SQLite `synchronous=NORMAL`, while the server keeps `FULL` for every write (§10, T17; [ADR 0002](design/adr/0002-persistence.md) amendment).
 - 2026-10-17 (found live): an engine's complete error answer (HTTP 5xx other than 503 with a JSON object body) is relayed as 502 `engine_error` with the engine's message and leaves the request `cancelling` until engine quiescence, instead of uncertain for the life of the session (§10, T17).
 - 2026-10-17, [ADR 0030](design/adr/0030-decision-models.md): decision models, a deployment's `api` (`chat` or `decisions`), refused on an engine, topology, residency or parser it cannot use, and the host capability `decisions` (§15.1, §16, T43); `POST /v1/systemone` for decisions deployments, its closed request contract, completion evidence, the `api_mismatch` refusal and `capyctl.api` in `/v1/models` (§10, T43); readiness of a model that generates no text is a fixed well-formed decision, and its wake check compares probabilities within 0.05 (§6.1).
 - 2026-10-09, [ADR 0029](design/adr/0029-llamacpp-engine.md): llama.cpp's `llama-server` as the fourth engine, `restart_only`, one model per deployment (§1, §9.4, T42).

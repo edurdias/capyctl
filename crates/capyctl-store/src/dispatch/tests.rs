@@ -363,3 +363,47 @@ fn a_local_lease_batch_leaves_other_writes_fully_synchronous() {
     ));
     assert_eq!(synchronous(&store), 2);
 }
+
+// T17 (SPEC §10, owner decision 2026-10-18): a lease granted on a standalone
+// store is on disk once its grant is answered. A process that dies between
+// the answer to its client and the lease close (the connection is never
+// closed, so nothing is checkpointed) leaves the lease charged: the next
+// session holds it as uncertain until its quiescence path settles it.
+#[test]
+fn a_local_grant_survives_a_crash_before_its_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite3");
+    let mut store = Store::open(&path).unwrap();
+    store.set_request_ledger_sync(crate::RequestLedgerSync::LocalEnginesOnly);
+    let session = store.begin_coordinator_session().unwrap();
+    let deployment = ready_deployment(&store, "a");
+    let granted = store
+        .apply_request_lease_batch(
+            &session,
+            &[LeaseWrite::Grant {
+                deployment_id: deployment.clone(),
+                max_per_deployment: 2,
+                max_total: 8,
+            }],
+        )
+        .unwrap();
+    let Ok(LeaseWriteOutcome::Granted(ticket)) = &granted[0] else {
+        panic!("granted: {granted:?}");
+    };
+    // The process dies: the connection is abandoned, not closed.
+    std::mem::forget(store);
+    let reopened = Store::open(&path).unwrap();
+    let _next = reopened.begin_coordinator_session().unwrap();
+    let pending = reopened.pending_dispatches(&deployment).unwrap();
+    assert_eq!(pending.len(), 1, "the lease stays charged: {pending:?}");
+    assert!(pending[0].uncertain, "{pending:?}");
+    let disposition: String = reopened
+        .conn
+        .query_row(
+            "SELECT disposition FROM request_leases WHERE id=?1",
+            [ticket.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(disposition, "uncertain");
+}

@@ -43,6 +43,30 @@ per case: the router's added p50 went from 4.2–4.8 ms (PR #150 alone) to
 1.8–2.0 ms. Over 100 requests per case the process made 78 `fsync` calls
 instead of 1117.
 
+The ledger durability is recorded as an amendment to ADR 0002 and in the
+SPEC's amendment list and T17 row. Tests (CPU, tagged T17 or T33):
+
+- `the_standalone_ledger_commits_for_local_engines_only` and
+  `the_server_ledger_commits_fully_synchronously` (`capyctl-cli`): each
+  role opens its store through one function (`standalone_owned_state`,
+  `server_owned_state`), and only the standalone one relaxes the ledger.
+- `a_completed_answer_reaches_the_client_before_its_lease_close`
+  (`capyctl-router`): with the close held back, a collected answer and a
+  stream through `[DONE]` both reach the client while the lease is still
+  open and the request still holds its slot; the close then ends the lease
+  completed and frees the slot.
+- `a_client_that_leaves_after_its_answer_still_has_its_lease_closed`: over
+  a real connection, a client that hangs up right after its whole answer,
+  collected or streamed, does not stop the close.
+- `a_crash_between_answer_and_close_leaves_the_lease_charged` (router: the
+  runtime dies with the close pending, the lease is never closed) and
+  `a_local_grant_survives_a_crash_before_its_close` (store: a grant
+  committed with `NORMAL` on a connection abandoned without closing is read
+  back by the next session as an uncertain, charged lease).
+- `v50_indexes_the_history_the_instance_read_searches`: a v49 store gains
+  both indexes, keeps its rows, and the lookups by binding and operation
+  use them.
+
 `scripts/ci-local.sh --deep` passes. CPU and Fake-engine tests are not
 qualification. Live check still needed: repeat the host A decision-request
 comparison (Julia-1 and Clef-Flash, one and three questions, about 200 and

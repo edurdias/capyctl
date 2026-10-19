@@ -282,6 +282,24 @@ struct StubAuthority {
     refuse_leases: Mutex<Option<capyctl_controller::LeaseRefused>>,
     /// ADR 0028 §11: the instance it serves, and the group stalls reported.
     instances: InstanceStub,
+    /// SPEC §10 (owner decision 2026-10-18): holds lease closes back.
+    closes: CloseGate,
+}
+
+/// SPEC §10 (owner decision 2026-10-18): while held, every lease close waits
+/// for a permit, so a test sees a request between its answer and its close.
+struct CloseGate {
+    held: std::sync::atomic::AtomicBool,
+    permits: tokio::sync::Semaphore,
+}
+
+impl Default for CloseGate {
+    fn default() -> Self {
+        Self {
+            held: std::sync::atomic::AtomicBool::new(false),
+            permits: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 /// ADR 0028 §11 (decided 2026-10-06): the one instance a stub reports, when it
@@ -344,6 +362,7 @@ impl StubAuthority {
                 stall_timeout: std::time::Duration::from_secs(120),
                 reports: Mutex::new(Vec::new()),
             },
+            closes: CloseGate::default(),
         })
     }
 
@@ -445,6 +464,9 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
         lease: capyctl_controller::RequestLease,
         end: capyctl_controller::LeaseEnd,
     ) -> Result<(), capyctl_controller::LeaseRefused> {
+        if self.closes.held.load(std::sync::atomic::Ordering::SeqCst) {
+            self.closes.permits.acquire().await.unwrap().forget();
+        }
         let mut leases = self.leases.lock().unwrap();
         let entry = leases
             .iter_mut()
@@ -642,6 +664,7 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
         instances: InstanceStub::default(),
+        closes: CloseGate::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let router = capyctl_router::serve_router(RouterDeps {
@@ -730,6 +753,7 @@ fn stub_router_on(endpoint: &str, engine: Option<&str>) -> (Arc<StubAuthority>, 
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
         instances: InstanceStub::default(),
+        closes: CloseGate::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let deps = RouterDeps {
@@ -1741,4 +1765,124 @@ async fn a_malformed_cache_salt_is_refused_before_any_engine() {
     let body = chat_body("public-alias", serde_json::json!({"cache_salt": longest}));
     let (status, answer) = post_raw(&router, body, None).await;
     assert_eq!(status, 200, "{answer}");
+}
+
+/// Wait, at most five seconds, until `done` holds.
+async fn eventually(mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "never happened");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+// T17 (SPEC §10, owner decision 2026-10-18): a completed answer, collected or
+// streamed through `[DONE]`, reaches the client before its lease close is
+// committed. Until the close is written the lease is open and the request
+// still holds its in-flight slot; the close then ends it completed and frees
+// the slot.
+#[tokio::test]
+async fn a_completed_answer_reaches_the_client_before_its_lease_close() {
+    let (endpoint, _) = scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+    let (authority, deps) = stub_router(&endpoint);
+    authority
+        .closes
+        .held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let router = capyctl_router::serve_router(deps.clone());
+
+    let (status, body) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ends(&authority), vec![None], "answered before the close");
+    assert_eq!(
+        deps.inflight.current("dep-1"),
+        1,
+        "the slot waits for the close"
+    );
+    authority.closes.permits.add_permits(1);
+    eventually(|| ends(&authority) == vec![Some(capyctl_controller::LeaseEnd::Completed)]).await;
+    eventually(|| deps.inflight.current("dep-1") == 0).await;
+
+    let (status, text) = chat_stream(&router, "public-alias").await;
+    assert_eq!(status, 200);
+    assert!(text.contains("[DONE]"), "{text}");
+    assert_eq!(
+        ends(&authority)[1],
+        None,
+        "the stream ended before its close"
+    );
+    assert_eq!(
+        deps.inflight.current("dep-1"),
+        1,
+        "the slot waits for the close"
+    );
+    authority.closes.permits.add_permits(1);
+    eventually(|| ends(&authority) == vec![Some(capyctl_controller::LeaseEnd::Completed); 2]).await;
+    eventually(|| deps.inflight.current("dep-1") == 0).await;
+}
+
+// T17 (SPEC §10, owner decision 2026-10-18): a client that hangs up right
+// after its whole answer, collected or streamed, does not stop the lease
+// close: the close runs on the dispatch's own task, not on the connection.
+#[tokio::test]
+async fn a_client_that_leaves_after_its_answer_still_has_its_lease_closed() {
+    let (endpoint, _) = scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+    let (authority, deps) = stub_router(&endpoint);
+    authority
+        .closes
+        .held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = capyctl_router::serve_router(deps.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for stream in [false, true] {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "public-alias", "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.text().await.unwrap();
+        assert!(!stream || body.contains("[DONE]"), "{body}");
+        // The client goes away with its connection.
+        drop(client);
+    }
+    assert_eq!(ends(&authority), vec![None, None]);
+    authority.closes.permits.add_permits(2);
+    eventually(|| ends(&authority) == vec![Some(capyctl_controller::LeaseEnd::Completed); 2]).await;
+    eventually(|| deps.inflight.current("dep-1") == 0).await;
+}
+
+// T17 (SPEC §10, owner decision 2026-10-18): a process that dies between a
+// completed answer and its lease close never closes the lease. With the
+// durable ledger it stays charged until the quiescence path settles it
+// (capyctl-store `a_local_grant_survives_a_crash_before_its_close`).
+#[test]
+fn a_crash_between_answer_and_close_leaves_the_lease_charged() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let authority = runtime.block_on(async {
+        let (endpoint, _) =
+            scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+        let (authority, deps) = stub_router(&endpoint);
+        authority
+            .closes
+            .held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let router = capyctl_router::serve_router(deps);
+        let (status, body) = chat_once(&router, "public-alias").await;
+        assert_eq!(status, 200, "{body}");
+        authority
+    });
+    // The process dies with the close still pending.
+    drop(runtime);
+    assert_eq!(ends(&authority), vec![None], "never closed: still charged");
 }
