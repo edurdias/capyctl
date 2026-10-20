@@ -53,7 +53,8 @@ pub fn validate_declared_resources(deployment: &Value) -> Result<(), ConfigError
         Some(value) => decode(value, "devices")?,
         None => Vec::new(),
     };
-    core::validate_resources_intrinsic(&recipe, &devices)
+    core::validate_resources_intrinsic(&recipe, &devices)?;
+    core::validate_device_coverage(&recipe)
 }
 
 /// Give each named claim without `sharing` the sharing `stated` gives the same

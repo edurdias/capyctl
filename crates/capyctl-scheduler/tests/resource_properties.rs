@@ -101,7 +101,8 @@ fn recipe_peaks_cover_each_adjacent_phase() {
 // without admission, so Ready may claim no device its peak phases lack. Found
 // by the formal review (formal/CapyFormal/Completion.lean): a cold phase with
 // no device and a Ready phase holding gpu0 exclusively put a second exclusive
-// owner on a GPU.
+// owner on a GPU. The rule is checked when a revision is written; the byte
+// rules every stored recipe is read under do not change.
 #[test]
 fn recipe_peaks_cover_each_adjacent_phase_device_claims() {
     let claim = |sharing| DeviceClaim {
@@ -125,7 +126,7 @@ fn recipe_peaks_cover_each_adjacent_phase_device_claims() {
         parked: f(ResourcePhase::Parked, 8, vec![]),
         wake: f(ResourcePhase::Wake, 70, ex()),
     };
-    assert_eq!(validate_recipe(&recipe), Ok(()));
+    assert_eq!(validate_device_coverage(&recipe), Ok(()));
     for drop in [0, 1, 2] {
         let mut broken = recipe.clone();
         match drop {
@@ -133,14 +134,21 @@ fn recipe_peaks_cover_each_adjacent_phase_device_claims() {
             1 => broken.parking.devices.clear(),
             _ => broken.wake.devices.clear(),
         }
-        assert_eq!(validate_recipe(&broken), Err(ResourceError::Invalid));
+        assert_eq!(
+            validate_device_coverage(&broken),
+            Err(ResourceError::Invalid)
+        );
+        assert_eq!(validate_recipe(&broken), Ok(()));
     }
     // A peak may hold a claim more strongly than Ready, never more weakly.
     recipe.ready.devices = vec![claim(Sharing::Shared)];
-    assert_eq!(validate_recipe(&recipe), Ok(()));
+    assert_eq!(validate_device_coverage(&recipe), Ok(()));
     recipe.ready.devices = ex();
     recipe.cold.devices = vec![claim(Sharing::Shared)];
-    assert_eq!(validate_recipe(&recipe), Err(ResourceError::Invalid));
+    assert_eq!(
+        validate_device_coverage(&recipe),
+        Err(ResourceError::Invalid)
+    );
 }
 
 #[test]

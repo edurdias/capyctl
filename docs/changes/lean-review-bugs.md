@@ -22,12 +22,19 @@ Lean models are not ported.
   `validate_recipe` compared bytes between phases but never device claims. A
   declared `resources:` block with no device in `cold` and `gpu0` exclusive in
   `ready` resolved, and completion then put a second exclusive owner on the
-  GPU. Every base-phase claim must now be held by its peak phase on the same
-  device, equally or exclusively. Tests (T26 T27):
-  `recipe_peaks_cover_each_adjacent_phase_device_claims` (scheduler) and
-  `a_ready_phase_may_not_claim_a_device_its_cold_phase_lacks` (config). The
-  `sequence` fixture that built such a recipe now claims the device in its
-  peak phases too.
+  GPU. A revision written now (deploy, replace, `capyctl validate`) must have
+  every base-phase claim held by its peak phase on the same device, equally or
+  exclusively (`validate_device_coverage`). The rule is not applied to a
+  revision accepted before it (`CheckpointFacts::accepted_revision`, set when
+  a stored snapshot is decoded or re-resolved and when a host resolves the
+  revision its server accepted). Such a revision still decodes, starts, stops
+  and can be replaced, because more than twenty store paths decode stored
+  revisions, placement and startup among them. Tests (T26 T27):
+  `recipe_peaks_cover_each_adjacent_phase_device_claims` (scheduler),
+  `a_ready_phase_may_not_claim_a_device_its_cold_phase_lacks` (config) and
+  `a_revision_stored_before_device_coverage_still_decodes_stops_and_is_replaced`
+  (store). The store test failed while the rule also applied to stored
+  revisions.
 - **A granted request lease leaked when its caller was dropped after the reply
   was sent** (SPEC §10). The writer closed a grant as not accepted only when
   `reply.send` failed. The first lease of a request is opened in the handler
@@ -49,7 +56,9 @@ the recipe rule; the park and lease paths have no live repro yet.
 - **A `resources:` block whose `ready` phase claims a device its `cold`,
   `parking` or `wake` phase does not is refused** when the deployment is
   written, instead of putting a second exclusive owner on the device when the
-  instance becomes ready.
+  instance becomes ready. A deployment stored before the upgrade with such a
+  block keeps running and can be stopped; replace it with a block whose
+  larger phases claim the device too.
 - **A request whose client disconnects while its lease is being granted no
   longer leaves that lease charged** until the controller restarts, where it
   refused parks of the instance and held switch drains to their timeout.
