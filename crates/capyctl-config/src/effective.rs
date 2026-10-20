@@ -1677,6 +1677,9 @@ pub fn resolve_effective_with_checkpoint(
             .unwrap_or(deadline_ceiling_ms),
     };
     core::validate_recipe(&recipe, &host, deadline_ceiling_ms)?;
+    if !facts.accepted_revision {
+        core::validate_device_coverage(&recipe.resources)?;
+    }
     let timeouts = timeouts::resolve_timeouts(
         d.timeouts.as_ref(),
         recipe.request_deadline_ms,

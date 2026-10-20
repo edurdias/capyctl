@@ -592,6 +592,9 @@ impl NativeHostExecution {
             // ADR 0029 §9: and the GGUF facts a llama.cpp revision was sized
             // with.
             gguf: plan.checkpoint_gguf,
+            // The server accepted this revision; it keeps the rules it was
+            // accepted under (SPEC §7.3 device coverage applies to writes).
+            accepted_revision: true,
             ..Default::default()
         };
         let mut effective =

@@ -286,6 +286,12 @@ pub struct CheckpointFacts {
     /// beside the weights (`context_fit::llamacpp::measure`): the bytes it
     /// loads and its header's cache shape. `None` for any other engine.
     pub gguf: Option<capyctl_domain::gguf::GgufFacts>,
+    /// The revision was accepted before: a stored snapshot re-resolved, or a
+    /// host resolving the revision its server accepted. It keeps the rules it
+    /// was accepted under, so SPEC §7.3's device coverage
+    /// (`resources::validate_device_coverage`, added 2026-10-20) is checked
+    /// only when a revision is written. Never set for a new resolution.
+    pub accepted_revision: bool,
 }
 
 impl CheckpointFacts {

@@ -163,6 +163,15 @@ struct ResidencyPlan {
     accepted_at_ms: i64,
     deadline_ms: i64,
     execution: Option<ResidencyExecution>,
+    /// When the park was accepted, the gate was open, or a switch of this
+    /// session handed over the closure it recorded on the open gate
+    /// (`handed_gate`). A park cancelled or refused without effect then
+    /// reopens it once no other closure remains. A gate a restart closed
+    /// records no closure; it stays closed for readiness supervision to reopen
+    /// after `require_settled` (SPEC §10).
+    /// Absent in plans stored before this field: they never reopen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reopens_dispatch: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -757,6 +766,9 @@ fn current_residency(
 
 /// Accept one instance's park or restore, or join the one of that kind already
 /// open. Nothing is sent; the worker arms it.
+/// `handed_gate`: the caller closed this instance's open gate for a reason it
+/// now hands to the park (a switch releasing its drained victim), so the park
+/// owns that closure as if it had closed the open gate itself.
 #[allow(clippy::too_many_arguments)]
 fn accept_instance(
     tx: &Transaction<'_>,
@@ -767,6 +779,7 @@ fn accept_instance(
     principal: &str,
     now: i64,
     deadline: i64,
+    handed_gate: bool,
 ) -> Result<ResidencyReceipt, LifecycleError> {
     // T15: a second request for the same change joins the open one.
     if let Some((operation, open_kind)) = open_run(tx, deployment, instance)? {
@@ -837,6 +850,8 @@ fn accept_instance(
         accepted_at_ms: now,
         deadline_ms: deadline,
         execution: None,
+        reopens_dispatch: kind == ResidencyKind::Park
+            && (handed_gate || dispatch_open(tx, deployment, instance)?),
     };
     let run_plan = serde_json::json!({
         "version": 1,
@@ -1048,6 +1063,7 @@ impl crate::Store {
                         principal,
                         now,
                         deadline,
+                        false,
                     ),
                 };
             match accepted {
@@ -1108,7 +1124,7 @@ impl crate::Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let receipt = Self::instance_park_in_transaction(
-            &tx, s, principal, deployment, instance, key, now, deadline,
+            &tx, s, principal, deployment, instance, key, now, deadline, false,
         )?;
         tx.commit()?;
         Ok(receipt)
@@ -1124,6 +1140,7 @@ impl crate::Store {
         key: &str,
         now: i64,
         deadline: i64,
+        handed_gate: bool,
     ) -> Result<ResidencyReceipt, LifecycleError> {
         let revision: i64 = tx
             .query_row(
@@ -1148,6 +1165,7 @@ impl crate::Store {
             principal,
             now,
             deadline,
+            handed_gate,
         )?;
         store_receipt(
             tx,
@@ -1279,6 +1297,7 @@ impl crate::Store {
                 principal,
                 now,
                 deadline,
+                false,
             ) {
                 Ok(receipt) => {
                     first.get_or_insert(receipt);
@@ -1568,9 +1587,9 @@ fn cancel(
         "DELETE FROM lifecycle_claims WHERE operation_id=?1",
         [&p.operation_id],
     )?;
-    if p.kind == ResidencyKind::Park {
+    if p.kind == ResidencyKind::Park && p.reopens_dispatch {
         // Nothing reached the engine or its host's gate: the launch is still
-        // Ready and serves again.
+        // Ready and serves again, through the gate this park closed.
         reopen(tx, p)?;
     }
     journal(
@@ -1587,10 +1606,24 @@ fn cancel(
     record(tx, s, p, Stage::Cancelled, None)
 }
 
+/// Whether the instance's dispatch gate is open now.
+fn dispatch_open(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row(
+        "SELECT dispatch_enabled=1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+        params![deployment, instance],
+        |r| r.get(0),
+    )?)
+}
+
 /// Reopen a Ready instance's dispatch after a park that had no effect on it.
 ///
 /// ADR 0015 amendment (closure reasons), SPEC §13.2: the park reopens only the
-/// gate it closed. A host-session, engine-exit or switch closure recorded for
+/// gate it closed (`reopens_dispatch`), never one a restart closed. A
+/// host-session, engine-exit or switch closure recorded for
 /// the incarnation while the park was in flight keeps it closed until its own
 /// evidence clears it.
 fn reopen(tx: &Transaction<'_>, p: &ResidencyPlan) -> Result<(), LifecycleError> {
@@ -2250,8 +2283,12 @@ fn refuse(
         [&p.operation_id],
     )?)?;
     let gate = if p.kind == ResidencyKind::Park && !remote(tx, &p.binding_id)? {
-        reopen(tx, &p)?;
-        "dispatch reopened"
+        if p.reopens_dispatch {
+            reopen(tx, &p)?;
+            "dispatch reopened"
+        } else {
+            "the gate it found closed stays closed until fresh readiness reopens it"
+        }
     } else if p.kind == ResidencyKind::Park {
         "the host's gate stays closed until a fresh model probe reopens it"
     } else {
@@ -2382,6 +2419,9 @@ pub(super) fn adopt_residency(
     for (id, state) in open {
         let (mut p, _) = read(tx, &id)?;
         let retired = std::mem::replace(&mut p.session_id, s.id().into());
+        // SPEC §10: the restart closed the gate this park found open, without
+        // a closure; only readiness supervision reopens it in this session.
+        p.reopens_dispatch = false;
         if state == "planned" {
             one(tx.execute(
                 "UPDATE lifecycle_steps SET state='cancelled' WHERE id=?1 AND state='planned'",
@@ -2652,7 +2692,7 @@ fn idle_one(
     if !parked && parks(&e) && !refused_park && growth.is_none() {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
-            tx, s, "idle", deployment, instance, &key, now, deadline,
+            tx, s, "idle", deployment, instance, &key, now, deadline, false,
         )?;
         journal(
             tx,
@@ -2934,6 +2974,7 @@ impl crate::Store {
                 &park_key,
                 now,
                 receipt.deadline_ms,
+                false,
             );
             match park {
                 // The same key replays an earlier park: one that failed (a
