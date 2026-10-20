@@ -71,6 +71,7 @@ pub fn render(command: &Command, value: &Value, context: &Context) -> String {
                 .as_str()
                 .unwrap_or("not recorded in this build")
         ),
+        Command::EngineFlags { .. } => engine_flags(value),
     }
 }
 
@@ -83,6 +84,41 @@ fn generic(command: &Command, value: &Value) -> String {
         .unwrap_or("command")
         .to_lowercase();
     record(&format!("{name} done"), value)
+}
+
+/// ADR 0021: `engine flags` as two tables, options then environment, each
+/// row with its class (and approval kind) and reason.
+fn engine_flags(value: &Value) -> String {
+    let rows = |key: &str| -> Vec<Vec<String>> {
+        value[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                let name = match row["match"].as_str() {
+                    Some("prefix") => format!("{}*", s(&row["name"])),
+                    _ => s(&row["name"]),
+                };
+                let class = match row["approval"].as_str() {
+                    Some(kind) => format!("{} ({kind})", s(&row["class"])),
+                    None => s(&row["class"]),
+                };
+                vec![name, class, s(&row["reason"])]
+            })
+            .collect()
+    };
+    let version = match value["version"].as_str() {
+        Some(version) => format!(" {version}"),
+        None => String::new(),
+    };
+    format!(
+        "{}{version} options\n{}\nOther options: {}.\n\nEngine environment\n{}\nOther names: {}.\n",
+        s(&value["engine"]),
+        table::table(&["OPTION", "CLASS", "REASON"], &rows("flags")),
+        s(&value["unlisted"]["flags"]),
+        table::table(&["NAME", "CLASS", "REASON"], &rows("env")),
+        s(&value["unlisted"]["env"]),
+    )
 }
 
 /// A scalar as text; empty for null or absent.

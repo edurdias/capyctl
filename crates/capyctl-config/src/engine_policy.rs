@@ -305,8 +305,9 @@ pub fn tensorfold_parallel(args: &[String]) -> Result<Option<Option<String>>, Pr
 pub const TENSORFOLD_PARALLEL: &str = "--parallel";
 
 /// Whole option families reserved for SGLang: every `ssl_*` field, the
-/// `modelopt_*_path` fields (quantization is out of scope, SPEC §1.2), and the
-/// disaggregation, hierarchical-cache and external-cache integrations (SPEC §12).
+/// `modelopt_*_path` fields (quantization is out of scope, SPEC §1.2), the
+/// disaggregation, hierarchical-cache and external-cache integrations (SPEC §12),
+/// and the tensor dump family ([`SGLANG_DUMP_FAMILY`]).
 const SGLANG_RESERVED_FAMILIES: &[&str] = &[
     "--ssl-",
     "--modelopt-",
@@ -314,6 +315,58 @@ const SGLANG_RESERVED_FAMILIES: &[&str] = &[
     "--hicache-storage-",
     "--lmcache-",
     "--flexkv-",
+    SGLANG_DUMP_FAMILY,
+];
+
+/// SPEC §8.2, T21 (owner decision 2026-10-20): SGLang's tensor dump options.
+/// They write activations, which carry request content, to disk.
+const SGLANG_DUMP_FAMILY: &str = "--debug-tensor-dump-";
+
+/// SPEC §8.2, T21 (owner decision 2026-10-20): SGLang 0.5.21 and 0.5.22
+/// options that write requests, tensors or debug data to a destination of the
+/// operator's choosing, or read the key that marks every answer. They are
+/// refused in every spelling, not approval-gated: no host approval makes a
+/// dump of request content safe. Enumerated from both installed parsers
+/// (`ServerArgs.add_cli_args`) and the code that reads each field. Names
+/// are `ServerArgs` fields; the option is the field with `_` spelled `-`.
+pub const SGLANG_DUMP_RESERVED: &[(&str, &str)] = &[
+    (
+        "watermark_config",
+        "0.5.22: names the file or JSON holding the watermark key that marks \
+         every answer (sampling/watermarking/config.py)",
+    ),
+    (
+        "debug_tensor_dump_output_folder",
+        "writes every layer's activations, which carry request content, to the \
+         folder (load_model_utils.py)",
+    ),
+    (
+        "debug_tensor_dump_layers",
+        "selects the layers the tensor dump writes",
+    ),
+    (
+        "debug_tensor_dump_input_file",
+        "replays tensors from a file in place of the request's input \
+         (entrypoints/http_server.py)",
+    ),
+    (
+        "msprobe_dump_config",
+        "a precision-debugger configuration that dumps tensors to disk \
+         (misc_utils.py)",
+    ),
+    (
+        "export_metrics_to_file",
+        "appends a record of every request to an hourly file \
+         (observability/request_metrics_exporter.py)",
+    ),
+    (
+        "export_metrics_to_file_dir",
+        "the directory the per-request records are written to",
+    ),
+    (
+        "spec_trace_dir",
+        "a directory for speculative-decoding traces",
+    ),
 ];
 
 /// ADR 0014 §6: a configuration file would hide values from every check here
@@ -777,8 +830,6 @@ const SGLANG_SHAPED: &[&str] = &[
     "--file-storage-path",
     "--load-publish-endpoint",
     "--otlp-traces-endpoint",
-    "--export-metrics-to-file",
-    "--export-metrics-to-file-dir",
     "--cuda-graph-config",
     "--uno-lora-path",
     "--speculative-draft-model-path",
@@ -787,7 +838,6 @@ const SGLANG_SHAPED: &[&str] = &[
     "--speculative-adaptive-config",
     "--decoupled-spec-bind-endpoint",
     "--decoupled-spec-connect-endpoints",
-    "--spec-trace-dir",
     "--speculative-ngram-external-corpus-path",
     "--deepep-config",
     "--hisparse-config",
@@ -807,10 +857,7 @@ const SGLANG_SHAPED: &[&str] = &[
     "--download-dir",
     "--decrypted-config-file",
     "--decrypted-draft-config-file",
-    "--debug-tensor-dump-output-folder",
-    "--debug-tensor-dump-input-file",
     "--weight-cache-socket",
-    "--msprobe-dump-config",
     "--model-loader-extra-config",
     "--kv-events-config",
     "--custom-weight-loader",
@@ -960,6 +1007,7 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
             .collect(),
         Engine::Sglang => SGLANG_RESERVED_FIELDS
             .iter()
+            .chain(SGLANG_DUMP_RESERVED.iter().map(|(field, _)| field))
             .map(|field| sglang_field_option(field))
             .chain(
                 SGLANG_RESERVED_ALIASES
@@ -1439,4 +1487,228 @@ pub fn validate_profile_env(env: &BTreeMap<String, String>) -> Result<(), String
     )
     .map(|_| ())
     .map_err(|refusal| refusal.code())
+}
+
+impl Sensitivity {
+    /// The approval kind the ownership table prints.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Sensitivity::Code => "code",
+            Sensitivity::Path {
+                checkpoint_exempt: false,
+            } => "path",
+            Sensitivity::Path {
+                checkpoint_exempt: true,
+            } => "path_or_checkpoint",
+            Sensitivity::ListenerOrEgress => "listener_or_egress",
+            Sensitivity::Config => "config",
+            Sensitivity::SpeculativeConfig => "speculative_config",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Sensitivity::Code => "loads code",
+            Sensitivity::Path {
+                checkpoint_exempt: false,
+            } => "takes a path, which must lie inside security.approved_paths",
+            Sensitivity::Path {
+                checkpoint_exempt: true,
+            } => {
+                "takes a path, which must lie inside the checkpoint or \
+                 security.approved_paths"
+            }
+            Sensitivity::ListenerOrEgress => "opens a listener or reaches off the host",
+            Sensitivity::Config => "a JSON value that can name paths or endpoints no check reads",
+            Sensitivity::SpeculativeConfig => {
+                "a JSON object of known keys whose draft `model` must lie inside \
+                 security.approved_paths"
+            }
+        }
+    }
+}
+
+/// How a table row's name is matched against an option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameMatch {
+    /// The name, and for every engine but llama.cpp any abbreviation of it,
+    /// `_` for `-`, `--no-` negated and `=value` (ADR 0014 §3).
+    Name,
+    /// Every option starting with the name.
+    Prefix,
+}
+
+/// What CapyCTL does with an option or an environment name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlagClass {
+    /// CapyCTL renders or closes it, or a typed field says it; refused.
+    Owned,
+    /// Nobody may set it; refused whatever an approval says.
+    Reserved,
+    /// Needs the host's named approval (`approval` names the kind).
+    Sensitive,
+    /// Passes unchanged.
+    Ordinary,
+}
+
+/// One row of the published ownership table (`capyctl engine flags`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlagRow {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub name_match: NameMatch,
+    pub class: FlagClass,
+    /// The approval kind of a sensitive row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<&'static str>,
+    pub reason: String,
+}
+
+/// Adds `row` unless an earlier row names the same option: rows are added in
+/// the order the checks apply, so the first class is the one a check gives.
+fn add_row(rows: &mut Vec<FlagRow>, row: FlagRow) {
+    if !rows.iter().any(|existing| existing.name == row.name) {
+        rows.push(row);
+    }
+}
+
+fn row(name: &str, name_match: NameMatch, class: FlagClass, reason: String) -> FlagRow {
+    FlagRow {
+        name: name.to_owned(),
+        name_match,
+        class,
+        approval: None,
+        reason,
+    }
+}
+
+/// ADR 0014 §3, §6, §8, ADR 0021: every option the policy names for
+/// `engine`, with its class and why, built from the same tables the checks
+/// read (no copy), in the order [`validate_extra_args`] applies them. An
+/// option not listed is classed by its name's shape, and otherwise ordinary.
+pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
+    let mut rows = Vec::new();
+    if engine != Engine::Llamacpp {
+        for name in CONFIG_FILE_OPTIONS {
+            add_row(
+                &mut rows,
+                row(
+                    name,
+                    NameMatch::Name,
+                    FlagClass::Reserved,
+                    "a configuration file would hide values from every check".to_owned(),
+                ),
+            );
+        }
+    }
+    if engine == Engine::Sglang {
+        for (field, reason) in SGLANG_DUMP_RESERVED {
+            add_row(
+                &mut rows,
+                row(
+                    &sglang_field_option(field),
+                    NameMatch::Name,
+                    FlagClass::Reserved,
+                    (*reason).to_owned(),
+                ),
+            );
+        }
+        add_row(
+            &mut rows,
+            row(
+                SGLANG_DUMP_FAMILY,
+                NameMatch::Prefix,
+                FlagClass::Reserved,
+                "tensor dumps write activations, which carry request content, to disk".to_owned(),
+            ),
+        );
+    }
+    for family in reserved_families(engine) {
+        add_row(
+            &mut rows,
+            row(
+                family,
+                NameMatch::Prefix,
+                FlagClass::Owned,
+                "CapyCTL owns every option in this family".to_owned(),
+            ),
+        );
+    }
+    for name in reserved_options(engine, false) {
+        let reason = match (engine, crate::llamacpp::typed_field(&name)) {
+            (Engine::Llamacpp, Some(field)) => {
+                format!("CapyCTL renders it from the typed field `{field}`")
+            }
+            _ => "CapyCTL renders or closes it".to_owned(),
+        };
+        add_row(
+            &mut rows,
+            row(&name, NameMatch::Name, FlagClass::Owned, reason),
+        );
+    }
+    for (name, field) in typed_options(engine) {
+        add_row(
+            &mut rows,
+            row(
+                name,
+                NameMatch::Name,
+                FlagClass::Owned,
+                format!("the typed field `{field}` is the one way to set it"),
+            ),
+        );
+    }
+    let explicit: Vec<&str> = match engine {
+        Engine::Vllm => VLLM_SENSITIVE.iter().map(|(name, _)| *name).collect(),
+        Engine::Sglang => SGLANG_SENSITIVE.iter().map(|(name, _)| *name).collect(),
+        Engine::Tensorfold => TENSORFOLD_SENSITIVE.iter().map(|(name, _)| *name).collect(),
+        Engine::Llamacpp => crate::llamacpp::SENSITIVE
+            .iter()
+            .flat_map(|(names, _)| names.iter().copied())
+            .collect(),
+    };
+    let shaped: &[&str] = match engine {
+        Engine::Vllm => VLLM_SHAPED,
+        Engine::Sglang => SGLANG_SHAPED,
+        Engine::Tensorfold => TENSORFOLD_SHAPED,
+        Engine::Llamacpp => &[],
+    };
+    for name in explicit.into_iter().chain(shaped.iter().copied()) {
+        if let Some(kind) = sensitivity(engine, name) {
+            add_row(
+                &mut rows,
+                FlagRow {
+                    approval: Some(kind.kind()),
+                    ..row(
+                        name,
+                        NameMatch::Name,
+                        FlagClass::Sensitive,
+                        kind.reason().to_owned(),
+                    )
+                },
+            );
+        }
+    }
+    let ordinary: &[&str] = match engine {
+        Engine::Llamacpp => crate::llamacpp::ORDINARY_SHAPED,
+        _ => ORDINARY_EXACT,
+    };
+    for name in ordinary {
+        if *name == "--vision" && engine != Engine::Tensorfold {
+            continue;
+        }
+        add_row(
+            &mut rows,
+            row(
+                name,
+                NameMatch::Name,
+                FlagClass::Ordinary,
+                "its exact name is ordinary although a longer option it prefixes \
+                 is sensitive"
+                    .to_owned(),
+            ),
+        );
+    }
+    rows
 }

@@ -676,6 +676,7 @@ CapyCTL uses engines you install yourself. Register them on the machine that run
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
     capyctl engine remove vllm [--drain]
+    capyctl engine flags sglang               # which options and variables CapyCTL owns, reserves or gates; runs nothing
     capyctl list engines                      # every host's engines on a server; this machine's on standalone
 
 `detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,

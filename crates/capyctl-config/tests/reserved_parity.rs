@@ -116,6 +116,8 @@ fn sglang_reserved_names_match_the_argument_mapper() {
     let source = runtime_source("sglang_server_args.py");
     let mut python = dict_keys(&source, "_RESERVED_CONSTANT = {");
     python.extend(quoted_block(&source, "_RESERVED_BOUND = (", ")"));
+    // SPEC §8.2, T21: the dump destinations, on both sides too.
+    python.extend(quoted_block(&source, "_RESERVED_DUMP = (", ")"));
     let python_families = quoted_block(&source, "_RESERVED_FAMILIES = (", ")");
     let rust: BTreeSet<String> = reserved_options(Engine::Sglang, false)
         .iter()
@@ -130,7 +132,14 @@ fn sglang_reserved_names_match_the_argument_mapper() {
             "sglang_server_args.py reserves `{name}`, engine_policy.rs does not"
         );
     }
-    for field in capyctl_config::engine_policy::SGLANG_RESERVED_FIELDS {
+    for field in capyctl_config::engine_policy::SGLANG_RESERVED_FIELDS
+        .iter()
+        .chain(
+            capyctl_config::engine_policy::SGLANG_DUMP_RESERVED
+                .iter()
+                .map(|(field, _)| field),
+        )
+    {
         assert!(
             python.contains(*field)
                 || python_families

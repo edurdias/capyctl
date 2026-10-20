@@ -216,3 +216,86 @@ fn debug_output_hides_values() {
     .unwrap();
     assert!(!format!("{r:?}").contains("hf_secret"));
 }
+
+// T21: SPEC §8.2 (owner decision 2026-10-20). SGLang's dumper family and the
+// SGLang names that dump requests or tensors to disk are reserved at both
+// levels, in any case, whatever an approval says; a glob that only reaches a
+// reserved family is not a valid approval.
+#[test]
+fn dump_environment_names_are_reserved() {
+    let wide = approved(&["SGLANG_*", "S*", "D*"]);
+    for name in [
+        "DUMPER_ENABLE",
+        "dumper_enable",
+        "Dumper_Dir",
+        "DUMPER_SERVER_PORT",
+        "DUMPER_SOURCE_PATCHER_CONFIG",
+        "SGLANG_DUMP_LOADER_DIR",
+        "sglang_dumper_anything",
+        "SGLANG_KERNEL_API_LOGLEVEL",
+        "SGLANG_KERNEL_API_DUMP_DIR",
+        "SGLANG_CUDA_COREDUMP",
+        "sglang_cuda_coredump_dir",
+        "SGLANG_DSPARK_DEBUG_DUMP",
+        "SGLANG_DSPARK_ENABLE_SPS_RECORD",
+        "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR",
+        "SGLANG_TORCH_PROFILER_DIR",
+    ] {
+        let e = resolve_engine_env(&map(&[]), &wide, &map(&[(name, "1")])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+        let e = resolve_engine_env(&map(&[(name, "1")]), &wide, &map(&[])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+    }
+    for glob in [
+        "DUMPER_*",
+        "DUMPER_EN*",
+        "SGLANG_KERNEL_API_*",
+        "SGLANG_DUMP*",
+    ] {
+        assert!(
+            matches!(
+                ApprovedEnv::parse(&[glob.to_string()]),
+                Err(EnvRefusal::Reserved(_))
+            ),
+            "{glob}"
+        );
+    }
+    // A neighbouring SGLang name stays approvable.
+    assert!(resolve_engine_env(
+        &map(&[]),
+        &wide,
+        &map(&[("SGLANG_ENABLE_JIT_DEEPGEMM", "0")])
+    )
+    .is_ok());
+}
+
+// T21, ADR 0021: the published environment table is the one the check reads:
+// every owned or reserved row is refused, every ordinary row is accepted.
+#[test]
+fn the_environment_table_matches_the_check() {
+    let rows = env_table();
+    assert!(rows.iter().any(|row| row.name == "DUMPER_"
+        && row.class == capyctl_config::engine_policy::FlagClass::Reserved));
+    for row in rows {
+        use capyctl_config::engine_policy::{FlagClass, NameMatch};
+        let name = match row.name_match {
+            NameMatch::Name => row.name.clone(),
+            NameMatch::Prefix => format!("{}X", row.name),
+        };
+        let value = if row.name == "MAX_JOBS" || row.name == "FLASHINFER_NVCC_THREADS" {
+            "2"
+        } else {
+            "1"
+        };
+        let result =
+            resolve_engine_env(&map(&[(&name, value)]), &ApprovedEnv::default(), &map(&[]));
+        match row.class {
+            FlagClass::Owned | FlagClass::Reserved => assert_eq!(
+                result.unwrap_err().code(),
+                format!("engine_env_reserved:{name}")
+            ),
+            FlagClass::Ordinary => assert!(result.is_ok(), "{name}"),
+            FlagClass::Sensitive => panic!("no sensitive environment row: {name}"),
+        }
+    }
+}

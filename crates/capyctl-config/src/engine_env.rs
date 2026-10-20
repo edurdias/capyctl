@@ -7,6 +7,7 @@
 //! and the recipe fingerprint, and output shows each name with its source,
 //! never its value (R10). They are not secret storage.
 
+use crate::engine_policy::{FlagClass, FlagRow, NameMatch};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -68,6 +69,61 @@ pub const OWNED_NAMES: &[&str] = &[
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
 ];
 
+/// SPEC §8.2, T21 (owner decision 2026-10-20): environment families that make
+/// SGLang dump requests or tensors to disk. Nobody may set them, whatever an
+/// approval says; refused as `engine_env_reserved:<name>`. Enumerated from
+/// SGLang 0.5.21 and 0.5.22 (`srt/environ.py` and the modules that read the
+/// environment directly).
+pub const DUMP_RESERVED_PREFIXES: &[(&str, &str)] = &[
+    (
+        "DUMPER_",
+        "SGLang's dumper (srt/debug_utils/dumper.py) writes tensors to disk; \
+         DUMPER_ENABLE turns it on",
+    ),
+    (
+        "SGLANG_DUMP",
+        "SGLang dump settings (SGLANG_DUMP_LOADER_DIR replays a saved dump)",
+    ),
+    (
+        "SGLANG_KERNEL_API_",
+        "kernel API logging; SGLANG_KERNEL_API_LOGLEVEL dumps kernel input \
+         tensors to SGLANG_KERNEL_API_DUMP_DIR",
+    ),
+    (
+        "SGLANG_CUDA_COREDUMP",
+        "a CUDA core dump writes GPU memory, which holds requests' KV cache, \
+         to disk",
+    ),
+];
+
+/// SPEC §8.2, T21 (owner decision 2026-10-20): single SGLang names that turn
+/// on a dump to disk or name where one is written.
+pub const DUMP_RESERVED_NAMES: &[(&str, &str)] = &[
+    (
+        "SGLANG_DSPARK_DEBUG_DUMP",
+        "dumps DSpark speculative-decoding state",
+    ),
+    (
+        "SGLANG_DSPARK_ENABLE_SPS_RECORD",
+        "records DSpark speculative-decoding state, as SGLANG_DSPARK_DEBUG_DUMP does",
+    ),
+    (
+        "SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR",
+        "where the expert-distribution recorder writes its dumps",
+    ),
+    (
+        "SGLANG_TORCH_PROFILER_DIR",
+        "where profiler traces are written",
+    ),
+];
+
+fn dump_reserved(upper: &str) -> bool {
+    DUMP_RESERVED_NAMES.iter().any(|(name, _)| *name == upper)
+        || DUMP_RESERVED_PREFIXES
+            .iter()
+            .any(|(prefix, _)| upper.starts_with(prefix))
+}
+
 /// ADR 0028 §2.1 rule 2: the existing safe names. They need no approval and
 /// keep their value rules at both levels.
 const SAFE_NAMES: &[&str] = &[
@@ -86,8 +142,9 @@ const MAX_VALUE_BYTES: usize = 4096;
 const MAX_NAMES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
 
-/// Whether CapyCTL owns `name` (rule 1). Compared upper-cased, so a lower-case
-/// spelling of an owned name is not a way around it.
+/// Whether CapyCTL owns or reserves `name` (rule 1, and the dump families
+/// above). Compared upper-cased, so a lower-case spelling of an owned name is
+/// not a way around it.
 pub fn is_owned(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if SAFE_NAMES.contains(&upper.as_str()) {
@@ -97,6 +154,7 @@ pub fn is_owned(name: &str) -> bool {
         || OWNED_PREFIXES
             .iter()
             .any(|prefix| upper.starts_with(prefix))
+        || dump_reserved(&upper)
 }
 
 /// Why an engine environment was refused.
@@ -161,7 +219,10 @@ impl ApprovedEnv {
             // A glob stays wide when its stem is shorter than an owned prefix:
             // the concrete name is checked at resolution (rule 1).
             let owned_only = if glob {
-                OWNED_PREFIXES.iter().any(|prefix| stem.starts_with(prefix))
+                OWNED_PREFIXES
+                    .iter()
+                    .chain(DUMP_RESERVED_PREFIXES.iter().map(|(prefix, _)| prefix))
+                    .any(|prefix| stem.starts_with(prefix))
             } else {
                 is_owned(stem)
             };
@@ -351,4 +412,46 @@ pub fn resolve_engine_env(
         vars.insert(name.clone(), (value.clone(), EnvSource::Deployment));
     }
     Ok(ResolvedEnv { vars })
+}
+
+/// ADR 0028 §2.1, ADR 0021: every environment name and family the policy
+/// names, with its class and why, built from the tables [`is_owned`] reads.
+/// Names are compared upper-cased. A name not listed needs a matching
+/// `security.approved_env` entry when a deployment sets it.
+pub fn env_table() -> Vec<FlagRow> {
+    let row = |name: &str, name_match, class, reason: &str| FlagRow {
+        name: name.to_owned(),
+        name_match,
+        class,
+        approval: None,
+        reason: reason.to_owned(),
+    };
+    let owned = "CapyCTL renders or closes it";
+    OWNED_PREFIXES
+        .iter()
+        .map(|prefix| row(prefix, NameMatch::Prefix, FlagClass::Owned, owned))
+        .chain(
+            OWNED_NAMES
+                .iter()
+                .map(|name| row(name, NameMatch::Name, FlagClass::Owned, owned)),
+        )
+        .chain(
+            DUMP_RESERVED_PREFIXES.iter().map(|(prefix, reason)| {
+                row(prefix, NameMatch::Prefix, FlagClass::Reserved, reason)
+            }),
+        )
+        .chain(
+            DUMP_RESERVED_NAMES
+                .iter()
+                .map(|(name, reason)| row(name, NameMatch::Name, FlagClass::Reserved, reason)),
+        )
+        .chain(SAFE_NAMES.iter().map(|name| {
+            row(
+                name,
+                NameMatch::Name,
+                FlagClass::Ordinary,
+                "needs no approval",
+            )
+        }))
+        .collect()
 }
