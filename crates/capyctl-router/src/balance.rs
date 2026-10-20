@@ -49,7 +49,10 @@
 //! candidate is tried, at most [`MAX_ATTEMPTS`] in all. A request that may have
 //! been accepted is never replayed: its lease stays uncertain and charged.
 //!
-//! Every selection is logged with its inputs, one JSON line on stderr.
+//! Every selection is logged with its inputs, one JSON line on stderr, with
+//! the request's IDs (SPEC §10, owner decision 2026-10-19). Since CapyCTL's
+//! ID is the first granted lease's, the lines of an offer are written once
+//! the offer has been decided, when that ID is known.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -61,6 +64,7 @@ use capyctl_controller::load_table::EngineGauges;
 use capyctl_controller::{LeaseEnd, LeaseRefused, LifecyclePort, RequestLease, ServingInstance};
 
 use crate::admission::InFlight;
+use crate::request_id::RequestIds;
 use crate::RouterDeps;
 
 /// KV usage (parts per million) above which a candidate is penalised.
@@ -332,6 +336,8 @@ pub struct Attempt {
     pub instance: Option<u32>,
     /// ADR 0028 §11: the first-token watch, for a group's head only.
     pub(crate) stall: Option<crate::stream::StallWatch>,
+    /// SPEC §10: the request's IDs, for the lease's role-log lines.
+    ids: Option<Arc<RequestIds>>,
     _slot: Option<InstanceSlot>,
 }
 
@@ -347,6 +353,7 @@ impl Attempt {
             generation: None,
             instance: None,
             stall: None,
+            ids: None,
             _slot: None,
         }
     }
@@ -359,7 +366,13 @@ impl Attempt {
     pub async fn settle(self, end: LeaseEnd) -> bool {
         match self.lease {
             Some((controller, lease)) => {
-                crate::chat::close_lease(controller.as_ref(), Some(lease), end).await;
+                crate::chat::close_lease(
+                    controller.as_ref(),
+                    Some(lease),
+                    end,
+                    self.ids.as_deref(),
+                )
+                .await;
                 true
             }
             None => false,
@@ -390,16 +403,22 @@ pub struct Plan {
     deployment: String,
     route: Route,
     last: Option<Refusal>,
+    /// SPEC §10 (owner decision 2026-10-19): the request's IDs.
+    ids: Arc<RequestIds>,
+    /// Role-log lines written before CapyCTL's request ID was decided, held
+    /// until it is (at most one selection and [`MAX_ATTEMPTS`] failovers).
+    pending: Vec<serde_json::Value>,
 }
 
 impl Plan {
     /// Rank the deployment's serving instances: `view` when admission read
     /// them for this request, otherwise a fresh read. Logs the selection with
-    /// its inputs.
+    /// its inputs and the request's `ids`.
     pub fn new(
         deps: &RouterDeps,
         deployment: &str,
         view: Option<InstanceView>,
+        ids: Arc<RequestIds>,
     ) -> Result<Self, Refusal> {
         let instances = match view {
             Some(InstanceView(instances)) => instances,
@@ -412,7 +431,7 @@ impl Plan {
             None => Route::Whole { offered: false },
             Some(instances) => {
                 let ranking = deps.inflight.instances.choose(deployment, &instances);
-                capyctl_domain::role_log::event(serde_json::json!({
+                let selection = serde_json::json!({
                     "event": "router_selection",
                     "deployment": deployment,
                     "chosen": ranking.order.first().map(|c| c.generation),
@@ -422,7 +441,7 @@ impl Plan {
                         "generation": s.generation,
                         "reason": s.reason,
                     })).collect::<Vec<_>>(),
-                }));
+                });
                 let last = if ranking.skipped.is_empty() {
                     None
                 } else {
@@ -434,7 +453,7 @@ impl Plan {
                         ),
                     ))
                 };
-                return Ok(Self {
+                let mut plan = Self {
                     deps: deps.clone(),
                     deployment: deployment.to_owned(),
                     route: Route::Instances {
@@ -443,7 +462,11 @@ impl Plan {
                         first_counted: true,
                     },
                     last,
-                });
+                    ids,
+                    pending: Vec::new(),
+                };
+                plan.log(selection);
+                return Ok(plan);
             }
         };
         Ok(Self {
@@ -451,12 +474,40 @@ impl Plan {
             deployment: deployment.to_owned(),
             route,
             last: None,
+            ids,
+            pending: Vec::new(),
         })
     }
 
+    /// Write one role-log line with the request's IDs, or hold it until
+    /// CapyCTL's is decided.
+    fn log(&mut self, event: serde_json::Value) {
+        log_for(&self.ids, &mut self.pending, event);
+    }
+
     /// The next offer, or the refusal that ends the request. Every refusal here
-    /// is decided before anything reaches an engine.
+    /// is decided before anything reaches an engine. Once it returns, the
+    /// request's CapyCTL ID is decided: the first granted lease's, or a fresh
+    /// one when none was granted (SPEC §10, owner decision 2026-10-19).
     pub async fn next(&mut self) -> Result<Attempt, Refusal> {
+        let next = self.offer().await;
+        if let Ok(Attempt {
+            lease: Some((_, lease)),
+            ..
+        }) = &next
+        {
+            self.ids.granted(lease.id());
+        }
+        // Decided either way from here on: a lease names the request, else a
+        // fresh ID does.
+        let _ = self.ids.capyctl();
+        for event in std::mem::take(&mut self.pending) {
+            self.log(event);
+        }
+        next
+    }
+
+    async fn offer(&mut self) -> Result<Attempt, Refusal> {
         let deps = self.deps.clone();
         let deployment = self.deployment.clone();
         match &mut self.route {
@@ -477,6 +528,7 @@ impl Plan {
                     generation: None,
                     instance: None,
                     stall: None,
+                    ids: Some(self.ids.clone()),
                     _slot: None,
                 })
             }
@@ -512,7 +564,11 @@ impl Plan {
                     {
                         Ok(lease) => lease,
                         Err(LeaseRefused::Closed) => {
-                            failover(&deployment, &candidate, "lease_refused_gate_closed");
+                            log_for(
+                                &self.ids,
+                                &mut self.pending,
+                                failover(&deployment, &candidate, "lease_refused_gate_closed"),
+                            );
                             self.last = Some(crate::chat::refusal(
                                 "unavailable",
                                 &format!(
@@ -555,6 +611,7 @@ impl Plan {
                                 generation: Some(candidate.generation),
                                 instance: Some(candidate.instance_index),
                                 stall,
+                                ids: Some(self.ids.clone()),
                                 _slot: Some(slot),
                             });
                         }
@@ -563,9 +620,14 @@ impl Plan {
                                 deps.controller.as_ref(),
                                 lease,
                                 LeaseEnd::NotAccepted,
+                                Some(&self.ids),
                             )
                             .await;
-                            failover(&deployment, &candidate, "forwarder_unavailable");
+                            log_for(
+                                &self.ids,
+                                &mut self.pending,
+                                failover(&deployment, &candidate, "forwarder_unavailable"),
+                            );
                             self.last = Some(crate::chat::map_forwarder(error));
                         }
                     }
@@ -583,7 +645,7 @@ impl Plan {
     /// answer, if no other offer succeeds, says so.
     pub fn refused(&mut self, generation: Option<i64>, reason: &str) {
         if let Some(generation) = generation {
-            capyctl_domain::role_log::event(serde_json::json!({
+            self.log(serde_json::json!({
                 "event": "router_failover",
                 "deployment": self.deployment,
                 "generation": generation,
@@ -607,14 +669,24 @@ impl Plan {
     }
 }
 
-fn failover(deployment: &str, candidate: &Scored, reason: &str) {
-    capyctl_domain::role_log::event(serde_json::json!({
+fn failover(deployment: &str, candidate: &Scored, reason: &str) -> serde_json::Value {
+    serde_json::json!({
         "event": "router_failover",
         "deployment": deployment,
         "generation": candidate.generation,
         "instance": candidate.instance_index,
         "reason": reason,
-    }));
+    })
+}
+
+/// See [`Plan::log`]: by field, so it can be called while the route is borrowed.
+fn log_for(ids: &RequestIds, pending: &mut Vec<serde_json::Value>, mut event: serde_json::Value) {
+    if ids.settled() {
+        ids.log_fields(&mut event);
+        capyctl_domain::role_log::event(event);
+    } else {
+        pending.push(event);
+    }
 }
 
 #[cfg(test)]

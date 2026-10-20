@@ -310,6 +310,7 @@ pub async fn dispatch(
         bytes,
         tokio::time::Instant::now(),
         RequestTiming::untracked(),
+        std::sync::Arc::new(crate::request_id::RequestIds::untracked()),
     )
     .await
     .map(|(response, _)| response)
@@ -319,10 +320,12 @@ pub async fn dispatch(
 /// response with the request's completed clock, for its timing header.
 /// `body_bytes` is the size of the request as received and `received` when it
 /// arrived: the queue deadline and the backend's first-event bound count from
-/// it (SPEC §10).
+/// it (SPEC §10). `ids` are the request's IDs (SPEC §10, owner decision
+/// 2026-10-19): its first granted lease names it.
 ///
 /// ADR 0030 §2: a decision request is admitted, leased and settled exactly as
 /// a chat completion; only its forward differs.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_timed(
     deps: &RouterDeps,
     endpoint: Endpoint,
@@ -331,6 +334,7 @@ pub async fn dispatch_timed(
     body_bytes: usize,
     received: tokio::time::Instant,
     mut timing: RequestTiming,
+    ids: std::sync::Arc<crate::request_id::RequestIds>,
 ) -> Result<(serde_json::Value, RequestTiming), (StatusCode, Json<serde_json::Value>)> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
     let (deployment_id, guard, view) =
@@ -338,7 +342,7 @@ pub async fn dispatch_timed(
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its
     // forwarder. Nothing has been sent yet: a refusal releases the guard on drop.
     let started = std::time::Instant::now();
-    let mut plan = crate::balance::Plan::new(deps, &deployment_id, view)?;
+    let mut plan = crate::balance::Plan::new(deps, &deployment_id, view, ids)?;
     timing.selected(started.elapsed());
     let started = std::time::Instant::now();
     let first = plan.next().await?;
@@ -610,18 +614,21 @@ pub(crate) async fn open_lease(
 }
 
 /// Close or retain a lease on the evidence. A failed write leaves it charged,
-/// which is the conservative outcome, so it is reported and not retried here.
+/// which is the conservative outcome, so it is reported and not retried here,
+/// with the request's IDs (SPEC §10, owner decision 2026-10-19).
 pub(crate) async fn close_lease(
     controller: &dyn capyctl_controller::LifecyclePort,
     lease: Option<RequestLease>,
     end: LeaseEnd,
+    ids: Option<&crate::request_id::RequestIds>,
 ) {
     if let Some(lease) = lease {
         let id = lease.id().to_owned();
         if let Err(error) = controller.close_request_lease(lease, end).await {
+            let request = ids.map(|ids| ids.log_suffix()).unwrap_or_default();
             capyctl_domain::role_log::notice(
                 capyctl_domain::role_log::Level::Warning,
-                &format!("request lease {id} stays charged: {error}"),
+                &format!("request lease {id} stays charged: {error}{request}"),
             );
         }
     }

@@ -24,6 +24,8 @@ async-stream = "0.3"
 async-trait = { workspace = true }
 # SPEC §13.3: constant-time comparison of the inference API key.
 subtle = "2"
+# SPEC §10: the CapyCTL request ID of a request refused before any lease.
+ulid = { workspace = true }
 
 [dev-dependencies]
 capyctl-testkit = { workspace = true }

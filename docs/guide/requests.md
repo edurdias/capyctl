@@ -261,7 +261,7 @@ curl -s http://127.0.0.1:8443/v1/systemone \
 ```
 
 ```text
-{"answers":{"angry":{"noul":0.6226,"type":"noul"},"route":{"choice":"billing","confidence":0.9255,"probabilities":{"billing":0.9503,"shipping":0.0157,"technical":0.0339},"type":"choice"},"urgency":{"confidence":0.48,"legend":{"0":"can wait","1":"this week","2":"today"},"probabilities":{"0":0.08,"1":0.71,"2":0.21},"score":1.1224,"type":"score"}},"model":"my-decider","usage":{"input_tokens":87,"output_tokens":0}}
+{"answers":{"angry":{"noul":0.6226,"type":"noul"},"route":{"choice":"billing","confidence":0.9255,"probabilities":{"billing":0.9503,"shipping":0.0157,"technical":0.0339},"type":"choice"},"urgency":{"confidence":0.48,"legend":{"0":"can wait","1":"this week","2":"today"},"probabilities":{"0":0.08,"1":0.71,"2":0.21},"score":1.1224,"type":"score"}},"capyctl":{"metrics":{"input_tokens":{"source":"engine","value":87},"time_to_response_ms":{"source":"router","value":41.2},"total_ms":{"source":"router","value":43.9}}},"model":"my-decider","usage":{"input_tokens":87,"output_tokens":0}}
 ```
 
 The probabilities come from your model; these are an example, and they can
@@ -283,9 +283,9 @@ Any other field (an engine's own extension included) is answered
 (how many questions or options, required `instructions`) and its refusal comes
 back as `engine_rejected` with its status. A decision is never streamed. The
 answer is the engine's, with `model` set to the name you sent and its `usage`
-as the engine reported it; it carries no `capyctl.metrics`, since time to first
-token and decode speed describe generated text. A parked or stopped decision
-model wakes or starts for the request, as a chat model does.
+as the engine reported it, plus the request's figures in `capyctl.metrics`
+(see [Request IDs and metrics](#request-ids-and-metrics)). A parked or stopped
+decision model wakes or starts for the request, as a chat model does.
 
 Sent to the other endpoint, a request is answered `400 api_mismatch` without
 waking anything; the message names the endpoint to use:
@@ -293,6 +293,54 @@ waking anything; the message names the endpoint to use:
 ```text
 {"code":"api_mismatch","message":"model my-decider serves the decisions API, which /v1/chat/completions does not answer; send its requests to POST /v1/systemone"}
 ```
+
+## Request IDs and metrics
+
+Every answer from `/v1/chat/completions` and `/v1/systemone`, success or
+error, carries CapyCTL's ID for the request in the `X-CapyCTL-Request-Id`
+header. It is the ID of the request's lease, the record CapyCTL keeps of the
+request while an engine works on it, so it is the ID to quote when you look
+for the request in CapyCTL's logs. A request refused before it got that far
+(a bad key, an invalid body, an unknown model, a full queue) gets a fresh
+one instead, so every answer has one.
+
+You can send your own ID in `X-Request-Id` and CapyCTL hands it back on the
+answer, in the response headers of a stream too:
+
+```bash
+curl -si http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -H 'X-Request-Id: checkout-7f3a' \
+  -d '{"model": "my-model", "messages": [{"role": "user", "content": "hi"}]}' \
+  | grep -i 'request-id'
+```
+
+```text
+x-capyctl-request-id: 01K7ZQ3M4X9V2B8N6C5D1F0G7H
+x-request-id: checkout-7f3a
+```
+
+Your ID must be 1 to 128 characters of printable ASCII with no spaces;
+anything else, or the header given twice, is answered `400 invalid_request`
+before the model is woken. CapyCTL writes it beside its own ID in its logs
+for the request (`caller_request_id` and `capyctl_request_id` on the router's
+`router_selection` and `router_failover` lines) and nowhere else: it is never
+sent to the engine, and never stored in CapyCTL's database or events. The
+same holds when the model runs on another machine behind its host's ingress.
+
+A decision's answer carries its figures in `capyctl.metrics`, in the same
+`{"value": ..., "source": ...}` form as a chat answer's
+([Per-request metrics](#per-request-metrics)):
+
+| Figure | What it measures |
+|---|---|
+| `total_ms` | router: from when CapyCTL received the request to the whole answer, waiting and waking included |
+| `time_to_response_ms` | router: from when CapyCTL sent the request to the engine to the whole answer |
+| `input_tokens` | engine: the answer's `usage.input_tokens` |
+| `queue_ms`, `prefill_ms`, `cached_tokens` | engine, when the engine reported them, read as for chat |
+
+A decision generates no text, so it has no `ttft_ms` or
+`decode_tokens_per_second`. A figure nobody measured is left out.
 
 ## When the model is parked
 

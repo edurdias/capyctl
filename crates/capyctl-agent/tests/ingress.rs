@@ -57,6 +57,10 @@ async fn ingress_requires_current_open_generation_and_replaces_internal_headers(
             .bearer_auth(token)
             .header("x-capyctl-generation", "999")
             .header("x-capyctl-admin-key", "must-not-forward")
+            // SPEC §10 (owner decision 2026-10-19): request IDs are CapyCTL's;
+            // neither reaches the engine.
+            .header("x-request-id", "caller-1")
+            .header("x-capyctl-request-id", "01JAAAAAAAAAAAAAAAAAAAAAAA")
             .json(&serde_json::json!({"model":"model","messages":[],"stream":true}))
             .send()
     };
@@ -79,6 +83,8 @@ async fn ingress_requires_current_open_generation_and_replaces_internal_headers(
     );
     assert!(!headers.contains_key("x-capyctl-generation"));
     assert!(!headers.contains_key("x-capyctl-admin-key"));
+    assert!(!headers.contains_key("x-request-id"));
+    assert!(!headers.contains_key("x-capyctl-request-id"));
     // T21: vLLM's development controls are never reachable through ingress,
     // default-on deep parking included (ADR 0012).
     for path in [
