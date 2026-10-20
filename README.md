@@ -234,6 +234,8 @@ Upgrade the server first, then the hosts one at a time.
   the named variable, then YAML, then the default).
 - [`docs/operations/network-access.md`](docs/operations/network-access.md):
   the inference endpoint on your network, its API key, and a TLS proxy.
+- [`docs/operations/data-retention.md`](docs/operations/data-retention.md):
+  what CapyCTL keeps about requests, where and for how long.
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `capyctl validate config` accepts
   them; they show the schema and are not tested engine recipes.

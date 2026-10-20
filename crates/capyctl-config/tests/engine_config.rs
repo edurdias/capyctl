@@ -156,6 +156,14 @@ fn reserved_options_are_refused_in_every_spelling() {
         // SPEC §17 (owner decision 2026-10-09): always on.
         json!(["--enable-per-request-metrics"]),
         json!(["--no-enable-per-request-metrics"]),
+        // SPEC §13.3 (owner decision 2026-10-20): request and output logging
+        // are rendered off; neither switch may be restated or reversed.
+        json!(["--enable-log-requests"]),
+        json!(["--no-enable-log-requests"]),
+        json!(["--disable-log-requests"]),
+        json!(["--enable-log-outputs"]),
+        json!(["--no-enable-log-outputs"]),
+        json!(["--enable-log-o"]),
         json!(["--middleware", "x"]),
         json!(["--revision", "main"]),
         json!(["--config", "/etc/vllm.yaml"]),

@@ -30,6 +30,7 @@ Tasks:
 Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [settings](../operations/configuration.md), [engine options](engine-flags.md),
 [network access](../operations/network-access.md),
+[data retention](../operations/data-retention.md),
 [installer options](installer.md), [exit codes and errors](errors.md).
 
 CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or

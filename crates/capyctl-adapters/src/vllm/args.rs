@@ -318,6 +318,17 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         // (reserved) never turns off.
         argv.push("--enable-per-request-metrics".into());
     }
+    // SPEC §13.3 (amended 2026-10-08), owner decision 2026-10-20: request and
+    // output logging are rendered off on every launch, not left to vLLM's
+    // default. vLLM 0.29.0, 0.30.0 and 0.31.0 define both as argparse
+    // `BooleanOptionalAction` switches with `--no-` negations
+    // (`AsyncEngineArgs.enable_log_requests` in vllm/engine/arg_utils.py,
+    // `FrontendArgs.enable_log_outputs` in vllm/entrypoints/launchers/
+    // cli_args.py), so one spelling serves every supported build and no
+    // version gate is needed. Both are reserved: the protected entry refuses
+    // any argument that resolves either destination differently.
+    argv.push("--no-enable-log-requests".into());
+    argv.push("--no-enable-log-outputs".into());
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.
     push(

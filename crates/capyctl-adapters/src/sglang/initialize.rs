@@ -39,7 +39,7 @@ const LOG_TAIL_LINES: usize = 20;
 
 /// The most log bytes read for a tail. An engine that logged a gigabyte before
 /// dying must not be read into memory to explain itself.
-const LOG_TAIL_BYTES: u64 = 64 * 1024;
+const LOG_TAIL_BYTES: usize = 64 * 1024;
 
 /// The private descriptor the launcher reads on fd 3.
 ///
@@ -473,8 +473,10 @@ fn log_tail(path: Option<&str>, lines: usize) -> String {
     let Some(path) = path else {
         return "(no engine log was configured for this launch)".into();
     };
-    let text = match read_tail_bytes(path) {
-        Ok(text) => text,
+    // Owner decision 2026-10-20: the shared reader, so a launch whose output
+    // is kept in memory (`engine_logs: memory`) is explained as one with a file.
+    let text = match crate::engine_log::tail_bytes(std::path::Path::new(path), LOG_TAIL_BYTES) {
+        Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return format!("(engine log {path} could not be read: {e})"),
     };
     let tail: Vec<&str> = text
@@ -489,18 +491,6 @@ fn log_tail(path: Option<&str>, lines: usize) -> String {
         return format!("(engine log {path} is empty)");
     }
     redact_text(&tail.join("\n"))
-}
-
-fn read_tail_bytes(path: &str) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > LOG_TAIL_BYTES {
-        file.seek(SeekFrom::Start(len - LOG_TAIL_BYTES))?;
-    }
-    let mut buffer = Vec::new();
-    file.take(LOG_TAIL_BYTES).read_to_end(&mut buffer)?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// Wall-clock milliseconds. A clock that cannot answer leaves the step uncertain

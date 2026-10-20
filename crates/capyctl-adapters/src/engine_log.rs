@@ -14,7 +14,11 @@
 //! [`read_tail`] reads the last bytes of a log for the management surface and
 //! redacts them again with the shape rules. A log written under
 //! `--debug-engine-logs` is raw development output and is never served
-//! (SPEC §13.3).
+//! (SPEC §13.3). Under `engine_logs: memory` (owner decision 2026-10-20) no
+//! file exists and every read is answered from the launch's writer instead
+//! ([`memory`]); the readers do not need to know which.
+
+pub mod memory;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -327,12 +331,21 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> Result<EngineLogTail, TailErr
 }
 
 /// Up to `limit` bytes from the end of the log, the rotated file first when
-/// the current one is shorter; whether older bytes were left unread.
+/// the current one is shorter; whether older bytes were left unread. With no
+/// file, the launch's in-memory buffer answers when its writer keeps one
+/// (`engine_logs: memory`), so every reader of a launch's output (the
+/// management tail, the launch-failure reason) works in either mode.
 pub fn tail_bytes(path: &Path, limit: usize) -> Result<(Vec<u8>, bool), TailError> {
-    let current = read_end(path, limit).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => TailError::Missing,
-        _ => TailError::Unreadable(error.kind().to_string()),
-    })?;
+    let unreadable = |error: std::io::Error| TailError::Unreadable(error.kind().to_string());
+    let current = match read_end(path, limit) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return memory::read_tail(path, limit).map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => TailError::Missing,
+                _ => unreadable(error),
+            });
+        }
+        other => other.map_err(unreadable)?,
+    };
     let (mut bytes, mut truncated) = current;
     if !truncated && bytes.len() < limit {
         match read_end(&rotated(path, 1), limit - bytes.len()) {

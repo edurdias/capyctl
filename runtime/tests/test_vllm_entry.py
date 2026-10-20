@@ -49,7 +49,10 @@ def _fake_parser(drop=(), nested=False):
     option("--cpu-offload-gb", type=float, default=0)
     option("--kv-cache-memory-bytes", type=int, default=None)
     option("--enable-sleep-mode", action=argparse.BooleanOptionalAction, default=False)
+    # vLLM 0.29.0-0.31.0: `AsyncEngineArgs.enable_log_requests` and
+    # `FrontendArgs.enable_log_outputs`, both BooleanOptionalAction, default off.
     option("--enable-log-requests", action=argparse.BooleanOptionalAction, default=False)
+    option("--enable-log-outputs", action=argparse.BooleanOptionalAction, default=False)
     option("--disable-log-stats", action="store_true")
     option("--enable-per-request-metrics", action=argparse.BooleanOptionalAction,
            default=False)
@@ -114,6 +117,7 @@ def fake_parser_0310(drop=()):
 
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
             "--enable-per-request-metrics",
+            "--no-enable-log-requests", "--no-enable-log-outputs",
             "--tensor-parallel-size", "1", "--pipeline-parallel-size", "1",
             "--port", "20001", "--gpu-memory-utilization", "0.10",
             "--kv-cache-memory-bytes", "4294967296"]
@@ -199,7 +203,9 @@ class ResolveTests(unittest.TestCase):
                      ["--ssl-ciphers", "x"], ["--ssl-keyfile", "/k"],
                      ["-dp", "2"], ["--data-parallel-rank", "0"],
                      ["--revision", "main"], ["--distributed-executor-backend", "ray"],
-                     ["--enable-log-requests"], ["--uvicorn-log-level", "debug"]):
+                     ["--enable-log-requests"], ["--enable-log-req"],
+                     ["--enable-log-outputs"], ["--enable-log-o"],
+                     ["--uvicorn-log-level", "debug"]):
             with self.subTest(user=user):
                 self.refused(user)
 
@@ -382,6 +388,23 @@ class VersionSkewTests(unittest.TestCase):
             self.assertIs(getattr(args, name, None), None)
         args = self.resolve(sleep=True, parser=fake_parser_0310())
         self.assertIs(args.enable_sleep_mode, True)
+
+    # T21 / SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): the
+    # rendered block turns request and output logging off on every supported
+    # build, each defining both switches with `--no-` negations: vLLM 0.29.0
+    # (engine/arg_utils.py:2981-2983, entrypoints/launchers/cli_args.py:150),
+    # 0.30.0 (arg_utils.py:3013-3015, cli_args.py:150) and 0.31.0
+    # (arg_utils.py:3141-3143, cli_args.py:163). No argument turns either back on.
+    def test_request_and_output_logging_are_off_on_every_supported_version(self):
+        for version, parser in (("0.29.0", fake_parser), ("0.30.0", fake_parser),
+                                ("0.31.0", fake_parser_0310)):
+            with self.subTest(version=version):
+                args = self.resolve(parser=parser())
+                self.assertIs(args.enable_log_requests, False)
+                self.assertIs(args.enable_log_outputs, False)
+                for user in (["--enable-log-requests"], ["--enable-log-outputs"],
+                             ["--enable-log-requests", "--enable-log-outputs"]):
+                    self.refused(user, parser())
 
     # T21: the whole 0.31.0 logging surface stays reserved however spelled —
     # the JSON object, every dotted field, the legacy flat overrides — so a

@@ -70,8 +70,15 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // Spec §3: the guard middleware is owned by capyctl, not a profile — a
     // profile cannot pass its own `--middleware` to bypass or replace it.
     "--middleware",
+    // SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): request and
+    // output logging are rendered off on every launch, so no prompt or
+    // completion reaches the engine log. vLLM 0.29.0, 0.30.0 and 0.31.0 define
+    // `--enable-log-requests` and `--enable-log-outputs` as boolean switches
+    // (each with a `--no-` negation, refused here too); `--disable-log-requests`
+    // exists in none of them and stays refused at deploy time.
     "--disable-log-requests",
     "--enable-log-requests",
+    "--enable-log-outputs",
     // W8 reads the engine's metrics; turning them off would blind load reports.
     "--disable-log-stats",
     // SPEC §17 (owner decision 2026-10-09): always on; the router reads the

@@ -312,6 +312,9 @@ pub struct HostConfig {
     /// SPEC §6.5, §10: `lifecycle.activation`, the activation policy of every
     /// deployment that may run on this host ([`host_activation`]).
     pub activation: crate::instances::Activation,
+    /// Owner decision 2026-10-20: `engine_logs`, where each launch's redacted
+    /// engine output is kept ([`engine_logs`]).
+    pub engine_logs: EngineLogs,
     pub document: Value,
     /// Owner decision 2026-09-25: the generic overrides (`--set`,
     /// `CAPYCTL_SET__…`) the host started with. A live reload of the document
@@ -355,6 +358,34 @@ pub fn host_activation(document: &Value) -> Result<crate::instances::Activation,
     match document.get("lifecycle").and_then(|l| l.get("activation")) {
         None => Ok(crate::instances::Activation::OnDemand),
         Some(value) => crate::instances::Activation::parse(value, "lifecycle.activation"),
+    }
+}
+/// Owner decision 2026-10-20 (SPEC §13.3): where a host keeps each launch's
+/// redacted engine output. `files` (the default) writes the private log
+/// file, rotated at 16 MiB with two older files kept; `memory` keeps the
+/// last 4 MiB in the launch's log writer only, writes no file, and is gone
+/// a minute after the engine exits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EngineLogs {
+    #[default]
+    Files,
+    Memory,
+}
+/// The `engine_logs` of a host document (or of a standalone document's
+/// `host:` block). Omitted, it is `files`; any value but `files` or `memory`
+/// is refused by name.
+pub fn engine_logs(document: &Value) -> Result<EngineLogs, ConfigError> {
+    match document.get("engine_logs") {
+        None => Ok(EngineLogs::Files),
+        Some(value) => match value.as_str() {
+            Some("files") => Ok(EngineLogs::Files),
+            Some("memory") => Ok(EngineLogs::Memory),
+            _ => Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "engine_logs",
+                "must be `files` or `memory`",
+            )),
+        },
     }
 }
 /// The load-report period when a host document names none.
@@ -649,6 +680,7 @@ impl HostConfig {
             load_report_interval,
             drain_timeout: drain_timeout(&document)?,
             activation: host_activation(&document)?,
+            engine_logs: engine_logs(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })
