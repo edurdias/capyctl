@@ -298,8 +298,8 @@ waking anything; the message names the endpoint to use:
 
 Every answer from `/v1/chat/completions` and `/v1/systemone`, success or
 error, carries CapyCTL's ID for the request in the `X-CapyCTL-Request-Id`
-header. It is the ID of the request's lease, the record CapyCTL keeps of the
-request while an engine works on it, so it is the ID to quote when you look
+header. It is the ID of the record CapyCTL keeps of the request while an
+engine works on it, so it is the ID to quote when you look
 for the request in CapyCTL's logs. A request refused before it got that far
 (a bad key, an invalid body, an unknown model, a full queue) gets a fresh
 one instead, so every answer has one.
