@@ -10,8 +10,8 @@ the engine's own output, and only if the engine prints it; see
 
 | What | Contents | Where | How long | Turn off or reduce |
 |---|---|---|---|---|
-| Request ledger | IDs only: request, deployment, revision, generation, session, in flight or uncertain | Server or standalone database | Deleted when the request completes, fails or its launch is cleaned up | Cannot be turned off; it is how a drain knows a request is still running |
-| Cancellation records | The request ID and the time it was cancelled | Server or standalone database | Deleted together with the request's ledger row | Cannot be turned off |
+| Request records | IDs only: request, deployment, revision, generation, session, in flight or uncertain | Server or standalone database | Deleted when the request completes, fails or its launch is cleaned up | Cannot be turned off; it is how a drain knows a request is still running |
+| Cancellation records | The request ID and the time it was cancelled | Server or standalone database | Deleted together with the request's record | Cannot be turned off |
 | Management events | Lifecycle events (operations, state changes, errors); no request bodies | Server or standalone database | 7 days, at most 100,000 rows and 64 MiB; older rows are pruned every time an event is written | Cannot be turned off |
 | Journal | Lifecycle commands and their evidence; no request bodies, engine log tails or probe text | Server, standalone and host databases | Never pruned | Cannot be turned off |
 | Latency and load figures | Per-request timings and engine load samples | Memory only | Until the role restarts | Nothing to turn off; never written to disk |
@@ -20,17 +20,18 @@ the engine's own output, and only if the engine prints it; see
 | Engine caches | Prefix and KV cache of recent requests | GPU memory of the running engine | While the engine runs; discarded when it parks or stops | Partition with `cache_salt` |
 | Wake canary references | A fixed probe prompt and the engine's answer to it | Server or standalone database | Replaced by the next launch of the same instance | Cannot be turned off |
 
-## Request ledger
+## Request records
 
-While a request runs, the router holds a lease on the engine instance serving
-it. The lease row records only identifiers: the lease ID, the deployment, its
-revision and generation, the router session and whether the request is in
-flight or uncertain (after a restart). The row is deleted when the request
-completes or fails, or when its launch is cleaned up. A drain or park waits
-until no lease rows remain.
+While a request runs, CapyCTL keeps a record of it against the engine
+instance serving it. The record holds only identifiers: the request ID (the
+`X-CapyCTL-Request-Id` an answer carries), the deployment, its revision and
+generation, the router session and whether the request is in flight or
+uncertain (after a restart). The record is deleted when the request completes
+or fails, or when its launch is cleaned up. A drain or park waits until no
+records of in-flight requests remain.
 
-A cancelled request also gets a cancellation record: its lease ID and the
-cancellation time. The record is deleted with the lease row it belongs to.
+A cancelled request also gets a cancellation record: its request ID and the
+cancellation time. It is deleted with the request's record.
 
 ## Management events
 
