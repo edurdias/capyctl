@@ -121,16 +121,17 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-10-18):
+  environments in use, all owner-approved (list updated 2026-10-20):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
     owner approval; 0.6.6 approved 2026-10-14), and a llama.cpp v0.7.0 build in the
     home directory (approved 2026-10-16, for Nemotron 3.5 Bolt and Super VL);
   - host A: vLLM 0.31.0 and a llama.cpp v0.6.0 build in the home directory
-    (approved 2026-10-14), and basal 2.1.0 (~/basal-2.1.0-venv, torch 2.11.0 cu130),
+    (approved 2026-10-14), basal 2.1.0 (~/basal-2.1.0-venv, torch 2.11.0 cu130),
     approved 2026-10-18 for a reference measurement of basal-omni-1.0-ultra run
-    directly, not through CapyCTL;
+    directly, not through CapyCTL, and basal 2.2.0 (~/basal-2.2.0-venv), approved
+    2026-10-20 for qualifying custom engines (ADR 0031);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B.
 
   Use these as they are. Do not create or modify any engine environment without the
