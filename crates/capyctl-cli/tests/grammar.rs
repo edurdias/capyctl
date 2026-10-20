@@ -614,6 +614,35 @@ fn engine_commands_parse() {
     );
 }
 
+// T21, ADR 0021: `engine flags <family> [--version V]` names a known family.
+#[test]
+fn engine_flags_parses() {
+    use capyctl_config::engine_policy::Engine;
+    assert_eq!(
+        parse([
+            "capyctl",
+            "engine",
+            "flags",
+            "sglang",
+            "--version",
+            "0.5.22"
+        ])
+        .unwrap(),
+        Command::EngineFlags {
+            engine: Engine::Sglang,
+            version: Some("0.5.22".into()),
+        }
+    );
+    assert_eq!(
+        parse(["capyctl", "engine", "flags", "llamacpp"])
+            .unwrap()
+            .label(),
+        "engine flags llamacpp"
+    );
+    assert!(parse(["capyctl", "engine", "flags"]).is_err());
+    assert!(parse(["capyctl", "engine", "flags", "SGLang"]).is_err());
+}
+
 // T01 (design §9): `--listen <addr:port>` narrows the inference bind of
 // `start standalone` and `start server`, and of no other command.
 #[test]

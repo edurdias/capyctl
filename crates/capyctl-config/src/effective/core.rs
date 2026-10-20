@@ -814,14 +814,8 @@ pub(super) fn validate_resources_intrinsic(
     resources: &RecipeFootprints,
     devices: &[DeviceClaim],
 ) -> Result<(), ConfigError> {
-    domain::validate_recipe(&domain::RecipeFootprints {
-        cold: domain_phase(&resources.cold, domain::ResourcePhase::Cold),
-        ready: domain_phase(&resources.ready, domain::ResourcePhase::Ready),
-        parking: domain_phase(&resources.parking, domain::ResourcePhase::Parking),
-        parked: domain_phase(&resources.parked, domain::ResourcePhase::Parked),
-        wake: domain_phase(&resources.wake, domain::ResourcePhase::Wake),
-    })
-    .map_err(|e| invalid("resources", e.to_string()))?;
+    domain::validate_recipe(&domain_recipe(resources))
+        .map_err(|e| invalid("resources", e.to_string()))?;
     let selected: BTreeMap<_, _> = devices.iter().map(|x| (x.id.as_str(), x.sharing)).collect();
     for p in [
         &resources.cold,
@@ -840,6 +834,30 @@ pub(super) fn validate_resources_intrinsic(
         }
     }
     Ok(())
+}
+
+/// SPEC §7.3: a revision being written may not give a phase a device claim
+/// its larger neighbouring phase does not hold as strongly. A start's or a
+/// wake's completion writes the Ready footprint without admission, so such a
+/// claim would enter the ledger unchecked. Not applied to a revision accepted
+/// before the rule (`CheckpointFacts::accepted_revision`).
+pub(super) fn validate_device_coverage(resources: &RecipeFootprints) -> Result<(), ConfigError> {
+    domain::validate_device_coverage(&domain_recipe(resources)).map_err(|_| {
+        invalid(
+            "resources.devices",
+            "a phase claims a device that its larger neighbouring phase (cold, parking or wake) does not claim as strongly",
+        )
+    })
+}
+
+fn domain_recipe(resources: &RecipeFootprints) -> domain::RecipeFootprints {
+    domain::RecipeFootprints {
+        cold: domain_phase(&resources.cold, domain::ResourcePhase::Cold),
+        ready: domain_phase(&resources.ready, domain::ResourcePhase::Ready),
+        parking: domain_phase(&resources.parking, domain::ResourcePhase::Parking),
+        parked: domain_phase(&resources.parked, domain::ResourcePhase::Parked),
+        wake: domain_phase(&resources.wake, domain::ResourcePhase::Wake),
+    }
 }
 
 pub(super) fn recipe_fingerprint(

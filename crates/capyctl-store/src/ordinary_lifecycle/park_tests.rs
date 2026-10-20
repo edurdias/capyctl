@@ -1635,3 +1635,182 @@ fn a_completed_restore_leaves_a_gate_another_reason_closed() {
     let (state, open, _) = lab.instance(&a.deployment_id);
     assert_eq!((state.as_str(), open), ("ready", false));
 }
+
+// T33 T19, SPEC §10 and §13.2: a restart closes every gate without a closure
+// row. A park accepted on the adopted launch and cancelled at its deadline
+// must not reopen that gate: a retired session's request may still run on
+// the engine and readiness is not yet re-proven in this session, which is
+// what `reverify_local_dispatch` waits for. Found by the formal review
+// (formal/CapyFormal/Protocols.lean, `Gate`).
+#[test]
+fn a_cancelled_park_does_not_reopen_a_gate_a_restart_closed() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    lab.ready(&a, 1_000, 10);
+    let generation = lab.instance(&a.deployment_id).2;
+    lab.store
+        .conn
+        .execute(
+            "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index) VALUES('retired',?1,?2,?3,?4,'inflight',0)",
+            params![a.deployment_id, a.revision, generation, lab.session.id()],
+        )
+        .unwrap();
+    let session = lab.store.begin_coordinator_session().unwrap();
+    for launch in lab.store.retired_local_launches(&session).unwrap() {
+        lab.store
+            .adopt_retired_local_launch(&session, launch.work.step_id())
+            .unwrap();
+    }
+    let lab = Lab { session, ..lab };
+    assert!(!lab.instance(&a.deployment_id).1);
+    let park = lab.park(&a, "p", 1_100);
+    assert_eq!(lab.arm(&park.step_id, 1_200), ResidencyArm::Draining);
+    assert!(lab
+        .store
+        .next_residency_work(&lab.session, 61_200)
+        .unwrap()
+        .is_empty());
+    assert!(
+        !lab.instance(&a.deployment_id).1,
+        "the restart's closure outlives the cancelled park"
+    );
+}
+
+// T26 T27, SPEC §7.3: the device coverage rule applies when a revision is
+// written. A revision an earlier binary stored with a Ready phase claiming a
+// device its cold phase does not still decodes, starts and stops (its
+// reservation released on gone evidence) and can be replaced, while writing
+// such a recipe now is refused.
+#[test]
+fn a_revision_stored_before_device_coverage_still_decodes_stops_and_is_replaced() {
+    use capyctl_config::effective::{
+        decode_effective_snapshot, resolve_effective_with_checkpoint, CheckpointFacts,
+    };
+    use capyctl_domain::completion::CleanupEvidence;
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let id = a.deployment_id.clone();
+    let stored: Value = serde_json::from_str(&lab.scalar::<String>(
+        "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1",
+        &id,
+    ))
+    .unwrap();
+    let source: Value = serde_json::from_str(&lab.scalar::<String>(
+        "SELECT config_json FROM managed_configuration_sources WHERE deployment_id=?1",
+        &id,
+    ))
+    .unwrap();
+    let earlier = CheckpointFacts {
+        accepted_revision: true,
+        ..Default::default()
+    };
+    let resolve = |config: &Value| resolve_effective_with_checkpoint(config, &lab.host, earlier);
+    assert_eq!(
+        serde_json::to_value(resolve(&source).unwrap()).unwrap(),
+        stored
+    );
+    // What an earlier binary stored for the same deployment with its cold
+    // phase claiming no device.
+    let mut uncovered = source.clone();
+    uncovered["resources"]["cold"]["devices"] = json!([]);
+    let legacy = resolve(&uncovered).unwrap();
+    let text = serde_json::to_string(&legacy).unwrap();
+    let tx = Transaction::new_unchecked(&lab.store.conn, TransactionBehavior::Immediate).unwrap();
+    for table in [
+        "effective_revisions",
+        "host_effective_revisions",
+        "host_device_effective_revisions",
+    ] {
+        tx.execute(
+            &format!("UPDATE {table} SET effective_json=?2,fingerprint=?3 WHERE deployment_id=?1"),
+            params![id, text, legacy.recipe_fingerprint],
+        )
+        .unwrap();
+    }
+    tx.execute(
+        "UPDATE managed_configuration_sources SET config_json=?2 WHERE deployment_id=?1",
+        params![id, uncovered.to_string()],
+    )
+    .unwrap();
+    crate::managed_configuration::reseal_migrated_receipt(
+        &tx,
+        &id,
+        a.revision,
+        &text,
+        Some(&uncovered),
+        None,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(decode_effective_snapshot(&text).is_ok());
+    // Written now, the same recipe is refused.
+    let mut b = uncovered.clone();
+    b["name"] = json!("b");
+    b["routes"] = json!(["b"]);
+    assert!(lab
+        .store
+        .create_stopped_managed_configuration(
+            &lab.session,
+            "principal",
+            "b",
+            &json!({ "config": b }).to_string(),
+            &lab.host,
+            10,
+        )
+        .is_err());
+    // The stored revision starts and stops on gone evidence.
+    lab.ready(&a, 1_000, 10);
+    assert_eq!(lab.instance(&id).0, "ready");
+    let receipt = lab
+        .store
+        .accept_ordinary_stop_command(
+            &lab.session,
+            "owner",
+            &id,
+            a.revision,
+            "stop",
+            2_000,
+            60_000,
+        )
+        .unwrap();
+    let (_, context) = lab
+        .store
+        .arm_ordinary_cleanup_with_context(&lab.session, &receipt.step_id, 2_001)
+        .unwrap();
+    let context = context.unwrap();
+    lab.store
+        .complete_cleanup(
+            &lab.session,
+            &receipt.step_id,
+            &CleanupEvidence {
+                binding_id: context.binding_id.clone(),
+                incarnation: context.incarnation.clone(),
+                identities: group(10),
+                observed_at_ms: 2_002,
+                receipt: "every recorded process gone".into(),
+            },
+            2_003,
+            2_000,
+        )
+        .unwrap();
+    assert!(!lab
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&id));
+    // And it is replaced by a covered recipe.
+    let mut covered = uncovered;
+    covered["resources"]["cold"]["devices"] = source["resources"]["cold"]["devices"].clone();
+    lab.store
+        .replace_stopped_managed_configuration(
+            &lab.session,
+            "principal",
+            "replace",
+            &id,
+            &json!({"config": covered, "expected_revision": a.revision}).to_string(),
+            &lab.host,
+            3_000,
+        )
+        .unwrap();
+}

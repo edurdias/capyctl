@@ -348,13 +348,7 @@ pub fn validate_recipe(r: &RecipeFootprints) -> Result<(), ResourceError> {
             return Err(ResourceError::Invalid);
         }
     }
-    for (peak, base) in [
-        (&r.cold, &r.ready),
-        (&r.parking, &r.ready),
-        (&r.parking, &r.parked),
-        (&r.wake, &r.parked),
-        (&r.wake, &r.ready),
-    ] {
+    for (peak, base) in peaks_and_bases(r) {
         for b in &base.allocations {
             let p = peak
                 .allocations
@@ -364,6 +358,37 @@ pub fn validate_recipe(r: &RecipeFootprints) -> Result<(), ResourceError> {
             if p.bytes < b.bytes || p.host_kv_bytes < b.host_kv_bytes {
                 return Err(ResourceError::Invalid);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Each transient phase and the steady phase it begins or ends in.
+fn peaks_and_bases(r: &RecipeFootprints) -> [(&PhaseFootprint, &PhaseFootprint); 5] {
+    [
+        (&r.cold, &r.ready),
+        (&r.parking, &r.ready),
+        (&r.parking, &r.parked),
+        (&r.wake, &r.parked),
+        (&r.wake, &r.ready),
+    ]
+}
+
+/// SPEC §7.3: a start's or a wake's completion replaces the held peak with the
+/// Ready footprint without admission, so a base phase may claim no device its
+/// peak did not already hold at least as strongly. Otherwise a second
+/// exclusive owner enters the ledger unchecked.
+///
+/// Checked when a revision is written, not by [`validate_recipe`]: a revision
+/// accepted before this rule must still decode, stop and be replaced.
+pub fn validate_device_coverage(r: &RecipeFootprints) -> Result<(), ResourceError> {
+    for (peak, base) in peaks_and_bases(r) {
+        if !base.devices.iter().all(|b| {
+            peak.devices.iter().any(|p| {
+                p.device == b.device && (p.sharing == b.sharing || p.sharing == Sharing::Exclusive)
+            })
+        }) {
+            return Err(ResourceError::Invalid);
         }
     }
     Ok(())

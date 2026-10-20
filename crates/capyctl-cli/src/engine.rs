@@ -61,6 +61,26 @@ pub fn is_engine_command(command: &Command) -> bool {
     )
 }
 
+/// ADR 0021, ADR 0014 §3, §8, ADR 0028 §2.1: `capyctl engine flags`, the
+/// ownership table of `engine`'s options and of the engine environment,
+/// taken from the tables the checks read. The policy is the same for every
+/// version of a family this build supports; `version` is recorded so a saved
+/// table names the installation it was read for.
+pub fn flags_table(engine: Engine, version: Option<&str>) -> Value {
+    json!({
+        "engine": engine.name(),
+        "version": version,
+        "flags": capyctl_config::engine_policy::flag_table(engine),
+        "env": capyctl_config::engine_env::env_table(),
+        "unlisted": {
+            "flags": "classed by the name's shape (code, listener or egress, path, \
+                      JSON configuration need approval), otherwise ordinary",
+            "env": "a deployment needs a matching security.approved_env entry; \
+                    a profile may set it",
+        },
+    })
+}
+
 pub async fn execute(
     command: &Command,
     config: Option<&Path>,

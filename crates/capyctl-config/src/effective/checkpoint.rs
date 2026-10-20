@@ -380,6 +380,7 @@ pub fn resolve_snapshot_with_checkpoint(
         &host,
         CheckpointFacts {
             member_of: frozen.member_of,
+            accepted_revision: true,
             ..facts
         },
     )
