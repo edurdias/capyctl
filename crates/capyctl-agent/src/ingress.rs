@@ -552,6 +552,10 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     }
     // Rebuild every upstream header: no end-user credential, routing override,
     // forwarded host, native admin secret or hop-by-hop field crosses this boundary.
+    // SPEC §10 (owner decision 2026-10-19): neither request ID crosses it
+    // either; `X-Request-Id` is a header CapyCTL consumes, and the router puts
+    // both IDs on the client's answer itself. The engine's own response
+    // headers are not relayed, so an engine's ID cannot replace them.
     // SPEC §10: only the engine's response head is bounded here. A request
     // timeout would also cover the body and cut a stream that is still
     // producing at a fixed wall time; the router bounds a relayed stream by

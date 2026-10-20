@@ -59,14 +59,16 @@ fn chunk(delta: Value, logprobs: Value, finish: Value) -> String {
     format!("data: {chunk}\n\n")
 }
 
-/// An engine that records every request body and answers with a stream whose
-/// choices carry `logprobs`.
-async fn engine(seen: Arc<Mutex<Vec<Value>>>) -> SocketAddr {
+/// An engine that records every request body and header set, and answers
+/// with a stream whose choices carry `logprobs`.
+async fn engine(seen: Arc<Mutex<Vec<Value>>>, heard: Heard) -> SocketAddr {
     let native = Router::new().route(
         "/v1/chat/completions",
         post(move |request: Request<Body>| {
             let seen = seen.clone();
+            let heard = heard.clone();
             async move {
+                heard.lock().unwrap().push(request.headers().clone());
                 let body = axum::body::to_bytes(request.into_body(), 1 << 20)
                     .await
                     .unwrap();
@@ -102,9 +104,12 @@ async fn engine(seen: Arc<Mutex<Vec<Value>>>) -> SocketAddr {
     serve(native).await
 }
 
+/// The header sets that reached the engine.
+type Heard = Arc<Mutex<Vec<axum::http::HeaderMap>>>;
+
 /// Router → engine forwarder → host ingress → engine.
-async fn stack(seen: Arc<Mutex<Vec<Value>>>) -> SocketAddr {
-    let native = engine(seen).await;
+async fn stack(seen: Arc<Mutex<Vec<Value>>>, heard: Heard) -> SocketAddr {
+    let native = engine(seen, heard).await;
     let ingress = Ingress::new().unwrap();
     let scope = IngressScope {
         host_id: "host".into(),
@@ -200,7 +205,7 @@ fn assert_forwarded_untouched(seen: &[Value], sent: &Value) {
 #[tokio::test]
 async fn collected_responses_keep_logprobs_and_requests_keep_supported_fields() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let router = stack(seen.clone()).await;
+    let router = stack(seen.clone(), Heard::default()).await;
     let sent = request(false);
     let response = reqwest::Client::new()
         .post(format!("http://{router}/v1/chat/completions"))
@@ -226,7 +231,7 @@ async fn collected_responses_keep_logprobs_and_requests_keep_supported_fields() 
 #[tokio::test]
 async fn streamed_responses_keep_logprobs_and_requests_keep_supported_fields() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let router = stack(seen.clone()).await;
+    let router = stack(seen.clone(), Heard::default()).await;
     let sent = request(true);
     let response = reqwest::Client::new()
         .post(format!("http://{router}/v1/chat/completions"))
@@ -259,4 +264,36 @@ async fn streamed_responses_keep_logprobs_and_requests_keep_supported_fields() {
     );
     assert!(chunks.iter().all(|chunk| chunk["model"] == "m1"));
     assert!(text.trim_end().ends_with("data: [DONE]"));
+}
+
+// T21 T17 (SPEC §10, owner decision 2026-10-19): through a host's ingress a
+// caller's `X-Request-Id` and CapyCTL's ID come back on the answer, collected
+// or streamed, and neither reaches the engine.
+#[tokio::test]
+async fn request_ids_survive_the_ingress_and_never_reach_the_engine() {
+    let heard = Heard::default();
+    let router = stack(Arc::default(), heard.clone()).await;
+    for stream in [false, true] {
+        let response = reqwest::Client::new()
+            .post(format!("http://{router}/v1/chat/completions"))
+            .bearer_auth("test-key")
+            .header("x-request-id", "trace-abc.1")
+            .json(&request(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let headers = response.headers().clone();
+        assert_eq!(headers["x-request-id"], "trace-abc.1");
+        let id = headers["x-capyctl-request-id"].to_str().unwrap().to_owned();
+        // The request's lease ID, a ULID from the ledger.
+        assert!(ulid::Ulid::from_string(&id).is_ok(), "{id}");
+        assert!(response.text().await.unwrap().contains("lo"));
+    }
+    let heard = heard.lock().unwrap();
+    assert_eq!(heard.len(), 2);
+    for headers in heard.iter() {
+        assert!(!headers.contains_key("x-request-id"), "{headers:?}");
+        assert!(!headers.contains_key("x-capyctl-request-id"), "{headers:?}");
+    }
 }

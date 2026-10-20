@@ -391,8 +391,9 @@ async fn decide(router: &axum::Router, body: &Value) -> (StatusCode, Value) {
 // T43 (ADR 0030 §2): a decision request wakes its deployment, is leased and
 // forwarded as one JSON body with only `model` replaced by the served name,
 // and comes back whole with the public name and the engine's usage; its
-// completion closes the lease and frees the slot. It carries no figures of
-// generated text.
+// completion closes the lease and frees the slot. Its `capyctl.metrics` has
+// the router's total and time to response and the engine's input tokens, and
+// no figure of generated text (owner decision 2026-10-19).
 #[tokio::test]
 async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
     let (endpoint, seen) =
@@ -415,7 +416,19 @@ async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
     assert_eq!(body["model"], ROUTE);
     assert_eq!(body["answers"], answer()["answers"]);
     assert_eq!(body["usage"], answer()["usage"]);
-    assert!(body.get("capyctl").is_none(), "{body}");
+    let metrics = &body["capyctl"]["metrics"];
+    assert_eq!(
+        metrics["input_tokens"],
+        json!({"value": 87, "source": "engine"}),
+        "{body}"
+    );
+    for figure in ["total_ms", "time_to_response_ms"] {
+        assert_eq!(metrics[figure]["source"], "router", "{body}");
+        assert!(metrics[figure]["value"].as_f64().unwrap() >= 0.0, "{body}");
+    }
+    for figure in ["ttft_ms", "decode_tokens_per_second"] {
+        assert!(metrics.get(figure).is_none(), "{body}");
+    }
     assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed)]);
     assert_eq!(deps.inflight.current(DEPLOYMENT), 0);
 

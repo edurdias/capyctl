@@ -14,6 +14,8 @@ pub mod endpoint;
 pub mod forwarders;
 // SPEC §10 step 1 (W10): bounded waiting for a deployment to become servable.
 pub mod queue;
+// SPEC §10 (owner decision 2026-10-19): the caller's and CapyCTL's request IDs.
+pub mod request_id;
 pub mod stream;
 pub mod switch;
 // SPEC §17 (owner decision 2026-10-09): per-request engine metrics.
@@ -170,12 +172,14 @@ struct Received {
     body_bytes: usize,
 }
 
-/// Authenticate, read the body under its bound, parse it and validate it
-/// against `endpoint`'s contract, before any accounting, activation or engine
-/// is touched (SPEC §10, T19 T21; ADR 0030 §2).
+/// Authenticate, check the caller's request ID, read the body under its
+/// bound, parse it and validate it against `endpoint`'s contract, before any
+/// accounting, activation or engine is touched (SPEC §10, T19 T21; ADR 0030
+/// §2).
 async fn receive(
     deps: &RouterDeps,
     headers: &HeaderMap,
+    ids: &request_id::RequestIds,
     body: axum::body::Body,
     endpoint: endpoint::Endpoint,
 ) -> Result<Received, (StatusCode, Json<serde_json::Value>)> {
@@ -190,6 +194,9 @@ async fn receive(
             "missing or valid api key required",
         ));
     }
+    // SPEC §10 (owner decision 2026-10-19): a malformed `X-Request-Id` is the
+    // client's error, refused before the body is read.
+    ids.check()?;
     // SPEC §10 (T19): the body is read under the router's configured bound
     // and no other. axum's implicit 2 MiB `Bytes` limit would refuse a
     // multimodal body the configured bound admits (with a plain-text 413) and
@@ -217,11 +224,23 @@ async fn receive(
 }
 
 /// `POST /v1/chat/completions` — authenticate → resolve → admit → dispatch.
-#[axum::debug_handler]
+/// SPEC §10 (owner decision 2026-10-19): every answer, error or success,
+/// carries the request's IDs.
 async fn chat_completions(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
     body: axum::body::Body,
+) -> axum::response::Response {
+    let ids = Arc::new(request_id::RequestIds::read(&headers));
+    let outcome = chat_completion(&state.deps, &headers, body, &ids).await;
+    ids.stamp(outcome)
+}
+
+async fn chat_completion(
+    deps: &RouterDeps,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    ids: &Arc<request_id::RequestIds>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::ChatCompletions;
     let Received {
@@ -230,7 +249,7 @@ async fn chat_completions(
         request: v,
         model,
         body_bytes,
-    } = receive(&state.deps, &headers, body, endpoint).await?;
+    } = receive(deps, headers, ids, body, endpoint).await?;
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
         // SPEC §10 step 1 and T19: a request that must wait holds its body's
@@ -238,20 +257,13 @@ async fn chat_completions(
         // slot in arrival order within its deadline. Accounting is registered
         // before the response is built; the stream guard releases when the
         // backend stream ends.
-        let (deployment_id, guard, view) = chat::admit_timed(
-            &state.deps,
-            endpoint,
-            &model,
-            body_bytes,
-            received,
-            &mut timing,
-        )
-        .await?;
+        let (deployment_id, guard, view) =
+            chat::admit_timed(deps, endpoint, &model, body_bytes, received, &mut timing).await?;
         // ADR 0013 §10 (I3): choose an instance; SPEC §10: its durable lease is
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
         let started = std::time::Instant::now();
-        let mut plan = balance::Plan::new(&state.deps, &deployment_id, view)?;
+        let mut plan = balance::Plan::new(deps, &deployment_id, view, ids.clone())?;
         timing.selected(started.elapsed());
         let started = std::time::Instant::now();
         let first = plan.next().await?;
@@ -259,8 +271,7 @@ async fn chat_completions(
         // SPEC §17: the phases known before the first byte; the rest follow
         // in the stream's timing comment.
         let header = timing.header_enabled().then(|| timing.header_value());
-        let bounds =
-            stream::StreamBounds::for_request(received, &state.deps.inflight.waiting.limits());
+        let bounds = stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
         let sse = stream::stream_planned_timed(first, Some(plan), v, guard, timing, bounds);
         let mut response = sse.into_response();
         if let Some(value) = header.and_then(|h| h.parse().ok()) {
@@ -269,13 +280,14 @@ async fn chat_completions(
         return Ok(response);
     }
     let (mut json, timing) = chat::dispatch_timed(
-        &state.deps,
+        deps,
         endpoint,
         &model,
         v,
         body_bytes,
         received,
         timing,
+        ids.clone(),
     )
     .await?;
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
@@ -286,27 +298,41 @@ async fn chat_completions(
 /// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
 /// and settled exactly as a chat completion, for `api: decisions` deployments
 /// only. It is never streamed. The answer is the engine's, with `model` the
-/// public name and its `usage` as the engine sent it; it carries no
-/// `capyctl.metrics`, since time to first token and decode speed describe
-/// generated text and a decision generates none. Its timings are recorded
-/// like any request's.
+/// public name and its `usage` as the engine sent it, plus the request's
+/// figures in `capyctl.metrics` (SPEC §17, owner decision 2026-10-19; see
+/// [`engine_metrics::attach_decision`]). Its timings are recorded like any
+/// request's, and it carries the request's IDs as a chat answer does (SPEC
+/// §10).
 async fn systemone(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
     body: axum::body::Body,
+) -> axum::response::Response {
+    let ids = Arc::new(request_id::RequestIds::read(&headers));
+    let outcome = decision(&state.deps, &headers, body, &ids).await;
+    ids.stamp(outcome)
+}
+
+async fn decision(
+    deps: &RouterDeps,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    ids: &Arc<request_id::RequestIds>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::Decisions;
-    let received = receive(&state.deps, &headers, body, endpoint).await?;
-    let (json, timing) = chat::dispatch_timed(
-        &state.deps,
+    let received = receive(deps, headers, ids, body, endpoint).await?;
+    let (mut json, timing) = chat::dispatch_timed(
+        deps,
         endpoint,
         &received.model,
         received.request,
         received.body_bytes,
         received.at,
         received.timing,
+        ids.clone(),
     )
     .await?;
+    engine_metrics::attach_decision(&mut json, &timing);
     Ok(with_timing(Json(json).into_response(), &timing))
 }
 

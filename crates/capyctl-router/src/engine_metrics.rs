@@ -25,6 +25,13 @@
 //! A non-streaming answer carries the set in its body as `capyctl.metrics`; a
 //! stream carries it as one SSE comment line (`: x-capyctl-metrics {...}`)
 //! before `data: [DONE]`, beside the timing comment, which SSE clients ignore.
+//!
+//! A decision (ADR 0030 §2; owner decision 2026-10-19) generates no text, so
+//! it has no time to first token or decode speed. Its answer carries
+//! [`decision_metrics`] instead: the router's `total_ms` and
+//! `time_to_response_ms`, the engine's `queue_ms`, `prefill_ms` and
+//! `cached_tokens` where it reported them (read as for chat), and the
+//! engine's `input_tokens` from its `usage`.
 
 use serde_json::{json, Map, Value};
 
@@ -195,6 +202,60 @@ pub fn attach(response: &mut Value, timing: &RequestTiming) {
     let mut report = EngineReport::default();
     report.observe(response);
     let figures = metrics(&report, timing);
+    if let Some(body) = response.as_object_mut() {
+        body.insert(BODY_KEY.to_owned(), json!({ "metrics": figures }));
+    }
+}
+
+/// ADR 0030 §2 (owner decision 2026-10-19): the figures of one decision, each
+/// labelled with its source as a chat answer's are. `total_ms` runs from when
+/// the router received the request to the whole answer, waiting and
+/// activation included; `time_to_response_ms` from when the router sent it to
+/// the engine to the whole answer. Absent values stay absent.
+pub fn decision_metrics(report: &EngineReport, response: &Value, timing: &RequestTiming) -> Value {
+    let mut out = Map::new();
+    let ms = |took: std::time::Duration| took.as_secs_f64() * 1000.0;
+    let phases = timing.phases();
+    let mut put = |name: &str, value: Option<f64>, source: &str| {
+        if let Some(value) = value {
+            out.insert(
+                name.to_owned(),
+                json!({"value": rounded(value), "source": source}),
+            );
+        }
+    };
+    put("total_ms", phases.total.map(ms), "router");
+    let to_response = phases
+        .time_to_last_chunk
+        .zip(phases.pre_forward)
+        .and_then(|(answered, sent)| answered.checked_sub(sent));
+    put("time_to_response_ms", to_response.map(ms), "router");
+    put("queue_ms", report.queue_ms, "engine");
+    put("prefill_ms", report.prefill_ms, "engine");
+    // The System One answer counts its input as `usage.input_tokens`.
+    if let Some(tokens) = response
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+    {
+        out.insert(
+            "input_tokens".to_owned(),
+            json!({"value": tokens, "source": "engine"}),
+        );
+    }
+    if let Some(cached) = report.cached_tokens {
+        out.insert(
+            "cached_tokens".to_owned(),
+            json!({"value": cached, "source": "engine"}),
+        );
+    }
+    Value::Object(out)
+}
+
+/// A decision's answer: its figures go in the body as `capyctl.metrics`.
+pub fn attach_decision(response: &mut Value, timing: &RequestTiming) {
+    let mut report = EngineReport::default();
+    report.observe(response);
+    let figures = decision_metrics(&report, response, timing);
     if let Some(body) = response.as_object_mut() {
         body.insert(BODY_KEY.to_owned(), json!({ "metrics": figures }));
     }
@@ -553,5 +614,30 @@ mod tests {
             answer["capyctl"]["metrics"],
             json!({"queue_ms": {"value": 1.0, "source": "engine"}})
         );
+    }
+
+    // T43 (owner decision 2026-10-19): a decision carries the engine's input
+    // tokens and the figures it timed, labelled engine; nothing about
+    // generated text, and nothing nobody measured.
+    #[test]
+    fn a_decision_carries_its_input_tokens_and_engine_figures() {
+        let engine = json!({"model": "m", "answers": {"q": {"type": "noul", "noul": 0.6}},
+            "usage": {"input_tokens": 87, "output_tokens": 0},
+            "timings": {"prompt_ms": 12.5, "predicted_per_second": 40.0}});
+        let mut answer = engine.clone();
+        attach_decision(&mut answer, &RequestTiming::untracked());
+        for key in ["model", "answers", "usage", "timings"] {
+            assert_eq!(answer[key], engine[key]);
+        }
+        assert_eq!(
+            answer["capyctl"]["metrics"],
+            json!({
+                "input_tokens": {"value": 87, "source": "engine"},
+                "prefill_ms": {"value": 12.5, "source": "engine"},
+            })
+        );
+        let mut bare = json!({"answers": {}});
+        attach_decision(&mut bare, &RequestTiming::untracked());
+        assert_eq!(bare["capyctl"]["metrics"], json!({}));
     }
 }
