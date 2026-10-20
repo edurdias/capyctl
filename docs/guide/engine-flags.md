@@ -19,11 +19,62 @@ schema (`crates/capyctl-config/src/schema.rs`). A test
 (`crates/capyctl-config/tests/engine_flag_table.rs`) runs every option in the
 tables below through CapyCTL's checks and fails if a row's class is wrong,
 or if a typed field is missing from its table. Options not listed follow the
-same rules: try `capyctl validate config` to see how one is treated.
+same rules: try `capyctl validate config` to see how one is treated, or print
+the full table with `capyctl engine flags`.
 
 An option that is not typed reaches the engine as written. CapyCTL does not
 count memory it makes the engine use, such as a CPU KV offload. Size
 `memory.request` to include it.
+
+## The ownership table
+
+`capyctl engine flags <family>` prints every option and environment name the
+checks know for an engine family (`vllm`, `sglang`, `tensorfold` or
+`llamacpp`), with its class and the reason. It is built from the same tables
+the checks read, so it cannot drift from them. It prints text by default;
+`--format json` (or `--json`) prints one object. `--version V` records the
+engine version in the output; the policy is the same for every version of a
+family this release supports.
+
+```sh
+capyctl engine flags sglang --version 0.5.22 --format json
+```
+
+```json
+{
+  "engine": "sglang",
+  "version": "0.5.22",
+  "flags": [
+    {"name": "--watermark-config", "match": "name", "class": "reserved", "reason": "..."},
+    {"name": "--debug-tensor-dump-", "match": "prefix", "class": "reserved", "reason": "..."},
+    {"name": "--port", "match": "name", "class": "owned", "reason": "..."},
+    {"name": "--chat-template", "match": "name", "class": "sensitive", "approval": "path_or_checkpoint", "reason": "..."},
+    {"name": "--reasoning-parser", "match": "name", "class": "ordinary", "reason": "..."}
+  ],
+  "env": [
+    {"name": "DUMPER_", "match": "prefix", "class": "reserved", "reason": "..."}
+  ],
+  "unlisted": {"flags": "...", "env": "..."}
+}
+```
+
+The classes in the output:
+
+- **owned**: CapyCTL renders or closes the setting, or a typed field says it
+  (the **typed** and **reserved** rows of the tables below). Refused.
+- **reserved**: nobody may set it, whatever the host approves: a
+  configuration file, and options or variables that write requests, tensors
+  or debug data to disk. Refused.
+- **sensitive**: needs the host's named approval; `approval` names the kind
+  (`code`, `path`, `path_or_checkpoint`, `listener_or_egress`, `config`,
+  `speculative_config`).
+- **ordinary**: passes unchanged.
+
+`match` is `name` for one option (every engine but llama.cpp also refuses
+its abbreviations, `_` spellings, `--no-` negations and `=value` forms) or
+`prefix` for every option starting with the name. Environment names are
+compared upper-cased, so `dumper_enable` is refused like `DUMPER_ENABLE`, with
+`engine_env_reserved:<name>`.
 
 ## vLLM 0.30 and 0.31
 
@@ -94,6 +145,7 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 | KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
 | Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. `SGLANG_PLUGINS` is set by CapyCTL and cannot be changed: SGLang loads no plugin. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |
+| Dumps to disk, watermark key | `--watermark-config`, `--debug-tensor-dump-output-folder`, `--debug-tensor-dump-layers`, `--debug-tensor-dump-input-file`, `--msprobe-dump-config`, `--export-metrics-to-file`, `--export-metrics-to-file-dir`, `--spec-trace-dir` | reserved | Not supported, whatever the host approves. They write requests, tensors or debug data to disk, or (0.5.22) read the key that marks every answer. Every `--debug-tensor-dump-*` option is reserved too, and so are the `DUMPER_*`, `SGLANG_DUMP*`, `SGLANG_KERNEL_API_*` and `SGLANG_CUDA_COREDUMP*` variables and `SGLANG_DSPARK_DEBUG_DUMP`, `SGLANG_DSPARK_ENABLE_SPS_RECORD`, `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` and `SGLANG_TORCH_PROFILER_DIR`. |
 
 **`--enable-linear-replayssm-spec`.** This option exists in SGLang 0.5.21.
 It was checked in the published wheel
@@ -123,7 +175,8 @@ The speculative options in that wheel (`arg_groups/fields/spec.py`) are
 `--speculative-adaptive-config`, `--spec-trace-dir`, the
 `--speculative-dflash-*`, `--speculative-dspark-*` and
 `--speculative-ngram-*` families, and `--uno-lora-path`. Options ending in
-`-path`, `-dir` or `-config` need approval, like the draft model path.
+`-path`, `-dir` or `-config` need approval, like the draft model path;
+`--spec-trace-dir` is reserved, because it writes traces to disk.
 
 ## TensorFold 0.6.6
 

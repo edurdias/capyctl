@@ -196,6 +196,46 @@ fn reserved_options_are_refused_in_every_spelling() {
     }
 }
 
+/// SPEC §8.2 (owner decision 2026-10-20): SGLang options that dump requests,
+/// tensors or debug data to disk, and the watermark key file, are reserved,
+/// not approval-gated: refused exact, abbreviated, with `=value`, as the
+/// tensor dump family, and with every one of them approved by name.
+// T21
+#[test]
+fn sglang_dump_destinations_are_reserved_in_every_spelling() {
+    let all: Vec<String> = capyctl_config::engine_policy::SGLANG_DUMP_RESERVED
+        .iter()
+        .map(|(field, _)| format!("--{}", field.replace('_', "-")))
+        .collect();
+    for args in [
+        json!(["--watermark-config", "/srv/key.json"]),
+        json!(["--watermark-config={\"key\": 1}"]),
+        json!(["--watermark", "/srv/key.json"]),
+        json!(["--watermark_config", "/srv/key.json"]),
+        json!(["--debug-tensor-dump-output-folder", "/tmp/d"]),
+        json!(["--debug-tensor-dump-out=/tmp/d"]),
+        json!(["--debug-tensor-dump-layers", "1"]),
+        json!(["--debug-tensor-dump-input-file", "/tmp/i"]),
+        json!(["--debug-tensor-dump-future-option", "x"]),
+        json!(["--msprobe-dump-config", "/c.json"]),
+        json!(["--msprobe", "/c.json"]),
+        json!(["--export-metrics-to-file"]),
+        json!(["--export-metrics", "x"]),
+        json!(["--export-metrics-to-file-dir", "/tmp/m"]),
+        json!(["--export-metrics-to-file-d=/tmp/m"]),
+        json!(["--spec-trace-dir", "/tmp/t"]),
+        json!(["--spec-trace=/tmp/t"]),
+    ] {
+        let (deployment, mut host) = with_extra_args("sglang", args.clone());
+        host["runtime_profiles"]["local"]["security"]["approved_options"] = json!(all);
+        host["runtime_profiles"]["local"]["security"]["approved_paths"] = json!(["/"]);
+        let error =
+            resolve_effective(&deployment, &host).expect_err(&format!("{args} must be refused"));
+        assert_eq!(error.path, "engine_config.extra_args", "{args}: {error}");
+        assert!(error.to_string().contains("reserved"), "{args}: {error}");
+    }
+}
+
 /// SPEC §8.2: rendezvous data is capyctl's. Found live 2026-09-23 (M08): the
 /// SGLang scheduler's torch TCP rendezvous listened on every interface, so a
 /// single rank now uses a private file store and neither the rendezvous
@@ -548,10 +588,6 @@ fn sensitive_shapes_and_abbreviations_need_approval() {
         ),
         ("sglang", json!(["--engine-info", "29500"])),
         ("sglang", json!(["--decrypted-config", "/tmp/c"])),
-        (
-            "sglang",
-            json!(["--debug-tensor-dump-output-folder", "/tmp/d"]),
-        ),
         (
             "sglang",
             json!([

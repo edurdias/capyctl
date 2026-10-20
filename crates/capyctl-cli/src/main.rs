@@ -64,6 +64,17 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+    // ADR 0021: the flag ownership table, from this build's own tables; no
+    // state, runtime or network.
+    if let Command::EngineFlags { engine, version } = &invocation.command {
+        emit(
+            &invocation.command,
+            &capyctl_cli::engine::flags_table(*engine, version.as_deref()),
+            format,
+            &context,
+        );
+        return ExitCode::SUCCESS;
+    }
     if capyctl_cli::remote_roles::supports(&invocation.command) {
         // SPEC §13.3: only a local startup flag enables full native output.
         // Clear inherited permission before creating runtime threads.

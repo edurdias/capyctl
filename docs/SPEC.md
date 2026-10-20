@@ -614,6 +614,7 @@ capyctl engine detect [--path DIR]
 capyctl engine add [PATH] [--name NAME] [--deep-park enabled|disabled] [--drift warn|refuse]
 capyctl engine list
 capyctl engine remove NAME [--drain]
+capyctl engine flags vllm|sglang|tensorfold|llamacpp [--version V]
 capyctl list engines --config server.yaml
 ```
 
