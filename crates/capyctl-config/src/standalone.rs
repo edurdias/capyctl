@@ -457,6 +457,10 @@ pub fn check_honoured(
     // a host; a malformed value is refused before any side effect.
     crate::remote_roles::host_activation(host)
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
+    // Owner decision 2026-10-20: where the embedded host keeps engine output,
+    // as on a host; a malformed value is refused before any side effect.
+    crate::remote_roles::engine_logs(host)
+        .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     if let Some(policy) = host.get("resource_policy") {
         let mut policy = policy.clone();
         if let Some(map) = policy.as_object_mut() {
@@ -745,6 +749,23 @@ mod tests {
         )
         .unwrap();
         check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
+    }
+
+    // T21 (owner decision 2026-10-20): `host.engine_logs` is honoured as on a
+    // host, and a malformed value is refused with its path.
+    #[test]
+    fn standalone_honours_engine_logs() {
+        let mut doc = generated("/s");
+        doc["host"]["engine_logs"] = json!("memory");
+        crate::validate(
+            &serde_json::to_string(&doc).unwrap(),
+            crate::ConfigKind::Standalone,
+        )
+        .unwrap();
+        check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
+        doc["host"]["engine_logs"] = json!("disk");
+        let error = check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap_err();
+        assert_eq!(error.path, "host.engine_logs", "{error}");
     }
 
     // T14 (ADR 0028 §3, R21): standalone honours `host.resource_policy.groups`

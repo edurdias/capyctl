@@ -1758,6 +1758,15 @@ async fn start_standalone_in(
                 .stall_timeout,
         )
     };
+    // Owner decision 2026-10-20: `host.engine_logs` (validated by
+    // `check_honoured` above) holds for every launch from here on;
+    // `--debug-engine-logs` is refused with `memory` before any side effect.
+    let engine_logs = capyctl_config::remote_roles::engine_logs(&stated_host)
+        .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
+    capyctl_launchers::engine_log_relay::keep_in_memory(
+        engine_logs == capyctl_config::remote_roles::EngineLogs::Memory,
+    )
+    .map_err(|error| StartError::Setting(error.to_string()))?;
     let db_path = state_dir.join("server").join("srv.sqlite3");
     // SPEC §15.2: an explicit document is operator configuration, not state,
     // so it does not bring the credentials a generated default would. A state

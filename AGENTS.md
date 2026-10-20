@@ -36,8 +36,9 @@ Read these in order when orienting. Lower entries never override higher ones.
 If a summary disagrees with `docs/SPEC.md`, the spec wins.
 
 Operator-facing docs: `docs/operations/install.md` (install, services, upgrades,
-discrete GPUs, containers), `docs/operations/configuration.md` (every setting) and
-`docs/operations/network-access.md` (the inference endpoint on the network).
+discrete GPUs, containers), `docs/operations/configuration.md` (every setting),
+`docs/operations/network-access.md` (the inference endpoint on the network) and
+`docs/operations/data-retention.md` (what is kept about requests, and for how long).
 Live test harness: `scripts/live/matrix/README.md`.
 
 ## Documentation rules

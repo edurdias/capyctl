@@ -841,9 +841,17 @@ is written:
 - The log rotates at 16 MiB to `<launch id>.log.1` and `.log.2`; older output
   is dropped, so one launch's log never exceeds 48 MiB.
 - No engine logs prompts or completions: request logging stays off. SGLang
-  runs with `log_requests` off and no crash dump folder; vLLM's
-  `--enable-log-requests` is reserved and off by default; TensorFold has no
-  request logging. Per-request lines carry the method, path and status only.
+  runs with `log_requests` off and no crash dump folder; vLLM runs with
+  `--no-enable-log-requests` and `--no-enable-log-outputs` on every launch,
+  and both flags are reserved; TensorFold has no request logging. Per-request
+  lines carry the method, path and status only.
+- With `engine_logs: memory` (standalone: `host.engine_logs: memory`), no log
+  file is written. The writer keeps the last 4 MiB of the launch's redacted
+  output in its own memory instead, and serves the management read and
+  CapyCTL's launch-failure reasons from there. It keeps the buffer for 60
+  seconds after the engine exits, then leaves, and the output is gone
+  ([Settings](configuration.md#engine-logs),
+  [Data retention](data-retention.md#engine-logs)).
 
 Read the end of an instance's log through the management API, on the
 management listener, with the admin token from the role's credentials file
@@ -874,7 +882,9 @@ directly, without the writer, for launches from then on. That output may
 contain prompts and secrets, so the management API never serves it (it answers
 that the log was written under `--debug-engine-logs`). It is a flag only: a
 variable left in a unit file must not turn it on. For a unit, add it to
-`ExecStart=` in a drop-in while you investigate, then remove it.
+`ExecStart=` in a drop-in while you investigate, then remove it. A role whose
+document sets `engine_logs: memory` refuses to start with the flag, since raw
+files would defeat the setting.
 
 - **A launch fails.** `capyctl status deployment <name>` shows the reason in
   `LAST OPERATION` (for example `initialize failed (launch_failed)`); the

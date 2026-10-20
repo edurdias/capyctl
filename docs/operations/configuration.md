@@ -334,6 +334,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`, `--allow-remote-code`; they write `engines.yaml`, which a host and standalone read alike) |
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
+| Engine logs: `files` (default), or `memory`, which keeps each launch's redacted engine output in memory only ([below](#engine-logs)) | host: `engine_logs` (standalone: `host.engine_logs`) |
 
 `lifecycle.activation` follows the server's lifecycle settings: the document,
 `--set lifecycle.activation=explicit` on `capyctl start host` (or
@@ -346,6 +347,30 @@ restart. A deployment states the same policy for itself as
 like `lifecycle.warm`. A deployment is explicit when it or any host it may run
 on says so. What that changes, and how it combines with `lifecycle.warm` and an
 operator's stop: [Only on your command](../guide/parking.md#only-on-your-command).
+
+### Engine logs
+
+`engine_logs` says where a host keeps each launch's engine output, after
+redaction ([engine logs](install.md#engine-logs-and-troubleshooting)):
+
+- `files` (the default) writes the owner-only log file, rotated at 16 MiB
+  with two older files kept, so one launch's log never exceeds 48 MiB.
+  CapyCTL does not delete it.
+- `memory` writes no engine log file. The launch's log writer keeps the last
+  4 MiB of redacted output in its own memory. The management engine-log read
+  and the reason CapyCTL gives for a failed launch are served from that
+  buffer. The buffer lasts until 60 seconds after the engine exits, then it
+  is gone. A host restart also loses it; a role restart does not, because the
+  writer runs beside the engine.
+
+Set it in the document, with `--set engine_logs=memory` on `capyctl start host`
+(`--set host.engine_logs=memory` on `capyctl start standalone`), or with
+`CAPYCTL_SET__ENGINE_LOGS=memory` (`CAPYCTL_SET__HOST__ENGINE_LOGS` for
+standalone). Any other value refuses the start. It applies to launches from
+the next start. `--debug-engine-logs` is refused together with `memory`,
+because raw log files would defeat it. Redaction removes credentials, not
+prompts or outputs; see [data retention](data-retention.md) for everything
+CapyCTL keeps.
 
 ## Any setting by its path
 
@@ -611,8 +636,9 @@ configuration, so they have no variable or YAML form. `--debug-engine-logs` on
 `start host` and `start standalone` is a flag only on purpose: full engine logs
 are written without redaction and may contain secrets, so a variable left in a
 shell or unit file must not turn them on. The engine log's redaction, rotation
-(16 MiB, two older files) and the management tail bound (256 KiB) are fixed,
-not settings ([engine logs](install.md#engine-logs-and-troubleshooting)).
+(16 MiB, two older files), the in-memory buffer of `engine_logs: memory`
+(4 MiB) and the management tail bound (256 KiB) are fixed, not settings
+([engine logs](install.md#engine-logs-and-troubleshooting)).
 
 Commands print text (tables, or a summary with details) unless `--format json`
 is given, even when their output is piped. `start server`, `start host` and

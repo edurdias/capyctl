@@ -1501,6 +1501,13 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(dir) = state_dir_override(invocation, &host.state_dir) {
                     host = host.with_state_dir(dir);
                 }
+                // Owner decision 2026-10-20: `engine_logs` holds for every
+                // launch from here on; `--debug-engine-logs` is refused with
+                // `memory` before any side effect.
+                capyctl_launchers::engine_log_relay::keep_in_memory(
+                    host.engine_logs == capyctl_config::remote_roles::EngineLogs::Memory,
+                )
+                .map_err(|refused| error(&format!("Invalid host configuration: {refused}")))?;
                 // Owner decision 2026-09-26: a command run later on this
                 // machine without --config (`capyctl engine`, `config show`)
                 // finds this host's document.
