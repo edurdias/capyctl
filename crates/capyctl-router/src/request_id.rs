@@ -121,11 +121,8 @@ impl RequestIds {
     /// Both IDs as a suffix for a role-log notice.
     pub fn log_suffix(&self) -> String {
         match self.caller() {
-            Some(caller) => format!(
-                " (CapyCTL request {}, caller request {caller})",
-                self.capyctl()
-            ),
-            None => format!(" (CapyCTL request {})", self.capyctl()),
+            Some(caller) => format!(" (request {}, caller {caller})", self.capyctl()),
+            None => format!(" (request {})", self.capyctl()),
         }
     }
 
@@ -213,15 +210,12 @@ mod tests {
             serde_json::json!({"event": "router_failover",
                 "capyctl_request_id": "lease-9", "caller_request_id": "caller-7"})
         );
-        assert_eq!(
-            ids.log_suffix(),
-            " (CapyCTL request lease-9, caller request caller-7)"
-        );
+        assert_eq!(ids.log_suffix(), " (request lease-9, caller caller-7)");
         let anonymous = RequestIds::untracked();
         anonymous.granted("lease-3");
         let mut event = serde_json::json!({});
         anonymous.log_fields(&mut event);
         assert_eq!(event, serde_json::json!({"capyctl_request_id": "lease-3"}));
-        assert_eq!(anonymous.log_suffix(), " (CapyCTL request lease-3)");
+        assert_eq!(anonymous.log_suffix(), " (request lease-3)");
     }
 }

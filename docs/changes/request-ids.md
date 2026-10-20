@@ -13,9 +13,12 @@ to the ledger or an event. Every answer of both endpoints carries
 `X-CapyCTL-Request-Id`, the ID of the request's first granted lease, or a fresh
 ULID when the request was refused before any lease. The router's
 `router_selection` and `router_failover` lines carry `capyctl_request_id` and,
-when given, `caller_request_id`; lines decided before the first lease are held
-until the offer is decided, so they carry the lease's ID. A lease close that
-could not be written names both IDs. `request_cancellation_acknowledged` is
+when given, `caller_request_id` in JSON output; in the default text output
+(ADR 0021) they read `request <capyctl id> (caller <id>) <deployment> -> <host>
+instance <n>`, the caller part only when given (found by the live check on host
+A: the text form first showed neither ID). Lines decided before the first lease
+are held until the offer is decided, so they carry the lease's ID. A lease close
+that could not be written names both IDs. `request_cancellation_acknowledged` is
 unchanged and keeps only CapyCTL's identifiers. A decision's answer now carries
 `capyctl.metrics`: the router's `total_ms` and `time_to_response_ms`, the
 engine's `input_tokens` from `usage`, and `queue_ms`, `prefill_ms` and
@@ -28,6 +31,8 @@ ID equals the lease ID; a fresh ULID per request refused before any lease; a
 malformed or repeated header refused before anything is leased or sent; an engine
 double that records headers never sees either ID, and its own `X-Request-Id`
 never reaches the client), the `request_id` and `engine_metrics` unit tests,
+the `role_text` unit test `router_lines_name_the_request_ids` (the text form
+names both IDs, and nothing extra without a caller ID),
 `decisions.rs` (decision metrics present, no time to first token or decode
 speed), `crates/capyctl-cli/tests/router_payloads.rs` (router, engine forwarder,
 host ingress and engine: both IDs on the answer, neither at the engine) and

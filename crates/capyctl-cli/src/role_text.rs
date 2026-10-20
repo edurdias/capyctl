@@ -23,6 +23,30 @@ fn short(id: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// An ID shown in full in a text line: one token of printable ASCII, at most
+/// 128 bytes (the caller request ID format, SPEC §10), or nothing.
+fn token(id: &Value) -> Option<&str> {
+    id.as_str()
+        .filter(|s| (1..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic()))
+}
+
+/// SPEC §10 (owner decision 2026-10-19): how a router line names its request:
+/// CapyCTL's request ID in full (the `X-CapyCTL-Request-Id` a client quotes),
+/// the caller's `X-Request-Id` when it sent one, then the deployment.
+fn request(value: &Value) -> String {
+    let mut out = String::from("request");
+    if let Some(id) = token(&value["capyctl_request_id"]) {
+        out.push(' ');
+        out.push_str(id);
+    }
+    if let Some(caller) = token(&value["caller_request_id"]) {
+        out.push_str(&format!(" (caller {caller})"));
+    }
+    out.push(' ');
+    out.push_str(&short(&value["deployment"]));
+    out
+}
+
 fn clock() -> String {
     // Local wall-clock time; the journal adds its own stamps in JSON mode.
     let now = std::time::SystemTime::now()
@@ -56,14 +80,14 @@ pub fn format_event(value: &Value) -> Option<String> {
             // The ranking's first candidate is the pick; `chosen` is its generation.
             match value["candidates"].get(0).filter(|pick| pick.is_object()) {
                 Some(pick) => format!(
-                    "request {} -> {} instance {}",
-                    short(&value["deployment"]),
+                    "{} -> {} instance {}",
+                    request(value),
                     pick["host"].as_str().unwrap_or("?"),
                     pick["instance"]
                 ),
                 None => format!(
-                    "request {}: no instance available ({} skipped)",
-                    short(&value["deployment"]),
+                    "{}: no instance available ({} skipped)",
+                    request(value),
                     value["skipped"].as_array().map_or(0, Vec::len)
                 ),
             }
@@ -76,14 +100,11 @@ pub fn format_event(value: &Value) -> Option<String> {
             );
             match value["detail"].as_str().filter(|d| !d.is_empty()) {
                 Some(detail) => format!(
-                    "request {} failed over: {reason} ({})",
-                    short(&value["deployment"]),
+                    "{} failed over: {reason} ({})",
+                    request(value),
                     crate::detail::one_line(detail)
                 ),
-                None => format!(
-                    "request {} failed over: {reason}",
-                    short(&value["deployment"])
-                ),
+                None => format!("{} failed over: {reason}", request(value)),
             }
         }
         _ => return None,
@@ -197,6 +218,56 @@ mod tests {
             "request 01M3QRCJJ0MX -> gpu-box instance 0"
         );
         assert_eq!(format_event(&json!({"event": "unknown_thing"})), None);
+    }
+
+    // T17 T02 (SPEC §10, ADR 0021): text router lines name CapyCTL's request
+    // ID in full and the caller's when given; without a caller ID nothing
+    // extra appears, and a value that is not one bounded token is left out.
+    #[test]
+    fn router_lines_name_the_request_ids() {
+        let route = json!({"event": "router_selection", "deployment": "01M3QRCJJ0MXR2F8ZAM3",
+            "chosen": 1, "candidates": [{"host": "gpu-box", "instance": 0, "generation": 1}],
+            "capyctl_request_id": "01M5ZQ3M4X9V2B8N6C5D1F0G7H", "caller_request_id": "live-check-1"});
+        assert_eq!(
+            without_time(&format_event(&route).unwrap()),
+            "request 01M5ZQ3M4X9V2B8N6C5D1F0G7H (caller live-check-1) 01M3QRCJJ0MX -> gpu-box instance 0"
+        );
+        let mut anonymous = route.clone();
+        anonymous
+            .as_object_mut()
+            .unwrap()
+            .remove("caller_request_id");
+        assert_eq!(
+            without_time(&format_event(&anonymous).unwrap()),
+            "request 01M5ZQ3M4X9V2B8N6C5D1F0G7H 01M3QRCJJ0MX -> gpu-box instance 0"
+        );
+        let none = json!({"event": "router_selection", "deployment": "01M3QRCJJ0MXR2F8ZAM3",
+            "candidates": [], "skipped": [{"instance": 0}],
+            "capyctl_request_id": "01M5ZQ3M4X9V2B8N6C5D1F0G7H"});
+        assert_eq!(
+            without_time(&format_event(&none).unwrap()),
+            "request 01M5ZQ3M4X9V2B8N6C5D1F0G7H 01M3QRCJJ0MX: no instance available (1 skipped)"
+        );
+        let failover = json!({"event": "router_failover", "deployment": "01M3QRCJJ0MXR2F8ZAM3",
+            "reason": "not_accepted", "detail": "host is shutting down",
+            "capyctl_request_id": "01M5ZQ3M4X9V2B8N6C5D1F0G7H", "caller_request_id": "c-9"});
+        assert_eq!(
+            without_time(&format_event(&failover).unwrap()),
+            "request 01M5ZQ3M4X9V2B8N6C5D1F0G7H (caller c-9) 01M3QRCJJ0MX failed over: not_accepted (host is shutting down)"
+        );
+        for bad in [
+            json!("two words"),
+            json!("a".repeat(129)),
+            json!(""),
+            json!(7),
+        ] {
+            let mut odd = anonymous.clone();
+            odd["caller_request_id"] = bad;
+            assert_eq!(
+                without_time(&format_event(&odd).unwrap()),
+                "request 01M5ZQ3M4X9V2B8N6C5D1F0G7H 01M3QRCJJ0MX -> gpu-box instance 0"
+            );
+        }
     }
 
     // T02 (ADR 0021)

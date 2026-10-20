@@ -323,10 +323,18 @@ x-request-id: checkout-7f3a
 Your ID must be 1 to 128 characters of printable ASCII with no spaces;
 anything else, or the header given twice, is answered `400 invalid_request`
 before the model is woken. CapyCTL writes it beside its own ID in its logs
-for the request (`caller_request_id` and `capyctl_request_id` on the router's
-`router_selection` and `router_failover` lines) and nowhere else: it is never
-sent to the engine, and never stored in CapyCTL's database or events. The
-same holds when the model runs on another machine behind its host's ingress.
+for the request and nowhere else: it is never sent to the engine, and never
+stored in CapyCTL's database or events. The same holds when the model runs on
+another machine behind its host's ingress. In the default text output a
+router line reads
+
+```text
+14:02:11 request 01K7ZQ3M4X9V2B8N6C5D1F0G7H (caller checkout-7f3a) 01K7ZPXQ2M8A -> gpu-box instance 0
+```
+
+and in JSON output the `router_selection` and `router_failover` events carry
+`capyctl_request_id` and `caller_request_id`.
+A request without your ID shows only CapyCTL's.
 
 A decision's answer carries its figures in `capyctl.metrics`, in the same
 `{"value": ..., "source": ...}` form as a chat answer's
