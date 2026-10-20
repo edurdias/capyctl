@@ -42,13 +42,31 @@ through the exec launcher with the test binary as the writer),
 `request_and_output_logging_cannot_be_enabled`, `request_logging_off_on_every_rank`
 and the Python `test_request_and_output_logging_are_off_on_every_supported_version`.
 
-CPU and Fake-engine tests are not qualification. The live check still needed:
-on a lab host with `engine_logs: memory`, launch vLLM 0.30 or 0.31 and SGLang,
-confirm no file under the host's log directory, read the management engine-log
-tail, force a launch failure (an unknown engine argument) and confirm its reason
-in status, restart the host role and read the tail again; and confirm on vLLM
-0.29, 0.30 and 0.31 that the rendered off flags are accepted and no request
-line is logged.
+CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch merged with `feat/request-ids`
+and `fix/sglang-flag-reservations` on main (integration build `23f72fd8`), an
+isolated standalone with `--set host.engine_logs=memory` and Qwen3-4B on
+SGLang 0.5.22, vLLM 0.31.0 and vLLM 0.30.0 (each ready in 90 to 110 s and
+answering chat, collected and streamed): the state log directory held one
+empty directory per deployment and no file, before and after a failed launch
+and a role restart. The management engine-log read (by deployment ID, admin
+token) answered 200 for all three, 16 and 256 KiB tails, `truncated` set when
+older output existed. vLLM 0.31.0 and 0.30.0 were running with
+`--no-enable-log-requests --no-enable-log-outputs` in their arguments and
+accepted them; after two collected and one streamed chat request carrying a
+marker word, no tail held the marker or a request or output line, only the
+access lines (`POST /v1/chat/completions` with status). A vLLM 0.31.0
+deployment with `accept_extra_args` and `extra_args: [--bogus-flag-016a, "1"]`
+failed before readiness; with no log file to read, `status deployment` showed
+`initialize failed (launch_failed)` and the instance's last error `the engine
+exited before readiness; it rejected argument --bogus-flag-016a`. Stopping the
+standalone left the six engine processes running; after it started again all
+three deployments were ready and the engine-log read answered 200 with the
+same launch incarnations. `start standalone --debug-engine-logs --set
+host.engine_logs=memory` exited 2 before starting (`invalid_config`:
+"--debug-engine-logs writes full engine output to files, which `engine_logs:
+memory` forbids"). vLLM 0.29 is installed only on host B and was not run.
 
 # Release note: Operations
 
