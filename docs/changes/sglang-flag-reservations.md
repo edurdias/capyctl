@@ -39,11 +39,23 @@ failing before), `the_environment_table_matches_the_check`,
 listed; the JSON form carries the classes), the runtime parity test and
 `test_dump_destinations_are_refused_however_spelled` in
 `runtime/tests/test_sglang_server_args.py`, and `engine_flags_parses`. CPU
-and Fake-engine tests are not qualification. Live check still needed: on host
-A, deploy an SGLang 0.5.22 model with `--watermark-config` and with
-`--export-metrics-to-file` in `extra_args` and with `DUMPER_ENABLE` in
-`engine_config.env`, and confirm each is refused before any launch, then that
-an ordinary SGLang deployment still starts.
+and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch merged with `feat/request-ids`
+and `feat/zero-retention` on main (integration build `23f72fd8`), an isolated
+standalone and Qwen3-4B on SGLang 0.5.22: `deploy model` refused all four
+before anything was stored or launched, exit 2. `extra_args: [--watermark-config,
+x]` and `[--export-metrics-to-file]` gave `invalid_config` ("reserved option
+... is rendered by capyctl and cannot be passed"); `engine_config.env`
+`DUMPER_ENABLE: "1"` gave `engine_env_reserved:DUMPER_ENABLE` and
+`dumper_enable: "1"` gave `engine_env_reserved:dumper_enable`. `engine add
+--approve-env 'DUMPER_*'` was refused with `engine_env_reserved:DUMPER_`. No
+engine process started for any of them. `capyctl engine flags sglang` printed
+the table (text, and `--format json` with `class`, `match`, `approval` and
+`reason` per row), listing `--watermark-config`, `--export-metrics-to-file`,
+`--export-metrics-to-file-dir` and `DUMPER_*` as reserved. An ordinary SGLang
+0.5.22 deployment of the same model then started (ready in 106 s) and answered
+a chat request.
 
 # Release note: Engines
 
