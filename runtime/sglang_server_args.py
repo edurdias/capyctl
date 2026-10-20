@@ -122,9 +122,18 @@ _RESERVED_BOUND = ("host", "port", "api_key", "admin_api_key", "model_path",
                    "tokenizer_path", "served_model_name", "base_gpu_id",
                    "mem_fraction_static", "enable_memory_saver",
                    "enable_weights_cpu_backup")
+# SPEC §8.2, T21 (owner decision 2026-10-20): destinations that write requests,
+# tensors or debug data to disk, or read the watermark key (0.5.22). Refused as
+# extra arguments and never set by capyctl, so a version without one of them
+# (0.5.21 has no watermark_config) is not a drift (engine_policy.rs
+# SGLANG_DUMP_RESERVED).
+_RESERVED_DUMP = ("watermark_config", "debug_tensor_dump_output_folder",
+                  "debug_tensor_dump_layers", "debug_tensor_dump_input_file",
+                  "msprobe_dump_config", "export_metrics_to_file",
+                  "export_metrics_to_file_dir", "spec_trace_dir")
 # Whole reserved families (ADR 0014 §3), matched on the parsed destination.
 _RESERVED_FAMILIES = ("ssl_", "modelopt_", "disaggregation_", "hicache_storage_",
-                      "lmcache_", "flexkv_")
+                      "lmcache_", "flexkv_", "debug_tensor_dump_")
 # Destinations an extra argument may never set: the reserved subset, the
 # configuration-file option (SPEC §8.2: a file would hide values), and each
 # typed field's native destinations (ADR 0014 §2: one way to say each thing).
@@ -135,7 +144,8 @@ _TYPED_DESTINATIONS = frozenset({
     "cuda_graph_backend_decode", "language_model_only", "trust_remote_code",
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
-_FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, "config"})
+_FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
+                              "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 

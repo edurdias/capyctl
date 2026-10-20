@@ -65,6 +65,14 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--max-mamba-cache-size", type=int, default=None)
         parser.add_argument("--mamba-full-memory-ratio", type=float, default=None)
         parser.add_argument("--speculative-draft-model-path", default=None)
+        # SPEC §8.2, T21: dump destinations (0.5.21 and 0.5.22).
+        parser.add_argument("--watermark-config", default=None)
+        parser.add_argument("--debug-tensor-dump-output-folder", default=None)
+        parser.add_argument("--debug-tensor-dump-layers", type=int, nargs="+", default=None)
+        parser.add_argument("--msprobe-dump-config", default=None)
+        parser.add_argument("--export-metrics-to-file", action="store_true")
+        parser.add_argument("--export-metrics-to-file-dir", default=None)
+        parser.add_argument("--spec-trace-dir", default=None)
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -73,7 +81,10 @@ SyntheticArgs.__struct_fields__ = (
     "ssl_keyfile", "dtype", "context_length", "reasoning_parser",
     "detokenizer_worker_num", "schedule_policy", "disable_cuda_graph",
     "engine_info_bootstrap_port", "decoupled_spec_bind_endpoint", "chat_template",
-    "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path")
+    "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path",
+    "watermark_config", "debug_tensor_dump_output_folder", "debug_tensor_dump_layers",
+    "msprobe_dump_config", "export_metrics_to_file", "export_metrics_to_file_dir",
+    "spec_trace_dir")
 
 
 def synthetic_constructor(**kwargs):
@@ -288,6 +299,31 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                               lambda **kw: self.fail("constructor reached"))
                 self.assertIn(caught.exception.code,
                               ("effective_args_mismatch", "invalid_extra_args"))
+
+    # T21: SPEC §8.2 (owner decision 2026-10-20). Destinations that dump
+    # requests, tensors or debug data, and the watermark key, are refused on
+    # the destination the installed parser resolved, however spelled.
+    def test_dump_destinations_are_refused_however_spelled(self):
+        def unreachable(**_):
+            self.fail("constructor reached")
+
+        unreachable.add_cli_args = SyntheticArgs.add_cli_args
+        unreachable.__struct_fields__ = SyntheticArgs.__struct_fields__
+        for extra in (["--watermark-config", "/k.json"], ["--watermark-config={}"],
+                      ["--watermark", "/k.json"],
+                      ["--debug-tensor-dump-output-folder", "/tmp/d"],
+                      ["--debug-tensor-dump-out=/tmp/d"],
+                      ["--debug-tensor-dump-layers", "1"],
+                      ["--msprobe-dump-config", "/c.json"], ["--msprobe", "/c.json"],
+                      ["--export-metrics-to-file"],
+                      ["--export-metrics-to-file-dir", "/tmp/m"],
+                      ["--export-metrics-to-file-d=/tmp/m"],
+                      ["--spec-trace-dir", "/tmp/t"], ["--spec-trace=/tmp/t"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    construct(self.spec_with(extra_args=extra), self.placement(),
+                              unreachable)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T21 T22: ADR 0014 §8, SPEC §8.2. A sensitive destination is refused on
     # what the installed parser resolved, so an abbreviation the deploy-time

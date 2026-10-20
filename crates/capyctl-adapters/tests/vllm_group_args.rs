@@ -129,6 +129,18 @@ fn sleep_mode_on_every_rank_when_deep() {
     }
 }
 
+// T21 / SPEC §13.3 (owner decision 2026-10-20): request and output logging
+// render off on every rank, the headless worker included.
+#[test]
+fn request_logging_off_on_every_rank() {
+    for rank in [0, 1] {
+        let argv = render_command(&group_input(rank)).unwrap().argv;
+        for flag in ["--no-enable-log-requests", "--no-enable-log-outputs"] {
+            assert!(argv.iter().any(|a| a == flag), "rank {rank}: {flag}");
+        }
+    }
+}
+
 // T21, T37, R11 (ADR 0028 §10): no NCCL or MASTER variable is rendered; the only
 // GLOO variable is the interface holding the member's own peer address.
 #[test]

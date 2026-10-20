@@ -927,6 +927,8 @@ pub fn defaults(
             ("resource_policy.parked_growth_limit", Value::from("auto")),
             // SPEC §6.5, §10: the host's activation policy.
             ("lifecycle.activation", Value::from("on_demand")),
+            // Owner decision 2026-10-20: engine output in private log files.
+            ("engine_logs", Value::from("files")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((

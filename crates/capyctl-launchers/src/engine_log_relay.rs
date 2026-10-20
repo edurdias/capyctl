@@ -17,15 +17,26 @@
 //! `--debug-engine-logs` keeps its meaning: full native output, written to the
 //! log directly, with a `<log>.raw` marker so the management surface never
 //! serves it (SPEC §13.3).
+//!
+//! Owner decision 2026-10-20: under `engine_logs: memory` the writer keeps the
+//! last [`memory::MEMORY_BYTES`] of the launch's redacted output in its own
+//! memory and writes no file at all; it answers reads of the log
+//! ([`capyctl_adapters::engine_log::memory`]) while the engine runs and for
+//! [`memory::LINGER`] after it exits, then leaves with the buffer. Raw output
+//! would defeat the setting, so `--debug-engine-logs` is refused with it
+//! ([`keep_in_memory`]).
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use capyctl_adapters::engine_log::memory::{self, Ring};
 use capyctl_adapters::engine_log::{raw_marker, rotated, LogRedactor};
 use capyctl_adapters::protected::ProtectedLaunchDescriptors;
 use capyctl_domain::redact::REDACTED;
@@ -35,6 +46,9 @@ pub const RELAY_ARG: &str = "__engine-log-relay";
 
 /// The variable naming the log, for the engine and for the writer.
 pub const LOG_VARIABLE: &str = "CAPYCTL_ENGINE_LOG";
+
+/// The variable telling the writer to keep the log in memory (`memory`).
+pub const MODE_VARIABLE: &str = "CAPYCTL_ENGINE_LOG_MODE";
 
 /// The largest a log file grows before it is rotated.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -90,6 +104,33 @@ pub(crate) fn installed() -> Option<LogRelay> {
     INSTALLED.get().cloned()
 }
 
+static IN_MEMORY: AtomicBool = AtomicBool::new(false);
+
+/// `--debug-engine-logs` with `engine_logs: memory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "--debug-engine-logs writes full engine output to files, which `engine_logs: memory` \
+     forbids; remove the flag or set `engine_logs: files`"
+)]
+pub struct RawLogsRefused;
+
+/// Owner decision 2026-10-20: the host's `engine_logs` setting for every
+/// launch this process starts from now on (`true` for `memory`). A role sets
+/// it from its document before it launches or adopts anything. Refused,
+/// changing nothing, when this process was started with
+/// `--debug-engine-logs`: raw files defeat a memory-only log.
+pub fn keep_in_memory(memory: bool) -> Result<(), RawLogsRefused> {
+    if memory && debug_engine_logs() {
+        return Err(RawLogsRefused);
+    }
+    IN_MEMORY.store(memory, Ordering::SeqCst);
+    Ok(())
+}
+
+fn in_memory() -> bool {
+    IN_MEMORY.load(Ordering::SeqCst)
+}
+
 /// Whether this process was started with `--debug-engine-logs` (the flag sets
 /// the variable for the role; an inherited value is cleared at startup).
 fn debug_engine_logs() -> bool {
@@ -98,7 +139,8 @@ fn debug_engine_logs() -> bool {
 
 /// The engine's standard output and error for a launch whose log is `log`:
 /// a pipe into a started writer, or, under `--debug-engine-logs` or with no
-/// writer installed, the file opened by `open`.
+/// writer installed, the file opened by `open`. Under `engine_logs: memory`
+/// it is always the writer, and nothing is created at `log`.
 pub(crate) fn attach(
     log: &Path,
     relay: Option<&LogRelay>,
@@ -106,8 +148,15 @@ pub(crate) fn attach(
     descriptors: Option<&ProtectedLaunchDescriptors>,
     open: impl Fn(&Path) -> std::io::Result<std::fs::File>,
 ) -> std::io::Result<(Stdio, Stdio)> {
+    let memory = in_memory();
     let relay = match relay {
         Some(relay) if !debug_engine_logs() => relay,
+        // Owner decision 2026-10-20: never a file under `engine_logs: memory`.
+        _ if memory => {
+            return Err(std::io::Error::other(
+                "`engine_logs: memory` keeps engine output only in the log writer",
+            ))
+        }
         _ => {
             if debug_engine_logs() {
                 // SPEC §13.3: raw development output is marked so it is never served.
@@ -117,34 +166,46 @@ pub(crate) fn attach(
             return Ok((Stdio::from(file.try_clone()?), Stdio::from(file)));
         }
     };
-    // The log is created (owner-only, never through a symlink) before the
-    // engine starts, so a refused path refuses the launch.
-    drop(open(log)?);
+    if !memory {
+        // The log is created (owner-only, never through a symlink) before the
+        // engine starts, so a refused path refuses the launch.
+        drop(open(log)?);
+    }
     let mut redactor = LogRedactor::new();
     redactor.own_environment(env);
     if let Some(descriptors) = descriptors {
         descriptors.own_credentials(&mut redactor)?;
     }
     let (output_read, output_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
-    start(relay, log, output_read, &redactor.encode())?;
+    start(relay, log, memory, output_read, &redactor.encode())?;
     let second = output_write.try_clone()?;
     Ok((Stdio::from(output_write), Stdio::from(second)))
 }
 
 /// Start the writer reading `output` and hand it the launch's credentials on
 /// its descriptor 3. It is reaped by a detached thread, like the engine.
-fn start(relay: &LogRelay, log: &Path, output: OwnedFd, secrets: &[u8]) -> std::io::Result<()> {
+fn start(
+    relay: &LogRelay,
+    log: &Path,
+    memory: bool,
+    output: OwnedFd,
+    secrets: &[u8],
+) -> std::io::Result<()> {
     let (secrets_read, secrets_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
     let secrets_fd = secrets_read.as_raw_fd();
     let mut command = std::process::Command::new(&relay.program);
     command
         .args(&relay.args)
-        // SPEC §13.3 / T21: the writer sees only the log's name.
+        // SPEC §13.3 / T21: the writer sees only the log's name (and where
+        // to keep it).
         .env_clear()
         .env(LOG_VARIABLE, log)
         .stdin(Stdio::from(output))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if memory {
+        command.env(MODE_VARIABLE, "memory");
+    }
     unsafe {
         command.pre_exec(move || {
             // Its own group: never signalled with, or observed as part of, the engine's.
@@ -174,7 +235,8 @@ fn start(relay: &LogRelay, log: &Path, output: OwnedFd, secrets: &[u8]) -> std::
 }
 
 /// The writer's `main`: read the credentials on descriptor 3, then relay
-/// standard input into the log named by [`LOG_VARIABLE`] until end of input.
+/// standard input into the log named by [`LOG_VARIABLE`] (or, with
+/// [`MODE_VARIABLE`] `memory`, into this process's buffer) until end of input.
 pub fn relay_main() -> i32 {
     let Some(log) = std::env::var_os(LOG_VARIABLE) else {
         return 2;
@@ -187,6 +249,10 @@ pub fn relay_main() -> i32 {
         }
     }
     let redactor = LogRedactor::decode(&secrets);
+    if std::env::var_os(MODE_VARIABLE).is_some_and(|mode| mode == "memory") {
+        relay_to_memory(Path::new(&log), &redactor, memory::LINGER);
+        return 0;
+    }
     let Ok(mut log) = RotatingLog::open(PathBuf::from(log), MAX_FILE_BYTES, KEEP_ROTATED) else {
         // Still drain the pipe: an engine must never block on its own output.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
@@ -196,10 +262,100 @@ pub fn relay_main() -> i32 {
     0
 }
 
+/// Owner decision 2026-10-20 (`engine_logs: memory`): relay standard input
+/// into a [`Ring`] this process answers reads of `log` from, then keep
+/// answering for `linger` after the input ends. A writer that cannot take the
+/// log's address still drains and buffers, so the engine never blocks.
+pub fn relay_to_memory(log: &Path, redactor: &LogRedactor, linger: std::time::Duration) {
+    let ring = Arc::new(Mutex::new(Ring::default()));
+    let ended = Arc::new(AtomicBool::new(false));
+    if let Some(listener) = listen(log) {
+        let (ring, ended) = (ring.clone(), ended.clone());
+        std::thread::spawn(move || answer(&listener, &ring, &ended));
+    }
+    relay(
+        std::io::stdin().lock(),
+        redactor,
+        &mut MemoryLog(ring.clone()),
+    );
+    ended.store(true, Ordering::SeqCst);
+    std::thread::sleep(linger);
+}
+
+/// The log's address. One still held by the writer of an earlier launch of
+/// the same log is asked for once that launch's engine has exited.
+fn listen(log: &Path) -> Option<UnixListener> {
+    let address = memory::address(log).ok()?;
+    for _ in 0..20 {
+        match UnixListener::bind_addr(&address) {
+            Ok(listener) => return Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                memory::release(log);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Answer reads, one request per connection, from this user only.
+fn answer(listener: &UnixListener, ring: &Mutex<Ring>, ended: &AtomicBool) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            continue;
+        };
+        if !memory::same_user(&stream) {
+            continue;
+        }
+        match memory::read_request(&mut stream) {
+            Ok((memory::TAIL, limit)) => {
+                let (bytes, truncated) = ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .tail(limit);
+                let _ = memory::answer_tail(&mut stream, &bytes, truncated);
+            }
+            Ok((memory::RELEASE, _)) => {
+                let leaving = ended.load(Ordering::SeqCst);
+                let _ = stream.write_all(&[u8::from(leaving)]);
+                if leaving {
+                    std::process::exit(0);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Where [`relay`] puts redacted lines.
+pub trait LogSink {
+    fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+impl LogSink for RotatingLog {
+    fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write(bytes)
+    }
+}
+
+/// A launch's in-memory buffer (`engine_logs: memory`).
+pub struct MemoryLog(pub Arc<Mutex<Ring>>);
+
+impl LogSink for MemoryLog {
+    fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(bytes);
+        Ok(())
+    }
+}
+
 /// Copy `input` into `log` line by line, redacted, until end of input. A write
 /// that fails is dropped and reading continues, so the engine never blocks on
 /// a full pipe because its log could not be written.
-pub fn relay(mut input: impl Read, redactor: &LogRedactor, log: &mut RotatingLog) {
+pub fn relay(mut input: impl Read, redactor: &LogRedactor, log: &mut impl LogSink) {
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -238,10 +394,10 @@ pub fn relay(mut input: impl Read, redactor: &LogRedactor, log: &mut RotatingLog
     }
 }
 
-fn emit(redactor: &LogRedactor, log: &mut RotatingLog, line: &[u8], end: u8) {
+fn emit(redactor: &LogRedactor, log: &mut impl LogSink, line: &[u8], end: u8) {
     let mut text = redactor.redact(&String::from_utf8_lossy(line)).into_bytes();
     text.push(end);
-    let _ = log.write(&text);
+    let _ = log.write_line(&text);
 }
 
 /// An owner-only log that rotates to `<log>.1` … `<log>.<keep>` when it would

@@ -916,6 +916,29 @@ fn a_malformed_drain_bound_refuses_startup() {
     assert!(installation.launches().is_empty());
 }
 
+/// T21 (owner decision 2026-10-20): `--debug-engine-logs` writes raw engine
+/// output to files, which `engine_logs: memory` forbids, so the pair refuses
+/// the start, named, before any engine exists.
+#[test]
+fn debug_engine_logs_are_refused_with_memory_engine_logs() {
+    let installation = Installation::new();
+    let out = output_within(
+        installation.command().args([
+            "start",
+            "standalone",
+            "--debug-engine-logs",
+            "--set",
+            "host.engine_logs=memory",
+        ]),
+        REFUSAL_BOUND,
+    );
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("--debug-engine-logs"), "{said}");
+    assert!(said.contains("engine_logs: memory"), "{said}");
+    assert!(installation.launches().is_empty());
+}
+
 /// SPEC §9.1, §13.3: standalone requires the same runtime directory integrity
 /// the host agent does. A guard module writable by other refuses startup with
 /// the named reason before any engine starts. (Group write through the owner's

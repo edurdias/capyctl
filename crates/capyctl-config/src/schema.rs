@@ -471,6 +471,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("runtime_profiles", FieldSpec::Struct(NO_FIELDS)),
         // SPEC §6.5, §10: the embedded host's activation policy, as on a host.
         ("lifecycle", FieldSpec::Struct(HOST_LIFECYCLE)),
+        // Owner decision 2026-10-20: where engine output is kept, as on a host.
+        ("engine_logs", SCALAR),
     ];
     /// SPEC §6.5, §10: a host's activation policy, for every deployment that
     /// may run on it. Controller policy; never part of the document a
@@ -548,6 +550,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("load_report_interval", DURATION),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
                 ("lifecycle", FieldSpec::Struct(HOST_LIFECYCLE)),
+                // Role-local (owner decision 2026-10-20): `files` or `memory`,
+                // where each launch's redacted engine output is kept.
+                ("engine_logs", SCALAR),
             ],
         },
         ConfigKind::Deployment => &KindSchema {

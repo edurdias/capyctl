@@ -223,3 +223,35 @@ fn a_redaction_never_lengthens_the_tail_past_its_bound() {
     let whole = read_tail(&log, 256).unwrap();
     assert_eq!((whole.text.as_str(), whole.truncated), ("short\n", false));
 }
+
+// T21 (owner decision 2026-10-20): the in-memory buffer of `engine_logs:
+// memory` is bounded, drops the oldest whole lines first and says so.
+#[test]
+fn the_memory_buffer_is_bounded_to_whole_lines() {
+    let mut ring = memory::Ring::with_capacity(32);
+    ring.push(b"first line\n");
+    ring.push(b"second line\n");
+    assert_eq!(
+        ring.tail(1024),
+        (b"first line\nsecond line\n".to_vec(), false)
+    );
+    assert_eq!(ring.tail(12), (b"second line\n".to_vec(), true));
+    ring.push(b"third line\n");
+    // 34 bytes do not fit 32: the first line leaves whole.
+    assert_eq!(
+        ring.tail(1024),
+        (b"second line\nthird line\n".to_vec(), true)
+    );
+    assert_eq!(memory::MEMORY_BYTES, 4 * 1024 * 1024);
+}
+
+// T21 (owner decision 2026-10-20): with no file and no writer answering,
+// a log is missing, as before.
+#[test]
+fn a_log_with_neither_file_nor_buffer_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        tail_bytes(&dir.path().join("none.log"), 1024),
+        Err(TailError::Missing)
+    );
+}

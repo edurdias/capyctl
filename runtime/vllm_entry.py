@@ -47,7 +47,12 @@ RESERVED = (
     "model_tag", "model", "host", "port", "uds", "root_path", "api_key", "middleware",
     "served_model_name", "tensor_parallel_size", "pipeline_parallel_size",
     "gpu_memory_utilization", "cpu_offload_gb", "kv_cache_memory_bytes",
-    "enable_sleep_mode", "enable_log_requests", "disable_log_stats",
+    "enable_sleep_mode", "disable_log_stats",
+    # SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): request and
+    # output logging are rendered off (`--no-enable-log-requests`,
+    # `--no-enable-log-outputs`; both defined in 0.29.0, 0.30.0 and 0.31.0), so
+    # no prompt or completion reaches the engine log.
+    "enable_log_requests", "enable_log_outputs",
     # SPEC §17 (owner decision 2026-10-09): always rendered on (per-request
     # `metrics` on each response; FrontendArgs in 0.29.0 and 0.30.0).
     "enable_per_request_metrics",

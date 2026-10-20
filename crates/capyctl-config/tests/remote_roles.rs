@@ -135,6 +135,36 @@ fn host_activation_defaults_to_on_demand_and_never_enters_resolution() {
     assert!(HostConfig::parse(&document.to_string()).is_err());
 }
 
+// T21 (owner decision 2026-10-20): `engine_logs` is `files` when omitted,
+// `memory` keeps engine output in memory only; it is role-local, so it never
+// reaches the document deployments are resolved against; any other value is
+// refused by name.
+#[test]
+fn engine_logs_default_to_files_and_stay_role_local() {
+    use capyctl_config::remote_roles::EngineLogs;
+    let root = Path::new("/home/operator/host");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&HostConfig::template(root)).unwrap();
+    let config = HostConfig::parse(&document.to_string()).unwrap();
+    assert_eq!(config.engine_logs, EngineLogs::Files);
+    let unset = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+    for (text, expected) in [("files", EngineLogs::Files), ("memory", EngineLogs::Memory)] {
+        document["engine_logs"] = text.into();
+        let config = HostConfig::parse(&document.to_string()).unwrap();
+        assert_eq!(config.engine_logs, expected, "{text}");
+        assert_eq!(
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap(),
+            unset,
+            "{text}"
+        );
+    }
+    for refused in [serde_json::json!("disk"), serde_json::json!(true)] {
+        document["engine_logs"] = refused.clone();
+        let error = HostConfig::parse(&document.to_string()).unwrap_err();
+        assert_eq!(error.path, "engine_logs", "{refused}: {error}");
+    }
+}
+
 // T03 T17: the shutdown drain bound is role configuration,
 // `shutdown.drain_timeout`, in server, host and standalone documents: 30 s when
 // omitted, 0 s to 600 s when set, refused outside that range.

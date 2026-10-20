@@ -178,6 +178,11 @@ fn reserved_flag_list_is_the_pinned_set() {
         "--kv-cache-bytes",
         "--enable-sleep-mode",
         "--api-key",
+        // T21 / SPEC §13.3 (owner decision 2026-10-20): request and output
+        // logging are capyctl's, rendered off.
+        "--enable-log-requests",
+        "--disable-log-requests",
+        "--enable-log-outputs",
     ] {
         assert!(RESERVED_FLAGS.contains(&flag), "{flag} must be reserved");
     }
@@ -687,21 +692,89 @@ fn chosen_parsers_render_as_typed_arguments() {
     assert!(render_command(&p).is_err());
 }
 
-/// T21 / SPEC §13.3: vLLM logs no prompt or completion text at its default
-/// level. vLLM 0.30.0 logs request text only with `--enable-log-requests`
-/// (default off, vllm/engine/arg_utils.py:3000, 3007-3020; prompts at DEBUG,
-/// vllm/entrypoints/serve/utils/request_logger.py:44-61) and completions only
-/// with `--enable-log-outputs` on top of it. capyctl renders none of them, no
-/// logging configuration or level, and refuses the request-logging switch in
-/// host-fixed and deployment arguments alike.
+/// T21 / SPEC §13.3 (amended 2026-10-08), owner decision 2026-10-20: request
+/// and output logging render off on every launch, in the reserved block
+/// before the marker, in the spellings the given vLLM build defines; neither
+/// switch is ever rendered on.
+fn assert_request_logging_rendered_off(version: &str, off: [&str; 2]) {
+    let mut input = base_input();
+    input.engine_bin = format!("/opt/vllm-{version}/bin/vllm");
+    let argv = render_command(&input).unwrap().argv;
+    let marker = argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
+    for flag in off {
+        let at = argv
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("{version}: `{flag}` not rendered: {argv:?}"));
+        assert!(
+            at < marker,
+            "{version}: `{flag}` after the marker: {argv:?}"
+        );
+    }
+    for on in [
+        "--enable-log-requests",
+        "--enable-log-outputs",
+        "--disable-log-requests",
+    ] {
+        assert!(
+            !argv.iter().any(|a| a.starts_with(on)),
+            "{version}: {on} rendered: {argv:?}"
+        );
+    }
+}
+
+/// vLLM 0.29.0: `--enable-log-requests` is an argparse `BooleanOptionalAction`,
+/// default off (vllm/engine/arg_utils.py:2968, 2981-2983); `--enable-log-outputs`
+/// is the `FrontendArgs.enable_log_outputs` boolean
+/// (vllm/entrypoints/launchers/cli_args.py:150), which `get_kwargs` makes a
+/// `BooleanOptionalAction` too (arg_utils.py:387-389). `--disable-log-requests`
+/// is not defined.
+// T21
 #[test]
-fn request_logging_is_never_rendered_and_cannot_be_enabled() {
+fn vllm_0_29_renders_request_and_output_logging_off() {
+    assert_request_logging_rendered_off(
+        "0.29.0",
+        ["--no-enable-log-requests", "--no-enable-log-outputs"],
+    );
+}
+
+/// vLLM 0.30.0: the same switches (vllm/engine/arg_utils.py:3000, 3013-3015;
+/// vllm/entrypoints/launchers/cli_args.py:150; `get_kwargs` at
+/// arg_utils.py:359-361). `--disable-log-requests` is not defined.
+// T21
+#[test]
+fn vllm_0_30_renders_request_and_output_logging_off() {
+    assert_request_logging_rendered_off(
+        "0.30.0",
+        ["--no-enable-log-requests", "--no-enable-log-outputs"],
+    );
+}
+
+/// vLLM 0.31.0: the same switches (vllm/engine/arg_utils.py:3128, 3141-3143;
+/// vllm/entrypoints/launchers/cli_args.py:163; `get_kwargs` at
+/// arg_utils.py:377-379). `--disable-log-requests` is not defined.
+// T21
+#[test]
+fn vllm_0_31_renders_request_and_output_logging_off() {
+    assert_request_logging_rendered_off(
+        "0.31.0",
+        ["--no-enable-log-requests", "--no-enable-log-outputs"],
+    );
+}
+
+/// T21 / SPEC §13.3: vLLM logs prompts only with `--enable-log-requests`
+/// (at DEBUG, vllm/entrypoints/serve/utils/request_logger.py:44-61 in 0.30.0)
+/// and completions only with `--enable-log-outputs` on top of it. capyctl
+/// renders no logging configuration or level, and refuses both switches,
+/// their negations, abbreviations and the retired `--disable-log-requests`
+/// in host-fixed (`local_engine.args`, profile) and deployment arguments alike.
+// T21
+#[test]
+fn request_and_output_logging_cannot_be_enabled() {
     let mut input = base_input();
     input.engine_log = Some("/var/lib/capyctl/logs/d/i.log".into());
     let cmd = render_command(&input).unwrap();
     for flag in [
-        "--enable-log-requests",
-        "--enable-log-outputs",
         "--log-config-file",
         "--logging-config",
         "--log-level",
@@ -720,7 +793,20 @@ fn request_logging_is_never_rendered_and_cannot_be_enabled() {
     ] {
         assert!(!cmd.env.contains_key(name), "{name} rendered");
     }
-    for spelling in ["--enable-log-requests", "--enable-log-requests=true"] {
+    for spelling in [
+        "--enable-log-requests",
+        "--enable-log-requests=true",
+        "--enable_log_requests",
+        "--no-enable-log-requests",
+        "--enable-log-req",
+        "--disable-log-requests",
+        "--enable-log-outputs",
+        "--enable-log-outputs=true",
+        "--enable_log_outputs",
+        "--no-enable-log-outputs",
+        "--enable-log-o",
+        "--enable-log",
+    ] {
         let mut fixed = base_input();
         fixed.engine_args.push(spelling.into());
         assert!(
@@ -730,7 +816,7 @@ fn request_logging_is_never_rendered_and_cannot_be_enabled() {
         let mut extra = base_input();
         extra.extra_args = vec![spelling.into()];
         assert!(
-            render_command(&extra).is_err(),
+            matches!(render_command(&extra), Err(ArgsError::ReservedConflict(_))),
             "{spelling} accepted in deployment arguments"
         );
     }

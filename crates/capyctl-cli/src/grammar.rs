@@ -199,6 +199,13 @@ pub enum Command {
         name: String,
         drain: bool,
     },
+    /// ADR 0021, ADR 0014 §3, §8: the option and environment ownership table
+    /// for an engine family, from the tables the checks read; executes
+    /// nothing and reads no state.
+    EngineFlags {
+        engine: capyctl_config::engine_policy::Engine,
+        version: Option<String>,
+    },
     /// This build's version and the commit it was built from
     /// (`build_info`); `--version` prints the version line only.
     Version,
@@ -281,6 +288,7 @@ impl Command {
             Command::EngineAdd { .. } => "engine add".into(),
             Command::EngineList => "engine list".into(),
             Command::EngineRemove { name, .. } => format!("engine remove {name}"),
+            Command::EngineFlags { engine, .. } => format!("engine flags {}", engine.name()),
             Command::Version => "version".into(),
         }
     }
@@ -535,6 +543,29 @@ enum EngineArgs {
         #[arg(long)]
         drain: bool,
     },
+    /// Print which engine options and environment variables CapyCTL owns,
+    /// reserves, gates behind an approval, or passes unchanged, and why.
+    Flags {
+        /// The engine family: vllm, sglang, tensorfold or llamacpp.
+        #[arg(value_parser = parse_engine_family)]
+        family: capyctl_config::engine_policy::Engine,
+        /// The engine version the table is read for; recorded in the output.
+        #[arg(long, value_name = "V")]
+        version: Option<String>,
+    },
+}
+
+fn parse_engine_family(value: &str) -> Result<capyctl_config::engine_policy::Engine, String> {
+    capyctl_config::engine_policy::Engine::from_name(value).ok_or_else(|| {
+        let names: Vec<&str> = capyctl_config::engine_policy::Engine::ALL
+            .iter()
+            .map(|engine| engine.name())
+            .collect();
+        format!(
+            "unknown engine family `{value}`; one of {}",
+            names.join(", ")
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -1221,6 +1252,10 @@ impl From<CliCommand> for Command {
                 },
                 EngineArgs::List => Command::EngineList,
                 EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },
+                EngineArgs::Flags { family, version } => Command::EngineFlags {
+                    engine: family,
+                    version,
+                },
             },
             CliCommand::Version => Command::Version,
         }
