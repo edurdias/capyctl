@@ -38,12 +38,29 @@ speed), `crates/capyctl-cli/tests/router_payloads.rs` (router, engine forwarder,
 host ingress and engine: both IDs on the answer, neither at the engine) and
 `crates/capyctl-agent/tests/ingress.rs` (the ingress forwards neither ID). Before
 the change the headers were absent and the decision test asserted no
-`capyctl.metrics`. CPU and Fake-engine tests are not qualification. The live
-check still needed: on host A, a chat request (collected and streamed) and a
-decision on llama.cpp v0.7.0 or SGLang 0.5.22 sent through the server to a host's
-ingress with `X-Request-Id`, confirming both headers on the answers, the
-`capyctl_request_id` in the router's role log matching the lease, and which
-engine figures each decision engine actually reports.
+`capyctl.metrics`. CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch (`5de86c59`) merged with
+`feat/zero-retention` and `fix/sglang-flag-reservations` on main (integration
+build `daffad0d`), an isolated standalone, Julia-1 Q8_0 as a decision
+deployment on llama.cpp v0.7.0 and Qwen3-4B chat on SGLang 0.5.22, each request
+sent with `X-Request-Id: live-check-1`: the decision, a collected chat and a
+streamed chat (`text/event-stream`, 6 data lines) answered 200 with
+`x-request-id: live-check-1` and an `x-capyctl-request-id` ULID, a different one
+per request; a request without the header got only `x-capyctl-request-id`. The
+decision's `capyctl.metrics` held `input_tokens` 33 (engine), `time_to_response_ms`
+30.2 and `total_ms` 31.4 (router); llama.cpp reported no `queue_ms`,
+`prefill_ms` or `cached_tokens`, and they were absent. `X-Request-Id: live check`
+was answered `400 invalid_request` ("X-Request-Id must be one value of 1 to 128
+printable ASCII characters with no spaces") with an `x-capyctl-request-id` and
+no echo. Each answered request had one `router_selection` line naming its
+`X-CapyCTL-Request-Id`: with `--format json` as `capyctl_request_id` and
+`caller_request_id: "live-check-1"`, and in text as `request
+01M5C29SXMR5FQ3133Q2RE59QG (caller live-check-1) 01M5C26QQBW5 -> <host A>
+instance 0` (the caller part absent for the request without the header). Neither
+engine log contained `live-check-1` or `capyctl-request-id`. The standalone's
+embedded host was used, so the path through a separate host's ingress was not
+run live; `ingress.rs` and `router_payloads.rs` cover it.
 
 # Release note: Requests
 
