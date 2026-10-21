@@ -949,14 +949,29 @@ standalone role as an unprivileged user (`--user 1000:1000`, `--cap-drop ALL`,
 `--security-opt no-new-privileges`, the container's own `/proc`, cgroup v2)
 started, parked, woke and stopped a llama.cpp decision model, SGLang 0.5.22
 and vLLM 0.31.0, with the engines' virtual environments, CUDA and the models
-bind-mounted read-only at their host paths.
+bind-mounted read-only at their host paths. Run live on a discrete GPU (an
+RTX 4090 Laptop GPU, 16 GiB) with Docker 29 and CDI, on 2026-10-21, the same
+way with the 0.1.6 release binary: vLLM 0.31.0 started, parked, woke and
+stopped, and TensorFold 0.6.6 started and stopped.
 
 **Per-process GPU memory.** The NVIDIA driver reports each compute process to
 `nvidia-smi` inside the container by its PID in the container's namespace, the
-same PID the container's `/proc` shows (on the GB10, an SGLang scheduler that
-was PID 3226640 on the host was PID 780 inside, with the same 14873 MiB in
-both). CapyCTL's per-process figures therefore work in a container as on a
-host: the startup peak and the parked charge are measured, not defaulted.
+same PID the container's `/proc` shows, on unified memory and on a discrete
+card alike (on the GB10, an SGLang scheduler that was PID 3226640 on the host
+was PID 780 inside, with the same 14873 MiB in both; on the laptop card, a
+vLLM engine that was PID 1306164 on the host was PID 654 inside, with the same
+11088 MiB ready and 1194 MiB parked in both). CapyCTL's per-process figures
+therefore work in a container as on a host: the parked charge is measured, and
+on unified memory so is the startup peak. On a discrete card the startup peak
+is not measured, in a container or not: the cold phase charges the card and
+host RAM, and only a single-domain cold phase is measured, so status keeps the
+derived figure (`startup.provenance` `default`).
+
+**Card sizing.** A discrete card's limits come from the card's total memory
+as `nvidia-smi` reports it, not from the container's memory limit (ADR 0019):
+on the 16 GiB laptop card a managed limit of 14.71 GiB with an 8 % reserve,
+and a vLLM launch sized as a share of the card (`--gpu-memory-utilization`
+0.75), with or without `--memory`.
 
 **GPUs.** Inject them with the NVIDIA Container Toolkit, either through CDI
 (`--device nvidia.com/gpu=all` with Podman, or Docker with CDI enabled) or with
@@ -983,7 +998,7 @@ The image also needs `python3` on `PATH`: the device inventory an SGLang
 deployment is placed by is collected at start by `python3` running CapyCTL's
 runtime module; without it SGLang deployments fail placement.
 
-Found in the live run, three more things the image must carry:
+Found in the live runs, four more things the image must carry:
 
 - **The CUDA libraries on the loader's default path.** llama.cpp links
   `libcudart` and `libcublas`, and CapyCTL checks an engine's version with a
@@ -992,13 +1007,28 @@ Found in the live run, three more things the image must carry:
   (`engine_version_failed`) and SGLang's processes fail to start. Add the
   directory to `/etc/ld.so.conf.d/` and run `ldconfig` while building the
   image (with the CUDA tree present, for example through a build-time bind
-  mount).
+  mount). The legacy builder (Docker without `buildx`) has no build-time
+  mounts: copy the CUDA shared libraries into a build stage at the mount path,
+  run `ldconfig` there, and copy only `/etc/ld.so.cache` into the image. Link
+  `/usr/local/cuda` to the mounted toolkit too: `capyctl engine add` looks
+  for CUDA there unless `CUDA_HOME` names another toolkit.
 - **A C and C++ compiler.** vLLM and SGLang compile FlashInfer kernels at
   their first start; without `g++` (`cannot execute 'cc1plus'`) the engine
   exits before it is ready.
+- **`ninja` for TensorFold.** TensorFold builds CUDA extensions on its first
+  start, and `capyctl engine add` refuses a TensorFold environment when
+  `ninja` is not on the engine's `PATH` (`toolchain_missing`). Install it in
+  the image (`ninja-build` on Ubuntu) or into the environment.
 - **The interpreter the environments link to.** An environment made with `uv`
   links to `~/.local/share/uv/python/...`; mount that directory read-only at
   the same path.
+
+**Host name.** The role names its host after the machine's hostname, which
+for a container is the container's: Docker gives each new container a new one.
+A role started from persisted state under a different host name refuses to
+start (`internal: deploy: blocked: resource policy refused: resource policy
+revision conflict`), so give the container a fixed `--hostname`; a restart of
+the same container keeps its hostname.
 
 **User and capabilities.** Run the role as the user that owns the state
 directory (`--user <uid>:<gid>`), or as root. It needs no added capabilities
@@ -1051,14 +1081,17 @@ the engine env.
 Measured live on the GB10 under Docker's private cgroup namespace (the role
 sees its cgroup as `/`): without `--memory` the role reported `meminfo`; with
 `--memory 100g` it reported `cgroup_v2:/`, a capacity of 102400 MiB, and said
-so at start.
+so at start. On the laptop with the discrete card: without `--memory`,
+`meminfo` and the machine's 61.2 GiB; with `--memory 24g`, `cgroup_v2:/`
+and 24576 MiB of host RAM, while the card's domain stayed at the card's
+16376 MiB.
 
 A standalone role on a GB10, as an example:
 
 ```bash
 install -d -m 0700 -o 1000 -g 1000 /srv/capyctl-state
-docker run -d --name capyctl --gpus all --ipc=host --memory 100g \
-  --user 1000:1000 \
+docker run -d --name capyctl --hostname capyctl --gpus all --ipc=host \
+  --memory 100g --user 1000:1000 \
   -v /srv/capyctl-state:/var/lib/capyctl \
   -v /srv/models:/models:ro \
   -v /opt/vllm:/opt/vllm:ro \
