@@ -8,7 +8,8 @@ quickstart are in the repository [`README.md`](../README.md).
 
 | Document | Contents |
 |---|---|
-| [`operations/install.md`](operations/install.md) | Release assets and `install.sh`, systemd units per role, file locations, restart versus drain, exit codes, discrete NVIDIA GPUs, upgrade (including to 0.1.0) and rollback. |
+| [`guide/index.md`](guide/index.md) | The user guide, also published on the website: install, one machine and several, adding engines (custom engines included), deploying, requests (request IDs and metrics included), parking and switching. |
+| [`operations/install.md`](operations/install.md) | Release assets and `install.sh`, systemd units per role, file locations, restart versus drain, exit codes, discrete NVIDIA GPUs, running in a container, upgrade (including to 0.1.0) and rollback. |
 | [`operations/configuration.md`](operations/configuration.md) | Every setting with its YAML field, flag and environment variable, `--set` and `capyctl config show`. |
 | [`operations/network-access.md`](operations/network-access.md) | Reaching the inference endpoint from other machines: the API key, narrowing to loopback or a Tailscale address, turning the key off, a TLS reverse proxy. |
 | [`operations/data-retention.md`](operations/data-retention.md) | What CapyCTL keeps about requests, where and for how long, and how to keep engine logs in memory only. |
@@ -18,6 +19,7 @@ quickstart are in the repository [`README.md`](../README.md).
 | [`operations/release-notes-0.1.2.md`](operations/release-notes-0.1.2.md) | Release notes for 0.1.2. |
 | [`operations/release-notes-0.1.3.md`](operations/release-notes-0.1.3.md) | Release notes for 0.1.3. |
 | [`operations/release-notes-0.1.4.md`](operations/release-notes-0.1.4.md) | Release notes for 0.1.4. |
+| [`operations/release-notes-0.1.5.md`](operations/release-notes-0.1.5.md) | Release notes for 0.1.5. |
 | [`operations/release-notes-0.1.6.md`](operations/release-notes-0.1.6.md) | Release notes for 0.1.6. |
 | [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management, inference on all interfaces behind the API key, networked enrollment and control listeners. |
 | [`examples/host.yaml`](examples/host.yaml) | Host role document: private ingress, unified-memory resource policy, placement labels, and vLLM and SGLang installations. |

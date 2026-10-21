@@ -1,7 +1,8 @@
 # How it works
 
-CapyCTL sits between your apps and the vLLM, SGLang, TensorFold or llama.cpp engines on
-your GPUs. Apps see one OpenAI-compatible endpoint. Behind it, CapyCTL starts engines, decides
+CapyCTL sits between your apps and the engines on your GPUs: vLLM, SGLang, TensorFold,
+llama.cpp, or another server you add as a [custom engine](engines.md#custom-engines).
+Apps see one OpenAI-compatible endpoint. Behind it, CapyCTL starts engines, decides
 which models hold GPU memory, and moves the rest out of the way.
 
 ![How requests reach a model through CapyCTL](how-it-works.svg)
@@ -67,8 +68,8 @@ whether memory was released, it keeps counting it as used.
 
 ## What CapyCTL never does
 
-- It does not install engines. You register the vLLM, SGLang, TensorFold or llama.cpp you
-  already have with `capyctl engine add`.
+- It does not install engines. You register the vLLM, SGLang, TensorFold, llama.cpp
+  or other server you already have with `capyctl engine add`.
 - It does not touch GPU drivers, CUDA or system packages.
 - It does not expose engines. They listen on loopback with a key made for each
   launch; the endpoint is the only way in.

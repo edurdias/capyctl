@@ -31,6 +31,9 @@ What works in 0.1.6:
 - vLLM, SGLang, TensorFold and llama.cpp engines, one GPU per model, on unified-memory
   machines and on discrete NVIDIA cards, where CapyCTL counts the card's memory apart from
   host RAM and picks the GPU on a machine with several.
+- Any other inference server as a
+  [custom engine](docs/guide/engines.md#custom-engines), started from a manifest
+  you write (one machine, restart only).
 - One machine (standalone) or a server with several GPU hosts.
 - One model across two machines (`tensor_parallel: 2` over a direct link) with vLLM,
   SGLang and TensorFold (restart only).
@@ -40,6 +43,16 @@ What works in 0.1.6:
   streaming and tool calls, on the network with an API key.
 - Decision models (`api: decisions`) on llama.cpp and SGLang, answering
   `POST /v1/systemone` with probabilities (one machine, restart only).
+- A request ID on every answer, with your own `X-Request-Id` echoed back, and
+  timing and token metrics on decision answers
+  ([request IDs and metrics](docs/guide/requests.md#request-ids-and-metrics)).
+- Engine logs kept in memory only, so no prompt or answer reaches the disk
+  ([data retention](docs/operations/data-retention.md)).
+- A management API a program can drive: create, start, watch and retry
+  ([driving CapyCTL from a controller](docs/guide/controller.md)).
+- A host or standalone role inside a container
+  ([running in a container](docs/operations/install.md#running-in-a-container));
+  run so far on a unified-memory machine with Docker.
 - Linux on x86-64 and ARM64, NVIDIA GPUs.
 
 Not there yet:
@@ -54,7 +67,8 @@ Not there yet:
   [settings reference](docs/operations/configuration.md#engine-installation)).
 
 CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or
-TensorFold environment; models come from a directory or from Hugging Face.
+TensorFold environment, llama.cpp build or other server; models come from a
+directory or from Hugging Face.
 
 ## Install
 
@@ -226,8 +240,11 @@ Upgrade the server first, then the hosts one at a time.
 
 ## Documentation
 
+- [`docs/guide/`](docs/guide/index.md): the user guide: engines (custom
+  engines too), deployments, requests, parking and
+  [driving CapyCTL from a controller](docs/guide/controller.md).
 - [`docs/operations/install.md`](docs/operations/install.md): install,
-  services, upgrades, rollback and exit codes.
+  services, upgrades, rollback, exit codes and running in a container.
 - [`docs/operations/configuration.md`](docs/operations/configuration.md):
   every setting, with its YAML field, flag and environment variable, and the
   one precedence rule (`--set`, then `CAPYCTL_SET__…`, then the named flag, then
@@ -236,6 +253,8 @@ Upgrade the server first, then the hosts one at a time.
   the inference endpoint on your network, its API key, and a TLS proxy.
 - [`docs/operations/data-retention.md`](docs/operations/data-retention.md):
   what CapyCTL keeps about requests, where and for how long.
+- [`docs/operations/release-notes-0.1.6.md`](docs/operations/release-notes-0.1.6.md):
+  what changed in 0.1.6.
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `capyctl validate config` accepts
   them; they show the schema and are not tested engine recipes.

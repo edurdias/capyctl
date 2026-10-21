@@ -1,6 +1,7 @@
 # CapyCTL documentation
 
-CapyCTL runs vLLM, SGLang, TensorFold and llama.cpp models on GPU machines you own. It
+CapyCTL runs vLLM, SGLang, TensorFold and llama.cpp models on GPU machines you own,
+and any other inference server as a [custom engine](engines.md#custom-engines). It
 parks the models nobody is using, which frees their GPU memory, and wakes the
 one a request asks for. Clients use one OpenAI-compatible endpoint, on your
 network, with an API key.
@@ -23,12 +24,15 @@ Tasks:
   or another program as a [custom engine](engines.md#custom-engines).
 - [Deploy a model](deploy.md): the deployment file; start, stop, delete.
 - [Make a request](requests.md): curl, streaming, the Python client, other
-  machines.
+  machines, decision requests, and
+  [request IDs and metrics](requests.md#request-ids-and-metrics).
 - [Parking and switching](parking.md): more models than your GPU holds.
 - [How requests wait and models switch](parking.md#how-requests-wait-and-models-switch):
   two apps, two models, one GPU.
 - [Driving CapyCTL from a controller](controller.md): the management API
   from a program: create, start, watch, retry.
+- [Run in a container](../operations/install.md#running-in-a-container): a
+  host or standalone role as the main process of a container.
 
 Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [settings](../operations/configuration.md), [engine options](engine-flags.md),
@@ -36,6 +40,9 @@ Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [data retention](../operations/data-retention.md),
 [installer options](installer.md), [exit codes and errors](errors.md).
 
+What changed in the latest release: [release notes for 0.1.6](../operations/release-notes-0.1.6.md).
+
 CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or
-TensorFold installation; [Install an engine](install-engines.md) shows how. Models come from a directory on your machine or from Hugging
-Face.
+TensorFold installation, llama.cpp build or other server;
+[Install an engine](install-engines.md) shows how. Models come from a directory
+on your machine or from Hugging Face.

@@ -1,11 +1,16 @@
+---
+import { REPO_URL, href } from '../../../site.config.mjs';
+---
 <section>
   <h2>Engines and platforms</h2>
   <table>
     <tbody>
-      <tr><th scope="row">Engines</th><td>vLLM, SGLang, TensorFold, llama.cpp</td></tr>
-      <tr><th scope="row">Hosts</th><td>Linux on x86-64 and ARM64, NVIDIA GPUs</td></tr>
+      <tr><th scope="row">Engines</th><td>vLLM, SGLang, TensorFold, llama.cpp, or any other server as a <a href={href('/docs/engines/#custom-engines')}>custom engine</a></td></tr>
+      <tr><th scope="row">Hosts</th><td>Linux on x86-64 and ARM64, NVIDIA GPUs, directly or <a href={`${REPO_URL}/blob/main/docs/operations/install.md#running-in-a-container`}>in a container</a></td></tr>
       <tr><th scope="row">Models</th><td>Anything your engine can load</td></tr>
-      <tr><th scope="row">API</th><td>OpenAI-compatible, streaming, tool calls</td></tr>
+      <tr><th scope="row">API</th><td>OpenAI-compatible, streaming, tool calls, decision models, and a <a href={href('/docs/requests/#request-ids-and-metrics')}>request ID</a> on every answer</td></tr>
+      <tr><th scope="row">Privacy</th><td>Engine logs can stay in memory, so no prompt or answer reaches the disk (<a href={href('/docs/reference/data-retention/')}>data retention</a>)</td></tr>
+      <tr><th scope="row">Automation</th><td>A management API your own program can drive (<a href={href('/docs/controller/')}>controller guide</a>)</td></tr>
     </tbody>
   </table>
   <p>Bring your own engine installation. CapyCTL manages the runtime around it.</p>
