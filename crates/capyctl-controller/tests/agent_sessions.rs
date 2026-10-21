@@ -1661,6 +1661,15 @@ struct RawSession {
     session_id: String,
 }
 async fn raw_session(identity: &PendingEnrollment, host: &str) -> RawSession {
+    raw_session_reporting(identity, host, vec![]).await.unwrap()
+}
+/// A raw session whose inventory reports `domains`, or the status that ended
+/// it before it was ready.
+async fn raw_session_reporting(
+    identity: &PendingEnrollment,
+    host: &str,
+    domains: Vec<pb::DomainObservation>,
+) -> Result<RawSession, Box<tonic::Status>> {
     let channel = identity
         .control_endpoint(now())
         .unwrap()
@@ -1679,42 +1688,48 @@ async fn raw_session(identity: &PendingEnrollment, host: &str) -> RawSession {
     .unwrap();
     let mut stream = AgentControlClient::new(channel)
         .session(ReceiverStream::new(recv))
-        .await
-        .unwrap()
+        .await?
         .into_inner();
-    send.send(pb::AgentToServer {
-        msg: Some(agent_to_server::Msg::ReportInventory(pb::ReportInventory {
-            envelope: Some(pb::Envelope {
-                host_id: host.into(),
-                protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+    // A refused session may close its request stream before these are sent;
+    // the refusal is read from the response stream below.
+    let _ = send
+        .send(pb::AgentToServer {
+            msg: Some(agent_to_server::Msg::ReportInventory(pb::ReportInventory {
+                envelope: Some(pb::Envelope {
+                    host_id: host.into(),
+                    protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+                    ..Default::default()
+                }),
+                domains,
                 ..Default::default()
-            }),
-            ..Default::default()
-        })),
-    })
-    .await
-    .unwrap();
-    send.send(pb::AgentToServer {
-        msg: Some(agent_to_server::Msg::ReconcileHistory(
-            pb::ReconcileHistory {
-                records: vec![],
-                complete: true,
-            },
-        )),
-    })
-    .await
-    .unwrap();
+            })),
+        })
+        .await;
+    let _ = send
+        .send(pb::AgentToServer {
+            msg: Some(agent_to_server::Msg::ReconcileHistory(
+                pb::ReconcileHistory {
+                    records: vec![],
+                    complete: true,
+                },
+            )),
+        })
+        .await;
     let session_id = loop {
-        match stream.message().await.unwrap().unwrap().msg {
+        let message = stream
+            .message()
+            .await?
+            .ok_or_else(|| tonic::Status::aborted("session closed"))?;
+        match message.msg {
             Some(pb::server_to_agent::Msg::SessionReady(ready)) => break ready.session_id,
             _ => continue,
         }
     };
-    RawSession {
+    Ok(RawSession {
         send,
         stream,
         session_id,
-    }
+    })
 }
 fn inspect_command(
     controller_id: String,
@@ -2103,5 +2118,69 @@ async fn a_replaced_session_leaves_no_load_behind() {
         "the replaced session's load is gone"
     );
     drop(first);
+    server.abort();
+}
+
+fn domain_bounded_by(memory_source: &str) -> pb::DomainObservation {
+    pb::DomainObservation {
+        memory_source: memory_source.into(),
+        ..domain(2048)
+    }
+}
+
+// T07 T26 (SPEC §7.2, install.md "Memory limits"): a host running under a
+// systemd user service (`user@1000.service`) or a template unit names the
+// cgroup bounding its memory as systemd does. Its session is accepted and
+// status shows the source. Every such host was refused with `host session
+// authorization failed` while `@` was not a valid character.
+#[tokio::test]
+async fn a_host_under_a_systemd_user_service_or_template_unit_is_accepted() {
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
+    for source in [
+        "cgroup_v2:/user.slice/user-1000.slice/user@1000.service/app.slice/run-p1234-i5678.scope",
+        "cgroup_v2:/system.slice/system-capyctl.slice/capyctl@spark.service",
+    ] {
+        let raw = raw_session_reporting(&identity, &host, vec![domain_bounded_by(source)])
+            .await
+            .unwrap_or_else(|status| panic!("{source}: {status:?}"));
+        let view = sessions.inspect(&host).unwrap();
+        assert_eq!(view.session_id, raw.session_id);
+        assert_eq!(view.domains[0].memory_source, source);
+        drop(raw);
+    }
+    server.abort();
+}
+
+// T07 T26 (SPEC §7.2): a memory source with a control character or whitespace
+// still refuses the session, as does one past the length bound.
+#[tokio::test]
+async fn a_memory_source_with_a_control_character_or_too_long_is_refused() {
+    let Enrolled {
+        identity,
+        host,
+        server,
+        _dirs,
+        ..
+    } = enrolled_host().await;
+    let too_long = format!("cgroup_v2:/user@1000.service/{}", "a".repeat(512));
+    for source in [
+        "cgroup_v2:/user@1000.service\n",
+        "cgroup_v2:/user@1000.service\u{1b}[2J",
+        "cgroup_v2:/user@1000.service (deleted)",
+        too_long.as_str(),
+    ] {
+        let refused = raw_session_reporting(&identity, &host, vec![domain_bounded_by(source)])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{source:?} was accepted"));
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{source:?}");
+        assert_eq!(refused.message(), "host session authorization failed");
+    }
     server.abort();
 }

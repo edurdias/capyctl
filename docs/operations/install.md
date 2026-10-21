@@ -1066,8 +1066,10 @@ counted as free, since the kernel reclaims it first). Standalone derives its
 limits from that capacity, and on a unified-memory machine (GB10) the single
 `unified` domain follows the same bound. At start the role says which cgroup
 bounds its memory, and `capyctl inspect host <name> --json` shows
-`memory_source` on each host domain: `meminfo`, or `cgroup_v2:<cgroup>`.
-cgroup v1 limits are not
+`memory_source` on each host domain: `meminfo`, or `cgroup_v2:<cgroup>`. The
+cgroup is named as systemd names it, a user service or template unit included
+(`cgroup_v2:/user.slice/user-1000.slice/user@1000.service/…`, `\x2d` escapes
+kept), up to 512 characters. cgroup v1 limits are not
 read: on a v1 host the role warns at start (`memory_source`
 `meminfo:cgroup_v1_unread`) and reads the whole machine, so state the limits in
 the role document instead (see

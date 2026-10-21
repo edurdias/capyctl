@@ -383,8 +383,8 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
                 } else {
                     d.device_id.is_empty()
                 }
-                // SPEC §7.2: a status token, bounded like every other name.
-                && (d.memory_source.is_empty() || bounded_name(&d.memory_source))
+                // SPEC §7.2: a status token, bounded, in cgroup path characters.
+                && (d.memory_source.is_empty() || memory_source_valid(&d.memory_source))
         })
         && inventory.profiles.iter().all(|p| {
             bounded_name(&p.name)
@@ -451,6 +451,31 @@ fn bounded_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
+}
+/// The longest `memory_source` a host may publish. A cgroup path nests
+/// systemd units (`user@1000.service/app.slice/…`) and can outgrow a name.
+/// SPEC §7.2 and install.md ("Memory limits"): the host names the cgroup that
+/// bounded its reading, as the kernel and systemd name it.
+const MAX_MEMORY_SOURCE: usize = 512;
+/// SPEC §7.2: a `memory_source` token is `meminfo…` or
+/// `cgroup_v2:<cgroup>`, and the cgroup is named by systemd's unit-name rules:
+/// letters, digits, `:-_.\@`, `/` between levels. `@` names a template
+/// instance (`user@1000.service`, `getty@tty1.service`), and `\` only starts a
+/// `\xNN` escape (`dev-disk-by\x2duuid`). Whitespace, control characters and
+/// anything else are refused: the token reaches status and logs verbatim.
+fn memory_source_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_MEMORY_SOURCE
+        && bytes.iter().enumerate().all(|(i, &b)| match b {
+            b'\\' => {
+                bytes.get(i + 1) == Some(&b'x')
+                    && bytes
+                        .get(i + 2..i + 4)
+                        .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            }
+            _ => b.is_ascii_alphanumeric() || b"-_.:/@".contains(&b),
+        })
 }
 struct Session {
     view: HostSessionView,
@@ -2257,8 +2282,71 @@ mod memory_source_tests {
             "host-a"
         ));
         assert!(!inventory_shape_valid(
-            &inventory(&"x".repeat(257)),
+            &inventory(&"x".repeat(MAX_MEMORY_SOURCE + 1)),
             "host-a"
         ));
+    }
+
+    // T26 T07 (SPEC §7.2, install.md "Memory limits"): a host under a systemd
+    // user service or a template unit names its cgroup as systemd does, `@`
+    // and `\xNN` escapes included, and its inventory is accepted. Found by the
+    // CI-shape gate, which runs under `systemd-run --user --scope`.
+    #[test]
+    fn a_systemd_unit_cgroup_is_a_valid_memory_source() {
+        for source in [
+            "cgroup_v2:/user.slice/user-1000.slice/user@1000.service/app.slice/run-u42.scope",
+            "cgroup_v2:/system.slice/system-capyctl.slice/capyctl@host-a.service",
+            "cgroup_v2:/system.slice/system-systemd\\x2dfsck.slice/systemd-fsck@dev-disk-by\\x2duuid-1234.service",
+            "cgroup_v2:/",
+            "meminfo:cgroup_v1_unread",
+            "meminfo:cgroup_v2_unreadable",
+        ] {
+            let report = inventory(source);
+            assert!(inventory_shape_valid(&report, "host-a"), "{source}");
+            let view = serde_json::to_value(DomainView::of(&report.domains[0])).unwrap();
+            assert_eq!(view["memory_source"], source);
+        }
+        let longest = format!(
+            "cgroup_v2:/user.slice/user@1000.service/{}",
+            "a".repeat(MAX_MEMORY_SOURCE - 40)
+        );
+        assert_eq!(longest.len(), MAX_MEMORY_SOURCE);
+        assert!(inventory_shape_valid(&inventory(&longest), "host-a"));
+        assert!(!inventory_shape_valid(
+            &inventory(&format!("{longest}a")),
+            "host-a"
+        ));
+    }
+
+    // T26 (SPEC §7.2): accepting systemd's names opens nothing else. Control
+    // characters, whitespace, a bare or truncated `\` escape, and characters
+    // no cgroup systemd creates are refused; `bounded_name` keeps its own
+    // narrower alphabet for every other field.
+    #[test]
+    fn a_memory_source_still_refuses_what_could_break_logs_or_status() {
+        for source in [
+            "cgroup_v2:/user@1000.service\n",
+            "cgroup_v2:/user@1000.service\r",
+            "cgroup_v2:/user\t@1000.service",
+            "cgroup_v2:/a\0b",
+            "cgroup_v2:/a\u{1b}[31mb",
+            "cgroup_v2:/a\u{7f}b",
+            "cgroup_v2:/user@1000.service (deleted)",
+            "cgroup_v2:/a\\b",
+            "cgroup_v2:/a\\x2",
+            "cgroup_v2:/a\\xzz",
+            "cgroup_v2:/a\\",
+            "cgroup_v2:/a\"b",
+            "cgroup_v2:/a'b",
+            "cgroup_v2:/a;b",
+            "cgroup_v2:/a%b",
+            "cgroup_v2:/caf\u{e9}",
+        ] {
+            assert!(
+                !inventory_shape_valid(&inventory(source), "host-a"),
+                "{source:?}"
+            );
+        }
+        assert!(!bounded_name("user@1000.service"));
     }
 }
