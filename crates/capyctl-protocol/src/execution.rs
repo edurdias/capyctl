@@ -37,6 +37,12 @@ pub struct SingleLaunchPlan {
     /// starting phase instead of its own placeholder, never below the steady
     /// request it resolves itself.
     pub startup_bytes: Option<i64>,
+    /// ADR 0019 §3: on a discrete GPU whose startup peak the server measured
+    /// per memory domain, the startup charge on host RAM (the system domain);
+    /// with it, `startup_bytes` is the charge on the card (the device domain).
+    /// The host charges each on its own domain, never below the steady charge
+    /// it resolves there itself.
+    pub startup_host_bytes: Option<i64>,
     /// ADR 0014 amendment A16: the hybrid state slot the server resolved this
     /// revision with, beside the weights.
     pub checkpoint_state_slot_bytes: Option<i64>,
@@ -183,6 +189,10 @@ impl SingleLaunchPlan {
             || plan.issued_at_unix_ms < 0
             || !recorded_checkpoint_ok(&plan.checkpoint_digest, plan.checkpoint_weights_bytes)
             || plan.startup_bytes.is_some_and(|bytes| bytes <= 0)
+            // ADR 0019 §3: the host RAM charge only beside the card's.
+            || plan
+                .startup_host_bytes
+                .is_some_and(|bytes| bytes <= 0 || plan.startup_bytes.is_none())
             || plan
                 .checkpoint_state_slot_bytes
                 .is_some_and(|bytes| bytes <= 0 || plan.checkpoint_digest.is_empty())
@@ -223,6 +233,7 @@ impl SingleLaunchPlan {
             checkpoint_digest: plan.checkpoint_digest,
             checkpoint_weights_bytes: plan.checkpoint_weights_bytes,
             startup_bytes: plan.startup_bytes,
+            startup_host_bytes: plan.startup_host_bytes,
             checkpoint_state_slot_bytes: plan.checkpoint_state_slot_bytes,
             checkpoint_layout: plan.checkpoint_layout.as_ref().and_then(layout_from_wire),
             checkpoint_tables: plan.checkpoint_tables.as_ref().and_then(tables_from_wire),
@@ -250,6 +261,7 @@ impl SingleLaunchPlan {
             checkpoint_digest: self.checkpoint_digest.clone(),
             checkpoint_weights_bytes: self.checkpoint_weights_bytes,
             startup_bytes: self.startup_bytes,
+            startup_host_bytes: self.startup_host_bytes,
             checkpoint_state_slot_bytes: self.checkpoint_state_slot_bytes,
             checkpoint_layout: self.checkpoint_layout.as_ref().map(layout_to_wire),
             checkpoint_tables: self.checkpoint_tables.as_ref().map(tables_to_wire),

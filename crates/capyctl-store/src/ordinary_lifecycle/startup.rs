@@ -11,9 +11,14 @@
 //!
 //! 1. declared as `engine_config.memory.startup` (or as the cold phase of a
 //!    declared `resources:` block), which is the operator's and never replaced;
-//! 2. measured by a first run on the host: the largest drop in the host's
-//!    published memory availability while an uncontended Initialize ran,
-//!    recorded per (revision, host, engine installation) when it reached Ready;
+//! 2. measured by a first run on the host, recorded per (revision, host,
+//!    engine installation, memory domain) when it reached Ready. On one pool
+//!    (unified memory) it is the largest drop in the host's published memory
+//!    availability while an uncontended Initialize ran. On a discrete GPU
+//!    (ADR 0019 §3) the card and host RAM are measured apart, from what the
+//!    launch's own processes held: the GPU memory the driver attributes to
+//!    them on the card, their resident pages in host RAM. Each domain's
+//!    estimate is replaced once that domain is measured;
 //! 3. the placeholder `max(request + graphs, weights × 2.25 + margin)` the
 //!    revision was resolved with (ADR 0014 amendment A8 adds the graphs;
 //!    amendments A21 and A22 size vLLM's eager loader as
@@ -34,7 +39,9 @@
 //! SGLang launch is involved, starts on one host are serialized through their
 //! startup phase whatever the peaks (`sglang_startup_contended`).
 use super::*;
-use capyctl_config::effective::{measurable, startup_budget, StartupBudget, StartupProvenance};
+use capyctl_config::effective::{
+    startup_budget, startup_measure, StartupMeasure, StartupProvenance,
+};
 use capyctl_scheduler::placement::{fits, HostRefusal};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,39 +57,79 @@ fn total(footprint: &capyctl_config::effective::PhaseFootprint) -> i64 {
     })
 }
 
-/// The largest startup peak recorded for this revision on its host and
-/// installation, if any.
-fn measured_peak(
+/// The startup peaks recorded for this revision on its host and installation,
+/// by memory domain.
+fn measured_peaks(
     tx: &rusqlite::Connection,
     deployment_id: &str,
     revision: i64,
     e: &EffectiveDeployment,
-) -> Result<Option<i64>, LifecycleError> {
+) -> Result<BTreeMap<String, i64>, LifecycleError> {
     Ok(tx
-        .query_row(
-            "SELECT peak_bytes FROM startup_measurements
-              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4",
+        .prepare(
+            "SELECT domain,peak_bytes FROM startup_measurements
+              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4
+                AND peak_bytes>0",
+        )?
+        .query_map(
             params![deployment_id, revision, e.host.name, installation(e)],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?
-        .filter(|peak| *peak > 0))
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<_, _>>()?)
 }
 
-/// The startup bytes a new start of this revision freezes into its plan: the
-/// measured peak, never below the steady footprint, when the revision's own
-/// budget is only a placeholder. `None` keeps the revision's cold phase.
+/// The pool a single-allocation placeholder is measured on (unified memory).
+fn pool(e: &EffectiveDeployment) -> Option<String> {
+    match startup_measure(e) {
+        Some(StartupMeasure::Pool { domain }) => Some(domain),
+        _ => None,
+    }
+}
+
+/// The bytes the Ready phase charges on `domain`.
+fn ready_on(e: &EffectiveDeployment, domain: &str) -> i64 {
+    e.resources
+        .ready
+        .allocations
+        .iter()
+        .filter(|a| a.domain == domain)
+        .fold(0_i64, |sum, a| sum.saturating_add(a.bytes))
+}
+
+/// The measured startup bytes a new start of this revision freezes into its
+/// plan when the revision's own budget is only a placeholder: on one pool the
+/// measured peak, never below the steady footprint (`.0`); on a discrete GPU
+/// each measured domain's peak, never below that domain's steady charge
+/// (`.1`, ADR 0019 §3). `(None, empty)` keeps the revision's cold phase.
 pub(super) fn frozen_startup(
     tx: &rusqlite::Connection,
     deployment_id: &str,
     revision: i64,
     e: &EffectiveDeployment,
-) -> Result<Option<i64>, LifecycleError> {
-    if !measurable(e) {
-        return Ok(None);
-    }
-    Ok(measured_peak(tx, deployment_id, revision, e)?
-        .map(|peak| peak.max(total(&e.resources.ready))))
+) -> Result<(Option<i64>, BTreeMap<String, i64>), LifecycleError> {
+    let Some(measure) = startup_measure(e) else {
+        return Ok((None, BTreeMap::new()));
+    };
+    let measured = measured_peaks(tx, deployment_id, revision, e)?;
+    Ok(match measure {
+        StartupMeasure::Pool { domain } => (
+            measured
+                .get(&domain)
+                .map(|peak| (*peak).max(total(&e.resources.ready))),
+            BTreeMap::new(),
+        ),
+        StartupMeasure::Domains { device, host } => (
+            None,
+            [device, host]
+                .into_iter()
+                .filter_map(|domain| {
+                    let peak = *measured.get(&domain)?;
+                    let bytes = peak.max(ready_on(e, &domain));
+                    Some((domain, bytes))
+                })
+                .collect(),
+        ),
+    })
 }
 
 /// Owner decision 2026-09-23 (solo first start): the placeholder startup peak
@@ -106,7 +153,7 @@ fn weighed_placeholder(
     e: &EffectiveDeployment,
 ) -> Result<Option<i64>, LifecycleError> {
     let memory = e.engine_config.memory();
-    if !measurable(e) || memory.weights_bytes.is_some() {
+    if pool(e).is_none() || memory.weights_bytes.is_some() {
         return Ok(None);
     }
     // The hashed weights once recorded, else the sized ones.
@@ -169,7 +216,10 @@ pub(super) fn whole_host_startup(
     revision: i64,
     e: &EffectiveDeployment,
 ) -> Result<Option<i64>, LifecycleError> {
-    if !measurable(e) || measured_peak(tx, deployment_id, revision, e)?.is_some() {
+    let Some(domain) = pool(e) else {
+        return Ok(None);
+    };
+    if measured_peaks(tx, deployment_id, revision, e)?.contains_key(&domain) {
         return Ok(None);
     }
     let [allocation] = e.resources.cold.allocations.as_slice() else {
@@ -190,10 +240,13 @@ pub(super) fn whole_host_startup(
 
 /// What a start accepted now freezes into its plan.
 pub(super) struct FrozenStartup {
-    /// The startup bytes it reserves: measured, the whole managed limit for a
-    /// solo first start, or the weighed placeholder; `None` keeps the
-    /// revision's cold phase.
+    /// The startup bytes it reserves on one pool: measured, the whole managed
+    /// limit for a solo first start, or the weighed placeholder; `None` keeps
+    /// the revision's cold phase.
     pub(super) bytes: Option<i64>,
+    /// ADR 0019 §3: on a discrete GPU, the measured startup bytes it reserves
+    /// on each measured domain; a domain absent keeps its cold charge.
+    pub(super) domains: BTreeMap<String, i64>,
     /// A solo first start.
     pub(super) whole_host: bool,
     /// `bytes` is the weighed placeholder, not a measurement.
@@ -212,13 +265,16 @@ pub(super) fn frozen_plan_startup(
     if let Some(limit) = whole_host_startup(tx, deployment_id, revision, e)? {
         return Ok(FrozenStartup {
             bytes: Some(limit),
+            domains: BTreeMap::new(),
             whole_host: true,
             estimated: false,
         });
     }
-    if let Some(bytes) = frozen_startup(tx, deployment_id, revision, e)? {
+    let (bytes, domains) = frozen_startup(tx, deployment_id, revision, e)?;
+    if bytes.is_some() || !domains.is_empty() {
         return Ok(FrozenStartup {
-            bytes: Some(bytes),
+            bytes,
+            domains,
             whole_host: false,
             estimated: false,
         });
@@ -226,22 +282,32 @@ pub(super) fn frozen_plan_startup(
     let estimate = weighed_placeholder(tx, deployment_id, revision, e)?;
     Ok(FrozenStartup {
         bytes: estimate,
+        domains: BTreeMap::new(),
         whole_host: false,
         estimated: estimate.is_some(),
     })
 }
 
-fn with_startup(e: &EffectiveDeployment, startup: Option<i64>) -> PhaseFootprint {
+fn with_startup(
+    e: &EffectiveDeployment,
+    startup: Option<i64>,
+    domains: &BTreeMap<String, i64>,
+) -> PhaseFootprint {
     let mut footprint = phase(&e.resources.cold, ResourcePhase::Cold);
     if let (Some(bytes), [allocation]) = (startup, footprint.allocations.as_mut_slice()) {
         allocation.bytes = bytes;
+    }
+    for allocation in &mut footprint.allocations {
+        if let Some(bytes) = domains.get(&allocation.domain) {
+            allocation.bytes = *bytes;
+        }
     }
     footprint
 }
 
 /// The cold (startup) footprint a start reserves from arm until Ready.
 pub(super) fn cold(p: &Plan, e: &EffectiveDeployment) -> PhaseFootprint {
-    with_startup(e, p.startup_bytes)
+    with_startup(e, p.startup_bytes, &p.startup_domains)
 }
 
 /// The startup footprint an instance of this revision would reserve if it were
@@ -254,7 +320,10 @@ pub(super) fn startup_footprint(
     e: &EffectiveDeployment,
 ) -> Result<(PhaseFootprint, bool), LifecycleError> {
     let frozen = frozen_plan_startup(tx, deployment_id, revision, e)?;
-    Ok((with_startup(e, frozen.bytes), frozen.whole_host))
+    Ok((
+        with_startup(e, frozen.bytes, &frozen.domains),
+        frozen.whole_host,
+    ))
 }
 
 /// The footprint a launch holds once Ready.
@@ -318,42 +387,91 @@ pub enum StartupGate {
 pub struct StartupReservation {
     pub bytes: i64,
     pub provenance: StartupProvenance,
+    /// ADR 0019 §3: on a discrete GPU, the card's and host RAM's parts of
+    /// `bytes`, each with its own provenance. Absent on one pool.
+    #[serde(flatten)]
+    pub split: Option<StartupSplit>,
 }
 
-fn reservation(p: &Plan, e: &EffectiveDeployment) -> StartupReservation {
-    let budget = startup_budget(e);
-    StartupReservation {
-        bytes: total_domain(&cold(p, e)),
-        provenance: if p.whole_host {
-            StartupProvenance::WholeHost
-        } else if p.estimated {
-            StartupProvenance::Default
-        } else if p.startup_bytes.is_some() {
-            StartupProvenance::Measured
-        } else {
-            budget.provenance
-        },
-    }
+/// ADR 0019 §3 (found live 2026-10-03): on a discrete GPU the part of a
+/// startup reservation charged on the card (the startup peak and the engine's
+/// CUDA context) and the part charged on host RAM (the engine process), apart,
+/// so the card's figure is not read as the sum, each with where it came from:
+/// a domain whose peak a first run measured is `measured`, any other keeps
+/// the provenance of the estimate it reserves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StartupSplit {
+    pub device_bytes: i64,
+    pub host_bytes: i64,
+    pub device_provenance: StartupProvenance,
+    pub host_provenance: StartupProvenance,
 }
 
-/// What the frozen cold phase charges host domains, when any of its
-/// allocations is on a device domain (a discrete GPU).
-fn host_share(e: &EffectiveDeployment) -> Option<i64> {
+/// `footprint` split between the card and host RAM, when any of its
+/// allocations is on a device domain (a discrete GPU). `measured` names the
+/// domains whose measured peak it reserves; every other domain is
+/// `unmeasured`.
+fn split(
+    e: &EffectiveDeployment,
+    footprint: &PhaseFootprint,
+    measured: &BTreeMap<String, i64>,
+    unmeasured: StartupProvenance,
+) -> Option<StartupSplit> {
     let on_device = |domain: &str| {
         e.host
             .domains
             .get(domain)
             .is_some_and(|d| d.memory == capyctl_config::effective::DomainMemory::Device)
     };
-    let cold = &e.resources.cold.allocations;
+    let cold = &footprint.allocations;
     if !cold.iter().any(|a| on_device(&a.domain)) {
         return None;
     }
-    Some(
-        cold.iter()
-            .filter(|a| !on_device(&a.domain))
-            .fold(0_i64, |host, a| host.saturating_add(a.bytes)),
-    )
+    let part = |device: bool| {
+        let mut allocations = cold.iter().filter(|a| on_device(&a.domain) == device);
+        let bytes = allocations
+            .clone()
+            .fold(0_i64, |sum, a| sum.saturating_add(a.bytes));
+        let provenance = if allocations.all(|a| measured.contains_key(&a.domain)) && bytes > 0 {
+            StartupProvenance::Measured
+        } else {
+            unmeasured
+        };
+        (bytes, provenance)
+    };
+    let ((device_bytes, device_provenance), (host_bytes, host_provenance)) =
+        (part(true), part(false));
+    Some(StartupSplit {
+        device_bytes,
+        host_bytes,
+        device_provenance,
+        host_provenance,
+    })
+}
+
+/// A reservation's provenance on a discrete GPU is the card's, the figure
+/// status shows first; elsewhere `whole`.
+fn overall(whole: StartupProvenance, split: &Option<StartupSplit>) -> StartupProvenance {
+    split.as_ref().map_or(whole, |s| s.device_provenance)
+}
+
+fn reservation(p: &Plan, e: &EffectiveDeployment) -> StartupReservation {
+    let footprint = cold(p, e);
+    let provenance = if p.whole_host {
+        StartupProvenance::WholeHost
+    } else if p.estimated {
+        StartupProvenance::Default
+    } else if p.startup_bytes.is_some() {
+        StartupProvenance::Measured
+    } else {
+        startup_budget(e).provenance
+    };
+    let split = split(e, &footprint, &p.startup_domains, provenance);
+    StartupReservation {
+        bytes: total_domain(&footprint),
+        provenance: overall(provenance, &split),
+        split,
+    }
 }
 
 fn total_domain(footprint: &PhaseFootprint) -> i64 {
@@ -367,6 +485,9 @@ fn total_domain(footprint: &PhaseFootprint) -> i64 {
 pub struct StartupMeasurement {
     pub host_id: String,
     pub installation: String,
+    /// The memory domain it was measured on: the pool on unified memory, the
+    /// card or host RAM on a discrete GPU (ADR 0019 §3).
+    pub domain: String,
     pub peak_bytes: i64,
     pub measured_at_ms: i64,
 }
@@ -377,15 +498,10 @@ pub struct StartupMeasurement {
 pub struct StartupStatus {
     pub bytes: i64,
     pub provenance: StartupProvenance,
-    /// ADR 0019 §3 (found live 2026-10-03): on a discrete GPU the part of
-    /// `bytes` charged on the card (the startup peak and the engine's CUDA
-    /// context) and the part charged on host RAM (the engine process), apart,
-    /// so the card's figure is not read as the sum. Absent on a host whose
-    /// memory is one pool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_bytes: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_bytes: Option<i64>,
+    /// ADR 0019 §3: on a discrete GPU, the card's and host RAM's parts of
+    /// `bytes`, each with its own provenance. Absent on one pool.
+    #[serde(flatten)]
+    pub split: Option<StartupSplit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<StartupMeasurement>,
 }
@@ -410,55 +526,57 @@ pub(crate) fn status(
     let Ok(e) = decode_effective_snapshot(&raw) else {
         return Ok(None);
     };
-    let StartupBudget { bytes, provenance } = startup_budget(&e);
     // Owner decision 2026-10-07 (found live: an SGLang deployment showed its
     // 55.2 GiB placeholder after a 29.7 GiB peak was measured): the figure is
     // the one admission reserves (`frozen_plan_startup`): a measured peak on
-    // the revision's host and installation, else the whole managed limit for
-    // a solo first start (owner decision 2026-09-23; ADR 0015 amendment
-    // 2026-09-23), else the placeholder recomputed with weights sized since
-    // the freeze. Found live 2026-10-16: a parking vLLM deployment of 71 GiB
-    // of weights showed its 265.2 GiB eager-loader placeholder while every
-    // start of it reserved the 108 GiB managed limit.
-    let (bytes, provenance) = match frozen_plan_startup(tx, deployment_id, revision, &e) {
-        Ok(FrozenStartup {
-            bytes: Some(bytes),
-            whole_host,
-            estimated,
-        }) => (
-            bytes,
-            if whole_host {
+    // the revision's host and installation (per domain on a discrete GPU),
+    // else the whole managed limit for a solo first start (owner decision
+    // 2026-09-23; ADR 0015 amendment 2026-09-23), else the placeholder
+    // recomputed with weights sized since the freeze. Found live 2026-10-16:
+    // a parking vLLM deployment of 71 GiB of weights showed its 265.2 GiB
+    // eager-loader placeholder while every start of it reserved the 108 GiB
+    // managed limit.
+    let frozen = frozen_plan_startup(tx, deployment_id, revision, &e).ok();
+    let (footprint, measured_domains, provenance) = match frozen {
+        Some(f) => (
+            with_startup(&e, f.bytes, &f.domains),
+            f.domains,
+            if f.whole_host {
                 StartupProvenance::WholeHost
-            } else if estimated {
+            } else if f.estimated {
                 StartupProvenance::Default
-            } else {
+            } else if f.bytes.is_some() {
                 StartupProvenance::Measured
+            } else {
+                startup_budget(&e).provenance
             },
         ),
-        _ => (bytes, provenance),
+        None => (
+            with_startup(&e, None, &BTreeMap::new()),
+            BTreeMap::new(),
+            startup_budget(&e).provenance,
+        ),
     };
     let measured = tx
         .prepare(
-            "SELECT host_id,installation,peak_bytes,measured_at_ms FROM startup_measurements
-              WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,installation",
+            "SELECT host_id,installation,domain,peak_bytes,measured_at_ms FROM startup_measurements
+              WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,installation,domain",
         )?
         .query_map(params![deployment_id, revision], |r| {
             Ok(StartupMeasurement {
                 host_id: r.get(0)?,
                 installation: r.get(1)?,
-                peak_bytes: r.get(2)?,
-                measured_at_ms: r.get(3)?,
+                domain: r.get(2)?,
+                peak_bytes: r.get(3)?,
+                measured_at_ms: r.get(4)?,
             })
         })?
         .collect::<Result<_, _>>()?;
-    // The host RAM charge is the frozen one; a recomputed placeholder changes
-    // only the card's peak.
-    let host_bytes = host_share(&e);
+    let split = split(&e, &footprint, &measured_domains, provenance);
     Ok(Some(StartupStatus {
-        bytes,
-        provenance,
-        device_bytes: host_bytes.map(|host| bytes.saturating_sub(host)),
-        host_bytes,
+        bytes: total_domain(&footprint),
+        provenance: overall(provenance, &split),
+        split,
         measured,
     }))
 }
@@ -623,44 +741,59 @@ impl crate::Store {
         }
     }
 
-    /// Owner decision 2026-09-23: record the startup peak an uncontended
-    /// Initialize measured, once it has reached Ready. The largest peak seen
-    /// for the revision on its host and installation is kept, so a later
-    /// launch never reserves less than any run needed. Returns whether a
-    /// measurement was written (a step that is not completed records none).
+    /// Owner decision 2026-09-23: record the startup peaks an uncontended
+    /// Initialize measured, once it has reached Ready, by memory domain: the
+    /// pool on unified memory, the card and host RAM apart on a discrete GPU
+    /// (ADR 0019 §3). The largest peak seen for the revision on its host,
+    /// installation and domain is kept, so a later launch never reserves less
+    /// than any run needed. Every domain must be one its cold phase charges.
+    /// Returns whether a measurement was written (a step that is not
+    /// completed records none).
     pub fn record_startup_peak(
         &self,
         s: &CoordinatorSession,
         step_id: &str,
-        peak_bytes: i64,
+        peaks: &BTreeMap<String, i64>,
         now_ms: i64,
     ) -> Result<bool, LifecycleError> {
-        if peak_bytes <= 0 || now_ms < 0 {
+        if peaks.is_empty() || peaks.values().any(|peak| *peak <= 0) || now_ms < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let (p, e, state) = load(&tx, step_id)?;
+        if !peaks.keys().all(|domain| {
+            e.resources
+                .cold
+                .allocations
+                .iter()
+                .any(|a| &a.domain == domain)
+        }) {
+            return Err(LifecycleError::Invalid);
+        }
         if state != "completed" {
             return Ok(false);
         }
-        tx.execute(
-            "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,peak_bytes,step_id,measured_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(deployment_id,revision,host_id,installation) DO UPDATE SET
-               step_id=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.step_id ELSE step_id END,
-               measured_at_ms=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
-               peak_bytes=MAX(peak_bytes,excluded.peak_bytes)",
-            params![
-                p.deployment_id,
-                p.revision,
-                e.host.name,
-                installation(&e),
-                peak_bytes,
-                p.step_id,
-                now_ms
-            ],
-        )?;
+        for (domain, peak_bytes) in peaks {
+            tx.execute(
+                "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(deployment_id,revision,host_id,installation,domain) DO UPDATE SET
+                   step_id=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.step_id ELSE step_id END,
+                   measured_at_ms=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
+                   peak_bytes=MAX(peak_bytes,excluded.peak_bytes)",
+                params![
+                    p.deployment_id,
+                    p.revision,
+                    e.host.name,
+                    installation(&e),
+                    domain,
+                    peak_bytes,
+                    p.step_id,
+                    now_ms
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -680,26 +813,6 @@ impl crate::Store {
             )
             .optional()?
             .flatten())
-    }
-
-    /// Owner decision 2026-09-23: the startup peak recorded for a revision on
-    /// a host and installation, if any.
-    pub fn startup_measurement(
-        &self,
-        deployment_id: &str,
-        revision: i64,
-        host_id: &str,
-    ) -> Result<Option<(String, i64)>, LifecycleError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT installation,peak_bytes FROM startup_measurements
-                  WHERE deployment_id=?1 AND revision=?2 AND host_id=?3
-                  ORDER BY measured_at_ms DESC LIMIT 1",
-                params![deployment_id, revision, host_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
     }
 }
 

@@ -1168,3 +1168,363 @@ async fn status_shows_the_whole_host_a_start_above_the_managed_limit_reserves() 
     .await;
     w.shutdown().await.unwrap();
 }
+
+/// ADR 0019 §3: a host with one 16 GB card (`gpu0`, a device domain) beside
+/// host RAM (`system`), as the engine bindings' discrete fixture states it.
+fn discrete_host(host: &mut serde_json::Value) {
+    host["resource_policy"]["domains"] = serde_json::json!({
+        "system": {"memory": "distinct", "managed_limit": "30GiB", "free_reserve": "12GiB",
+                   "parked_limit": "15GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] =
+        serde_json::json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+}
+
+/// A deployment that states only its card request: its startup peak on the
+/// card is the request (ADR 0019 amendment A1) and on host RAM the engine
+/// host overhead, both placeholders a first run measures.
+fn discrete_deployment(deployment: &mut serde_json::Value) {
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["residency"] = serde_json::json!("restart_only");
+    deployment["engine_config"]["memory"] =
+        serde_json::json!({"request": "12GiB", "kv_cache": "4GiB"});
+}
+
+/// A coordinator store on the discrete host, with that deployment stopped.
+fn discrete_setup() -> (
+    tempfile::TempDir,
+    SharedCoordinatorState,
+    DeploymentFence,
+    Vec<MemoryObservation>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture::fixture_with(|deployment, host| {
+        discrete_deployment(deployment);
+        discrete_host(host);
+    });
+    let fence = fixture::managed_edit(&f, "discrete", |deployment, host| {
+        discrete_deployment(deployment);
+        discrete_host(host);
+    });
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("srv.sqlite3");
+    f.sql
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = Arc::new(Mutex::new(
+        crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+    ));
+    (dir, owner, fence, f.observations.clone())
+}
+
+/// A discrete host whose processes the test scripts. Each observation is
+/// sampled a millisecond after the last, never past the service clock.
+struct ScriptedProcesses {
+    domains: Vec<MemoryObservation>,
+    residents: Mutex<Vec<ProcessResident>>,
+    sampled: AtomicI64,
+}
+impl ScriptedProcesses {
+    fn hold(&self, residents: Vec<ProcessResident>) {
+        *self.residents.lock().unwrap() = residents;
+    }
+    async fn sampled(&self, samples: i64) {
+        let from = self.sampled.load(Ordering::SeqCst);
+        until("the startup sampler to read the scripted processes", || {
+            self.sampled.load(Ordering::SeqCst) >= from + samples
+        })
+        .await;
+    }
+}
+impl ServiceObservation for ScriptedProcesses {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let at = self.sampled.fetch_add(1, Ordering::SeqCst).min(1899);
+        let values = self
+            .domains
+            .iter()
+            .map(|o| MemoryObservation {
+                sampled_at_ms: at,
+                ..o.clone()
+            })
+            .collect();
+        Box::pin(async move { Ok(values) })
+    }
+    fn observe_with_residents(&self, host: String) -> ResidentObservationFuture {
+        let observed = self.observe(host);
+        let residents = self.residents.lock().unwrap().clone();
+        Box::pin(async move { Ok((observed.await?, residents)) })
+    }
+}
+
+/// One process as the host samples it: GPU bytes on the card and resident
+/// pages in host RAM, apart. The Fake engine's processes are pids 71 and 72.
+fn process(pid: u32, device: i64, host: i64) -> ProcessResident {
+    ProcessResident {
+        pid,
+        boot_id: "fake-lifecycle-boot".into(),
+        start_ticks: if pid == 72 { 101 } else { 100 },
+        bytes: device + host,
+        device_bytes: device,
+        host_bytes: host,
+    }
+}
+
+fn on(footprint: &PhaseFootprint, domain: &str) -> i64 {
+    footprint
+        .allocations
+        .iter()
+        .find(|a| a.domain == domain)
+        .unwrap()
+        .bytes
+}
+
+fn deployment_startup(owner: &SharedCoordinatorState, id: &str) -> serde_json::Value {
+    let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+    let status = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    serde_json::to_value(status.startup.as_ref().unwrap()).unwrap()
+}
+
+fn instance_startup(owner: &SharedCoordinatorState, id: &str) -> serde_json::Value {
+    let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+    let status = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    serde_json::to_value(status.instances[0].startup.as_ref().unwrap()).unwrap()
+}
+
+fn recorded_peaks(dir: &tempfile::TempDir, fence: &DeploymentFence) -> Vec<(String, i64)> {
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let rows = sql
+        .prepare(
+            "SELECT domain,peak_bytes FROM startup_measurements
+              WHERE deployment_id=?1 AND revision=?2 ORDER BY domain",
+        )
+        .unwrap()
+        .query_map(
+            rusqlite::params![fence.deployment_id, fence.revision],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows
+}
+
+/// ADR 0019 §3, ADR 0014 amendment A2 (found live on a 16 GB laptop GPU: the
+/// cold phase charged the card and host RAM, so no peak was ever measured):
+/// on a discrete GPU a first start's peak is measured per memory domain from
+/// the launch's own processes, the card from the GPU memory the driver
+/// attributes to them and host RAM from their resident pages. Another
+/// process's memory is not counted. Both are recorded, status says each was
+/// measured, and the next start reserves each domain's measured peak (never
+/// below its steady charge) until Ready, then the steady footprint.
+// T14 T26
+#[tokio::test]
+async fn a_discrete_startup_peak_is_measured_per_memory_domain() {
+    use capyctl_config::effective::ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES as RAM;
+    let (dir, owner, fence, observations) = discrete_setup();
+    let (gate, again) = (Gate::new(false), Gate::new(false));
+    let launches = Arc::new(Mutex::new(vec![again.clone(), gate.clone()]));
+    let host = Arc::new(ScriptedProcesses {
+        domains: observations.clone(),
+        residents: Mutex::new(Vec::new()),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        host.clone(),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+        Arc::new(move |_| match launches.lock().unwrap().pop() {
+            Some(gate) => Ok(test_driver(gate)),
+            None => Err(CoordinatorError::Service("no scripted engine left".into())),
+        }),
+    )
+    .unwrap();
+    let first = w.start(&fence, 60_000).unwrap();
+    gate.entered().await;
+    // The placeholders: on the card the derived startup and the CUDA
+    // context, in host RAM the engine host overhead.
+    let cold = footprint(&owner, &fence.deployment_id).unwrap();
+    assert_eq!(cold.phase, ResourcePhase::Cold);
+    let estimate = on(&cold, "gpu0");
+    assert!(estimate > 14 * GIB, "{estimate}");
+    assert_eq!(on(&cold, "system"), RAM);
+    let placeholder = instance_startup(&owner, &fence.deployment_id);
+    assert_eq!(placeholder["device_provenance"], "default", "{placeholder}");
+    assert_eq!(placeholder["host_provenance"], "default", "{placeholder}");
+    // Loading: the engine's two processes hold 14 GiB of the card and 7 GiB
+    // of host RAM at most; a foreign process holds more of both throughout.
+    let foreign = process(99, GIB, 20 * GIB);
+    host.hold(vec![
+        process(71, 10 * GIB, 3 * GIB),
+        process(72, 4 * GIB, 4 * GIB),
+        foreign.clone(),
+    ]);
+    host.sampled(5).await;
+    host.hold(vec![
+        process(71, 9 * GIB, 2 * GIB),
+        process(72, 4 * GIB, GIB),
+        foreign,
+    ]);
+    host.sampled(5).await;
+    gate.release.add_permits(1);
+    assert_eq!(
+        first.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    until("both measured peaks", || {
+        recorded_peaks(&dir, &fence).len() == 2
+    })
+    .await;
+    assert_eq!(
+        recorded_peaks(&dir, &fence),
+        vec![("gpu0".into(), 14 * GIB), ("system".into(), 7 * GIB)]
+    );
+    let ready = footprint(&owner, &fence.deployment_id).unwrap();
+    assert_eq!(ready.phase, ResourcePhase::Ready);
+    let steady = on(&ready, "gpu0");
+    assert!(steady < 14 * GIB, "{steady}");
+    let shown = deployment_startup(&owner, &fence.deployment_id);
+    assert_eq!(shown["provenance"], "measured", "{shown}");
+    assert_eq!(shown["device_provenance"], "measured", "{shown}");
+    assert_eq!(shown["host_provenance"], "measured", "{shown}");
+    assert_eq!(shown["device_bytes"], 14 * GIB, "{shown}");
+    assert_eq!(shown["host_bytes"], 7 * GIB, "{shown}");
+    assert_eq!(shown["bytes"], 21 * GIB, "{shown}");
+    assert_eq!(shown["measured"][0]["domain"], "gpu0", "{shown}");
+    assert_eq!(shown["measured"][1]["domain"], "system", "{shown}");
+
+    // The next start reserves each measured peak until Ready.
+    let stop = w.stop("owner", &fence, "stop-discrete", 60_000).unwrap();
+    assert_eq!(
+        stop.wait(Duration::from_secs(10)).await.unwrap(),
+        OrdinaryCleanupStatus::Completed
+    );
+    w.commands()
+        .start(
+            "owner",
+            &fence.deployment_id,
+            fence.revision,
+            "start-discrete-again",
+            60_000,
+        )
+        .unwrap();
+    again.entered().await;
+    let cold = footprint(&owner, &fence.deployment_id).unwrap();
+    assert_eq!(cold.phase, ResourcePhase::Cold);
+    assert_eq!(on(&cold, "gpu0"), 14 * GIB);
+    assert_eq!(on(&cold, "system"), 7 * GIB);
+    let reserved = instance_startup(&owner, &fence.deployment_id);
+    assert_eq!(reserved, {
+        let mut shown = shown.clone();
+        shown.as_object_mut().unwrap().remove("measured");
+        shown
+    });
+    again.release.add_permits(1);
+    until("the second start to reach Ready", || {
+        footprint(&owner, &fence.deployment_id)
+            .is_some_and(|held| held.phase == ResourcePhase::Ready)
+    })
+    .await;
+    let ready = footprint(&owner, &fence.deployment_id).unwrap();
+    assert_eq!(on(&ready, "gpu0"), steady);
+    assert_eq!(on(&ready, "system"), RAM);
+    w.shutdown().await.unwrap();
+}
+
+/// ADR 0019 §3: a domain is replaced only once it is measured. A host whose
+/// reporter does not split a process's memory (no card figure) measures host
+/// RAM only: the card keeps its placeholder and says so, and a host RAM peak
+/// below the steady charge there is reserved at the steady charge.
+// T14 T26
+#[tokio::test]
+async fn a_discrete_domain_keeps_its_estimate_until_it_is_measured() {
+    use capyctl_config::effective::ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES as RAM;
+    let (dir, owner, fence, observations) = discrete_setup();
+    let (gate, again) = (Gate::new(false), Gate::new(false));
+    let launches = Arc::new(Mutex::new(vec![again.clone(), gate.clone()]));
+    let host = Arc::new(ScriptedProcesses {
+        domains: observations.clone(),
+        residents: Mutex::new(Vec::new()),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        host.clone(),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+        Arc::new(move |_| match launches.lock().unwrap().pop() {
+            Some(gate) => Ok(test_driver(gate)),
+            None => Err(CoordinatorError::Service("no scripted engine left".into())),
+        }),
+    )
+    .unwrap();
+    let first = w.start(&fence, 60_000).unwrap();
+    gate.entered().await;
+    let estimate = on(&footprint(&owner, &fence.deployment_id).unwrap(), "gpu0");
+    host.hold(vec![process(71, 0, 3 * GIB)]);
+    host.sampled(5).await;
+    gate.release.add_permits(1);
+    assert_eq!(
+        first.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    until("the host RAM peak", || {
+        !recorded_peaks(&dir, &fence).is_empty()
+    })
+    .await;
+    assert_eq!(
+        recorded_peaks(&dir, &fence),
+        vec![("system".into(), 3 * GIB)]
+    );
+    let shown = deployment_startup(&owner, &fence.deployment_id);
+    assert_eq!(shown["device_provenance"], "default", "{shown}");
+    assert_eq!(shown["host_provenance"], "measured", "{shown}");
+    assert_eq!(
+        shown["provenance"], "default",
+        "the card's, shown first: {shown}"
+    );
+    assert_eq!(shown["device_bytes"], estimate, "{shown}");
+    assert_eq!(
+        shown["host_bytes"], RAM,
+        "never below the steady charge: {shown}"
+    );
+
+    let stop = w.stop("owner", &fence, "stop-partial", 60_000).unwrap();
+    assert_eq!(
+        stop.wait(Duration::from_secs(10)).await.unwrap(),
+        OrdinaryCleanupStatus::Completed
+    );
+    w.commands()
+        .start(
+            "owner",
+            &fence.deployment_id,
+            fence.revision,
+            "start-partial-again",
+            60_000,
+        )
+        .unwrap();
+    again.entered().await;
+    let cold = footprint(&owner, &fence.deployment_id).unwrap();
+    assert_eq!(on(&cold, "gpu0"), estimate);
+    assert_eq!(on(&cold, "system"), RAM);
+    let reserved = instance_startup(&owner, &fence.deployment_id);
+    assert_eq!(reserved["device_provenance"], "default", "{reserved}");
+    assert_eq!(reserved["host_provenance"], "measured", "{reserved}");
+    again.release.add_permits(1);
+    until("the second start to reach Ready", || {
+        footprint(&owner, &fence.deployment_id)
+            .is_some_and(|held| held.phase == ResourcePhase::Ready)
+    })
+    .await;
+    w.shutdown().await.unwrap();
+}

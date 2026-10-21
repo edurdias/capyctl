@@ -464,6 +464,9 @@ impl EngineAdapter for RemoteEngine {
         if plan.startup_bytes.is_some() {
             needs.push(capabilities::STARTUP_BYTES);
         }
+        if plan.startup_host_bytes.is_some() {
+            needs.push(capabilities::STARTUP_HOST_BYTES);
+        }
         if plan.checkpoint_state_slot_bytes.is_some() {
             needs.push(capabilities::CHECKPOINT_STATE_SLOT);
         }
@@ -1131,6 +1134,16 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             .recorded_checkpoint(&work.fence().deployment_id, work.fence().revision)
             .map_err(|_| denied())?
             .unwrap_or_default();
+        let reservation = work.startup_reservation();
+        let measured = capyctl_config::effective::StartupProvenance::Measured;
+        let (startup_bytes, startup_host_bytes) = match &reservation.split {
+            Some(split)
+                if split.device_provenance == measured || split.host_provenance == measured =>
+            {
+                (split.device_bytes, Some(split.host_bytes))
+            }
+            _ => (reservation.bytes, None),
+        };
         let plan = SingleLaunchPlan {
             // ADR 0014 §5: the host resolves with the facts this revision was
             // frozen with, so both sides derive the same memory request: the
@@ -1159,8 +1172,11 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 .memory()
                 .gguf
                 .map(|recorded| recorded.facts),
-            // Owner decision 2026-09-23: the peak this launch reserved.
-            startup_bytes: Some(work.startup_reservation().bytes),
+            // Owner decision 2026-09-23: the peak this launch reserved. ADR
+            // 0019 §3: on a discrete GPU measured per domain, the card's and
+            // host RAM's apart, so the host charges each where it belongs.
+            startup_bytes: Some(startup_bytes),
+            startup_host_bytes,
             checkpoint_digest,
             deployment_config: local.to_string(),
             profile_name,
@@ -1426,6 +1442,7 @@ mod tests {
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
                 startup_bytes: None,
+                startup_host_bytes: None,
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,

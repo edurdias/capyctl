@@ -267,9 +267,14 @@ INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
 
 `STARTUP` is the memory CapyCTL set aside to start the model. On a discrete GPU
 it is the card's memory, with the host RAM the engine process takes beside it.
-Before a first start has measured it, a model whose estimated startup peak is
-above the machine's managed limit shows that limit: its first start runs alone
-on the machine and sets aside all of it (`--json` names this `whole_host`).
+A first start measures the peak (on a discrete GPU the card and host RAM
+apart) and later starts set that aside instead of the estimate; `--json` says
+where each figure came from (`startup.provenance`, and on a discrete GPU
+`startup.device_provenance` and `startup.host_provenance`: `measured`, or
+`default` for the estimate). Before a first start has measured it, a model
+whose estimated startup peak is above the machine's managed limit shows that
+limit: its first start runs alone on the machine and sets aside all of it
+(`--json` names this `whole_host`).
 When a start fails, `LAST OPERATION` says so and the instance's `LAST ERROR`
 gives the reason:
 

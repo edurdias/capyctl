@@ -296,6 +296,7 @@ fn launch() -> MemberAction {
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: Some(2 << 30),
+        startup_host_bytes: None,
     })
 }
 

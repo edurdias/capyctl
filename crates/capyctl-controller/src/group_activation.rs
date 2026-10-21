@@ -1106,6 +1106,7 @@ fn launch_commands(
                 // ADR 0029 §1: llama.cpp runs no groups.
                 checkpoint_gguf: None,
                 startup_bytes: None,
+                startup_host_bytes: None,
             };
             let command_id = if head {
                 work.step_id().to_owned()

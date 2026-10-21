@@ -94,6 +94,12 @@ struct Plan {
     /// the revision was frozen, not a measured peak. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     estimated: bool,
+    /// ADR 0019 §3: on a discrete GPU, the measured startup peak this start
+    /// reserves on each measured domain (the card, host RAM), frozen when it
+    /// was accepted; a domain absent keeps the revision's cold charge there.
+    /// Absent when empty, so earlier plans keep their exact encoding.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    startup_domains: std::collections::BTreeMap<String, i64>,
 }
 fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -1005,6 +1011,7 @@ impl crate::Store {
         )?;
         let startup::FrozenStartup {
             bytes: startup_bytes,
+            domains: startup_domains,
             whole_host,
             estimated,
         } = startup::frozen_plan_startup(tx, &f.deployment_id, f.revision, &e)?;
@@ -1028,6 +1035,7 @@ impl crate::Store {
             startup_bytes,
             whole_host,
             estimated,
+            startup_domains,
         };
         tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'initialize','pending')",params![operation_id,f.deployment_id])?;
         crate::lifecycle::insert_initialize_run(tx, s, f, &operation_id, deadline)?;

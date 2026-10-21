@@ -1083,6 +1083,38 @@ CREATE INDEX IF NOT EXISTS journal_entries_operation ON journal_entries(operatio
 pub const SCHEMA_V51: &str =
     "-- cancellations the engine answered (request_lease_cancellations::migrate_v51)";
 
+/// v52 (ADR 0019 §3, ADR 0014 amendment A2): a startup peak is recorded per
+/// memory domain, so a discrete GPU's card and host RAM are measured apart.
+/// SQLite cannot change a primary key, so the table is rebuilt. Every peak
+/// recorded before was measured on a revision whose cold phase is one
+/// allocation, so each keeps that allocation's domain, read from the frozen
+/// revision it was measured for; one whose revision is no longer stored is
+/// read by nothing and is not carried over. Forward-only.
+pub const SCHEMA_V52: &str = r#"
+CREATE TABLE startup_measurements_v52(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  installation TEXT NOT NULL,
+  domain TEXT NOT NULL CHECK(domain<>''),
+  peak_bytes INTEGER NOT NULL CHECK(peak_bytes>0),
+  step_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,installation,domain)
+);
+INSERT INTO startup_measurements_v52(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms)
+  SELECT m.deployment_id,m.revision,m.host_id,m.installation,
+         json_extract(e.effective_json,'$.resources.cold.allocations[0].domain'),
+         m.peak_bytes,m.step_id,m.measured_at_ms
+    FROM startup_measurements m JOIN effective_revisions e
+      ON e.deployment_id=m.deployment_id AND e.revision=m.revision
+   WHERE json_valid(e.effective_json)
+     AND json_type(e.effective_json,'$.resources.cold.allocations[0].domain')='text'
+     AND json_extract(e.effective_json,'$.resources.cold.allocations[0].domain')<>'';
+DROP TABLE startup_measurements;
+ALTER TABLE startup_measurements_v52 RENAME TO startup_measurements;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
