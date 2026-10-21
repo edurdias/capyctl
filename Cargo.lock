@@ -296,7 +296,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "capyctl-adapters"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-agent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-config"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "capyctl-domain",
  "hex",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-controller"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-domain"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "proptest",
  "serde",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-launchers"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "capyctl-adapters",
  "capyctl-config",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-management"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "capyctl-adapters",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "capyctl-config",
  "capyctl-domain",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-router"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-scheduler"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "capyctl-domain",
  "proptest",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "capyctl-config",
  "capyctl-domain",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-testkit"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "capyctl-adapters",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "capyctl-adapters",

@@ -1,5 +1,637 @@
 # Current implementation and launch status
 
+## The exact decision readiness request — 2026-10-21 (branch `docs/decision-probe-text`)
+
+Docs only. ADR 0030 §3 now publishes the exact v1 readiness request of a
+decisions deployment (kind `decision`, version `1`), copied from
+`crates/capyctl-adapters/src/decision_probe.rs`: the JSON body with `model`
+as the engine's served name, the readiness rule (every option present and no
+other, finite probabilities in [0, 1], sum within 1e-3, the pick one of the
+options; a well-formed answer, not the correct choice), and the rule that any
+change to the request is a new version. The deploy guide gains "The readiness
+question" with the same JSON. No code or tests change; CPU and Fake-engine
+tests are not qualification, and no live check is needed.
+
+## Custom engines (ADR 0031) — 2026-10-21 (branch `feat/custom-engines`)
+
+Implements [ADR 0031](../design/adr/0031-custom-engines.md) (owner decisions of
+2026-10-20) with its amendment A1 (owner decision 2026-10-21), for 0.1.6. A
+fifth engine kind, `custom`, runs a program CapyCTL has no integration for from a
+host-approved manifest: `capyctl engine add --custom <executable> --name <profile>
+--manifest <file>` executes nothing, validates the manifest (closed, at most 64
+KiB; `api` `chat` or `decisions`; `args` with the placeholders `{host}`, `{port}`,
+`{model_dir}` and optionally `{served_name}`, `{context_length}`, `{api_key}`;
+optional `version`, `environment`, `env`, `health`, `idle`), prints what will run
+and asks for confirmation on a terminal, or needs `--yes` (`not_interactive`
+otherwise; a refusal at the prompt is `declined`, nothing written). The manifest
+is copied into the profile with its digest, which is part of the recipe
+fingerprint. The installation digest covers the executable and, for one in a
+virtual environment, the whole environment with its interpreter, or the
+manifest's `environment` root; drift warns unless `installation_drift: refuse`.
+Resolution makes a custom engine a custom/fixed recipe: `resources` required,
+`restart_only` (`capability_missing:deep_park`), no `topology`
+(`group_shape_unsupported:custom`), `api` equal to the manifest's
+(`capability_missing:decisions` / `capability_missing:chat`), every
+`engine_config` field but `context_length` and `env` refused
+`custom_field_unsupported:<field>`, and `{context_length}` without a declared one
+refused `custom_placeholder_unset:context_length`. The launch renders each
+placeholder into one argument without a shell, in a closed environment where the
+manifest's `env` is the lowest layer; readiness is the port, the optional
+`health` path, then the API's existing probe; after it the host lists the
+launch's TCP listeners and stops a launch listening off loopback
+(`custom_listener_exposed`). Without an idle signal, a request left cancelling by
+a hang-up, a deadline cut or an engine error settles only on the instance's
+verified exit at the next stop or restart, drains do not wait for it, and its
+charge and the instance's reservation are kept until then; status shows each
+instance's cancelling count and how it settles (`requests.cancelling`,
+`requests.cancelling_settles`), and `engine list` gains `IDLE SIGNAL` and
+`ENGINE KEY`. Placement needs the new host capability `custom_engines`
+(`host_capability_missing:custom_engines`). New CLI exit 27,
+`custom_manifest_invalid`.
+
+Amendment A1: 0.1.5 reads `engines.yaml` strictly against a closed profile shape
+and would refuse the whole file over a copied manifest, so custom engine profiles
+live in `custom-engines.yaml` beside `engines.yaml` (same revision header, lock
+and atomic write; document kind `custom_engines`). `engines.yaml` keeps 0.1.5's
+shape and refuses `engine: custom`; a profile name is unique across both files
+and the role document (`profile_exists`). A downgrade below 0.1.6 ignores
+`custom-engines.yaml` and loses the custom engines; every other engine keeps
+working. For a decisions deployment, ADR 0030's document check refuses a
+`topology` or a parking residency before the profile is known, so those two
+refusals carry ADR 0030's wording there; a chat deployment gets ADR 0031's codes.
+
+Review fixes (PR #166 review, 784366a5): (1) the standalone role keyed its
+installations by executable and `environment` only, so a built-in and a custom
+profile on one executable shared one measurement and the second was
+drift-checked against the first's; installations are now keyed by engine too
+(and, for a custom engine, its root and pinned digest). (2) `engine add` and
+`engine add --custom` locked their own file, so two concurrent adds of one name
+could both write; both files now share one lock (`engines.yaml.lock`), taken
+before either is loaded, and the size bound is checked on both under it. (3) A
+remote host whose profile set no longer held a launch's approved document read
+its idle signal from the current profiles, so after a remove and re-add a
+running instance could be sampled with another manifest; the signal now travels
+with the launch, and without it the launch's idleness is unknown (no load
+figures, cancelling requests settle only at the verified stop, and the stop
+gate waits its bound). (4) A remote host's ingress forwarding and idle reads
+sent the engine key to a custom engine whose manifest does not use
+`{api_key}`; they no longer do. (5) A hand-written custom profile without
+`security.credential_ref` validated and then failed every start with a generic
+conflict; resolution now refuses it `custom_credential_ref_missing`. (6) The
+installation digest shown at the confirmation was not saved, so the role took
+whatever it measured at its next start as the baseline; it is now saved as
+`custom.installation_digest`, and a different measurement at registration is
+drift, never adopted. (7) A deployment's served name such as
+`--log-decisions=/tmp/x` reached the engine as an option when the manifest
+placed `{served_name}` as an argument; a served name or model path that starts
+with `-` or holds a control character is refused `custom_value_invalid:<name>`
+at resolution and again at launch. Amendment A1 records each of them.
+
+SPEC amendments landed with the implementation: §8.2 (a custom engine is a
+custom/fixed recipe whose flags CapyCTL does not validate), §9.4 (custom engines
+as a later backend), §10 (the settlement of `cancelling` requests on an engine
+with no idle signal, and the `idle` signal), §15.1 (the second engines file), §20
+(T44, live rows CE1–CE4) and §21. Guide: [Custom engines](../guide/engines.md#custom-engines),
+with the basal-serve 2.2.0 example and its 422 caveat; settings:
+[Custom engines](../operations/configuration.md#custom-engines); the new codes in
+[Exit codes and errors](../guide/errors.md).
+
+Tests: tagged T44 (and T13, T14, T17, T37, T43 where they apply), in
+`crates/capyctl-config/src/custom.rs` and `crates/capyctl-config/tests/custom_engines.rs`
+(manifest validation, placeholders, digests, profile files, resolution
+refusals), `crates/capyctl-adapters/src/custom/` (rendering), the CLI
+(`crates/capyctl-cli/tests/errors.rs`: codes and exits), the controller's
+installation gate and version-skew capability tests, and the store's cancelling
+settlement (`crates/capyctl-store/src/ordinary_lifecycle/park_cancelling_tests.rs`).
+The review fixes add, by finding: (1)
+`a_builtin_and_a_custom_profile_on_one_executable_are_two_installations` and
+`embedded_installations_are_keyed_by_executable_and_engine`
+(`installation_gate.rs`); (2)
+`a_normal_and_a_custom_add_of_one_name_serialize_on_one_lock` and
+`the_size_bound_counts_both_engines_files` (`tests/custom_engines.rs`); (3)
+`a_republished_profile_never_supplies_a_running_launch_idle_signal`
+(`native_execution.rs`) and an unknown launch in
+`a_custom_launch_reads_quiescent_only_on_its_idle_signal` (agent `tests/load.rs`);
+(4) `the_native_key_reaches_only_an_engine_that_takes_it` (agent
+`tests/ingress.rs`, recording fake engines); (5)
+`a_custom_profile_without_a_credential_reference_is_refused`; (6)
+`a_profile_block_carries_its_pinned_installation_digest` (`custom.rs`),
+`a_pinned_installation_digest_is_the_baseline_and_never_adopted`
+(`installation.rs`), `a_pinned_installation_digest_is_the_embedded_baseline`,
+`a_pinned_drift_is_journaled_once_at_publication` (`agent_sessions.rs`) and
+the pinned digest in `tests/engine_custom.rs`; (7)
+`a_value_that_reads_as_an_option_is_refused`,
+`a_dash_leading_or_control_value_is_refused_at_render` and
+`a_dash_leading_deployment_value_refuses_the_launch` (`custom/args.rs`). CPU and
+Fake-engine tests are not qualification.
+
+Live qualification, host A (GB10), basal 2.2.0 in `~/basal-2.2.0-venv` (torch
+2.11.0 cu130, `basal[media]`) and basal-2.0-4.5B at revision e5ba914, through
+`capyctl start standalone` (ports 38443/37443, isolated state and config):
+CE1 passed on 2026-10-21: `engine add --custom` without a terminal and without
+`--yes` was refused `not_interactive` (exit 23) with nothing written; a "n" at
+the terminal prompt was `declined` (exit 2) with nothing written; `--yes` and a
+"y" wrote `custom-engines.yaml` (revision 1, manifest and digest) and left
+`engines.yaml` absent; the pinned root was the whole virtual environment with
+its external interpreter (23,021 files, 4.87 GB); `engine list` showed `CUSTOM
+yes`, `IDLE SIGNAL none`, `ENGINE KEY none`. The run found one listing bug (a
+second custom profile on the same root showed the first one's version), fixed
+here.
+
+Drift launch passed: after a file under a scratch `environment` root changed,
+the profile registered with `--drift refuse` was refused `installation_drift`
+before any effect, and the `warn` one launched (basal `--mode eager`, ready in
+about 60 s) with `installation_drift_flagged` journaled and the host's profile
+shown `drifted`. CE2 passed: `basal-20` (`--mode fast --template-prefix off`,
+`resources: {gpu: 24GiB, ram: 8GiB}`, `timeouts.initialize: 30m`) became ready
+on the fixed decision in 703 s with a warm compile cache; the engine's only
+listener was 127.0.0.1:38500; a decision through the router answered in 67 ms;
+a manifest binding `--host 0.0.0.0` failed `custom_listener_exposed: an owned
+process listens on 0.0.0.0:38500, not on loopback; the engine was stopped`,
+with no listener and no process left. CE4 passed: after an operator stop
+(verified exit, `ordinary_cleanup_completed`) `start deployment basal-20 --wait`
+was ready again in 691 s through the decision probe, and its first decision gave
+the same probabilities as before the restart (0.9638675 for `technical`).
+
+CE3 is not demonstrated on basal. A client that hangs up on `POST /v1/systemone`
+does not make the request `cancelling`: a collected answer is still completed
+when the engine answers (the hung-up request's lease closed completed, status
+showed `cancelling: 0` before and after; basal kept computing it, so the next
+request waited 9.6 s). A deadline cut cannot be produced on basal either: a
+deployment's `request_deadline` must be at least its `timeouts.initialize`, and
+basal's start takes 11 to 14 minutes.
+
+CE3 passed on 2026-10-21 on a chat custom engine: llama-server from the
+approved llama.cpp v0.7.0 build, added with a manifest of `api: chat` and no
+`idle` (`-m "{model_dir}/Qwen3-4B-Q4_K_M.gguf" --host "{host}" --port "{port}"
+-c 4096 --alias "{served_name}"`), deployment `resources: {gpu: 8GiB, ram:
+4GiB}` on the Qwen3-4B GGUF directory, ready in under 20 s. A streamed chat
+request (`stream: true`, `max_tokens: 3000`) cut by the client after 3 s
+(53 KB received) left `instances[].requests` at `{cancelling: "1",
+cancelling_settles: "stop"}` (0 before), and the text status read `cancelling:
+1 (settles at the next stop or restart: the engine reports no idle signal)`.
+`capyctl stop deployment` returned in 0.05 s without waiting on it; 3 s later
+the deployment was `stopped` with `cancelling: 0`, no llama-server left, and the
+journal held `request_cancellation_acknowledged` (count 1, receipt: no idle
+signal, the stop operation's cleanup step verified the exit of the process
+group) beside that operation's `ordinary_cleanup_completed`.
+
+CE3 passed again on 2026-10-21 with the review fixes (working tree on
+784366a5, release build, host A, the same llama-server manifest and
+deployment): `engine add --custom --yes` wrote `custom.installation_digest`
+equal to the digest its summary showed, and the role registered the engine
+`measured` at that digest; the deployment was ready in 7 s; a streamed
+request cut by the client after 3 s (55 KB received) moved
+`instances[].requests` from `{cancelling: "0", cancelling_settles: "stop"}` to
+`{cancelling: "1", ...}`; `stop deployment` returned in 0.04 s; 3 s later the
+deployment was `stopped` with `cancelling: "0"` and no llama-server left, and
+the journal held `request_cancellation_acknowledged` (count 1, receipt: no
+idle signal, the stop's cleanup step verified the exit of the process group)
+beside that operation's `ordinary_cleanup_completed`. A deployment on it with
+`routes: ["--log-file=/tmp/x"]` was refused
+`custom_value_invalid:served_name` (exit 2). Fixes (3) and (4) change only a
+remote host's sampling and forwarding; CE3 runs standalone, whose load
+sampling and quiescence path they leave as they were.
+
+Deep gate (`scripts/ci-local.sh --deep --only workspace`, host A, branch head
+3a99062a): 3436 passed, 3 failed, 1 ignored over 244 test binaries. The three
+failures are `a_role_warns_when_its_limits_exceed_the_memory_available`
+(`admission_figures`), `standalone_memory_limits_follow_the_document_and_its_overrides`
+and `standalone_parked_limit_follows_the_document_and_its_overrides`
+(`switching_cli`); they fail the same way on `main` (169081b9) on the same
+host, so they are host-specific, not regressions: their assertions depend on
+the host's free memory, and host A had 10.0 GiB of its 32 GiB unified pool
+available, less than its 16 GiB limit plus 6.4 GiB reserve
+(`admission_figures.rs:165`, `switching_cli.rs:336` and `:422`).
+
+With the review fixes, on the laptop: `scripts/ci-local.sh` passed every step
+(fmt, name, clippy, unit, runtime, shellcheck, installer, changes), and
+`scripts/ci-local.sh --deep --only workspace` gave 3445 passed, 7 failed, 1
+ignored over 244 test binaries. The 7 are the standalone launches of
+`engine_exit` (2) and `role_shutdown` (5), refused
+`insufficient_device_memory` because another program held 14 of the laptop
+GPU's 16 GiB (1.9 GiB available against 8.7 GiB needed). Both binaries passed
+in full on host A in a git-initialised archive of the same tree (3 and 25
+passed).
+
+basal's `--mode fp8` needs torchao, which the approved environment does not
+have; `--mode fast` (bf16, compiled) served a decision directly in 69 ms after
+an 843 s cold start (683 s with a warm compile cache), so deployments on it
+state `timeouts.initialize`.
+
+## Containers run live on a GB10 — 2026-10-20 (branch `docs/container-qualification`)
+
+Live qualification of a standalone role running as the main process of a
+container on host A (GB10, unified memory, CUDA 13.0, Docker 29 with CDI),
+built from `main` at `fdbca583`. Documentation only: no code changed.
+
+The container: `docker run --init --device nvidia.com/gpu=all --cap-drop ALL
+--security-opt no-new-privileges --user 1000:1000 --shm-size 16g`, the
+container's own `/proc` and cgroup namespace, ports 38443 and 37443 published
+to the host's loopback only, the `capyctl` binary, llama.cpp v0.7.0, SGLang
+0.5.22, vLLM 0.31.0, CUDA, the `uv` interpreter directory and the models
+bind-mounted read-only at their host paths, a fresh writable state directory,
+managed limit 108 GiB. The image is `ubuntu:24.04` plus `python3`, `gcc`,
+`g++` and a loader cache entry for the CUDA libraries.
+
+Results:
+
+- Julia-1 (llama.cpp, `api: decisions`, resources 1 GiB + 1 GiB, context
+  8192, batch and ubatch 8192): cold start 3 s, decision HTTP 200, stop 2 s,
+  `startup.measured` peak 1197170688 bytes.
+- Qwen3-4B on SGLang 0.5.22 (deep park): cold start 148 s, chat collected
+  (`323`) and streamed (16 data lines) HTTP 200, park 2 s, wake through a
+  request 59 s, stop 6 s; `startup.measured` peak 22354280448 bytes,
+  `parked.measured` 6970511360 bytes.
+- Qwen3-4B on vLLM 0.31.0 (deep park, KV cache 4 GiB): cold start 152 s, chat
+  collected and streamed (14 data lines) HTTP 200, park 2 s, wake through a
+  request 9 s, stop 2 s; `startup.measured` peak 21130612736 bytes,
+  `parked.measured` 3953291264 bytes.
+- Per-process GPU memory (ADR 0007, ADR 0019): `nvidia-smi
+  --query-compute-apps` inside the container reports the container's PIDs,
+  equal to the container's `/proc` (host 3226640 → container 780 per
+  `NSpid`, 14873 MiB in both readings; vLLM host 3228849 → 2066, 13081 MiB
+  ready, 1139 MiB parked). The measured startup peaks and parked charges come
+  from those readings, so attribution works without a translation and no fix
+  was needed.
+- Memory limits: without `--memory` the role reported `meminfo` (cgroup `/`,
+  `memory.max` `max`); with `--memory 100g` it reported `cgroup_v2:/`,
+  capacity 102400 MiB.
+- Found and documented: llama.cpp and SGLang need the CUDA libraries in the
+  image's loader cache (the version check runs with a cleared environment),
+  vLLM and SGLang need `g++` for FlashInfer's first-start compile, and `uv`
+  environments need the `uv` interpreter directory mounted.
+- Nothing left running: `docker ps` empty, no engine processes.
+
+CPU and Fake-engine tests are not qualification; this entry records a live
+run. Still not run live in a container: a discrete GPU, Podman, and a host
+role joined to a server.
+
+## Group launch tests clean up their processes and directories — 2026-10-20 (branch `fix/group-launch-test-cleanup`)
+
+Found on the development laptop on 2026-10-20: four `capyctl-group-launch-*`
+fixture directories from 2026-10-09 in the home directory, and two fake SGLang
+engine processes (`runtime/sglang_entry.py`) from them, running for 11 days.
+They came from `crates/capyctl-agent/tests/group_launch.rs`. The fake engine's
+leader watched its parent, but the children it forked watched only the fixture
+directory. A test that is interrupted or killed runs no `Drop`, so its
+directory stays, and children whose leader had already died ran on. On a
+panic, the cleanup terminated only the launches the host's journal still
+claimed.
+
+The fix is in that test file only (SPEC §13.2: the cleanup is of the test's
+own process groups, found by the fixture path on their command lines):
+
+- **The fixture guard.** The host's fixture directory is now owned by a guard
+  whose drop runs when a test passes, fails an assertion or panics. It kills
+  every process whose command line names a path inside the fixture, each with
+  its whole process group (never the test's own group), waits until none is
+  left, then removes the directory, retrying while the host's threads may
+  still write into it. It replaces the journal-based cleanup.
+- **Children die with the test.** Every process of the fake engine's tree (the
+  leader, the child it forks at once and its late children) watches the test
+  process that spawned it, by pid and start time, and the fixture directory,
+  and kills its process group once either is gone. `PR_SET_PDEATHSIG` fires
+  when the spawning thread exits, and the agent starts engines from tokio's
+  blocking pool (`journal.execute` under `spawn_blocking`), whose threads exit
+  when idle, so it cannot be used for the engines; the new interruption test
+  uses it, as the CLI tests' `Guarded` does, for the child test process it
+  starts.
+- The fixture stays under the home directory, because the owner-only checks of
+  the runtime directory and the host's private state (SPEC §13.3) refuse a
+  shared `/tmp` ancestor. The other tests that create temporary directories
+  under the home directory remove them on drop and were not changed.
+
+Tests (T12): `an_interrupted_test_leaves_no_engine_process_behind` runs the
+test binary again as a test whose SGLang worker's leader died and left its
+children, kills it with SIGKILL, and requires every process of the tree to end
+by itself. With the old fake engine it failed (three processes of the killed
+test's tree still running after 10 s); it passes now.
+`a_failed_test_leaves_no_engine_process_or_directory_behind` panics while it
+owns such a host and requires no fixture process and no fixture directory
+afterwards; it passed before as well and guards the new cleanup. Checked by
+hand with the whole `group_launch` binary (four test threads) interrupted after
+12 s with SIGINT, SIGTERM and SIGKILL: each time 8 fixture processes were
+running, none 3 s after the signal. The four fixture directories of an
+interrupted run remain, since no `Drop` runs on a signal death, but nothing
+runs in them.
+
+CPU and Fake-engine tests are not qualification. No live check is needed: the
+change is to a test file only.
+
+## Guide: driving CapyCTL from a controller — 2026-10-20 (branch `docs/controller-guide`)
+
+Documentation only; no code changes. Owner decision of 2026-10-20: an outside
+controller is one more user of the existing management API (SPEC §14: the API
+is the source of semantics for the CLI and integrations), with no special
+mode, and requests still start and wake models unless
+`lifecycle.activation: explicit` is set (SPEC §6.5, §10). Idempotency keys and
+revision preconditions are SPEC §6.4's. The new guide page,
+`docs/guide/controller.md`, describes that use: the admin token and the
+loopback base path; the loop of reading `GET /management/v1/snapshot` (what
+each field a controller needs means, and how an instance's `observed_state`
+maps to what is running), creating with `POST /management/v1/deployments`
+(`activate: false`, then a start; `activate: true` is answered `503
+unsupported_capability`), replacing with `PUT /management/v1/deployments/{id}`
+and `expected_revision`, and acting with
+`POST /management/v1/deployments/{id}/actions` (`start`, `stop`, `park`,
+`preinitialize`, `delete`, with `deadline_ms` an absolute Unix time taken from
+the snapshot's `timeouts`); following `GET /management/v1/events` from the
+snapshot's cursor; `Idempotency-Key` retries (same key and body replays the
+first answer, a different body is `409 idempotency_conflict`, a refused change
+does not use up its key); `409 revision_conflict` on a stale revision; request
+IDs, which belong to the inference endpoint while the management API
+correlates by key and `operation_id`; which codes to retry, fix or stop on, by
+`retryable`; `lifecycle.activation: explicit`, `max_pending_per_deployment: 0`
+and `--no-inference-auth` for a controller that decides everything; and a
+worked `curl` and `jq` script. The page is linked from the guide index,
+`docs/README.md` and the site's Tasks sidebar (`site/scripts/pages.mjs`,
+`site/astro.config.mjs`).
+
+Every request and answer shown was taken from the handlers in
+`crates/capyctl-management/src` and checked against a local
+`capyctl start standalone` built from `main` (`fdbca58`) with the site's
+stand-in engine (`site/scripts/transcript/fake-vllm.py`), which loads nothing:
+create, replay and conflicting replay, `activate: true`, an unpinned `hf:`
+reference and a `~/` path, `route_conflict`, stale and current revisions,
+start (with `checkpoint_digest_pending` and its retry), stop, park,
+preinitialize, delete before and after the stop, `runtime_retained`,
+deadlines out of range, a string revision, the event stream and its cursor,
+`deployment_stopped` and `deployment_inactive` on the inference endpoint, and
+the worked script end to end, whose output the page shows. CPU and Fake-engine
+runs are not qualification; no native engine was run for this page, and none
+is needed for a documentation change.
+
+## Request IDs and decision metrics — 2026-10-20 (branch `feat/request-ids`)
+
+Owner decisions of 2026-10-19, recorded as two SPEC §10 notes and an amendment
+entry. A request to `/v1/chat/completions` or `/v1/systemone` may carry the
+caller's own `X-Request-Id`: 1 to 128 bytes of printable ASCII with no space or
+control character, refused `400 invalid_request` naming the header after
+authentication and before the body is read. A well-formed one is echoed on the
+answer, success or error, a stream's response headers included. CapyCTL consumes
+it: the router never sends it to a host's ingress or an engine (the ingress
+rebuilds every upstream header, which a test now pins for both request IDs), it
+goes only into the router's role logs for the request, and it is never written
+to the ledger or an event. Every answer of both endpoints carries
+`X-CapyCTL-Request-Id`, the ID of the request's first granted lease, or a fresh
+ULID when the request was refused before any lease. The router's
+`router_selection` and `router_failover` lines carry `capyctl_request_id` and,
+when given, `caller_request_id` in JSON output; in the default text output
+(ADR 0021) they read `request <capyctl id> (caller <id>) <deployment> -> <host>
+instance <n>`, the caller part only when given (found by the live check on host
+A: the text form first showed neither ID). Lines decided before the first lease
+are held until the offer is decided, so they carry the lease's ID. A lease close
+that could not be written names both IDs. `request_cancellation_acknowledged` is
+unchanged and keeps only CapyCTL's identifiers. A decision's answer now carries
+`capyctl.metrics`: the router's `total_ms` and `time_to_response_ms`, the
+engine's `input_tokens` from `usage`, and `queue_ms`, `prefill_ms` and
+`cached_tokens` when the engine reports them, each labelled with its source;
+absent values stay absent.
+
+Tests: `crates/capyctl-router/tests/request_ids.rs` (T17 T19 T21 T43: echo on
+collected, streamed and decision answers and on errors after a lease; the CapyCTL
+ID equals the lease ID; a fresh ULID per request refused before any lease; a
+malformed or repeated header refused before anything is leased or sent; an engine
+double that records headers never sees either ID, and its own `X-Request-Id`
+never reaches the client), the `request_id` and `engine_metrics` unit tests,
+the `role_text` unit test `router_lines_name_the_request_ids` (the text form
+names both IDs, and nothing extra without a caller ID),
+`decisions.rs` (decision metrics present, no time to first token or decode
+speed), `crates/capyctl-cli/tests/router_payloads.rs` (router, engine forwarder,
+host ingress and engine: both IDs on the answer, neither at the engine) and
+`crates/capyctl-agent/tests/ingress.rs` (the ingress forwards neither ID). Before
+the change the headers were absent and the decision test asserted no
+`capyctl.metrics`. CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch (`5de86c59`) merged with
+`feat/zero-retention` and `fix/sglang-flag-reservations` on main (integration
+build `daffad0d`), an isolated standalone, Julia-1 Q8_0 as a decision
+deployment on llama.cpp v0.7.0 and Qwen3-4B chat on SGLang 0.5.22, each request
+sent with `X-Request-Id: live-check-1`: the decision, a collected chat and a
+streamed chat (`text/event-stream`, 6 data lines) answered 200 with
+`x-request-id: live-check-1` and an `x-capyctl-request-id` ULID, a different one
+per request; a request without the header got only `x-capyctl-request-id`. The
+decision's `capyctl.metrics` held `input_tokens` 33 (engine), `time_to_response_ms`
+30.2 and `total_ms` 31.4 (router); llama.cpp reported no `queue_ms`,
+`prefill_ms` or `cached_tokens`, and they were absent. `X-Request-Id: live check`
+was answered `400 invalid_request` ("X-Request-Id must be one value of 1 to 128
+printable ASCII characters with no spaces") with an `x-capyctl-request-id` and
+no echo. Each answered request had one `router_selection` line naming its
+`X-CapyCTL-Request-Id`: with `--format json` as `capyctl_request_id` and
+`caller_request_id: "live-check-1"`, and in text as `request
+01M5C29SXMR5FQ3133Q2RE59QG (caller live-check-1) 01M5C26QQBW5 -> <host A>
+instance 0` (the caller part absent for the request without the header). Neither
+engine log contained `live-check-1` or `capyctl-request-id`. The standalone's
+embedded host was used, so the path through a separate host's ingress was not
+run live; `ingress.rs` and `router_payloads.rs` cover it.
+
+## Engine logs in memory; vLLM request logging off; data retention docs — 2026-10-20 (branch `feat/zero-retention`)
+
+Owner decisions of 2026-10-19 and 2026-10-20, under SPEC §13.3 (engine logs are
+private, redacted and served only as a bounded tail):
+
+- **`engine_logs: files | memory`.** A new role-local host setting (standalone:
+  `host.engine_logs`; also `--set` and `CAPYCTL_SET__…`), `files` by default,
+  which is the existing behaviour. With `memory`, the redacting log writer keeps
+  the last 4 MiB of each launch's redacted output in its own memory and writes
+  no file. It answers reads on a Linux abstract Unix socket named from a digest
+  of the launch's log path, and both ends refuse a peer that is not the same
+  user. It keeps answering for 60 seconds after the engine exits, then leaves
+  with the buffer. Every reader of a launch's output goes through
+  `capyctl_adapters::engine_log::tail_bytes`, which falls back to the buffer
+  when no file exists. That covers the management engine-log read (the host's
+  `EngineLogTail` and the standalone tail), the launch-failure reason quoted
+  by vLLM, llama.cpp, TensorFold and group workers, and SGLang's own tail,
+  which used to read the file directly and now uses the shared reader. A role
+  started with `--debug-engine-logs` and `engine_logs: memory` refuses to
+  start with a named reason; the flag is otherwise unchanged.
+- **vLLM request logging off.** Every launch renders `--no-enable-log-requests
+  --no-enable-log-outputs`. vLLM 0.29.0, 0.30.0 and 0.31.0 define both as
+  `BooleanOptionalAction` switches, checked against the source of each tag, so
+  no version gate or entry pin is needed. `--enable-log-outputs` is now
+  reserved beside `--enable-log-requests` and `--disable-log-requests`, in
+  `VLLM_RESERVED_FLAGS` and in the protected entry's `RESERVED`.
+- **Data retention.** A new page, `docs/operations/data-retention.md`, linked
+  from the guide and docs indexes and the site, lists what CapyCTL keeps per
+  request and for how long, and how to turn each part off where that is
+  possible. The settings reference documents `engine_logs`.
+
+Tests (T20, T21), each failing before this change and passing after:
+`memory_mode_writes_no_file_and_serves_the_tail` and
+`a_startup_failure_is_classified_from_memory` (capyctl-launchers, a real child
+through the exec launcher with the test binary as the writer),
+`the_memory_buffer_is_bounded_to_whole_lines` and
+`a_log_with_neither_file_nor_buffer_is_missing` (capyctl-adapters),
+`engine_logs_default_to_files_and_stay_role_local` and
+`standalone_honours_engine_logs` (capyctl-config),
+`debug_engine_logs_are_refused_with_memory_engine_logs` (the `capyctl` binary),
+`vllm_0_29_renders_request_and_output_logging_off`, `vllm_0_30_…`, `vllm_0_31_…`,
+`request_and_output_logging_cannot_be_enabled`, `request_logging_off_on_every_rank`
+and the Python `test_request_and_output_logging_are_off_on_every_supported_version`.
+
+CPU and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch merged with `feat/request-ids`
+and `fix/sglang-flag-reservations` on main (integration build `23f72fd8`), an
+isolated standalone with `--set host.engine_logs=memory` and Qwen3-4B on
+SGLang 0.5.22, vLLM 0.31.0 and vLLM 0.30.0 (each ready in 90 to 110 s and
+answering chat, collected and streamed): the state log directory held one
+empty directory per deployment and no file, before and after a failed launch
+and a role restart. The management engine-log read (by deployment ID, admin
+token) answered 200 for all three, 16 and 256 KiB tails, `truncated` set when
+older output existed. vLLM 0.31.0 and 0.30.0 were running with
+`--no-enable-log-requests --no-enable-log-outputs` in their arguments and
+accepted them; after two collected and one streamed chat request carrying a
+marker word, no tail held the marker or a request or output line, only the
+access lines (`POST /v1/chat/completions` with status). A vLLM 0.31.0
+deployment with `accept_extra_args` and `extra_args: [--bogus-flag-016a, "1"]`
+failed before readiness; with no log file to read, `status deployment` showed
+`initialize failed (launch_failed)` and the instance's last error `the engine
+exited before readiness; it rejected argument --bogus-flag-016a`. Stopping the
+standalone left the six engine processes running; after it started again all
+three deployments were ready and the engine-log read answered 200 with the
+same launch incarnations. `start standalone --debug-engine-logs --set
+host.engine_logs=memory` exited 2 before starting (`invalid_config`:
+"--debug-engine-logs writes full engine output to files, which `engine_logs:
+memory` forbids"). vLLM 0.29 is installed only on host B and was not run.
+
+## SGLang dump options and DUMPER_ reserved; engine flags table — 2026-10-20 (branch `fix/sglang-flag-reservations`)
+
+Owner decision 2026-10-20 (SPEC §8.2, T21; ADR 0014 §3, §8; ADR 0028 §2.1;
+ADR 0021). SGLang options and environment variables that write requests,
+tensors or debug data to disk are now reserved: refused in every spelling,
+whatever the host approves, where before the path-shaped ones only needed a
+named approval. The list was read from the installed SGLang 0.5.21 and 0.5.22
+parsers (`ServerArgs.add_cli_args`) on host A and from the code that reads
+each field or variable:
+
+- options (`SGLANG_DUMP_RESERVED` in `engine_policy.rs`, `_RESERVED_DUMP` in
+  `runtime/sglang_server_args.py`): `--watermark-config` (0.5.22; the
+  watermark key file or JSON), `--debug-tensor-dump-output-folder`,
+  `--debug-tensor-dump-layers`, `--debug-tensor-dump-input-file` and the whole
+  `--debug-tensor-dump-*` family, `--msprobe-dump-config`,
+  `--export-metrics-to-file` and `--export-metrics-to-file-dir` (a record of
+  every request, hourly files), and `--spec-trace-dir`. `--log-requests`,
+  `--log-requests-target` and `--crash-dump-folder` were already CapyCTL's.
+- environment (`engine_env.rs`, refused as `engine_env_reserved:<name>`,
+  compared upper-cased at both levels, and refused as an approval glob): the
+  `DUMPER_`, `SGLANG_DUMP`, `SGLANG_KERNEL_API_` and `SGLANG_CUDA_COREDUMP`
+  families, and `SGLANG_DSPARK_DEBUG_DUMP`, `SGLANG_DSPARK_ENABLE_SPS_RECORD`,
+  `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` and `SGLANG_TORCH_PROFILER_DIR`.
+
+New command `capyctl engine flags <family> [--version V]` prints every option
+and environment name the checks know for a family with its class (owned,
+reserved, sensitive with the approval kind, or ordinary) and the reason; text
+by default, `--format json` on request (ADR 0021). It is built from the same
+tables the checks read (`engine_policy::flag_table`, `engine_env::env_table`).
+Documented in `docs/guide/engine-flags.md`.
+
+Tests (T21): `sglang_dump_destinations_are_reserved_in_every_spelling`
+(exact, abbreviated, `_` and `=value` spellings and the family, with every
+option approved; failing before), `dump_environment_names_are_reserved`
+(`DUMPER_*` and the SGLang names in any case, both levels, approval globs;
+failing before), `the_environment_table_matches_the_check`,
+`engine_flag_ownership.rs` (every table row run through
+`validate_extra_args` agrees with its class; every reserved and typed name is
+listed; the JSON form carries the classes), the runtime parity test and
+`test_dump_destinations_are_refused_however_spelled` in
+`runtime/tests/test_sglang_server_args.py`, and `engine_flags_parses`. CPU
+and Fake-engine tests are not qualification.
+
+Live on host A, 2026-10-20, with this branch merged with `feat/request-ids`
+and `feat/zero-retention` on main (integration build `23f72fd8`), an isolated
+standalone and Qwen3-4B on SGLang 0.5.22: `deploy model` refused all four
+before anything was stored or launched, exit 2. `extra_args: [--watermark-config,
+x]` and `[--export-metrics-to-file]` gave `invalid_config` ("reserved option
+... is rendered by capyctl and cannot be passed"); `engine_config.env`
+`DUMPER_ENABLE: "1"` gave `engine_env_reserved:DUMPER_ENABLE` and
+`dumper_enable: "1"` gave `engine_env_reserved:dumper_enable`. `engine add
+--approve-env 'DUMPER_*'` was refused with `engine_env_reserved:DUMPER_`. No
+engine process started for any of them. `capyctl engine flags sglang` printed
+the table (text, and `--format json` with `class`, `match`, `approval` and
+`reason` per row), listing `--watermark-config`, `--export-metrics-to-file`,
+`--export-metrics-to-file-dir` and `DUMPER_*` as reserved. An ordinary SGLang
+0.5.22 deployment of the same model then started (ready in 106 s) and answered
+a chat request.
+
+## three accounting bugs from the formal review, fixed on main — 2026-10-20 (branch `fix/lean-review-bugs`)
+
+The Lean review in closed PR #16 (tag `archive/formal-review-lean`) found three
+bugs that never reached `main`. Each was re-checked against `main` at
+`af661ac2` and was still live; each new test failed there and passes now. The
+Lean models are not ported.
+
+- **A cancelled or refused park reopened a gate a restart had closed**
+  (SPEC §6.1, §10). A restart closes every dispatch gate without a closure row;
+  an adopted launch reopens only through `reverify_local_dispatch`, on fresh
+  readiness evidence with no lease left by the retired session. A park
+  accepted on the adopted launch and then cancelled at its deadline, or
+  refused, called `reopen()` and opened dispatch over the retired session's
+  lease. The residency plan now records `reopens_dispatch`: true when the park
+  found the gate open, or when a switch releasing its drained victim handed it
+  the closure it recorded on this session's open gate. A park adopted from a
+  retired session has it cleared. Plans stored without the field never reopen;
+  readiness supervision reopens those gates on evidence. Test (T33 T19):
+  `a_cancelled_park_does_not_reopen_a_gate_a_restart_closed`.
+- **A Ready phase could claim a device its peak phase lacked** (SPEC §7.3).
+  Start and wake completions write the Ready footprint without admission, and
+  `validate_recipe` compared bytes between phases but never device claims. A
+  declared `resources:` block with no device in `cold` and `gpu0` exclusive in
+  `ready` resolved, and completion then put a second exclusive owner on the
+  GPU. A revision written now (deploy, replace, `capyctl validate`) must have
+  every base-phase claim held by its peak phase on the same device, equally or
+  exclusively (`validate_device_coverage`). The rule is not applied to a
+  revision accepted before it (`CheckpointFacts::accepted_revision`, set when
+  a stored snapshot is decoded or re-resolved and when a host resolves the
+  revision its server accepted). Such a revision still decodes, starts, stops
+  and can be replaced, because more than twenty store paths decode stored
+  revisions, placement and startup among them. Tests (T26 T27):
+  `recipe_peaks_cover_each_adjacent_phase_device_claims` (scheduler),
+  `a_ready_phase_may_not_claim_a_device_its_cold_phase_lacks` (config) and
+  `a_revision_stored_before_device_coverage_still_decodes_stops_and_is_replaced`
+  (store). The store test failed while the rule also applied to stored
+  revisions.
+- **A granted request lease leaked when its caller was dropped after the reply
+  was sent** (SPEC §10). The writer closed a grant as not accepted only when
+  `reply.send` failed. The first lease of a request is opened in the handler
+  future, before the dispatch task is spawned (#152 moved only the close), so
+  a client disconnect between the send and the caller's next poll dropped the
+  ticket inside the channel and left the lease `inflight` for the session. The
+  ticket now travels in a guard whose `Drop` queues its `Finish`; the idle
+  writer looks for such orphans every 50 ms and flushes them before it stops.
+  Test (T17 T19): `a_grant_sent_but_never_taken_is_closed_as_not_accepted`.
+
+CPU and Fake-engine tests are not qualification. No live check is needed for
+the recipe rule; the park and lease paths have no live repro yet.
+
+## ADR 0031 accepted: custom engines — 2026-10-20 (branch `docs/adr-0031-command-engines`)
+
+ADR 0031 records the owner's decisions of 2026-10-20 (proposed 2026-10-18) for custom
+engines in 0.1.6: a generic engine kind, `custom`, for one-off engines CapyCTL has no
+integration for. It is not a custom build of a known engine, and not ADR 0008's runtime
+type `command`. A host administrator registers one with `capyctl engine add --custom <exe>
+--name <n> --manifest <file>`, confirmed on a terminal or with `--yes`. The manifest is the
+whole argument template (placeholders `{host}`, `{port}`, `{model_dir}`, optional
+`{served_name}`, `{context_length}`, `{api_key}`), its API (`chat` or `decisions`), an
+optional idle signal and an optional version string. The digest covers the executable and
+its whole environment by default (site-packages and interpreter), or a narrower root the
+manifest names; drift warns unless `installation_drift: refuse`. CapyCTL keeps process
+ownership, the loopback port, routing, authentication, admission, readiness through the
+existing chat and decision probes, measured peaks and logs. It refuses parking, groups,
+derived sizing (`resources` is required), extra arguments, typed engine fields and
+parsers. After readiness, a loopback-listener check stops a launch whose processes listen
+off loopback (`custom_listener_exposed`). Without an idle signal, a lease left cancelling
+by a hang-up, a deadline cut or an engine error settles only at the instance's next
+verified stop or restart, drains do not wait for it, its memory is not freed before that
+exit, and status says so (a SPEC §10 amendment). The host capability is `custom_engines`;
+the acceptance row is T44. `/v1/systemone` stays closed, and basal's extensions need
+their own ADR. The worked example is `basal-serve` 2.2.0 `--mode eager` for basal-omni
+decision models: no API key, no in-flight counts, and a 422 for every failure, which may
+mean an engine failure (upstream issue rkinas/basal#22). Live rows CE1–CE4 will run on
+host A with `~/basal-2.2.0-venv` (owner approved 2026-10-20, added to AGENTS.md). Nothing
+is implemented; the SPEC amendments it lists land with the implementation.
+
 ## SGLang 0.5.22 finds `cutlass` without running its `.pth` hook — 2026-10-19 (branch `fix/sglang-cutlass-path`)
 
 Found live on host A on 2026-10-19: SGLang 0.5.22 under CapyCTL failed to

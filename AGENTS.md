@@ -4,9 +4,11 @@ Rust controller for managing inference-engine deployments on hardware that canno
 keep all model weights resident. The primary audience is home users and prosumers
 running models on GPU machines they own.
 
-Current phase: 0.1.5 on `main` (multi-node groups qualified on two hosts: vLLM
+Current phase: 0.1.6 on `main` (multi-node groups qualified on two hosts: vLLM
 and SGLang with deep parking, TensorFold TP2; decision models, `api: decisions`
-on llama.cpp and SGLang, ready on a fixed decision and served at `/v1/systemone`). Releases are
+on llama.cpp and SGLang, ready on a fixed decision and served at `/v1/systemone`;
+custom engines, ADR 0031: any engine run from a manifest added with
+`capyctl engine add --custom`, loopback-only, confirmed and pinned, restart only on one machine). Releases are
 published as GitHub releases; release candidates as
 pre-releases.
 
