@@ -328,10 +328,13 @@ fn settle_in(
 
 /// SPEC §10 (amended 2026-10-01): mark this session's in-flight lease as
 /// cancelling. It stays `inflight`; only the engine's quiescence closes it.
+/// Amended 2026-10-21: `answered` records whether the engine answered the
+/// request before the cancellation; only then may quiescence close it.
 fn cancel_in(
     transaction: &Connection,
     session: &CoordinatorSession,
     ticket: &DispatchTicket,
+    answered: bool,
 ) -> Result<bool, DispatchError> {
     if ticket.session_id != session.id {
         return Err(DispatchError::StaleSession);
@@ -343,8 +346,8 @@ fn cancel_in(
         .min(i64::MAX as u128) as i64;
     let changed = transaction
         .prepare_cached(
-            "INSERT OR IGNORE INTO request_lease_cancellations(lease_id,cancelled_at_ms)
-         SELECT id,?6 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3
+            "INSERT OR IGNORE INTO request_lease_cancellations(lease_id,cancelled_at_ms,engine_answered)
+         SELECT id,?6,?7 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3
          AND generation=?4 AND session_id=?5 AND disposition='inflight'",
         )?
         .execute(params![
@@ -353,7 +356,8 @@ fn cancel_in(
             ticket.revision,
             ticket.generation,
             ticket.session_id,
-            now
+            now,
+            answered
         ])?;
     Ok(changed == 1)
 }
@@ -385,8 +389,13 @@ pub enum LeaseWrite {
     Uncertain(DispatchTicket),
     /// SPEC §10 (amended 2026-10-01): the client hung up and the engine
     /// connection closed. The lease stays `inflight` and charged until the
-    /// engine reports quiescence.
-    Cancel(DispatchTicket),
+    /// engine reports quiescence. Amended 2026-10-21: only when `answered`,
+    /// the engine having answered the request before the cancellation;
+    /// otherwise only the instance's verified exit settles it.
+    Cancel {
+        ticket: DispatchTicket,
+        answered: bool,
+    },
 }
 
 /// What one `LeaseWrite` in a batch produced.
@@ -469,8 +478,9 @@ impl crate::Store {
                 LeaseWrite::Uncertain(ticket) => {
                     settle_in(&transaction, session, ticket, false).map(LeaseWriteOutcome::Settled)
                 }
-                LeaseWrite::Cancel(ticket) => {
-                    cancel_in(&transaction, session, ticket).map(LeaseWriteOutcome::Settled)
+                LeaseWrite::Cancel { ticket, answered } => {
+                    cancel_in(&transaction, session, ticket, *answered)
+                        .map(LeaseWriteOutcome::Settled)
                 }
             };
             // A storage error inside the transaction poisons the whole group.

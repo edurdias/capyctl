@@ -59,6 +59,17 @@ impl Progress {
     fn mark(&self) {
         self.0.send_replace(Some(tokio::time::Instant::now()));
     }
+
+    /// SPEC §10 (amended 2026-10-21): whether the backend produced output for
+    /// this request: an event parsed from the engine that is backend progress
+    /// (a content, reasoning, tool-call or finish chunk; not a chunk that only
+    /// opens the reply, and not response headers). A request cancelled after
+    /// it reached the engine's scheduler, so the engine's idle reading after
+    /// the cancellation may settle it; one cancelled before may still be in
+    /// transit inside the engine, and settles only at its verified exit.
+    pub(crate) fn produced(&self) -> bool {
+        self.0.borrow().is_some()
+    }
 }
 
 /// Run `forward` until it ends, or until the backend stops progressing within
@@ -70,12 +81,17 @@ impl Progress {
 /// until the engine reports quiescence. A stream the router cut for missing
 /// its bounds was cancelled the same way: dropping the forward closed the
 /// engine connection (found live 2026-10-02), so it is cancelling too.
+/// Amended 2026-10-21: `answered` is `Progress::produced`; only a request
+/// the engine answered before its cancellation settles on quiescence.
 pub fn stream_lease_end(
     result: &Result<Result<StreamEnded, AdapterError>, ()>,
+    answered: bool,
 ) -> capyctl_controller::LeaseEnd {
     match result {
         Ok(Ok(StreamEnded::Completed)) => capyctl_controller::LeaseEnd::Completed,
-        Ok(Ok(StreamEnded::Cancelled)) | Err(()) => capyctl_controller::LeaseEnd::Cancelling,
+        Ok(Ok(StreamEnded::Cancelled)) | Err(()) => {
+            capyctl_controller::LeaseEnd::Cancelling { answered }
+        }
         Ok(Err(error)) => crate::chat::lease_end(Some(error)),
         Ok(Ok(StreamEnded::BackendClosed)) => capyctl_controller::LeaseEnd::Uncertain,
     }
@@ -328,7 +344,7 @@ pub fn stream_planned_timed(
                 completed = Some(attempt);
                 break (result, None);
             }
-            let end = stream_lease_end(&result);
+            let end = stream_lease_end(&result, progress.produced());
             durable = attempt.settle(end).await;
             // SPEC §10, T19: a deterministic refusal decided before sending is
             // answered in-band; another instance would refuse it the same way.

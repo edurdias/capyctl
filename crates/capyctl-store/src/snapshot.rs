@@ -416,10 +416,20 @@ pub struct InstanceSnapshot {
 pub struct InstanceRequests {
     /// How many, as a decimal string (the snapshot's counter convention).
     pub cancelling: String,
-    /// `idle_signal` when the engine's idle signal settles them, `stop` when
-    /// the engine reports none and only the verified exit at the next stop or
-    /// restart does. Read from the instance's retained revision.
+    /// `idle_signal` when the engine reports an idle signal, which settles
+    /// the cancelled requests it answered; `stop` when the engine reports none
+    /// and only the verified exit at the next stop or restart settles any.
+    /// Read from the instance's retained revision.
     pub cancelling_settles: CancellingSettles,
+    /// SPEC §10 (amended 2026-10-21): of `cancelling`, how many settle on the
+    /// engine's idle reading: the engine answered them before they were
+    /// cancelled, and it reports an idle signal. Additive.
+    pub settle_when_idle: String,
+    /// SPEC §10 (amended 2026-10-21): of `cancelling`, how many settle only
+    /// at the instance's next verified stop or restart: the engine did not
+    /// answer them before they were cancelled, or reports no idle signal.
+    /// Additive.
+    pub settle_at_stop: String,
 }
 
 /// ADR 0031 §6: what settles an instance's cancelling requests.
@@ -889,8 +899,9 @@ impl Store {
         // owner; a group instance's members are listed as reservations each.
         // ADR 0031 §6, SPEC §10: its cancelling requests (still in flight,
         // with a cancellation), and whether its engine reports no idle signal,
-        // from the same retained revision the launch ran with.
-        let instances_sql = format!("SELECT i.deployment_id,i.instance_index,i.host_id,i.device_json,i.generation,i.state,i.operator_stopped,{},(SELECT o.owner_id FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index AND o.member_rank IS NULL),{},{},{},COALESCE({},{}),{},i.revision,substr(i.last_error,1,1024),(SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index AND l.disposition='inflight'),{} FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=COALESCE(i.revision,d.revision) LEFT JOIN host_effective_revisions h ON h.deployment_id=d.id AND h.revision=COALESCE(i.revision,d.revision) AND h.host_id=i.host_id AND h.outcome='resolved' ORDER BY i.deployment_id,i.instance_index",
+        // from the same retained revision the launch ran with; amended
+        // 2026-10-21, how many of them the engine never answered.
+        let instances_sql = format!("SELECT i.deployment_id,i.instance_index,i.host_id,i.device_json,i.generation,i.state,i.operator_stopped,{},(SELECT o.owner_id FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index AND o.member_rank IS NULL),{},{},{},COALESCE({},{}),{},i.revision,substr(i.last_error,1,1024),(SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index AND l.disposition='inflight'),{},(SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index AND l.disposition='inflight' AND c.engine_answered=0) FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=COALESCE(i.revision,d.revision) LEFT JOIN host_effective_revisions h ON h.deployment_id=d.id AND h.revision=COALESCE(i.revision,d.revision) AND h.host_id=i.host_id AND h.outcome='resolved' ORDER BY i.deployment_id,i.instance_index",
             INSTANCE_OBSERVED_STATE, json_text(chosen, "$.profile.engine"), json_text(chosen, "$.profile.security.deep_park"), json_text(chosen, "$.profile.security.deep_park_source"), json_bool(chosen, "$.engine_config.enable_sleep_mode"), json_bool(chosen, "$.profile.launch_settings.enable_sleep_mode"), json_text(chosen, "$.residency"),
             crate::request_lease_cancellations::lane_without_idle_signal("i.deployment_id", "i.instance_index"));
         let instances = budget.read(&tx, &instances_sql, |r| {
@@ -922,13 +933,30 @@ impl Store {
                     startup: None,
                     latest_operation: None,
                     group: None,
-                    requests: InstanceRequests {
-                        cancelling: number(r, 16)?,
-                        cancelling_settles: if boolean(r, 17)? {
-                            CancellingSettles::Stop
+                    requests: {
+                        let cancelling: i64 = r.get(16)?;
+                        let no_idle_signal = boolean(r, 17)?;
+                        let unanswered: i64 = r.get(18)?;
+                        // SPEC §10 (amended 2026-10-21), ADR 0031 §6: without
+                        // an idle signal every one waits for the stop.
+                        let at_stop = if no_idle_signal {
+                            cancelling
                         } else {
-                            CancellingSettles::IdleSignal
-                        },
+                            unanswered
+                        };
+                        if cancelling < 0 || at_stop < 0 || at_stop > cancelling {
+                            return Err(SnapshotError::CorruptData);
+                        }
+                        InstanceRequests {
+                            cancelling: cancelling.to_string(),
+                            cancelling_settles: if no_idle_signal {
+                                CancellingSettles::Stop
+                            } else {
+                                CancellingSettles::IdleSignal
+                            },
+                            settle_when_idle: (cancelling - at_stop).to_string(),
+                            settle_at_stop: at_stop.to_string(),
+                        }
                     },
                 },
             ))

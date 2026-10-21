@@ -1074,6 +1074,15 @@ CREATE INDEX IF NOT EXISTS lifecycle_steps_binding ON lifecycle_steps(binding_id
 CREATE INDEX IF NOT EXISTS journal_entries_operation ON journal_entries(operation_id);
 "#;
 
+/// v51 (SPEC §10, amended 2026-10-21): whether the engine answered a
+/// cancelled request before its cancellation (a stream's first output, or a
+/// complete error answer). Only an answered cancellation settles on the
+/// engine's idle reading; an unanswered one waits for the instance's verified
+/// exit. A row written before v51 reads 0, not answered: the conservative
+/// reading. Additive and forward-only.
+pub const SCHEMA_V51: &str =
+    "-- cancellations the engine answered (request_lease_cancellations::migrate_v51)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

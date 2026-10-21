@@ -1770,18 +1770,38 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
         .await
         .unwrap()
         .expect("a durable lease");
+    // SPEC §10 (amended 2026-10-21): a request the engine never answered.
+    let unanswered = lifecycle
+        .open_instance_lease(&fence.deployment_id, fence.generation, 8)
+        .await
+        .unwrap()
+        .expect("a durable lease");
     // The host's last idle sample was taken before the client hung up.
     assert_eq!(idle_sample(capyctl_protocol::now_unix_ms()).applied, 1);
     tokio::time::sleep(Duration::from_millis(5)).await;
     lifecycle
-        .close_request_lease(lease, crate::request_leases::LeaseEnd::Cancelling)
+        .close_request_lease(
+            lease,
+            crate::request_leases::LeaseEnd::Cancelling { answered: true },
+        )
+        .await
+        .unwrap();
+    lifecycle
+        .close_request_lease(
+            unanswered,
+            crate::request_leases::LeaseEnd::Cancelling { answered: false },
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await;
-    assert_eq!(leases(), 1, "an idle sample before the hang-up");
-    // A sample taken after the hang-up settles it, on the host's receipt.
+    assert_eq!(leases(), 2, "an idle sample before the hang-up");
+    // A sample taken after the hang-up settles the answered one, on the
+    // host's receipt; the one the engine never answered stays charged.
     assert_eq!(idle_sample(capyctl_protocol::now_unix_ms()).applied, 1);
-    until(|| leases() == 0).await;
+    until(|| leases() == 1).await;
+    assert_eq!(idle_sample(capyctl_protocol::now_unix_ms()).applied, 1);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(leases(), 1, "never settled by the host's idle sample");
     let receipt: String = sql
         .query_row(
             "SELECT payload_json FROM management_events WHERE kind='request_cancellation_acknowledged' AND deployment_id=?1",
@@ -1883,7 +1903,10 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
         .unwrap()
         .expect("a durable lease");
     lifecycle
-        .close_request_lease(lease, crate::request_leases::LeaseEnd::Cancelling)
+        .close_request_lease(
+            lease,
+            crate::request_leases::LeaseEnd::Cancelling { answered: true },
+        )
         .await
         .unwrap();
     // The stop is accepted while the lease is still cancelling; its drain

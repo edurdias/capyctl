@@ -4,11 +4,18 @@
 //! `inflight` and charged until the engine's own counters read quiescent at
 //! or after the hang-up; only then does it close.
 //!
+//! SPEC §10 (amended 2026-10-21): only a cancellation the engine answered
+//! first (`engine_answered`: a stream's first output, or a complete error
+//! answer) settles on that reading. An engine can read idle while a request
+//! it never answered is still on its way to its scheduler, so an unanswered
+//! cancellation is settled as below, at the instance's verified exit.
+//!
 //! ADR 0031 §6, SPEC §10: an engine that reports no idle signal (a custom
 //! engine without `idle`) can never read quiescent. Its cancelling leases are
 //! never settled while it runs: no quiescence question is asked of it, and
 //! only the verified exit of its instance at the next stop or restart settles
-//! them (`cleanup.rs`). Drains do not wait for them; they stay charged.
+//! them (`cleanup.rs`). Drains do not wait for them; they stay charged. Both
+//! kinds are "settled at stop" ([`settled_at_stop`]).
 
 use rusqlite::{params, Transaction, TransactionBehavior};
 
@@ -51,24 +58,59 @@ pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String 
     )
 }
 
-/// ADR 0031 §6, SPEC §10: whether request lease `lease` (an alias of
-/// `request_leases`) is cancelling on an engine that reports no idle signal.
-/// Drains do not wait for such a lease; admission limits still count it.
-pub(crate) fn cancelling_without_idle_signal(lease: &str) -> String {
+/// SPEC §10 (amended 2026-10-21), ADR 0031 §6: whether cancellation row
+/// `cancellation` (an alias of `request_lease_cancellations`) of a lease on
+/// instance lane (`deployment`, `index`) settles only at the instance's
+/// verified exit: the engine did not answer the request before it was
+/// cancelled, or the engine reports no idle signal. Otherwise the engine's
+/// idle reading after the cancellation settles it.
+pub(crate) fn settled_at_stop(cancellation: &str, deployment: &str, index: &str) -> String {
     format!(
-        "(EXISTS(SELECT 1 FROM request_lease_cancellations xc WHERE xc.lease_id={lease}.id)
+        "({cancellation}.engine_answered=0 OR {})",
+        lane_without_idle_signal(deployment, index)
+    )
+}
+
+/// SPEC §10 (amended 2026-10-21), ADR 0031 §6: whether request lease `lease`
+/// (an alias of `request_leases`) is cancelling and settles only at its
+/// instance's verified exit ([`settled_at_stop`]). Drains do not wait for
+/// such a lease; admission limits still count it.
+pub(crate) fn cancelling_settled_at_stop(lease: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM request_lease_cancellations xc WHERE xc.lease_id={lease}.id
           AND {})",
-        lane_without_idle_signal(
+        settled_at_stop(
+            "xc",
             &format!("{lease}.deployment_id"),
             &format!("{lease}.instance_index")
         )
     )
 }
 
+/// v51 (SPEC §10, amended 2026-10-21): record whether the engine answered a
+/// cancelled request before its cancellation. A row already present reads 0,
+/// not answered: the conservative reading, so no idle reading settles it.
+/// Applied once; a store that has the column already is left unchanged.
+pub(crate) fn migrate_v51(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('request_lease_cancellations') WHERE name='engine_answered')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE request_lease_cancellations
+               ADD COLUMN engine_answered INTEGER NOT NULL DEFAULT 0 CHECK(engine_answered IN (0,1));",
+        )?;
+    }
+    Ok(())
+}
+
 impl crate::Store {
-    /// Bindings of this session with at least one cancelling lease, on an
-    /// engine that reports an idle signal. ADR 0031 §6: an engine without
-    /// one is never asked; its cancelling leases settle at its verified exit.
+    /// Bindings of this session with at least one cancelling lease that the
+    /// engine's idle reading may settle. SPEC §10 (amended 2026-10-21), ADR
+    /// 0031 §6: a cancellation settled at stop is not counted, and a binding
+    /// with only those is never asked; its verified exit settles them.
     pub fn cancelling_bindings(
         &self,
         session: &CoordinatorSession,
@@ -77,7 +119,7 @@ impl crate::Store {
             "SELECT b.id,b.deployment_id,COUNT(*),MAX(c.cancelled_at_ms) {CANCELLING}
                AND NOT {}
              GROUP BY b.id,b.deployment_id ORDER BY b.id",
-            lane_without_idle_signal("l.deployment_id", "l.instance_index")
+            settled_at_stop("c", "l.deployment_id", "l.instance_index")
         ))?;
         let rows = statement.query_map([session.id()], |r| {
             let leases: i64 = r.get(2)?;
@@ -93,8 +135,9 @@ impl crate::Store {
 
     /// Close this session's cancelling leases on the binding cancelled at or
     /// before `asked_at_ms`; journals one event with `receipt`. Returns the count.
-    /// ADR 0031 §6: never on an engine that reports no idle signal, whatever
-    /// the caller observed; only its verified exit settles those (0 here).
+    /// SPEC §10 (amended 2026-10-21), ADR 0031 §6: never a cancellation settled
+    /// at stop (unanswered by the engine, or on an engine that reports no idle
+    /// signal), whatever the caller observed; only the verified exit settles it.
     pub fn settle_cancelled_leases(
         &self,
         session: &CoordinatorSession,
@@ -130,7 +173,7 @@ impl crate::Store {
                      AND b.instance_index=l.instance_index
                    WHERE b.id=?2 AND l.session_id=?1 AND l.disposition='inflight'
                      AND c.cancelled_at_ms<=?3 AND NOT {})",
-                lane_without_idle_signal("l.deployment_id", "l.instance_index")
+                settled_at_stop("c", "l.deployment_id", "l.instance_index")
             ),
             params![session.id(), binding_id, asked_at_ms],
         )?;
@@ -234,10 +277,17 @@ mod tests {
         }
     }
 
-    fn cancel(f: &Fixture) {
+    /// Cancel the fixture's lease; `answered` when the engine answered it first.
+    fn cancel(f: &Fixture, answered: bool) {
         let outcome = f
             .store
-            .apply_request_lease_batch(&f.session, &[LeaseWrite::Cancel(f.ticket.clone())])
+            .apply_request_lease_batch(
+                &f.session,
+                &[LeaseWrite::Cancel {
+                    ticket: f.ticket.clone(),
+                    answered,
+                }],
+            )
             .unwrap();
         assert!(matches!(
             outcome[..],
@@ -250,7 +300,7 @@ mod tests {
     #[test]
     fn a_cancelling_lease_keeps_every_drain_waiting() {
         let f = ready_instance_with_lease();
-        cancel(&f);
+        cancel(&f, true);
         assert_eq!(f.store.switch_outstanding_leases(&f.dep, 0, 1).unwrap(), 1);
         assert_eq!(
             f.store.binding_outstanding_leases(&f.binding).unwrap(),
@@ -263,11 +313,37 @@ mod tests {
         assert_eq!(cancelling[0].leases, 1);
     }
 
+    // T17 T38, SPEC §10 (amended 2026-10-21): a request cancelled before the
+    // engine answered it is never asked about and no idle reading closes it,
+    // however late; drains do not wait for it, and it stays charged.
+    #[test]
+    fn an_unanswered_cancellation_is_never_settled_by_an_idle_reading() {
+        let f = ready_instance_with_lease();
+        cancel(&f, false);
+        assert!(f.store.cancelling_bindings(&f.session).unwrap().is_empty());
+        assert_eq!(
+            f.store
+                .settle_cancelled_leases(&f.session, &f.binding, i64::MAX, "r")
+                .unwrap(),
+            0
+        );
+        assert_eq!(f.store.switch_outstanding_leases(&f.dep, 0, 1).unwrap(), 0);
+        assert_eq!(
+            f.store.binding_outstanding_leases(&f.binding).unwrap(),
+            Some(0)
+        );
+        assert_eq!(f.store.pending_dispatches(&f.dep).unwrap().len(), 1);
+        let events = f.store.events_after(None, 100).unwrap().events;
+        assert!(!events
+            .iter()
+            .any(|e| e.kind == "request_cancellation_acknowledged"));
+    }
+
     // T17: only cancellations at or before the quiescence question close.
     #[test]
     fn settling_closes_only_leases_cancelled_before_the_question() {
         let f = ready_instance_with_lease();
-        cancel(&f);
+        cancel(&f, true);
         let at = f.store.cancelling_bindings(&f.session).unwrap()[0].newest_cancelled_at_ms;
         assert_eq!(
             f.store
@@ -319,7 +395,7 @@ mod tests {
     #[test]
     fn a_cancelling_lease_is_uncertain_after_a_restart() {
         let f = ready_instance_with_lease();
-        cancel(&f);
+        cancel(&f, true);
         let Fixture {
             _directory,
             path,

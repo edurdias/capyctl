@@ -2586,8 +2586,9 @@ impl crate::Store {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
             check_session(&tx, s)?;
             // SPEC §6.5: a warm-residency commitment, or a deployment whose
-            // activation is explicit, is never idled. ADR 0031 §6, SPEC §10:
-            // a cancelling lease on an engine that reports no idle signal does
+            // activation is explicit, is never idled. ADR 0031 §6, SPEC §10
+            // (amended 2026-10-21): a cancelling lease settled at stop (no
+            // idle signal, or cancelled before the engine answered it) does
             // not hold the instance busy; only the stop's verified exit can
             // settle it, so it must not prevent that stop.
             let rows = tx.prepare(&format!(
@@ -2601,7 +2602,7 @@ impl crate::Store {
                                      AND NOT (l.disposition='inflight' AND {}))
                     AND NOT {}
                   ORDER BY i.deployment_id,i.instance_index",
-                crate::request_lease_cancellations::cancelling_without_idle_signal("l"),
+                crate::request_lease_cancellations::cancelling_settled_at_stop("l"),
                 crate::switch_state::exempt_clause("i")
             ))?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -2694,7 +2695,22 @@ fn idle_one(
     } else {
         None
     };
-    if !parked && parks(&e) && !refused_park && growth.is_none() {
+    // SPEC §10 (amended 2026-10-21): a cancelled request the engine never
+    // answered settles only at the verified exit, and a park would wait for
+    // it forever (SPEC §9.2: unknown work is not quiescence for a park), so
+    // the instance stops instead.
+    let unanswered = !parked
+        && parks(&e)
+        && tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2
+                         AND l.disposition='inflight' AND {})",
+                crate::request_lease_cancellations::cancelling_settled_at_stop("l")
+            ),
+            params![deployment, instance],
+            |r| r.get::<_, bool>(0),
+        )?;
+    if !parked && parks(&e) && !refused_park && growth.is_none() && !unanswered {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
             tx, s, "idle", deployment, instance, &key, now, deadline, false,
@@ -2717,6 +2733,8 @@ fn idle_one(
         "ready_idle_park_refused"
     } else if growth.is_some() {
         "ready_idle_parked_growth"
+    } else if unanswered {
+        "ready_idle_unanswered_cancellation"
     } else {
         "ready_idle_restart_only"
     };

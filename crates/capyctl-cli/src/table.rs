@@ -710,14 +710,33 @@ fn status(value: &Value, names: &HostNames) -> String {
 }
 
 /// ADR 0031 §6, SPEC §10: one instance's cancelled requests, shown only when
-/// it has some: `Instance 0  cancelling: 2 (settles ...)`.
+/// it has some: `Instance 0  cancelling: 2 (settles ...)`. Amended
+/// 2026-10-21: on an engine with an idle signal, those cancelled before the
+/// engine answered them settle at the next stop or restart, and the line
+/// says how many settle each way.
 fn cancelling_line(instance: &Value) -> Option<String> {
     let requests = &instance["requests"];
     let count = number(&requests["cancelling"]).filter(|n| *n > 0)?;
+    const UNANSWERED: &str = "cancelled before the engine answered";
     let settles = match requests["cancelling_settles"].as_str() {
-        Some("stop") => " (settles at the next stop or restart: the engine reports no idle signal)",
-        Some("idle_signal") => " (settles on the engine's idle signal)",
-        _ => "",
+        Some("stop") => {
+            " (settles at the next stop or restart: the engine reports no idle signal)".to_owned()
+        }
+        Some("idle_signal") => {
+            let at_stop = number(&requests["settle_at_stop"])
+                .unwrap_or(0)
+                .clamp(0, count);
+            match count - at_stop {
+                _ if at_stop == 0 => " (settles on the engine's idle signal)".to_owned(),
+                0 => format!(" (settles at the next stop or restart: {UNANSWERED})"),
+                when_idle => format!(
+                    " ({when_idle} {} on the engine's idle signal; {at_stop} at the next stop \
+                     or restart: {UNANSWERED})",
+                    if when_idle == 1 { "settles" } else { "settle" }
+                ),
+            }
+        }
+        _ => String::new(),
     };
     Some(format!(
         "Instance {}  cancelling: {count}{settles}\n",
@@ -1132,28 +1151,38 @@ mod tests {
         assert!(api > engine && out[api..].contains("decisions"), "{out}");
     }
 
-    // T44 T17 (ADR 0031 §6): status says how many cancelled requests each
-    // instance still carries and what settles them; nothing when none.
+    // T44 T17 (ADR 0031 §6, SPEC §10 amended 2026-10-21): status says how
+    // many cancelled requests each instance still carries and what settles
+    // them, the engine's idle signal or the next stop; nothing when none.
     #[test]
     fn status_shows_each_instances_cancelling_requests_and_what_settles_them() {
-        let instance = |index: u32, cancelling: &str, settles: &str| {
+        let instance = |index: u32, cancelling: &str, settles: &str, at_stop: &str| {
             json!({"index": index, "observed_state": "ready", "lifecycle": "active",
-                "requests": {"cancelling": cancelling, "cancelling_settles": settles}})
+                "requests": {"cancelling": cancelling, "cancelling_settles": settles,
+                    "settle_at_stop": at_stop}})
         };
         let d = json!({"name": "basal", "observed_state": "ready", "instances": [
-            instance(0, "2", "stop"), instance(1, "0", "stop"), instance(2, "1", "idle_signal")]});
+            instance(0, "2", "stop", "2"), instance(1, "0", "stop", "0"),
+            instance(2, "1", "idle_signal", "0"), instance(3, "1", "idle_signal", "1"),
+            instance(4, "3", "idle_signal", "1"), instance(5, "3", "idle_signal", "2")]});
         let out = render(View::Status, &d, &HostNames::new());
         assert!(
             out.contains(
                 "\nInstance 0  cancelling: 2 (settles at the next stop or restart: \
                  the engine reports no idle signal)\n\
-                 Instance 2  cancelling: 1 (settles on the engine's idle signal)\n"
+                 Instance 2  cancelling: 1 (settles on the engine's idle signal)\n\
+                 Instance 3  cancelling: 1 (settles at the next stop or restart: \
+                 cancelled before the engine answered)\n\
+                 Instance 4  cancelling: 3 (2 settle on the engine's idle signal; \
+                 1 at the next stop or restart: cancelled before the engine answered)\n\
+                 Instance 5  cancelling: 3 (1 settles on the engine's idle signal; \
+                 2 at the next stop or restart: cancelled before the engine answered)\n"
             ),
             "{out}"
         );
         assert!(!out.contains("Instance 1  cancelling"), "{out}");
         let quiet = json!({"name": "basal", "observed_state": "ready",
-            "instances": [instance(0, "0", "stop")]});
+            "instances": [instance(0, "0", "stop", "0")]});
         let out = render(View::Status, &quiet, &HostNames::new());
         assert!(!out.contains("cancelling"), "{out}");
     }

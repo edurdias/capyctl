@@ -195,9 +195,11 @@ pub(crate) enum EventMetadata {
         detail: String,
     },
     /// SPEC §10 (amended 2026-10-01): the engine reported quiescence after a
-    /// client hung up, so the binding's cancelling leases closed. ADR 0031 §6:
-    /// on an engine that reports no idle signal, the verified exit of its
-    /// instance at a stop closes them instead; the receipt names that stop.
+    /// client hung up, so the binding's cancelling leases closed. ADR 0031 §6,
+    /// SPEC §10 (amended 2026-10-21): on an engine that reports no idle
+    /// signal, or for a request the engine never answered before its
+    /// cancellation, the verified exit of its instance at a stop closes them
+    /// instead; the receipt names that stop and why.
     #[serde(rename = "1")]
     RequestCancellationAcknowledged {
         deployment_id: String,

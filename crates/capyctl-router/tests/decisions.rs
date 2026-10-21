@@ -601,7 +601,8 @@ const LLAMA_TOO_LARGE: &str = r#"{"error":{"code":500,"message":"input (8195 tok
 // T43 T17 (SPEC §10, amended 2026-10-17, found live): an engine's complete
 // error answer is relayed as a 502 `engine_error` with the engine's message,
 // not retryable and never replayed; its lease is cancelling, charged until
-// the engine reports quiescence, and the in-memory slot is released.
+// the engine reports quiescence, and the in-memory slot is released. Amended
+// 2026-10-21: the complete answer counts as the engine's answer.
 #[tokio::test]
 async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
     let (endpoint, seen) = engine(Reply::Answer(
@@ -622,7 +623,10 @@ async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
             .starts_with("input (8195 tokens) is too large to process"),
         "{answer}"
     );
-    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Cancelling)]);
+    assert_eq!(
+        authority.ends(),
+        vec![Some(LeaseEnd::Cancelling { answered: true })]
+    );
     assert_eq!(seen.lock().unwrap().len(), 1, "never replayed");
     assert_eq!(deps.inflight.current(DEPLOYMENT), 0);
 }
@@ -630,6 +634,8 @@ async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
 // T43 T19 (ADR 0030 §2, SPEC §10): a decision has no first-token event, so its
 // whole answer is due by the request deadline whatever the idle bound; one
 // cut there closed the engine connection and stays charged as cancelling.
+// T17 (amended 2026-10-21): it was cut before its answer arrived, so it is
+// unanswered and settles only at the instance's verified stop.
 #[tokio::test]
 async fn a_decision_is_bounded_by_the_request_deadline() {
     let (endpoint, _) = engine(Reply::Stall).await;
@@ -648,7 +654,10 @@ async fn a_decision_is_bounded_by_the_request_deadline() {
             .expect("cut at the request deadline");
     assert_eq!(status, 500, "{answer}");
     assert_eq!(answer["code"], "engine_error");
-    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Cancelling)]);
+    assert_eq!(
+        authority.ends(),
+        vec![Some(LeaseEnd::Cancelling { answered: false })]
+    );
 }
 
 // T43 (ADR 0030 §5): `/v1/models` names the API each model answers, read

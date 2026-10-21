@@ -608,29 +608,42 @@ async fn a_hung_up_stream_without_a_ledger_keeps_its_slot() {
 // bounds is cancelled the same way (found live 2026-10-02): dropping the
 // forward closed the engine connection, so it is cancelling too. So is one
 // the engine answered with an error before it started (amended 2026-10-17);
-// a body that proves nothing stays uncertain.
+// a body that proves nothing stays uncertain. Amended 2026-10-21: the
+// cancellation carries whether the engine produced output first, and an
+// engine's complete error answer counts as its answer.
 #[test]
 fn a_hung_up_stream_closes_its_lease_as_cancelling() {
     use capyctl_controller::LeaseEnd;
     use capyctl_router::stream::stream_lease_end;
-    assert_eq!(
-        stream_lease_end(&Ok(Ok(StreamEnded::Cancelled))),
-        LeaseEnd::Cancelling
-    );
-    assert_eq!(
-        stream_lease_end(&Ok(Ok(StreamEnded::Completed))),
-        LeaseEnd::Completed
-    );
-    assert_eq!(stream_lease_end(&Err(())), LeaseEnd::Cancelling);
-    assert_eq!(
-        stream_lease_end(&Ok(Err(AdapterError::EngineError {
-            status: 500,
-            message: "input (8195 tokens) is too large to process".into(),
-        }))),
-        LeaseEnd::Cancelling
-    );
-    assert_eq!(
-        stream_lease_end(&Ok(Err(AdapterError::Uncertain("cut short".into())))),
-        LeaseEnd::Uncertain
-    );
+    for answered in [true, false] {
+        assert_eq!(
+            stream_lease_end(&Ok(Ok(StreamEnded::Cancelled)), answered),
+            LeaseEnd::Cancelling { answered }
+        );
+        assert_eq!(
+            stream_lease_end(&Err(()), answered),
+            LeaseEnd::Cancelling { answered }
+        );
+        assert_eq!(
+            stream_lease_end(&Ok(Ok(StreamEnded::Completed)), answered),
+            LeaseEnd::Completed
+        );
+        assert_eq!(
+            stream_lease_end(
+                &Ok(Err(AdapterError::EngineError {
+                    status: 500,
+                    message: "input (8195 tokens) is too large to process".into(),
+                })),
+                answered
+            ),
+            LeaseEnd::Cancelling { answered: true }
+        );
+        assert_eq!(
+            stream_lease_end(
+                &Ok(Err(AdapterError::Uncertain("cut short".into()))),
+                answered
+            ),
+            LeaseEnd::Uncertain
+        );
+    }
 }
