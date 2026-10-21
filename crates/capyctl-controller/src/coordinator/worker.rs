@@ -3746,9 +3746,11 @@ struct QuiescenceAnswer {
 
 /// SPEC §10 (amended 2026-10-01): at most every 250 ms, the retained bindings
 /// with a cancelling lease, each with its driver. Reading them waits for no
-/// engine. ADR 0031 §6, SPEC §10: an engine that reports no idle signal is
-/// never listed (`cancelling_bindings`), so it is never asked; its cancelling
-/// leases settle only at its verified exit, in the stop's cleanup.
+/// engine. ADR 0031 §6, SPEC §10 (amended 2026-10-21): a cancellation settled
+/// at stop (on an engine that reports no idle signal, or of a request the
+/// engine never answered) is never listed (`cancelling_bindings`), so no
+/// engine is asked about it; it settles only at its instance's verified exit,
+/// in the stop's cleanup.
 async fn cancelling_drivers(
     shared: &Arc<Shared>,
 ) -> Result<
@@ -3849,9 +3851,10 @@ async fn settle_quiescent(
 /// close). SPEC §10: live requests are not killed while the bound runs. When it
 /// passes with requests still charged, the Stop terminates anyway: an explicit
 /// or policy Stop is the separate authorization force termination needs. Their
-/// leases keep their accounting until they settle on evidence. ADR 0031 §6:
-/// a cancelling lease on an engine that reports no idle signal is not waited
-/// for (`binding_outstanding_leases`); this stop's verified exit settles it.
+/// leases keep their accounting until they settle on evidence. ADR 0031 §6,
+/// SPEC §10 (amended 2026-10-21): a cancelling lease settled at stop is not
+/// waited for (`binding_outstanding_leases`); this stop's verified exit
+/// settles it.
 async fn drain_before_terminate(
     shared: &Arc<Shared>,
     work: &OrdinaryCleanupReceipt,

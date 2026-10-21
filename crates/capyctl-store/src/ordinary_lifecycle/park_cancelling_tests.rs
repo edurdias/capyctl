@@ -1,5 +1,7 @@
 //! ADR 0031 §6, SPEC §10: cancelling requests on a custom engine, with and
-//! without an idle signal, against the durable lifecycle. CPU only.
+//! without an idle signal, and (amended 2026-10-21) on a built-in engine,
+//! answered by the engine before their cancellation or not, against the
+//! durable lifecycle. CPU only.
 use super::*;
 use crate::dispatch::{DispatchRequest, DispatchTicket, LeaseWrite, LeaseWriteOutcome};
 use crate::ordinary_lifecycle::retired_leases::QuiescenceEvidence;
@@ -87,10 +89,17 @@ impl Lab {
         )
     }
 
-    fn cancel(&self, ticket: &DispatchTicket) {
+    /// Cancel `ticket`; `answered` when the engine answered it first.
+    fn cancel(&self, ticket: &DispatchTicket, answered: bool) {
         let outcome = self
             .store
-            .apply_request_lease_batch(&self.session, &[LeaseWrite::Cancel(ticket.clone())])
+            .apply_request_lease_batch(
+                &self.session,
+                &[LeaseWrite::Cancel {
+                    ticket: ticket.clone(),
+                    answered,
+                }],
+            )
             .unwrap();
         assert!(matches!(
             outcome[..],
@@ -133,13 +142,13 @@ impl Lab {
     }
 }
 
-/// A Ready custom instance with one cancelling lease.
+/// A Ready custom instance with one cancelling lease the engine answered.
 fn cancelling(idle: bool) -> (Lab, DeploymentFence) {
     let lab = custom_lab(idle);
     let a = lab.deploy_custom("a", idle);
     lab.ready(&a, 1_000, 10);
     let ticket = lab.grant(&a, 4).unwrap();
-    lab.cancel(&ticket);
+    lab.cancel(&ticket, true);
     (lab, a)
 }
 
@@ -190,7 +199,7 @@ fn a_cancelling_lease_without_an_idle_signal_stays_charged_and_drains_skip_it() 
             .unwrap(),
         1
     );
-    lab.cancel(&answering);
+    lab.cancel(&answering, false);
     assert_eq!(
         lab.store.binding_outstanding_leases(&binding).unwrap(),
         Some(0)
@@ -204,7 +213,8 @@ fn a_cancelling_lease_without_an_idle_signal_stays_charged_and_drains_skip_it() 
     let json = serde_json::to_value(&requests).unwrap();
     assert_eq!(
         json,
-        json!({"cancelling": "2", "cancelling_settles": "stop"})
+        json!({"cancelling": "2", "cancelling_settles": "stop",
+            "settle_when_idle": "0", "settle_at_stop": "2"})
     );
 }
 
@@ -415,4 +425,170 @@ fn retired_leases_without_an_idle_signal_are_not_abandoned_on_a_reading() {
         .unwrap_err();
     assert!(matches!(error, LifecycleError::Rejected(_)), "{error:?}");
     assert_eq!(lab.leases(&a), 1);
+}
+
+/// A Ready deep-parking built-in instance with one cancelling lease, answered
+/// by the engine before its cancellation when `answered`.
+fn built_in_cancelling(answered: bool) -> (Lab, DeploymentFence) {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    lab.ready(&a, 1_000, 10);
+    let ticket = lab.grant(&a, 4).unwrap();
+    lab.cancel(&ticket, answered);
+    (lab, a)
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-21): a request cut before the engine
+// answered it is never settled by an idle reading, however late, and status
+// counts it apart from one the engine answered, which still settles on the
+// reading. Only the instance's verified stop settles it, journaled once with
+// a receipt naming that stop and why.
+#[test]
+fn an_unanswered_cancellation_stays_charged_until_the_verified_stop() {
+    let (lab, a) = built_in_cancelling(false);
+    let binding = lab.binding(&a);
+    assert!(lab
+        .store
+        .cancelling_bindings(&lab.session)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        lab.store
+            .settle_cancelled_leases(&lab.session, &binding, i64::MAX, "metrics read 0")
+            .unwrap(),
+        0
+    );
+    assert_eq!(lab.leases(&a), 1);
+    // An answered one beside it settles on the reading; the other stays.
+    let answered = lab.grant(&a, 4).unwrap();
+    lab.cancel(&answered, true);
+    let requests = lab.requests(&a);
+    assert_eq!(
+        serde_json::to_value(&requests).unwrap(),
+        json!({"cancelling": "2", "cancelling_settles": "idle_signal",
+            "settle_when_idle": "1", "settle_at_stop": "1"})
+    );
+    assert!(matches!(
+        lab.store
+            .cancelling_bindings(&lab.session)
+            .unwrap()
+            .as_slice(),
+        [CancellingBinding { leases: 1, .. }]
+    ));
+    assert_eq!(
+        lab.store
+            .settle_cancelled_leases(&lab.session, &binding, i64::MAX, "metrics read 0")
+            .unwrap(),
+        1
+    );
+    assert_eq!(lab.leases(&a), 1);
+    assert_eq!(lab.acknowledgements().len(), 1);
+    // The stop does not wait for it, and its verified exit settles it.
+    assert_eq!(
+        lab.store.binding_outstanding_leases(&binding).unwrap(),
+        Some(0)
+    );
+    let stop = lab
+        .store
+        .accept_instance_stop_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            0,
+            a.revision,
+            "stop",
+            1_100,
+            60_000,
+        )
+        .unwrap()
+        .unwrap();
+    finish_stop(&lab, &stop.step_id, 1_200, true).unwrap();
+    assert_eq!(lab.leases(&a), 0);
+    let acknowledged = lab.acknowledgements();
+    assert_eq!(acknowledged.len(), 2, "{acknowledged:?}");
+    let payload: Value = serde_json::from_str(&acknowledged[1].payload_json).unwrap();
+    assert_eq!(payload["count"], json!(1), "{payload}");
+    let receipt = payload["receipt"].as_str().unwrap();
+    assert!(
+        receipt.starts_with("cancelled before the engine answered; stop operation"),
+        "{receipt}"
+    );
+    assert!(receipt.contains(&stop.step_id), "{receipt}");
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-21): an unverified stop keeps an
+// unanswered cancellation charged; nothing is acknowledged.
+#[test]
+fn an_unverified_stop_keeps_an_unanswered_cancellation() {
+    let (lab, a) = built_in_cancelling(false);
+    let stop = lab
+        .store
+        .accept_instance_stop_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            0,
+            a.revision,
+            "stop",
+            1_100,
+            60_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(finish_stop(&lab, &stop.step_id, 1_200, false).is_err());
+    assert_eq!(lab.leases(&a), 1);
+    assert!(lab.acknowledgements().is_empty());
+    assert_eq!(lab.requests(&a).settle_at_stop, "1");
+}
+
+// T17 (SPEC §10, amended 2026-10-21, §9.2): the idle policy stops, rather
+// than parks, an instance whose only lease is a cancellation the engine
+// never answered, and a switch releases it by a stop: a park would wait for
+// it forever. One the engine answered still holds the instance busy.
+#[test]
+fn an_unanswered_cancellation_turns_a_park_into_a_stop() {
+    let policy = IdlePolicy {
+        ready_idle_ms: Some(5_000),
+        parked_idle_ms: None,
+    };
+    let quiet = |_: &str, _: i64| None;
+    let (lab, a) = built_in_cancelling(false);
+    let actions = lab
+        .store
+        .apply_idle_policy(&lab.session, 7_000, policy, &quiet, 0)
+        .unwrap();
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [IdleAction::Stopped { deployment_id, reason: "ready_idle_unanswered_cancellation", .. }]
+                if *deployment_id == a.deployment_id
+        ),
+        "{actions:?}"
+    );
+    let (lab, _) = built_in_cancelling(true);
+    assert!(lab
+        .store
+        .apply_idle_policy(&lab.session, 7_000, policy, &quiet, 0)
+        .unwrap()
+        .is_empty());
+    let (lab, a) = built_in_cancelling(false);
+    let generation = lab.instance(&a.deployment_id).2;
+    assert!(lab
+        .store
+        .close_for_switch(&lab.session, &a.deployment_id, 0, generation)
+        .unwrap());
+    let release = lab
+        .store
+        .accept_switch_release(
+            &lab.session,
+            "switch",
+            &a.deployment_id,
+            0,
+            generation,
+            "switch-release",
+            1_100,
+            true,
+        )
+        .unwrap();
+    assert!(!release.parked);
 }

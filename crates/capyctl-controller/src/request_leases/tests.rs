@@ -284,7 +284,9 @@ async fn group_commit_bounds_the_latency_a_dispatch_pays() {
 }
 
 // T17, SPEC §10 (amended 2026-10-01): a hung-up request's lease stays
-// in flight and charged; only the engine's quiescence closes it.
+// in flight and charged; only the engine's quiescence closes it. Amended
+// 2026-10-21: only one the engine answered is asked about; one it never
+// answered stays charged for the verified stop, and drains skip it.
 #[tokio::test]
 async fn closing_as_cancelling_keeps_the_lease_charged() {
     let f = fixture();
@@ -297,13 +299,24 @@ async fn closing_as_cancelling_keeps_the_lease_charged() {
         )
         .unwrap();
     let writer = RequestLeaseWriter::spawn(f.backend(Default::default()));
-    let lease = writer.open(&f.deployment, 8).await.unwrap();
-    writer.close(lease, LeaseEnd::Cancelling).await.unwrap();
-    assert!(f.leases().iter().all(|(_, d)| d == "inflight"));
+    let answered = writer.open(&f.deployment, 8).await.unwrap();
+    let unanswered = writer.open(&f.deployment, 8).await.unwrap();
+    writer
+        .close(answered, LeaseEnd::Cancelling { answered: true })
+        .await
+        .unwrap();
+    writer
+        .close(unanswered, LeaseEnd::Cancelling { answered: false })
+        .await
+        .unwrap();
+    let leases = f.leases();
+    assert_eq!(leases.len(), 2);
+    assert!(leases.iter().all(|(_, d)| d == "inflight"));
     let store = f.store.lock().unwrap();
     let cancelling = store.cancelling_bindings(&f.session).unwrap();
     assert_eq!(cancelling.len(), 1);
     assert_eq!(cancelling[0].binding_id, "binding-a");
+    assert_eq!(cancelling[0].leases, 1);
     assert_eq!(
         store.binding_outstanding_leases("binding-a").unwrap(),
         Some(1)

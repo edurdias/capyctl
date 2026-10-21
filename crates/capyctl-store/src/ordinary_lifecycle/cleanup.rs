@@ -1477,22 +1477,35 @@ pub(crate) fn complete(
     if unproven {
         return Err(LifecycleError::Conflict);
     }
-    // ADR 0031 §6, SPEC §10: on an engine that reports no idle signal, this
-    // verified exit is the cancellation acknowledgement of its cancelling
-    // leases. It is journaled with a receipt naming this stop, in the same
-    // transaction that deletes them and releases the reservation; an
-    // uncertain cleanup never reaches here, so both stay held. Built-in
-    // engines settle on their idle signal and are unchanged.
-    let acknowledged: i64 = tx.query_row(
+    // ADR 0031 §6, SPEC §10 (amended 2026-10-21): this verified exit is the
+    // cancellation acknowledgement of the cancelling leases no idle reading
+    // may settle: those on an engine that reports no idle signal, and those
+    // the engine never answered before their cancellation. It is journaled
+    // with a receipt naming this stop, in the same transaction that deletes
+    // them and releases the reservation; an uncertain cleanup never reaches
+    // here, so both stay held. Answered cancellations on an engine with an
+    // idle signal settle on its reading and are unchanged.
+    let (without_idle_signal, unanswered): (i64, i64) = tx.query_row(
         &format!(
-            "SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id
-              WHERE l.deployment_id=?1 AND l.revision=?2 AND l.generation=?3 AND l.disposition='inflight' AND {}",
-            crate::request_lease_cancellations::lane_without_idle_signal("l.deployment_id", "l.instance_index")
+            "SELECT COALESCE(SUM(CASE WHEN {no_idle} THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN NOT {no_idle} AND c.engine_answered=0 THEN 1 ELSE 0 END),0)
+               FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id
+              WHERE l.deployment_id=?1 AND l.revision=?2 AND l.generation=?3 AND l.disposition='inflight'",
+            no_idle = crate::request_lease_cancellations::lane_without_idle_signal(
+                "l.deployment_id",
+                "l.instance_index"
+            )
         ),
         params![original.deployment_id, original.revision, original.generation],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let acknowledged = without_idle_signal + unanswered;
     if acknowledged > 0 {
+        let why = match (without_idle_signal > 0, unanswered > 0) {
+            (true, false) => "the engine reports no idle signal",
+            (false, true) => "cancelled before the engine answered",
+            _ => "the engine reports no idle signal, or cancelled before the engine answered",
+        };
         crate::events::append_event(
             tx,
             &crate::events::EventMetadata::RequestCancellationAcknowledged {
@@ -1501,7 +1514,7 @@ pub(crate) fn complete(
                 count: usize::try_from(acknowledged)
                     .map_err(|_| LifecycleError::CorruptStoredData)?,
                 receipt: format!(
-                    "the engine reports no idle signal; stop operation {} (cleanup step {}) \
+                    "{why}; stop operation {} (cleanup step {}) \
                      verified the exit of the instance's process group",
                     p.receipt.operation_id, p.receipt.step_id
                 ),

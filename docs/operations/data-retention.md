@@ -11,7 +11,7 @@ the engine's own output, and only if the engine prints it; see
 | What | Contents | Where | How long | Turn off or reduce |
 |---|---|---|---|---|
 | Request records | IDs only: request, deployment, revision, generation, session, in flight or uncertain | Server or standalone database | Deleted when the request completes, fails or its launch is cleaned up | Cannot be turned off; it is how a drain knows a request is still running |
-| Cancellation records | The request ID and the time it was cancelled | Server or standalone database | Deleted together with the request's record | Cannot be turned off |
+| Cancellation records | The request ID, the time it was cancelled, and whether the engine had answered it by then | Server or standalone database | Deleted together with the request's record | Cannot be turned off |
 | Management events | Lifecycle events (operations, state changes, errors); no request bodies | Server or standalone database | 7 days, at most 100,000 rows and 64 MiB; older rows are pruned every time an event is written | Cannot be turned off |
 | Journal | Lifecycle commands and their evidence; no request bodies, engine log tails or probe text | Server, standalone and host databases | Never pruned | Cannot be turned off |
 | Latency and load figures | Per-request timings and engine load samples | Memory only | Until the role restarts | Nothing to turn off; never written to disk |
@@ -30,8 +30,13 @@ uncertain (after a restart). The record is deleted when the request completes
 or fails, or when its launch is cleaned up. A drain or park waits until no
 records of in-flight requests remain.
 
-A cancelled request also gets a cancellation record: its request ID and the
-cancellation time. It is deleted with the request's record.
+A cancelled request also gets a cancellation record: its request ID, the
+cancellation time, and whether the engine had answered it before the
+cancellation (no content: only yes or no). It is deleted with the request's
+record: when the engine reports itself idle afterwards if it had answered,
+otherwise when the engine next stops or restarts
+([When a request is cut short](../guide/requests.md#when-a-request-is-cut-short)).
+A record written by 0.1.6 or earlier reads as not answered.
 
 ## Management events
 

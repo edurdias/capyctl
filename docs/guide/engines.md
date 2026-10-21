@@ -704,7 +704,11 @@ stopped. Known engines show it through their counts of running and waiting
 requests; a custom engine shows it only through `idle`. With `idle`, CapyCTL
 reads the path after the hang-up and counts the request finished once every
 named gauge or field reads 0 (or `false`). A missing, malformed or failing
-reading never counts as idle.
+reading never counts as idle. A reading counts only for a request the engine
+had answered before it was cut (part of its answer, or its error); one cut
+before that may not have reached the engine's queue yet, and settles at the
+next stop or restart as below, whatever the engine
+([When a request is cut short](requests.md#when-a-request-is-cut-short)).
 
 Without `idle`, nothing shows that the engine stopped working on the request,
 and some engines do not: basal finishes a decision whose client has gone. So
@@ -721,10 +725,13 @@ there are any:
 Instance 0  cancelling: 2 (settles at the next stop or restart: the engine reports no idle signal)
 ```
 
-or, with `idle`, `Instance 0  cancelling: 1 (settles on the engine's idle signal)`. With
-`--json`, each instance has `requests.cancelling` and
-`requests.cancelling_settles` (`idle_signal` or `stop`). `capyctl engine list`
-shows each custom engine's `IDLE SIGNAL`, or `none`.
+or, with `idle`, `Instance 0  cancelling: 1 (settles on the engine's idle signal)`,
+or, when some were cut before the engine answered them,
+`Instance 0  cancelling: 3 (2 settle on the engine's idle signal; 1 at the next stop or restart: cancelled before the engine answered)`.
+With `--json`, each instance has `requests.cancelling`,
+`requests.cancelling_settles` (`idle_signal` or `stop`), and how many of them
+settle each way, `requests.settle_when_idle` and `requests.settle_at_stop`.
+`capyctl engine list` shows each custom engine's `IDLE SIGNAL`, or `none`.
 
 ### What CapyCTL cannot promise
 

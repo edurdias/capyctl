@@ -937,7 +937,9 @@ async fn an_unverified_failure_keeps_the_lease_charged() {
 // error answer (llama.cpp v0.7.0's 500 for an input over its batch size) is
 // relayed as a 502 `engine_error` with the engine's message, not retryable,
 // collected and streamed alike, and never sent to another instance. The
-// lease is cancelling, not uncertain, so the engine's quiescence settles it.
+// lease is cancelling, not uncertain, so the engine's quiescence settles it:
+// amended 2026-10-21, the complete answer is the engine's answer, so the
+// cancellation counts as answered.
 #[tokio::test]
 async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
     let error = serde_json::json!({"error":{"code":500,
@@ -972,7 +974,7 @@ async fn an_engine_error_answer_is_relayed_and_leaves_the_lease_cancelling() {
     );
     assert_eq!(
         ends(&authority),
-        vec![Some(capyctl_controller::LeaseEnd::Cancelling); bound + 3]
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling { answered: true }); bound + 3]
     );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), bound + 3);
     assert_eq!(deps.inflight.current("dep-1"), 0);
@@ -1343,6 +1345,8 @@ async fn with_no_waiting_a_request_beyond_the_in_flight_bound_is_refused_at_once
 // not by a fixed 300 s / 60 s cap. A backend that stalls after its first event
 // is cut at the idle bound; the cut closed the engine connection, so its lease
 // is cancelling until the engine reports quiescence (found live 2026-10-02).
+// Amended 2026-10-21: the engine produced output first, so the cancellation
+// counts as answered.
 #[tokio::test]
 async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     let first = format!(
@@ -1385,8 +1389,170 @@ async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     assert_eq!(answer["code"], "engine_error");
     assert_eq!(
         ends(&authority),
-        vec![Some(capyctl_controller::LeaseEnd::Cancelling)]
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+            answered: true
+        })]
     );
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-21): a collected request cut at its
+// deadline before the engine answered anything (headers and a chunk that only
+// opens the reply are not an answer) is cancelling as unanswered, so no idle
+// reading settles it; only the instance's verified stop does.
+#[tokio::test]
+async fn a_collected_request_cut_before_its_answer_is_unanswered() {
+    let opening = format!(
+        "data: {}\n\n",
+        serde_json::json!({"id":"chat-1","object":"chat.completion.chunk","created":1,
+            "model":"served-name","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]})
+    );
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || {
+            let opening = opening.clone();
+            async move {
+                let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(opening) })
+                    .chain(futures::stream::pending());
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let (authority, deps) = stub_router(&endpoint);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, answer) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_once(&router, "public-alias"),
+    )
+    .await
+    .expect("cut at the request deadline");
+    assert_eq!(status, 500, "{answer}");
+    assert_eq!(
+        ends(&authority),
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+            answered: false
+        })]
+    );
+}
+
+/// An engine that answers every chat request with an SSE stream: `opening`
+/// first, then, when `content`, a content chunk every 20 ms forever.
+async fn endless_engine(content: bool) -> String {
+    let chunk = |delta: serde_json::Value| {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"id":"chat-1","object":"chat.completion.chunk","created":1,
+                "model":"served-name","choices":[{"index":0,"delta":delta,"finish_reason":null}]})
+        )
+    };
+    let opening = chunk(serde_json::json!({"role":"assistant","content":""}));
+    let token = chunk(serde_json::json!({"content":"he"}));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || {
+            let (opening, token) = (opening.clone(), token.clone());
+            async move {
+                let tokens = futures::stream::unfold(token, |token| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Some((Ok::<_, std::io::Error>(token.clone()), token))
+                });
+                let opening = futures::stream::once(async move { Ok(opening) });
+                let body = if content {
+                    axum::body::Body::from_stream(opening.chain(tokens))
+                } else {
+                    axum::body::Body::from_stream(opening.chain(futures::stream::pending()))
+                };
+                ([("content-type", "text/event-stream")], body)
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    endpoint
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-21): a stream the router cuts at its
+// request deadline before the engine produced any output (only response
+// headers and a chunk that only opens the reply) is cancelling as
+// unanswered: no idle reading settles it, only the verified stop.
+#[tokio::test]
+async fn a_stream_cut_before_any_engine_output_is_unanswered() {
+    let endpoint = endless_engine(false).await;
+    let (authority, deps) = stub_router(&endpoint);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_stream(&router, "public-alias"),
+    )
+    .await
+    .expect("cut at the request deadline");
+    assert_eq!(status, 200);
+    assert!(!text.contains("[DONE]"), "{text}");
+    eventually(|| {
+        ends(&authority)
+            == vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+                answered: false,
+            })]
+    })
+    .await;
+}
+
+// T17 (SPEC §10, amended 2026-10-21): a client that hangs up after the
+// engine's first output leaves a cancellation the engine answered, which its
+// idle reading settles as before.
+#[tokio::test]
+async fn a_hang_up_after_an_engine_chunk_is_answered() {
+    let endpoint = endless_engine(true).await;
+    let (authority, deps) = stub_router(&endpoint);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = capyctl_router::serve_router(deps.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{address}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "public-alias", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("\"he\"") {
+        let bytes = body.next().await.unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    // The client hangs up mid-stream.
+    drop(body);
+    drop(client);
+    eventually(|| {
+        ends(&authority)
+            == vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+                answered: true,
+            })]
+    })
+    .await;
 }
 
 // T15 (SPEC §10 step 2): a detached activation whose task panics answers its

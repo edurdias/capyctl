@@ -10,8 +10,8 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V6,
+    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -78,6 +78,9 @@ pub const MIGRATIONS: &[&str] = &[
     // SPEC §17 (owner decision 2026-10-18): history indexes for the router's
     // serving-instance read.
     SCHEMA_V50,
+    // SPEC §10 (amended 2026-10-21): whether the engine answered a cancelled
+    // request; old rows read as not answered.
+    SCHEMA_V51,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -181,6 +184,11 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
         if version == 46 {
             // ADR 0014 §7 (amendment of 2026-10-08): digest provenance.
             crate::checkpoint_digests::migrate_v46(&tx)?;
+        }
+        if version == 51 {
+            // SPEC §10 (amended 2026-10-21): whether the engine answered a
+            // cancelled request; old rows read as not answered.
+            crate::request_lease_cancellations::migrate_v51(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -330,6 +338,44 @@ mod tests {
             .unwrap();
         assert_eq!(max, MIGRATIONS.len() as i64);
         assert_eq!(count, MIGRATIONS.len() as i64);
+    }
+
+    /// SPEC §10 (amended 2026-10-21, v51): a cancellation 0.1.6 recorded is
+    /// carried across unchanged and reads as not answered by the engine, so
+    /// no idle reading settles it; a new row can say either, nothing else.
+    // T17 T33
+    #[test]
+    fn v51_reads_an_existing_cancellation_as_unanswered() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 50).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition,instance_index) VALUES('old','a',1,1,'s','inflight',0),('new','a',1,1,'s','inflight',0);
+            INSERT INTO request_lease_cancellations(lease_id,cancelled_at_ms) VALUES('old',7);"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let carried: (i64, i64) = conn
+            .query_row(
+                "SELECT cancelled_at_ms,engine_answered FROM request_lease_cancellations WHERE lease_id='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(carried, (7, 0), "an old cancellation reads as unanswered");
+        assert!(conn
+            .execute(
+                "INSERT INTO request_lease_cancellations(lease_id,cancelled_at_ms,engine_answered) VALUES('new',8,2)",
+                []
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO request_lease_cancellations(lease_id,cancelled_at_ms,engine_answered) VALUES('new',8,1)",
+            [],
+        )
+        .unwrap();
     }
 
     /// ADR 0028 §5, §6 (v41): resource owners, endpoint leases and recorded

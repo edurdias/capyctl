@@ -394,8 +394,12 @@ pub async fn dispatch_timed(
             };
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
             // closes the engine connection, so the lease is cancelling, as for
-            // a stream whose client hung up.
+            // a stream whose client hung up. Amended 2026-10-21: it settles on
+            // the engine's quiescence only if the engine produced output for
+            // it first. A decision reports no progress, and its answer comes
+            // whole, so a cut decision was never answered.
             let cut = bounded.is_err();
+            let answered = progress.produced();
             let result = bounded.unwrap_or_else(|()| {
                 Err(AdapterError::Uncertain(
                     "the backend missed the request's deadline or idle bound".into(),
@@ -422,7 +426,7 @@ pub async fn dispatch_timed(
                 Err(error) => error,
             };
             let end = if cut {
-                LeaseEnd::Cancelling
+                LeaseEnd::Cancelling { answered }
             } else {
                 lease_end(Some(&error))
             };
@@ -548,7 +552,9 @@ pub(crate) fn lease_end(error: Option<&AdapterError>) -> LeaseEnd {
         Some(AdapterError::Rejected { .. }) => LeaseEnd::Completed,
         // SPEC §10 (amended 2026-10-17, found live): an engine's error answer
         // does not prove it stopped; charged until it reports quiescence.
-        Some(AdapterError::EngineError { .. }) => LeaseEnd::Cancelling,
+        // Amended 2026-10-21: it is the engine's complete answer to this
+        // request, so the engine had the request and its quiescence settles it.
+        Some(AdapterError::EngineError { .. }) => LeaseEnd::Cancelling { answered: true },
         // SPEC §10: a request the forwarder refused by policy or capability was
         // never sent; that is evidence of non-acceptance, not uncertainty.
         Some(error) if refused_before_sending(error) => LeaseEnd::NotAccepted,

@@ -96,7 +96,11 @@ pub enum LeaseEnd {
     /// connection was closed; the lease stays charged until the engine
     /// reports quiescence. Amended 2026-10-17 (found live): the same for an
     /// engine's complete error answer, which does not prove it stopped.
-    Cancelling,
+    /// Amended 2026-10-21: `answered` is whether the engine answered the
+    /// request before the cancellation (a stream's first output, or its
+    /// complete error answer). Only an answered request settles on the
+    /// engine's quiescence; any other settles at the instance's verified exit.
+    Cancelling { answered: bool },
 }
 
 /// Why a lease was not granted.
@@ -273,7 +277,7 @@ impl RequestLeaseWriter {
         let write = match end {
             LeaseEnd::Completed | LeaseEnd::NotAccepted => LeaseWrite::Finish(ticket),
             LeaseEnd::Uncertain => LeaseWrite::Uncertain(ticket),
-            LeaseEnd::Cancelling => LeaseWrite::Cancel(ticket),
+            LeaseEnd::Cancelling { answered } => LeaseWrite::Cancel { ticket, answered },
         };
         self.submit(write).await.map(|_| ())
     }

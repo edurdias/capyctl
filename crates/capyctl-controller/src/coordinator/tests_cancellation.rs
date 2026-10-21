@@ -1,6 +1,8 @@
 //! SPEC §10 (amended 2026-10-01): a request whose client hung up keeps its
 //! lease charged as cancelling until the engine reports quiescence, read by
-//! the real worker against the switching lab's scripted engine.
+//! the real worker against the switching lab's scripted engine. Amended
+//! 2026-10-21: only a request the engine answered before its cancellation
+//! settles that way; any other waits for the instance's verified exit.
 //!
 //! CPU and scripted engines only; nothing here qualifies a native engine.
 use super::*;
@@ -8,6 +10,14 @@ use crate::request_leases::{LeaseEnd, RequestLease};
 
 /// Long enough for several 250 ms quiescence ticks.
 const TICKS: Duration = Duration::from_millis(600);
+
+/// A cancellation of a request the engine answered first (a stream's first
+/// output, or its complete error answer).
+const ANSWERED: LeaseEnd = LeaseEnd::Cancelling { answered: true };
+
+/// A cancellation before the engine answered (a deadline cut while waiting
+/// for the first output, or a collected request cut before its answer).
+const UNANSWERED: LeaseEnd = LeaseEnd::Cancelling { answered: false };
 
 struct Harness {
     lab: Lab,
@@ -69,7 +79,7 @@ impl Harness {
 async fn a_cancelling_lease_closes_on_engine_quiescence() {
     let h = harness_with_ready_instance(false).await;
     let lease = h.open_lease().await;
-    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.close_lease(lease, ANSWERED).await;
     until("a second quiescence question", || {
         h.lab.engine.asked.lock().unwrap().len() > 1
     })
@@ -88,7 +98,7 @@ async fn a_completed_neighbour_does_not_close_a_cancelling_lease_on_a_busy_engin
     let h = harness_with_ready_instance(false).await;
     let other = h.open_lease().await;
     let hung_up = h.open_lease().await;
-    h.close_lease(hung_up, LeaseEnd::Cancelling).await;
+    h.close_lease(hung_up, ANSWERED).await;
     tokio::time::sleep(TICKS).await;
     assert_eq!(h.outstanding(), 2);
     h.close_lease(other, LeaseEnd::Completed).await;
@@ -114,7 +124,7 @@ async fn an_idle_sample_before_the_hang_up_closes_nothing() {
     let before = capyctl_protocol::now_unix_ms() - 1;
     *h.lab.engine.idle_at.lock().unwrap() = Some(before);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.close_lease(lease, ANSWERED).await;
     // One question at a time: a second one means the first answer, the idle
     // sample from before the hang-up, was applied.
     until("a second quiescence question", || {
@@ -144,7 +154,7 @@ async fn a_wedged_engine_never_delays_a_start() {
         generation,
     };
     let lease = h.open_lease().await;
-    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.close_lease(lease, ANSWERED).await;
     until("a quiescence question", || {
         !h.lab.engine.asked.lock().unwrap().is_empty()
     })
@@ -173,7 +183,7 @@ async fn a_wedged_engine_never_delays_a_start() {
 async fn a_cancelling_lease_settles_while_a_launch_is_paused() {
     let h = harness_with_ready_instance(false).await;
     let lease = h.open_lease().await;
-    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.close_lease(lease, ANSWERED).await;
     h.lab.worker.shared.pause(Paused {
         binding: "an-uncertain-launch".into(),
         status: WorkerStatus::Uncertain {
@@ -194,7 +204,7 @@ async fn a_cancelling_lease_settles_while_a_launch_is_paused() {
 async fn a_switch_waits_for_a_cancelling_lease() {
     let h = harness_with_ready_instance(false).await;
     let lease = h.open_lease().await;
-    h.close_lease(lease, LeaseEnd::Cancelling).await;
+    h.close_lease(lease, ANSWERED).await;
     let b = h.lab.c.deployment_id.clone();
     let switch = {
         let port = h.lab.port(Duration::from_secs(10));
@@ -217,6 +227,67 @@ async fn a_switch_waits_for_a_cancelling_lease() {
     assert_eq!(h.outstanding(), 0);
     assert_eq!(h.lab.state(&b), "ready");
     assert_eq!(h.lab.state(&h.lab.a.deployment_id), "parked");
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-21): a request cut before any engine
+// output (a deadline cut while waiting for its first token) stays charged
+// through quiescent readings: the engine is never asked about it. Only the
+// instance's verified stop settles it, journaled with a receipt naming the
+// stop.
+#[tokio::test]
+async fn a_cut_before_any_engine_output_settles_only_at_the_verified_stop() {
+    let h = harness_with_ready_instance(true).await;
+    let lease = h.open_lease().await;
+    h.close_lease(lease, UNANSWERED).await;
+    tokio::time::sleep(TICKS * 2).await;
+    assert!(h.lab.engine.asked.lock().unwrap().is_empty(), "never asked");
+    assert_eq!(h.outstanding(), 1, "still charged on a quiescent engine");
+    assert_eq!(h.acknowledged(), 0);
+    let id = h.lab.a.deployment_id.clone();
+    let stop = h
+        .lab
+        .worker
+        .commands()
+        .administrative_stop("operator", &id, h.lab.a.revision, "stop", 100_000)
+        .unwrap();
+    until_succeeded(&h.lab, stop.operation_id(), &id).await;
+    assert_eq!(h.outstanding(), 0, "the verified exit settles it");
+    let acknowledged = acknowledgements(&h.lab, &id);
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(acknowledged[0]["count"], json!(1));
+    let receipt = acknowledged[0]["receipt"].as_str().unwrap();
+    assert!(
+        receipt.starts_with("cancelled before the engine answered"),
+        "{receipt}"
+    );
+    assert!(receipt.contains(stop.operation_id()), "{receipt}");
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17 T16 (SPEC §10, amended 2026-10-21): a switch does not wait for a
+// cancellation the engine never answered: the victim is released by a stop,
+// never a park, and that stop's verified exit settles it.
+#[tokio::test]
+async fn a_switch_releases_an_unanswered_cancellation_by_a_stop() {
+    let h = harness_with_ready_instance(true).await;
+    let lease = h.open_lease().await;
+    h.close_lease(lease, UNANSWERED).await;
+    let b = h.lab.c.deployment_id.clone();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        h.lab.port(Duration::from_secs(5)).activate_for_request(&b),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let a = h.lab.a.deployment_id.clone();
+    assert_eq!(h.lab.state(&b), "ready");
+    assert_eq!(h.lab.state(&a), "stopped");
+    assert!(h.lab.operations(&a, "park").is_empty());
+    assert_eq!(h.outstanding(), 0);
+    assert_eq!(acknowledgements(&h.lab, &a).len(), 1);
+    assert!(h.lab.engine.asked.lock().unwrap().is_empty());
     h.lab.worker.shutdown().await.unwrap();
 }
 
@@ -330,9 +401,7 @@ async fn a_cancellation_without_an_idle_signal_is_never_settled_while_the_engine
         .await
         .unwrap()
         .unwrap();
-    port.close_request_lease(lease, LeaseEnd::Cancelling)
-        .await
-        .unwrap();
+    port.close_request_lease(lease, ANSWERED).await.unwrap();
     tokio::time::sleep(TICKS * 2).await;
     assert!(lab.engine.asked.lock().unwrap().is_empty(), "never asked");
     assert_eq!(leases(&lab, &fence.deployment_id), 1, "still charged");
@@ -350,9 +419,7 @@ async fn a_cancellation_with_an_idle_signal_settles_on_the_reading() {
         .await
         .unwrap()
         .unwrap();
-    port.close_request_lease(lease, LeaseEnd::Cancelling)
-        .await
-        .unwrap();
+    port.close_request_lease(lease, ANSWERED).await.unwrap();
     until("the idle reading to settle it", || {
         leases(&lab, &fence.deployment_id) == 0
     })
@@ -381,9 +448,7 @@ async fn a_stop_does_not_wait_for_a_cancellation_without_an_idle_signal() {
         .await
         .unwrap()
         .unwrap();
-    port.close_request_lease(lease, LeaseEnd::Cancelling)
-        .await
-        .unwrap();
+    port.close_request_lease(lease, ANSWERED).await.unwrap();
     assert_eq!(leases(&lab, &id), 1);
     let started = std::time::Instant::now();
     let stop = lab
@@ -420,9 +485,7 @@ async fn a_switch_does_not_wait_for_a_cancellation_without_an_idle_signal() {
         .await
         .unwrap()
         .unwrap();
-    port.close_request_lease(lease, LeaseEnd::Cancelling)
-        .await
-        .unwrap();
+    port.close_request_lease(lease, ANSWERED).await.unwrap();
     let b = lab.c.deployment_id.clone();
     // A drain that waited for the cancellation would fail at this bound.
     tokio::time::timeout(

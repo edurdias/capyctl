@@ -116,6 +116,29 @@ SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources; vLLM 0.30's `reasoning`
 was confirmed live, vLLM 0.31.0's streamed answers were relayed live, and the
 other listed versions are assumed to match until run against them.
 
+### When a request is cut short
+
+If your client hangs up, or a request runs past its deadline (no answer
+within `queue.request_deadline`, or a stream that goes quiet for
+`queue.stream_idle_timeout`), CapyCTL closes the engine connection, which
+asks the engine to stop. Closing a connection does not prove the engine
+stopped, so the request stays counted against its model's memory until
+CapyCTL sees the engine stop:
+
+- If the engine had already answered (it produced part of the answer, or
+  answered with an error), CapyCTL counts the request finished the first time
+  the engine reports no running and no waiting requests afterwards.
+- If it had not (the cut came before the engine's first token, streamed or
+  not; a chunk that only names the assistant role does not count, and a
+  decision request has no tokens before its whole answer), the engine may not
+  have started the request yet and could still run it after reporting itself
+  idle. The request stays counted until the engine's next stop or restart.
+  Stopping or switching does not wait for it, and a model that would park
+  stops instead.
+
+`capyctl status deployment <name>` shows, under the instance table, how many
+cancelled requests each instance still counts and how each will be settled.
+
 ## Per-request metrics
 
 Every completed chat answer carries the engine's figures for that request,
