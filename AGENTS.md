@@ -124,12 +124,16 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-10-20):
+  environments in use, all owner-approved (list updated 2026-10-21):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
     owner approval; 0.6.6 approved 2026-10-14), and a llama.cpp v0.7.0 build in the
     home directory (approved 2026-10-16, for Nemotron 3.5 Bolt and Super VL);
+  - host A, for qualifying LMCache (ADR 0033), approved 2026-10-21:
+    ~/vllm-0.32.0-lmcache-venv (a copy of the vLLM 0.32.0 environment with LMCache
+    0.5.6) and ~/sglang-0.5.22-lmcache-venv (a copy of the SGLang 0.5.22 environment
+    with LMCache 0.5.6 built against its torch 2.14.1);
   - host A: vLLM 0.31.0 and a llama.cpp v0.6.0 build in the home directory
     (approved 2026-10-14), and basal 2.2.0 (~/basal-2.2.0-venv, torch 2.11.0
     cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031);
