@@ -342,6 +342,7 @@ runtime_profiles:
     security:
       deep_park: disabled
       trust_remote_code: false
+      credential_ref: "secret://engine-key"
       installation_drift: warn
     custom:
       manifest:
@@ -356,7 +357,10 @@ runtime_profiles:
 
 `build_fingerprint` is the manifest's `version`, or `unversioned`.
 `security.deep_park` is always `disabled`: a custom engine never parks.
-`security.credential_ref` is present only when the manifest uses `{api_key}`.
+`security.credential_ref` names the engine-key reference and is required on a
+custom profile, including one written by hand in the role document (write
+`secret://engine-key`): CapyCTL seals a key for every launch, but renders and
+sends it only when the manifest uses `{api_key}`.
 `custom.manifest_digest` is the digest of the manifest; a profile whose digest
 does not match is refused `custom_manifest_invalid`, and the message gives
 the digest the manifest has. `args` stays empty: the manifest is the whole

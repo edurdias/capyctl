@@ -573,6 +573,17 @@ every registered engine with it, instead of skipping one profile as §1 first sa
   instead of parking"). A chat deployment on a custom engine gets this ADR's codes,
   `group_shape_unsupported:custom` and `capability_missing:deep_park` (§4, §10). Either
   way nothing is stored or started.
+- An operator who answers anything but `y` or `yes` at the confirmation of §8 gets the
+  new closed code `declined` (exit 2), and nothing is written.
+- Every custom profile names an engine-key reference, `security.credential_ref`
+  (`engine add --custom` writes `secret://engine-key`): the launch path seals a
+  per-launch key for every engine and refuses a profile without the reference. The key
+  is rendered and sent only when the manifest uses `{api_key}` (§7). A custom profile
+  written by hand in the role document states it too.
+- Qualification (owner decision 2026-10-21): CE1–CE4 run with basal-2.0-4.5B, a
+  decision model basal-serve serves, instead of basal-omni-1.0. basal's `--mode fp8`
+  needs torchao, which the approved environment does not install, so the rows run
+  `--mode fast --template-prefix off` and state `timeouts.initialize`.
 
 This amends SPEC §15.1 (the engines file) and T44, and replaces the `engines.yaml`
 references of §1, §8 and the Verification above.

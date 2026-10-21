@@ -76,12 +76,38 @@ the terminal prompt was `declined` (exit 2) with nothing written; `--yes` and a
 its external interpreter (23,021 files, 4.87 GB); `engine list` showed `CUSTOM
 yes`, `IDLE SIGNAL none`, `ENGINE KEY none`. The run found one listing bug (a
 second custom profile on the same root showed the first one's version), fixed
-here. The drift launch, CE2 (decisions readiness and the loopback check), CE3
-(a hang-up held until the verified stop) and CE4 (restart and the wake check)
-are still to run. basal's `--mode fp8` needs torchao, which the approved
-environment does not have; `--mode fast` (bf16, compiled) served a decision
-directly in 69 ms after an 843 s cold start (683 s with a warm compile cache),
-so deployments on it state `timeouts.initialize`.
+here.
+
+Drift launch passed: after a file under a scratch `environment` root changed,
+the profile registered with `--drift refuse` was refused `installation_drift`
+before any effect, and the `warn` one launched (basal `--mode eager`, ready in
+about 60 s) with `installation_drift_flagged` journaled and the host's profile
+shown `drifted`. CE2 passed: `basal-20` (`--mode fast --template-prefix off`,
+`resources: {gpu: 24GiB, ram: 8GiB}`, `timeouts.initialize: 30m`) became ready
+on the fixed decision in 703 s with a warm compile cache; the engine's only
+listener was 127.0.0.1:38500; a decision through the router answered in 67 ms;
+a manifest binding `--host 0.0.0.0` failed `custom_listener_exposed: an owned
+process listens on 0.0.0.0:38500, not on loopback; the engine was stopped`,
+with no listener and no process left. CE4 passed: after an operator stop
+(verified exit, `ordinary_cleanup_completed`) `start deployment basal-20 --wait`
+was ready again in 691 s through the decision probe, and its first decision gave
+the same probabilities as before the restart (0.9638675 for `technical`).
+
+CE3 is not demonstrated live. A client that hangs up on `POST /v1/systemone`
+does not make the request `cancelling`: a collected answer is still completed
+when the engine answers (the hung-up request's lease closed completed, status
+showed `cancelling: 0` before and after; basal kept computing it, so the next
+request waited 9.6 s). A deadline cut cannot be produced on basal either: a
+deployment's `request_deadline` must be at least its `timeouts.initialize`, and
+basal's start takes 11 to 14 minutes. The no-idle-signal settlement is covered
+by the store and controller tests named above (CPU and Fake-engine tests, not
+qualification); a live row needs a chat custom engine (a hang-up mid-stream) or
+an engine that answers 5xx.
+
+basal's `--mode fp8` needs torchao, which the approved environment does not
+have; `--mode fast` (bf16, compiled) served a decision directly in 69 ms after
+an 843 s cold start (683 s with a warm compile cache), so deployments on it
+state `timeouts.initialize`.
 
 # Release note: Engines
 

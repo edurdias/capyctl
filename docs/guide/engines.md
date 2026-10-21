@@ -1118,10 +1118,16 @@ capyctl engine list
 ```
 
 ```text
-PROFILE        SOURCE         ENGINE   VERSION     CUSTOM   DEEP PARK   PUBLISHED   DEPLOYMENTS
-vllm           engines.yaml   vllm     0.31.0      no       enabled     published   -
-vllm-nightly   engines.yaml   vllm     0.32.0rc1   yes      enabled     published   -
+PROFILE        SOURCE                ENGINE   VERSION     CUSTOM   DEEP PARK   IDLE SIGNAL   ENGINE KEY   PUBLISHED   DEPLOYMENTS
+basal-serve    custom-engines.yaml   custom   2.2.0       yes      disabled    none          none         published   -
+vllm           engines.yaml          vllm     0.31.0      no       enabled     -             -            published   -
+vllm-nightly   engines.yaml          vllm     0.32.0rc1   yes      enabled     -             -            published   -
 ```
+
+`IDLE SIGNAL` and `ENGINE KEY` apply to custom engines only (`-` for the
+others): the idle signal the manifest states, or `none`, and whether CapyCTL
+gives the engine a key per launch (`per-launch`) or it listens without one
+(`none`).
 
 `PUBLISHED` shows whether the running CapyCTL uses it (`unknown` while CapyCTL is
 not running). `capyctl list engines` lists the engines of every host on a server, and of this machine on a standalone.
