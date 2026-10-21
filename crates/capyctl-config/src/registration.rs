@@ -3,7 +3,8 @@
 //! and (ADR 0031 amendment A1) `custom-engines.yaml` beside it for custom
 //! engines. The host or standalone document is never rewritten; the role
 //! merges them at load, and a profile name declared twice is refused. Writes
-//! hold `<file>.lock`, go through a temporary file, sync and rename, and
+//! hold `engines.yaml.lock` (one lock for both files, amendment A1), go
+//! through a temporary file, sync and rename, and
 //! record the revision on the first line (a comment the parser ignores).
 use crate::effective::InstallationDrift;
 use crate::engine_policy::Engine;
@@ -282,13 +283,27 @@ pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<()
     Ok(())
 }
 
-/// An exclusive advisory lock on `<engines file>.lock` for one
-/// read-modify-write. Dropping it releases the lock.
+/// An exclusive advisory lock (`flock`) on `engines.yaml.lock` for one
+/// read-modify-write of either file of the pair. Dropping it releases the
+/// lock.
+///
+/// ADR 0031 amendment A1: a profile name lives in one of the two files, and
+/// both files count together toward the size bound, so both checks read the
+/// other file. One lock guards the pair — whichever file is written, the
+/// lock is `engines.yaml.lock` beside it — so a normal and a custom add (or
+/// a remove from either file) are serialized against each other and the
+/// sibling read under the lock is current.
 pub struct EnginesLock {
     _file: File,
+    /// The engines.yaml of the pair this lock guards.
     path: PathBuf,
     /// Who owns an engines file this write creates (`None`: the writer).
     owner: Option<(u32, u32)>,
+}
+
+/// The engines.yaml of the pair `path` (either file) belongs to.
+fn pair_of(path: &Path) -> PathBuf {
+    path.with_file_name(ENGINES_FILE)
 }
 
 pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError> {
@@ -308,7 +323,9 @@ pub fn lock_engines_for(
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
     }
-    let lock = PathBuf::from(format!("{}.lock", path.display()));
+    // ADR 0031 amendment A1: one lock for engines.yaml and custom-engines.yaml.
+    let pair = pair_of(path);
+    let lock = PathBuf::from(format!("{}.lock", pair.display()));
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -324,7 +341,7 @@ pub fn lock_engines_for(
     file.lock().map_err(|e| io(&lock, e))?;
     Ok(EnginesLock {
         _file: file,
-        path: path.to_path_buf(),
+        path: pair,
         owner,
     })
 }
@@ -377,7 +394,7 @@ pub fn write_engines(
     lock: &EnginesLock,
     host_document: Option<&Value>,
 ) -> Result<u64, ConfigError> {
-    if lock.path != file.path {
+    if lock.path != pair_of(&file.path) {
         return Err(ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
             file.path.display().to_string(),

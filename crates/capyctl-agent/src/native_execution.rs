@@ -230,14 +230,11 @@ impl NativeHostExecution {
         // The host document's period, bounded when it was parsed (D9: 250 ms
         // to 5 s), so a reporter is never refused for it here. ADR 0031 §6:
         // a custom engine's load is its manifest's idle signal, never a
-        // built-in family's `/metrics`.
+        // built-in family's `/metrics`; each ingress entry carries the signal
+        // frozen with its launch (`Ingress::bind_handle`).
         let load = crate::load::LoadReporter::new(ingress.clone(), host_id.clone())
             .and_then(|reporter| reporter.with_interval(config.load_report_interval))
             .ok()
-            .map(|reporter| {
-                reporter
-                    .with_launch_signals(custom::launch_signals(journal.clone(), profiles.clone()))
-            })
             .map(Arc::new);
         // ADR 0008: the store and policy come from this host's own approved
         // document; token references resolve from `<state_dir>/secrets`.
@@ -1532,9 +1529,19 @@ impl NativeHostExecution {
                     keys.inference,
                 )
                 .map_err(|_| SessionError)?;
-            // D9: load samples name the launch the controller holds as owned handle.
+            // D9: load samples name the launch the controller holds as owned
+            // handle. ADR 0031 §6, §7: the entry keeps how this launch's
+            // engine is read and keyed, from the document it is approved
+            // under, for the launch's whole life.
             self.ingress
-                .bind_handle(&scope, &command.identity.command_id)
+                .bind_handle(
+                    &scope,
+                    &command.identity.command_id,
+                    custom::engine_access(
+                        effective.profile.engine,
+                        effective.profile.custom.as_ref(),
+                    ),
+                )
                 .map_err(|_| SessionError)?;
         }
         let initialized = adapter
@@ -1611,8 +1618,14 @@ impl NativeHostExecution {
                 keys.inference,
             )
             .map_err(|_| SessionError)?;
+        // ADR 0031 §6, §7: unknown when the launch's approved profile is no
+        // longer held; an entry already bound to this launch keeps its own.
         self.ingress
-            .bind_handle(&scope, &owned.identity.command_id)
+            .bind_handle(
+                &scope,
+                &owned.identity.command_id,
+                self.retained_access(owned),
+            )
             .map_err(|_| SessionError)?;
         Ok(scope)
     }
@@ -4747,6 +4760,160 @@ mod tests {
                 .await
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    const CUSTOM_NEXT: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+        args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+        idle: {url: /next-idle, gauges: [next_running]}\n";
+
+    /// A custom engine whose approved idle signal (`/metrics`) reads busy and
+    /// whose republished one (`/next-idle`) would read idle. It records the
+    /// path of every request.
+    async fn republished_stub() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let captured = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = captured.clone();
+            async move {
+                seen.lock().unwrap().push(uri.path().to_owned());
+                match uri.path() {
+                    "/next-idle" => "next_running 0\n",
+                    _ => "requests_running 1\n",
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, seen)
+    }
+
+    /// Whether each sample of one load tick of `ingress` carries engine
+    /// figures (the only figures that can read quiescent).
+    async fn engine_figures(ingress: &Arc<crate::ingress::Ingress>) -> Vec<bool> {
+        let reporter = crate::load::LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+        reporter
+            .reports()
+            .await
+            .into_iter()
+            .flat_map(|r| {
+                capyctl_protocol::reports::LoadReport::try_from(r)
+                    .unwrap()
+                    .samples
+            })
+            .map(|sample| sample.engine.is_some())
+            .collect()
+    }
+
+    // T44 T17 (ADR 0031 §6; AGENTS.md: uncertainty must retain accounting): a
+    // profile removed and re-added under the same name with another idle
+    // signal takes two publications, after which the running launch's own
+    // document is no longer held. The launch is never sampled with the new
+    // manifest: an ingress entry keeps the signal frozen with its launch; one
+    // bound without it reads nothing and carries no engine figures, so its
+    // cancelling requests are never settled on a sample (only at the
+    // verified stop); and the stop gate waits its bound instead of skipping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_republished_profile_never_supplies_a_running_launch_idle_signal() {
+        use crate::ingress::{EngineAccess, Ingress, IngressScope};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            custom_fixture(root.path(), identity_dir.path(), CUSTOM_IDLE);
+        let (port, seen) = republished_stub().await;
+        let (launch, plan) = custom_launch(root.path(), &deployment, &policy, port);
+        let approved = EngineAccess::custom(&capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(CUSTOM_IDLE).unwrap(),
+        ));
+        assert_eq!(executor.retained_access(&launch), approved);
+        let scope = |deployment: &str| IngressScope {
+            host_id: "host".into(),
+            deployment_id: deployment.into(),
+            binding_id: "binding".into(),
+            incarnation: "incarnation".into(),
+            member_id: "head".into(),
+            generation: 1,
+            revision: 1,
+            instance_index: 0,
+        };
+        let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let handle = launch.identity.command_id.clone();
+        // The launch path binds the access it was approved with.
+        let bound = Ingress::new().unwrap();
+        bound
+            .register(scope("bound"), target, "toy".into(), [1; 32], [2; 32])
+            .unwrap();
+        bound
+            .bind_handle(&scope("bound"), &handle, executor.retained_access(&launch))
+            .unwrap();
+        bound.open(&scope("bound")).unwrap();
+        // Removed, then added again with another idle signal: two publications.
+        let next = capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(CUSTOM_NEXT).unwrap(),
+        );
+        let republish = |request: &str, fingerprint: &str| {
+            let accepted = executor.profiles.accepted();
+            let mut document = accepted.config.document.clone();
+            document["runtime_profiles"]["local"]["custom"] = serde_json::to_value(&next).unwrap();
+            let config = HostConfig::parse(&document.to_string()).unwrap();
+            let mut inventory = accepted.inventory.clone();
+            inventory.policy_fingerprint = fingerprint.into();
+            executor
+                .profiles
+                .stage(request, crate::profiles::ProfileSet::new(config, inventory))
+                .unwrap();
+            assert!(executor.profiles.settle(request, true));
+        };
+        republish("r1", "republished-1");
+        // The previous document is still held: still the approved manifest.
+        assert_eq!(executor.retained_access(&launch), approved);
+        republish("r2", "republished-2");
+        assert!(executor.frozen_engine(&launch, &plan).is_none());
+        assert_eq!(executor.retained_access(&launch), EngineAccess::unknown());
+        // A later registration of the same launch (`register_retained`) keeps
+        // the access bound with it, so it is still read by its own signal:
+        // `/metrics` reads busy, never the new `/next-idle`.
+        bound
+            .bind_handle(&scope("bound"), &handle, executor.retained_access(&launch))
+            .unwrap();
+        assert_eq!(engine_figures(&bound).await, [false]);
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
+        // A launch first bound now (a restarted host) is unknown: nothing is
+        // read and no engine figures are published, so it never reads idle.
+        let unknown = Ingress::new().unwrap();
+        unknown
+            .register(scope("unknown"), target, "toy".into(), [3; 32], [4; 32])
+            .unwrap();
+        unknown
+            .bind_handle(
+                &scope("unknown"),
+                &handle,
+                executor.retained_access(&launch),
+            )
+            .unwrap();
+        unknown.open(&scope("unknown")).unwrap();
+        let targets = unknown.load_targets().unwrap();
+        assert_eq!(targets[0].signal, crate::load::LaunchSignal::Unknown);
+        assert!(
+            targets[0].native.is_none(),
+            "no manifest shows it takes the key"
+        );
+        assert_eq!(engine_figures(&unknown).await, [false]);
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
+        // The stop gate does not skip its wait as it would for a manifest
+        // without an idle signal: it waits the bound, then proceeds, having
+        // read nothing.
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(
+                    &launch,
+                    capyctl_protocol::now_unix_ms() + idle_gate::IDLE_MARGIN_MS + 1_500
+                )
+                .await
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_300));
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
     }
 
     /// A prepared host's runtime directory for SGLang: the agent user's

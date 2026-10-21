@@ -8,9 +8,11 @@
 //! status, journaled once per newly observed digest, and refused with the
 //! closed reason `installation_drift` only when the launch's host policy says
 //! `installation_drift: refuse` (default `warn`). An installation that could not
-//! be measured at registration is `unmeasured` and never drifts. Adoption,
-//! Park and Restore are never refused on drift: a running engine loaded its
-//! code at launch.
+//! be measured at registration is `unmeasured` and never drifts. ADR 0031 §8: a
+//! custom profile's pinned installation digest is its baseline; registered
+//! differently (or unmeasured) it stands drifted from registration on, and its
+//! first launch journals that drift. Adoption, Park and Restore are never
+//! refused on drift: a running engine loaded its code at launch.
 //!
 //! Passing fingerprints are not qualification evidence (AGENTS.md).
 
@@ -19,7 +21,7 @@ use std::sync::Arc;
 
 use capyctl_adapters::traits::*;
 use capyctl_agent::installation::{InstallationDrift, InstallationRegistry};
-use capyctl_config::custom::CustomManifest;
+use capyctl_config::custom::CustomProfile;
 use capyctl_config::engine_policy::Engine;
 use capyctl_domain::completion::EffectObservation;
 use capyctl_protocol::pb;
@@ -36,19 +38,25 @@ pub struct EmbeddedInstallation {
     profile: String,
     engine: Engine,
     executable: PathBuf,
-    /// ADR 0031 §3: a custom engine's manifest; its `environment` names the
-    /// root measured instead of the default one.
-    custom: Option<CustomManifest>,
+    /// ADR 0031 §3: a custom engine's block; its manifest's `environment`
+    /// names the root measured instead of the default one, and (§8) its
+    /// pinned installation digest is the registered baseline.
+    custom: Option<CustomProfile>,
     /// The fields registration published (version, digest, state).
     registration: pb::RuntimeProfileStatus,
     registry: InstallationRegistry,
+    /// The observed digest of the drift last reported for the journal,
+    /// `None` while not drifted: each drift is journaled once, a drift found
+    /// at registration (ADR 0031 §8) by the first launch.
+    reported: std::sync::Mutex<Option<String>>,
 }
 
 /// One launch-time measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftCheck {
     /// `(registered, observed)` when this measurement found a drift not
-    /// already flagged (a new drift, or a drift to a different digest).
+    /// already reported (a new drift, a drift to a different digest, or one
+    /// registration found and no launch reported yet).
     pub newly_drifted: Option<(String, String)>,
     /// `Some(DRIFT_REFUSAL)` when the policy refuses the drifted launch.
     pub refused: Option<&'static str>,
@@ -57,29 +65,28 @@ pub struct DriftCheck {
 impl EmbeddedInstallation {
     /// Register (measure) the installation `profile` names. A measurement that
     /// fails is `unmeasured`, never a refusal. ADR 0031 §3: a custom engine
-    /// is measured with its manifest (`custom`).
+    /// is measured with its manifest (`custom`); §8: its pinned installation
+    /// digest, when set, is the baseline and a different measurement is
+    /// drift, never adopted.
     pub fn register(
         profile: &str,
         engine: Engine,
         executable: &Path,
-        custom: Option<&CustomManifest>,
+        custom: Option<&CustomProfile>,
     ) -> Self {
         let measurer = capyctl_agent::installation::InstallationMeasurer::new();
-        let (version, digest, state) =
-            capyctl_agent::installation::registration(&measurer, Some(engine), executable, custom);
-        let registration = pb::RuntimeProfileStatus {
+        let mut registration = pb::RuntimeProfileStatus {
             name: profile.to_owned(),
-            installation_version: version,
-            installation_digest: digest,
-            installation_state: state,
             ..Default::default()
         };
+        capyctl_agent::installation::registration(&measurer, Some(engine), executable, custom)
+            .write(&mut registration);
         let mut registry = InstallationRegistry::from_inventory(&pb::ReportInventory {
             profiles: vec![registration.clone()],
             ..Default::default()
         });
-        if let Some(manifest) = custom {
-            registry = registry.with_custom(profile, manifest.clone());
+        if let Some(custom) = custom {
+            registry = registry.with_custom(profile, custom.manifest.clone());
         }
         Self {
             profile: profile.to_owned(),
@@ -88,16 +95,28 @@ impl EmbeddedInstallation {
             custom: custom.cloned(),
             registration,
             registry,
+            reported: std::sync::Mutex::new(None),
         }
     }
 
-    /// Whether this is the installation at `executable` measured with
-    /// `custom`'s root (ADR 0031 §3: two custom profiles on one executable
-    /// with different roots are two installations).
-    fn is(&self, executable: &Path, custom: Option<&CustomManifest>) -> bool {
-        self.executable == executable
-            && self.custom.as_ref().and_then(|m| m.environment.as_deref())
-                == custom.and_then(|m| m.environment.as_deref())
+    /// Whether this is `engine`'s installation at `executable`, measured
+    /// with `custom`'s root against its pinned digest. ADR 0018 §5: two
+    /// profiles of one engine on one executable are one installation; two
+    /// engines on one executable (a built-in and a custom engine included)
+    /// are two. ADR 0031 §3, §8: two custom profiles on one executable with
+    /// different roots or pinned digests are two.
+    fn is(&self, engine: Engine, executable: &Path, custom: Option<&CustomProfile>) -> bool {
+        fn scope(custom: Option<&CustomProfile>) -> Option<(Option<&str>, Option<&str>)> {
+            custom.map(|c| {
+                (
+                    c.manifest.environment.as_deref(),
+                    c.installation_digest.as_deref(),
+                )
+            })
+        }
+        self.engine == engine
+            && self.executable == executable
+            && scope(self.custom.as_ref()) == scope(custom)
     }
 
     /// The status view: registered version and digest, `measured`,
@@ -126,14 +145,22 @@ impl EmbeddedInstallation {
 
     /// Measure the installation again for a launch under `policy`.
     pub fn check(&self, policy: InstallationDrift) -> DriftCheck {
-        let before = self.registry.drifted(&self.profile);
         let verdict = self
             .registry
             .verify(&self.profile, self.engine, &self.executable, policy);
+        let drifted = self.registry.drifted(&self.profile);
         let newly_drifted = self
-            .registry
-            .drifted(&self.profile)
-            .filter(|observed| before.as_ref() != Some(observed))
+            .reported
+            .lock()
+            .ok()
+            .and_then(|mut reported| {
+                let new = drifted
+                    .as_ref()
+                    .filter(|observed| reported.as_ref() != Some(*observed))
+                    .cloned();
+                *reported = drifted;
+                new
+            })
             .and_then(|observed| {
                 self.registry
                     .registered(&self.profile)
@@ -146,9 +173,12 @@ impl EmbeddedInstallation {
     }
 }
 
-/// ADR 0018 §5: the embedded host's installations, keyed by executable (two
-/// profiles on one executable are one installation) and, ADR 0031 §3, a
-/// custom engine's manifest `environment`, in registration order.
+/// ADR 0018 §5: the embedded host's installations, keyed by executable and
+/// engine (two profiles of one engine on one executable are one
+/// installation; a built-in and a custom engine on one executable are two,
+/// measured and drift-checked separately) and, ADR 0031 §3, §8, a custom
+/// engine's manifest `environment` and pinned installation digest, in
+/// registration order.
 pub struct EmbeddedInstallations {
     registered: std::sync::RwLock<Vec<Arc<EmbeddedInstallation>>>,
 }
@@ -160,24 +190,24 @@ impl EmbeddedInstallations {
         })
     }
 
-    /// Register (measure) the installation at `executable` (with `custom`'s
-    /// root for a custom engine) unless one is already registered there.
-    /// Blocking: it reads the installation's files.
+    /// Register (measure) `engine`'s installation at `executable` (with
+    /// `custom`'s root and pin for a custom engine) unless one is already
+    /// registered there. Blocking: it reads the installation's files.
     pub fn register(
         &self,
         profile: &str,
         engine: Engine,
         executable: &Path,
-        custom: Option<&CustomManifest>,
+        custom: Option<&CustomProfile>,
     ) {
-        if self.find(executable, custom).is_some() {
+        if self.find(engine, executable, custom).is_some() {
             return;
         }
         let registered = Arc::new(EmbeddedInstallation::register(
             profile, engine, executable, custom,
         ));
         if let Ok(mut all) = self.registered.write() {
-            if !all.iter().any(|known| known.is(executable, custom)) {
+            if !all.iter().any(|known| known.is(engine, executable, custom)) {
                 all.push(registered);
             }
         }
@@ -191,18 +221,19 @@ impl EmbeddedInstallations {
         }
     }
 
-    /// The installation at `executable`, measured with `custom`'s root for a
-    /// custom engine (`None` for every other engine).
+    /// `engine`'s installation at `executable`, measured with `custom`'s
+    /// root and pin for a custom engine (`None` for every other engine).
     pub fn find(
         &self,
+        engine: Engine,
         executable: &Path,
-        custom: Option<&CustomManifest>,
+        custom: Option<&CustomProfile>,
     ) -> Option<Arc<EmbeddedInstallation>> {
         self.registered
             .read()
             .ok()?
             .iter()
-            .find(|known| known.is(executable, custom))
+            .find(|known| known.is(engine, executable, custom))
             .cloned()
     }
 
@@ -365,15 +396,16 @@ impl EngineBindings for InstalledBindings {
         self.inner.launch_gone(incarnation)
     }
 
-    /// ADR 0018 §5: picked by the frozen profile's executable (and, ADR 0031
-    /// §3, a custom engine's manifest root). One that is not registered is
-    /// admitted without a drift check: unmeasured is never a refusal (ADR
-    /// 0008).
+    /// ADR 0018 §5: picked by the frozen profile's engine and executable
+    /// (and, ADR 0031 §3, §8, a custom engine's manifest root and pinned
+    /// digest). One that is not registered is admitted without a drift
+    /// check: unmeasured is never a refusal (ADR 0008).
     fn installation(&self, work: &InitializeWork) -> Option<Arc<EmbeddedInstallation>> {
         let profile = &work.effective().profile;
         self.installations.find(
+            profile.engine,
             Path::new(&profile.executable),
-            profile.custom.as_ref().map(|custom| &custom.manifest),
+            profile.custom.as_ref(),
         )
     }
 
@@ -390,6 +422,7 @@ impl EngineBindings for InstalledBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capyctl_config::custom::CustomManifest;
 
     /// A synthetic virtual environment with an SGLang package tree.
     fn venv() -> tempfile::TempDir {
@@ -406,6 +439,29 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// [`venv`] as a virtual environment (`pyvenv.cfg`) with a dependency
+    /// beside the SGLang package, which a built-in SGLang measurement does
+    /// not cover. Returns the dependency's file.
+    fn venv_with_dependency() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = venv();
+        std::fs::write(dir.path().join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let dep = dir.path().join("lib/python3.12/site-packages/dep");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("__init__.py"), "x = 1\n").unwrap();
+        (dir, dep.join("__init__.py"))
+    }
+
+    /// A custom engine's block (version `1.0`), with `environment` when set.
+    fn custom(environment: Option<&Path>) -> CustomProfile {
+        let mut text = String::from(
+            "kind: custom_engine\nschema_version: 1\napi: chat\nversion: \"1.0\"\nargs: [\"{host}\", \"{port}\", \"{model_dir}\"]\n",
+        );
+        if let Some(root) = environment {
+            text.push_str(&format!("environment: {}\n", root.display()));
+        }
+        CustomProfile::new(CustomManifest::parse(&text).unwrap())
     }
 
     // T21 T22: standalone registers its installation, flags drift in its
@@ -470,10 +526,11 @@ mod tests {
     }
 
     // T21 T22 (ADR 0018 §5): the embedded host keeps one installation per
-    // executable; a launch finds its own by executable, an unregistered one
-    // finds none (admitted unmeasured), and a removed one is forgotten.
+    // executable and engine; a launch finds its own by engine and
+    // executable, an unregistered one finds none (admitted unmeasured), and
+    // a removed one is forgotten.
     #[test]
-    fn embedded_installations_are_keyed_by_executable() {
+    fn embedded_installations_are_keyed_by_executable_and_engine() {
         let sglang = venv();
         let other = tempfile::tempdir().unwrap();
         let python = sglang.path().join("bin/python3");
@@ -487,11 +544,21 @@ mod tests {
         assert_eq!(views[0]["profile"], "local-sglang");
         assert_eq!(views[0]["state"], "measured");
         assert_eq!(views[1]["state"], "unmeasured");
-        assert!(all.find(&python, None).is_some());
-        assert!(all.find(Path::new("/nowhere/python3"), None).is_none());
+        assert!(all.find(Engine::Sglang, &python, None).is_some());
+        assert!(all
+            .find(Engine::Sglang, Path::new("/nowhere/python3"), None)
+            .is_none());
+        // Another engine on the same executable is another installation.
+        assert!(all.find(Engine::Vllm, &python, None).is_none());
+        all.register("vllm-here", Engine::Vllm, &python, None);
+        assert_eq!(all.views().len(), 3);
+        assert_eq!(
+            all.find(Engine::Vllm, &python, None).unwrap().view()["profile"],
+            "vllm-here"
+        );
         all.retain(&[python.as_path()]);
-        assert!(all.find(&vllm, None).is_none());
-        assert_eq!(all.views().len(), 1);
+        assert!(all.find(Engine::Vllm, &vllm, None).is_none());
+        assert_eq!(all.views().len(), 2);
     }
 
     // T44 T21 (ADR 0031 §3): standalone measures a custom engine with its
@@ -512,22 +579,15 @@ mod tests {
         let executable = bin.join("serve");
         std::fs::write(&executable, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let manifest = |environment: Option<&Path>| {
-            let mut text = String::from(
-                "kind: custom_engine\nschema_version: 1\napi: chat\nversion: \"1.0\"\nargs: [\"{host}\", \"{port}\", \"{model_dir}\"]\n",
-            );
-            if let Some(root) = environment {
-                text.push_str(&format!("environment: {}\n", root.display()));
-            }
-            CustomManifest::parse(&text).unwrap()
-        };
-        let default = manifest(None);
+        let default = custom(None);
         let all = EmbeddedInstallations::new();
         all.register("serve", Engine::Custom, &executable, Some(&default));
-        let narrow = manifest(Some(&site));
+        let narrow = custom(Some(&site));
         all.register("serve-narrow", Engine::Custom, &executable, Some(&narrow));
         assert_eq!(all.views().len(), 2, "another root is another installation");
-        let installation = all.find(&executable, Some(&default)).unwrap();
+        let installation = all
+            .find(Engine::Custom, &executable, Some(&default))
+            .unwrap();
         let view = installation.view();
         assert_eq!(view["state"], "measured");
         assert_eq!(view["version"], "1.0");
@@ -541,6 +601,147 @@ mod tests {
             installation.check(InstallationDrift::Refuse).refused,
             Some(DRIFT_REFUSAL)
         );
+    }
+
+    // T44 T21 T22 (ADR 0018 §5, ADR 0031 §3): a built-in profile and a
+    // custom profile on one executable are two installations whichever
+    // registers first, each with its own measurement: the custom one covers
+    // the whole virtual environment with the manifest's version. A changed
+    // dependency the built-in measurement does not cover is drift for the
+    // custom installation only, refused under `refuse`.
+    #[test]
+    fn a_builtin_and_a_custom_profile_on_one_executable_are_two_installations() {
+        for custom_first in [false, true] {
+            let (dir, dependency) = venv_with_dependency();
+            let python = dir.path().join("bin/python3");
+            let serve = custom(None);
+            let all = EmbeddedInstallations::new();
+            let register_builtin = || all.register("local-sglang", Engine::Sglang, &python, None);
+            let register_custom = || all.register("serve", Engine::Custom, &python, Some(&serve));
+            if custom_first {
+                register_custom();
+                register_builtin();
+            } else {
+                register_builtin();
+                register_custom();
+            }
+            assert_eq!(all.views().len(), 2, "custom first: {custom_first}");
+            let sglang = all.find(Engine::Sglang, &python, None).unwrap();
+            let engine = all.find(Engine::Custom, &python, Some(&serve)).unwrap();
+            assert!(!Arc::ptr_eq(&sglang, &engine));
+            let (built_in, custom_view) = (sglang.view(), engine.view());
+            assert_eq!(built_in["profile"], "local-sglang");
+            assert_eq!(built_in["version"], "0.5.20");
+            assert_eq!(built_in["state"], "measured");
+            assert_eq!(custom_view["profile"], "serve");
+            assert_eq!(custom_view["version"], "1.0");
+            assert_eq!(custom_view["state"], "measured");
+            assert_ne!(
+                built_in["digest"], custom_view["digest"],
+                "the custom installation measures the whole environment"
+            );
+
+            std::fs::write(&dependency, "x = 2\n").unwrap();
+            assert_eq!(
+                sglang.check(InstallationDrift::Refuse),
+                DriftCheck {
+                    newly_drifted: None,
+                    refused: None
+                },
+                "outside the SGLang package"
+            );
+            let refused = engine.check(InstallationDrift::Refuse);
+            assert_eq!(refused.refused, Some(DRIFT_REFUSAL));
+            assert!(refused.newly_drifted.is_some());
+            assert_eq!(engine.view()["state"], "drifted");
+            assert_eq!(sglang.view()["state"], "measured");
+        }
+    }
+
+    // T44 T21 T22 (ADR 0031 §3, §8): a custom profile's pinned installation
+    // digest is the embedded baseline, never the fresh measurement. Equal,
+    // it is `measured`. Changed before registration, it is `drifted` from
+    // registration on with the measured digest observed; the first launch
+    // reports the drift for the journal once, warns under `warn` and refuses
+    // under `refuse`. A profile without the pin keeps today's rule and is
+    // another installation.
+    #[test]
+    fn a_pinned_installation_digest_is_the_embedded_baseline() {
+        let (dir, dependency) = venv_with_dependency();
+        let python = dir.path().join("bin/python3");
+        let unpinned = custom(None);
+        let approved = capyctl_agent::installation::InstallationMeasurer::new()
+            .measure_profile(Engine::Custom, &python, Some(&unpinned.manifest))
+            .unwrap()
+            .digest;
+        let mut pinned = unpinned.clone();
+        pinned.installation_digest = Some(approved.clone());
+        let register =
+            || EmbeddedInstallation::register("serve", Engine::Custom, &python, Some(&pinned));
+
+        let installation = register();
+        let view = installation.view();
+        assert_eq!(view["state"], "measured");
+        assert_eq!(view["digest"], approved.as_str());
+        assert_eq!(
+            installation.check(InstallationDrift::Refuse),
+            DriftCheck {
+                newly_drifted: None,
+                refused: None
+            }
+        );
+
+        // Changed between approval and registration: never adopted.
+        std::fs::write(&dependency, "x = 2\n").unwrap();
+        let installation = register();
+        let view = installation.view();
+        assert_eq!(view["state"], "drifted");
+        assert_eq!(view["digest"], approved.as_str(), "the pinned digest");
+        let observed = view["observed_digest"].as_str().unwrap().to_owned();
+        assert!(observed.starts_with("sha256:"));
+        assert_ne!(observed, approved);
+        assert_eq!(
+            installation.check(InstallationDrift::Warn),
+            DriftCheck {
+                newly_drifted: Some((approved.clone(), observed.clone())),
+                refused: None
+            },
+            "the first launch journals the drift found at registration"
+        );
+        assert_eq!(
+            installation.check(InstallationDrift::Refuse),
+            DriftCheck {
+                newly_drifted: None,
+                refused: Some(DRIFT_REFUSAL)
+            },
+            "journaled once"
+        );
+        let refusing = register();
+        assert_eq!(
+            refusing.check(InstallationDrift::Refuse),
+            DriftCheck {
+                newly_drifted: Some((approved.clone(), observed.clone())),
+                refused: Some(DRIFT_REFUSAL)
+            }
+        );
+
+        // Without the pin the measurement is the baseline, as for every
+        // built-in engine; the two are separate installations.
+        let all = EmbeddedInstallations::new();
+        all.register("serve", Engine::Custom, &python, Some(&pinned));
+        all.register("serve-unpinned", Engine::Custom, &python, Some(&unpinned));
+        assert_eq!(all.views().len(), 2);
+        let plain = all
+            .find(Engine::Custom, &python, Some(&unpinned))
+            .unwrap()
+            .view();
+        assert_eq!(plain["state"], "measured");
+        assert_eq!(plain["digest"], observed.as_str());
+
+        // Measured as pinned again, the drift clears.
+        std::fs::write(&dependency, "x = 1\n").unwrap();
+        assert_eq!(installation.check(InstallationDrift::Refuse).refused, None);
+        assert_eq!(installation.view()["state"], "measured");
     }
 
     // T17: the gate does not hide the engine's quiescence.

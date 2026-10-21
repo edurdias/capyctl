@@ -9,8 +9,9 @@ use capyctl_config::effective::{
 };
 use capyctl_config::engine_env::EnvSource;
 use capyctl_config::registration::{
-    check_profile, custom_engines_beside, custom_profile_document, lock_engines, write_engines,
-    CustomProfileSpec, EnginesFile, CUSTOM_ENGINES_FILE, ENGINES_FILE,
+    check_profile, custom_engines_beside, custom_profile_document, lock_engines, merge_into_host,
+    write_engines, CustomProfileSpec, EnginesFile, CUSTOM_ENGINES_FILE, ENGINES_FILE,
+    MAX_PUBLISHED_BYTES,
 };
 use capyctl_config::{ConfigError, ConfigErrorCode};
 use capyctl_domain::launch::{LaunchSettings, SettingSource};
@@ -304,6 +305,74 @@ fn an_unset_context_length_placeholder_is_refused() {
     }
 }
 
+// T44 (ADR 0031 Amendment A1): a custom profile written by hand states its
+// engine-key reference; one without it, or with a blank one, is refused at
+// resolution (and at registration) instead of failing every start.
+#[test]
+fn a_custom_profile_without_a_credential_reference_is_refused() {
+    for credential in [None, Some(""), Some("  ")] {
+        let (deployment, mut host) = fixture("chat");
+        let security = host["runtime_profiles"]["local"]["security"]
+            .as_object_mut()
+            .unwrap();
+        security.remove("credential_ref");
+        if let Some(blank) = credential {
+            security.insert("credential_ref".into(), blank.into());
+        }
+        let error = resolve(&deployment, &host).unwrap_err();
+        assert_eq!(error.code, ConfigErrorCode::MissingRequired, "{error}");
+        refused(
+            &error,
+            "runtime_profiles.security.credential_ref",
+            "custom_credential_ref_missing",
+        );
+        assert!(check_profile("basal", &host["runtime_profiles"]["local"]).is_err());
+    }
+    let (deployment, host) = fixture("chat");
+    resolve(&deployment, &host).unwrap();
+}
+
+// T44 (ADR 0031 §8): deployment operators cannot add arguments, so a custom
+// deployment's served name (the first route, what `{served_name}` renders)
+// and its checkpoint directory (`{model_dir}`) may not start with `-` or hold
+// a control character. A relative model path always resolves under the
+// store, so it never leads with `-`. Built-in engines are unaffected.
+#[test]
+fn a_value_that_reads_as_an_option_is_refused() {
+    for route in ["--log-decisions=/tmp/x", "-v", "basal\n--x", "basal\u{1b}"] {
+        let (mut deployment, host) = fixture("chat");
+        deployment["routes"] = json!([route]);
+        refused(
+            &resolve(&deployment, &host).unwrap_err(),
+            "routes",
+            "custom_value_invalid:served_name",
+        );
+    }
+    let (mut deployment, host) = fixture("chat");
+    deployment["routes"] = json!(["basal-2", "--alias"]);
+    resolve(&deployment, &host).unwrap();
+
+    for path in ["/srv/models/to\ny", "/srv/models/to\u{7}y"] {
+        let (mut deployment, host) = fixture("chat");
+        deployment["model"]["path"] = path.into();
+        refused(
+            &resolve(&deployment, &host).unwrap_err(),
+            "model",
+            "custom_value_invalid:model_dir",
+        );
+    }
+    let (mut deployment, host) = fixture("chat");
+    deployment["model"]["path"] = "--trust-remote-code".into();
+    let effective = resolve(&deployment, &host).unwrap();
+    let resolved = effective.model.resolved_path.unwrap();
+    assert!(resolved.starts_with('/'), "{resolved}");
+
+    let all: Value = serde_json::from_str(include_str!("fixtures/f2-deployment.json")).unwrap();
+    let (mut deployment, host) = (all["deployment"].clone(), all["host"].clone());
+    deployment["routes"] = json!(["-toy"]);
+    capyctl_config::effective::resolve_effective(&deployment, &host).unwrap();
+}
+
 // T44 T37 (ADR 0031 §2, ADR 0028 §2.1): the manifest's env is the lowest
 // layer, the profile's overrides it and the deployment's overrides both; a
 // deployment name still needs the profile's approval.
@@ -593,4 +662,86 @@ fn the_two_engines_files_merge_and_share_one_namespace() {
     drop(lock);
     let reread = EnginesFile::load_with_custom(&engines).unwrap();
     assert_eq!(reread.profiles["basal"], basal);
+}
+
+// T44, T03 (ADR 0031 amendment A1): one lock guards both engines files, so a
+// normal and a custom add of the same name racing each other end with the
+// name in exactly one file; the other add is refused at that name.
+#[test]
+fn a_normal_and_a_custom_add_of_one_name_serialize_on_one_lock() {
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let engines = dir.path().join(ENGINES_FILE);
+        let custom = dir.path().join(CUSTOM_ENGINES_FILE);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let add = |path: std::path::PathBuf, profile: Value| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                // As `engine add`: the lock first, then the load, then the write.
+                let lock = lock_engines(&path).unwrap();
+                let mut file = EnginesFile::load(&path).unwrap();
+                file.profiles.insert("dup".into(), profile);
+                write_engines(&file, &lock, Some(&json!({})))
+            })
+        };
+        let normal = add(engines.clone(), vllm_profile());
+        let basal = add(custom.clone(), profile(manifest("chat"), &[], &[]));
+        let results = [normal.join().unwrap(), basal.join().unwrap()];
+        let refused: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(refused.len(), 1, "{results:?}");
+        assert_eq!(refused[0].path, "runtime_profiles.dup", "{}", refused[0]);
+        let holders = [&engines, &custom]
+            .into_iter()
+            .filter(|p| EnginesFile::load(p).unwrap().profiles.contains_key("dup"))
+            .count();
+        assert_eq!(holders, 1);
+        assert!(!dir.path().join("custom-engines.yaml.lock").exists());
+    }
+}
+
+// T44, T03 (ADR 0031 amendment A1): both files count together toward the
+// publication bound; a custom add that fits on its own but not beside
+// engines.yaml is refused and nothing is written.
+#[test]
+fn the_size_bound_counts_both_engines_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let engines = dir.path().join(ENGINES_FILE);
+    let custom = dir.path().join(CUSTOM_ENGINES_FILE);
+    let basal = profile(manifest("chat"), &[], &[]);
+    let published = |profiles: &serde_json::Map<String, Value>, with_basal: bool| {
+        let mut host = json!({});
+        let file = EnginesFile::parse(
+            &engines,
+            &engines_text("engines", Value::Object(profiles.clone())),
+        )
+        .unwrap();
+        merge_into_host(&mut host, &file).unwrap();
+        if with_basal {
+            let file = EnginesFile::parse(
+                &custom,
+                &engines_text("custom_engines", json!({"basal": basal})),
+            )
+            .unwrap();
+            merge_into_host(&mut host, &file).unwrap();
+        }
+        host.to_string().len()
+    };
+    // Fill engines.yaml until adding the custom profile would cross the bound.
+    let mut normal = serde_json::Map::new();
+    for i in 0.. {
+        if published(&normal, true) > MAX_PUBLISHED_BYTES {
+            break;
+        }
+        normal.insert(format!("v{i}"), vllm_profile());
+    }
+    assert!(published(&normal, false) <= MAX_PUBLISHED_BYTES);
+    std::fs::write(&engines, engines_text("engines", Value::Object(normal))).unwrap();
+
+    let lock = lock_engines(&custom).unwrap();
+    let mut file = EnginesFile::load(&custom).unwrap();
+    file.profiles.insert("basal".into(), basal);
+    let error = write_engines(&file, &lock, Some(&json!({}))).unwrap_err();
+    assert!(error.detail.contains("32768"), "{error}");
+    assert!(!custom.exists());
 }

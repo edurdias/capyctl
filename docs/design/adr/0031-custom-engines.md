@@ -553,8 +553,12 @@ every registered engine with it, instead of skipping one profile as §1 first sa
 - `capyctl engine add --custom` writes the profile to `custom-engines.yaml`, beside
   `engines.yaml` (the same directory, found the same way from `--config`,
   `CAPYCTL_CONFIG` or `XDG_CONFIG_HOME`), with the same first-line revision header
-  (`# capyctl-document-revision: N`), lock and atomic write; its document kind is
-  `custom_engines`. `engine remove` removes a custom engine from it.
+  (`# capyctl-document-revision: N`) and atomic write; its document kind is
+  `custom_engines`. `engine remove` removes a custom engine from it. Both files share
+  one lock, `engines.yaml.lock`, which every `engine add` and `engine remove` (custom or
+  not) takes before it loads either file, so two concurrent adds of one name end with
+  one written and the other refused, and the size bound below is checked on the
+  combined set under that lock.
 - `engines.yaml` keeps 0.1.5's profile shape and refuses `engine: custom`;
   `custom-engines.yaml` refuses any other engine. A profile written by hand under
   `runtime_profiles` in the role document is unchanged (§1).
@@ -578,8 +582,36 @@ every registered engine with it, instead of skipping one profile as §1 first sa
 - Every custom profile names an engine-key reference, `security.credential_ref`
   (`engine add --custom` writes `secret://engine-key`): the launch path seals a
   per-launch key for every engine and refuses a profile without the reference. The key
-  is rendered and sent only when the manifest uses `{api_key}` (§7). A custom profile
-  written by hand in the role document states it too.
+  is rendered and sent only when the manifest uses `{api_key}` (§7): on probes, on
+  requests the host's ingress forwards and on idle reads alike; an engine whose
+  manifest does not use it gets no `Authorization` header from any of them. A custom
+  profile written by hand in the role document states it too; one without it, or with
+  a blank one, is refused at resolution `custom_credential_ref_missing` (exit 2).
+- **The confirmed installation digest is pinned** (§3, §8). `engine add --custom`
+  saves the digest its summary showed in the profile as `custom.installation_digest`
+  (left out when the installation was unmeasured). At registration that digest is the
+  baseline: a measurement that differs, or an installation that can no longer be
+  measured, is drift from registration on, shown as `drifted`, journaled
+  (`installation_drift_flagged`; the standalone role at the first launch, a host once
+  per control session) and refused `installation_drift` under
+  `installation_drift: refuse`, warned otherwise; it is never adopted as the baseline.
+  A hand-written profile may leave it out, and is then registered as before.
+- **Installations are told apart by engine** (§3). A built-in profile and a custom
+  profile on one executable are two installations, measured and drift-checked
+  separately, and so are two custom profiles with different roots or pinned digests.
+- **A launch's idle signal is the one it was approved with** (§6). A host reads a
+  running launch's idle signal only from the manifest frozen with it, never from the
+  current profile set, so a remove and re-add of the same name with another `idle`
+  never changes how a running instance is read. When that manifest is no longer held,
+  the launch's idleness is unknown: no load figures are published for it, so its
+  cancelling requests settle only at its verified stop, and the stop gate waits its
+  full bound instead of skipping the wait.
+- **Values from a deployment cannot read as options** (§8). A deployment's first route
+  (what `{served_name}` renders) and its resolved model path (`{model_dir}`) must not
+  start with `-` or hold a control character, on any custom engine whether or not its
+  manifest uses the placeholder; resolution refuses such a value
+  `custom_value_invalid:served_name` or `custom_value_invalid:model_dir` (exit 2), and
+  the launch refuses it again when it renders the command.
 - Qualification (owner decision 2026-10-21): CE1–CE4 run with basal-2.0-4.5B, a
   decision model basal-serve serves, instead of basal-omni-1.0. basal's `--mode fp8`
   needs torchao, which the approved environment does not install, so the rows run

@@ -828,40 +828,103 @@ pub fn probe_capabilities(
 }
 
 /// Registration (agent start): the installation fields one profile publishes.
-/// A measurement that fails is `unmeasured`, never a refusal. ADR 0031 §3: a
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    pub version: String,
+    /// The baseline later launches are compared against.
+    pub digest: String,
+    /// `measured`, `unmeasured` or `drifted`.
+    pub state: String,
+    /// While `drifted`: the digest registration measured instead of the
+    /// pinned one, or `unmeasured`.
+    pub observed_digest: String,
+}
+
+impl Registration {
+    /// Fill a published profile's installation fields.
+    pub fn write(self, status: &mut capyctl_protocol::pb::RuntimeProfileStatus) {
+        status.installation_version = self.version;
+        status.installation_digest = self.digest;
+        status.installation_state = self.state;
+        status.installation_observed_digest = self.observed_digest;
+    }
+}
+
+/// Registration (agent start): measure one profile's installation. A
+/// measurement that fails is `unmeasured`, never a refusal. ADR 0031 §3: a
 /// custom engine is measured with its manifest; one without a valid manifest
-/// is `unmeasured`.
+/// is `unmeasured`. ADR 0031 §8: a custom profile's pinned installation
+/// digest (the one the operator approved) is the baseline, never the fresh
+/// measurement; a measurement that differs, or none, is `drifted` from
+/// registration on.
 pub fn registration(
     measurer: &InstallationMeasurer,
     engine: Option<Engine>,
     executable: &Path,
-    custom: Option<&CustomManifest>,
-) -> (String, String, String) {
+    custom: Option<&capyctl_config::custom::CustomProfile>,
+) -> Registration {
     let measured = match engine {
         Some(Engine::Custom) if custom.is_none() => None,
-        Some(engine) => Some(measurer.measure_profile(engine, executable, custom)),
+        Some(engine) => measurer
+            .measure_profile(engine, executable, custom.map(|c| &c.manifest))
+            .ok(),
         None => None,
     };
-    match measured {
-        Some(Ok(fingerprint)) => (fingerprint.version, fingerprint.digest, "measured".into()),
-        _ => (String::new(), String::new(), "unmeasured".into()),
+    let pinned = custom.and_then(|c| c.installation_digest.as_deref());
+    match (pinned, measured) {
+        (None, Some(fingerprint)) => Registration {
+            version: fingerprint.version,
+            digest: fingerprint.digest,
+            state: "measured".into(),
+            observed_digest: String::new(),
+        },
+        (None, None) => Registration {
+            version: String::new(),
+            digest: String::new(),
+            state: "unmeasured".into(),
+            observed_digest: String::new(),
+        },
+        (Some(pinned), Some(fingerprint)) if fingerprint.digest == pinned => Registration {
+            version: fingerprint.version,
+            digest: pinned.to_owned(),
+            state: "measured".into(),
+            observed_digest: String::new(),
+        },
+        (Some(pinned), measured) => {
+            let (version, observed_digest) = measured.map_or_else(
+                || (String::new(), UNMEASURED.to_owned()),
+                |fingerprint| (fingerprint.version, fingerprint.digest),
+            );
+            Registration {
+                version,
+                digest: pinned.to_owned(),
+                state: "drifted".into(),
+                observed_digest,
+            }
+        }
     }
+}
+
+/// ADR 0031 §3: a custom engine's profile's `custom` block, validated with
+/// its digest, else `None`.
+pub fn custom_profile(
+    profile: &serde_json::Value,
+) -> Option<capyctl_config::custom::CustomProfile> {
+    if profile["engine"].as_str() != Some(Engine::Custom.name()) {
+        return None;
+    }
+    capyctl_config::custom::CustomProfile::from_value(profile.get("custom")?).ok()
 }
 
 /// ADR 0031 §3: the manifest a custom engine's profile carries (its
 /// `custom` block, validated with its digest), else `None`.
 pub fn custom_manifest(profile: &serde_json::Value) -> Option<CustomManifest> {
-    if profile["engine"].as_str() != Some(Engine::Custom.name()) {
-        return None;
-    }
-    capyctl_config::custom::CustomProfile::from_value(profile.get("custom")?)
-        .ok()
-        .map(|custom| custom.manifest)
+    custom_profile(profile).map(|custom| custom.manifest)
 }
 
 /// Fill one published profile's installation fields from its host document
 /// entry (`engine`, `executable` and, ADR 0031 §3, a custom engine's
-/// `custom` block).
+/// `custom` block with its manifest and pinned installation digest).
 pub fn register_profile(
     measurer: &InstallationMeasurer,
     profile: &serde_json::Value,
@@ -869,11 +932,8 @@ pub fn register_profile(
 ) {
     let engine = serde_json::from_value::<Engine>(profile["engine"].clone()).ok();
     let executable = Path::new(profile["executable"].as_str().unwrap_or(""));
-    let custom = custom_manifest(profile);
-    let (version, digest, state) = registration(measurer, engine, executable, custom.as_ref());
-    status.installation_version = version;
-    status.installation_digest = digest;
-    status.installation_state = state;
+    let custom = custom_profile(profile);
+    registration(measurer, engine, executable, custom.as_ref()).write(status);
 }
 
 /// What an observed digest reads as when the installation could not be
@@ -897,21 +957,39 @@ pub struct InstallationRegistry {
 
 impl InstallationRegistry {
     /// The fingerprints this host registered, from its published inventory,
-    /// with the custom engines' manifests its document carries.
+    /// with the custom engines' manifests its document carries. ADR 0031 §8:
+    /// a profile registered `drifted` (its pinned digest was measured
+    /// differently, or not at all) keeps the pinned digest as its baseline
+    /// and stands drifted until a launch measures it as pinned.
     pub fn from_inventory(inventory: &capyctl_protocol::pb::ReportInventory) -> Self {
         let document =
             serde_json::from_str::<serde_json::Value>(&inventory.approved_host_config_json)
                 .unwrap_or_default();
+        let registered = |p: &&capyctl_protocol::pb::RuntimeProfileStatus| {
+            matches!(p.installation_state.as_str(), "measured" | "drifted")
+                && !p.installation_digest.is_empty()
+        };
         let registry = Self {
             measurer: InstallationMeasurer::new(),
             registered: inventory
                 .profiles
                 .iter()
-                .filter(|p| p.installation_state == "measured" && !p.installation_digest.is_empty())
+                .filter(registered)
                 .map(|p| (p.name.clone(), p.installation_digest.clone()))
                 .collect(),
             custom: BTreeMap::new(),
-            drift: Mutex::default(),
+            drift: Mutex::new(
+                inventory
+                    .profiles
+                    .iter()
+                    .filter(registered)
+                    .filter(|p| {
+                        p.installation_state == "drifted"
+                            && !p.installation_observed_digest.is_empty()
+                    })
+                    .map(|p| (p.name.clone(), p.installation_observed_digest.clone()))
+                    .collect(),
+            ),
             capabilities: Mutex::default(),
             probe_timeout: PROBE_TIMEOUT,
         };
@@ -1020,7 +1098,8 @@ impl InstallationRegistry {
             .map(|(_, report)| report.clone())
     }
 
-    /// The digest `profile` registered, when it was measured at registration.
+    /// The digest `profile` registered: measured at registration or, ADR
+    /// 0031 §8, the pinned one a custom profile carries.
     pub fn registered(&self, profile: &str) -> Option<&str> {
         self.registered.get(profile).map(String::as_str)
     }
@@ -1634,13 +1713,13 @@ mod tests {
             ),
             Err(FingerprintError::TooLarge)
         );
-        let (_, _, state) = registration(
+        let registered = registration(
             &InstallationMeasurer::new(),
             Some(Engine::Custom),
             &executable,
-            Some(&bounded),
+            Some(&capyctl_config::custom::CustomProfile::new(bounded)),
         );
-        assert_eq!(state, "unmeasured");
+        assert_eq!(registered.state, "unmeasured");
     }
 
     // T44 T21 T22 (ADR 0031 §3): a custom profile registers with its
@@ -1713,5 +1792,120 @@ mod tests {
             &mut bare,
         );
         assert_eq!(bare.installation_state, "unmeasured");
+    }
+
+    // T44 T21 T22 (ADR 0031 §3, §8): a custom profile's pinned installation
+    // digest (the one the operator approved) is the registered baseline,
+    // never the fresh measurement. An equal measurement is `measured`; one
+    // that differs, or none, is `drifted` from registration on, warned under
+    // `warn` and refused `installation_drift` under `refuse`, until a launch
+    // measures the pinned digest again.
+    #[test]
+    fn a_pinned_installation_digest_is_the_baseline_and_never_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, executable, _, dependency) = custom_venv(dir.path());
+        let manifest = custom_manifest_with(None, Some("1.0"));
+        let approved = InstallationMeasurer::new()
+            .measure_profile(Engine::Custom, &executable, Some(&manifest))
+            .unwrap()
+            .digest;
+        let mut custom = capyctl_config::custom::CustomProfile::new(manifest);
+        custom.installation_digest = Some(approved.clone());
+        let profile =
+            serde_json::json!({"engine": "custom", "executable": executable, "custom": custom});
+        let register = |profile: &serde_json::Value| {
+            let mut status = capyctl_protocol::pb::RuntimeProfileStatus {
+                name: "serve".into(),
+                ..Default::default()
+            };
+            register_profile(&InstallationMeasurer::new(), profile, &mut status);
+            let registry =
+                InstallationRegistry::from_inventory(&capyctl_protocol::pb::ReportInventory {
+                    profiles: vec![status.clone()],
+                    approved_host_config_json:
+                        serde_json::json!({"runtime_profiles": {"serve": profile}}).to_string(),
+                    ..Default::default()
+                });
+            (status, registry)
+        };
+        let verify = |registry: &InstallationRegistry, executable: &Path, policy| {
+            registry.verify("serve", Engine::Custom, executable, policy)
+        };
+
+        // Measured as approved: `measured`, the pinned digest registered.
+        let (status, registry) = register(&profile);
+        assert_eq!(status.installation_state, "measured");
+        assert_eq!(status.installation_digest, approved);
+        assert_eq!(status.installation_version, "1.0");
+        assert!(status.installation_observed_digest.is_empty());
+        assert_eq!(registry.registered("serve"), Some(approved.as_str()));
+        assert_eq!(registry.drifted("serve"), None);
+        assert_eq!(
+            verify(&registry, &executable, InstallationDrift::Refuse),
+            Ok(approved.clone())
+        );
+
+        // Changed between approval and registration: never adopted.
+        std::fs::write(&dependency, "x = 2\n").unwrap();
+        let (status, registry) = register(&profile);
+        assert_eq!(status.installation_state, "drifted");
+        assert_eq!(
+            status.installation_digest, approved,
+            "the pinned digest, not the fresh measurement"
+        );
+        let changed = status.installation_observed_digest.clone();
+        assert!(changed.starts_with(DIGEST_PREFIX));
+        assert_ne!(changed, approved);
+        assert_eq!(registry.registered("serve"), Some(approved.as_str()));
+        assert_eq!(registry.drifted("serve"), Some(changed.clone()));
+        let mut profiles = vec![status.clone()];
+        registry.overlay(&mut profiles);
+        assert_eq!(profiles[0].installation_state, "drifted");
+        assert_eq!(profiles[0].installation_observed_digest, changed);
+        assert_eq!(
+            verify(&registry, &executable, InstallationDrift::Warn),
+            Ok(changed.clone()),
+            "warned, launched"
+        );
+        assert_eq!(
+            verify(&registry, &executable, InstallationDrift::Refuse),
+            Err("installation_drift")
+        );
+        // Measured as pinned again, the drift clears.
+        std::fs::write(&dependency, "x = 1\n").unwrap();
+        assert_eq!(
+            verify(&registry, &executable, InstallationDrift::Refuse),
+            Ok(approved.clone())
+        );
+        registry.overlay(&mut profiles);
+        assert_eq!(profiles[0].installation_state, "measured");
+        assert!(profiles[0].installation_observed_digest.is_empty());
+
+        // Not measurable at registration: `drifted`, observed `unmeasured`.
+        let gone = dir.path().join("gone");
+        let mut missing = profile.clone();
+        missing["executable"] = gone.to_string_lossy().into_owned().into();
+        let (status, registry) = register(&missing);
+        assert_eq!(status.installation_state, "drifted");
+        assert_eq!(status.installation_digest, approved);
+        assert_eq!(status.installation_observed_digest, UNMEASURED);
+        assert_eq!(
+            verify(&registry, &gone, InstallationDrift::Warn),
+            Ok(String::new())
+        );
+        assert_eq!(
+            verify(&registry, &gone, InstallationDrift::Refuse),
+            Err("installation_drift")
+        );
+
+        // Built-in engines and unpinned custom profiles keep today's rule.
+        let mut unpinned = profile.clone();
+        unpinned["custom"]
+            .as_object_mut()
+            .unwrap()
+            .remove("installation_digest");
+        let (status, _) = register(&unpinned);
+        assert_eq!(status.installation_state, "measured");
+        assert_eq!(status.installation_digest, approved);
     }
 }

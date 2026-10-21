@@ -483,12 +483,20 @@ fn prometheus_name(name: &str) -> bool {
 }
 
 /// ADR 0031 §2, §3: the custom block of a profile: the manifest as it
-/// validated, and its digest.
+/// validated, its digest, and (ADR 0031 §8) the installation digest the
+/// operator approved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomProfile {
     pub manifest: CustomManifest,
     pub manifest_digest: String,
+    /// ADR 0031 §3, §8: the installation digest `engine add --custom`
+    /// measured and showed in the summary the operator confirmed. When set,
+    /// registration pins it as the baseline and never adopts a different
+    /// measurement. `None` when it could not be measured (or the profile was
+    /// written by hand).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_digest: Option<String>,
 }
 
 impl CustomProfile {
@@ -497,37 +505,61 @@ impl CustomProfile {
         Self {
             manifest,
             manifest_digest,
+            installation_digest: None,
         }
     }
 
-    /// A profile's `custom` block, validated: the manifest again, and its
-    /// digest recomputed from it.
+    /// A profile's `custom` block, validated: the manifest again, its digest
+    /// recomputed from it, and a pinned installation digest of the form
+    /// `sha256:` + 64 lowercase hex.
     pub fn from_value(value: &serde_json::Value) -> Result<Self, ManifestError> {
         let digest = value
             .get("manifest_digest")
             .and_then(|d| d.as_str())
             .ok_or_else(|| ManifestError::invalid("`custom.manifest_digest` is missing"))?;
         if let Some(other) = value.as_object().and_then(|o| {
-            o.keys()
-                .find(|k| *k != "manifest" && *k != "manifest_digest")
+            o.keys().find(|k| {
+                !matches!(
+                    k.as_str(),
+                    "manifest" | "manifest_digest" | "installation_digest"
+                )
+            })
         }) {
             return Err(ManifestError::invalid(format!(
                 "unknown field `custom.{other}`"
             )));
         }
+        let installation_digest = match value.get("installation_digest") {
+            None => None,
+            Some(pinned) => Some(
+                pinned
+                    .as_str()
+                    .filter(|d| {
+                        d.strip_prefix("sha256:")
+                            .is_some_and(crate::model_source::is_sha256_hex)
+                    })
+                    .ok_or_else(|| {
+                        ManifestError::invalid(
+                            "`custom.installation_digest` must be sha256: and 64 lowercase hex characters",
+                        )
+                    })?
+                    .to_owned(),
+            ),
+        };
         let manifest = CustomManifest::from_value(
             value
                 .get("manifest")
                 .cloned()
                 .ok_or_else(|| ManifestError::invalid("`custom.manifest` is missing"))?,
         )?;
-        let profile = Self::new(manifest);
+        let mut profile = Self::new(manifest);
         if profile.manifest_digest != digest {
             return Err(ManifestError::invalid(format!(
                 "`custom.manifest_digest` is {digest}, but the manifest digests to {}",
                 profile.manifest_digest
             )));
         }
+        profile.installation_digest = installation_digest;
         Ok(profile)
     }
 }
@@ -555,33 +587,62 @@ impl std::fmt::Debug for PlaceholderValues {
     }
 }
 
-/// ADR 0031 §2: a placeholder the launch cannot fill.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unset(pub Placeholder);
+/// ADR 0031 §8: a value that comes from the deployment (the served name, the
+/// checkpoint directory) is refused when it starts with `-` or holds a control
+/// character, so a program can never read it as an option: deployment
+/// operators cannot add arguments.
+pub fn is_invalid_value(value: &str) -> bool {
+    value.starts_with('-') || value.chars().any(char::is_control)
+}
 
-impl std::fmt::Display for Unset {
+/// ADR 0031 §2, §8: a placeholder a launch cannot render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceholderError {
+    /// The launch has no value for it (`custom_placeholder_unset:<name>`).
+    Unset(Placeholder),
+    /// Its value could be read as an option (`custom_value_invalid:<name>`).
+    Invalid(Placeholder),
+}
+
+impl std::fmt::Display for PlaceholderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "custom_placeholder_unset:{}", self.0.name())
+        match self {
+            Self::Unset(p) => write!(f, "custom_placeholder_unset:{}", p.name()),
+            Self::Invalid(p) => write!(f, "custom_value_invalid:{}", p.name()),
+        }
     }
 }
 
 impl PlaceholderValues {
-    fn value(&self, placeholder: Placeholder) -> Result<String, Unset> {
+    fn value(&self, placeholder: Placeholder) -> Result<String, PlaceholderError> {
+        // ADR 0031 §8: resolution refuses these already; a frozen launch is
+        // checked again so nothing older slips through.
+        let from_deployment = |value: &str| {
+            if is_invalid_value(value) {
+                Err(PlaceholderError::Invalid(placeholder))
+            } else {
+                Ok(value.to_owned())
+            }
+        };
         Ok(match placeholder {
             Placeholder::Host => LOOPBACK_HOST.into(),
             Placeholder::Port => self.port.to_string(),
-            Placeholder::ModelDir => self.model_dir.clone(),
-            Placeholder::ServedName => self.served_name.clone(),
-            Placeholder::ContextLength => {
-                self.context_length.ok_or(Unset(placeholder))?.to_string()
-            }
-            Placeholder::ApiKey => self.api_key.clone().ok_or(Unset(placeholder))?,
+            Placeholder::ModelDir => from_deployment(&self.model_dir)?,
+            Placeholder::ServedName => from_deployment(&self.served_name)?,
+            Placeholder::ContextLength => self
+                .context_length
+                .ok_or(PlaceholderError::Unset(placeholder))?
+                .to_string(),
+            Placeholder::ApiKey => self
+                .api_key
+                .clone()
+                .ok_or(PlaceholderError::Unset(placeholder))?,
         })
     }
 
     /// One template string rendered: each placeholder replaced by its value,
     /// the result one string (one argument), never split (SPEC §8.1).
-    pub fn render(&self, template: &str) -> Result<String, Unset> {
+    pub fn render(&self, template: &str) -> Result<String, PlaceholderError> {
         let mut out = String::new();
         // A template that failed to parse never reached a validated manifest.
         for piece in parse_template(template).unwrap_or_default() {
@@ -594,12 +655,15 @@ impl PlaceholderValues {
     }
 
     /// The manifest's argument vector rendered, one argument per entry.
-    pub fn render_args(&self, manifest: &CustomManifest) -> Result<Vec<String>, Unset> {
+    pub fn render_args(&self, manifest: &CustomManifest) -> Result<Vec<String>, PlaceholderError> {
         manifest.args.iter().map(|arg| self.render(arg)).collect()
     }
 
     /// The manifest's environment rendered.
-    pub fn render_env(&self, manifest: &CustomManifest) -> Result<BTreeMap<String, String>, Unset> {
+    pub fn render_env(
+        &self,
+        manifest: &CustomManifest,
+    ) -> Result<BTreeMap<String, String>, PlaceholderError> {
         manifest
             .env
             .iter()
@@ -762,6 +826,61 @@ mod tests {
         );
     }
 
+    // T44 (ADR 0031 §8): a frozen launch whose served name or checkpoint
+    // directory could be read as an option is refused at render, in `args`
+    // and in `env` values alike; the other placeholders are CapyCTL's own.
+    #[test]
+    fn a_dash_leading_or_control_value_is_refused_at_render() {
+        let ok = PlaceholderValues {
+            port: 1,
+            model_dir: "/m/a-b".into(),
+            served_name: "basal-2".into(),
+            context_length: Some(4096),
+            api_key: Some("k".into()),
+        };
+        assert_eq!(
+            ok.render("--name={served_name} {model_dir}").unwrap(),
+            "--name=basal-2 /m/a-b"
+        );
+        for (served_name, model_dir, code) in [
+            (
+                "--log-decisions=/tmp/x",
+                "/m",
+                "custom_value_invalid:served_name",
+            ),
+            ("-v", "/m", "custom_value_invalid:served_name"),
+            ("a\nb", "/m", "custom_value_invalid:served_name"),
+            ("a\u{7f}", "/m", "custom_value_invalid:served_name"),
+            ("s", "--trust-remote-code", "custom_value_invalid:model_dir"),
+            ("s", "/m\t--x", "custom_value_invalid:model_dir"),
+        ] {
+            let values = PlaceholderValues {
+                served_name: served_name.into(),
+                model_dir: model_dir.into(),
+                ..ok.clone()
+            };
+            let template = if code.ends_with("served_name") {
+                "{served_name}"
+            } else {
+                "{model_dir}"
+            };
+            assert_eq!(
+                values.render(template).unwrap_err().to_string(),
+                code,
+                "{values:?}"
+            );
+            assert_eq!(
+                values
+                    .render(&format!("--x={template}"))
+                    .unwrap_err()
+                    .to_string(),
+                code
+            );
+            // A template that never renders the value is unaffected.
+            assert_eq!(values.render("{port}").unwrap(), "1");
+        }
+    }
+
     // T44: a profile's block is checked against its own digest.
     #[test]
     fn a_profile_block_must_match_its_digest() {
@@ -773,6 +892,43 @@ mod tests {
             .unwrap_err()
             .detail
             .contains("digests to"));
+    }
+
+    // T44 T21 T22 (ADR 0031 §3, §8): the installation digest the operator
+    // approved round-trips with the block; an unpinned block serializes
+    // without the key; a malformed pin is `custom_manifest_invalid`.
+    #[test]
+    fn a_profile_block_carries_its_pinned_installation_digest() {
+        let mut profile = CustomProfile::new(CustomManifest::parse(basal()).unwrap());
+        assert!(serde_json::to_value(&profile)
+            .unwrap()
+            .get("installation_digest")
+            .is_none());
+        let pinned = format!("sha256:{}", "a".repeat(64));
+        profile.installation_digest = Some(pinned.clone());
+        let value = serde_json::to_value(&profile).unwrap();
+        assert_eq!(value["installation_digest"], pinned.as_str());
+        let read = CustomProfile::from_value(&value).unwrap();
+        assert_eq!(read.installation_digest.as_deref(), Some(pinned.as_str()));
+        assert_eq!(read, profile);
+        assert_eq!(
+            serde_json::from_value::<CustomProfile>(value.clone()).unwrap(),
+            profile
+        );
+        for bad in [
+            serde_json::json!(format!("sha256:{}", "A".repeat(64))),
+            serde_json::json!(format!("sha256:{}", "a".repeat(63))),
+            serde_json::json!(format!("md5:{}", "a".repeat(64))),
+            serde_json::json!("unmeasured"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+        ] {
+            let mut malformed = value.clone();
+            malformed["installation_digest"] = bad.clone();
+            let error = CustomProfile::from_value(&malformed).unwrap_err();
+            assert_eq!(error.code, MANIFEST_INVALID, "{bad}");
+            assert!(error.detail.contains("installation_digest"), "{bad}");
+        }
     }
 
     // T44, T37 (ADR 0031 §8): the server shows the rendered command with the

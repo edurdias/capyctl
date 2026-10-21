@@ -5,7 +5,7 @@ use axum::{
     routing::post,
     Router,
 };
-use capyctl_agent::ingress::{Ingress, IngressScope};
+use capyctl_agent::ingress::{EngineAccess, Ingress, IngressScope};
 use std::sync::{Arc, Mutex};
 fn scope(generation: i64) -> IngressScope {
     IngressScope {
@@ -281,8 +281,12 @@ async fn two_instances_of_one_deployment_hold_separate_gates_on_one_host() {
     ingress
         .register(one.clone(), second_native, "model".into(), [3; 32], [4; 32])
         .unwrap();
-    ingress.bind_handle(&zero, "launch-zero").unwrap();
-    ingress.bind_handle(&one, "launch-one").unwrap();
+    ingress
+        .bind_handle(&zero, "launch-zero", EngineAccess::builtin())
+        .unwrap();
+    ingress
+        .bind_handle(&one, "launch-one", EngineAccess::builtin())
+        .unwrap();
     ingress.open(&one).unwrap();
     let (address, task) = serve(ingress.clone().router()).await;
     let client = reqwest::Client::new();
@@ -675,4 +679,134 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
         .contains("must be provided"));
     task.abort();
     native_task.abort();
+}
+
+/// What a recording engine saw: each request's path and its
+/// `Authorization` header, if any.
+type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// A fake engine that answers a chat completion as a stream and any other
+/// read with an idle gauge, recording every request's path and header.
+async fn recording_engine() -> (std::net::SocketAddr, Seen, tokio::task::JoinHandle<()>) {
+    let seen: Seen = Arc::default();
+    let captured = seen.clone();
+    let engine = Router::new().fallback(move |request: Request<Body>| {
+        let seen = captured.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let authorization = request
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            seen.lock().unwrap().push((path.clone(), authorization));
+            if path == "/v1/chat/completions" {
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from("data: [DONE]\n\n"))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .body(Body::from("requests_running 0\n"))
+                    .unwrap()
+            }
+        }
+    });
+    let (address, task) = serve(engine).await;
+    (address, seen, task)
+}
+
+const KEYED_MANIFEST: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+    args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+    env: {SERVE_AUTH: \"{api_key}\"}\n\
+    idle: {url: /idle, gauges: [requests_running]}\n";
+const UNKEYED_MANIFEST: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+    args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+    idle: {url: /idle, gauges: [requests_running]}\n";
+
+// T44 T13 T14 (ADR 0031 §7, amendment A1): the launch's native key is sent
+// only to an engine that takes it. A built-in engine and a custom engine
+// whose manifest uses `{api_key}` receive `Bearer <key>` on forwarded
+// requests and on the load reporter's loopback reads; a custom engine whose
+// manifest does not receives no `Authorization` header on either. No
+// assertion message carries a key.
+#[tokio::test]
+async fn the_native_key_reaches_only_an_engine_that_takes_it() {
+    use capyctl_config::custom::{CustomManifest, CustomProfile};
+    let custom = |manifest: &str| CustomProfile::new(CustomManifest::parse(manifest).unwrap());
+    let ingress = Ingress::new().unwrap();
+    let mut engines = Vec::new();
+    for (name, gate, native, access, read_path) in [
+        ("builtin", 11u8, 21u8, EngineAccess::builtin(), "/metrics"),
+        (
+            "keyed",
+            12,
+            22,
+            EngineAccess::custom(&custom(KEYED_MANIFEST)),
+            "/idle",
+        ),
+        (
+            "unkeyed",
+            13,
+            23,
+            EngineAccess::custom(&custom(UNKEYED_MANIFEST)),
+            "/idle",
+        ),
+    ] {
+        let (target, seen, engine_task) = recording_engine().await;
+        let launch = IngressScope {
+            deployment_id: name.into(),
+            ..scope(1)
+        };
+        ingress
+            .register(
+                launch.clone(),
+                target,
+                "model".into(),
+                [gate; 32],
+                [native; 32],
+            )
+            .unwrap();
+        ingress
+            .bind_handle(&launch, &format!("launch-{name}"), access)
+            .unwrap();
+        ingress.open(&launch).unwrap();
+        engines.push((name, gate, native, read_path, seen, engine_task));
+    }
+    let (address, task) = serve(ingress.clone().router()).await;
+    let client = reqwest::Client::new();
+    for (name, gate, ..) in &engines {
+        let response = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(hex::encode([*gate; 32]))
+            .json(&serde_json::json!({"model":"model","messages":[],"stream":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert!(response.text().await.unwrap().ends_with("data: [DONE]\n\n"));
+    }
+    let reporter = capyctl_agent::load::LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+    assert!(!reporter.reports().await.is_empty());
+    for (name, _, native, read_path, seen, engine_task) in engines {
+        let expected = format!("Bearer {}", hex::encode([native; 32]));
+        let seen = seen.lock().unwrap().clone();
+        let paths: Vec<_> = seen.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["/v1/chat/completions", read_path], "{name}");
+        for (path, authorization) in &seen {
+            if name == "unkeyed" {
+                assert!(
+                    authorization.is_none(),
+                    "{name}: {path} carried an Authorization header"
+                );
+            } else {
+                assert!(
+                    authorization.as_deref() == Some(expected.as_str()),
+                    "{name}: {path} did not carry the launch's own key"
+                );
+            }
+        }
+        engine_task.abort();
+    }
+    task.abort();
 }

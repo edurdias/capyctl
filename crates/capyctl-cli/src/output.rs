@@ -285,6 +285,20 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Required,
         Some(ExitCode::INVALID_CONFIG),
     ),
+    // ADR 0031 §8: a served name or checkpoint directory that would read as
+    // an option, refused at resolution and again at launch.
+    (
+        "custom_value_invalid",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    // ADR 0031 Amendment A1: a custom profile without its engine-key
+    // reference.
+    (
+        "custom_credential_ref_missing",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
     ("custom_listener_exposed", Named::Bare, None),
     // ADR 0023 §2: an existing code keeps its exit when a configuration
     // refusal carries it (`capability_missing:deep_park`).

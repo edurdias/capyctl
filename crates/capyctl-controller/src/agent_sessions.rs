@@ -306,26 +306,59 @@ fn installation_fields_valid(p: &pb::RuntimeProfileStatus) -> bool {
             .iter()
             .all(|c| matches!(c.as_str(), "core" | "deep_park" | "metrics" | "observation"))
 }
-/// ADR 0008: the drifts `new` reports that `old` did not (a new drift, or a
-/// drift to a different observed digest): (installation, registered, observed).
+/// ADR 0008: the drifts `new` reports that `old` did not (a new drift, a
+/// drift to a different observed digest, or a drift of a profile `old` does
+/// not publish with the same registered digest): (installation, registered,
+/// observed). Profiles are matched by name.
 fn newly_drifted(
     new: &[pb::RuntimeProfileStatus],
     old: &[pb::RuntimeProfileStatus],
 ) -> Vec<(String, String, String)> {
     new.iter()
-        .zip(old)
-        .filter(|(new, previous)| {
+        .filter(|new| {
             new.installation_state == "drifted"
                 && !new.installation_digest.is_empty()
-                && (previous.installation_state != "drifted"
-                    || previous.installation_observed_digest != new.installation_observed_digest)
+                && old
+                    .iter()
+                    .find(|previous| previous.name == new.name)
+                    .is_none_or(|previous| {
+                        previous.installation_state != "drifted"
+                            || previous.installation_digest != new.installation_digest
+                            || previous.installation_observed_digest
+                                != new.installation_observed_digest
+                    })
         })
-        .map(|(new, _)| {
+        .map(|new| {
             (
                 new.name.clone(),
                 new.installation_digest.clone(),
                 new.installation_observed_digest.clone(),
             )
+        })
+        .collect()
+}
+/// ADR 0031 §8: the profiles a publication reports drifted from the
+/// installation digest their document pins (`custom.installation_digest`)
+/// that `old` (the profiles published before; none for a session's first
+/// publication) did not: registration measured the approved installation
+/// differently, or not at all. Journaled once at publication; a status
+/// refresh only journals what changes after it. Built-in engines pin
+/// nothing, so none appears here.
+fn pinned_drifts(
+    inventory: &pb::ReportInventory,
+    old: &[pb::RuntimeProfileStatus],
+) -> Vec<(String, String, String)> {
+    let drifts = newly_drifted(&inventory.profiles, old);
+    if drifts.is_empty() {
+        return drifts;
+    }
+    let document = serde_json::from_str::<serde_json::Value>(&inventory.approved_host_config_json)
+        .unwrap_or_default();
+    drifts
+        .into_iter()
+        .filter(|(name, registered, _)| {
+            document["runtime_profiles"][name.as_str()]["custom"]["installation_digest"].as_str()
+                == Some(registered.as_str())
         })
         .collect()
 }
@@ -1406,6 +1439,12 @@ impl AgentSessions {
                                     Some(reason) => format!("host inventory publication refused: {reason}"),
                                     None => "host inventory publication refused".to_owned(),
                                 }))?;
+                                // ADR 0031 §8: a pinned installation registration found
+                                // changed is journaled once, here; refreshes journal only
+                                // what changes after. Evidence only, as for a refresh.
+                                for (name, registered, observed) in pinned_drifts(&inventory, &[]) {
+                                    let _ = self.authority.record_installation_drift(&host, &name, &registered, &observed);
+                                }
                                 let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }
@@ -1438,6 +1477,11 @@ impl AgentSessions {
                                 // Store work outside the session table (SPEC §13).
                                 let verdict = self.authority.republish_inventory(&host, &inventory, &previous);
                                 if verdict.is_ok() {
+                                    // ADR 0031 §8: as at publication, a pinned installation the
+                                    // re-measurement newly found changed is journaled once.
+                                    for (name, registered, observed) in pinned_drifts(&inventory, &previous.profiles) {
+                                        let _ = self.authority.record_installation_drift(&host, &name, &registered, &observed);
+                                    }
                                     let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                     let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                     if s.view.session_id != id { return Err(denied()); }
@@ -2128,6 +2172,45 @@ mod installation_tests {
         assert!(installation_fields_valid(
             &pb::RuntimeProfileStatus::default()
         ));
+    }
+
+    // T44 T21 T22 (ADR 0031 §3, §8): a first publication journals a profile
+    // registered drifted from its pinned installation digest once; a built-in
+    // profile's drift (no pin) is left to the refreshes, as before, and a
+    // refresh or re-publication reporting the same drift journals nothing.
+    #[test]
+    fn a_pinned_drift_is_journaled_once_at_publication() {
+        let pinned = format!("sha256:{}", "a".repeat(64));
+        let observed = format!("sha256:{}", "b".repeat(64));
+        let drifted = |name: &str| pb::RuntimeProfileStatus {
+            name: name.into(),
+            installation_state: "drifted".into(),
+            installation_observed_digest: observed.clone(),
+            ..measured()
+        };
+        let inventory = pb::ReportInventory {
+            profiles: vec![drifted("serve"), drifted("local")],
+            approved_host_config_json: serde_json::json!({"runtime_profiles": {
+                "serve": {"engine": "custom", "custom": {"installation_digest": pinned}},
+                "local": {"engine": "sglang"},
+            }})
+            .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pinned_drifts(&inventory, &[]),
+            vec![("serve".to_owned(), pinned.clone(), observed.clone())]
+        );
+        assert!(pinned_drifts(&inventory, &inventory.profiles).is_empty());
+        assert!(newly_drifted(&inventory.profiles, &inventory.profiles).is_empty());
+        // Unmeasured at registration reads as a drift to `unmeasured`.
+        let mut unmeasured = inventory.clone();
+        unmeasured.profiles[0].installation_observed_digest = "unmeasured".into();
+        assert!(installation_fields_valid(&unmeasured.profiles[0]));
+        assert_eq!(
+            pinned_drifts(&unmeasured, &inventory.profiles),
+            vec![("serve".to_owned(), pinned, "unmeasured".to_owned())]
+        );
     }
 }
 

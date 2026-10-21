@@ -463,7 +463,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         (
             "custom",
-            FieldSpec::Struct(&[("manifest", CUSTOM_MANIFEST), ("manifest_digest", SCALAR)]),
+            // ADR 0031 §8: the installation digest the operator approved.
+            FieldSpec::Struct(&[
+                ("manifest", CUSTOM_MANIFEST),
+                ("manifest_digest", SCALAR),
+                ("installation_digest", SCALAR),
+            ]),
         ),
     ]);
     // Standalone `server:`/`host:` blocks mirror the generated standalone

@@ -46,6 +46,33 @@ working. For a decisions deployment, ADR 0030's document check refuses a
 `topology` or a parking residency before the profile is known, so those two
 refusals carry ADR 0030's wording there; a chat deployment gets ADR 0031's codes.
 
+Review fixes (PR #166 review, 784366a5): (1) the standalone role keyed its
+installations by executable and `environment` only, so a built-in and a custom
+profile on one executable shared one measurement and the second was
+drift-checked against the first's; installations are now keyed by engine too
+(and, for a custom engine, its root and pinned digest). (2) `engine add` and
+`engine add --custom` locked their own file, so two concurrent adds of one name
+could both write; both files now share one lock (`engines.yaml.lock`), taken
+before either is loaded, and the size bound is checked on both under it. (3) A
+remote host whose profile set no longer held a launch's approved document read
+its idle signal from the current profiles, so after a remove and re-add a
+running instance could be sampled with another manifest; the signal now travels
+with the launch, and without it the launch's idleness is unknown (no load
+figures, cancelling requests settle only at the verified stop, and the stop
+gate waits its bound). (4) A remote host's ingress forwarding and idle reads
+sent the engine key to a custom engine whose manifest does not use
+`{api_key}`; they no longer do. (5) A hand-written custom profile without
+`security.credential_ref` validated and then failed every start with a generic
+conflict; resolution now refuses it `custom_credential_ref_missing`. (6) The
+installation digest shown at the confirmation was not saved, so the role took
+whatever it measured at its next start as the baseline; it is now saved as
+`custom.installation_digest`, and a different measurement at registration is
+drift, never adopted. (7) A deployment's served name such as
+`--log-decisions=/tmp/x` reached the engine as an option when the manifest
+placed `{served_name}` as an argument; a served name or model path that starts
+with `-` or holds a control character is refused `custom_value_invalid:<name>`
+at resolution and again at launch. Amendment A1 records each of them.
+
 SPEC amendments landed with the implementation: §8.2 (a custom engine is a
 custom/fixed recipe whose flags CapyCTL does not validate), §9.4 (custom engines
 as a later backend), §10 (the settlement of `cancelling` requests on an engine
@@ -61,8 +88,27 @@ Tests: tagged T44 (and T13, T14, T17, T37, T43 where they apply), in
 refusals), `crates/capyctl-adapters/src/custom/` (rendering), the CLI
 (`crates/capyctl-cli/tests/errors.rs`: codes and exits), the controller's
 installation gate and version-skew capability tests, and the store's cancelling
-settlement (`crates/capyctl-store/src/ordinary_lifecycle/park_cancelling_tests.rs`);
-the integrator completes this list with the final test names at commit. CPU and
+settlement (`crates/capyctl-store/src/ordinary_lifecycle/park_cancelling_tests.rs`).
+The review fixes add, by finding: (1)
+`a_builtin_and_a_custom_profile_on_one_executable_are_two_installations` and
+`embedded_installations_are_keyed_by_executable_and_engine`
+(`installation_gate.rs`); (2)
+`a_normal_and_a_custom_add_of_one_name_serialize_on_one_lock` and
+`the_size_bound_counts_both_engines_files` (`tests/custom_engines.rs`); (3)
+`a_republished_profile_never_supplies_a_running_launch_idle_signal`
+(`native_execution.rs`) and an unknown launch in
+`a_custom_launch_reads_quiescent_only_on_its_idle_signal` (agent `tests/load.rs`);
+(4) `the_native_key_reaches_only_an_engine_that_takes_it` (agent
+`tests/ingress.rs`, recording fake engines); (5)
+`a_custom_profile_without_a_credential_reference_is_refused`; (6)
+`a_profile_block_carries_its_pinned_installation_digest` (`custom.rs`),
+`a_pinned_installation_digest_is_the_baseline_and_never_adopted`
+(`installation.rs`), `a_pinned_installation_digest_is_the_embedded_baseline`,
+`a_pinned_drift_is_journaled_once_at_publication` (`agent_sessions.rs`) and
+the pinned digest in `tests/engine_custom.rs`; (7)
+`a_value_that_reads_as_an_option_is_refused`,
+`a_dash_leading_or_control_value_is_refused_at_render` and
+`a_dash_leading_deployment_value_refuses_the_launch` (`custom/args.rs`). CPU and
 Fake-engine tests are not qualification.
 
 Live qualification, host A (GB10), basal 2.2.0 in `~/basal-2.2.0-venv` (torch
@@ -116,6 +162,23 @@ journal held `request_cancellation_acknowledged` (count 1, receipt: no idle
 signal, the stop operation's cleanup step verified the exit of the process
 group) beside that operation's `ordinary_cleanup_completed`.
 
+CE3 passed again on 2026-10-21 with the review fixes (working tree on
+784366a5, release build, host A, the same llama-server manifest and
+deployment): `engine add --custom --yes` wrote `custom.installation_digest`
+equal to the digest its summary showed, and the role registered the engine
+`measured` at that digest; the deployment was ready in 7 s; a streamed
+request cut by the client after 3 s (55 KB received) moved
+`instances[].requests` from `{cancelling: "0", cancelling_settles: "stop"}` to
+`{cancelling: "1", ...}`; `stop deployment` returned in 0.04 s; 3 s later the
+deployment was `stopped` with `cancelling: "0"` and no llama-server left, and
+the journal held `request_cancellation_acknowledged` (count 1, receipt: no
+idle signal, the stop's cleanup step verified the exit of the process group)
+beside that operation's `ordinary_cleanup_completed`. A deployment on it with
+`routes: ["--log-file=/tmp/x"]` was refused
+`custom_value_invalid:served_name` (exit 2). Fixes (3) and (4) change only a
+remote host's sampling and forwarding; CE3 runs standalone, whose load
+sampling and quiescence path they leave as they were.
+
 Deep gate (`scripts/ci-local.sh --deep --only workspace`, host A, branch head
 3a99062a): 3436 passed, 3 failed, 1 ignored over 244 test binaries. The three
 failures are `a_role_warns_when_its_limits_exceed_the_memory_available`
@@ -126,6 +189,16 @@ host, so they are host-specific, not regressions: their assertions depend on
 the host's free memory, and host A had 10.0 GiB of its 32 GiB unified pool
 available, less than its 16 GiB limit plus 6.4 GiB reserve
 (`admission_figures.rs:165`, `switching_cli.rs:336` and `:422`).
+
+With the review fixes, on the laptop: `scripts/ci-local.sh` passed every step
+(fmt, name, clippy, unit, runtime, shellcheck, installer, changes), and
+`scripts/ci-local.sh --deep --only workspace` gave 3445 passed, 7 failed, 1
+ignored over 244 test binaries. The 7 are the standalone launches of
+`engine_exit` (2) and `role_shutdown` (5), refused
+`insufficient_device_memory` because another program held 14 of the laptop
+GPU's 16 GiB (1.9 GiB available against 8.7 GiB needed). Both binaries passed
+in full on host A in a git-initialised archive of the same tree (3 and 25
+passed).
 
 basal's `--mode fp8` needs torchao, which the approved environment does not
 have; `--mode fast` (bf16, compiled) served a decision directly in 69 ms after

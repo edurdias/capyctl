@@ -88,6 +88,7 @@ impl EmbeddedTargets {
                     owned_handle: launch.step_id,
                     target: SocketAddr::new(ip, url.port_or_known_default()?),
                     native,
+                    signal: capyctl_agent::load::LaunchSignal::Builtin,
                     in_flight: 0,
                 })
             })

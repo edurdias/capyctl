@@ -1374,6 +1374,16 @@ fn check_custom_deployment(
              `{context_length}`, so the deployment states engine_config.context_length",
         ));
     }
+    // ADR 0031 §8: deployment operators cannot add arguments, so the served
+    // name `{served_name}` renders may not read as an option.
+    if crate::custom::is_invalid_value(&d.routes[0]) {
+        return Err(invalid(
+            "routes",
+            "custom_value_invalid:served_name: a custom engine's served name (the first \
+             route) may not start with `-` or hold a control character, so the engine can \
+             never read it as an option",
+        ));
+    }
     Ok(())
 }
 
@@ -1638,6 +1648,21 @@ pub fn resolve_effective_with_checkpoint(
         Some(&host.model_store),
         Some(host.model_sources.root(&host.model_store)),
     )?;
+    // ADR 0031 §8: the checkpoint directory `{model_dir}` renders comes from
+    // the deployment's model, so it may not read as an option either.
+    if profile.custom.is_some()
+        && model
+            .resolved_path
+            .as_deref()
+            .is_some_and(crate::custom::is_invalid_value)
+    {
+        return Err(invalid(
+            "model",
+            "custom_value_invalid:model_dir: a custom engine's checkpoint directory may not \
+             start with `-` or hold a control character, so the engine can never read it as \
+             an option",
+        ));
+    }
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
     // ADR 0008 amendment 2026-10-08: and so does a remote drafter source.

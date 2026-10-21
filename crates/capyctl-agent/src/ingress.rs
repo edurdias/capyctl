@@ -51,6 +51,46 @@ fn key(scope: &IngressScope) -> EntryKey {
 #[derive(Debug, thiserror::Error)]
 #[error("inference ingress authorization failed")]
 pub struct IngressError;
+/// ADR 0031 §6, §7: how the engine behind an entry is read and keyed, frozen
+/// with the launch bound to it: from the profile in the document that launch
+/// was approved under, never from the host's current profile set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineAccess {
+    /// How the load reporter samples the engine.
+    pub signal: crate::load::LaunchSignal,
+    /// Whether forwarding and loopback reads present the launch's native key
+    /// as a bearer token. ADR 0031 §7 / amendment A1: a custom engine is
+    /// keyed only when its manifest uses `{api_key}`.
+    pub keyed: bool,
+}
+impl EngineAccess {
+    /// A built-in engine: read by its family's `/metrics`, always keyed.
+    pub fn builtin() -> Self {
+        Self {
+            signal: crate::load::LaunchSignal::Builtin,
+            keyed: true,
+        }
+    }
+    /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
+    /// (never at all without one) and keyed only when the manifest uses
+    /// `{api_key}`.
+    pub fn custom(custom: &capyctl_config::custom::CustomProfile) -> Self {
+        Self {
+            signal: crate::load::LaunchSignal::Custom(custom.manifest.idle.clone()),
+            keyed: custom.manifest.uses_api_key(),
+        }
+    }
+    /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
+    /// whose frozen profile is no longer held. Its idleness is unknown, so it
+    /// is never read; and with no manifest to show that the engine takes the
+    /// key (amendment A1), the key is never sent.
+    pub fn unknown() -> Self {
+        Self {
+            signal: crate::load::LaunchSignal::Unknown,
+            keyed: false,
+        }
+    }
+}
 struct Entry {
     scope: IngressScope,
     target: SocketAddr,
@@ -60,8 +100,9 @@ struct Entry {
     open: AtomicBool,
     current: AtomicUsize,
     /// The launch this entry forwards to (its launch command id), bound by the
-    /// launch path so load samples name the owned handle the controller holds.
-    handle: Mutex<Option<String>>,
+    /// launch path so load samples name the owned handle the controller holds,
+    /// with its engine's access (ADR 0031 §6, §7).
+    handle: Mutex<Option<(String, EngineAccess)>>,
     /// SPEC §17 (M80): what this entry's forwards took since the load reporter
     /// last drained them. Bounded by the capyctl bucket layout.
     timings: Mutex<IngressTimings>,
@@ -103,13 +144,16 @@ impl Entry {
 /// SPEC §10, D9: one open scope the host load reporter scrapes on loopback.
 /// The native key authenticates the scrape only; it never leaves the host.
 /// `None` is a launch that takes no key (an embedded llama.cpp launch, ADR
-/// 0029 §4); its scrapes carry no `Authorization` header.
+/// 0029 §4; a custom engine whose manifest does not use `{api_key}`, ADR 0031
+/// §7); its scrapes carry no `Authorization` header. ADR 0031 §6: `signal` is
+/// how the launch's engine is sampled, frozen with the launch.
 #[derive(Clone)]
 pub struct LoadTarget {
     pub scope: IngressScope,
     pub owned_handle: String,
     pub target: SocketAddr,
     pub native: Option<[u8; 32]>,
+    pub signal: crate::load::LaunchSignal,
     pub in_flight: usize,
 }
 #[derive(Default)]
@@ -304,17 +348,30 @@ impl Ingress {
         Ok(())
     }
     /// Bind the owned handle (launch command id) of the launch behind this
-    /// exact scope. Load samples are reported only for bound, open entries.
+    /// exact scope, with its engine's access. Load samples are reported only
+    /// for bound, open entries.
     pub fn bind_handle(
         &self,
         scope: &IngressScope,
         owned_handle: &str,
+        engine: EngineAccess,
     ) -> Result<(), IngressError> {
         if owned_handle.trim().is_empty() || owned_handle.len() > 4096 {
             return Err(IngressError);
         }
         let entry = self.entry(scope)?;
-        *entry.handle.lock().map_err(|_| IngressError)? = Some(owned_handle.to_owned());
+        let mut bound = entry.handle.lock().map_err(|_| IngressError)?;
+        // ADR 0031 §6: the access is frozen with the launch. A later bind of
+        // the same launch (a re-registration after its document was no longer
+        // held) never replaces a known access with an unknown one.
+        let keep = bound.as_ref().is_some_and(|(handle, kept)| {
+            handle == owned_handle
+                && kept.signal != crate::load::LaunchSignal::Unknown
+                && engine.signal == crate::load::LaunchSignal::Unknown
+        });
+        if !keep {
+            *bound = Some((owned_handle.to_owned(), engine));
+        }
         Ok(())
     }
     /// SPEC §10, D9: every open, handle-bound scope with its loopback target
@@ -326,14 +383,18 @@ impl Ingress {
             if !entry.open.load(Ordering::SeqCst) {
                 continue;
             }
-            let Some(owned_handle) = entry.handle.lock().map_err(|_| IngressError)?.clone() else {
+            let Some((owned_handle, engine)) =
+                entry.handle.lock().map_err(|_| IngressError)?.clone()
+            else {
                 continue;
             };
             targets.push(LoadTarget {
                 scope: entry.scope.clone(),
                 owned_handle,
                 target: entry.target,
-                native: Some(entry.native),
+                // ADR 0031 §7: only an engine that takes the key gets it.
+                native: engine.keyed.then_some(entry.native),
+                signal: engine.signal,
                 in_flight: entry.current.load(Ordering::SeqCst),
             });
         }
@@ -561,12 +622,27 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // producing at a fixed wall time; the router bounds a relayed stream by
     // its deadline and the idle gap between events, and dropping it closes
     // this body.
+    // ADR 0031 §7 / amendment A1: the native key is sent only to an engine
+    // that takes it; a custom engine whose manifest does not use `{api_key}`
+    // gets no `Authorization` header. An entry no launch is bound to yet
+    // keeps the key it was registered with.
+    let keyed = entry
+        .handle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_none_or(|(_, engine)| engine.keyed);
+    let upstream = ingress
+        .client
+        .post(format!("http://{}{}", entry.target, kind.path()));
+    let upstream = if keyed {
+        upstream.bearer_auth(hex::encode(entry.native))
+    } else {
+        upstream
+    };
     let response = match tokio::time::timeout(
         Duration::from_secs(900),
-        ingress
-            .client
-            .post(format!("http://{}{}", entry.target, kind.path()))
-            .bearer_auth(hex::encode(entry.native))
+        upstream
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .send(),

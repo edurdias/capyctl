@@ -21,7 +21,9 @@
 //! ADR 0031 §4, §6: a custom engine has no load reports. Its `/metrics` is
 //! never read; with a manifest idle signal, its sample carries 0 running and
 //! 0 waiting only when that signal reads idle (the SPEC §10 cancellation
-//! evidence of a remote host), and no engine figures otherwise.
+//! evidence of a remote host), and no engine figures otherwise. The signal is
+//! the one frozen with the launch ([`LoadTarget::signal`]); a launch whose
+//! frozen profile is no longer held is never read and never reads idle.
 use crate::ingress::{Ingress, IngressScope, LoadTarget};
 use capyctl_adapters::tensorfold::http::HealthReport;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
@@ -580,11 +582,13 @@ pub enum LaunchSignal {
     Builtin,
     /// A custom engine, with its manifest's idle signal when it has one.
     Custom(Option<capyctl_config::custom::IdleSignal>),
+    /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): the
+    /// profile the launch was approved under is no longer held, so its
+    /// engine is not known. Nothing is read and no engine figures are
+    /// carried: its idleness is unknown, so the controller never settles its
+    /// cancelling requests on a sample, only at the verified stop.
+    Unknown,
 }
-
-/// The [`LaunchSignal`] of the launch behind an owned handle (the launch
-/// command id the ingress scope is bound to).
-pub type LaunchSignals = Arc<dyn Fn(&str) -> LaunchSignal + Send + Sync>;
 
 /// Scrapes Ready scopes and builds bounded load reports for one host.
 pub struct LoadReporter {
@@ -598,9 +602,6 @@ pub struct LoadReporter {
     /// fixed for the launch's life, so it is read once; bounded and pruned as
     /// the baselines are.
     limits: Mutex<HashMap<LaunchKey, u32>>,
-    /// ADR 0031 §6: which launches run a custom engine; every launch is a
-    /// built-in one when unset.
-    signals: Option<LaunchSignals>,
 }
 
 /// A response body, refused as soon as it passes the scrape size bound.
@@ -615,8 +616,9 @@ async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
     Some(body)
 }
 
-/// A loopback read of `path` on the target, with the launch's key when it has
-/// one (an embedded llama.cpp launch has none, ADR 0029 §4).
+/// A loopback read of `path` on the target, with the launch's key when its
+/// engine takes one (an embedded llama.cpp launch takes none, ADR 0029 §4; a
+/// custom engine only when its manifest uses `{api_key}`, ADR 0031 §7).
 fn keyed_get(client: &reqwest::Client, target: &LoadTarget, path: &str) -> reqwest::RequestBuilder {
     let request = client.get(format!("http://{}{path}", target.target));
     match target.native {
@@ -640,28 +642,14 @@ impl LoadReporter {
             interval: DEFAULT_LOAD_INTERVAL,
             baselines: Mutex::new(HashMap::new()),
             limits: Mutex::new(HashMap::new()),
-            signals: None,
         })
     }
     pub fn with_interval(mut self, period: Duration) -> Result<Self, LoadError> {
         self.interval = load_interval(period)?;
         Ok(self)
     }
-    /// ADR 0031 §6: how each launch is sampled, by its owned handle.
-    pub fn with_launch_signals(mut self, signals: LaunchSignals) -> Self {
-        self.signals = Some(signals);
-        self
-    }
     pub fn interval(&self) -> Duration {
         self.interval
-    }
-
-    fn signal(&self, target: &LoadTarget) -> LaunchSignal {
-        self.signals
-            .as_ref()
-            .map_or(LaunchSignal::Builtin, |signals| {
-                signals(&target.owned_handle)
-            })
     }
 
     /// ADR 0031 §6: one read of a custom engine's idle signal on the same
@@ -838,14 +826,16 @@ impl LoadReporter {
             .into_iter()
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
-        let signals: Vec<LaunchSignal> = targets.iter().map(|t| self.signal(t)).collect();
+        // ADR 0031 §6: each launch is sampled by the signal frozen with it.
+        let signals: Vec<LaunchSignal> = targets.iter().map(|t| t.signal.clone()).collect();
         // ADR 0031 §6: a custom engine's `/metrics` is never read, so no
-        // built-in family is ever matched on it.
+        // built-in family is ever matched on it; nor is that of an engine
+        // whose frozen profile is no longer held.
         let scraped =
             futures::future::join_all(targets.iter().zip(&signals).map(|(t, s)| async move {
                 match s {
                     LaunchSignal::Builtin => self.scrape(t).await,
-                    LaunchSignal::Custom(_) => None,
+                    LaunchSignal::Custom(_) | LaunchSignal::Unknown => None,
                 }
             }))
             .await;
@@ -901,6 +891,9 @@ impl LoadReporter {
                             waiting: 0,
                             kv_usage_ppm: 0,
                         }),
+                        // ADR 0031 §6, AGENTS.md: unknown idleness carries no
+                        // engine figures, so it never reads quiescent.
+                        LaunchSignal::Unknown => None,
                         LaunchSignal::Builtin => body.as_deref().and_then(|body| match side_read {
                             SideRead::Health(health) => parse_engine_load(body)
                                 .map(|load| fold_tensorfold_health(load, health.as_ref())),

@@ -353,20 +353,28 @@ runtime_profiles:
         args: [--mode, eager, --host, "{host}", --port, "{port}", --model, "{model_dir}"]
         health: /health
       manifest_digest: "sha256:<64 hex digits>"
+      installation_digest: "sha256:<64 hex digits>"
 ```
 
 `build_fingerprint` is the manifest's `version`, or `unversioned`.
 `security.deep_park` is always `disabled`: a custom engine never parks.
 `security.credential_ref` names the engine-key reference and is required on a
 custom profile, including one written by hand in the role document (write
-`secret://engine-key`): CapyCTL seals a key for every launch, but renders and
-sends it only when the manifest uses `{api_key}`.
+`secret://engine-key`); one without it, or with a blank one, is refused
+`custom_credential_ref_missing`. CapyCTL seals a key for every launch, but
+renders and sends it only when the manifest uses `{api_key}`: an engine whose
+manifest does not gets no `Authorization` header on requests, probes or idle
+reads.
 `custom.manifest_digest` is the digest of the manifest; a profile whose digest
 does not match is refused `custom_manifest_invalid`, and the message gives
-the digest the manifest has. `args` stays empty: the manifest is the whole
-command. A profile in the role document is checked the same way when the role
-starts; there is no `local_engine` setting, flag or variable for a custom
-engine.
+the digest the manifest has. `custom.installation_digest`, optional, is the
+installation digest `engine add` showed at the confirmation; when it is set, it
+is the baseline drift is measured against, and an installation that measures
+differently at the role's start is drifted from then on, never taken as the new
+baseline. A malformed one is refused `custom_manifest_invalid`. `args` stays
+empty: the manifest is the whole command. A profile in the role document is
+checked the same way when the role starts; there is no `local_engine` setting,
+flag or variable for a custom engine.
 
 The manifest's fields:
 

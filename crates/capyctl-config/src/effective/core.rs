@@ -186,10 +186,28 @@ pub(super) fn normalize_profile(
     // is validated again here (and its digest recomputed); no other kind
     // carries one.
     let custom = match (raw_profile.engine, &raw_profile.custom) {
-        (Engine::Custom, Some(block)) => Some(
-            crate::custom::CustomProfile::from_value(block)
-                .map_err(|e| e.at("runtime_profiles.custom"))?,
-        ),
+        (Engine::Custom, Some(block)) => {
+            let custom = crate::custom::CustomProfile::from_value(block)
+                .map_err(|e| e.at("runtime_profiles.custom"))?;
+            // ADR 0031 Amendment A1: every custom profile, a hand-written one
+            // too, names its engine-key reference; the launch path seals a
+            // key for every engine and could never start one without it.
+            if raw_profile
+                .security
+                .credential_ref
+                .as_deref()
+                .is_none_or(|reference| reference.trim().is_empty())
+            {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::MissingRequired,
+                    "runtime_profiles.security.credential_ref",
+                    "custom_credential_ref_missing: a custom engine's profile names its \
+                     engine-key reference (`capyctl engine add --custom` writes \
+                     `secret://engine-key`)",
+                ));
+            }
+            Some(custom)
+        }
         (Engine::Custom, None) => {
             return Err(ConfigError::new(
                 ConfigErrorCode::MissingRequired,

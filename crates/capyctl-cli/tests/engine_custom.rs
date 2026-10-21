@@ -222,6 +222,11 @@ async fn add_custom_executes_nothing_and_writes_custom_engines_yaml() {
     );
     assert_eq!(profile["custom"]["manifest_digest"], parsed.digest());
     assert_eq!(out["manifest_digest"], parsed.digest());
+    // T21 T22 (ADR 0031 §8): the installation digest the summary showed is
+    // the one written, pinned for registration to compare against.
+    let shown = out["fingerprint"]["digest"].as_str().unwrap();
+    assert!(out["installation"].as_str().unwrap().starts_with(shown));
+    assert_eq!(profile["custom"]["installation_digest"], shown);
     assert_eq!(profile["security"]["deep_park"], "disabled");
     assert!(
         !engines_beside(&document).exists(),

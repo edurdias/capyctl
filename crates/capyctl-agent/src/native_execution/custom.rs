@@ -5,12 +5,16 @@
 //! keys it with the launch's own inference key when the manifest uses
 //! `{api_key}` (§7), and checks its listeners after every proof (§7).
 use super::NativeHostExecution;
-use crate::{ingress_identity::NativeCredentials, journal::JournalError, session::SessionError};
+use crate::{
+    ingress::EngineAccess, ingress_identity::NativeCredentials, journal::JournalError,
+    session::SessionError,
+};
 use capyctl_adapters::custom::{
     plan_from_effective, CustomAdapter, ListenerCheck, PlanInputCustom,
 };
 use capyctl_config::custom::CustomProfile;
 use capyctl_config::effective::EffectiveDeployment;
+use capyctl_config::engine_policy::Engine;
 use capyctl_domain::completion::{Presence, ProcessIdentity};
 use capyctl_protocol::execution::SingleLaunchPlan;
 
@@ -28,40 +32,49 @@ pub(super) fn custom_key(
         .map(|keys| hex::encode(keys.inference))
 }
 
-/// ADR 0031 §6: how the load reporter samples the launch behind an owned
-/// handle: a custom engine by its manifest's idle signal (or not at all
-/// without one), any other by its family's `/metrics`. The profile is read
-/// from the document the launch was approved under; a launch that cannot be
-/// read is a built-in one, as before.
-pub(super) fn launch_signals(
-    journal: std::sync::Arc<crate::journal::HostJournal>,
-    profiles: std::sync::Arc<crate::profiles::HostProfiles>,
-) -> crate::load::LaunchSignals {
-    use crate::load::LaunchSignal;
-    std::sync::Arc::new(move |owned_handle: &str| {
-        let Ok(owned) = journal.retained_command(owned_handle) else {
-            return LaunchSignal::Builtin;
-        };
-        let Some(plan) = owned.action.launch_plan() else {
-            return LaunchSignal::Builtin;
-        };
-        let set = profiles
-            .for_fingerprint(&plan.host_policy_fingerprint)
-            .unwrap_or_else(|| profiles.accepted());
-        let profile = &set.config.document["runtime_profiles"][&plan.profile_name];
-        if profile["engine"].as_str() != Some(capyctl_config::engine_policy::Engine::Custom.name())
-        {
-            return LaunchSignal::Builtin;
-        }
-        LaunchSignal::Custom(
-            CustomProfile::from_value(&profile["custom"])
-                .ok()
-                .and_then(|custom| custom.manifest.idle),
-        )
-    })
+/// ADR 0031 §6, §7: how the ingress and the load reporter read and key a
+/// launch's engine, from the profile it was approved under. A custom engine
+/// without its profile is unknown, never a built-in one.
+pub(super) fn engine_access(engine: Engine, custom: Option<&CustomProfile>) -> EngineAccess {
+    match (engine, custom) {
+        (Engine::Custom, Some(custom)) => EngineAccess::custom(custom),
+        (Engine::Custom, None) => EngineAccess::unknown(),
+        _ => EngineAccess::builtin(),
+    }
+}
+
+/// ADR 0031 §6: the engine of profile `name` in a document a launch was
+/// approved under, with a custom engine's manifest. `None` when it cannot be
+/// read, a custom profile's manifest included.
+pub(super) fn frozen_profile(
+    set: &crate::profiles::ProfileSet,
+    name: &str,
+) -> Option<(Engine, Option<CustomProfile>)> {
+    let profile = &set.config.document["runtime_profiles"][name];
+    let engine: Engine = serde_json::from_value(profile["engine"].clone()).ok()?;
+    if engine != Engine::Custom {
+        return Some((engine, None));
+    }
+    let custom = CustomProfile::from_value(&profile["custom"]).ok()?;
+    Some((engine, Some(custom)))
 }
 
 impl NativeHostExecution {
+    /// ADR 0031 §6, §7: how a retained launch's engine is read and keyed,
+    /// from the profile it was approved under ([`Self::frozen_engine`]);
+    /// unknown when that profile is no longer held, never today's.
+    pub(super) fn retained_access(
+        &self,
+        owned: &capyctl_protocol::execution::MemberCommand,
+    ) -> EngineAccess {
+        owned
+            .action
+            .launch_plan()
+            .and_then(|plan| self.frozen_engine(owned, plan))
+            .map_or_else(EngineAccess::unknown, |(engine, custom)| {
+                engine_access(engine, custom.as_ref())
+            })
+    }
     /// ADR 0031 §2: the launch plan. The key is the adapter's to give it
     /// ([`Self::custom_adapter`]), from the launch's own credentials.
     pub(super) fn custom_plan(

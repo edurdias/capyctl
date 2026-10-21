@@ -511,7 +511,10 @@ placeholder, a missing `{host}`, `{port}` or `{model_dir}`, a placeholder in
 or `idle.url` that is not a path, or an `environment` that is not an absolute
 directory. A deployment on an engine that uses `{context_length}` must state
 `engine_config.context_length`, or it is refused
-`custom_placeholder_unset:context_length`.
+`custom_placeholder_unset:context_length`. A deployment cannot add options to
+the command through a value either: a first route (the served name) or a model
+path that starts with `-` or holds a control character is refused
+`custom_value_invalid:served_name` or `custom_value_invalid:model_dir`.
 
 The manifest's `env` needs no approval, but a name CapyCTL sets itself is
 refused (`engine_env_reserved:<name>`, [the list](../operations/configuration.md#engine-environment)).
@@ -579,12 +582,18 @@ interpreter still count.
 
 The first fingerprint reads the whole environment, several GB with PyTorch; later
 ones read only the files that changed. Past 100,000 files, 16 GiB or 32
-directory levels the engine is `unmeasured`, never refused. Every launch
-measures again. A different digest is drift: the machine's status and its
-event log show it, and the launch is refused (`installation_drift`) only if you
-added the engine with `--drift refuse` (`security.installation_drift: refuse`);
-by default it warns. The version shown is the manifest's `version`, or
-`unversioned`, and every custom engine lists as `CUSTOM yes`.
+directory levels the engine is `unmeasured`, never refused. The digest
+`engine add` shows before you confirm is saved with the engine
+(`custom.installation_digest`) and is the one every later measurement is
+compared with: if the files changed between the confirmation and the role's
+start, the engine starts out drifted rather than taking the new files as its
+baseline. Every launch measures again. A different digest is drift: the
+machine's status and its event log show it, and the launch is refused
+(`installation_drift`) only if you added the engine with `--drift refuse`
+(`security.installation_drift: refuse`); by default it warns. A custom engine
+and a supported engine on the same executable are fingerprinted separately.
+The version shown is the manifest's `version`, or `unversioned`, and every
+custom engine lists as `CUSTOM yes`.
 
 ### What CapyCTL keeps and what it refuses
 

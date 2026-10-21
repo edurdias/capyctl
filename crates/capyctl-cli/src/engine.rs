@@ -789,9 +789,26 @@ async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, St
         .map_err(|e| error(e.code(), format!("{e}; nothing was written")))?;
     let manifest = read_manifest(request.manifest)?;
     refuse_existing(target, name)?;
+    // ADR 0031 §3: the installation's identity, from its files only.
+    let (measured, layout) = {
+        let (executable, manifest) = (executable.clone(), manifest.clone());
+        tokio::task::spawn_blocking(move || {
+            let layout =
+                capyctl_agent::installation::custom_installation(&executable, Some(&manifest));
+            let measured = capyctl_agent::installation::InstallationMeasurer::new()
+                .measure_profile(Engine::Custom, &executable, Some(&manifest));
+            (measured, layout)
+        })
+        .await
+        .map_err(|_| error("internal", "measuring the installation failed"))?
+    };
+    // ADR 0031 §8: the digest the summary shows is the one pinned; the role
+    // registers against it and never adopts a different measurement.
+    let mut custom = CustomProfile::new(manifest.clone());
+    custom.installation_digest = measured.as_ref().ok().map(|f| f.digest.clone());
     let spec = CustomProfileSpec {
         executable: executable.clone(),
-        custom: CustomProfile::new(manifest.clone()),
+        custom,
         installation_drift: match request.drift {
             DriftChoice::Warn => InstallationDrift::Warn,
             DriftChoice::Refuse => InstallationDrift::Refuse,
@@ -808,19 +825,6 @@ async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, St
             format!("{}: {}; nothing was written", e.path, e.detail),
         )
     })?;
-    // ADR 0031 §3: the installation's identity, from its files only.
-    let (measured, layout) = {
-        let (executable, manifest) = (executable.clone(), manifest.clone());
-        tokio::task::spawn_blocking(move || {
-            let layout =
-                capyctl_agent::installation::custom_installation(&executable, Some(&manifest));
-            let measured = capyctl_agent::installation::InstallationMeasurer::new()
-                .measure_profile(Engine::Custom, &executable, Some(&manifest));
-            (measured, layout)
-        })
-        .await
-        .map_err(|_| error("internal", "measuring the installation failed"))?
-    };
     let environment: Vec<String> = manifest
         .env
         .keys()
@@ -933,9 +937,9 @@ fn confirm_custom(yes: bool) -> Result<(), StructuredError> {
     }
 }
 
-/// ADR 0031 amendment A1: lock custom-engines.yaml, re-check the name
-/// against both files and the role document, write. engines.yaml is never
-/// touched. The revision written.
+/// ADR 0031 amendment A1: take the one lock both engines files share, then
+/// re-check the name against both files and the role document, and write.
+/// engines.yaml is never touched. The revision written.
 fn write_custom_profile(
     target: &Target,
     name: &str,

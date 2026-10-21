@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use capyctl_agent::{
-    ingress::{Ingress, IngressScope},
+    ingress::{EngineAccess, Ingress, IngressScope},
     load::{self, LoadReporter},
 };
 use capyctl_protocol::reports::{LoadReport, LoadSample, MAX_LOAD_SAMPLES};
@@ -230,13 +230,17 @@ async fn reports_open_scopes_with_scraped_gauges_or_a_failed_scrape() {
         (&keyed, "launch-k"),
         (&closed, "launch-c"),
     ] {
-        ingress.bind_handle(s, handle).unwrap();
+        ingress
+            .bind_handle(s, handle, EngineAccess::builtin())
+            .unwrap();
     }
     for s in [&vllm, &sglang, &slow, &keyed, &unbound] {
         ingress.open(s).unwrap();
     }
     // A handle binds only to the exact current scope.
-    assert!(ingress.bind_handle(&scope("vllm", 4), "other").is_err());
+    assert!(ingress
+        .bind_handle(&scope("vllm", 4), "other", EngineAccess::builtin())
+        .is_err());
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
     let started = std::time::Instant::now();
     let all = samples(reporter.reports().await);
@@ -278,7 +282,9 @@ async fn reports_open_scopes_with_scraped_gauges_or_a_failed_scrape() {
     );
     ingress.open(&next).unwrap();
     assert!(reporter.reports().await.is_empty());
-    ingress.bind_handle(&next, "launch-v4").unwrap();
+    ingress
+        .bind_handle(&next, "launch-v4", EngineAccess::builtin())
+        .unwrap();
     let after = samples(reporter.reports().await);
     assert_eq!((after.len(), after[0].generation), (1, 4));
 }
@@ -296,7 +302,9 @@ async fn many_scopes_split_into_bounded_reports() {
         ingress
             .register(s.clone(), target, "model".into(), gate, [0xBB; 32])
             .unwrap();
-        ingress.bind_handle(&s, &format!("launch-{i}")).unwrap();
+        ingress
+            .bind_handle(&s, &format!("launch-{i}"), EngineAccess::builtin())
+            .unwrap();
         ingress.open(&s).unwrap();
     }
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
@@ -423,7 +431,9 @@ async fn an_sglang_launch_reports_its_running_limit_once_read() {
         [2; 32],
     );
     for (s, handle) in [(&sglang, "launch-s"), (&vllm, "launch-v")] {
-        ingress.bind_handle(s, handle).unwrap();
+        ingress
+            .bind_handle(s, handle, EngineAccess::builtin())
+            .unwrap();
         ingress.open(s).unwrap();
     }
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
@@ -445,7 +455,9 @@ async fn an_sglang_launch_reports_its_running_limit_once_read() {
     let next = scope("sglang", 3);
     let (address, again) = sglang_engine([5; 32], SGLANG_LOADS).await;
     register(&ingress, &next, address, 6, [5; 32]);
-    ingress.bind_handle(&next, "launch-s3").unwrap();
+    ingress
+        .bind_handle(&next, "launch-s3", EngineAccess::builtin())
+        .unwrap();
     ingress.open(&next).unwrap();
     let all = samples(reporter.reports().await);
     assert_eq!(all[0].max_running, Some(48));
@@ -648,7 +660,9 @@ async fn engine_histograms_are_reported_as_deltas() {
         1,
         [2; 32],
     );
-    ingress.bind_handle(&s, "launch-t").unwrap();
+    ingress
+        .bind_handle(&s, "launch-t", EngineAccess::builtin())
+        .unwrap();
     ingress.open(&s).unwrap();
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
     let first = samples(reporter.reports().await);
@@ -837,7 +851,9 @@ async fn a_tensorfold_scrape_folds_in_health() {
         [4; 32],
     );
     for (s, handle) in [(&busy, "launch-b"), (&idle, "launch-i")] {
-        ingress.bind_handle(s, handle).unwrap();
+        ingress
+            .bind_handle(s, handle, EngineAccess::builtin())
+            .unwrap();
         ingress.open(s).unwrap();
     }
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
@@ -883,7 +899,9 @@ async fn an_oversized_health_body_is_cut_at_the_bound() {
     let ingress = Ingress::new().unwrap();
     let s = scope("endless", 1);
     register(&ingress, &s, address, 1, [6; 32]);
-    ingress.bind_handle(&s, "launch-e").unwrap();
+    ingress
+        .bind_handle(&s, "launch-e", EngineAccess::builtin())
+        .unwrap();
     ingress.open(&s).unwrap();
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
     let started = std::time::Instant::now();
@@ -1083,7 +1101,9 @@ async fn a_llamacpp_scrape_reads_its_slots() {
         (&refused, "launch-x"),
         (&malformed, "launch-m"),
     ] {
-        ingress.bind_handle(s, handle).unwrap();
+        ingress
+            .bind_handle(s, handle, EngineAccess::builtin())
+            .unwrap();
         ingress.open(s).unwrap();
     }
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
@@ -1134,6 +1154,7 @@ impl load::LoadSource for Unkeyed {
             owned_handle: "launch-u".into(),
             target: self.0,
             native: None,
+            signal: load::LaunchSignal::Builtin,
             in_flight: 0,
         }]
     }
@@ -1153,8 +1174,9 @@ async fn a_target_without_a_key_is_scraped_unkeyed() {
     );
 }
 
-/// Launches on fake engines, each with its own owned handle.
-struct Launches(Vec<(&'static str, SocketAddr, [u8; 32])>);
+/// Launches on fake engines, each with its own owned handle and the signal
+/// frozen with it.
+struct Launches(Vec<(&'static str, SocketAddr, [u8; 32], load::LaunchSignal)>);
 
 impl load::LoadSource for Launches {
     fn targets(&self) -> Vec<capyctl_agent::ingress::LoadTarget> {
@@ -1162,11 +1184,12 @@ impl load::LoadSource for Launches {
             .iter()
             .enumerate()
             .map(
-                |(n, (handle, target, native))| capyctl_agent::ingress::LoadTarget {
+                |(n, (handle, target, native, signal))| capyctl_agent::ingress::LoadTarget {
                     scope: scope(handle, n as i64 + 1),
                     owned_handle: (*handle).into(),
                     target: *target,
                     native: Some(*native),
+                    signal: signal.clone(),
                     in_flight: 0,
                 },
             )
@@ -1177,10 +1200,13 @@ impl load::LoadSource for Launches {
 // T44 T17 (ADR 0031 §4, §6): a custom engine's `/metrics` is never matched to
 // a built-in family. With an idle signal, its sample reads 0 running and 0
 // waiting only when the signal reads idle; busy, missing or without a signal,
-// it carries no engine figures, so it never reads quiescent.
+// it carries no engine figures, so it never reads quiescent. A launch whose
+// frozen profile is no longer held (unknown) is never read, even on an
+// engine that would read idle, so it never reads quiescent either.
 #[tokio::test]
 async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
     use capyctl_config::custom::IdleSignal;
+    use load::LaunchSignal;
     let native = [7; 32];
     let vllm = engine(native, VLLM_METRICS, Duration::ZERO).await;
     let idle = engine(
@@ -1196,25 +1222,20 @@ async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
     )
     .await;
     let missing = engine(native, "requests_running 0\n", Duration::ZERO).await;
-    let source = std::sync::Arc::new(Launches(vec![
-        ("a-builtin", vllm, native),
-        ("b-custom-none", vllm, native),
-        ("c-custom-idle", idle, native),
-        ("d-custom-busy", busy, native),
-        ("e-custom-missing", missing, native),
-    ]));
-    let signal = IdleSignal {
+    let signal = LaunchSignal::Custom(Some(IdleSignal {
         url: "/metrics".into(),
         gauges: vec!["requests_running".into(), "requests_waiting".into()],
         json: vec![],
-    };
-    let reporter = LoadReporter::new(source, "host".into())
-        .unwrap()
-        .with_launch_signals(std::sync::Arc::new(move |handle: &str| match handle {
-            "a-builtin" => load::LaunchSignal::Builtin,
-            "b-custom-none" => load::LaunchSignal::Custom(None),
-            _ => load::LaunchSignal::Custom(Some(signal.clone())),
-        }));
+    }));
+    let source = std::sync::Arc::new(Launches(vec![
+        ("a-builtin", vllm, native, LaunchSignal::Builtin),
+        ("b-custom-none", vllm, native, LaunchSignal::Custom(None)),
+        ("c-custom-idle", idle, native, signal.clone()),
+        ("d-custom-busy", busy, native, signal.clone()),
+        ("e-custom-missing", missing, native, signal),
+        ("f-unknown", idle, native, LaunchSignal::Unknown),
+    ]));
+    let reporter = LoadReporter::new(source, "host".into()).unwrap();
     let all = samples(reporter.reports().await);
     let engines: Vec<_> = all
         .iter()
@@ -1233,6 +1254,7 @@ async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
             ("c-custom-idle", Some((0, 0, 0))),
             ("d-custom-busy", None),
             ("e-custom-missing", None),
+            ("f-unknown", None),
         ]
     );
     // No engine latency family is read from a custom engine's metrics.

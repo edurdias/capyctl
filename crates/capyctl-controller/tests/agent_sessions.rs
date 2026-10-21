@@ -1568,7 +1568,13 @@ async fn ingress_and_engine_latency_ride_the_load_report() {
     ingress
         .register(scope.clone(), target, "model".into(), [7; 32], [8; 32])
         .unwrap();
-    ingress.bind_handle(&scope, "launch-5").unwrap();
+    ingress
+        .bind_handle(
+            &scope,
+            "launch-5",
+            capyctl_agent::ingress::EngineAccess::builtin(),
+        )
+        .unwrap();
     ingress.open(&scope).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ingress_address = listener.local_addr().unwrap();

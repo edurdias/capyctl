@@ -196,13 +196,14 @@ impl EmbeddedHost {
     }
 }
 
-/// ADR 0031 §3: the manifest a registered custom engine is measured with.
-fn custom_of(named: &NamedInstallation) -> Option<capyctl_config::custom::CustomManifest> {
+/// ADR 0031 §3, §8: the block a registered custom engine is measured with:
+/// its manifest and the installation digest the operator approved.
+fn custom_of(named: &NamedInstallation) -> Option<capyctl_config::custom::CustomProfile> {
     named
         .installation
         .registered
         .as_ref()
-        .and_then(capyctl_agent::installation::custom_manifest)
+        .and_then(capyctl_agent::installation::custom_profile)
 }
 
 /// The standalone role's control-socket handler.
@@ -458,7 +459,11 @@ impl StandaloneControl {
             let view = self
                 .host
                 .installations
-                .find(&n.installation.executable, custom_of(&n).as_ref())
+                .find(
+                    n.installation.engine,
+                    &n.installation.executable,
+                    custom_of(&n).as_ref(),
+                )
                 .map(|i| i.view())
                 .unwrap_or(Value::Null);
             accepted.insert(

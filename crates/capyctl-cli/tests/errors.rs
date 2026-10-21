@@ -341,6 +341,27 @@ fn custom_engine_codes_map_to_exits() {
             2,
             "custom_placeholder_unset:context_length",
         ),
+        // ADR 0031 §8: a value that would read as an option.
+        (
+            "invalid_config",
+            "routes: custom_value_invalid:served_name: a custom engine's served name ...",
+            2,
+            "custom_value_invalid:served_name",
+        ),
+        (
+            "operation_failed",
+            "Operation 01J failed: custom_value_invalid:model_dir",
+            2,
+            "custom_value_invalid:model_dir",
+        ),
+        // ADR 0031 Amendment A1: a custom profile without its engine-key
+        // reference.
+        (
+            "invalid_config",
+            "runtime_profiles.security.credential_ref: custom_credential_ref_missing: a custom ...",
+            2,
+            "custom_credential_ref_missing",
+        ),
         ("declined", "", 2, "declined"),
     ] {
         let error = StructuredError {

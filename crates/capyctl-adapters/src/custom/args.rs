@@ -6,7 +6,7 @@
 //! renders, the closed environment, the key and the log.
 use std::collections::BTreeMap;
 
-use capyctl_config::custom::{CustomManifest, PlaceholderValues, Unset};
+use capyctl_config::custom::{CustomManifest, PlaceholderError, PlaceholderValues};
 use capyctl_config::engine_env::{is_owned, EnvSource, ResolvedEnv};
 
 use crate::traits::RenderedCommand;
@@ -58,10 +58,11 @@ impl std::fmt::Debug for PlanInputCustom {
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CustomArgsError {
-    /// ADR 0031 §2: a placeholder the launch cannot fill
-    /// (`custom_placeholder_unset:<name>`).
+    /// ADR 0031 §2, §8: a placeholder the launch cannot fill
+    /// (`custom_placeholder_unset:<name>`), or a deployment value it would
+    /// render that could be read as an option (`custom_value_invalid:<name>`).
     #[error("{0}")]
-    Unset(Unset),
+    Placeholder(PlaceholderError),
     /// ADR 0031 §2, ADR 0028 §2.1 rule 1: an environment name CapyCTL owns,
     /// refused again at launch.
     #[error("engine_env_reserved:{0}")]
@@ -75,9 +76,9 @@ impl CustomArgsError {
     }
 }
 
-impl From<Unset> for CustomArgsError {
-    fn from(unset: Unset) -> Self {
-        Self::Unset(unset)
+impl From<PlaceholderError> for CustomArgsError {
+    fn from(error: PlaceholderError) -> Self {
+        Self::Placeholder(error)
     }
 }
 
@@ -306,6 +307,27 @@ mod tests {
         assert_eq!(
             render_command(&unset).unwrap_err().code(),
             "custom_placeholder_unset:context_length"
+        );
+    }
+
+    // T44 (ADR 0031 §8): a frozen plan whose served name or checkpoint
+    // directory starts with `-` is refused at launch, so a deployment can
+    // never add an option to the manifest's command.
+    #[test]
+    fn a_dash_leading_deployment_value_refuses_the_launch() {
+        let text = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+                    args: [\"{host}\", \"{port}\", \"{model_dir}\", \"{served_name}\"]\n";
+        let mut served = plan(manifest(text), None);
+        served.values.served_name = "--log-decisions=/tmp/x".into();
+        assert_eq!(
+            render_command(&served).unwrap_err().code(),
+            "custom_value_invalid:served_name"
+        );
+        let mut model = plan(manifest(text), None);
+        model.values.model_dir = "-m".into();
+        assert_eq!(
+            render_command(&model).unwrap_err().code(),
+            "custom_value_invalid:model_dir"
         );
     }
 
