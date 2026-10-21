@@ -500,6 +500,9 @@ impl EngineSettings {
                     Engine::Sglang => "local-sglang",
                     Engine::Tensorfold => "local-tensorfold",
                     Engine::Llamacpp => "local-llamacpp",
+                    // ADR 0031 §1: a custom engine is registered only with
+                    // `engine add --custom`; the list above never holds one.
+                    Engine::Custom => unreachable!("no role-local custom engine"),
                 };
                 (name, engine, path)
             })
@@ -620,7 +623,8 @@ pub fn apply_to_host_with(
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
             Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args.clone(),
-            Engine::Sglang => Vec::new(),
+            // ADR 0031 §1: `installations` never yields a custom engine.
+            Engine::Sglang | Engine::Custom => Vec::new(),
         };
         let profile = crate::registration::profile_document(&crate::registration::ProfileSpec {
             engine,

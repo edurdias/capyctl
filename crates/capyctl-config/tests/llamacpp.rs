@@ -61,7 +61,8 @@ fn llamacpp_is_a_named_engine() {
     for spelling in ["llama.cpp", "llama-cpp", "LlamaCpp", "llama-server"] {
         assert_eq!(Engine::from_name(spelling), None, "{spelling}");
     }
-    assert_eq!(Engine::ALL.last(), Some(&Engine::Llamacpp));
+    // ADR 0031 §1: the custom engine kind follows llama.cpp in the list.
+    assert!(Engine::ALL.ends_with(&[Engine::Llamacpp, Engine::Custom]));
     assert!(ENVIRONMENT_PROFILES.contains(&"local-llamacpp"));
 }
 

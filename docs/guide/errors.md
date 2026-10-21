@@ -20,6 +20,9 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`). | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
 | 2 | `engine_env_not_approved:<name>` | A deployment sets an engine variable the engine profile does not approve (on some machine of a group). | Approve it with `capyctl engine add ... --approve-env <name>` on every machine, or remove it ([Engine variables](engines.md#engine-variables)). |
 | 2 | `engine_env_conflict:<name>` | The same variable is in the file and on the command line. | Give it one way only. |
+| 2 | `custom_field_unsupported:<field>` | A deployment on a custom engine states something the engine's manifest owns: `extra_args`, `accept_extra_args`, a tool-call or reasoning parser, `memory`, a draft model or a typed engine field such as `dtype` or `max_concurrent_requests`. | Remove it; a custom engine's deployment states only `engine_config.context_length` and `engine_config.env` ([Custom engines](engines.md#custom-engines)). |
+| 2 | `custom_placeholder_unset:context_length` | The custom engine's manifest uses `{context_length}` and the deployment states no `engine_config.context_length`. | Add `engine_config.context_length` to the deployment. |
+| 2 | `declined` | `capyctl engine add --custom` asked for confirmation and the answer was not `y` or `yes`. Nothing was written. | Run it again and answer `y`, after checking what it prints. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
 | 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. |
 | 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. | Use a smaller or quantized checkpoint, a smaller KV cache, or free the card. vLLM needs a card of about 10 GiB or more. |
@@ -33,13 +36,15 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `multi_gpu_unsupported` | The deployment names two GPUs on one machine. | Use one GPU per machine; to spread one model over machines, give it a `topology` and `placement.hosts`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
-| 5 | `capability_missing` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp), or a deployment asking such an engine to park. | Leave `--deep-park` out; use `residency: restart_only`. |
-| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)). |
+| 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`). | Leave `--deep-park` out; use `residency: restart_only`. |
+| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); for a custom engine, remove `topology` and use `instances` for more copies. |
 | 5 | `group_instances_unsupported` | `instances` above 1 with a `topology`. | Deploy one group per deployment. |
 | 5 | `group_drift:<field>` | The engine changed a multi-machine setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
 | 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
-| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM, TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, or an installation whose registered build names no version. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add` ([Decision models](deploy.md#decision-models)). |
+| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM, TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
+| 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
+| 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
 | 7 | `device_conflict` | Another deployment holds the GPU exclusively. | Stop that deployment or choose another device. |
 | 8 | `category_limit` | A host limit on how many models of this kind may run was reached. | Stop one, or raise the limit in the host document. |
@@ -49,17 +54,18 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 13 | `internal` | An internal, storage or I/O failure, or a launch that failed (`operation_failed`). | Read the message, `capyctl status deployment <name>` and the role's log. |
 | 14 | `host_revoked` | The server revoked this host. The host exits and is not restarted. | Bring it back (see [Several machines](several-machines.md#take-a-machine-out)). |
 | 15 | `host_ineligible` | No allowed host can take the deployment: drained, revoked, offline or too old. | Undrain, reconnect, upgrade or re-enroll the host the message names. |
-| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or a `llama-server` binary or its directory, or search with `capyctl engine detect --path <dir>`. |
+| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary; or, with `--custom`, the executable is missing or is not an executable file. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or a `llama-server` binary or its directory, or search with `capyctl engine detect --path <dir>`; with `--custom`, name the program itself. |
 | 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`. |
 | 18 | `engine_version_failed` | The engine's version check failed or timed out; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
 | 19 | `profile_exists` | The engine profile name is taken. | Pass `--name`, or remove the existing profile first. |
 | 20 | `profile_in_use` | Removing or replacing the engine would affect the deployments listed. | Stop them, or rerun with `--drain`. |
 | 21 | `publish_rejected` | The server refused the updated engine list; the reason follows. | Fix what the reason names. |
 | 22 | `agent_unreachable` | CapyCTL on this machine is running but did not answer an engine command. | Retry; if the message says the outcome is unknown, run `capyctl engine list` first. |
-| 23 | `not_interactive` | `capyctl engine add` without a path needs a terminal to pick one. | Name the installation. |
+| 23 | `not_interactive` | `capyctl engine add` without a path needs a terminal to pick one; `capyctl engine add --custom` needs a terminal to confirm. | Name the installation; with `--custom`, pass `--yes` once you have checked the manifest. |
 | 24 | `profile_not_published` | No allowed host offers the engine profile the deployment names; nothing was stored. | Register the engine on a host with `capyctl engine add <path> --name <profile>`, then deploy again. |
 | 25 | `still_stopping` | A `start` came right after a `stop`, before the engine finished going away, or while CapyCTL was still confirming that a slow stop's engine exited; nothing was started. | Retry in a moment, or run `capyctl start deployment <name> --wait`, which waits for the stop and then starts. |
 | 26 | `toolchain_missing` | `capyctl engine add` found a TensorFold installation, but `ninja`, `nvcc` or a C++ compiler is not on the engine's PATH (its `bin`, the CUDA toolkit's `bin`, then `/usr/local/bin`, `/usr/bin`, `/bin`). TensorFold builds CUDA kernels on its first start. Nothing was written. | Install what the message names into one of those directories, or set `CUDA_HOME` to a toolkit that has `nvcc`, then add the engine again. |
+| 27 | `custom_manifest_invalid` | `capyctl engine add --custom` could not use the manifest: it is unreadable, larger than 64 KiB, has an unknown field, uses an unknown placeholder or leaves out `{host}`, `{port}` or `{model_dir}`, puts a placeholder in `health` or `idle` or `{api_key}` outside `args` and `env`, has a `health` or `idle.url` that is not a path, or an `environment` that is not an absolute directory. Also a hand-written custom engine profile whose `manifest_digest` does not match. Nothing was written. | Fix what the message names ([The manifest](engines.md#the-manifest)), then add the engine again. |
 
 The systemd units restart CapyCTL when it fails, except on exits a restart cannot
 fix: 2, 3 and 5, and 14 for a host.
@@ -109,6 +115,11 @@ A deployment on one machine can show these codes the same way:
   different slot count or window, or its `/metrics` or `/slots` page off, than
   CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
   differently from llama.cpp v0.6.0.
+- `custom_listener_exposed` (custom engine): once the engine passed its
+  check, one of its processes listened on an address other than `127.0.0.1`
+  or `::1`; the message names the address and port. CapyCTL stops the engine
+  and the start fails. Make the manifest's `args` bind the engine to
+  `"{host}"` ([The listener check](engines.md#the-listener-check)).
 
 The inference endpoint answers HTTP errors with a JSON body holding `code` and
 `message` ([Make a request](requests.md); waiting errors are listed under
@@ -137,7 +148,9 @@ For decision models:
   decision request's fields or shapes; the message says which.
 - `engine_rejected` (400, 413 or 422): the engine refused the request as
   invalid, for example a `choice` question without options; the message is
-  the engine's.
+  the engine's. Some custom engines answer every failure this way, an engine
+  failure included: when a request you believe valid is rejected, read the
+  instance's engine log ([Example: basal decision models](engines.md#example-basal-decision-models)).
 
 ## Troubleshooting
 

@@ -26,6 +26,7 @@
 //!
 //! Passing fingerprints and probes are not qualification evidence (AGENTS.md).
 
+use capyctl_config::custom::CustomManifest;
 use capyctl_config::engine_policy::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -66,6 +67,8 @@ pub fn capability_names(engine: Engine) -> &'static [&'static str] {
         Engine::Tensorfold => &["core", "deep_park", "metrics"],
         // ADR 0029 §2: nothing is probed; deep parking is reported missing.
         Engine::Llamacpp => &["deep_park"],
+        // ADR 0031 §1, §4: nothing is ever executed or probed; it cannot park.
+        Engine::Custom => &["deep_park"],
     }
 }
 
@@ -77,6 +80,9 @@ pub fn package_name(engine: Engine) -> Option<&'static str> {
         Engine::Vllm => Some("vllm"),
         Engine::Tensorfold => Some("tensorfold"),
         Engine::Llamacpp => None,
+        // ADR 0031 §3: a custom engine is measured from its executable and
+        // environment, never through a package of its own.
+        Engine::Custom => None,
     }
 }
 
@@ -229,21 +235,60 @@ impl InstallationMeasurer {
         Self::default()
     }
 
-    /// Measure one installation of `engine` started through `executable`.
+    /// Measure one installation of `engine` started through `executable`. A
+    /// custom engine measured here has no manifest: its default root (ADR
+    /// 0031 §3); [`Self::measure_profile`] takes the manifest.
     pub fn measure(
         &self,
         engine: Engine,
         executable: &Path,
     ) -> Result<InstallationFingerprint, FingerprintError> {
+        self.measure_profile(engine, executable, None)
+    }
+
+    /// As [`Self::measure`], with a custom engine's manifest (ADR 0031 §3:
+    /// its `environment` replaces the default root, its `version` is the
+    /// fingerprint's). `custom` is ignored for every other engine.
+    pub fn measure_profile(
+        &self,
+        engine: Engine,
+        executable: &Path,
+        custom: Option<&CustomManifest>,
+    ) -> Result<InstallationFingerprint, FingerprintError> {
+        if engine == Engine::Custom {
+            return self.measure_custom(executable, custom);
+        }
         let Some(package) = package_name(engine) else {
             return self.measure_binary(executable);
         };
         let site = site_packages(engine, executable)?;
         let root = site.join(package);
-        let mut entries: Vec<(Vec<u8>, u64, [u8; 32])> = Vec::new();
-        let mut total: u64 = 0;
-        let mut stack: Vec<(PathBuf, Vec<u8>, usize)> = vec![(root.clone(), Vec::new(), 0)];
-        let mut seen = std::collections::BTreeSet::new();
+        let mut collected = Collected::default();
+        self.walk(&root, b"", &mut collected)?;
+        // Forget files that left the installation, so the cache stays bounded.
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| !path.starts_with(&root) || collected.seen.contains(path));
+        }
+        let digest = manifest_digest(&mut collected.entries)?;
+        Ok(InstallationFingerprint {
+            version: version(&site, package),
+            digest,
+            files: collected.entries.len(),
+            bytes: collected.total,
+        })
+    }
+
+    /// ADR 0008: every file under `root` (bytecode caches left out, a link by
+    /// its target text), named `prefix/<relative path>` (no prefix when
+    /// `prefix` is empty), within the installation bounds.
+    fn walk(
+        &self,
+        root: &Path,
+        prefix: &[u8],
+        into: &mut Collected,
+    ) -> Result<(), FingerprintError> {
+        let mut stack: Vec<(PathBuf, Vec<u8>, usize)> =
+            vec![(root.to_path_buf(), prefix.to_vec(), 0)];
         while let Some((dir, relative, depth)) = stack.pop() {
             if depth > MAX_DEPTH {
                 return Err(FingerprintError::TooLarge);
@@ -272,7 +317,7 @@ impl InstallationMeasurer {
                 if name.ends_with(b".pyc") {
                     continue;
                 }
-                if entries.len() >= MAX_FILES {
+                if into.entries.len() >= MAX_FILES {
                     return Err(FingerprintError::TooLarge);
                 }
                 let (size, digest) = if kind.is_symlink() {
@@ -282,24 +327,72 @@ impl InstallationMeasurer {
                 } else {
                     return Err(FingerprintError::UnsafeFile);
                 };
-                total = total.checked_add(size).ok_or(FingerprintError::TooLarge)?;
-                if total > MAX_BYTES {
-                    return Err(FingerprintError::TooLarge);
-                }
-                seen.insert(path);
-                entries.push((path_bytes, size, digest));
+                into.push(path_bytes, path, size, digest)?;
             }
         }
-        // Forget files that left the installation, so the cache stays bounded.
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.retain(|path, _| !path.starts_with(&root) || seen.contains(path));
+        Ok(())
+    }
+
+    /// ADR 0031 §3: a custom engine's installation is its executable, the
+    /// interpreter its virtual environment's `bin/python3` runs (followed to
+    /// its file, which may be outside the tree), and its root: the
+    /// manifest's `environment`, else the whole virtual environment the
+    /// executable is in, else nothing more. Named `executable`,
+    /// `interpreter` and `root/<relative path>` in the canonical manifest.
+    /// Nothing is executed. The version is the manifest's, else
+    /// `unversioned`.
+    fn measure_custom(
+        &self,
+        executable: &Path,
+        custom: Option<&CustomManifest>,
+    ) -> Result<InstallationFingerprint, FingerprintError> {
+        let metadata =
+            std::fs::symlink_metadata(executable).map_err(|_| FingerprintError::NotFound)?;
+        if !metadata.is_file() {
+            return Err(FingerprintError::UnsafeFile);
         }
-        let digest = manifest_digest(&mut entries)?;
+        let layout = custom_installation(executable, custom);
+        let mut collected = Collected::default();
+        collected.push(
+            b"executable".to_vec(),
+            executable.to_path_buf(),
+            metadata.size(),
+            self.hash(executable, &metadata)?,
+        )?;
+        if let Some(interpreter) = &layout.interpreter {
+            let metadata =
+                std::fs::symlink_metadata(interpreter).map_err(|_| FingerprintError::Changed)?;
+            if !metadata.is_file() {
+                return Err(FingerprintError::UnsafeFile);
+            }
+            collected.push(
+                b"interpreter".to_vec(),
+                interpreter.clone(),
+                metadata.size(),
+                self.hash(interpreter, &metadata)?,
+            )?;
+        }
+        if let Some(root) = &layout.root {
+            self.walk(root, b"root", &mut collected)?;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| {
+                layout
+                    .root
+                    .as_ref()
+                    .is_none_or(|root| !path.starts_with(root))
+                    || collected.seen.contains(path)
+            });
+        }
+        let digest = manifest_digest(&mut collected.entries)?;
         Ok(InstallationFingerprint {
-            version: version(&site, package),
+            version: custom.map_or_else(
+                || capyctl_config::custom::UNVERSIONED.to_owned(),
+                CustomManifest::build_fingerprint,
+            ),
             digest,
-            files: entries.len(),
-            bytes: total,
+            files: collected.entries.len(),
+            bytes: collected.total,
         })
     }
 
@@ -436,6 +529,85 @@ fn manifest_digest(entries: &mut [(Vec<u8>, u64, [u8; 32])]) -> Result<String, F
         "{DIGEST_PREFIX}{}",
         hex::encode(manifest.finalize())
     ))
+}
+
+/// The canonical manifest's entries as a measurement collects them, within
+/// the installation bounds (ADR 0008).
+#[derive(Default)]
+struct Collected {
+    entries: Vec<(Vec<u8>, u64, [u8; 32])>,
+    total: u64,
+    /// The files measured, so the cache forgets the ones that left.
+    seen: std::collections::BTreeSet<PathBuf>,
+}
+
+impl Collected {
+    fn push(
+        &mut self,
+        name: Vec<u8>,
+        path: PathBuf,
+        size: u64,
+        digest: [u8; 32],
+    ) -> Result<(), FingerprintError> {
+        if self.entries.len() >= MAX_FILES {
+            return Err(FingerprintError::TooLarge);
+        }
+        self.total = self
+            .total
+            .checked_add(size)
+            .ok_or(FingerprintError::TooLarge)?;
+        if self.total > MAX_BYTES {
+            return Err(FingerprintError::TooLarge);
+        }
+        self.seen.insert(path);
+        self.entries.push((name, size, digest));
+        Ok(())
+    }
+}
+
+/// ADR 0031 §3: what a custom engine's installation covers besides its
+/// executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomInstallation {
+    /// The tree measured: the manifest's `environment`, else the virtual
+    /// environment the executable is in, else none (the executable alone).
+    pub root: Option<PathBuf>,
+    /// Whether `root` is the manifest's `environment`.
+    pub declared_root: bool,
+    /// The file the virtual environment's `bin/python3` runs, followed
+    /// through its links (usually outside the tree). Kept when the manifest
+    /// names another root.
+    pub interpreter: Option<PathBuf>,
+}
+
+/// ADR 0031 §3: the virtual environment `executable` is in: its directory is
+/// `bin` and the directory above holds `pyvenv.cfg`. Lexical, as ADR 0018 §1.
+pub fn virtual_environment(executable: &Path) -> Option<PathBuf> {
+    let bin = executable
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "bin"))?;
+    let prefix = bin.parent()?;
+    std::fs::symlink_metadata(prefix.join("pyvenv.cfg"))
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| prefix.to_path_buf())
+}
+
+/// ADR 0031 §3: the root and interpreter a custom engine's measurement
+/// covers, read from directory metadata only.
+pub fn custom_installation(
+    executable: &Path,
+    custom: Option<&CustomManifest>,
+) -> CustomInstallation {
+    let venv = virtual_environment(executable);
+    let interpreter = venv
+        .as_ref()
+        .and_then(|venv| std::fs::canonicalize(venv.join("bin/python3")).ok());
+    let declared = custom.and_then(|manifest| manifest.environment.as_deref());
+    CustomInstallation {
+        root: declared.map(PathBuf::from).or(venv),
+        declared_root: declared.is_some(),
+        interpreter,
+    }
 }
 
 /// A symbolic link's own target text, never what it points at.
@@ -656,20 +828,40 @@ pub fn probe_capabilities(
 }
 
 /// Registration (agent start): the installation fields one profile publishes.
-/// A measurement that fails is `unmeasured`, never a refusal.
+/// A measurement that fails is `unmeasured`, never a refusal. ADR 0031 §3: a
+/// custom engine is measured with its manifest; one without a valid manifest
+/// is `unmeasured`.
 pub fn registration(
     measurer: &InstallationMeasurer,
     engine: Option<Engine>,
     executable: &Path,
+    custom: Option<&CustomManifest>,
 ) -> (String, String, String) {
-    match engine.map(|engine| measurer.measure(engine, executable)) {
+    let measured = match engine {
+        Some(Engine::Custom) if custom.is_none() => None,
+        Some(engine) => Some(measurer.measure_profile(engine, executable, custom)),
+        None => None,
+    };
+    match measured {
         Some(Ok(fingerprint)) => (fingerprint.version, fingerprint.digest, "measured".into()),
         _ => (String::new(), String::new(), "unmeasured".into()),
     }
 }
 
+/// ADR 0031 §3: the manifest a custom engine's profile carries (its
+/// `custom` block, validated with its digest), else `None`.
+pub fn custom_manifest(profile: &serde_json::Value) -> Option<CustomManifest> {
+    if profile["engine"].as_str() != Some(Engine::Custom.name()) {
+        return None;
+    }
+    capyctl_config::custom::CustomProfile::from_value(profile.get("custom")?)
+        .ok()
+        .map(|custom| custom.manifest)
+}
+
 /// Fill one published profile's installation fields from its host document
-/// entry (`engine`, `executable`).
+/// entry (`engine`, `executable` and, ADR 0031 §3, a custom engine's
+/// `custom` block).
 pub fn register_profile(
     measurer: &InstallationMeasurer,
     profile: &serde_json::Value,
@@ -677,7 +869,8 @@ pub fn register_profile(
 ) {
     let engine = serde_json::from_value::<Engine>(profile["engine"].clone()).ok();
     let executable = Path::new(profile["executable"].as_str().unwrap_or(""));
-    let (version, digest, state) = registration(measurer, engine, executable);
+    let custom = custom_manifest(profile);
+    let (version, digest, state) = registration(measurer, engine, executable, custom.as_ref());
     status.installation_version = version;
     status.installation_digest = digest;
     status.installation_state = state;
@@ -692,6 +885,9 @@ pub struct InstallationRegistry {
     measurer: InstallationMeasurer,
     /// Profile name → digest measured at registration.
     registered: BTreeMap<String, String>,
+    /// ADR 0031 §3: profile name → the manifest a custom engine's launch is
+    /// measured with (its `environment` root).
+    custom: BTreeMap<String, CustomManifest>,
     /// Profile name → the digest a launch measured instead (drift).
     drift: Mutex<BTreeMap<String, String>>,
     /// Profile name → (installation digest probed, report).
@@ -700,9 +896,13 @@ pub struct InstallationRegistry {
 }
 
 impl InstallationRegistry {
-    /// The fingerprints this host registered, from its published inventory.
+    /// The fingerprints this host registered, from its published inventory,
+    /// with the custom engines' manifests its document carries.
     pub fn from_inventory(inventory: &capyctl_protocol::pb::ReportInventory) -> Self {
-        Self {
+        let document =
+            serde_json::from_str::<serde_json::Value>(&inventory.approved_host_config_json)
+                .unwrap_or_default();
+        let registry = Self {
             measurer: InstallationMeasurer::new(),
             registered: inventory
                 .profiles
@@ -710,10 +910,33 @@ impl InstallationRegistry {
                 .filter(|p| p.installation_state == "measured" && !p.installation_digest.is_empty())
                 .map(|p| (p.name.clone(), p.installation_digest.clone()))
                 .collect(),
+            custom: BTreeMap::new(),
             drift: Mutex::default(),
             capabilities: Mutex::default(),
             probe_timeout: PROBE_TIMEOUT,
+        };
+        match document["runtime_profiles"].as_object() {
+            Some(profiles) => registry.with_profiles(profiles),
+            None => registry,
         }
+    }
+
+    /// ADR 0031 §3: the custom engines' manifests among `profiles` (a host
+    /// document's `runtime_profiles`), so their launches measure what their
+    /// registration measured.
+    pub fn with_profiles(mut self, profiles: &serde_json::Map<String, serde_json::Value>) -> Self {
+        for (name, profile) in profiles {
+            if let Some(manifest) = custom_manifest(profile) {
+                self.custom.insert(name.clone(), manifest);
+            }
+        }
+        self
+    }
+
+    /// ADR 0031 §3: `profile` is a custom engine measured with `manifest`.
+    pub fn with_custom(mut self, profile: &str, manifest: CustomManifest) -> Self {
+        self.custom.insert(profile.to_owned(), manifest);
+        self
     }
 
     pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
@@ -725,7 +948,8 @@ impl InstallationRegistry {
     /// registered digest is recorded (and cleared when it measures as
     /// registered again); it refuses only under `installation_drift: refuse`.
     /// Returns the digest measured now (empty when it could not be measured),
-    /// which keys the capability cache.
+    /// which keys the capability cache. ADR 0031 §3: a custom engine is
+    /// measured with the manifest its profile carries.
     pub fn verify(
         &self,
         profile: &str,
@@ -733,7 +957,12 @@ impl InstallationRegistry {
         executable: &Path,
         policy: InstallationDrift,
     ) -> Result<String, &'static str> {
-        let measured = self.measurer.measure(engine, executable);
+        let custom = self.custom.get(profile);
+        let measured = if engine == Engine::Custom && custom.is_none() {
+            Err(FingerprintError::NotFound)
+        } else {
+            self.measurer.measure_profile(engine, executable, custom)
+        };
         let observed = measured
             .as_ref()
             .map_or_else(|_| UNMEASURED.to_owned(), |f| f.digest.clone());
@@ -1239,5 +1468,250 @@ mod tests {
             measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
             installed.digest
         );
+    }
+
+    /// ADR 0031 §3: a virtual environment holding the console script
+    /// `bin/serve`, a dependency in `site-packages` (with a bytecode cache),
+    /// and `bin/python3` linked to an interpreter outside the tree. Returns
+    /// (root, executable, interpreter, dependency).
+    fn custom_venv(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = dir.join("venv");
+        let bin = root.join("bin");
+        let dep = root.join("lib/python3.12/site-packages/dep");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dep.join("__pycache__")).unwrap();
+        std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        std::fs::write(dep.join("__init__.py"), "x = 1\n").unwrap();
+        std::fs::write(dep.join("__pycache__/__init__.cpython-312.pyc"), "c").unwrap();
+        let outside = dir.join("python");
+        std::fs::create_dir_all(&outside).unwrap();
+        let interpreter = outside.join("python3.12");
+        std::fs::write(&interpreter, "interpreter v1").unwrap();
+        std::os::unix::fs::symlink(&interpreter, bin.join("python3")).unwrap();
+        let executable = bin.join("serve");
+        std::fs::write(&executable, "#!/venv/bin/python3\nimport dep\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (root, executable, interpreter, dep.join("__init__.py"))
+    }
+
+    fn custom_manifest_with(environment: Option<&Path>, version: Option<&str>) -> CustomManifest {
+        let mut manifest = serde_json::json!({
+            "kind": "custom_engine", "schema_version": 1, "api": "decisions",
+            "args": ["--host", "{host}", "--port", "{port}", "--model", "{model_dir}"],
+        });
+        if let Some(root) = environment {
+            manifest["environment"] = root.to_string_lossy().into();
+        }
+        if let Some(version) = version {
+            manifest["version"] = version.into();
+        }
+        CustomManifest::from_value(manifest).unwrap()
+    }
+
+    // T44 T21 (ADR 0031 §3): by default a custom engine's digest covers its
+    // executable, every file of its virtual environment (a dependency in
+    // `site-packages` included, bytecode caches left out) and the interpreter
+    // `bin/python3` links to outside the tree. The version is the manifest's,
+    // else `unversioned`. Nothing is executed.
+    #[test]
+    fn a_custom_engine_pins_its_environment_and_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, executable, interpreter, dependency) = custom_venv(dir.path());
+        let layout = custom_installation(&executable, None);
+        assert_eq!(layout.root.as_deref(), Some(root.as_path()));
+        assert!(!layout.declared_root);
+        assert_eq!(
+            layout.interpreter,
+            Some(interpreter.canonicalize().unwrap())
+        );
+        let measurer = InstallationMeasurer::new();
+        let manifest = custom_manifest_with(None, Some("2.2.0"));
+        let measure = || {
+            measurer
+                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .unwrap()
+        };
+        let first = measure();
+        assert_eq!(first.version, "2.2.0");
+        // executable, interpreter, and in the root: pyvenv.cfg, bin/serve,
+        // the bin/python3 link and the dependency (no bytecode cache).
+        assert_eq!(first.files, 6);
+        assert_eq!(
+            InstallationMeasurer::new()
+                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .unwrap(),
+            first,
+            "a measurer without a cache computes the same digest"
+        );
+        std::fs::write(
+            dependency
+                .parent()
+                .unwrap()
+                .join("__pycache__/__init__.cpython-312.pyc"),
+            "rewritten",
+        )
+        .unwrap();
+        assert_eq!(measure(), first, "a bytecode cache is not drift");
+        std::fs::write(&dependency, "x = 2\n").unwrap();
+        let dependency_changed = measure();
+        assert_ne!(dependency_changed.digest, first.digest);
+        std::fs::write(&interpreter, "interpreter v2").unwrap();
+        assert_ne!(measure().digest, dependency_changed.digest);
+        assert_eq!(
+            measurer
+                .measure_profile(
+                    Engine::Custom,
+                    &executable,
+                    Some(&custom_manifest_with(None, None))
+                )
+                .unwrap()
+                .version,
+            "unversioned"
+        );
+    }
+
+    // T44 T21 (ADR 0031 §3): the manifest's `environment` replaces the
+    // default root, never the executable or the interpreter: a change
+    // elsewhere in the virtual environment is not drift; one under the root,
+    // in the executable or in the interpreter is.
+    #[test]
+    fn a_manifest_environment_replaces_only_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, executable, interpreter, dependency) = custom_venv(dir.path());
+        let package = dependency.parent().unwrap().to_path_buf();
+        let manifest = custom_manifest_with(Some(&package), None);
+        let layout = custom_installation(&executable, Some(&manifest));
+        assert_eq!(layout.root.as_deref(), Some(package.as_path()));
+        assert!(layout.declared_root);
+        assert!(layout.interpreter.is_some());
+        let measurer = InstallationMeasurer::new();
+        let measure = || {
+            measurer
+                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .unwrap()
+                .digest
+        };
+        let first = measure();
+        std::fs::write(root.join("pyvenv.cfg"), "home = /elsewhere\n").unwrap();
+        assert_eq!(measure(), first, "outside the declared root");
+        std::fs::write(&dependency, "x = 3\n").unwrap();
+        let rooted = measure();
+        assert_ne!(rooted, first);
+        std::fs::write(&executable, "#!/venv/bin/python3\nimport other\n").unwrap();
+        let executable_changed = measure();
+        assert_ne!(executable_changed, rooted);
+        std::fs::write(&interpreter, "interpreter v3").unwrap();
+        assert_ne!(measure(), executable_changed);
+    }
+
+    // T44 T21 (ADR 0031 §3): outside a virtual environment the executable
+    // alone is the installation; beyond the depth bound a root is
+    // `unmeasured` (too_large), never a refusal.
+    #[test]
+    fn a_bare_custom_executable_is_measured_alone_and_bounds_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("serve");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("neighbour"), "not the installation").unwrap();
+        let manifest = custom_manifest_with(None, None);
+        let alone = InstallationMeasurer::new()
+            .measure_profile(Engine::Custom, &executable, Some(&manifest))
+            .unwrap();
+        assert_eq!(alone.files, 1);
+        assert_eq!(custom_installation(&executable, Some(&manifest)).root, None);
+        let mut deep = dir.path().join("deep");
+        for level in 0..=MAX_DEPTH + 1 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), "x").unwrap();
+        let bounded = custom_manifest_with(Some(&dir.path().join("deep")), None);
+        assert_eq!(
+            InstallationMeasurer::new().measure_profile(
+                Engine::Custom,
+                &executable,
+                Some(&bounded)
+            ),
+            Err(FingerprintError::TooLarge)
+        );
+        let (_, _, state) = registration(
+            &InstallationMeasurer::new(),
+            Some(Engine::Custom),
+            &executable,
+            Some(&bounded),
+        );
+        assert_eq!(state, "unmeasured");
+    }
+
+    // T44 T21 T22 (ADR 0031 §3): a custom profile registers with its
+    // manifest read from the profile; a launch measures with the manifest
+    // the published document carries. A changed dependency is drift: flagged
+    // under `warn`, refused `installation_drift` only under `refuse`.
+    #[test]
+    fn custom_engine_drift_warns_and_refuses_only_under_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, executable, _, dependency) = custom_venv(dir.path());
+        let package = dependency.parent().unwrap().to_path_buf();
+        let custom = capyctl_config::custom::CustomProfile::new(custom_manifest_with(
+            Some(&package),
+            Some("1.0"),
+        ));
+        let profile =
+            serde_json::json!({"engine": "custom", "executable": executable, "custom": custom});
+        let mut status = capyctl_protocol::pb::RuntimeProfileStatus {
+            name: "serve".into(),
+            ..Default::default()
+        };
+        register_profile(&InstallationMeasurer::new(), &profile, &mut status);
+        assert_eq!(status.installation_state, "measured");
+        assert_eq!(status.installation_version, "1.0");
+        let registered = status.installation_digest.clone();
+        let registry =
+            InstallationRegistry::from_inventory(&capyctl_protocol::pb::ReportInventory {
+                profiles: vec![status.clone()],
+                approved_host_config_json:
+                    serde_json::json!({"runtime_profiles": {"serve": profile}}).to_string(),
+                ..Default::default()
+            });
+        assert_eq!(
+            registry.verify(
+                "serve",
+                Engine::Custom,
+                &executable,
+                InstallationDrift::Refuse
+            ),
+            Ok(registered.clone()),
+            "measured with the profile's own root"
+        );
+        std::fs::write(&dependency, "x = 9\n").unwrap();
+        let observed = registry
+            .verify(
+                "serve",
+                Engine::Custom,
+                &executable,
+                InstallationDrift::Warn,
+            )
+            .unwrap();
+        assert_ne!(observed, registered);
+        let mut profiles = vec![status];
+        registry.overlay(&mut profiles);
+        assert_eq!(profiles[0].installation_state, "drifted");
+        assert_eq!(
+            registry.verify(
+                "serve",
+                Engine::Custom,
+                &executable,
+                InstallationDrift::Refuse
+            ),
+            Err("installation_drift")
+        );
+        // Without its manifest a custom profile is unmeasured, never drift.
+        let mut bare = capyctl_protocol::pb::RuntimeProfileStatus::default();
+        register_profile(
+            &InstallationMeasurer::new(),
+            &serde_json::json!({"engine": "custom", "executable": executable}),
+            &mut bare,
+        );
+        assert_eq!(bare.installation_state, "unmeasured");
     }
 }

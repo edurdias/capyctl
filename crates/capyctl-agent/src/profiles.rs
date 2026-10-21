@@ -44,7 +44,11 @@ impl ProfileSet {
     /// The fingerprint is the inventory's `policy_fingerprint`, the one plans
     /// name.
     pub fn new(config: HostConfig, inventory: pb::ReportInventory) -> Self {
-        let installations = Arc::new(InstallationRegistry::from_inventory(&inventory));
+        // ADR 0031 §3: a custom engine's launch measures what its
+        // registration measured, with the manifest its profile carries.
+        let installations = Arc::new(
+            InstallationRegistry::from_inventory(&inventory).with_profiles(&config.profiles),
+        );
         let fingerprint = inventory.policy_fingerprint.clone();
         Self {
             config,

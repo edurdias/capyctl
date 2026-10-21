@@ -1015,7 +1015,7 @@ fn engine_views_print_tables_and_json_on_request() {
     let table = capyctl(dir.path(), &list);
     assert!(
         table.starts_with(
-            "PROFILE   SOURCE   ENGINE   VERSION   CUSTOM   DEEP PARK   PUBLISHED   DEPLOYMENTS\n"
+            "PROFILE   SOURCE   ENGINE   VERSION   CUSTOM   DEEP PARK   IDLE SIGNAL   ENGINE KEY   PUBLISHED   DEPLOYMENTS\n"
         ),
         "{table}"
     );

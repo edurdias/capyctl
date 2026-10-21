@@ -147,6 +147,23 @@ impl crate::Store {
         {
             return Err(LifecycleError::Conflict);
         }
+        // ADR 0031 §6, SPEC §10: an engine that reports no idle signal cannot
+        // be observed quiescent, whatever a generic read returned, and a role
+        // restart is not its verified exit: only a stop's cleanup settles these.
+        let no_idle_signal: bool = tx.query_row(
+            &format!(
+                "SELECT {}",
+                crate::request_lease_cancellations::lane_without_idle_signal("?1", "?2")
+            ),
+            params![p.deployment_id, p.instance_index],
+            |r| r.get(0),
+        )?;
+        if no_idle_signal {
+            return Err(LifecycleError::Rejected(
+                "the engine reports no idle signal; only a verified exit settles these leases"
+                    .into(),
+            ));
+        }
         let ttl = policy(&tx, &e)?.controls.observation_ttl_ms;
         let started = session_started_at_ms(s)?;
         let fresh = |at: i64| {

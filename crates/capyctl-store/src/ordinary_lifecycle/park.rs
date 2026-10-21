@@ -2586,7 +2586,10 @@ impl crate::Store {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
             check_session(&tx, s)?;
             // SPEC §6.5: a warm-residency commitment, or a deployment whose
-            // activation is explicit, is never idled.
+            // activation is explicit, is never idled. ADR 0031 §6, SPEC §10:
+            // a cancelling lease on an engine that reports no idle signal does
+            // not hold the instance busy; only the stop's verified exit can
+            // settle it, so it must not prevent that stop.
             let rows = tx.prepare(&format!(
                 "SELECT i.deployment_id,i.instance_index,i.generation,i.observed_state FROM deployment_instances i
                    JOIN deployments d ON d.id=i.deployment_id
@@ -2594,9 +2597,11 @@ impl crate::Store {
                     AND ((i.observed_state='ready' AND i.dispatch_enabled=1) OR i.observed_state='parked')
                     AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.state IN ('queued','running','uncertain'))
                     AND NOT EXISTS(SELECT 1 FROM lifecycle_claims c WHERE c.deployment_id=i.deployment_id AND c.instance_index=i.instance_index)
-                    AND NOT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index)
+                    AND NOT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index
+                                     AND NOT (l.disposition='inflight' AND {}))
                     AND NOT {}
                   ORDER BY i.deployment_id,i.instance_index",
+                crate::request_lease_cancellations::cancelling_without_idle_signal("l"),
                 crate::switch_state::exempt_clause("i")
             ))?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?

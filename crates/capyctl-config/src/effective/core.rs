@@ -12,6 +12,7 @@ pub(super) struct NormalizedProfile {
     pub(super) cuda_home: Option<String>,
     pub(super) security: Security,
     pub(super) log_policy: LogPolicy,
+    pub(super) custom: Option<crate::custom::CustomProfile>,
 }
 
 pub(super) struct NormalizedRecipe {
@@ -181,6 +182,30 @@ pub(super) fn normalize_profile(
             "every approved option is a long option name such as `--tool-parser-plugin`",
         ));
     }
+    // ADR 0031 §1, §2: a custom engine's profile carries its manifest, which
+    // is validated again here (and its digest recomputed); no other kind
+    // carries one.
+    let custom = match (raw_profile.engine, &raw_profile.custom) {
+        (Engine::Custom, Some(block)) => Some(
+            crate::custom::CustomProfile::from_value(block)
+                .map_err(|e| e.at("runtime_profiles.custom"))?,
+        ),
+        (Engine::Custom, None) => {
+            return Err(ConfigError::new(
+                ConfigErrorCode::MissingRequired,
+                "runtime_profiles.custom",
+                "custom_manifest_invalid: a custom engine's profile carries its manifest \
+                 (`capyctl engine add --custom` writes it)",
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(invalid(
+                "runtime_profiles.custom",
+                "only a profile of engine `custom` carries a manifest",
+            ))
+        }
+        (_, None) => None,
+    };
     let profile = NormalizedProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -194,6 +219,7 @@ pub(super) fn normalize_profile(
             max_file_bytes: parse_bytes(&raw_profile.log_policy.max_file_bytes)?,
             retained_files: raw_profile.log_policy.retained_files,
         },
+        custom,
     };
     Ok(profile)
 }
@@ -909,6 +935,11 @@ pub(super) fn recipe_fingerprint(
         log_policy: &'a LogPolicy,
         hardware_fingerprint: &'a str,
         environment_fingerprint: &'a str,
+        // ADR 0031 §3: a custom engine's manifest is part of its recipe.
+        // Absent for every other engine, so their fingerprints keep their
+        // identity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        manifest_digest: Option<&'a str>,
     }
     let material = Recipe {
         api: d.api,
@@ -940,6 +971,7 @@ pub(super) fn recipe_fingerprint(
         log_policy: &profile.log_policy,
         hardware_fingerprint: &host.hardware_fingerprint,
         environment_fingerprint: &host.environment_fingerprint,
+        manifest_digest: profile.custom.as_ref().map(|c| c.manifest_digest.as_str()),
     };
     let recipe_fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,

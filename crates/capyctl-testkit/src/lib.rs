@@ -195,6 +195,34 @@ pub fn llamacpp_launch_settings() -> LaunchSettings {
     })
 }
 
+/// ADR 0031 §4: custom engine settings: a declared context and a memory
+/// request from the deployment's `resources`.
+pub fn custom_launch_settings() -> LaunchSettings {
+    LaunchSettings::Custom(capyctl_domain::launch::CustomLaunchSettings {
+        common: CommonEngineSettings {
+            context_length: Some(4096),
+            ..CommonEngineSettings::default()
+        },
+        memory: MemoryRequest {
+            request_bytes: 8 << 30,
+            kv_cache_bytes: 0,
+            margin_bytes: 0,
+            weights_bytes: None,
+            startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
+            startup_graphs_bytes: None,
+            startup_eager_cap_bytes: None,
+            state_slot_bytes: None,
+            state_bytes: None,
+            member: None,
+            disk_tables: None,
+            gguf: None,
+        },
+        provenance: Default::default(),
+    })
+}
+
 /// The `engine_config` block a test deployment carries (ADR 0014 §2): JSON,
 /// validated by the configuration layer rather than by a second parser here.
 pub fn vllm_engine_config_json() -> serde_json::Value {

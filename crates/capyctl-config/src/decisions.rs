@@ -153,6 +153,9 @@ pub fn engine_refusal(engine: Engine, build_fingerprint: &str) -> Option<String>
                  yet; {serve_on}"
             ))
         }
+        // ADR 0031 §2: a custom engine serves the API its manifest names,
+        // which resolution compares with the deployment's (no version check).
+        Engine::Custom => return None,
     };
     match EngineVersion::parse(build_fingerprint.trim()) {
         Some(version) if version.at_least(&minimum) => None,
@@ -224,6 +227,8 @@ pub fn check_parsers(settings: &LaunchSettings) -> Result<(), ConfigError> {
         LaunchSettings::Sglang(s) => ("sglang", &s.tool_call_parser, &s.reasoning_parser),
         // ADR 0029 §12: llama-server has no parser setting.
         LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => return Ok(()),
+        // ADR 0031 §4: a custom engine's parsers are refused at resolution.
+        LaunchSettings::Custom(_) => return Ok(()),
     };
     let refused = |path: String, what: &str| {
         Err(invalid(

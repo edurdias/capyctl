@@ -1477,6 +1477,41 @@ pub(crate) fn complete(
     if unproven {
         return Err(LifecycleError::Conflict);
     }
+    // ADR 0031 §6, SPEC §10: on an engine that reports no idle signal, this
+    // verified exit is the cancellation acknowledgement of its cancelling
+    // leases. It is journaled with a receipt naming this stop, in the same
+    // transaction that deletes them and releases the reservation; an
+    // uncertain cleanup never reaches here, so both stay held. Built-in
+    // engines settle on their idle signal and are unchanged.
+    let acknowledged: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id
+              WHERE l.deployment_id=?1 AND l.revision=?2 AND l.generation=?3 AND l.disposition='inflight' AND {}",
+            crate::request_lease_cancellations::lane_without_idle_signal("l.deployment_id", "l.instance_index")
+        ),
+        params![original.deployment_id, original.revision, original.generation],
+        |r| r.get(0),
+    )?;
+    if acknowledged > 0 {
+        crate::events::append_event(
+            tx,
+            &crate::events::EventMetadata::RequestCancellationAcknowledged {
+                deployment_id: original.deployment_id.clone(),
+                binding_id: p.receipt.binding_id.clone(),
+                count: usize::try_from(acknowledged)
+                    .map_err(|_| LifecycleError::CorruptStoredData)?,
+                receipt: format!(
+                    "the engine reports no idle signal; stop operation {} (cleanup step {}) \
+                     verified the exit of the instance's process group",
+                    p.receipt.operation_id, p.receipt.step_id
+                ),
+            },
+        )
+        .map_err(|error| match error {
+            crate::events::EventWriteError::Sql(error) => LifecycleError::Sql(error),
+            _ => LifecycleError::CorruptStoredData,
+        })?;
+    }
     tx.execute(
         "DELETE FROM request_leases WHERE deployment_id=?1 AND revision=?2 AND generation=?3",
         params![

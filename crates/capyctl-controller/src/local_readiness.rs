@@ -43,6 +43,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// ADR 0030 §3: the bound on the fixed decision probe of an adopted
 /// decisions launch (an engine's first decision can be slow).
 const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
+/// ADR 0031 §7: how long an exposed custom engine's processes get on
+/// SIGTERM before SIGKILL.
+const EXPOSED_GRACE: Duration = Duration::from_secs(5);
 /// The first wait after a failed proof, doubled per failure up to the cap.
 const FIRST_RETRY: Duration = Duration::from_millis(500);
 const MAX_RETRY: Duration = Duration::from_secs(60);
@@ -82,6 +85,9 @@ struct Target {
     served: String,
     /// ADR 0030 §1: the API the deployment serves.
     decisions: bool,
+    /// ADR 0031: a custom engine's manifest; its proof is the port, the
+    /// health path, the API probe and the loopback check, never a model list.
+    custom: Option<capyctl_config::custom::CustomProfile>,
 }
 
 pub struct LocalReadiness {
@@ -252,28 +258,163 @@ impl LocalReadiness {
             .ok_or_else(|| "the deployment serves no route".to_owned())?;
         // ADR 0030 §1: the frozen revision's API; omitted is chat, and a
         // value this build cannot read proves nothing.
-        let api = store
+        let effective = store
             .effective_configuration(&launch.fence.deployment_id)
             .map_err(|error| format!("the deployment's revision is unreadable: {error}"))?
-            .map(|configuration| configuration.effective["api"].clone())
+            .map(|configuration| configuration.effective)
             .unwrap_or(serde_json::Value::Null);
-        let decisions = match api {
+        let decisions = match effective["api"].clone() {
             serde_json::Value::Null => false,
             api => !serde_json::from_value::<capyctl_config::effective::DeploymentApi>(api)
                 .map_err(|_| "the deployment's api is unreadable".to_owned())?
                 .is_chat(),
+        };
+        // ADR 0031: a custom engine's frozen manifest, re-validated.
+        let custom = match effective["profile"]["engine"].as_str() {
+            Some(engine) if engine == capyctl_config::engine_policy::Engine::Custom.name() => Some(
+                capyctl_config::custom::CustomProfile::from_value(&effective["profile"]["custom"])
+                    .map_err(|_| "the custom engine's manifest is unreadable".to_owned())?,
+            ),
+            _ => None,
         };
         Ok(Target {
             url,
             key,
             served,
             decisions,
+            custom,
         })
+    }
+
+    /// ADR 0031 §5, §7: a custom engine's proof: the port accepts a
+    /// connection, the health path answers 200 when stated, the API's own
+    /// probe is answered with the launch's key, then every live owned
+    /// process listens on loopback only. One that does not is stopped, with
+    /// gone evidence, and the proof fails `custom_listener_exposed`.
+    async fn prove_custom(
+        &self,
+        launch: &LocalReadyLaunch,
+        target: &Target,
+        custom: &capyctl_config::custom::CustomProfile,
+    ) -> Result<(), String> {
+        use capyctl_adapters::traits::{ChatForward, EngineAdapter, MemberRef, Readiness};
+        let adapter = custom_adapter(target, custom);
+        let member = MemberRef {
+            deployment_id: launch.fence.deployment_id.clone(),
+            member_id: launch.binding_id.clone(),
+        };
+        let ready = tokio::time::timeout(PROBE_TIMEOUT, adapter.check_readiness(&member))
+            .await
+            .map_err(|_| "the engine's port or health path did not answer in time".to_owned())?
+            .map_err(|error| format!("the engine's readiness could not be read: {error}"))?;
+        if ready != Readiness::Ready {
+            return Err("the engine's port or health path is not answering".into());
+        }
+        if target.decisions {
+            adapter
+                .decision_probe(&target.served, DECISION_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    format!("the engine did not answer the decision probe: {error}")
+                })?;
+        } else {
+            let body = serde_json::json!({
+                "model": target.served,
+                "messages": [{"role": "user", "content": "Say ready."}],
+                "max_tokens": 8,
+                "temperature": 0,
+            });
+            let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body))
+                .await
+                .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
+                .map_err(|error| format!("the engine did not answer the chat probe: {error}"))?;
+            if !capyctl_adapters::forward::probe_answered(&answer) {
+                return Err("the engine answered the chat probe with empty content".into());
+            }
+        }
+        let live = alive(&launch.identities)?;
+        let checked = tokio::task::spawn_blocking(move || {
+            capyctl_adapters::custom::check_loopback(std::path::Path::new("/proc"), &live, &|id| {
+                capyctl_launchers::process_absence::presence(id) == Presence::Alive
+            })
+        })
+        .await
+        .map_err(|_| "the listener check did not run".to_owned())?;
+        match checked {
+            Ok(()) => Ok(()),
+            Err(exposed @ capyctl_adapters::custom::ListenerCheck::Exposed(_)) => {
+                let recorded = launch.identities.clone();
+                let stopped = tokio::task::spawn_blocking(move || {
+                    capyctl_launchers::owned_launch::terminate_recorded(&recorded, EXPOSED_GRACE)
+                })
+                .await
+                .map_err(|_| format!("{exposed}; the stop did not run"))?;
+                Err(match stopped {
+                    Ok(_) => format!("{exposed}; the engine was stopped"),
+                    Err(error) => format!("{exposed}; the stop is unproven: {error}"),
+                })
+            }
+            Err(unreadable) => Err(unreadable.to_string()),
+        }
     }
 
     async fn prove(&self, launch: &LocalReadyLaunch) -> Result<(), String> {
         alive(&launch.identities)?;
         let target = self.target(launch)?;
+        match &target.custom {
+            Some(custom) => self.prove_custom(launch, &target, custom).await?,
+            None => self.prove_listed(&target).await?,
+        }
+        // SPEC §6.1: the answer must come from the recorded group, so the group is
+        // proven alive on both sides of it.
+        let live = alive(&launch.identities)?;
+        let observed_at_ms = capyctl_protocol::now_unix_ms();
+        self.settle_retired_leases(launch, &target, observed_at_ms)
+            .await?;
+        let evidence =
+            RemoteReadinessEvidence {
+                binding_id: launch.binding_id.clone(),
+                incarnation: launch.incarnation.clone(),
+                identities: live,
+                observed_at_ms,
+                receipt: match &target.custom {
+                    Some(_) => format!(
+                    "every recorded engine process alive with its recorded start ticks and boot; \
+                     the custom engine's port and health answered, it answered the {} probe for \
+                     {}, and every owned listener is on loopback",
+                    if target.decisions { "fixed decision" } else { "chat" },
+                    target.served,
+                ),
+                    None => format!(
+                    "every recorded engine process alive with its recorded start ticks and boot; \
+                     the engine answered an authenticated model list naming {}{}",
+                    target.served,
+                    if target.decisions {
+                        " and the fixed decision probe"
+                    } else {
+                        ""
+                    }
+                ),
+                },
+            };
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| "coordinator state unavailable".to_owned())?;
+        owner
+            .store()
+            .reverify_local_dispatch(
+                owner.session(),
+                &launch.step_id,
+                &evidence,
+                capyctl_protocol::now_unix_ms(),
+            )
+            .map_err(|error| format!("readiness evidence was refused: {error}"))
+    }
+
+    /// The known engines' proof: an authenticated model list naming the
+    /// route, and for a decisions deployment the fixed decision.
+    async fn prove_listed(&self, target: &Target) -> Result<(), String> {
         let mut request = self.client.get(
             target
                 .url
@@ -316,41 +457,7 @@ impl LocalReadiness {
             .await
             .map_err(|error| format!("the engine did not answer the decision probe: {error}"))?;
         }
-        // SPEC §6.1: the answer must come from the recorded group, so the group is
-        // proven alive on both sides of it.
-        let live = alive(&launch.identities)?;
-        let observed_at_ms = capyctl_protocol::now_unix_ms();
-        self.settle_retired_leases(launch, &target, observed_at_ms)
-            .await?;
-        let evidence = RemoteReadinessEvidence {
-            binding_id: launch.binding_id.clone(),
-            incarnation: launch.incarnation.clone(),
-            identities: live,
-            observed_at_ms,
-            receipt: format!(
-                "every recorded engine process alive with its recorded start ticks and boot; \
-                 the engine answered an authenticated model list naming {}{}",
-                target.served,
-                if target.decisions {
-                    " and the fixed decision probe"
-                } else {
-                    ""
-                }
-            ),
-        };
-        let owner = self
-            .owner
-            .lock()
-            .map_err(|_| "coordinator state unavailable".to_owned())?;
-        owner
-            .store()
-            .reverify_local_dispatch(
-                owner.session(),
-                &launch.step_id,
-                &evidence,
-                capyctl_protocol::now_unix_ms(),
-            )
-            .map_err(|error| format!("readiness evidence was refused: {error}"))
+        Ok(())
     }
 
     /// SPEC §10 (W12): a standalone crash with requests in flight left their
@@ -383,31 +490,62 @@ impl LocalReadiness {
                  was not observed quiescent"
             )
         };
-        let mut request = self.client.get(
-            target
-                .url
-                .join("metrics")
-                .map_err(|_| "the metrics URL is invalid")?,
-        );
-        if let Some(key) = &target.key {
-            request = request.bearer_auth(key);
-        }
-        let response = request.send().await.map_err(|_| unobserved())?;
-        if !response.status().is_success() {
-            return Err(unobserved());
-        }
-        let body = response.bytes().await.map_err(|_| unobserved())?;
-        if body.len() > capyctl_agent::load::MAX_METRICS_BYTES {
-            return Err(unobserved());
-        }
-        // Missing or ambiguous gauges are unknown load, never zero.
-        let load = std::str::from_utf8(&body)
-            .ok()
-            .and_then(capyctl_agent::load::parse_engine_load)
-            .ok_or_else(unobserved)?;
-        if load.running != 0 || load.waiting != 0 {
-            return Err(unobserved());
-        }
+        let receipt = match &target.custom {
+            // ADR 0031 §6: a custom engine's only account of its work is its
+            // manifest's idle signal, read now with its key. Without one the
+            // leases are never settled while the engine runs: they stay
+            // charged until the verified exit of its next stop (a role
+            // restart is not one), and the store keeps dispatch closed
+            // while they remain.
+            Some(custom) => {
+                use capyctl_adapters::traits::{EngineAdapter, EngineWork, MemberRef};
+                if custom.manifest.idle.is_none() {
+                    return Ok(());
+                }
+                let member = MemberRef {
+                    deployment_id: launch.fence.deployment_id.clone(),
+                    member_id: launch.binding_id.clone(),
+                };
+                if custom_adapter(target, custom)
+                    .idle_before_signal(&member)
+                    .await
+                    != Some(EngineWork::Idle)
+                {
+                    return Err(unobserved());
+                }
+                "the custom engine's idle signal, read with its per-launch key after a fresh \
+                 probe, reported no running and no waiting requests"
+            }
+            None => {
+                let mut request = self.client.get(
+                    target
+                        .url
+                        .join("metrics")
+                        .map_err(|_| "the metrics URL is invalid")?,
+                );
+                if let Some(key) = &target.key {
+                    request = request.bearer_auth(key);
+                }
+                let response = request.send().await.map_err(|_| unobserved())?;
+                if !response.status().is_success() {
+                    return Err(unobserved());
+                }
+                let body = response.bytes().await.map_err(|_| unobserved())?;
+                if body.len() > capyctl_agent::load::MAX_METRICS_BYTES {
+                    return Err(unobserved());
+                }
+                // Missing or ambiguous gauges are unknown load, never zero.
+                let load = std::str::from_utf8(&body)
+                    .ok()
+                    .and_then(capyctl_agent::load::parse_engine_load)
+                    .ok_or_else(unobserved)?;
+                if load.running != 0 || load.waiting != 0 {
+                    return Err(unobserved());
+                }
+                "the engine's metrics, read with its per-launch key after a fresh model \
+                 check, reported 0 running and 0 waiting requests"
+            }
+        };
         // The quiescent engine is still the recorded group.
         let live = alive(&launch.identities)?;
         let evidence = QuiescenceEvidence {
@@ -416,9 +554,7 @@ impl LocalReadiness {
             identities: live,
             readiness_observed_at_ms: probed_at,
             quiescent_at_ms: capyctl_protocol::now_unix_ms(),
-            receipt: "the engine's metrics, read with its per-launch key after a fresh model \
-                      check, reported 0 running and 0 waiting requests"
-                .into(),
+            receipt: receipt.into(),
         };
         let owner = self
             .owner
@@ -435,6 +571,23 @@ impl LocalReadiness {
             .map(|_| ())
             .map_err(|error| format!("quiescence evidence was refused: {error}"))
     }
+}
+
+/// ADR 0031: an adapter that can only question an adopted custom engine,
+/// with its manifest's API, health path and idle signal and its sealed key.
+fn custom_adapter(
+    target: &Target,
+    custom: &capyctl_config::custom::CustomProfile,
+) -> capyctl_adapters::custom::CustomAdapter {
+    capyctl_adapters::custom::CustomAdapter::new(
+        target.url.clone(),
+        custom.manifest.build_fingerprint(),
+        target.served.clone(),
+        target.key.clone(),
+    )
+    .with_api(custom.manifest.api)
+    .with_health(custom.manifest.health.clone())
+    .with_idle(custom.manifest.idle.clone())
 }
 
 /// Every recorded engine process is alive as recorded; `Unknown` is not alive.

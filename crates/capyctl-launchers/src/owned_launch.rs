@@ -270,6 +270,33 @@ impl DurableProcessLaunch {
     }
 }
 
+/// An association for a tool that only stops: it never spawns.
+struct StopOnly;
+
+impl LaunchAssociation for StopOnly {
+    fn persist_api_identity(
+        &self,
+        _identity: &ProcessIdentity,
+    ) -> Result<(), crate::durable::AssociationError> {
+        Err(crate::durable::AssociationError::Uncertain(
+            "a stop-only tool never launches".into(),
+        ))
+    }
+}
+
+/// ADR 0031 §7: stop a launch's recorded processes from outside its builder,
+/// as [`DurableProcessLaunch::terminate_escalating`] does (SIGTERM, `grace`,
+/// SIGKILL, then proof that every identity and the group are gone). The
+/// owner of the recorded identities calls it when a launch whose processes
+/// it holds must not keep running (an engine listening off loopback); the
+/// claim and accounting stay until the settlement records the gone evidence.
+pub fn terminate_recorded(
+    identities: &[ProcessIdentity],
+    grace: Duration,
+) -> Result<bool, RuntimeError> {
+    DurableProcessLaunch::new(Arc::new(StopOnly)).terminate_escalating(identities, grace)
+}
+
 impl DurableProcessLaunch {
     /// Poll until every recorded process is proven gone and the group itself is
     /// empty, or the deadline passes. Both halves are required: a recorded process

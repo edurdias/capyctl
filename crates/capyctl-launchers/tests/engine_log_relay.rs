@@ -182,3 +182,51 @@ fn the_exec_launcher_log_is_redacted_too() {
     assert!(text.contains("key <redacted>"), "{text}");
     assert!(!text.contains(VLLM_KEY), "{text}");
 }
+
+const CUSTOM_KEY: &str = "custom-key-not-hex-shaped-0008";
+
+// T44 T21 (ADR 0031 §7, SPEC §13.3): a custom engine's key, wherever its
+// manifest put it (an argument, a variable whose name says nothing, part of
+// a larger value), is redacted by value in the log and its tail; the
+// writer's metadata never reaches the engine.
+#[test]
+fn a_custom_engine_key_is_redacted_wherever_it_was_rendered() {
+    use capyctl_adapters::engine_log::{encode_owned_values, OWNED_VALUES_VARIABLE};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("custom.log");
+    let command = RenderedCommand {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            "echo \"argv $1\"; echo \"auth $AUTH\"; echo \"dsn $DSN\" >&2; \
+             echo \"metadata [$CAPYCTL_ENGINE_LOG_OWNS]\"; echo engine-done"
+                .into(),
+            "basal-serve".into(),
+            format!("--api-key={CUSTOM_KEY}"),
+        ],
+        env: BTreeMap::from([
+            (LOG_VARIABLE.to_owned(), log.to_str().unwrap().to_owned()),
+            ("AUTH".to_owned(), CUSTOM_KEY.to_owned()),
+            ("DSN".to_owned(), format!("user:{CUSTOM_KEY}@local")),
+            (
+                OWNED_VALUES_VARIABLE.to_owned(),
+                encode_owned_values([CUSTOM_KEY]),
+            ),
+        ]),
+    };
+    DurableSpawn::new()
+        .with_log_relay(relay())
+        .spawn_persisted("custom-relay", &command, &Accept)
+        .unwrap();
+    let text = read_until_done(&log);
+    assert!(text.contains("argv --api-key=<redacted>"), "{text}");
+    assert!(text.contains("auth <redacted>"), "{text}");
+    assert!(text.contains("dsn user:"), "{text}");
+    assert!(
+        text.contains("metadata []"),
+        "the engine saw the metadata:\n{text}"
+    );
+    assert!(!text.contains(CUSTOM_KEY), "{text}");
+    let tail = capyctl_adapters::launch_failure::log_tail(log.to_str());
+    assert!(!tail.contains(CUSTOM_KEY), "{tail}");
+}

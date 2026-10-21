@@ -95,6 +95,7 @@ impl EmbeddedHost {
                 &n.profile,
                 n.installation.engine,
                 &n.installation.executable,
+                custom_of(n).as_ref(),
             );
         }
         Arc::new(Self {
@@ -175,6 +176,7 @@ impl EmbeddedHost {
                 &n.profile,
                 n.installation.engine,
                 &n.installation.executable,
+                custom_of(n).as_ref(),
             );
         }
         let executables: Vec<&Path> = named
@@ -192,6 +194,15 @@ impl EmbeddedHost {
             .map_err(|_| "installation list lock poisoned")? = named;
         Ok(())
     }
+}
+
+/// ADR 0031 §3: the manifest a registered custom engine is measured with.
+fn custom_of(named: &NamedInstallation) -> Option<capyctl_config::custom::CustomManifest> {
+    named
+        .installation
+        .registered
+        .as_ref()
+        .and_then(capyctl_agent::installation::custom_manifest)
 }
 
 /// The standalone role's control-socket handler.
@@ -287,7 +298,7 @@ fn reload(
     commands: &CoordinatorCommands,
     host_id: &str,
 ) -> Value {
-    let registered = match EnginesFile::load(engines) {
+    let registered = match EnginesFile::load_with_custom(engines) {
         // ADR 0018 amendment A3: an unknown engine kind is skipped, as at start.
         Ok(file) => file.runnable().0,
         Err(e) => return refused("invalid_config", format!("{}: {}", e.path, e.detail)),
@@ -365,7 +376,7 @@ impl StandaloneControl {
             profile.to_owned(),
         );
         tokio::task::spawn_blocking(move || {
-            let mut registered = EnginesFile::load(&engines)
+            let mut registered = EnginesFile::load_with_custom(&engines)
                 .map_err(|e| refused("invalid_config", format!("{}: {}", e.path, e.detail)))?
                 .runnable()
                 .0;
@@ -447,7 +458,7 @@ impl StandaloneControl {
             let view = self
                 .host
                 .installations
-                .for_executable(&n.installation.executable)
+                .find(&n.installation.executable, custom_of(&n).as_ref())
                 .map(|i| i.view())
                 .unwrap_or(Value::Null);
             accepted.insert(

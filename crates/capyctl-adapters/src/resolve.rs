@@ -113,6 +113,25 @@ pub enum AdapterSpec {
         /// ADR 0030 §1: the API the deployment serves.
         api: capyctl_config::effective::DeploymentApi,
     },
+    /// ADR 0031: a custom engine listens on loopback; an owned launch
+    /// carries its plan. The key, when the manifest uses `{api_key}` (§7),
+    /// is this spec's `api_key`, the one source the plan and every request
+    /// take it from, so sealing and adoption replace it in one place.
+    Custom {
+        endpoint: reqwest::Url,
+        fingerprint: String,
+        model_id: String,
+        launch: Option<crate::custom::PlanInputCustom>,
+        /// ADR 0031 §2: the manifest's API.
+        api: capyctl_config::effective::DeploymentApi,
+        /// ADR 0031 §7: the per-launch engine key, only for a manifest that
+        /// uses `{api_key}`.
+        api_key: Option<String>,
+        /// ADR 0031 §6: the manifest's idle signal.
+        idle: Option<capyctl_config::custom::IdleSignal>,
+        /// ADR 0031 §5: the manifest's health path.
+        health: Option<String>,
+    },
 }
 
 impl AdapterSpec {
@@ -124,6 +143,7 @@ impl AdapterSpec {
             Self::Sglang { .. } => Engine::Sglang,
             Self::Tensorfold { .. } => Engine::Tensorfold,
             Self::Llamacpp { .. } => Engine::Llamacpp,
+            Self::Custom { .. } => Engine::Custom,
         }
     }
 }
@@ -249,6 +269,30 @@ pub fn resolve(
                 crate::llamacpp::LlamacppAdapter::new(endpoint, fingerprint, model_id)
                     .with_api(api);
             if let Some(launch) = launch {
+                adapter = adapter.with_launch(launch);
+            }
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            Box::new(adapter)
+        }
+        AdapterSpec::Custom {
+            endpoint,
+            fingerprint,
+            model_id,
+            launch,
+            api,
+            api_key,
+            idle,
+            health,
+        } => {
+            let mut adapter =
+                crate::custom::CustomAdapter::new(endpoint, fingerprint, model_id, api_key.clone())
+                    .with_api(api)
+                    .with_health(health)
+                    .with_idle(idle);
+            if let Some(mut launch) = launch {
+                launch.values.api_key = api_key;
                 adapter = adapter.with_launch(launch);
             }
             if let Some(tools) = tools {

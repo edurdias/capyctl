@@ -352,6 +352,7 @@ fn every_post_baseline_field_names_its_capability() {
             CHECKPOINT_TABLES,
             CHECKPOINT_GGUF,
             DECISIONS,
+            CUSTOM_ENGINES,
         ]
         .contains(name)
         {
@@ -566,6 +567,33 @@ fn decisions_gates_only_decision_deployments() {
     );
     assert_eq!(
         decisions_refusal(&agent_capabilities().into_iter().collect()),
+        None
+    );
+}
+
+// T44 T34 (ADR 0031 §9): `custom_engines` is a capability every current
+// agent declares. It is no placement requirement for other deployments:
+// only a deployment on a custom engine is refused, typed, on a host without
+// it.
+#[test]
+fn custom_engines_gates_only_custom_engine_deployments() {
+    use capabilities::*;
+    assert_eq!(CUSTOM_ENGINES, "custom_engines");
+    assert!(CATALOGUE.contains(&(CUSTOM_ENGINES, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&CUSTOM_ENGINES.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&CUSTOM_ENGINES));
+    assert!(is_gate_refusal(&missing(CUSTOM_ENGINES)));
+    let older: BTreeSet<String> = agent_capabilities()
+        .into_iter()
+        .filter(|name| name != CUSTOM_ENGINES)
+        .collect();
+    assert_eq!(
+        custom_engines_refusal(&older).as_deref(),
+        Some("host_capability_missing:custom_engines")
+    );
+    assert_eq!(decisions_refusal(&older), None);
+    assert_eq!(
+        custom_engines_refusal(&agent_capabilities().into_iter().collect()),
         None
     );
 }

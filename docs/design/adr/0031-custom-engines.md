@@ -2,11 +2,13 @@
 
 **Status:** Accepted (owner decision 2026-10-20). Proposed 2026-10-18; the owner answered
 every open question on 2026-10-20, and the answers are recorded below (summary at the
-end). Target release 0.1.6. Nothing is implemented yet.
+end). Implemented in 0.1.6, with amendment A1 (owner decision 2026-10-21): custom engine
+profiles live in `custom-engines.yaml`, beside `engines.yaml`.
 **Amends:** `SPEC.md` §8.2 (a custom engine is a custom/fixed recipe in §8.1's sense:
 CapyCTL does not validate its flags), §9.4 (later backends), §10 (when a cancelling lease
-settles on an engine with no idle signal), §20 (T44); ADR 0018 §1 (a third installation
-path beside the dist-info environment and the bare binary).
+settles on an engine with no idle signal), §15.1 (amendment A1: the second engines file),
+§20 (T44); ADR 0018 §1 (a third installation path beside the dist-info environment and
+the bare binary).
 **Related:** ADR 0008 (installations, fingerprints, drift; its runtime type `command` is a
 different thing, see §1), ADR 0012 (deep parking and its protections), ADR 0014 (§5 memory
 request, A2 measured startup peak), ADR 0017 (capability gating), ADR 0018 (registration,
@@ -92,15 +94,15 @@ capyctl engine add --custom <executable> --name <profile> --manifest <file>
   `engine list` shows each one with `CUSTOM yes` (ADR 0017).
 - `engine detect` never lists custom engines; there is nothing to detect.
 - The manifest is read once, validated (§2), and copied into the profile in
-  `engines.yaml`, with its digest. Editing the file later changes nothing; changing the
-  command means `engine remove` and `engine add` again, which ADR 0018 §4 already makes
-  safe for running deployments.
+  `custom-engines.yaml` (amendment A1), with its digest. Editing the file later changes
+  nothing; changing the command means `engine remove` and `engine add` again, which ADR
+  0018 §4 already makes safe for running deployments.
 - A profile of kind `custom` may also be written by hand under `runtime_profiles` in the
   role document, in the same shape, and is validated the same way at role start. There
   is no `local_engine.custom` and no start flag or variable for one: the three-ways rule
   (ADR 0018 A1) covers the role's own installation, which stays one of the known engines.
-- A release that predates this ADR skips a `custom` profile with a warning at start
-  (ADR 0018 A3) and keeps the rest.
+- A release before 0.1.6 does not read `custom-engines.yaml`: a downgrade loses the
+  custom engines and keeps every other engine (amendment A1).
 
 `--env` and `--approve-env` are the ADR 0028 §2.1 settings, with their environment
 variables (`CAPYCTL_ENGINE_ADD_ENV`, `CAPYCTL_APPROVE_ENV`). `--drift` writes
@@ -330,8 +332,9 @@ A custom engine runs whatever program the host administrator names, with argumen
 wrote. That is SPEC §8.1's "administrator-authored scripts are trusted execution, not a
 sandbox", made explicit:
 
-- **Approval is `engine add`.** Only the local CLI on the host writes `engines.yaml`, as
-  the role's service user or root (ADR 0018 §2); no management or remote API creates or
+- **Approval is `engine add`.** Only the local CLI on the host writes the engines files
+  (`custom-engines.yaml` for custom engines, amendment A1), as the role's service user
+  or root (ADR 0018 §2); no management or remote API creates or
   edits a custom engine, so a server operator or deployment owner cannot introduce a
   program (SPEC §13.3). `engine add --custom` prints the executable, the argument
   template, the API, the environment names, the root pinned and its digest, and asks
@@ -355,9 +358,10 @@ sandbox", made explicit:
 
 A host that implements this ADR declares `custom_engines` (ADR 0017). The server places a
 deployment whose profile is of kind `custom` only on a host that declared it; any other
-is refused `host_capability_missing:custom_engines` before anything is sent. A host never
-publishes a `custom` profile from an older release (it skips it, §1), and a server is
-never older than its hosts (ADR 0017), so publication needs no gate.
+is refused `host_capability_missing:custom_engines` before anything is sent. A host on an
+older release never publishes a `custom` profile (it does not read `custom-engines.yaml`,
+amendment A1), and a server is never older than its hosts (ADR 0017), so publication
+needs no gate.
 
 ### 10. Refusal codes
 
@@ -495,7 +499,8 @@ counts can be given an `idle` entry in its manifest without a CapyCTL change.
 A new conformance row, **T44 — custom engines**: `engine add --custom` executes nothing,
 requires `--name`, refuses an unknown or missing required placeholder, a reserved
 environment name and `--deep-park enabled`, asks for confirmation (or `--yes`, else
-`not_interactive`) and writes the manifest into `engines.yaml` with its digest; the
+`not_interactive`) and writes the manifest into `custom-engines.yaml` with its digest
+(amendment A1); the
 digest covers the executable, the whole environment with its interpreter, or the
 manifest's `environment` root, and drift is flagged and refused only under
 `installation_drift: refuse`; rendering substitutes each placeholder into one argument,
@@ -509,7 +514,9 @@ readings after the hang-up and never on missing or malformed ones; without one, 
 cancelled by a hang-up, a deadline cut or an engine error stays charged while the engine
 runs, drains do not wait for it, and it settles on the stop's verified exit and not
 before, with the reservation held until then; status shows the cancelling count and how
-it settles; `cache_salt` is refused; an older release skips a `custom` profile. Tests
+it settles; `cache_salt` is refused; `engines.yaml` refuses `engine: custom`, a profile
+name is unique across both engines files and the role document, and a release before
+0.1.6 ignores `custom-engines.yaml` (amendment A1). Tests
 also tag T13, T14, T17, T37 and T43 where they apply.
 
 CPU and Fake-engine tests (the fake engine gains a custom mode with and without an idle
@@ -535,3 +542,37 @@ The open questions of the proposal, answered:
 7. **Release and digest:** release 0.1.6; the digest covers the whole environment by
    default, the manifest may name a narrower root, and drift warns unless
    `installation_drift: refuse` (§3).
+
+## Amendment A1 (owner decision 2026-10-21)
+
+**Custom engine profiles live in `custom-engines.yaml`.** Found while implementing: 0.1.5
+reads `engines.yaml` strictly against a closed profile shape, so a custom profile there,
+with its copied manifest, would make 0.1.5 refuse the whole file after a downgrade, and
+every registered engine with it, instead of skipping one profile as §1 first said. So:
+
+- `capyctl engine add --custom` writes the profile to `custom-engines.yaml`, beside
+  `engines.yaml` (the same directory, found the same way from `--config`,
+  `CAPYCTL_CONFIG` or `XDG_CONFIG_HOME`), with the same first-line revision header
+  (`# capyctl-document-revision: N`), lock and atomic write; its document kind is
+  `custom_engines`. `engine remove` removes a custom engine from it.
+- `engines.yaml` keeps 0.1.5's profile shape and refuses `engine: custom`;
+  `custom-engines.yaml` refuses any other engine. A profile written by hand under
+  `runtime_profiles` in the role document is unchanged (§1).
+- A profile name is unique across both files and the role document: a name taken in any
+  of them is `profile_exists`. Both files count together toward the size bound of the
+  profiles a host publishes.
+- A downgrade to a release before 0.1.6 ignores `custom-engines.yaml` and loses the
+  custom engines (a deployment naming one finds no host that publishes it), while every
+  other engine keeps working. This replaces §1's sentence that a release predating this
+  ADR skips a `custom` profile in `engines.yaml` with a warning; §9 holds unchanged, since
+  an older release never publishes a custom profile.
+- For a deployment with `api: decisions`, ADR 0030's document check refuses a `topology`
+  or a parking residency (`deep`, `host_backed`) before the profile is known, so on a
+  decisions custom engine those two refusals carry ADR 0030's wording (an invalid
+  `topology` or `residency`, "a decisions deployment runs on one machine" and "restarts
+  instead of parking"). A chat deployment on a custom engine gets this ADR's codes,
+  `group_shape_unsupported:custom` and `capability_missing:deep_park` (§4, §10). Either
+  way nothing is stored or started.
+
+This amends SPEC §15.1 (the engines file) and T44, and replaces the `engines.yaml`
+references of §1, §8 and the Verification above.

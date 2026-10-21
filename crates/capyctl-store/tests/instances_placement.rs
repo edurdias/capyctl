@@ -2345,3 +2345,49 @@ fn a_decisions_deployment_is_never_placed_on_a_host_without_the_capability() {
         vec![(0, "host-a")],
     );
 }
+
+/// The vLLM golden on a chat custom engine (ADR 0031): declared resources,
+/// no residency (restart_only), no typed engine setting.
+fn custom_golden() -> (Value, Value) {
+    use capyctl_config::custom::{CustomManifest, CustomProfile};
+    use capyctl_config::registration::{custom_profile_document, CustomProfileSpec};
+    let (mut deployment, mut host) = golden();
+    let manifest = CustomManifest::from_value(json!({
+        "kind": "custom_engine", "schema_version": 1, "api": "chat",
+        "args": ["--host", "{host}", "--port", "{port}", "--model", "{model_dir}"],
+    }))
+    .unwrap();
+    let mut profile = custom_profile_document(&CustomProfileSpec {
+        executable: "/opt/serve/bin/serve".into(),
+        custom: CustomProfile::new(manifest),
+        installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+        env: Default::default(),
+        approved_env: vec![],
+    });
+    profile["revision"] = deployment["runtime_profile_revision"].clone();
+    host["runtime_profiles"]["local"] = profile;
+    let object = deployment.as_object_mut().unwrap();
+    object.remove("residency");
+    object.remove("engine_config");
+    (deployment, host)
+}
+
+/// ADR 0031 §9: a deployment on a custom engine is placed only on a host
+/// that declared `custom_engines` (as its latest session recorded it); the
+/// host that would otherwise win (spread, ties by host id) is passed over.
+// T44 T34
+#[test]
+fn a_custom_engine_deployment_is_never_placed_on_a_host_without_the_capability() {
+    let t = two_hosts_with(custom_golden(), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups", "decisions"]);
+    t.declared("host-b", &["engine_groups", "custom_engines"]);
+    let id = t.deploy("deploy", json!({})).deployment_id;
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(
+        t.planned(&id)
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-b")],
+    );
+}

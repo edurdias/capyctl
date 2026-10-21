@@ -447,12 +447,14 @@ name = "capyctl-launchers"
 version = "0.1.5"
 dependencies = [
  "capyctl-adapters",
+ "capyctl-config",
  "capyctl-domain",
  "nix",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 

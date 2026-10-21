@@ -508,6 +508,29 @@ pub fn fit_for_launch(
         LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Tensorfold(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Llamacpp(s) => (&s.common, &s.memory, None, 0),
+        // ADR 0031 §4: CapyCTL fits nothing for a custom engine; a declared
+        // context reaches it only through its placeholder, and otherwise the
+        // manifest, the host's own command, decides.
+        LaunchSettings::Custom(s) => {
+            return match s.common.context_length {
+                Some(tokens) => ContextFit {
+                    tokens: Some(tokens),
+                    source: ContextSource::Declared,
+                    reason: None,
+                    warning: None,
+                    running_limit: None,
+                    streams: None,
+                },
+                None => ContextFit {
+                    tokens: None,
+                    source: ContextSource::HostFixed,
+                    reason: Some("a custom engine's manifest is its whole command".into()),
+                    warning: None,
+                    running_limit: None,
+                    streams: None,
+                },
+            }
+        }
     };
     if common.context_length.is_none() {
         if let Some(option) = typed_field_option(engine, "context_length") {
@@ -817,6 +840,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
         LaunchSettings::Sglang(s) => s.common.context_length,
         LaunchSettings::Tensorfold(s) => s.common.context_length,
         LaunchSettings::Llamacpp(s) => s.common.context_length,
+        LaunchSettings::Custom(s) => s.common.context_length,
     };
     let fit = fit_for_launch(
         effective.profile.engine,
@@ -950,6 +974,9 @@ pub fn max_running_for_effective(
             },
             None => MaxRunning::of(None, MaxRunningSource::EngineDefault),
         },
+        // ADR 0031 §4: CapyCTL does not know how many requests the program
+        // runs at once; the router's own bound still applies.
+        LaunchSettings::Custom(_) => MaxRunning::of(None, MaxRunningSource::EngineDefault),
     }
 }
 

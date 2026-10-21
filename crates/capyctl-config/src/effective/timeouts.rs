@@ -215,6 +215,9 @@ pub(super) fn resolve_timeouts(
                 .saturating_add(STARTUP_WARMUP_MS)
                 .min(INITIALIZE_CAP_MS),
         },
+        // ADR 0031 §5: undeclared, a custom engine's start follows ADR 0014
+        // A1 alone; a program that starts slower declares `timeouts.initialize`.
+        Engine::Custom => derived_initialize_ms(weights),
     };
     let initialize_ms = pick("initialize", initialize, derived_initialize);
     let wake_ms = pick("wake", wake, derived_wake_ms(weights));

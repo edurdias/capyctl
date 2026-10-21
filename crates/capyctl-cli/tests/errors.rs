@@ -308,6 +308,50 @@ fn toolchain_missing_exits_26() {
     assert_eq!(ExitCode::TOOLCHAIN_MISSING, ExitCode(26));
 }
 
+// T44 T14 (ADR 0031 §10): a refused manifest exits 27, alone or carried in a
+// configuration refusal; a host without `custom_engines` exits as
+// unsupported; resolution's custom refusals exit as invalid configuration;
+// a declined confirmation exits 2.
+#[test]
+fn custom_engine_codes_map_to_exits() {
+    assert_eq!(ExitCode::CUSTOM_MANIFEST_INVALID, ExitCode(27));
+    for (code, message, exit, closed) in [
+        ("custom_manifest_invalid", "", 27, "custom_manifest_invalid"),
+        (
+            "invalid_config",
+            "runtime_profiles.basal.custom: custom_manifest_invalid: `args` ...",
+            27,
+            "custom_manifest_invalid",
+        ),
+        (
+            "invalid_config",
+            "host_capability_missing:custom_engines: host `a` cannot run custom engines",
+            5,
+            "host_capability_missing:custom_engines",
+        ),
+        (
+            "invalid_config",
+            "engine_config.dtype: custom_field_unsupported:dtype",
+            2,
+            "custom_field_unsupported:dtype",
+        ),
+        (
+            "invalid_config",
+            "custom_placeholder_unset:context_length",
+            2,
+            "custom_placeholder_unset:context_length",
+        ),
+        ("declined", "", 2, "declined"),
+    ] {
+        let error = StructuredError {
+            code,
+            message: message.into(),
+        };
+        assert_eq!(error.exit_code(), ExitCode(exit), "{code} {message}");
+        assert_eq!(error.closed_code(), closed, "{code} {message}");
+    }
+}
+
 // T14 (ADR 0028 §16): every closed group code exits with its class, whether
 // it is the code itself or travels as a detail inside a refusal's message (a
 // management `invalid_config`, a configuration refusal, a failed start). A

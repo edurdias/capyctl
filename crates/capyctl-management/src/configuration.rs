@@ -794,24 +794,52 @@ fn registry_targets(
             ));
             continue;
         }
-        // ADR 0030 §1: a decisions deployment is never placed on a host that
-        // did not declare `decisions` (ADR 0017); such a host is recorded
-        // refused, typed, and is sent nothing.
-        if decisions {
+        // ADR 0030 §1, ADR 0031 §9: a decisions deployment is never placed
+        // on a host that did not declare `decisions`, nor one on a custom
+        // engine on a host that did not declare `custom_engines` (ADR 0017);
+        // such a host is recorded refused, typed, and is sent nothing. A
+        // decisions custom engine needs both.
+        let custom = config["runtime_profile"]
+            .as_str()
+            .and_then(|requested| {
+                capyctl_config::deployment_defaults::profile_on_host(requested, &original)
+            })
+            .is_some_and(|name| {
+                original["runtime_profiles"][&name]["engine"].as_str()
+                    == Some(capyctl_config::engine_policy::Engine::Custom.name())
+            });
+        if decisions || custom {
             let declared: std::collections::BTreeSet<String> = store
                 .host_version(&publication.host_id)
                 .map_err(|_| ConfigurationFailure::Internal)?
                 .map(|version| version.capabilities.into_iter().collect())
                 .unwrap_or_default();
-            if let Some(code) = capyctl_protocol::capabilities::decisions_refusal(&declared) {
+            let refusal = decisions
+                .then(|| capyctl_protocol::capabilities::decisions_refusal(&declared))
+                .flatten()
+                .map(|code| {
+                    let detail = format!(
+                        "{code}: host `{selector}` cannot serve decision models; upgrade its agent"
+                    );
+                    (code, "api", detail)
+                })
+                .or_else(|| {
+                    custom
+                        .then(|| capyctl_protocol::capabilities::custom_engines_refusal(&declared))
+                        .flatten()
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot run custom engines; upgrade its agent"
+                            );
+                            (code, "runtime_profile", detail)
+                        })
+                });
+            if let Some((code, path, detail)) = refusal {
                 single = Some(refuse(
                     capyctl_config::ConfigError::new(
                         capyctl_config::ConfigErrorCode::UnsupportedCombination,
-                        "api",
-                        format!(
-                            "{code}: host `{selector}` cannot serve decision models; \
-                             upgrade its agent"
-                        ),
+                        path,
+                        detail,
                     )
                     .into(),
                     &code,
@@ -1079,6 +1107,25 @@ pub(crate) async fn model_sources(State(state): State<Arc<AppState>>) -> Respons
     }
 }
 
+/// ADR 0031 §8: beside a custom engine's resolved configuration, the command
+/// it runs (`custom_command`): the executable, the rendered arguments with the
+/// key redacted, and the environment names with their sources.
+fn add_custom_commands(view: &mut Value) {
+    let add = |effective: &mut Value| {
+        if let Some(command) = capyctl_config::custom::command_view(effective) {
+            effective["custom_command"] = command;
+        }
+    };
+    add(&mut view["effective"]);
+    if let Some(hosts) = view["hosts"].as_array_mut() {
+        for host in hosts {
+            if host["effective"].is_object() {
+                add(&mut host["effective"]);
+            }
+        }
+    }
+}
+
 /// SPEC §8.2: `GET /management/v1/deployments/{id}/effective-config`, the
 /// resolved configuration with provenance, secrets redacted.
 pub(crate) async fn effective_config(
@@ -1097,6 +1144,7 @@ pub(crate) async fn effective_config(
     };
     match accept_blocking(permit, move || source.effective_configuration(&id)).await {
         Ok(Some(mut view)) => {
+            add_custom_commands(&mut view);
             redact_effective(&mut view);
             view["api_version"] = Value::String("1".into());
             (StatusCode::OK, Json(view)).into_response()

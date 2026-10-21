@@ -104,6 +104,14 @@ pub(super) fn factory(
                     *admin = recorded(SecretRole::Admin)?;
                     *session = Some(owner.session().id().to_owned());
                 }
+                // ADR 0031 §7: a custom engine was given the key its launch
+                // sealed, only when its manifest uses `{api_key}`; the fresh
+                // one the spec carries is never what the engine holds.
+                AdapterSpec::Custom { api_key, .. } => {
+                    if api_key.is_some() {
+                        *api_key = Some(recorded(SecretRole::Inference)?);
+                    }
+                }
                 // ADR 0023 §3, ADR 0029 §4: TensorFold and llama.cpp hold no
                 // key to recover.
                 AdapterSpec::Tensorfold { .. } | AdapterSpec::Llamacpp { .. } => {}

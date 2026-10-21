@@ -17,6 +17,11 @@
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
+//!
+//! ADR 0031 §4, §6: a custom engine has no load reports. Its `/metrics` is
+//! never read; with a manifest idle signal, its sample carries 0 running and
+//! 0 waiting only when that signal reads idle (the SPEC §10 cancellation
+//! evidence of a remote host), and no engine figures otherwise.
 use crate::ingress::{Ingress, IngressScope, LoadTarget};
 use capyctl_adapters::tensorfold::http::HealthReport;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
@@ -563,6 +568,24 @@ impl LoadSource for Ingress {
     }
 }
 
+/// ADR 0031 §4, §6: how one launch's engine is sampled. A custom engine has
+/// no load gauges and is never matched against a built-in engine's metric
+/// families: with an idle signal its sample carries 0 running and 0 waiting
+/// only on a real idle reading of that signal (the SPEC §10 cancellation
+/// evidence a remote host gives), and no engine figures otherwise; without
+/// one it never carries engine figures, so it never reads quiescent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchSignal {
+    /// A built-in engine: its family is read from `/metrics`.
+    Builtin,
+    /// A custom engine, with its manifest's idle signal when it has one.
+    Custom(Option<capyctl_config::custom::IdleSignal>),
+}
+
+/// The [`LaunchSignal`] of the launch behind an owned handle (the launch
+/// command id the ingress scope is bound to).
+pub type LaunchSignals = Arc<dyn Fn(&str) -> LaunchSignal + Send + Sync>;
+
 /// Scrapes Ready scopes and builds bounded load reports for one host.
 pub struct LoadReporter {
     source: Arc<dyn LoadSource>,
@@ -575,6 +598,9 @@ pub struct LoadReporter {
     /// fixed for the launch's life, so it is read once; bounded and pruned as
     /// the baselines are.
     limits: Mutex<HashMap<LaunchKey, u32>>,
+    /// ADR 0031 §6: which launches run a custom engine; every launch is a
+    /// built-in one when unset.
+    signals: Option<LaunchSignals>,
 }
 
 /// A response body, refused as soon as it passes the scrape size bound.
@@ -614,14 +640,56 @@ impl LoadReporter {
             interval: DEFAULT_LOAD_INTERVAL,
             baselines: Mutex::new(HashMap::new()),
             limits: Mutex::new(HashMap::new()),
+            signals: None,
         })
     }
     pub fn with_interval(mut self, period: Duration) -> Result<Self, LoadError> {
         self.interval = load_interval(period)?;
         Ok(self)
     }
+    /// ADR 0031 §6: how each launch is sampled, by its owned handle.
+    pub fn with_launch_signals(mut self, signals: LaunchSignals) -> Self {
+        self.signals = Some(signals);
+        self
+    }
     pub fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn signal(&self, target: &LoadTarget) -> LaunchSignal {
+        self.signals
+            .as_ref()
+            .map_or(LaunchSignal::Builtin, |signals| {
+                signals(&target.owned_handle)
+            })
+    }
+
+    /// ADR 0031 §6: one read of a custom engine's idle signal on the same
+    /// loopback target, with the launch's key, within the scrape bound.
+    /// `Some(true)` only on a 200 answer that reads idle; anything missing,
+    /// malformed, unreachable or non-200 is unknown (`None`), never idle.
+    async fn idle_reading(
+        &self,
+        target: &LoadTarget,
+        signal: &capyctl_config::custom::IdleSignal,
+    ) -> Option<bool> {
+        if !target.target.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = keyed_get(&self.client, target, &signal.url)
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
+            }
+            capyctl_adapters::custom::idle_reading(signal, &bounded_body(response).await?)
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn scrape(&self, target: &LoadTarget) -> Option<String> {
@@ -770,7 +838,25 @@ impl LoadReporter {
             .into_iter()
             .filter(|t| t.scope.host_id == self.host_id)
             .collect();
-        let scraped = futures::future::join_all(targets.iter().map(|t| self.scrape(t))).await;
+        let signals: Vec<LaunchSignal> = targets.iter().map(|t| self.signal(t)).collect();
+        // ADR 0031 §6: a custom engine's `/metrics` is never read, so no
+        // built-in family is ever matched on it.
+        let scraped =
+            futures::future::join_all(targets.iter().zip(&signals).map(|(t, s)| async move {
+                match s {
+                    LaunchSignal::Builtin => self.scrape(t).await,
+                    LaunchSignal::Custom(_) => None,
+                }
+            }))
+            .await;
+        let idle =
+            futures::future::join_all(targets.iter().zip(&signals).map(|(t, s)| async move {
+                match s {
+                    LaunchSignal::Custom(Some(signal)) => self.idle_reading(t, signal).await,
+                    _ => None,
+                }
+            }))
+            .await;
         let families: Vec<Option<&'static str>> = scraped
             .iter()
             .map(|body| body.as_deref().and_then(family_of).map(|(name, ..)| name))
@@ -802,32 +888,44 @@ impl LoadReporter {
             .zip(scraped)
             .zip(side_reads)
             .zip(limits)
-            .map(|(((target, body), side_read), max_running)| {
-                // A failed `/slots` read leaves the engine load out, as a
-                // failed scrape does.
-                let engine = body.as_deref().and_then(|body| match side_read {
-                    SideRead::Health(health) => parse_engine_load(body)
-                        .map(|load| fold_tensorfold_health(load, health.as_ref())),
-                    SideRead::KvUsage(kv) => parse_llamacpp_load(body, kv),
-                    SideRead::None => parse_engine_load(body),
-                });
-                let latency = self.latency(&target, body.as_deref(), &mut baselines);
-                (
-                    target.scope.instance_index,
-                    LoadSample {
-                        deployment_id: target.scope.deployment_id,
-                        generation: target.scope.generation,
-                        owned_handle: target.owned_handle,
-                        sampled_at_ms: capyctl_protocol::now_unix_ms(),
-                        ingress_in_flight: u32::try_from(target.in_flight)
-                            .unwrap_or(MAX_LOAD_GAUGE)
-                            .min(MAX_LOAD_GAUGE),
-                        engine,
-                        latency,
-                        max_running,
-                    },
-                )
-            })
+            .zip(signals.iter().zip(idle))
+            .map(
+                |((((target, body), side_read), max_running), (signal, idle))| {
+                    // A failed `/slots` read leaves the engine load out, as a
+                    // failed scrape does.
+                    let engine = match signal {
+                        // ADR 0031 §6: nothing running, nothing waiting and
+                        // nothing held, read from the idle signal itself.
+                        LaunchSignal::Custom(_) => (idle == Some(true)).then_some(EngineLoad {
+                            running: 0,
+                            waiting: 0,
+                            kv_usage_ppm: 0,
+                        }),
+                        LaunchSignal::Builtin => body.as_deref().and_then(|body| match side_read {
+                            SideRead::Health(health) => parse_engine_load(body)
+                                .map(|load| fold_tensorfold_health(load, health.as_ref())),
+                            SideRead::KvUsage(kv) => parse_llamacpp_load(body, kv),
+                            SideRead::None => parse_engine_load(body),
+                        }),
+                    };
+                    let latency = self.latency(&target, body.as_deref(), &mut baselines);
+                    (
+                        target.scope.instance_index,
+                        LoadSample {
+                            deployment_id: target.scope.deployment_id,
+                            generation: target.scope.generation,
+                            owned_handle: target.owned_handle,
+                            sampled_at_ms: capyctl_protocol::now_unix_ms(),
+                            ingress_in_flight: u32::try_from(target.in_flight)
+                                .unwrap_or(MAX_LOAD_GAUGE)
+                                .min(MAX_LOAD_GAUGE),
+                            engine,
+                            latency,
+                            max_running,
+                        },
+                    )
+                },
+            )
             .collect();
         drop(baselines);
         // Two members of one instance (deployment, instance and generation)

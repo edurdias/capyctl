@@ -50,6 +50,7 @@ pub enum LaunchSettings {
     Sglang(SglangLaunchSettings),
     Tensorfold(TensorfoldLaunchSettings),
     Llamacpp(LlamacppLaunchSettings),
+    Custom(CustomLaunchSettings),
 }
 
 impl LaunchSettings {
@@ -59,6 +60,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.common,
             Self::Tensorfold(settings) => &settings.common,
             Self::Llamacpp(settings) => &settings.common,
+            Self::Custom(settings) => &settings.common,
         }
     }
 
@@ -68,6 +70,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.memory,
             Self::Tensorfold(settings) => &settings.memory,
             Self::Llamacpp(settings) => &settings.memory,
+            Self::Custom(settings) => &settings.memory,
         }
     }
 
@@ -77,6 +80,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.memory,
             Self::Tensorfold(settings) => &mut settings.memory,
             Self::Llamacpp(settings) => &mut settings.memory,
+            Self::Custom(settings) => &mut settings.memory,
         }
     }
 
@@ -86,6 +90,8 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.extra_args,
             Self::Tensorfold(settings) => &settings.extra_args,
             Self::Llamacpp(settings) => &settings.extra_args,
+            // ADR 0031 §4: the manifest is the whole command.
+            Self::Custom(_) => &[],
         }
     }
 
@@ -95,6 +101,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.provenance,
             Self::Tensorfold(settings) => &mut settings.provenance,
             Self::Llamacpp(settings) => &mut settings.provenance,
+            Self::Custom(settings) => &mut settings.provenance,
         }
     }
 
@@ -104,6 +111,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.provenance,
             Self::Tensorfold(settings) => &settings.provenance,
             Self::Llamacpp(settings) => &settings.provenance,
+            Self::Custom(settings) => &settings.provenance,
         }
     }
 }
@@ -408,6 +416,17 @@ impl LlamacppLaunchSettings {
             .max_concurrent_requests
             .unwrap_or(LLAMACPP_DEFAULT_PARALLEL)
     }
+}
+
+/// ADR 0031 §4: a custom engine's resolved settings. CapyCTL renders none of
+/// the program's options: `common` holds at most `context_length`, used only
+/// through its placeholder, and `memory` is the deployment's declared
+/// `resources` (there is no derivation and no KV cache CapyCTL sizes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    pub provenance: BTreeMap<String, SettingSource>,
 }
 
 /// ADR 0029 §5: llama.cpp's `--gpu-layers`, written `all` or as a count.

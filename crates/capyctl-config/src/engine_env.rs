@@ -139,7 +139,7 @@ const COUNT_NAMES: &[&str] = &["MAX_JOBS", "FLASHINFER_NVCC_THREADS"];
 
 /// ADR 0028 §2.1 rule 7.
 const MAX_VALUE_BYTES: usize = 4096;
-const MAX_NAMES: usize = 64;
+pub(crate) const MAX_NAMES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
 
 /// Whether CapyCTL owns or reserves `name` (rule 1, and the dump families
@@ -246,6 +246,8 @@ impl ApprovedEnv {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvSource {
+    /// ADR 0031 §2: a custom engine's manifest, below the profile.
+    Manifest,
     Profile,
     Deployment,
 }
@@ -358,7 +360,7 @@ pub fn redact_values(value: &mut serde_json::Value) {
     }
 }
 
-fn check_entry(name: &str, value: &str) -> Result<(), EnvRefusal> {
+pub(crate) fn check_entry(name: &str, value: &str) -> Result<(), EnvRefusal> {
     let shaped = !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && !name.starts_with(|c: char| c.is_ascii_digit())
@@ -412,6 +414,29 @@ pub fn resolve_engine_env(
         vars.insert(name.clone(), (value.clone(), EnvSource::Deployment));
     }
     Ok(ResolvedEnv { vars })
+}
+
+/// ADR 0031 §2: [`resolve_engine_env`] for a custom engine, whose manifest's
+/// `env` is the lowest layer: the profile's names override it, and the
+/// deployment's override both. The manifest's names were checked when it
+/// validated; they are checked again here, at every resolution and so at
+/// every launch, against the names CapyCTL owns now. Its values may hold
+/// placeholders, which only the launch renders.
+pub fn resolve_engine_env_with_manifest(
+    manifest_env: &BTreeMap<String, String>,
+    profile_env: &BTreeMap<String, String>,
+    approved: &ApprovedEnv,
+    deployment_env: &BTreeMap<String, String>,
+) -> Result<ResolvedEnv, EnvRefusal> {
+    let mut resolved = resolve_engine_env(profile_env, approved, deployment_env)?;
+    for (name, value) in manifest_env {
+        check_entry(name, value)?;
+        resolved
+            .vars
+            .entry(name.clone())
+            .or_insert_with(|| (value.clone(), EnvSource::Manifest));
+    }
+    Ok(resolved)
 }
 
 /// ADR 0028 §2.1, ADR 0021: every environment name and family the policy

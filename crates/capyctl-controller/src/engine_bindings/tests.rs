@@ -773,3 +773,82 @@ fn an_embedded_launch_clears_a_killed_builds_lock_only_without_a_live_owner() {
         "the build state is read after the lock goes"
     );
 }
+
+/// A custom engine deployment on the lab fixture: the profile carries
+/// `manifest`, its checkpoint `checkpoint`.
+fn custom_work(checkpoint: &std::path::Path, manifest: &str) -> InitializeWork {
+    let all: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .expect("fixture JSON parses");
+    let (mut deployment, mut host) = (all["deployment"].clone(), all["host"].clone());
+    let custom = capyctl_config::custom::CustomProfile::new(
+        capyctl_config::custom::CustomManifest::parse(manifest).unwrap(),
+    );
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("custom");
+    profile["executable"] = json!("/opt/basal/bin/basal-serve");
+    profile["build_fingerprint"] = json!(custom.manifest.build_fingerprint());
+    profile["args"] = json!([]);
+    profile["env"] = json!({});
+    profile["security"]["deep_park"] = json!("disabled");
+    profile["custom"] = serde_json::to_value(&custom).unwrap();
+    deployment["residency"] = json!("restart_only");
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment["engine_config"] = json!({"context_length": 4096});
+    deployment["api"] = json!(custom.manifest.api);
+    admit_measured(&deployment, &host, None)
+}
+
+// T44 (ADR 0031 §2, §7): the embedded path builds the custom spec through
+// the shared builder: the manifest's API, health path and idle signal, the
+// served route, and a fresh key only when the manifest uses `{api_key}`,
+// which the resolver hands to the plan.
+#[test]
+fn a_custom_profile_builds_a_custom_spec() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bindings = ProfileBindings::new(dir.path().join("logs"), dir.path().join("runtime"));
+    let keyed = custom_work(
+        checkpoint.path(),
+        "kind: custom_engine\nschema_version: 1\napi: decisions\nversion: \"2.2.0\"\n\
+         args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\", \"--key={api_key}\"]\n\
+         health: /health\nidle: {url: /stats, json: [queue.running]}\n",
+    );
+    let AdapterSpec::Custom {
+        launch: Some(launch),
+        model_id,
+        fingerprint,
+        api,
+        api_key: Some(key),
+        idle: Some(idle),
+        health,
+        endpoint,
+    } = bindings.spec(&keyed).unwrap()
+    else {
+        panic!("a keyed custom spec");
+    };
+    assert_eq!(model_id, launch.values.served_name);
+    assert_eq!(fingerprint, "2.2.0");
+    assert_eq!(api, capyctl_config::effective::DeploymentApi::Decisions);
+    assert_eq!(health.as_deref(), Some("/health"));
+    assert_eq!(idle.json, vec!["queue.running"]);
+    assert_eq!(key.len(), 64, "a fresh 32-byte key, hex");
+    assert_eq!(Some(launch.values.port), endpoint.port());
+    assert_eq!(launch.values.context_length, Some(4096));
+    assert_eq!(
+        launch.values.api_key, None,
+        "the resolver hands the plan its key"
+    );
+    assert_eq!(launch.values.model_dir, checkpoint.path().to_string_lossy());
+    let unkeyed = custom_work(
+        checkpoint.path(),
+        "kind: custom_engine\nschema_version: 1\napi: chat\n\
+         args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n",
+    );
+    let AdapterSpec::Custom { api_key, idle, .. } = bindings.spec(&unkeyed).unwrap() else {
+        panic!("a custom spec");
+    };
+    assert_eq!(api_key, None, "no key for a manifest without {{api_key}}");
+    assert_eq!(idle, None);
+}

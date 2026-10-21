@@ -1,8 +1,9 @@
 //! ADR 0018 §2 (owner decision 2026-09-25): engine registration writes only
-//! `engines.yaml`, a capyctl-owned file beside the role's configuration file.
-//! The host or standalone document is never rewritten; the role merges the
-//! two at load, and a profile name declared in both is refused. Writes hold
-//! `engines.yaml.lock`, go through a temporary file, sync and rename, and
+//! `engines.yaml`, a capyctl-owned file beside the role's configuration file,
+//! and (ADR 0031 amendment A1) `custom-engines.yaml` beside it for custom
+//! engines. The host or standalone document is never rewritten; the role
+//! merges them at load, and a profile name declared twice is refused. Writes
+//! hold `<file>.lock`, go through a temporary file, sync and rename, and
 //! record the revision on the first line (a comment the parser ignores).
 use crate::effective::InstallationDrift;
 use crate::engine_policy::Engine;
@@ -46,6 +47,16 @@ pub fn engines_path(role_document: Option<&Path>, config_home: &Path) -> PathBuf
         Some(document) => engines_beside(document),
         None => config_home.join("capyctl").join(ENGINES_FILE),
     }
+}
+
+/// ADR 0031 amendment A1 (2026-10-21): custom engines' profiles live in their
+/// own capyctl-owned file beside engines.yaml, which no release before 0.1.6
+/// reads, so engines.yaml keeps the shape those releases parse strictly.
+pub const CUSTOM_ENGINES_FILE: &str = "custom-engines.yaml";
+
+/// `dir/engines.yaml` → `dir/custom-engines.yaml`.
+pub fn custom_engines_beside(engines: &Path) -> PathBuf {
+    engines.with_file_name(CUSTOM_ENGINES_FILE)
 }
 
 /// `$XDG_CONFIG_HOME`, else `$HOME/.config` (absolute paths only).
@@ -92,13 +103,38 @@ impl EnginesFile {
         }
     }
 
-    /// SPEC §15.3: strict, like every role document.
+    /// SPEC §15.3: strict, like every role document. ADR 0031 amendment A1:
+    /// engines.yaml keeps 0.1.5's profile shape and holds no custom engine;
+    /// custom-engines.yaml holds nothing else.
     pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
-        let value = parse_strict(ConfigKind::Engines, text)?;
+        Self::parse_as(kind_of(path), path, text)
+    }
+
+    /// [`Self::parse`] as `kind` ([`ConfigKind::Engines`] or
+    /// [`ConfigKind::CustomEngines`]) whatever the file is named, for
+    /// `capyctl validate`.
+    pub fn parse_as(kind: ConfigKind, path: &Path, text: &str) -> Result<Self, ConfigError> {
+        let value = parse_strict(kind, text)?;
         let profiles = value["runtime_profiles"]
             .as_object()
             .cloned()
             .unwrap_or_default();
+        for (name, profile) in &profiles {
+            let custom = profile["engine"].as_str() == Some(Engine::Custom.name());
+            if custom != (kind == ConfigKind::CustomEngines) {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    format!("runtime_profiles.{name}.engine"),
+                    if custom {
+                        format!("a custom engine's profile belongs in {CUSTOM_ENGINES_FILE}, not {ENGINES_FILE}")
+                    } else {
+                        format!(
+                            "{CUSTOM_ENGINES_FILE} holds custom engines only (`engine: custom`)"
+                        )
+                    },
+                ));
+            }
+        }
         Ok(Self {
             path: path.to_path_buf(),
             revision: revision_of(text),
@@ -132,11 +168,57 @@ impl EnginesFile {
 
     /// JSON-shaped YAML, as `capyctl init` writes, under the revision line.
     pub fn render(&self, revision: u64) -> String {
-        let body = serde_json::json!({"schema_version": 1, "kind": "engines", "runtime_profiles": self.profiles});
+        let body = serde_json::json!({"schema_version": 1, "kind": self.kind().as_str(), "runtime_profiles": self.profiles});
         format!(
             "{REVISION_HEADER}{revision}\n# Written by `capyctl engine add` and `remove`. The role merges it with its own document.\n{}\n",
             serde_json::to_string_pretty(&body).expect("profiles always encode")
         )
+    }
+
+    /// ADR 0031 amendment A1: which of the two capyctl-owned files this is,
+    /// by its name: `custom-engines.yaml` holds custom engines' profiles,
+    /// any other name (`engines.yaml`) every other kind.
+    pub fn kind(&self) -> ConfigKind {
+        kind_of(&self.path)
+    }
+
+    /// The other file of the pair, in the same directory.
+    pub fn sibling(&self) -> PathBuf {
+        match self.kind() {
+            ConfigKind::CustomEngines => self.path.with_file_name(ENGINES_FILE),
+            _ => custom_engines_beside(&self.path),
+        }
+    }
+
+    /// ADR 0018 §2, ADR 0031 amendment A1: the registered profiles a role
+    /// reads: `engines` (engines.yaml) and the custom-engines.yaml beside it,
+    /// as one file at engines.yaml's path and revision. A name in both is
+    /// refused.
+    pub fn load_with_custom(engines: &Path) -> Result<Self, ConfigError> {
+        let mut file = Self::load(engines)?;
+        let custom = Self::load(&custom_engines_beside(engines))?;
+        for (name, profile) in custom.profiles {
+            if file.profiles.contains_key(&name) {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    format!("runtime_profiles.{name}"),
+                    format!(
+                        "profile {name} is registered in both {} and {}; remove one",
+                        engines.display(),
+                        custom.path.display()
+                    ),
+                ));
+            }
+            file.profiles.insert(name, profile);
+        }
+        Ok(file)
+    }
+}
+
+fn kind_of(path: &Path) -> ConfigKind {
+    match path.file_name() {
+        Some(name) if name == CUSTOM_ENGINES_FILE => ConfigKind::CustomEngines,
+        _ => ConfigKind::Engines,
     }
 }
 
@@ -305,6 +387,8 @@ pub fn write_engines(
     if let Some(host) = host_document {
         let mut merged = host.clone();
         merge_into_host(&mut merged, file)?;
+        // ADR 0031 amendment A1: the publication carries both files.
+        merge_into_host(&mut merged, &EnginesFile::load(&file.sibling())?)?;
         let published = merged.to_string().len();
         if published > MAX_PUBLISHED_BYTES {
             return Err(ConfigError::new(
@@ -313,6 +397,22 @@ pub fn write_engines(
                 format!("the host document with these engines would be {published} bytes; a publication carries at most {MAX_PUBLISHED_BYTES} (32768)"),
             ));
         }
+    }
+    // ADR 0031 amendment A1: one profile name in one of the two files.
+    let sibling = EnginesFile::load(&file.sibling())?;
+    if let Some(name) = file
+        .profiles
+        .keys()
+        .find(|name| sibling.profiles.contains_key(*name))
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            format!("runtime_profiles.{name}"),
+            format!(
+                "profile {name} is already registered in {}; remove it first",
+                sibling.path.display()
+            ),
+        ));
     }
     let current = EnginesFile::load(&file.path)?;
     let revision = current.revision + 1;
@@ -400,6 +500,8 @@ pub fn is_verified_in(table: &[(Engine, &str)], engine: Engine, version: &str) -
             None => return false,
         },
         Engine::Vllm | Engine::Sglang | Engine::Tensorfold => version.to_owned(),
+        // ADR 0031 §1: no custom engine is ever in the verified set.
+        Engine::Custom => return false,
     };
     table.iter().any(|(e, v)| *e == engine && *v == release)
 }
@@ -414,7 +516,10 @@ pub fn listed_version(
     reported: Option<&str>,
     build_fingerprint: Option<&str>,
 ) -> String {
-    let reported = reported.filter(|v| !v.is_empty() && engine != Some(Engine::Llamacpp));
+    // ADR 0031 §1: a custom engine's version is its manifest's, never what a
+    // host's measurement of a shared installation reports.
+    let reported = reported
+        .filter(|v| !v.is_empty() && !matches!(engine, Some(Engine::Llamacpp | Engine::Custom)));
     reported
         .or(build_fingerprint)
         .unwrap_or("unknown")
@@ -556,6 +661,49 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
         profile["cuda_home"] = cuda_home.to_string_lossy().into();
     }
     profile
+}
+
+/// ADR 0031 §1: what `capyctl engine add --custom` writes into a profile.
+#[derive(Debug, Clone)]
+pub struct CustomProfileSpec {
+    pub executable: PathBuf,
+    pub custom: crate::custom::CustomProfile,
+    pub installation_drift: InstallationDrift,
+    /// ADR 0028 §2.1: the profile's own engine environment (`--env`).
+    pub env: BTreeMap<String, String>,
+    /// ADR 0028 §2.1: the names deployments may set (`--approve-env`).
+    pub approved_env: Vec<String>,
+}
+
+/// ADR 0031 §1, §4, §7: a custom engine's profile. It never parks
+/// (`deep_park: disabled`), has no host-fixed arguments (the manifest is the
+/// whole command) and no admin key. It names the engine-key reference as
+/// every profile does (a start seals a per-launch key for every launch, as
+/// for llama.cpp); the key reaches the engine, and travels on its requests,
+/// only when the manifest renders `{api_key}`.
+pub fn custom_profile_document(spec: &CustomProfileSpec) -> Value {
+    let mut security = serde_json::json!({
+        "deep_park": "disabled",
+        "trust_remote_code": false,
+        "credential_ref": "secret://engine-key",
+    });
+    if spec.installation_drift == InstallationDrift::Refuse {
+        security["installation_drift"] = "refuse".into();
+    }
+    if !spec.approved_env.is_empty() {
+        security["approved_env"] = serde_json::json!(spec.approved_env);
+    }
+    serde_json::json!({
+        "engine": Engine::Custom.name(),
+        "revision": 1,
+        "executable": spec.executable.to_string_lossy(),
+        "build_fingerprint": spec.custom.manifest.build_fingerprint(),
+        "args": [],
+        "env": spec.env,
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+        "security": security,
+        "custom": spec.custom,
+    })
 }
 
 /// ADR 0018 §1, SPEC §15.3: a profile is written only if its name is valid

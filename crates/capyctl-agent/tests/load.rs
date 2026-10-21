@@ -1152,3 +1152,91 @@ async fn a_target_without_a_key_is_scraped_unkeyed() {
         (2, 3, 125_000)
     );
 }
+
+/// Launches on fake engines, each with its own owned handle.
+struct Launches(Vec<(&'static str, SocketAddr, [u8; 32])>);
+
+impl load::LoadSource for Launches {
+    fn targets(&self) -> Vec<capyctl_agent::ingress::LoadTarget> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(
+                |(n, (handle, target, native))| capyctl_agent::ingress::LoadTarget {
+                    scope: scope(handle, n as i64 + 1),
+                    owned_handle: (*handle).into(),
+                    target: *target,
+                    native: Some(*native),
+                    in_flight: 0,
+                },
+            )
+            .collect()
+    }
+}
+
+// T44 T17 (ADR 0031 §4, §6): a custom engine's `/metrics` is never matched to
+// a built-in family. With an idle signal, its sample reads 0 running and 0
+// waiting only when the signal reads idle; busy, missing or without a signal,
+// it carries no engine figures, so it never reads quiescent.
+#[tokio::test]
+async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
+    use capyctl_config::custom::IdleSignal;
+    let native = [7; 32];
+    let vllm = engine(native, VLLM_METRICS, Duration::ZERO).await;
+    let idle = engine(
+        native,
+        "requests_running 0\nrequests_waiting{q=\"a\"} 0\n",
+        Duration::ZERO,
+    )
+    .await;
+    let busy = engine(
+        native,
+        "requests_running 1\nrequests_waiting 0\n",
+        Duration::ZERO,
+    )
+    .await;
+    let missing = engine(native, "requests_running 0\n", Duration::ZERO).await;
+    let source = std::sync::Arc::new(Launches(vec![
+        ("a-builtin", vllm, native),
+        ("b-custom-none", vllm, native),
+        ("c-custom-idle", idle, native),
+        ("d-custom-busy", busy, native),
+        ("e-custom-missing", missing, native),
+    ]));
+    let signal = IdleSignal {
+        url: "/metrics".into(),
+        gauges: vec!["requests_running".into(), "requests_waiting".into()],
+        json: vec![],
+    };
+    let reporter = LoadReporter::new(source, "host".into())
+        .unwrap()
+        .with_launch_signals(std::sync::Arc::new(move |handle: &str| match handle {
+            "a-builtin" => load::LaunchSignal::Builtin,
+            "b-custom-none" => load::LaunchSignal::Custom(None),
+            _ => load::LaunchSignal::Custom(Some(signal.clone())),
+        }));
+    let all = samples(reporter.reports().await);
+    let engines: Vec<_> = all
+        .iter()
+        .map(|s| {
+            (
+                s.deployment_id.as_str(),
+                s.engine.map(|e| (e.running, e.waiting, e.kv_usage_ppm)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        engines,
+        [
+            ("a-builtin", Some((5, 4, 500_000))),
+            ("b-custom-none", None),
+            ("c-custom-idle", Some((0, 0, 0))),
+            ("d-custom-busy", None),
+            ("e-custom-missing", None),
+        ]
+    );
+    // No engine latency family is read from a custom engine's metrics.
+    assert!(all[1..]
+        .iter()
+        .all(|s| s.latency.as_ref().is_none_or(|l| l.engine.is_none())));
+}

@@ -1,5 +1,7 @@
 // ADR 0028 §9 (decided 2026-10-06): the completion probe's request forms.
 pub mod completion_probe;
+// ADR 0031: custom engines, started from a host-approved manifest.
+pub mod custom;
 // ADR 0030 §3: the fixed decision probe of a decisions deployment.
 pub mod decision_probe;
 pub mod engine_env;

@@ -206,6 +206,7 @@ fn spec(engine: Engine) -> ProfileSpec {
             Engine::Sglang => "/home/u/venv/bin/python3".into(),
             Engine::Tensorfold => "/home/u/venv/bin/tensorfold".into(),
             Engine::Llamacpp => "/home/u/llama.cpp/build/bin/llama-server".into(),
+            Engine::Custom => "/home/u/basal-venv/bin/basal-serve".into(),
         },
         build_fingerprint: "0.29.0".into(),
         deep_park: true,

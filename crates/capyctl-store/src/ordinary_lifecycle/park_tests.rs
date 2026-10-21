@@ -1814,3 +1814,7 @@ fn a_revision_stored_before_device_coverage_still_decodes_stops_and_is_replaced(
         )
         .unwrap();
 }
+
+// ADR 0031 §6: cancelling requests on custom engines.
+#[path = "park_cancelling_tests.rs"]
+mod cancelling;

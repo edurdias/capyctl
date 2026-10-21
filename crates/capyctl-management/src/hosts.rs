@@ -246,7 +246,7 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
     );
     // ADR 0018 §1: `custom` is derived, never declared.
     let custom = kind.is_none_or(|e| !is_verified(e, &version));
-    serde_json::json!({
+    let mut row_value = serde_json::json!({
         "host_id": row.host_id, "host": row.host_name,
         "online": row.online,
         "profile": row.profile_name, "engine": engine, "version": version, "custom": custom,
@@ -257,7 +257,68 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
         "published": "published",
         "retiring": row.retiring,
         "deployments": row.deployments,
-    })
+    });
+    if kind == Some(Engine::Custom) {
+        if let Some(object) = row_value.as_object_mut() {
+            object.extend(custom_engine_view(profile));
+        }
+    }
+    row_value
+}
+
+/// ADR 0031 §6, §7, §8: what the server shows of a custom engine: the
+/// executable, the argument template, the API, the environment names with
+/// their sources (never a value: a profile value is the host's, and a
+/// manifest value may render the engine key), the health path, the idle
+/// signal (or `none`), the engine key (`per-launch` or `none`) and the
+/// manifest's digest. A profile whose manifest does not validate shows
+/// `manifest: null`.
+pub fn custom_engine_view(
+    profile: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(custom) = capyctl_config::custom::CustomProfile::from_value(&profile["custom"]) else {
+        return serde_json::Map::from_iter([("manifest".to_owned(), serde_json::Value::Null)]);
+    };
+    let manifest = &custom.manifest;
+    let environment: Vec<serde_json::Value> = manifest
+        .env
+        .keys()
+        .map(|name| serde_json::json!({"name": name, "source": "manifest"}))
+        .chain(
+            profile["env"]
+                .as_object()
+                .into_iter()
+                .flat_map(|env| env.keys())
+                .map(|name| serde_json::json!({"name": name, "source": "profile"})),
+        )
+        .collect();
+    let idle = manifest
+        .idle
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |idle| idle.describe());
+    let key = if manifest.uses_api_key() {
+        "per-launch"
+    } else {
+        "none"
+    };
+    serde_json::Map::from_iter([
+        ("idle_signal".to_owned(), serde_json::json!(idle)),
+        ("engine_key".to_owned(), serde_json::json!(key)),
+        (
+            "manifest".to_owned(),
+            serde_json::json!({
+                "executable": profile["executable"],
+                "args": manifest.args,
+                "api": manifest.api,
+                "version": manifest.build_fingerprint(),
+                "environment": manifest.environment,
+                "env": environment,
+                "health": manifest.health,
+                "idle": manifest.idle,
+                "digest": custom.manifest_digest,
+            }),
+        ),
+    ])
 }
 
 /// A standalone role's one embedded host, as the inventory reads it.
@@ -517,5 +578,67 @@ mod tests {
         );
         assert!(find("vllm").get("unauthenticated_local_surfaces").is_none());
         assert_eq!(view["state"], "not_exposed");
+    }
+
+    // T44 T37 (ADR 0031 §6, §7, §8): the server's engines row of a custom
+    // engine carries its manifest (executable, argument template, API,
+    // environment names with their sources), its idle signal and engine key;
+    // never an environment value. A known engine's row is unchanged.
+    #[test]
+    fn a_custom_engine_row_shows_its_manifest_never_a_value() {
+        use capyctl_config::custom::{CustomManifest, CustomProfile};
+        use capyctl_config::registration::{custom_profile_document, CustomProfileSpec};
+        let manifest = CustomManifest::from_value(serde_json::json!({
+            "kind": "custom_engine", "schema_version": 1, "api": "decisions",
+            "args": ["--host", "{host}", "--port", "{port}", "--model", "{model_dir}"],
+            "env": {"SERVE_KEY": "{api_key}"},
+            "idle": {"url": "/metrics", "gauges": ["running"]},
+        }))
+        .unwrap();
+        let profile = custom_profile_document(&CustomProfileSpec {
+            executable: "/opt/serve/bin/serve".into(),
+            custom: CustomProfile::new(manifest.clone()),
+            installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+            env: [("SERVE_MODE".to_owned(), "zq-profile-value".to_owned())].into(),
+            approved_env: vec![],
+        });
+        let row = |profile: &serde_json::Value| {
+            super::engine_row(super::EngineRow {
+                host_id: "h",
+                host_name: "h",
+                online: true,
+                profile_name: "serve",
+                profile,
+                reported_version: None,
+                fingerprint: None,
+                deep_park_missing: false,
+                retiring: false,
+                deployments: vec![],
+            })
+        };
+        let custom = row(&profile);
+        assert!(!custom.to_string().contains("zq-profile-value"), "{custom}");
+        assert_eq!(custom["custom"], true);
+        assert_eq!(custom["version"], "unversioned");
+        assert_eq!(custom["idle_signal"], "/metrics gauges running");
+        assert_eq!(custom["engine_key"], "per-launch");
+        assert_eq!(custom["manifest"]["executable"], "/opt/serve/bin/serve");
+        assert_eq!(custom["manifest"]["api"], "decisions");
+        assert_eq!(custom["manifest"]["args"], serde_json::json!(manifest.args));
+        assert_eq!(
+            custom["manifest"]["env"],
+            serde_json::json!([
+                {"name": "SERVE_KEY", "source": "manifest"},
+                {"name": "SERVE_MODE", "source": "profile"},
+            ])
+        );
+        assert_eq!(custom["manifest"]["digest"], manifest.digest());
+        let known = row(
+            &serde_json::json!({"engine": "vllm", "build_fingerprint": "0.30.0",
+            "security": {"deep_park": "enabled"}}),
+        );
+        for field in ["manifest", "idle_signal", "engine_key"] {
+            assert!(known.get(field).is_none(), "{known}");
+        }
     }
 }

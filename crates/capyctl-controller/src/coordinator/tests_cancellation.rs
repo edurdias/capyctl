@@ -228,3 +228,214 @@ fn an_unanswered_question_backs_off_up_to_a_cap() {
     assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
     assert_eq!(quiescence_backoff(u32::MAX).as_secs(), 30);
 }
+
+/// ADR 0031 §6: a custom engine profile, with an idle signal when `idle`.
+fn custom_profile(idle: bool) -> Value {
+    let mut manifest = json!({
+        "kind": "custom_engine",
+        "schema_version": 1,
+        "api": "chat",
+        "version": "2.2.0",
+        "args": ["--host", "{host}", "--port", "{port}", "--model", "{model_dir}"],
+    });
+    if idle {
+        manifest["idle"] = json!({"url": "/metrics", "gauges": ["requests_running"]});
+    }
+    let mut profile = capyctl_config::registration::custom_profile_document(
+        &capyctl_config::registration::CustomProfileSpec {
+            executable: "/bin/true".into(),
+            custom: capyctl_config::custom::CustomProfile::new(
+                capyctl_config::custom::CustomManifest::from_value(manifest).unwrap(),
+            ),
+            installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+            env: Default::default(),
+            approved_env: Vec::new(),
+        },
+    );
+    // Every launch seals an inference key (SPEC §13.3).
+    profile["security"]["credential_ref"] = json!("secret://engine-key");
+    profile
+}
+
+/// A stopped custom deployment on the lab's host: the vLLM golden's model
+/// and resources on a custom profile, restart-only.
+fn deploy_custom(lab: &Lab, name: &str, idle: bool) -> DeploymentFence {
+    let source: Value = serde_json::from_str(VLLM).unwrap();
+    let mut host = source["input"]["host"].clone();
+    host["runtime_profiles"]["local"] = custom_profile(idle);
+    host["resource_policy"]["domains"]["unified"]["managed_limit"] =
+        json!(format!("{}GiB", lab.managed_gib));
+    host["resource_policy"]["queue"]["admission_window"] = json!(format!("{}ms", lab.window_ms));
+    let mut deployment = source["input"]["deployment"].clone();
+    deployment["name"] = json!(name);
+    deployment["routes"] = json!([name]);
+    deployment["runtime_profile_revision"] = json!(1);
+    deployment["engine_config"] = json!({});
+    deployment["residency"] = json!("restart_only");
+    let o = lab.owner.lock().unwrap();
+    let receipt = o
+        .store()
+        .create_stopped_managed_configuration(
+            o.session(),
+            "owner",
+            name,
+            &json!({ "config": deployment }).to_string(),
+            &host,
+            1700,
+        )
+        .unwrap();
+    DeploymentFence {
+        deployment_id: receipt.deployment_id,
+        revision: receipt.revision,
+        generation: receipt.generation,
+    }
+}
+
+/// The lab with one READY custom deployment whose engine would answer every
+/// quiescence question quiescent, and a router port on it.
+async fn custom_ready(
+    idle: bool,
+    options: CoordinatorOptions,
+) -> (Lab, DeploymentFence, CoordinatorLifecycle, i64) {
+    let lab = lab_options(15, 50, None, options).await;
+    let fence = deploy_custom(&lab, "custom", idle);
+    lab.ready(&fence).await;
+    lab.engine.quiet.store(true, Ordering::SeqCst);
+    let generation = lab.instance(&fence.deployment_id, 0).2.unwrap();
+    let port = lab.port(Duration::from_secs(10));
+    (lab, fence, port, generation)
+}
+
+/// The acknowledgements journaled for `deployment`, as payloads.
+fn acknowledgements(lab: &Lab, deployment: &str) -> Vec<Value> {
+    let sql = lab.sql();
+    let mut statement = sql
+        .prepare("SELECT payload_json FROM management_events WHERE kind='request_cancellation_acknowledged' AND deployment_id=?1")
+        .unwrap();
+    statement
+        .query_map([deployment], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|payload| serde_json::from_str(&payload.unwrap()).unwrap())
+        .collect()
+}
+
+// T44 T17 (ADR 0031 §6, SPEC §10): on an engine that reports no idle signal a
+// cancelling lease is never settled while the engine runs: the engine is
+// never asked, even one that would answer quiescent.
+#[tokio::test]
+async fn a_cancellation_without_an_idle_signal_is_never_settled_while_the_engine_runs() {
+    let (lab, fence, port, generation) = custom_ready(false, CoordinatorOptions::default()).await;
+    let lease = port
+        .open_instance_lease(&fence.deployment_id, generation, 32)
+        .await
+        .unwrap()
+        .unwrap();
+    port.close_request_lease(lease, LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    tokio::time::sleep(TICKS * 2).await;
+    assert!(lab.engine.asked.lock().unwrap().is_empty(), "never asked");
+    assert_eq!(leases(&lab, &fence.deployment_id), 1, "still charged");
+    assert!(acknowledgements(&lab, &fence.deployment_id).is_empty());
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T44 T17 (ADR 0031 §6): with an idle signal a custom engine is asked, and
+// its idle reading settles the cancellation as for a built-in engine.
+#[tokio::test]
+async fn a_cancellation_with_an_idle_signal_settles_on_the_reading() {
+    let (lab, fence, port, generation) = custom_ready(true, CoordinatorOptions::default()).await;
+    let lease = port
+        .open_instance_lease(&fence.deployment_id, generation, 32)
+        .await
+        .unwrap()
+        .unwrap();
+    port.close_request_lease(lease, LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    until("the idle reading to settle it", || {
+        leases(&lab, &fence.deployment_id) == 0
+    })
+    .await;
+    assert!(!lab.engine.asked.lock().unwrap().is_empty());
+    assert_eq!(acknowledgements(&lab, &fence.deployment_id).len(), 1);
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T44 T17 T10 (ADR 0031 §6, SPEC §10): a stop does not wait out its drain
+// bound for a cancellation no idle signal can settle; the stop's verified
+// exit settles it, journaled once with a receipt naming the stop.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_a_cancellation_without_an_idle_signal() {
+    let (lab, fence, port, generation) = custom_ready(
+        false,
+        CoordinatorOptions {
+            stop_drain_timeout: Duration::from_secs(20),
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = fence.deployment_id.clone();
+    let lease = port
+        .open_instance_lease(&id, generation, 32)
+        .await
+        .unwrap()
+        .unwrap();
+    port.close_request_lease(lease, LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    assert_eq!(leases(&lab, &id), 1);
+    let started = std::time::Instant::now();
+    let stop = lab
+        .worker
+        .commands()
+        .administrative_stop("operator", &id, fence.revision, "stop", 100_000)
+        .unwrap();
+    until_succeeded(&lab, stop.operation_id(), &id).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the stop waited {:?} for a cancellation",
+        started.elapsed()
+    );
+    assert_eq!(leases(&lab, &id), 0, "the verified exit settles it");
+    assert_eq!(lab.state(&id), "stopped");
+    let acknowledged = acknowledgements(&lab, &id);
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(acknowledged[0]["count"], json!(1));
+    let receipt = acknowledged[0]["receipt"].as_str().unwrap();
+    assert!(receipt.contains(stop.operation_id()), "{receipt}");
+    assert!(lab.engine.asked.lock().unwrap().is_empty());
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T44 T17 T16 (ADR 0031 §6, SPEC §10): a switch away from an engine that
+// reports no idle signal does not wait for its cancellation: the victim is
+// released by a stop at once, and that stop's verified exit settles it.
+#[tokio::test]
+async fn a_switch_does_not_wait_for_a_cancellation_without_an_idle_signal() {
+    let (lab, fence, port, generation) = custom_ready(false, CoordinatorOptions::default()).await;
+    let id = fence.deployment_id.clone();
+    let lease = port
+        .open_instance_lease(&id, generation, 32)
+        .await
+        .unwrap()
+        .unwrap();
+    port.close_request_lease(lease, LeaseEnd::Cancelling)
+        .await
+        .unwrap();
+    let b = lab.c.deployment_id.clone();
+    // A drain that waited for the cancellation would fail at this bound.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        lab.port(Duration::from_secs(5)).activate_for_request(&b),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(lab.state(&b), "ready");
+    assert_eq!(lab.state(&id), "stopped");
+    assert!(lab.operations(&id, "park").is_empty());
+    assert_eq!(leases(&lab, &id), 0);
+    assert_eq!(acknowledgements(&lab, &id).len(), 1);
+    lab.worker.shutdown().await.unwrap();
+}

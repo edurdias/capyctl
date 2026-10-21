@@ -455,6 +455,8 @@ pub async fn dispatch_timed(
                 // offered to another instance. Its lease is cancelling: the
                 // ledger keeps the charge until the engine reports quiescence,
                 // so the in-memory slot is released as for an uncertain end.
+                // ADR 0031 §6: the same on an engine that reports no idle
+                // signal, where only its verified exit settles the charge.
                 AdapterError::EngineError { message, .. } => {
                     if durable {
                         guard.release();

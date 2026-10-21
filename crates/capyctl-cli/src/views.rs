@@ -44,7 +44,7 @@ pub fn render(command: &Command, value: &Value, context: &Context) -> String {
             .row("Host ID", s(&value["host_id"]))
             .render(),
         Command::Validate { .. } => validate(value),
-        Command::EngineAdd { .. } => engine_add(value),
+        Command::EngineAdd { .. } | Command::EngineAddCustom { .. } => engine_add(value),
         Command::EngineRemove { .. } => engine_remove(value),
         Command::Drain { host, .. } => drain(host.as_deref(), value),
         Command::Revoke { host } => revoke(host, value),
@@ -353,6 +353,20 @@ fn engines_file(value: &Value) -> String {
     }
 }
 
+/// A list of strings joined with `separator`; empty for anything else.
+fn words(value: &Value, separator: &str) -> String {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(separator)
+        })
+        .unwrap_or_default()
+}
+
 fn engine_add(value: &Value) -> String {
     Detail::new(format!(
         "Registered {} ({} {})",
@@ -361,6 +375,15 @@ fn engine_add(value: &Value) -> String {
         s(&value["version"])
     ))
     .row("Executable", s(&value["executable"]))
+    // ADR 0031 §8: a custom engine's command, API, environment and identity.
+    .row("Arguments", words(&value["args"], " "))
+    .row("API", s(&value["api"]))
+    .row("Environment", words(&value["environment"], ", "))
+    .row("Pinned root", s(&value["root"]))
+    .row("Interpreter", s(&value["interpreter"]))
+    .row("Installation", s(&value["installation"]))
+    .row("Idle signal", s(&value["idle_signal"]))
+    .row("Engine key", s(&value["engine_key"]))
     .row("Deep park", s(&value["deep_park"]))
     // Spec §3: shown only when allowed, so a default registration reads as before.
     .row(
