@@ -53,13 +53,32 @@ const GATE: [u8; 32] = [7; 32];
 /// start, never a key. A worker forks one child and waits; the head serves the
 /// keyed model list and chat, and the engine's residency controls (ADR 0028
 /// §12: the collective the head's agent invokes). With `ignore-sigterm` beside
-/// it the whole tree ignores SIGTERM, as SGLang's rank > 0 does. It ends itself
-/// when the test process or the fixture directory goes away.
+/// it the whole tree ignores SIGTERM, as SGLang's rank > 0 does. Every process
+/// of the tree watches the test process that spawned it (by pid and start
+/// time) and the fixture directory, and kills the whole group once either is
+/// gone: a test interrupted or killed outright runs no `Drop`, so this is
+/// what ends the engine with it.
 const FAKE_ENGINE: &str = r#"
 import json, os, signal, sys, threading, time, http.server, urllib.parse
 args = sys.argv[1:]
 here = os.path.dirname(os.path.abspath(__file__))
 name = os.path.basename(__file__)
+def started(pid):
+    # A live process's start time (/proc stat field 22); None once it ended.
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return None if fields[0] in ("Z", "X") else fields[19]
+    except (OSError, IndexError):
+        return None
+# The init gate execs into this process, so its parent is the test process.
+# Taken before any fork, so every child watches the same process.
+test = os.getppid()
+test_started = started(test)
+def watch():
+    while test_started is not None and started(test) == test_started and os.path.isdir(here):
+        time.sleep(0.5)
+    os.killpg(0, signal.SIGKILL)
 if os.path.exists(os.path.join(here, "ignore-sigterm")):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if name == "sglang_entry.py":
@@ -91,24 +110,17 @@ if os.path.exists(os.path.join(here, "transient-child")):
         time.sleep(0.5)
         os._exit(0)
     time.sleep(1.2)
-parent = os.getppid()
 if os.fork() == 0:
-    while os.path.isdir(here):
-        time.sleep(0.5)
+    watch()
     os._exit(0)
-def orphaned():
-    while os.getppid() == parent and os.path.isdir(here):
-        time.sleep(0.5)
-    os.killpg(0, signal.SIGKILL)
-threading.Thread(target=orphaned, daemon=True).start()
+threading.Thread(target=watch, daemon=True).start()
 if os.path.exists(os.path.join(here, "late-children")):
     # A child started just after the spawn, and one long after the tree settled.
     def late(delay, label):
         time.sleep(delay)
         pid = os.fork()
         if pid == 0:
-            while os.path.isdir(here):
-                time.sleep(0.5)
+            watch()
             os._exit(0)
         with open(os.path.join(here, label + ".tmp"), "w") as f:
             f.write(str(pid))
@@ -275,13 +287,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
-fn directory() -> tempfile::TempDir {
+/// The host's fixture directory, under `$HOME` because the owner-only checks
+/// of the runtime directory and of the host's private state refuse a group-
+/// or other-writable ancestor such as `/tmp`.
+fn directory() -> Fixture {
     let d = tempfile::Builder::new()
         .prefix("capyctl-group-launch-")
         .tempdir_in(std::env::var("HOME").unwrap())
         .unwrap();
     std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    d
+    Fixture(d.keep())
+}
+
+/// A host's fixture directory. Its drop runs whether the test passed, failed
+/// an assertion or panicked: it kills every process the host's engines
+/// started, each with its whole process group, then removes the directory, so
+/// nothing outlives the test or still writes into the directory as it goes.
+struct Fixture(PathBuf);
+impl Fixture {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // It runs while a panic unwinds, so nothing here panics.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: getpgrp has no preconditions.
+        let ours = unsafe { libc::getpgrp() };
+        loop {
+            let left = fixture_processes(self.path());
+            if left.is_empty() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            for (pid, group) in left {
+                // SAFETY: kill and killpg have no memory preconditions. The
+                // pid named the fixture on its command line just now, and its
+                // group is the one the launcher started it in, never the
+                // test's own.
+                unsafe {
+                    if group > 1 && group != ours {
+                        libc::killpg(group, libc::SIGKILL);
+                    }
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The host's own threads may still be writing into the directory, and
+        // one entry added during the removal fails it, so it is retried.
+        for _ in 0..50 {
+            match std::fs::remove_dir_all(self.path()) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Every live process, as (pid, process group), whose command line names a
+/// path inside `root`: the host's engines, the init gate before its exec, and
+/// every child they forked. A zombie has no command line and is not listed.
+fn fixture_processes(root: &Path) -> Vec<(i32, i32)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut inside = root.as_os_str().as_bytes().to_vec();
+    inside.push(b'/');
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let pid: i32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            if !cmdline.windows(inside.len()).any(|part| part == inside) {
+                return None;
+            }
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // After the command name: state, parent pid, process group.
+            let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+            let state = fields.next()?;
+            let group = fields.nth(1)?.parse().ok()?;
+            (!matches!(state, "Z" | "X")).then_some((pid, group))
+        })
+        .collect()
 }
 
 fn private(path: &Path) -> PathBuf {
@@ -372,10 +462,9 @@ impl SaverResidency for StubSaver {
 
 /// The host once built: its fixture, its executor and its open session.
 struct Built {
-    /// Declared first so it runs first on drop: whatever the host launched is
-    /// reaped before anything else of it goes away.
-    _reap: Reap,
-    root: tempfile::TempDir,
+    /// Declared first so it drops first: whatever the host launched is
+    /// killed before anything else of it goes away.
+    root: Fixture,
     config: HostConfig,
     deployment: Value,
     service_port: u16,
@@ -386,30 +475,6 @@ struct Built {
     session: u64,
     saver: Option<Arc<StubSaver>>,
     sampler: Option<Arc<ResidencySampler>>,
-}
-
-/// Kills whatever the journal recorded if a test fails mid way.
-struct Reap(Arc<HostJournal>);
-impl Drop for Reap {
-    fn drop(&mut self) {
-        use capyctl_adapters::traits::OwnedProcessLaunch;
-        struct NoSpawn;
-        impl capyctl_launchers::LaunchAssociation for NoSpawn {
-            fn persist_api_identity(
-                &self,
-                _: &capyctl_domain::completion::ProcessIdentity,
-            ) -> Result<(), capyctl_launchers::AssociationError> {
-                panic!("cleanup cannot spawn")
-            }
-        }
-        let tools = capyctl_launchers::DurableProcessLaunch::new(Arc::new(NoSpawn));
-        for claimed in self.0.claimed_launches("").unwrap_or_default() {
-            if let Ok(owned) = self.0.inspect_owned(&claimed.command.identity.command_id) {
-                let identities: Vec<_> = owned.into_iter().map(|(p, _)| p).collect();
-                let _ = tools.terminate_owned(&identities, std::time::Duration::from_millis(200));
-            }
-        }
-    }
 }
 
 /// What a member's Launch answered.
@@ -728,7 +793,6 @@ impl FakeHost {
         let session = journal.connect().unwrap();
         executor.connected(session).unwrap();
         Built {
-            _reap: Reap(journal.clone()),
             root,
             config,
             deployment,
@@ -1499,6 +1563,173 @@ async fn a_dead_worker_leaders_unrecorded_child_is_terminated_and_the_stop_settl
         .unwrap()
         .iter()
         .any(|claim| claim.command.identity.command_id == out.owned_handle));
+}
+
+/// A SGLang worker on `host` whose recorded leader died once its whole tree
+/// was up (the child it forks at once and its two late children), as an
+/// engine that crashed leaves its children running. Answers the host's
+/// fixture directory.
+async fn a_worker_tree_without_its_leader(host: &FakeHost) -> PathBuf {
+    host.execute(launch(two_member_plan(host))).await.unwrap();
+    late_pid(host, "late-2");
+    let root = host.host().root.path().to_owned();
+    let running = fixture_processes(&root);
+    assert!(running.len() >= 4, "{running:?}");
+    let (leader, _) = running
+        .iter()
+        .find(|(pid, group)| pid == group)
+        .copied()
+        .unwrap();
+    // SAFETY: kill has no memory preconditions; the pid leads the engine's group.
+    assert_eq!(unsafe { libc::kill(leader, libc::SIGKILL) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fixture_processes(&root)
+        .iter()
+        .any(|(pid, _)| *pid == leader)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leader never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    root
+}
+
+fn sglang_worker_with_late_children() -> FakeHost {
+    FakeHost::new("host-b")
+        .with_groups_policy(WORKER_PEER)
+        .with_engine("sglang")
+        .with_late_children()
+}
+
+// T12 (SPEC §13.2): a test that fails mid way leaves no process of its engines
+// and no fixture directory behind. The host's fixture drops while the panic
+// unwinds, kills every process its engines started, each with its group, even
+// a tree whose leader already died, and only then removes the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_test_leaves_no_engine_process_or_directory_behind() {
+    let host = sglang_worker_with_late_children();
+    let root = a_worker_tree_without_its_leader(&host).await;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _host = host;
+        panic!("an assertion failed mid way");
+    }));
+    assert!(failed.is_err());
+    let left = fixture_processes(&root);
+    assert!(left.is_empty(), "outlived the failed test: {left:?}");
+    assert!(
+        !root.exists(),
+        "the fixture directory outlived the failed test"
+    );
+}
+
+/// The child half of [`an_interrupted_test_leaves_no_engine_process_behind`]:
+/// run only when that test starts this binary with `CAPYCTL_INTERRUPTED_TEST`.
+/// It prints its fixture directory once its worker's leader died, then waits
+/// to be killed (bounded, so it never outlives a parent that failed to).
+#[test]
+fn interrupted_test_fixture() {
+    if std::env::var_os("CAPYCTL_INTERRUPTED_TEST").is_none() {
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let host = sglang_worker_with_late_children();
+            let root = a_worker_tree_without_its_leader(&host).await;
+            println!("\nfixture={}", root.display());
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        });
+}
+
+// T12 (SPEC §13.2): a test interrupted or killed outright runs no `Drop`, yet
+// its engines end with it. This binary runs again as a test whose worker's
+// leader died and left its children (an engine that crashed), and is killed
+// with SIGKILL; every process of the tree then ends by itself. Failed before
+// the change: those children watched only the fixture directory, which a
+// killed test never removes, and ran on.
+#[test]
+fn an_interrupted_test_leaves_no_engine_process_behind() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+    // As the CLI tests' `Guarded`: the child test runs in its own process
+    // group (each engine it launches starts its own) and dies with the
+    // thread that spawned it, which is this test's own.
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            // SAFETY: killpg has no memory preconditions; the group is the
+            // child test's own (`process_group(0)`), never an engine's.
+            unsafe {
+                libc::killpg(self.0.id() as i32, libc::SIGKILL);
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let parent = std::process::id() as libc::pid_t;
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "interrupted_test_fixture",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CAPYCTL_INTERRUPTED_TEST", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe functions (prctl, getppid).
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died between fork and prctl.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::other("the test process is gone"));
+            }
+            Ok(())
+        });
+    }
+    let mut child = Killed(command.spawn().unwrap());
+    let stdout = child.0.stdout.take().unwrap();
+    let (sent, fixture) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if let Some(path) = line.strip_prefix("fixture=") {
+                let _ = sent.send(PathBuf::from(path));
+            }
+        }
+    });
+    let root = fixture
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the child test launched its worker");
+    // Whatever the child leaves is killed and removed here, pass or fail.
+    let left_behind = Fixture(root.clone());
+    assert!(!fixture_processes(&root).is_empty());
+    drop(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let left = fixture_processes(&root);
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "outlived the killed test: {left:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(left_behind);
+    assert!(!root.exists());
 }
 
 // T31 (ADR 0028 §8, §11; found live 2026-10-15, MN2 and MN5): a worker forks a
