@@ -1132,6 +1132,11 @@ async fn engine_counters(llamacpp: bool, health: Health) -> Box<dyn EngineAdapte
 // has not loaded its model, or hangs on `/health` (TensorFold) or `/metrics`
 // (llama.cpp) is terminated: the first three at once, the hung one once the
 // bound passes.
+//
+// The busy and hung engines get a one-second bound. The other three get a
+// minute and must complete within the 15 s the stop is waited for, so one
+// that waited for its bound fails without any wall-clock bound tighter than
+// the wait (a 900 ms one failed under load).
 #[tokio::test]
 async fn only_an_engine_answering_busy_is_not_signalled() {
     let healths = [
@@ -1158,8 +1163,15 @@ async fn only_an_engine_answering_busy_is_not_signalled() {
             start.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Completed
         );
+        // The lifecycle clock stands at 1.9 s and the cleanup keeps its 7 s
+        // protocol bound before the deadline: 9.9 s leaves the idle check one
+        // second, 68.9 s a minute.
+        let deadline = match health {
+            Health::Busy | Health::Hung => 9_900,
+            Health::Idle | Health::Gone | Health::Loading => 68_900,
+        };
         let started = std::time::Instant::now();
-        let stop = w.stop("owner", &fence, "idle-check", 9_900).unwrap();
+        let stop = w.stop("owner", &fence, "idle-check", deadline).unwrap();
         let observed = stop.wait(Duration::from_secs(15)).await;
         assert!(
             engine.reads.load(Ordering::SeqCst) > 0,
@@ -1189,12 +1201,6 @@ async fn only_an_engine_answering_busy_is_not_signalled() {
             if health == Health::Hung {
                 // The bound (one second here), then the read still in flight.
                 assert!(started.elapsed() >= Duration::from_millis(900));
-            } else {
-                assert!(
-                    started.elapsed() < Duration::from_millis(900),
-                    "{health:?}: {:?}",
-                    started.elapsed()
-                );
             }
         }
         w.shutdown().await.unwrap();

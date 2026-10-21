@@ -368,9 +368,9 @@ impl Installation {
     }
 
     fn deploy(&self) -> String {
-        // Sized for the shape the binary publishes on this machine, from an
-        // explicit capacity rather than this machine's (see
-        // `support::binary_template_memory`).
+        // Sized for the unified shape the binary publishes with its GPUs
+        // pinned to none, from an explicit capacity rather than this
+        // machine's (see `support::binary_template_memory`).
         let document = capyctl_cli::standalone_config::deployment_document(
             "w13-model",
             "w13-model",
@@ -390,7 +390,7 @@ impl Installation {
             false,
             "local",
         )
-        .expect("the template fits the stated card");
+        .expect("the unified template");
         let file = self.root.path().join("deployment.json");
         std::fs::write(&file, document.to_string()).unwrap();
         let out = self.cli(&[

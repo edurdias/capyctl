@@ -172,6 +172,12 @@ pub fn parse_compute_apps(text: &str) -> Option<Vec<(u32, i64)>> {
 }
 
 fn run_nvidia_smi() -> Option<String> {
+    // A test process whose GPUs are pinned (`TEST_PINNED_GPU_ENV`, debug
+    // builds only) observes no process on this machine's GPUs, as on a
+    // machine without `nvidia-smi`.
+    if crate::gpu_memory::gpu_pinned() {
+        return None;
+    }
     // SPEC §7.2: the same lookup as the memory sample: fixed paths, then PATH.
     let program = crate::gpu_memory::nvidia_smi()?;
     let mut child = Command::new(program)
