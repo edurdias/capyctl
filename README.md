@@ -52,7 +52,7 @@ What works in 0.1.6:
   ([driving CapyCTL from a controller](docs/guide/controller.md)).
 - A host or standalone role inside a container
   ([running in a container](docs/operations/install.md#running-in-a-container));
-  run so far on a unified-memory machine with Docker.
+  run so far with Docker on a unified-memory machine and on a discrete GPU.
 - Linux on x86-64 and ARM64, NVIDIA GPUs.
 
 Not there yet:

@@ -54,8 +54,8 @@ A host or standalone role can also run as the main process of a container,
 with the engines and models mounted in. CapyCTL publishes no image; the
 [operations guide](../operations/install.md#running-in-a-container) shows
 what to put in one, which mounts it needs, and how to stop it cleanly. So far
-this has run on a unified-memory machine with Docker; a discrete card, Podman
-and a host joined to a server have not run in a container yet.
+this has run with Docker on a unified-memory machine and on a discrete card;
+Podman and a host joined to a server have not run in a container yet.
 
 ## Uninstall
 
