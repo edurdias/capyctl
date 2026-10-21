@@ -1,8 +1,9 @@
 # Install
 
 You need Linux on x86-64 or ARM64, an NVIDIA GPU with its driver
-(`nvidia-smi` works), and a vLLM, SGLang, TensorFold or llama.cpp installation. The GPU can be a
-discrete card or a unified-memory machine; the steps are the same.
+(`nvidia-smi` works), and a vLLM, SGLang, TensorFold or llama.cpp installation,
+or another inference server you run as a [custom engine](engines.md#custom-engines).
+The GPU can be a discrete card or a unified-memory machine; the steps are the same.
 
 ```bash
 curl -fsSL https://edurdias.github.io/capyctl/install.sh | sh
@@ -46,6 +47,15 @@ Two things to know when upgrading from an earlier release candidate to 0.1.0:
   each deployment for the card (its revision goes up by one) and prints which
   ones. The next request for each starts it from scratch. This happens once;
   unified-memory machines are not affected.
+
+## In a container
+
+A host or standalone role can also run as the main process of a container,
+with the engines and models mounted in. CapyCTL publishes no image; the
+[operations guide](../operations/install.md#running-in-a-container) shows
+what to put in one, which mounts it needs, and how to stop it cleanly. So far
+this has run on a unified-memory machine with Docker; a discrete card, Podman
+and a host joined to a server have not run in a container yet.
 
 ## Uninstall
 

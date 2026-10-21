@@ -14,6 +14,10 @@ Engines take many options. CapyCTL treats each one in one of four ways:
   spelling, abbreviations included. The table names the setting to use
   instead.
 
+These rules cover vLLM, SGLang, TensorFold and llama.cpp. A
+[custom engine](engines.md#custom-engines) takes its options from its
+manifest, and CapyCTL checks none of them; a deployment on it cannot add any.
+
 The rules come from `crates/capyctl-config/src/engine_policy.rs` and the typed fields from the `engine_config`
 schema (`crates/capyctl-config/src/schema.rs`). A test
 (`crates/capyctl-config/tests/engine_flag_table.rs`) runs every option in the

@@ -96,6 +96,10 @@ What each engine prints by default:
   does not print prompt or completion text.
 - **TensorFold**: CapyCTL passes no logging options; the output is whatever
   TensorFold prints by default.
+- **A custom engine**: CapyCTL runs the command its manifest gives and checks
+  none of its options, so the output is whatever that command prints; keep
+  options that log or save requests out of the manifest
+  ([custom engines](../guide/engines.md#what-capyctl-cannot-promise)).
 
 If you need no request content on disk at all, use `engine_logs: memory`.
 

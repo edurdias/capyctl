@@ -840,11 +840,14 @@ is written:
   bearer values and long credential-shaped runs. Each becomes `<redacted>`.
 - The log rotates at 16 MiB to `<launch id>.log.1` and `.log.2`; older output
   is dropped, so one launch's log never exceeds 48 MiB.
-- No engine logs prompts or completions: request logging stays off. SGLang
-  runs with `log_requests` off and no crash dump folder; vLLM runs with
-  `--no-enable-log-requests` and `--no-enable-log-outputs` on every launch,
-  and both flags are reserved; TensorFold has no request logging. Per-request
-  lines carry the method, path and status only.
+- No engine CapyCTL knows logs prompts or completions: request logging stays
+  off. SGLang runs with `log_requests` off and no crash dump folder; vLLM runs
+  with `--no-enable-log-requests` and `--no-enable-log-outputs` on every
+  launch, and both flags are reserved; llama.cpp's default verbosity prints no
+  prompt or completion text; TensorFold has no request logging. Per-request
+  lines carry the method, path and status only. A custom engine logs whatever
+  its manifest's command makes it log; CapyCTL does not check its options
+  ([custom engines](../guide/engines.md#what-capyctl-cannot-promise)).
 - With `engine_logs: memory` (standalone: `host.engine_logs: memory`), no log
   file is written. The writer keeps the last 4 MiB of the launch's redacted
   output in its own memory instead, and serves the management read and
