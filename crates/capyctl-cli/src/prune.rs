@@ -11,9 +11,10 @@
 //! download lock is held or anything outside `sources/`. Without a referenced
 //! set it removes nothing.
 use crate::output::StructuredError;
+use capyctl_config::model_settings::ModelOverrides;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
     StructuredError {
@@ -24,31 +25,32 @@ fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
 
 /// The sources store a host document names (ADR 0008; owner ruling
 /// 2026-09-25), resolved by the host role's rule
-/// (`capyctl_config::model_settings`): `model_sources.path`, else the models
-/// directory (`model_store.path`, else `CAPYCTL_MODELS_ROOT`, else `~/models`),
-/// under which downloads live in `sources/`.
-fn model_store(host_config: &Path) -> Result<std::path::PathBuf, StructuredError> {
-    use capyctl_config::model_settings::{default_models_root, resolve, ModelOverrides};
+/// (`capyctl_config::model_settings`) with `env` as the environment's layer:
+/// `model_sources.path`, else the models directory (`model_store.path`, else
+/// `CAPYCTL_MODELS_ROOT`, else `~/models`), under which downloads live in
+/// `sources/`.
+fn model_store(host_config: &Path, env: &ModelOverrides) -> Result<PathBuf, StructuredError> {
+    use capyctl_config::model_settings::{default_models_root, resolve};
     let text = std::fs::read_to_string(host_config)
         .map_err(|_| error("invalid_config", "Cannot read the host configuration"))?;
     let host = capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &text)
         .map_err(|e| error("invalid_config", format!("Invalid host configuration: {e}")))?;
-    let invalid = |e: capyctl_config::ConfigError| {
-        error(
-            "invalid_config",
-            format!("Invalid host configuration: {}: {}", e.path, e.detail),
-        )
-    };
-    let env = ModelOverrides::from_process_env().map_err(invalid)?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let settings = resolve(
         &host,
         &ModelOverrides::default(),
-        &env,
+        env,
         default_models_root(home.as_deref()).as_deref(),
     )
     .map_err(invalid)?;
     Ok(settings.policy.root(&settings.models_root).to_path_buf())
+}
+
+fn invalid(e: capyctl_config::ConfigError) -> StructuredError {
+    error(
+        "invalid_config",
+        format!("Invalid host configuration: {}: {}", e.path, e.detail),
+    )
 }
 
 /// The referenced store keys, from a `GET /management/v1/model-sources` body.
@@ -67,13 +69,17 @@ pub fn referenced_keys(body: &Value) -> Result<BTreeSet<String>, StructuredError
         .collect()
 }
 
-/// Prune the host's model store against a referenced set.
+/// Prune the host's model store against a referenced set, with `env` as the
+/// environment's layer of the store's resolution (the process's own in
+/// [`execute`]; a test states an empty one, so the copies it prunes are never
+/// those of a store the machine's environment names).
 pub fn prune_store(
     host_config: &Path,
+    env: &ModelOverrides,
     referenced: &BTreeSet<String>,
     apply: bool,
 ) -> Result<Value, StructuredError> {
-    let store = model_store(host_config)?;
+    let store = model_store(host_config, env)?;
     let report = capyctl_agent::sources::prune(&store, referenced, apply).map_err(|_| {
         error(
             "internal",
@@ -128,7 +134,8 @@ pub async fn execute(
         }
     };
     let referenced = referenced_keys(&body)?;
-    prune_store(host_config, &referenced, apply)
+    let env = ModelOverrides::from_process_env().map_err(invalid)?;
+    prune_store(host_config, &env, &referenced, apply)
 }
 
 #[cfg(test)]
@@ -137,8 +144,13 @@ mod tests {
 
     // SPEC §6.3 (ADR 0008): the CLI prunes only what the referenced set does
     // not name, lists without --apply, and refuses a malformed referenced set.
+    // The environment's layer is stated empty: on host A the process's own
+    // named the machine's real model store (the environment wins over the
+    // document), so the listing showed its downloads instead of this test's
+    // and `--apply` would have removed them.
     #[test]
     fn prune_sources_lists_then_removes_only_unreferenced_copies() {
+        let env = ModelOverrides::default();
         let root = tempfile::tempdir().unwrap();
         let store = root.path().join("models");
         let state = store.join("sources/.capyctl");
@@ -171,13 +183,13 @@ mod tests {
         )
         .unwrap();
         let referenced = referenced_keys(&json!({"referenced": ["sources/http/aaa"]})).unwrap();
-        let listed = prune_store(&host, &referenced, false).unwrap();
+        let listed = prune_store(&host, &env, &referenced, false).unwrap();
         assert_eq!(listed["removed"][0]["key"], "sources/http/bbb");
         assert!(
             store.join("sources/http/bbb").is_dir(),
             "listing removes nothing"
         );
-        let applied = prune_store(&host, &referenced, true).unwrap();
+        let applied = prune_store(&host, &env, &referenced, true).unwrap();
         assert_eq!(applied["removed_bytes"], 3);
         assert!(!store.join("sources/http/bbb").exists());
         assert!(store.join("sources/http/aaa").is_dir());
@@ -194,7 +206,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            model_store(&with_store).unwrap(),
+            model_store(&with_store, &env).unwrap(),
             root.path().join("models")
         );
         let stated = root.path().join("stated.yaml");
@@ -203,7 +215,7 @@ mod tests {
             "schema_version: 1\nkind: host\nname: h\nstate_dir: /s\nmodel_sources:\n  path: /dl\n",
         )
         .unwrap();
-        assert_eq!(model_store(&stated).unwrap(), Path::new("/dl"));
+        assert_eq!(model_store(&stated, &env).unwrap(), Path::new("/dl"));
         assert!(referenced_keys(&json!({"referenced": ["/etc"]})).is_err());
         assert!(referenced_keys(&json!({})).is_err());
     }

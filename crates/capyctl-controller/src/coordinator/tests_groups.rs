@@ -55,6 +55,9 @@ const GROUP_CONTROLLER: &str = "controller";
 /// The private ingress every world host publishes (SPEC §15: loopback is a
 /// protected link).
 const WORLD_INGRESS: &str = "http://127.0.0.1:9443";
+/// The longest `resource_policy.observation_ttl` a host policy accepts, for a
+/// test whose commits must not depend on how fast the machine runs it.
+const LONGEST_OBSERVATION_TTL: Duration = Duration::from_secs(10);
 
 /// Host `index`'s peer address: documentation addresses only (RFC 5737).
 fn peer_address(index: usize) -> IpAddr {
@@ -2827,6 +2830,12 @@ async fn host_without_capability_is_refused() {
 
 // T14, T37, Review Focus 1: an env name unapproved on one host refuses the group;
 // members render equal environments apart from the address variable.
+//
+// The launching world keeps its observations fresh for the policy's longest
+// TTL (10 s): under the default 2 s, a loaded machine (found 2026-10-21, the
+// controller suite taking 703 s) committed the group's readiness on evidence
+// older than that, the store refused it (`evidence freshness`) and the
+// deployment never became Ready. Freshness is not what this test checks.
 #[tokio::test]
 async fn group_engine_env_is_approved_everywhere_and_equal() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
@@ -2839,6 +2848,7 @@ async fn group_engine_env_is_approved_everywhere_and_equal() {
     assert_eq!(err.code(), "engine_env_not_approved:SGLANG_ENABLE_X");
     let world = GroupWorld::hosts(&["host-a", "host-b"])
         .with_engine("sglang")
+        .with_observation_ttl(LONGEST_OBSERVATION_TTL)
         .approved_env("host-a", &["SGLANG_ENABLE_*"])
         .approved_env("host-b", &["SGLANG_ENABLE_*"]);
     let id = world
@@ -3327,10 +3337,16 @@ async fn unreachable_host_keeps_charge_and_port() {
 }
 
 // Review Focus 3: a worker host back with an empty journal settles only on recorded identities.
+//
+// Observations stay fresh for the policy's longest TTL, as in
+// `group_engine_env_is_approved_everywhere_and_equal`: under the default 2 s a
+// loaded machine committed generation 2's start on stale evidence
+// (`evidence freshness`), so it never started.
 #[tokio::test]
 async fn empty_journal_reconnect_settles_on_recorded_identities_only() {
     let world = GroupWorld::hosts(&["host-a", "host-b"])
         .recovery_reconcile()
+        .with_observation_ttl(LONGEST_OBSERVATION_TTL)
         .ready("g")
         .await;
     world.group.disconnect_host("host-b");

@@ -60,7 +60,14 @@ pub struct InventoryPublication {
 /// `sample` is the boot's one `nvidia-smi` sample, which the device UUIDs are
 /// corroborated against and keyed by (see
 /// [`InventoryPublication::physical_gpu_uuids`]).
+///
+/// A test process whose GPUs are pinned
+/// ([`capyctl_agent::gpu_memory::TEST_PINNED_GPU_ENV`], debug builds only)
+/// collects nothing: the machine running it is not the one the pin states.
 pub fn collect(runtime_dir: &Path, sample: Option<&GpuSample>) -> Option<InventoryPublication> {
+    if capyctl_agent::gpu_memory::gpu_pinned() {
+        return None;
+    }
     collect_with(runtime_dir, sample, &run_collector)
 }
 

@@ -69,29 +69,39 @@ pub fn isolate(command: &mut std::process::Command) -> &mut std::process::Comman
 }
 
 /// The `capyctl` binary under test, isolated from the developer's home
-/// ([`isolate`]) and observing the stated host memory ([`pin_host_memory`]).
-/// Every test spawns the binary through this.
+/// ([`isolate`]) and observing the stated machine ([`pin_machine`]). Every
+/// test spawns the binary through this.
 pub fn capyctl() -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_capyctl"));
     isolate(&mut command);
-    pin_host_memory(&mut command);
+    pin_machine(&mut command);
     command
 }
 
-/// Every role a spawned `capyctl` runs (standalone or host) observes
-/// [`TEST_CAPACITY_BYTES`], all of it free, instead of this machine's
-/// `/proc/meminfo`, through the test-only
-/// [`capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV`] (debug builds only).
-/// SPEC §7: standalone derives its limits from observed capacity and admits
-/// against observed free memory, so on a busy machine (found 2026-10-08:
-/// 14 GiB available of 61) every deploy the binary tests made failed
-/// `insufficient resources`. A test that clears the environment calls this
+/// Every role a spawned `capyctl` runs (standalone or host) observes a stated
+/// machine instead of the one running the suite, through test-only variables
+/// only debug builds read. A test that clears the environment calls this
 /// again.
-pub fn pin_host_memory(command: &mut std::process::Command) -> &mut std::process::Command {
-    command.env(
-        capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV,
-        format!("{TEST_CAPACITY_BYTES}:{TEST_CAPACITY_BYTES}"),
-    )
+///
+/// - Host memory: [`TEST_CAPACITY_BYTES`], all of it free, instead of
+///   `/proc/meminfo` ([`capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV`]).
+///   SPEC §7: standalone derives its limits from observed capacity and admits
+///   against observed free memory, so on a busy machine (found 2026-10-08:
+///   14 GiB available of 61) every deploy the binary tests made failed
+///   `insufficient resources`.
+/// - GPUs: none, instead of `nvidia-smi`'s sample and the device inventory
+///   ([`capyctl_agent::gpu_memory::TEST_PINNED_GPU_ENV`]). SPEC §7.2: a
+///   discrete card's free memory gates admission, so on a machine whose GPU
+///   another program held (found 2026-10-21 on the laptop: 1.9 GiB of 16
+///   free) every standalone launch the binary tests made failed
+///   `insufficient_device_memory`.
+pub fn pin_machine(command: &mut std::process::Command) -> &mut std::process::Command {
+    command
+        .env(
+            capyctl_agent::memory::TEST_PINNED_HOST_MEMORY_ENV,
+            format!("{TEST_CAPACITY_BYTES}:{TEST_CAPACITY_BYTES}"),
+        )
+        .env(capyctl_agent::gpu_memory::TEST_PINNED_GPU_ENV, "")
 }
 
 use std::sync::Arc;
@@ -445,48 +455,23 @@ pub const TEST_CAPACITY_BYTES: i64 = 32 << 30;
 
 /// The capacity a test that drives the real `capyctl` binary sizes its
 /// deployment documents from. The binary observes [`TEST_CAPACITY_BYTES`]
-/// ([`pin_host_memory`]); documents stay sized from a smaller capacity so
+/// ([`pin_machine`]); documents stay sized from a smaller capacity so
 /// several deployments fit its derived limits at once.
 pub const BINARY_TEST_CAPACITY_BYTES: i64 = 4 << 30;
 
 /// The template memory a test that drives the real `capyctl` binary sizes its
 /// deployment document from.
 ///
-/// Design §1: the binary samples this machine's GPUs with `nvidia-smi`, and a
-/// test cannot hand a sampler to another process, so it samples them the same
-/// way and generates the template for the shape the binary will publish: a
-/// machine without a GPU (or a unified one) gets the unified template sized
-/// from [`BINARY_TEST_CAPACITY_BYTES`]; a discrete one gets a device request
-/// sized for a small stated card, so it fits under the limits the binary
-/// derives from any real card and the memory free on a busy one. The toy
-/// checkpoint's weights are negligible.
+/// Design §1: the binary publishes the shape of the GPUs it samples, and
+/// [`pin_machine`] states none, so it publishes the unified shape on every
+/// machine; the template is the unified one sized from
+/// [`BINARY_TEST_CAPACITY_BYTES`]. The toy checkpoint's weights are
+/// negligible.
 pub fn binary_template_memory() -> capyctl_cli::standalone_config::TemplateMemory {
-    use capyctl_agent::gpu_memory::{shape, GpuMemory, HostShape};
-    match shape(capyctl_agent::gpu_memory::sample().as_ref()) {
-        Ok(HostShape::Discrete(_)) => {
-            let card = GpuMemory {
-                total_bytes: BINARY_TEST_DEVICE_BYTES,
-                used_bytes: 0,
-                free_bytes: BINARY_TEST_DEVICE_BYTES,
-            };
-            let limits = capyctl_cli::standalone_config::device_limits(&card, 4);
-            capyctl_cli::standalone_config::TemplateMemory::Device {
-                managed_limit: limits.managed_limit,
-                device_total: card.total_bytes,
-                weights_bytes: Some(0),
-                system_parked_limit: BINARY_TEST_CAPACITY_BYTES / 4,
-                kv_cache_bytes: None,
-            }
-        }
-        _ => capyctl_cli::standalone_config::TemplateMemory::Unified {
-            capacity_bytes: BINARY_TEST_CAPACITY_BYTES,
-        },
+    capyctl_cli::standalone_config::TemplateMemory::Unified {
+        capacity_bytes: BINARY_TEST_CAPACITY_BYTES,
     }
 }
-
-/// The card a binary test sizes a discrete deployment for (see
-/// [`binary_template_memory`]).
-pub const BINARY_TEST_DEVICE_BYTES: i64 = 10 << 30;
 
 pub fn test_memory() -> capyctl_cli::host_observation::MemoryReader {
     capyctl_cli::host_observation::fixed_memory(TEST_CAPACITY_BYTES, TEST_CAPACITY_BYTES)
