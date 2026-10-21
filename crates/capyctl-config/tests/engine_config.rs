@@ -639,6 +639,9 @@ fn sensitive_shapes_and_abbreviations_need_approval() {
         json!(["--enable-scale-out"]),
         json!(["--enable-scale"]),
         json!(["--no-enable-scale-out"]),
+        // vLLM 0.32.0: a second, gRPC listener beside HTTP.
+        json!(["--grpc-port", "50051"]),
+        json!(["--grpc-port=0"]),
     ] {
         let text = extra_args_error("vllm", args.clone());
         assert!(text.contains("reserved"), "{args}: {text}");

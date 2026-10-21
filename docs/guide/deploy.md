@@ -117,7 +117,12 @@ revisions. In this release a `decisions` deployment:
   `capyctl engine add` (which records the engine's version), or a
   [custom engine](engines.md#custom-engines) whose manifest says
   `api: decisions`. vLLM and TensorFold are refused with
-  `capability_missing:decisions` ([Exit codes and errors](errors.md));
+  `capability_missing:decisions` ([Exit codes and errors](errors.md)). vLLM
+  0.32.0 serves `POST /v1/systemone`, but it answers Clef and Clef-Flash from
+  their text output instead of their decision head: questions with more than
+  26 options are refused and accuracy and calibration fall well below SGLang's
+  and llama.cpp's. CapyCTL admits vLLM once a release uses these models'
+  decision heads;
 - runs on one machine: a `topology` is refused;
 - restarts instead of parking: `residency` is `restart_only`, and `deep` or
   `host_backed` is refused;

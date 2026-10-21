@@ -54,6 +54,9 @@ pub enum AdapterSpec {
         /// ADR 0010, discrete GPU design §5: the deployment's declared
         /// residency, which fixes the sleep level a park uses.
         residency: capyctl_config::effective::Residency,
+        /// ADR 0030 §1, §6 (amended 2026-10-21): the API the deployment
+        /// serves, which decides how readiness and the wake canary are proven.
+        api: capyctl_config::effective::DeploymentApi,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch
     /// it was verified against, the two per-launch credentials, and — when the
@@ -177,9 +180,11 @@ pub fn resolve(
             engine_key,
             admin_key,
             residency,
+            api,
         } => {
             let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id)
-                .with_residency(residency);
+                .with_residency(residency)
+                .with_api(api);
             if let Some(launch) = launch {
                 adapter = adapter.with_launch(launch);
             }

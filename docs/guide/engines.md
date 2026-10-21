@@ -62,7 +62,7 @@ the CLI and the running role the same ones.
 
 ## Custom builds
 
-`CUSTOM yes` means a version other than vLLM 0.29.0, 0.30.0 and 0.31.0, SGLang 0.5.20 and 0.5.21 or
+`CUSTOM yes` means a version other than vLLM 0.29.0 to 0.32.0, SGLang 0.5.20 and 0.5.21 or
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
 llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. A custom build is
 not a [custom engine](#custom-engines): CapyCTL still knows its options. Give it its own
@@ -73,7 +73,7 @@ capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly
 ```
 
 ```text
-Registered vllm-nightly (vllm 0.32.0rc1)
+Registered vllm-nightly (vllm 0.33.0rc1)
 
   Executable     /home/me/venvs/vllm-nightly/bin/vllm
   Deep park      enabled

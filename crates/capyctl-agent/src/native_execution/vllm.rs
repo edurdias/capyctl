@@ -110,7 +110,10 @@ impl NativeHostExecution {
         )
         // ADR 0010, discrete GPU design §5: the park level is the declared
         // residency of the approved launch, never the command's.
-        .with_residency(effective.residency);
+        .with_residency(effective.residency)
+        // ADR 0030 §3: readiness, the post-wake probe and the wake canary
+        // follow the deployment's API.
+        .with_api(effective.api);
         Ok(match keys {
             Some(keys) => adapter
                 .with_engine_key(hex::encode(keys.inference))

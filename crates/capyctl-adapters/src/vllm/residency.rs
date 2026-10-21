@@ -15,7 +15,7 @@
 //! | `ReloadWeights`   | `POST /collective_rpc {"method":"reload_weights"}` | `WeightsUsable`     |
 //! | `InvalidateCache` | `POST /wake_up?tags=kv_cache`, `POST /reset_prefix_cache`, `/is_sleeping` false | `CacheValid` |
 //!
-//! | `Probe`           | one authenticated chat completion answered       | `ModelUsable`         |
+//! | `Probe`           | one authenticated chat completion answered; the fixed decision (ADR 0030 §3) for a decisions deployment | `ModelUsable` |
 //!
 //! None of the first four is model readiness: the caller proves a usable model
 //! with the fresh `Probe` after the last step (SPEC §6.1). Waking allocations
@@ -207,23 +207,40 @@ async fn step(
                     "vLLM still reports sleeping at the readiness probe".into(),
                 ));
             }
-            let body = serde_json::json!({
-                "model": adapter.served_model(),
-                "messages": [{"role": "user", "content": "Say ready."}],
-                "max_tokens": 8,
-                "temperature": 0,
-            });
-            let answer = crate::traits::ChatForward::forward_chat(adapter, &body)
+            if adapter.decisions() {
+                // ADR 0030 §3, SPEC §6.1: a decisions launch is usable after
+                // a wake only on the fixed decision, never a chat answer.
+                let left = c.deadline_ms.saturating_sub(now_ms()?).max(0);
+                crate::traits::ChatForward::decision_probe(
+                    adapter,
+                    adapter.served_model(),
+                    std::time::Duration::from_millis(left as u64),
+                )
                 .await
                 .map_err(|e| {
                     RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
-                        "vLLM did not answer the readiness probe after waking: {e:?}"
+                        "vLLM did not answer the decision probe after waking: {e}"
                     )))
                 })?;
-            if !crate::forward::probe_answered(&answer) {
-                return Err(RuntimeError::Uncertain(
-                    "vLLM answered the readiness probe with empty content".into(),
-                ));
+            } else {
+                let body = serde_json::json!({
+                    "model": adapter.served_model(),
+                    "messages": [{"role": "user", "content": "Say ready."}],
+                    "max_tokens": 8,
+                    "temperature": 0,
+                });
+                let answer = crate::traits::ChatForward::forward_chat(adapter, &body)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                            "vLLM did not answer the readiness probe after waking: {e:?}"
+                        )))
+                    })?;
+                if !crate::forward::probe_answered(&answer) {
+                    return Err(RuntimeError::Uncertain(
+                        "vLLM answered the readiness probe with empty content".into(),
+                    ));
+                }
             }
             Milestone::ModelUsable
         }

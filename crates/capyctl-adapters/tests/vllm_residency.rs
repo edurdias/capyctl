@@ -198,9 +198,34 @@ async fn chat(
     Sse::new(futures::stream::iter(events)).into_response()
 }
 
+/// ADR 0030 §3: vLLM 0.32.0's `/v1/systemone`, answering the fixed decision
+/// only when awake with its weights reloaded, as the chat surface does.
+async fn systemone(State(engine): State<Shared>, headers: HeaderMap) -> axum::response::Response {
+    if !keyed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Err(status) = record(&engine, "decision") {
+        return status.into_response();
+    }
+    {
+        let e = engine.lock().unwrap();
+        if e.sleeping || (e.weights_awake && !e.weights_loaded) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    Json(json!({
+        "model": "m",
+        "answers": {"route": {"type": "choice", "choice": "billing", "confidence": 0.9,
+            "probabilities": {"billing": 0.95, "shipping": 0.02, "technical": 0.03}}},
+        "usage": {"input_tokens": 60, "output_tokens": 1}
+    }))
+    .into_response()
+}
+
 async fn serve(engine: Shared) -> u16 {
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/systemone", post(systemone))
         .route("/sleep", post(sleep))
         .route("/wake_up", post(wake))
         .route("/collective_rpc", post(collective))
@@ -507,6 +532,31 @@ async fn a_readiness_probe_proves_the_woken_model_usable() {
         engine.lock().unwrap().calls.last().map(String::as_str),
         Some("chat")
     );
+}
+
+/// ADR 0030 §3, §4: a decisions launch woken on vLLM is proven usable by the
+/// fixed decision, never by a chat answer. Decision deployments resolve
+/// `restart_only` today (§7.2), so this is the post-wake proof parking them
+/// would rely on.
+// T43
+#[tokio::test]
+async fn a_woken_decisions_launch_is_proven_by_the_fixed_decision() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled)
+        .with_api(capyctl_config::effective::DeploymentApi::Decisions);
+    for (action, id) in [
+        (RuntimeAction::Park, "p"),
+        (RuntimeAction::Restore, "w"),
+        (RuntimeAction::ReloadWeights, "r"),
+        (RuntimeAction::InvalidateCache, "c"),
+        (RuntimeAction::Probe, "probe"),
+    ] {
+        vllm.execute_persisted(&step(action, id)).await.unwrap();
+    }
+    let calls = engine.lock().unwrap().calls.clone();
+    assert_eq!(calls.last().map(String::as_str), Some("decision"));
+    assert!(!calls.contains(&"chat".to_string()), "{calls:?}");
 }
 
 /// Discrete GPU design §5 (ADR 0010): a `host_backed` deployment parks at

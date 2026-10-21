@@ -489,6 +489,9 @@ pub const VERIFIED: &[(Engine, &str)] = &[
     (Engine::Vllm, "0.30.0"),
     // ADR 0018 §1 (owner decision 2026-10-14).
     (Engine::Vllm, "0.31.0"),
+    // ADR 0018 §1 (owner decision 2026-10-21): qualified live on host A for
+    // chat, deep park included; decisions stay refused (ADR 0030 §6).
+    (Engine::Vllm, "0.32.0"),
     (Engine::Sglang, "0.5.20"),
     (Engine::Sglang, "0.5.21"),
     // ADR 0023 §1.

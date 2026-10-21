@@ -127,6 +127,10 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // SPEC §8.2 / T21: vLLM 0.30 scale-out registers extra serving routes
     // (`/render`, `/derender`, `/inference/v1/generate`); capyctl never enables it.
     "--enable-scale-out",
+    // SPEC §8.2 / T21: vLLM 0.32.0 opens a second, gRPC listener on this port
+    // beside HTTP (`FrontendArgs.grpc_port`, with its Rust frontend); capyctl
+    // owns every listener.
+    "--grpc-port",
 ];
 
 /// Whole option families reserved for vLLM: any option whose name starts here.

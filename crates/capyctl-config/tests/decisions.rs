@@ -157,14 +157,19 @@ fn existing_revisions_keep_their_fingerprints() {
     }
 }
 
-// T43 (ADR 0030 §1, §6): only llama.cpp 0.7.0 or newer and SGLang 0.5.22 or
-// newer serve decision models; vLLM, TensorFold, older releases and a build
-// that names no version are `capability_missing:decisions`, before anything
-// else about the deployment is resolved.
+// T43 (ADR 0030 §1, §6, amended 2026-10-21): only llama.cpp 0.7.0 or newer and
+// SGLang 0.5.22 or newer serve decision models; vLLM on every version (0.32.0
+// reads Clef and Clef-Flash from their text output, not their decision head),
+// TensorFold, older releases and a build that names no version are
+// `capability_missing:decisions`, before anything else about the deployment
+// is resolved.
 #[test]
 fn an_engine_that_cannot_serve_decisions_is_refused() {
     for (engine, fingerprint) in [
         ("vllm", "0.31.0"),
+        ("vllm", "0.32.0"),
+        ("vllm", "0.33.0"),
+        ("vllm", "vllm-build-1"),
         ("tensorfold", "1.0.12"),
         ("llamacpp", "0.6.0+d812350"),
         ("sglang", "0.5.21"),
@@ -179,6 +184,9 @@ fn an_engine_that_cannot_serve_decisions_is_refused() {
             error.detail.starts_with("capability_missing:decisions:"),
             "{engine} {fingerprint}: {error}"
         );
+        if engine == "vllm" {
+            assert!(error.detail.contains("decision head"), "{error}");
+        }
         // The same deployment serving chat is not refused for it.
         let mut chat = deployment.clone();
         chat.as_object_mut().unwrap().remove("api");
