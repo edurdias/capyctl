@@ -1669,7 +1669,7 @@ async fn raw_session_reporting(
     identity: &PendingEnrollment,
     host: &str,
     domains: Vec<pb::DomainObservation>,
-) -> Result<RawSession, tonic::Status> {
+) -> Result<RawSession, Box<tonic::Status>> {
     let channel = identity
         .control_endpoint(now())
         .unwrap()
