@@ -93,16 +93,39 @@ with no listener and no process left. CE4 passed: after an operator stop
 was ready again in 691 s through the decision probe, and its first decision gave
 the same probabilities as before the restart (0.9638675 for `technical`).
 
-CE3 is not demonstrated live. A client that hangs up on `POST /v1/systemone`
+CE3 is not demonstrated on basal. A client that hangs up on `POST /v1/systemone`
 does not make the request `cancelling`: a collected answer is still completed
 when the engine answers (the hung-up request's lease closed completed, status
 showed `cancelling: 0` before and after; basal kept computing it, so the next
 request waited 9.6 s). A deadline cut cannot be produced on basal either: a
 deployment's `request_deadline` must be at least its `timeouts.initialize`, and
-basal's start takes 11 to 14 minutes. The no-idle-signal settlement is covered
-by the store and controller tests named above (CPU and Fake-engine tests, not
-qualification); a live row needs a chat custom engine (a hang-up mid-stream) or
-an engine that answers 5xx.
+basal's start takes 11 to 14 minutes.
+
+CE3 passed on 2026-10-21 on a chat custom engine: llama-server from the
+approved llama.cpp v0.7.0 build, added with a manifest of `api: chat` and no
+`idle` (`-m "{model_dir}/Qwen3-4B-Q4_K_M.gguf" --host "{host}" --port "{port}"
+-c 4096 --alias "{served_name}"`), deployment `resources: {gpu: 8GiB, ram:
+4GiB}` on the Qwen3-4B GGUF directory, ready in under 20 s. A streamed chat
+request (`stream: true`, `max_tokens: 3000`) cut by the client after 3 s
+(53 KB received) left `instances[].requests` at `{cancelling: "1",
+cancelling_settles: "stop"}` (0 before), and the text status read `cancelling:
+1 (settles at the next stop or restart: the engine reports no idle signal)`.
+`capyctl stop deployment` returned in 0.05 s without waiting on it; 3 s later
+the deployment was `stopped` with `cancelling: 0`, no llama-server left, and the
+journal held `request_cancellation_acknowledged` (count 1, receipt: no idle
+signal, the stop operation's cleanup step verified the exit of the process
+group) beside that operation's `ordinary_cleanup_completed`.
+
+Deep gate (`scripts/ci-local.sh --deep --only workspace`, host A, branch head
+3a99062a): 3436 passed, 3 failed, 1 ignored over 244 test binaries. The three
+failures are `a_role_warns_when_its_limits_exceed_the_memory_available`
+(`admission_figures`), `standalone_memory_limits_follow_the_document_and_its_overrides`
+and `standalone_parked_limit_follows_the_document_and_its_overrides`
+(`switching_cli`); they fail the same way on `main` (169081b9) on the same
+host, so they are host-specific, not regressions: their assertions depend on
+the host's free memory, and host A had 10.0 GiB of its 32 GiB unified pool
+available, less than its 16 GiB limit plus 6.4 GiB reserve
+(`admission_figures.rs:165`, `switching_cli.rs:336` and `:422`).
 
 basal's `--mode fp8` needs torchao, which the approved environment does not
 have; `--mode fast` (bf16, compiled) served a decision directly in 69 ms after
