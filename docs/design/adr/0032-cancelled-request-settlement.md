@@ -1,11 +1,13 @@
 # ADR 0032 — Settling a cancelled request on evidence about that request
 
-**Status:** Proposed (2026-10-21). Nothing is implemented. The owner's answers to the open
-questions at the end decide whether this lands, and in what scope.
-**Would amend:** `SPEC.md` §10 (amended 2026-10-01: when a `cancelling` request settles;
-note of 2026-10-19: what crosses a host's ingress, only if the remote half is accepted),
-§13.1 (the "cancel supported work" operation family becomes a real agent operation for
-one engine), §20 (T17).
+**Status:** Accepted (owner decisions 2026-10-21). Proposed 2026-10-21; the owner answered
+every open question the same day, and the answers are recorded below ("Owner decisions of
+2026-10-21"). Not implemented yet; the plan targets 0.1.7.
+**Amends (with the implementation):** `SPEC.md` §10 (amended 2026-10-01: when a
+`cancelling` request settles; note of 2026-10-19: CapyCTL's request ID crosses a host's
+ingress), §13.1 (the "cancel supported work" operation family becomes a host-agent
+operation for SGLang), §20 (T17). Decision 6 is the separate SPEC §10 amendment of
+2026-10-21 that settles on an idle reading only a request the engine answered.
 **Related:** ADR 0013 (a request lease is charged to one instance), ADR 0017 (capability
 gating by engine version), ADR 0028 §9 (the agent's loopback probes with the launch's
 own key), ADR 0029 (llama.cpp), ADR 0031 §6 (engines without an idle signal).
@@ -97,15 +99,16 @@ TensorFold and custom engines were not examined; this ADR leaves them as they ar
 SGLang's `rid` and vLLM's `request_id` included (`CHAT_REQUEST_FIELDS`,
 `crates/capyctl-adapters/src/forward.rs`), and never forwards the caller's
 `X-Request-Id` (SPEC §10, note of 2026-10-19). An ID would therefore be CapyCTL's
-alone: the request lease's own ID, a ULID.
+alone: its request ID, the `X-CapyCTL-Request-Id` value (the request's first lease ID, a
+ULID).
 
 - SGLang takes the body field `rid` as the engine's request ID unchanged
   (`entrypoints/openai/protocol.py:986-987`, `entrypoints/openai/serving_chat.py:1320`)
   and returns it as the answer's `id` (`serving_chat.py:2109-2111`). A `rid` still in
   flight is refused as a duplicate (`managers/tokenizer_manager.py:3828-3832`). The
   scheduler matches an abort by prefix (`managers/scheduler.py:5471`, `:5587`); a
-  ULID has a fixed length of 26 characters, so no lease ID is a proper prefix of
-  another.
+  ULID has a fixed length of 26 characters, so no CapyCTL request ID is a proper prefix
+  of another.
 - vLLM takes `X-Request-Id`, else the body's `request_id`
   (`entrypoints/serve/engine/serving.py:120-129`), makes it `chatcmpl-<id>`
   (`entrypoints/openai/chat_completion/serving.py:291-293`), and adds 8 random
@@ -276,122 +279,202 @@ scheduler is counted by no engine, so a zero reading after the hang-up does not 
 scheduler, so a zero reading after the hang-up does show it is gone. The exposure is a
 request cancelled before its first output, while the engine is otherwise idle, and lasts
 for its transit time. When it is hit, the request runs uncounted after it settled, and on
-vLLM it may run to its end. This is not what this ADR decides; it is open question 6.
+vLLM it may run to its end. The owner closed this separately: owner decision 6 below.
 
-## Decision (proposed)
+## Decision
 
-Settle a cancelled request on SGLang by its own terminal output after aborting it by an
-ID CapyCTL assigns. Keep today's rule for every other engine, and for SGLang whenever
-that evidence does not arrive.
+Settle a cancelled request on SGLang by its own final output after aborting it by
+CapyCTL's request ID, on the router's machine and on hosts alike. Keep today's rule, as
+amended by owner decision 6, for every other engine and for SGLang whenever that evidence does
+not arrive. Restart an instance when requests that can only settle at its next stop fill
+the deployment's limit. The owner's decisions of 2026-10-21 are listed after the plan.
 
 1. **The ID.** On an SGLang launch whose engine has the capability (ADR 0017: SGLang
-   0.5.22, one tokenizer worker, the chat endpoint), the body CapyCTL sends carries
-   `rid` set to the request lease's own ID. A caller's `rid` is still refused. The
-   engine returns it as the answer's `id`.
-2. **Abort and keep reading.** On a hang-up or a deadline or idle cut, the lease becomes
-   `cancelling` as today and stays charged. Instead of dropping the engine response, the
-   router keeps reading it and discards what it reads, and asks the engine to abort that
-   `rid` on its own loopback port with the engine key: locally through the adapter's
-   `cancel_work`, and for a host through an agent operation (SPEC §13.1, "cancel
-   supported work") that the agent runs as it runs the wake canary (ADR 0028 §9), never
-   through the ingress or the router.
-3. **Settle on that request's terminal output.** If, within a bound, the response ends
-   with its terminal output read whole (a stream's final chunk and `[DONE]`, or a whole
-   collected answer), the lease closes with `request_cancellation_acknowledged` and a
-   receipt naming the evidence: "the engine finished this request after it was asked to
-   abort it". Anything else (the bound passes, the connection breaks, an error event, a
-   truncated or unreadable end, an abort that could not be sent) closes the response and
-   leaves the lease to today's rule. Engine-wide quiescence still settles the lease if it
-   comes first.
-4. **Engine error answers** keep today's rule: the answer is complete, so there is no
+   0.5.22 with one tokenizer worker), every chat request CapyCTL sends carries `rid` set
+   to CapyCTL's request ID: the `X-CapyCTL-Request-Id` value, never the caller's
+   `X-Request-Id`. A caller's `rid` is still refused. The engine returns it as the
+   answer's `id`, which CapyCTL keeps and does not rewrite. A request offered to a second
+   instance after a refusal before acceptance keeps its ID (SPEC §10, note of
+   2026-10-19), so it reaches that instance's engine under the same `rid`; the first
+   engine never accepted it. Decision requests keep today's rule: SGLang 0.5.22's
+   `/v1/systemone` handler builds its engine request without a `rid`
+   (`entrypoints/systemone/serving.py:130-143`), so CapyCTL cannot name one.
+2. **Hosts.** The router sends CapyCTL's request ID to the host's ingress with the
+   request. The ingress consumes it (it never reaches the engine as a header), sets it as
+   `rid` on an SGLang launch with the capability, and otherwise drops it. The caller's
+   `X-Request-Id` still never crosses the ingress.
+3. **Abort and keep reading.** On SGLang every cut takes this path: a client hang-up, a
+   request deadline cut and a stream idle cut. The lease becomes `cancelling` as today
+   and stays charged; a cut client gets its answer first, as today. Instead of dropping
+   the engine response, the router keeps reading it and discards what it reads. The
+   engine is asked to abort that `rid` (`POST /abort_request` on its own loopback port,
+   with the engine key): on the router's machine through the adapter's `cancel_work`, and
+   on a host through a new host-agent operation, sent over the agent session (SPEC
+   §13.1, "cancel supported work"), that the agent runs on loopback with the launch's
+   key as it runs the wake canary (ADR 0028 §9), never through the ingress or the
+   router. The answer to the abort is not evidence: `cancel_work` still reports
+   `Uncertain`.
+4. **Settle on that request's own final output.** If the response ends with its final
+   output read whole (a stream's final chunk and `[DONE]`, or a whole collected answer)
+   within the stream idle bound (`resource_policy.queue.stream_idle_timeout`), counted
+   from when the abort was sent, the lease closes with `request_cancellation_acknowledged`
+   and a receipt naming the evidence: "the engine finished this request after it was
+   asked to abort it". Anything else (the bound passes, the connection breaks, an error
+   event, a truncated or unreadable end, an abort that could not be sent) closes the
+   response and leaves the lease to today's rule as amended by owner decision 6.
+5. **Engine error answers** keep today's rule: the answer is complete, so there is no
    response left to read.
-5. **vLLM, llama.cpp, TensorFold and custom engines** keep today's rule, ADR 0031 §6
+6. **vLLM, llama.cpp, TensorFold and custom engines** keep today's rule, ADR 0031 §6
    included. A later engine version can gain the capability only with source and a live
    check showing an acknowledgement that its scheduler emits after it removed the
-   request, or a terminal output its API process does not make up.
+   request, or a final output its API process does not make up.
+7. **Restart when full.** When requests that settle only at their instance's next stop
+   (a custom engine without an idle signal, ADR 0031 §6, or a request the engine never
+   answered, owner decision 6) are the deployment's only open leases and fill its limit of 32,
+   CapyCTL restarts each instance holding them. The restart's stop is the controlled
+   cleanup of SPEC §10: its verified exit settles them, and a stop that cannot verify the
+   exit keeps their charges and the instance's reservation. No live request is cut,
+   since there is none; requests waiting for a place wait through the restart as through
+   an activation. An uncertain lease is not such a request, so one keeps the restart
+   from being triggered. The restart is journaled as an event naming the deployment, the
+   instance and the number of requests it settles. The trigger is that count reaching
+   the limit, never a timer.
 
-Why this never settles a request the engine may still run: the terminal output reaches
-the router only after the tokenizer received the scheduler's own finished output or
-abort echo for that `rid`, and the scheduler sends either only after the request has left
-its waiting queue or finished its last forward pass. A request still in transit inside
-the engine when the abort arrives is not settled sooner: it runs to its own end, which
-then settles it, or the bound passes and today's rule applies.
+Why this never settles a request the engine may still run: the final output reaches the
+router only after the tokenizer received the scheduler's own finished output or abort
+echo for that `rid`, and the scheduler sends either only after the request has left its
+waiting queue or finished its last forward pass. A request still in transit inside the
+engine when the abort arrives is not settled sooner: it runs to its own end, which then
+settles it, or the bound passes and the fallback applies.
 
-The SPEC §10 text this would add, to land with the implementation: "On an engine with
-the capability (ADR 0032), a request cancelled by a hang-up or a cut is aborted by
-CapyCTL's own ID while the router keeps reading its response, and settles when that
-response ends with its terminal output read whole within the bound; otherwise it
-settles as above."
+The SPEC text to land with the implementation:
+
+- §10, after the amendment of 2026-10-21 (owner decision 6): "On an SGLang engine with the
+  capability (ADR 0032), a chat request cancelled by a client hang-up, a request deadline
+  cut or a stream idle cut is aborted by CapyCTL's request ID while the router keeps
+  reading its response, and settles when that response ends with its final output read
+  whole within the stream idle bound counted from the abort; otherwise it settles as
+  above."
+- §10, the note of 2026-10-19: "CapyCTL's request ID (never the caller's) is sent to a
+  host's ingress, which sets it as SGLang's `rid` (ADR 0032) and sends it to the engine
+  in no other form."
+- §10, after the amendment of 2026-10-21 by ADR 0031 §6: "When requests that settle only
+  at the next stop are a deployment's only open requests and fill its limit, CapyCTL
+  restarts each instance holding them, and journals the restart; the restart's verified
+  exit settles them (ADR 0032)."
 
 ## Consequences
 
-- On SGLang, a cancelled request would settle about one forward pass after the abort
-  reaches the scheduler, whatever else the engine runs, so hang-ups stop filling the
-  bound there. [INFERENCE until measured live.]
-- The router keeps an engine response open for up to the bound after each hang-up, and
-  a host's ingress keeps relaying it. The ingress in-flight count then stays above 0, so
-  the remote quiescence reading cannot settle anything meanwhile.
-- On SGLang the answer's `id` becomes the lease ID instead of a random hex string. It is
-  CapyCTL's own ID, already sent as `X-CapyCTL-Request-Id` (for a request offered to a
-  second instance, the header keeps the first lease's ID and the body carries the
-  second's).
-- For a host, the lease ID has to reach the ingress so the ingress can set `rid`, which
-  the note of 2026-10-19 ("neither request ID crosses it") does not allow today; the
-  agent gains an abort operation.
-- vLLM and llama.cpp deployments see no change: the problem stays on those engines.
+- On SGLang, a cancelled chat request would settle about one forward pass after the
+  abort reaches the scheduler, whatever else the engine runs, so cuts stop filling the
+  limit there. [INFERENCE until measured live: row L1.]
+- The router keeps an engine response open for up to the stream idle bound after each
+  cut, and a host's ingress keeps relaying it. The ingress in-flight count then stays
+  above 0, so the remote idle reading cannot settle anything meanwhile.
+- On SGLang the answer's `id` is CapyCTL's request ID instead of a random hex string,
+  the same value as the `X-CapyCTL-Request-Id` header.
+- CapyCTL's request ID now crosses a host's ingress; the agent gains an abort operation
+  and the host session declares it.
+- vLLM and llama.cpp deployments keep today's rule. Their requests cancelled before any
+  output, and every engine's held requests, no longer block a deployment for good: they
+  are settled by the restart of item 7 above.
 
 ## Alternatives considered
 
 - **Keep today's rule everywhere.** No new path or failure mode; the problem stays on
   every engine.
-- **Let a cancelled request run to its end** and settle on its terminal output, on every
+- **Let a cancelled request run to its end** and settle on its final output, on every
   engine. Sound, but the engine spends a slot generating for nobody until `max_tokens`
   or the deadline, and it reverses the owner decision of 2026-10-01.
 - **Settle on counts** (`R + W` at most the live leases, or an equivalent margin).
   Unsound: section 4.
 - **Settle when the engine has closed its socket.** It proves dispatch of an abort, not
   its effect: section 5.
-- **vLLM's development-mode abort followed by reading to the end.** The terminal output
-  is made by the API process before EngineCore sees the abort: section 1.
+- **vLLM's development-mode abort followed by reading to the end.** The final output is
+  made by the API process before EngineCore sees the abort: section 1.
 - **llama.cpp slot pinning** (`id_slot`, an engine-internal field CapyCTL refuses) **and
   `/slots`.** The slot shows an internal task ID CapyCTL never learns, and queued tasks
   are not shown.
-- **Not counting cancelling leases against the per-deployment bound.** It settles
-  nothing; it changes what the bound means, and is left to the owner (question 7).
+- **Not counting held requests against the per-deployment limit.** It settles nothing
+  and changes what the limit means; the owner chose the restart of item 7 instead.
+- **Restart after a held request has waited a while.** A timer is not evidence; the
+  restart is triggered only by the limit being full of held requests.
 
-## Verification
+## Implementation plan (target 0.1.7)
 
-When implemented: unit tests against stub engines for each branch of decision 3, tagged
-T17. CPU and Fake-engine tests are not qualification. Live rows, on SGLang 0.5.22 in an
-approved environment and in a session the owner schedules:
+1. **Capability.** The SGLang adapter declares per-request abort for 0.5.22 launches with
+   one tokenizer worker (ADR 0017); a host declares the agent's abort operation in its
+   session. A lane without both keeps today's rule.
+2. **ID on the request.** The SGLang chat forwarder sets `rid` to CapyCTL's request ID
+   (`crates/capyctl-adapters/src/forward.rs`); the caller's `rid` stays refused. The
+   router sends the ID to a host's ingress, and the ingress validates it as a ULID and
+   sets `rid` (`crates/capyctl-agent/src/ingress.rs`); the ingress tests that neither ID
+   reaches the engine as a header are kept.
+3. **Abort.** SGLang's `cancel_work` posts `/abort_request` on loopback with the engine
+   key and reports `Uncertain`. A new agent operation in `capyctl-protocol` carries the
+   deployment, generation, owned handle and request ID; the agent checks them against its
+   retained launch before it posts.
+4. **Router.** On a cut on a capable lane, `stream.rs` and `chat.rs` keep the engine
+   response, request the abort, read to the final output or the bound, and end the lease
+   with a new outcome, "acknowledged by its own final output", or the fallback.
+5. **Ledger.** A store call closes one cancelling lease by ID and journals
+   `request_cancellation_acknowledged` with the per-request receipt in the same
+   transaction (`crates/capyctl-store/src/request_lease_cancellations.rs`).
+6. **Restart when full.** Where a grant is refused as full, the coordinator checks
+   whether every open lease of the deployment settles only at the next stop; if so it
+   restarts each instance holding them and journals the event (proposed name
+   `instance_restarted_for_held_requests`). An instance already stopping or restarting
+   is not asked again.
+7. **Docs.** The SPEC text above and the T17 row; the guide's errors and parking pages
+   where they describe cancelled requests; one change file.
 
-1. Under steady traffic that keeps the engine from reading idle, a client hangs up
-   mid-stream; the lease settles with the per-request receipt while the gauges never read
-   0, and the request is gone from the engine's running count.
-2. A hang-up while the request is queued, and one during a long, chunked prefill.
-3. A hang-up before the first output, and one before the engine dispatched the request.
-4. The engine is killed while CapyCTL reads after the abort; the lease stays charged
-   until the instance's verified exit.
-5. The same on a host, through its ingress and the agent's abort.
+Tests, tagged T17, against stub engines: each branch of item 4; the ID on SGLang
+only, never the caller's; the ingress setting `rid`; the agent operation refused for a
+launch it does not retain; the restart triggered at the limit and not one request below,
+not with an uncertain lease open, and its verified exit settling the held requests. CPU
+and Fake-engine tests are not qualification.
 
-## Open questions for the owner
+## Live qualification (host A, SGLang 0.5.22)
 
-1. Adopt the SGLang-only design, or keep today's rule on every engine?
-2. For hosts: may the lease ID cross the ingress so that the ingress sets `rid` (amending
-   the note of 2026-10-19), or should the first version cover only engines the router
-   reaches on loopback?
-3. The bound on reading after the abort. A running request ends after one forward pass,
-   but a long chunked prefill defers the abort until its chunk ends. Proposed: the
-   stream idle bound.
-4. Should deadline and idle cuts take this path as hang-ups do? The cut client gets its
-   answer first; only the settlement changes.
-5. Is the lease ID as the answer's `id` on SGLang acceptable, or should the router
-   restore a random one?
-6. Today's rule can settle a request cancelled before it reached the scheduler (section
-   "A finding about today's rule"). Accept the window, or narrow it: settle on a zero
-   reading only the requests that produced output, read SGLang's grammar queue gauge as
-   well, or wait a transit allowance after the hang-up?
-7. The ledger counts cancelling and uncertain leases against the 32 per deployment. On a
-   custom engine without an idle signal, 32 cancelled requests would leave the deployment
-   refusing new requests until its next stop or restart, while ADR 0031 §6 point 3 says
-   admission is not starved. Is that intended, or a separate fix?
+Run in a live session the owner schedules (one live session on the hosts at a time), in
+the approved SGLang 0.5.22 environment:
+
+- **L1, abort settles within one decode step.** Under steady traffic that keeps the
+  engine from reading idle, a client hangs up mid-stream. The lease settles with the
+  per-request receipt within one decode step of the abort reaching the engine (the time
+  from the abort to the settlement, against the engine's step time), while its gauges
+  never read 0, and the engine's running count drops by one.
+- **L2, a deadline cut before output settles promptly.** A request whose deadline passes
+  before its first output (queued behind others, or in a long prefill) is cut; it
+  settles on its own final output well within the stream idle bound, not at the next
+  stop.
+- **L3, the host path.** Host A serves as a host of a server on the control host: a
+  hang-up through its ingress sets `rid` there, the agent's operation aborts it, and the
+  lease settles on the final output relayed through the ingress.
+- **L4, restart when full.** On an SGLang decisions deployment, 32 decision requests cut
+  before their answers fill the limit; CapyCTL restarts the instance, journals the
+  event, and the verified exit settles all 32; the next request is served by the
+  restarted instance.
+
+## Owner decisions of 2026-10-21
+
+1. Adopt the SGLang-only per-request proof: CapyCTL assigns its own request ID (the
+   `X-CapyCTL-Request-Id` value, never the caller's) as SGLang's `rid`, aborts that
+   `rid` on loopback, and settles on that request's own final output. Other engines keep
+   today's rule.
+2. Hosts too: amend the note of 2026-10-19. The router sends CapyCTL's request ID (never
+   the caller's) to the host's ingress, which sets it as SGLang's `rid`, and the abort
+   runs on the host through a new host-agent operation.
+3. The bound on reading after the abort is the existing stream idle bound; past it, the
+   request falls back to today's rule.
+4. Every cut takes this path on SGLang: client hang-ups, request deadline cuts and stream
+   idle cuts.
+5. The answer's `id` on SGLang may equal CapyCTL's request ID; it is kept, not
+   rewritten.
+6. Decided separately (the early-settle fix, branch `fix/settle-after-engine-output`, SPEC
+   §10 amendment of 2026-10-21): a cancelled request settles on an idle reading only if
+   the engine produced output for it (a parsed output event, or a complete error
+   answer); otherwise at its instance's next verified stop.
+7. When requests held until the next stop alone fill the deployment's limit of 32,
+   CapyCTL restarts the instance; its verified stop settles them, and the restart is
+   journaled as an event. The restart is the evidence, never a timer.
