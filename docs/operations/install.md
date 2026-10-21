@@ -940,8 +940,20 @@ start under the unit but starts by hand, check these first.
 A host or standalone role can run as the main process of a container. CapyCTL
 publishes no image: build one from a base that carries the NVIDIA user-space
 tools your engine needs, add the `capyctl` binary and the engine virtual
-environments, and start the role in the foreground. Not yet run live in a
-container; the behaviour below is covered by CPU tests only.
+environments, and start the role in the foreground. Run live on a GB10
+(unified memory, CUDA 13.0) with Docker 29 and CDI, on 2026-10-20: a
+standalone role as an unprivileged user (`--user 1000:1000`, `--cap-drop ALL`,
+`--security-opt no-new-privileges`, the container's own `/proc`, cgroup v2)
+started, parked, woke and stopped a llama.cpp decision model, SGLang 0.5.22
+and vLLM 0.31.0, with the engines' virtual environments, CUDA and the models
+bind-mounted read-only at their host paths.
+
+**Per-process GPU memory.** The NVIDIA driver reports each compute process to
+`nvidia-smi` inside the container by its PID in the container's namespace, the
+same PID the container's `/proc` shows (on the GB10, an SGLang scheduler that
+was PID 3226640 on the host was PID 780 inside, with the same 14873 MiB in
+both). CapyCTL's per-process figures therefore work in a container as on a
+host: the startup peak and the parked charge are measured, not defaulted.
 
 **GPUs.** Inject them with the NVIDIA Container Toolkit, either through CDI
 (`--device nvidia.com/gpu=all` with Podman, or Docker with CDI enabled) or with
@@ -967,6 +979,23 @@ host (see "Layout"):
 The image also needs `python3` on `PATH`: the device inventory an SGLang
 deployment is placed by is collected at start by `python3` running CapyCTL's
 runtime module; without it SGLang deployments fail placement.
+
+Found in the live run, three more things the image must carry:
+
+- **The CUDA libraries on the loader's default path.** llama.cpp links
+  `libcudart` and `libcublas`, and CapyCTL checks an engine's version with a
+  cleared environment, so `LD_LIBRARY_PATH` does not reach it: with CUDA
+  mounted but not in the loader cache, registering llama.cpp fails
+  (`engine_version_failed`) and SGLang's processes fail to start. Add the
+  directory to `/etc/ld.so.conf.d/` and run `ldconfig` while building the
+  image (with the CUDA tree present, for example through a build-time bind
+  mount).
+- **A C and C++ compiler.** vLLM and SGLang compile FlashInfer kernels at
+  their first start; without `g++` (`cannot execute 'cc1plus'`) the engine
+  exits before it is ready.
+- **The interpreter the environments link to.** An environment made with `uv`
+  links to `~/.local/share/uv/python/...`; mount that directory read-only at
+  the same path.
 
 **User and capabilities.** Run the role as the user that owns the state
 directory (`--user <uid>:<gid>`), or as root. It needs no added capabilities
@@ -1015,6 +1044,11 @@ could not read under `/sys/fs/cgroup`. The JIT compile-job count (`MAX_JOBS`)
 is still sized from the machine's `MemAvailable` (less the deployment's Ready
 charge on unified memory); in a tightly limited container, set `MAX_JOBS` in
 the engine env.
+
+Measured live on the GB10 under Docker's private cgroup namespace (the role
+sees its cgroup as `/`): without `--memory` the role reported `meminfo`; with
+`--memory 100g` it reported `cgroup_v2:/`, a capacity of 102400 MiB, and said
+so at start.
 
 A standalone role on a GB10, as an example:
 
