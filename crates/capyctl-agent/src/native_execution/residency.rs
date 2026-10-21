@@ -862,6 +862,8 @@ impl NativeHostExecution {
             Engine::Tensorfold => return Err(SessionError),
             // ADR 0029 §1, §10: llama.cpp never parks.
             Engine::Llamacpp => return Err(SessionError),
+            // ADR 0031 §4: a custom engine never parks.
+            Engine::Custom => return Err(SessionError),
         })
     }
 

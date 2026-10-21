@@ -192,6 +192,27 @@ pub enum Command {
         /// Spec §3, ADR 0014 §8: `--allow-remote-code`, `security.trust_remote_code`.
         allow_remote_code: bool,
     },
+    /// ADR 0031 §1: register a custom engine from a host-approved manifest.
+    /// Nothing is executed.
+    EngineAddCustom {
+        /// `--custom <executable>`.
+        executable: PathBuf,
+        /// `--name`, required (no default profile name).
+        name: String,
+        /// `--manifest <file>`, read once.
+        manifest: PathBuf,
+        /// Refused `capability_missing` when `enabled` (a custom engine
+        /// cannot park); `disabled` is what is written anyway.
+        deep_park: Option<DeepParkChoice>,
+        /// `--drift`, written as `security.installation_drift`.
+        drift: DriftChoice,
+        /// ADR 0028 §2.1: `--env K=V`, the profile's own engine environment.
+        env: Vec<(String, String)>,
+        /// ADR 0028 §2.1: `--approve-env GLOB`, `security.approved_env`.
+        approved_env: Vec<String>,
+        /// ADR 0031 §8: `--yes`, the confirmation without a terminal.
+        yes: bool,
+    },
     /// ADR 0018 §1: this machine's runtime profiles.
     EngineList,
     /// ADR 0018 §4: remove a runtime profile, stopping its deployments with `drain`.
@@ -285,7 +306,7 @@ impl Command {
                 format!("prune sources{}", if *apply { " --apply" } else { "" })
             }
             Command::EngineDetect { .. } => "engine detect".into(),
-            Command::EngineAdd { .. } => "engine add".into(),
+            Command::EngineAdd { .. } | Command::EngineAddCustom { .. } => "engine add".into(),
             Command::EngineList => "engine list".into(),
             Command::EngineRemove { name, .. } => format!("engine remove {name}"),
             Command::EngineFlags { engine, .. } => format!("engine flags {}", engine.name()),
@@ -487,8 +508,23 @@ enum EngineArgs {
     Add {
         /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3, or a llama-server
         /// binary or the directory holding it. Omit to pick interactively.
+        #[arg(conflicts_with = "custom")]
         path: Option<PathBuf>,
-        /// The profile name (default: the engine's name).
+        /// A custom engine: the program to run, started with the arguments
+        /// its --manifest states. Needs --name and --manifest; nothing is
+        /// executed when it is registered.
+        #[arg(long, value_name = "EXECUTABLE", requires_all = ["name", "manifest"])]
+        custom: Option<PathBuf>,
+        /// A custom engine's manifest (YAML, at most 64 KiB): its API, the
+        /// argument template and the optional health path and idle signal.
+        /// Read once and copied into the profile.
+        #[arg(long, value_name = "FILE", requires = "custom")]
+        manifest: Option<PathBuf>,
+        /// Register a custom engine without asking (needed without a terminal).
+        #[arg(long, requires = "custom")]
+        yes: bool,
+        /// The profile name (default: the engine's name; required with
+        /// --custom).
         #[arg(long)]
         name: Option<String>,
         /// Record deep parking enabled or disabled (default: enabled unless
@@ -499,22 +535,23 @@ enum EngineArgs {
         #[arg(long, value_enum, default_value_t = DriftChoice::Warn)]
         drift: DriftChoice,
         /// An engine argument added to every launch with this profile
-        /// (repeatable).
-        #[arg(long = "arg", allow_hyphen_values = true)]
+        /// (repeatable; not with --custom).
+        #[arg(long = "arg", allow_hyphen_values = true, conflicts_with = "custom")]
         args: Vec<String>,
         /// A security-sensitive engine option deployments may pass in
         /// engine_config.extra_args, such as --drafter (repeatable). Written as
-        /// security.approved_options.
+        /// security.approved_options. Not with --custom.
         #[arg(
             long = "approve-option",
             value_name = "OPTION",
-            allow_hyphen_values = true
+            allow_hyphen_values = true,
+            conflicts_with = "custom"
         )]
         approved_options: Vec<String>,
         /// A directory an approved path option may name, such as a drafter's
         /// parent directory (repeatable, absolute). Written as
-        /// security.approved_paths.
-        #[arg(long = "approve-path", value_name = "DIR")]
+        /// security.approved_paths. Not with --custom.
+        #[arg(long = "approve-path", value_name = "DIR", conflicts_with = "custom")]
         approved_paths: Vec<PathBuf>,
         /// An engine environment variable every launch with this profile sets
         /// (repeatable). Also read from CAPYCTL_ENGINE_ADD_ENV (`K=V;K=V`); a
@@ -529,8 +566,8 @@ enum EngineArgs {
         approved_env: Vec<String>,
         /// Let deployments set engine_config.trust_remote_code: true, which
         /// runs the Python a checkpoint ships with (vLLM and SGLang only).
-        /// Written as security.trust_remote_code.
-        #[arg(long)]
+        /// Written as security.trust_remote_code. Not with --custom.
+        #[arg(long, conflicts_with = "custom")]
         allow_remote_code: bool,
     },
     /// This machine's runtime profiles and whether the server accepted them.
@@ -1227,8 +1264,32 @@ impl From<CliCommand> for Command {
             },
             CliCommand::Engine { action } => match action {
                 EngineArgs::Detect { paths } => Command::EngineDetect { paths },
+                // ADR 0031 §1: clap makes `--custom` exclude the positional
+                // path and the known-engine flags, and require `--name` and
+                // `--manifest`.
+                EngineArgs::Add {
+                    custom: Some(executable),
+                    manifest,
+                    yes,
+                    name,
+                    deep_park,
+                    drift,
+                    env,
+                    approved_env,
+                    ..
+                } => Command::EngineAddCustom {
+                    executable,
+                    name: name.expect("clap: --custom requires --name"),
+                    manifest: manifest.expect("clap: --custom requires --manifest"),
+                    deep_park,
+                    drift,
+                    env,
+                    approved_env,
+                    yes,
+                },
                 EngineArgs::Add {
                     path,
+                    custom: None,
                     name,
                     deep_park,
                     drift,
@@ -1238,6 +1299,7 @@ impl From<CliCommand> for Command {
                     env,
                     approved_env,
                     allow_remote_code,
+                    ..
                 } => Command::EngineAdd {
                     path,
                     name,

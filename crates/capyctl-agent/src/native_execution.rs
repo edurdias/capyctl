@@ -43,6 +43,8 @@ mod vllm;
 mod tensorfold;
 // ADR 0029: llama.cpp's plan and adapter.
 mod llamacpp;
+// ADR 0031: custom engines' plan, adapter and loopback check.
+mod custom;
 // ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
 mod idle_gate;
 // SPEC §§9.1, 10 (W4): remote Park and Restore of a retained launch.
@@ -194,6 +196,8 @@ enum PreparedLaunch {
     /// The plan and whether its extensions are already built.
     Tensorfold(Box<(capyctl_adapters::tensorfold::PlanInputTensorfold, bool)>),
     Llamacpp(Box<capyctl_adapters::llamacpp::PlanInputLlamacpp>),
+    /// ADR 0031: the plan, keyed when the manifest uses `{api_key}`.
+    Custom(Box<capyctl_adapters::custom::PlanInputCustom>),
 }
 
 impl NativeHostExecution {
@@ -224,7 +228,10 @@ impl NativeHostExecution {
             inventory,
         ));
         // The host document's period, bounded when it was parsed (D9: 250 ms
-        // to 5 s), so a reporter is never refused for it here.
+        // to 5 s), so a reporter is never refused for it here. ADR 0031 §6:
+        // a custom engine's load is its manifest's idle signal, never a
+        // built-in family's `/metrics`; each ingress entry carries the signal
+        // frozen with its launch (`Ingress::bind_handle`).
         let load = crate::load::LoadReporter::new(ingress.clone(), host_id.clone())
             .and_then(|reporter| reporter.with_interval(config.load_report_interval))
             .ok()
@@ -722,6 +729,18 @@ impl NativeHostExecution {
         // approved paths; a retained one is never blocked by them.
         if effective.profile.engine == Engine::Llamacpp && !retained {
             self.llamacpp_plan(&effective, plan)?;
+        }
+        // ADR 0031 §2: a new custom launch must render: every placeholder
+        // filled (the key is the launch's own, minted later, so any value
+        // stands for it here) and no name CapyCTL owns in its environment,
+        // checked again at launch. A retained one is never blocked by it.
+        if effective.profile.engine == Engine::Custom && !retained {
+            let mut custom = self.custom_plan(&effective, plan)?;
+            if custom.manifest.uses_api_key() {
+                custom.values.api_key = Some(hex::encode([0u8; 32]));
+            }
+            capyctl_adapters::custom::render_command(&custom)
+                .map_err(|_| JournalError::Unauthorized)?;
         }
         Ok(effective)
     }
@@ -1298,6 +1317,13 @@ impl NativeHostExecution {
                     .map_err(|_| SessionError)?,
             ))),
             Engine::Llamacpp => Err(SessionError),
+            // ADR 0031 §4: one process per instance; a `topology` is refused
+            // at resolution, and a group member is never built.
+            Engine::Custom if group.is_none() => Ok(PreparedLaunch::Custom(Box::new(
+                self.custom_plan(effective, plan)
+                    .map_err(|_| SessionError)?,
+            ))),
+            Engine::Custom => Err(SessionError),
         }
     }
 
@@ -1387,6 +1413,17 @@ impl NativeHostExecution {
                     .with_launch(*input)
                     .with_tools(tools),
             ),
+            PreparedLaunch::Custom(input) => {
+                // ADR 0031 §7: the plan renders the key the adapter presents.
+                let adapter = self.custom_adapter(effective, plan, keys, served)?;
+                let mut input = *input;
+                input.values.api_key = effective
+                    .profile
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom::custom_key(custom, keys));
+                Box::new(adapter.with_launch(input).with_tools(tools))
+            }
         })
     }
 
@@ -1412,6 +1449,7 @@ impl NativeHostExecution {
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
             Engine::Llamacpp => Box::new(self.llamacpp_adapter(effective, plan, served)?),
+            Engine::Custom => Box::new(self.custom_adapter(effective, plan, Some(keys), served)?),
         })
     }
 
@@ -1491,20 +1529,49 @@ impl NativeHostExecution {
                     keys.inference,
                 )
                 .map_err(|_| SessionError)?;
-            // D9: load samples name the launch the controller holds as owned handle.
+            // D9: load samples name the launch the controller holds as owned
+            // handle. ADR 0031 §6, §7: the entry keeps how this launch's
+            // engine is read and keyed, from the document it is approved
+            // under, for the launch's whole life.
             self.ingress
-                .bind_handle(&scope, &command.identity.command_id)
+                .bind_handle(
+                    &scope,
+                    &command.identity.command_id,
+                    custom::engine_access(
+                        effective.profile.engine,
+                        effective.profile.custom.as_ref(),
+                    ),
+                )
                 .map_err(|_| SessionError)?;
         }
-        let observation = adapter
+        let initialized = adapter
             .execute_persisted(&initialize_command(command, plan, &effective))
-            .await
-            .map_err(|error| LaunchError {
-                engine: match error {
-                    capyctl_adapters::traits::RuntimeError::LaunchFailed(text) => Some(text),
-                    _ => None,
-                },
-            })?;
+            .await;
+        let observation = match initialized {
+            Ok(observation) => observation,
+            Err(capyctl_adapters::traits::RuntimeError::LaunchFailed(text)) => {
+                if text.starts_with(capyctl_config::custom::LISTENER_EXPOSED) {
+                    // ADR 0031 §7: an engine listening off loopback is
+                    // stopped, with gone evidence, before the failure is
+                    // reported. The launch tools confer no cleanup authority,
+                    // so the host stops exactly the processes its journal
+                    // recorded for this launch; the claim stays until the
+                    // controller's Terminate settles it on that evidence.
+                    let journal = self.journal.clone();
+                    let owner = command.identity.command_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let recorded: Vec<_> = journal
+                            .inspect_owned(&owner)
+                            .map(|seen| seen.into_iter().map(|(identity, _)| identity).collect())
+                            .unwrap_or_default();
+                        !recorded.is_empty() && custom::stop_exposed(&recorded)
+                    })
+                    .await;
+                }
+                return Err(LaunchError { engine: Some(text) });
+            }
+            Err(_) => return Err(LaunchError { engine: None }),
+        };
         if !serves {
             // ADR 0028 §9: a worker's readiness is the head's; its spawned
             // and recorded processes are its whole answer.
@@ -1551,8 +1618,14 @@ impl NativeHostExecution {
                 keys.inference,
             )
             .map_err(|_| SessionError)?;
+        // ADR 0031 §6, §7: unknown when the launch's approved profile is no
+        // longer held; an entry already bound to this launch keeps its own.
         self.ingress
-            .bind_handle(&scope, &owned.identity.command_id)
+            .bind_handle(
+                &scope,
+                &owned.identity.command_id,
+                self.retained_access(owned),
+            )
             .map_err(|_| SessionError)?;
         Ok(scope)
     }
@@ -1604,6 +1677,39 @@ impl NativeHostExecution {
             command.identity.deadline_ms - PROBE_MARGIN_MS,
         )
         .await?;
+        // ADR 0031 §7: a custom launch's listeners are checked again
+        // whenever this host re-proves it, after the probe and before the
+        // gate reopens; one off loopback stops the launch.
+        if effective.profile.engine == Engine::Custom {
+            let journal = self.journal.clone();
+            let owner = owned_handle.to_owned();
+            let checked = tokio::task::spawn_blocking(move || {
+                let alive: Vec<_> = journal
+                    .inspect_owned(&owner)
+                    .map_err(|_| SessionError)?
+                    .into_iter()
+                    .filter(|(_, presence)| {
+                        *presence == capyctl_domain::completion::Presence::Alive
+                    })
+                    .map(|(identity, _)| identity)
+                    .collect();
+                match custom::check_listeners(&alive) {
+                    Ok(()) => Ok(()),
+                    Err(capyctl_adapters::custom::ListenerCheck::Exposed(_)) => {
+                        let recorded: Vec<_> = journal
+                            .inspect_owned(&owner)
+                            .map(|seen| seen.into_iter().map(|(identity, _)| identity).collect())
+                            .unwrap_or_default();
+                        custom::stop_exposed(&recorded);
+                        Err(SessionError)
+                    }
+                    Err(_) => Err(SessionError),
+                }
+            })
+            .await
+            .map_err(|_| SessionError)?;
+            checked?;
+        }
         let journal = self.journal.clone();
         let id = command.identity.command_id.clone();
         tokio::task::spawn_blocking(move || {
@@ -2135,9 +2241,18 @@ fn dp_attention(deployment_config: &str) -> bool {
 
 /// SPEC §§6.4, 13.2: the bounded summary of a launch whose recorded processes
 /// all exited before readiness, with the exit status this host's launcher
-/// reaped (the api process first) when it knows it.
+/// reaped (the api process first) when it knows it. ADR 0031 §7, §10: a
+/// custom launch this host stopped for listening off loopback reports that,
+/// with its closed code and the address and port (never a path or a value).
 fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> String {
     use capyctl_adapters::launch_failure::{summary, EngineExit};
+    if let Some(exposed) = engine
+        .and_then(|text| text.lines().next())
+        .filter(|line| line.starts_with(capyctl_config::custom::LISTENER_EXPOSED))
+        .filter(|line| capyctl_protocol::execution::is_launch_failure_text(line))
+    {
+        return exposed.to_owned();
+    }
     let mut processes: Vec<&pb::OwnedProcessObservation> = result.processes.iter().collect();
     processes.sort_by_key(|p| p.role != "api");
     let exit = processes.iter().find_map(|p| {
@@ -2342,6 +2457,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
             Engine::Tensorfold => Err(JournalError::Unauthorized),
             // ADR 0029 §1, §10: llama.cpp is restart-only and never parks.
             Engine::Llamacpp => Err(JournalError::Unauthorized),
+            // ADR 0031 §4: a custom engine is restart-only and never parks.
+            Engine::Custom => Err(JournalError::Unauthorized),
         }
     }
     fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {
@@ -4483,6 +4600,322 @@ mod tests {
         );
     }
 
+    /// ADR 0031: the fixture host with its `local` profile a custom engine
+    /// whose manifest is `manifest`, written by hand in the role document
+    /// (§1), and a restart-only chat deployment of it.
+    fn custom_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        manifest: &str,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let custom = capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(manifest).unwrap(),
+        );
+        let (executor, mut deployment, policy) =
+            sglang_fixture_with(root, identity_dir, "restart_only", |document| {
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["engine"] = "custom".into();
+                profile["executable"] = "/opt/basal/bin/basal-serve".into();
+                profile["build_fingerprint"] = custom.manifest.build_fingerprint().into();
+                profile["args"] = serde_json::json!([]);
+                profile["env"] = serde_json::json!({});
+                profile["security"]["deep_park"] = "disabled".into();
+                profile["security"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admin_credential_ref");
+                profile["custom"] = serde_json::to_value(&custom).unwrap();
+            });
+        deployment["engine_config"] = serde_json::json!({"context_length": 4096});
+        (executor, deployment, policy)
+    }
+
+    /// A custom launch command for the fixture under `root`, on `port`, with
+    /// the checkpoint's recorded digest and the profile's fingerprint.
+    fn custom_launch(
+        root: &std::path::Path,
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut launch, plan) = llamacpp_launch(root, deployment, policy, port);
+        launch.identity.profile_fingerprint = capyctl_config::custom::UNVERSIONED.into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (launch, plan)
+    }
+
+    const CUSTOM_IDLE: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+        args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\", \"--ctx={context_length}\"]\n\
+        env: {SERVE_AUTH: \"{api_key}\"}\n\
+        idle: {url: /metrics, gauges: [requests_running]}\n";
+    const CUSTOM_NO_IDLE: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+        args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n";
+
+    // T44 (ADR 0031 §2, §4): the host resolves and prepares a custom launch
+    // from its own document: the manifest's command with the leased port,
+    // the absolute checkpoint and the context; never a group member; an
+    // adapter for a retained one.
+    #[test]
+    fn a_custom_launch_prepares_from_local_policy() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            custom_fixture(root.path(), identity_dir.path(), CUSTOM_IDLE);
+        let port = closed_port();
+        let (launch, plan) = custom_launch(root.path(), &deployment, &policy, port);
+        let effective = executor.resolve(&launch).unwrap();
+        assert_eq!(effective.profile.engine, Engine::Custom);
+        let input = executor.custom_plan(&effective, &plan).unwrap();
+        assert_eq!(input.values.port, port);
+        assert!(input.values.model_dir.ends_with("models/toy"));
+        assert!(std::path::Path::new(&input.values.model_dir).is_absolute());
+        assert_eq!(input.values.served_name, "toy");
+        assert_eq!(input.values.context_length, Some(4096));
+        assert_eq!(
+            input.values.api_key, None,
+            "the key is the adapter's to give"
+        );
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Custom(..))
+        ));
+        let args = capyctl_domain::group::GroupMemberArgs {
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            nnodes: 2,
+            node_rank: 1,
+            head_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            rendezvous_port: 29500,
+            own_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            worker_port: None,
+            own_interface: None,
+        };
+        assert!(executor
+            .prepare(&effective, &plan, "toy", Some(args))
+            .is_err());
+        let keys = NativeCredentials {
+            gate: [1; 32],
+            inference: [2; 32],
+            admin: [3; 32],
+        };
+        assert!(executor
+            .probe_adapter(&effective, &plan, &keys, "toy")
+            .is_ok());
+        // ADR 0031 §7: the launch's own inference key, for a manifest that
+        // places `{api_key}` only.
+        let custom = effective.profile.custom.as_ref().unwrap();
+        assert_eq!(
+            custom::custom_key(custom, Some(&keys)),
+            Some(hex::encode([2u8; 32]))
+        );
+        let unkeyed = capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(CUSTOM_NO_IDLE).unwrap(),
+        );
+        assert_eq!(custom::custom_key(&unkeyed, Some(&keys)), None);
+    }
+
+    async fn gauge_stub(running: u64) -> u16 {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || async move { format!("requests_running {running}\n") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    // T44 (ADR 0031 §6): before Terminate the host reads a custom engine's
+    // idle signal: idle is signalled at once, busy at the bound is not;
+    // without an idle signal the stop proceeds on CapyCTL's own drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_reads_a_custom_engine_idle_signal() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            custom_fixture(root.path(), identity_dir.path(), CUSTOM_IDLE);
+        let (idle, _) = custom_launch(root.path(), &deployment, &policy, gauge_stub(0).await);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&idle, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let (busy, _) = custom_launch(root.path(), &deployment, &policy, gauge_stub(1).await);
+        assert!(
+            !executor
+                .idle_before_terminate(&busy, capyctl_protocol::now_unix_ms() + 1_200)
+                .await
+        );
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            custom_fixture(root.path(), identity_dir.path(), CUSTOM_NO_IDLE);
+        let (busy, _) = custom_launch(root.path(), &deployment, &policy, gauge_stub(1).await);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&busy, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    const CUSTOM_NEXT: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
+        args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+        idle: {url: /next-idle, gauges: [next_running]}\n";
+
+    /// A custom engine whose approved idle signal (`/metrics`) reads busy and
+    /// whose republished one (`/next-idle`) would read idle. It records the
+    /// path of every request.
+    async fn republished_stub() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let captured = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = captured.clone();
+            async move {
+                seen.lock().unwrap().push(uri.path().to_owned());
+                match uri.path() {
+                    "/next-idle" => "next_running 0\n",
+                    _ => "requests_running 1\n",
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, seen)
+    }
+
+    /// Whether each sample of one load tick of `ingress` carries engine
+    /// figures (the only figures that can read quiescent).
+    async fn engine_figures(ingress: &Arc<crate::ingress::Ingress>) -> Vec<bool> {
+        let reporter = crate::load::LoadReporter::new(ingress.clone(), "host".into()).unwrap();
+        reporter
+            .reports()
+            .await
+            .into_iter()
+            .flat_map(|r| {
+                capyctl_protocol::reports::LoadReport::try_from(r)
+                    .unwrap()
+                    .samples
+            })
+            .map(|sample| sample.engine.is_some())
+            .collect()
+    }
+
+    // T44 T17 (ADR 0031 §6; AGENTS.md: uncertainty must retain accounting): a
+    // profile removed and re-added under the same name with another idle
+    // signal takes two publications, after which the running launch's own
+    // document is no longer held. The launch is never sampled with the new
+    // manifest: an ingress entry keeps the signal frozen with its launch; one
+    // bound without it reads nothing and carries no engine figures, so its
+    // cancelling requests are never settled on a sample (only at the
+    // verified stop); and the stop gate waits its bound instead of skipping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_republished_profile_never_supplies_a_running_launch_idle_signal() {
+        use crate::ingress::{EngineAccess, Ingress, IngressScope};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            custom_fixture(root.path(), identity_dir.path(), CUSTOM_IDLE);
+        let (port, seen) = republished_stub().await;
+        let (launch, plan) = custom_launch(root.path(), &deployment, &policy, port);
+        let approved = EngineAccess::custom(&capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(CUSTOM_IDLE).unwrap(),
+        ));
+        assert_eq!(executor.retained_access(&launch), approved);
+        let scope = |deployment: &str| IngressScope {
+            host_id: "host".into(),
+            deployment_id: deployment.into(),
+            binding_id: "binding".into(),
+            incarnation: "incarnation".into(),
+            member_id: "head".into(),
+            generation: 1,
+            revision: 1,
+            instance_index: 0,
+        };
+        let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let handle = launch.identity.command_id.clone();
+        // The launch path binds the access it was approved with.
+        let bound = Ingress::new().unwrap();
+        bound
+            .register(scope("bound"), target, "toy".into(), [1; 32], [2; 32])
+            .unwrap();
+        bound
+            .bind_handle(&scope("bound"), &handle, executor.retained_access(&launch))
+            .unwrap();
+        bound.open(&scope("bound")).unwrap();
+        // Removed, then added again with another idle signal: two publications.
+        let next = capyctl_config::custom::CustomProfile::new(
+            capyctl_config::custom::CustomManifest::parse(CUSTOM_NEXT).unwrap(),
+        );
+        let republish = |request: &str, fingerprint: &str| {
+            let accepted = executor.profiles.accepted();
+            let mut document = accepted.config.document.clone();
+            document["runtime_profiles"]["local"]["custom"] = serde_json::to_value(&next).unwrap();
+            let config = HostConfig::parse(&document.to_string()).unwrap();
+            let mut inventory = accepted.inventory.clone();
+            inventory.policy_fingerprint = fingerprint.into();
+            executor
+                .profiles
+                .stage(request, crate::profiles::ProfileSet::new(config, inventory))
+                .unwrap();
+            assert!(executor.profiles.settle(request, true));
+        };
+        republish("r1", "republished-1");
+        // The previous document is still held: still the approved manifest.
+        assert_eq!(executor.retained_access(&launch), approved);
+        republish("r2", "republished-2");
+        assert!(executor.frozen_engine(&launch, &plan).is_none());
+        assert_eq!(executor.retained_access(&launch), EngineAccess::unknown());
+        // A later registration of the same launch (`register_retained`) keeps
+        // the access bound with it, so it is still read by its own signal:
+        // `/metrics` reads busy, never the new `/next-idle`.
+        bound
+            .bind_handle(&scope("bound"), &handle, executor.retained_access(&launch))
+            .unwrap();
+        assert_eq!(engine_figures(&bound).await, [false]);
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
+        // A launch first bound now (a restarted host) is unknown: nothing is
+        // read and no engine figures are published, so it never reads idle.
+        let unknown = Ingress::new().unwrap();
+        unknown
+            .register(scope("unknown"), target, "toy".into(), [3; 32], [4; 32])
+            .unwrap();
+        unknown
+            .bind_handle(
+                &scope("unknown"),
+                &handle,
+                executor.retained_access(&launch),
+            )
+            .unwrap();
+        unknown.open(&scope("unknown")).unwrap();
+        let targets = unknown.load_targets().unwrap();
+        assert_eq!(targets[0].signal, crate::load::LaunchSignal::Unknown);
+        assert!(
+            targets[0].native.is_none(),
+            "no manifest shows it takes the key"
+        );
+        assert_eq!(engine_figures(&unknown).await, [false]);
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
+        // The stop gate does not skip its wait as it would for a manifest
+        // without an idle signal: it waits the bound, then proceeds, having
+        // read nothing.
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(
+                    &launch,
+                    capyctl_protocol::now_unix_ms() + idle_gate::IDLE_MARGIN_MS + 1_500
+                )
+                .await
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_300));
+        assert_eq!(*seen.lock().unwrap(), ["/metrics"]);
+    }
+
     /// A prepared host's runtime directory for SGLang: the agent user's
     /// modules, not writable by group or other.
     fn sglang_runtime(root: &std::path::Path) {
@@ -4931,6 +5364,32 @@ mod tests {
             launch_failure(&result, None),
             "the engine exited before readiness"
         );
+    }
+
+    /// ADR 0031 §7, §10: a custom launch this host stopped for listening off
+    /// loopback reports `custom_listener_exposed` with the address and port,
+    /// in one line the wire validation accepts, never the exit summary.
+    // T44
+    #[test]
+    fn an_exposed_custom_launch_reports_its_closed_code() {
+        let result = pb::MemberExecutionResult {
+            state: "launched".into(),
+            processes: vec![pb::OwnedProcessObservation {
+                role: "api".into(),
+                pid: 10,
+                boot_id: "boot-that-never-reaped".into(),
+                start_ticks: 7,
+                presence: "gone".into(),
+            }],
+            ..Default::default()
+        };
+        let engine = "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback\nmore";
+        let text = launch_failure(&result, Some(engine));
+        assert_eq!(
+            text,
+            "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback"
+        );
+        assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
     }
 
     /// ADR 0028 §7 (owner decision 10): a group Prepare answers from this

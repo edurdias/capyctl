@@ -247,6 +247,35 @@ impl ProfileBindings {
         )
         .map_err(|error| refuse(error.to_string()))
     }
+
+    /// ADR 0031 §2: the embedded custom plan through the shared builder. The
+    /// key is left for the resolver, which takes it from the spec.
+    fn custom_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+        endpoint: &reqwest::Url,
+    ) -> Result<capyctl_adapters::custom::PlanInputCustom, CoordinatorError> {
+        let refuse = |what: String| {
+            CoordinatorError::Service(format!("cannot build a custom engine launch plan: {what}"))
+        };
+        let port = endpoint
+            .port()
+            .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
+        capyctl_adapters::custom::plan_from_effective(
+            effective,
+            port,
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+            None,
+        )
+        .map_err(|error| refuse(error.to_string()))
+    }
 }
 
 /// ADR 0023 §3: before a TensorFold launch, clear the build locks a killed
@@ -460,6 +489,42 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0030 §3: readiness and the canary follow the
                     // deployment's API.
                     api: effective.api,
+                })
+            }
+            Engine::Custom => {
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "frozen binding endpoint names no address: {}",
+                        work.endpoint()
+                    ))
+                })?;
+                let manifest = &profile
+                    .custom
+                    .as_ref()
+                    .ok_or_else(|| {
+                        CoordinatorError::Service(
+                            "the frozen custom profile carries no manifest".into(),
+                        )
+                    })?
+                    .manifest;
+                // ADR 0031 §7: a fresh key per launch, only when the
+                // manifest places `{api_key}`; the resolved-spawn factory
+                // seals it under the binding before the builder runs, and
+                // the resolver hands it to the plan.
+                let api_key = manifest
+                    .uses_api_key()
+                    .then(|| hex::encode(capyctl_store::secrets::new_engine_key()));
+                let launch = self.custom_plan(work, &self.sized(work)?, &endpoint)?;
+                Ok(AdapterSpec::Custom {
+                    fingerprint: profile.build_fingerprint.clone(),
+                    // ADR 0031 §5: the probe asks for the route served.
+                    model_id: launch.values.served_name.clone(),
+                    api: manifest.api,
+                    idle: manifest.idle.clone(),
+                    health: manifest.health.clone(),
+                    endpoint,
+                    launch: Some(launch),
+                    api_key,
                 })
             }
         }

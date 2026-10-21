@@ -1943,3 +1943,177 @@ async fn a_host_without_decisions_never_takes_a_decisions_deployment() {
     assert!(message.contains("host-a"), "{message}");
     assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
 }
+
+/// Two enrolled hosts publishing one chat custom engine as `local` (its
+/// manifest renders `{api_key}` into an argument under an arbitrary option
+/// name); each declares `custom_engines` when `capable` says so.
+fn custom_hosts(
+    state: &Arc<Mutex<OwnedCoordinatorState>>,
+    capable: [bool; 2],
+) -> (axum::Router, Vec<String>) {
+    use capyctl_config::custom::{CustomManifest, CustomProfile};
+    use capyctl_config::registration::{custom_profile_document, CustomProfileSpec};
+    let manifest = CustomManifest::from_value(json!({
+        "kind": "custom_engine",
+        "schema_version": 1,
+        "api": "chat",
+        "version": "2.2.0",
+        "args": ["--host", "{host}", "--port", "{port}", "--model", "{model_dir}", "--sesame", "{api_key}"],
+        "env": {"SERVE_THREADS": "4"},
+        "health": "/health",
+    }))
+    .unwrap();
+    let mut profile = custom_profile_document(&CustomProfileSpec {
+        executable: "/opt/serve/bin/serve".into(),
+        custom: CustomProfile::new(manifest),
+        installation_drift: capyctl_config::effective::InstallationDrift::Warn,
+        env: [("SERVE_MODE".to_owned(), "zq-profile-value".to_owned())].into(),
+        approved_env: vec![],
+    });
+    profile["revision"] = 7.into();
+    let mut ids = Vec::new();
+    for (index, (name, digest)) in [("host-a", 'e'), ("host-b", 'f')].into_iter().enumerate() {
+        let id = publish_host(state, name, digest, json!({}));
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&id)
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        document["runtime_profiles"]["local"] = profile.clone();
+        owner
+            .store()
+            .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                host_id: id.clone(),
+                config_json: document.to_string(),
+                boot_id: format!("boot-{name}"),
+                fingerprint: capyctl_config::remote_resources::policy_fingerprint(&document),
+                received_at_ms: 2000,
+            })
+            .unwrap();
+        let mut capabilities = vec!["heartbeats".to_owned(), "decisions".to_owned()];
+        if capable[index] {
+            capabilities.push("custom_engines".into());
+        }
+        owner
+            .store()
+            .record_host_version(
+                &id,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.1.6".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities,
+                    recorded_at_ms: 2000,
+                },
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    (router, ids)
+}
+
+/// The golden deployment on the custom engine, on `hosts`: declared
+/// resources, no residency (restart_only) and no typed engine setting.
+fn custom_config(mut config: Value, hosts: &[&str]) -> Value {
+    let object = config.as_object_mut().unwrap();
+    object.remove("residency");
+    object.remove("engine_config");
+    config["placement"] = json!({ "hosts": hosts });
+    config["devices"] = json!([{"sharing": "shared"}]);
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+    }
+    config
+}
+
+/// ADR 0031 §9 (ADR 0017): a host that does not declare `custom_engines` is
+/// never a candidate for a deployment on a custom engine: among several
+/// allowed hosts it is recorded refused with the typed reason, and named
+/// alone it refuses the deploy, storing nothing. ADR 0031 §8: the effective
+/// configuration the server shows carries the manifest (executable, argument
+/// template, API, idle signal) and the environment names with their sources,
+/// and never an environment value.
+// T44 T34 T37
+#[tokio::test]
+async fn a_host_without_custom_engines_never_takes_a_custom_deployment() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, ids) = custom_hosts(&state, [false, true]);
+    let (status, body) = deploy(
+        &router,
+        "both",
+        &custom_config(config.clone(), &["host-a", "host-b"]),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let id = body["deployment_id"].as_str().unwrap().to_owned();
+    let snapshot = state.lock().unwrap().store().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    let hosts: Vec<_> = deployment
+        .hosts
+        .iter()
+        .map(|h| (h.host_id.clone(), h.outcome.clone(), h.diagnostic.clone()))
+        .collect();
+    assert!(
+        hosts.contains(&(
+            "host-a".into(),
+            "refused".into(),
+            Some("host_capability_missing:custom_engines".into())
+        )),
+        "{hosts:?}"
+    );
+    assert!(
+        hosts.contains(&(ids[1].clone(), "resolved".into(), None)),
+        "{hosts:?}"
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/management/v1/deployments/{id}/effective-config"))
+                .header("authorization", format!("Bearer {MANAGEMENT}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let view = json_response(response).await;
+    assert!(!view.to_string().contains("zq-profile-value"), "{view}");
+    let effective = &view["effective"];
+    assert_eq!(effective["profile"]["engine"], "custom", "{view}");
+    assert_eq!(effective["profile"]["executable"], "/opt/serve/bin/serve");
+    let manifest = &effective["profile"]["custom"]["manifest"];
+    assert_eq!(manifest["api"], "chat", "{view}");
+    assert_eq!(manifest["args"][1], "{host}", "{view}");
+    assert_eq!(manifest["health"], "/health", "{view}");
+    assert_eq!(
+        effective["engine_env"]["vars"]["SERVE_THREADS"][1], "manifest",
+        "{view}"
+    );
+    assert_eq!(
+        effective["engine_env"]["vars"]["SERVE_MODE"],
+        json!(["<redacted>", "profile"]),
+        "{view}"
+    );
+
+    let (status, body) = deploy(&router, "alone", &custom_config(config, &["host-a"])).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("host_capability_missing:custom_engines"),
+        "{message}"
+    );
+    assert!(message.contains("host-a"), "{message}");
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
+}

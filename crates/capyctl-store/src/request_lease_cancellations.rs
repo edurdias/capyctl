@@ -3,6 +3,12 @@
 //! but a closed socket is not proof the engine stopped. The lease stays
 //! `inflight` and charged until the engine's own counters read quiescent at
 //! or after the hang-up; only then does it close.
+//!
+//! ADR 0031 §6, SPEC §10: an engine that reports no idle signal (a custom
+//! engine without `idle`) can never read quiescent. Its cancelling leases are
+//! never settled while it runs: no quiescence question is asked of it, and
+//! only the verified exit of its instance at the next stop or restart settles
+//! them (`cleanup.rs`). Drains do not wait for them; they stay charged.
 
 use rusqlite::{params, Transaction, TransactionBehavior};
 
@@ -26,15 +32,52 @@ const CANCELLING: &str = "FROM request_lease_cancellations c
        AND b.instance_index=l.instance_index AND b.state!='released'
      WHERE l.session_id=?1 AND l.disposition='inflight'";
 
+/// ADR 0031 §6: whether the engine of instance lane (`deployment`, `index`),
+/// SQL expressions, reports no idle signal: its retained revision (the
+/// instance's own, else the deployment's), as resolved on its host when it
+/// was, profiles `engine: custom` with no `custom.manifest.idle`. Every
+/// built-in engine reports one; a configuration that does not decode is
+/// treated as reporting one, so it keeps the conservative built-in rules.
+pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String {
+    let chosen = "COALESCE(nh.effective_json,ne.effective_json)";
+    format!(
+        "EXISTS(SELECT 1 FROM deployment_instances ni JOIN deployments nd ON nd.id=ni.deployment_id
+           LEFT JOIN effective_revisions ne ON ne.deployment_id=nd.id AND ne.revision=COALESCE(ni.revision,nd.revision)
+           LEFT JOIN host_effective_revisions nh ON nh.deployment_id=nd.id AND nh.revision=COALESCE(ni.revision,nd.revision)
+             AND nh.host_id=ni.host_id AND nh.outcome='resolved'
+          WHERE ni.deployment_id={deployment} AND ni.instance_index={index}
+            AND CASE WHEN json_valid({chosen}) THEN json_extract({chosen},'$.profile.engine')='custom'
+                  AND json_type({chosen},'$.profile.custom.manifest.idle') IS NULL ELSE 0 END)"
+    )
+}
+
+/// ADR 0031 §6, SPEC §10: whether request lease `lease` (an alias of
+/// `request_leases`) is cancelling on an engine that reports no idle signal.
+/// Drains do not wait for such a lease; admission limits still count it.
+pub(crate) fn cancelling_without_idle_signal(lease: &str) -> String {
+    format!(
+        "(EXISTS(SELECT 1 FROM request_lease_cancellations xc WHERE xc.lease_id={lease}.id)
+          AND {})",
+        lane_without_idle_signal(
+            &format!("{lease}.deployment_id"),
+            &format!("{lease}.instance_index")
+        )
+    )
+}
+
 impl crate::Store {
-    /// Bindings of this session with at least one cancelling lease.
+    /// Bindings of this session with at least one cancelling lease, on an
+    /// engine that reports an idle signal. ADR 0031 §6: an engine without
+    /// one is never asked; its cancelling leases settle at its verified exit.
     pub fn cancelling_bindings(
         &self,
         session: &CoordinatorSession,
     ) -> Result<Vec<CancellingBinding>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT b.id,b.deployment_id,COUNT(*),MAX(c.cancelled_at_ms) {CANCELLING}
-             GROUP BY b.id,b.deployment_id ORDER BY b.id"
+               AND NOT {}
+             GROUP BY b.id,b.deployment_id ORDER BY b.id",
+            lane_without_idle_signal("l.deployment_id", "l.instance_index")
         ))?;
         let rows = statement.query_map([session.id()], |r| {
             let leases: i64 = r.get(2)?;
@@ -50,6 +93,8 @@ impl crate::Store {
 
     /// Close this session's cancelling leases on the binding cancelled at or
     /// before `asked_at_ms`; journals one event with `receipt`. Returns the count.
+    /// ADR 0031 §6: never on an engine that reports no idle signal, whatever
+    /// the caller observed; only its verified exit settles those (0 here).
     pub fn settle_cancelled_leases(
         &self,
         session: &CoordinatorSession,
@@ -78,12 +123,15 @@ impl crate::Store {
             return Ok(0);
         };
         let count = tx.execute(
-            "DELETE FROM request_leases WHERE id IN (SELECT l.id FROM request_lease_cancellations c
-               JOIN request_leases l ON l.id=c.lease_id
-               JOIN runtime_bindings b ON b.deployment_id=l.deployment_id
-                 AND b.instance_index=l.instance_index
-               WHERE b.id=?2 AND l.session_id=?1 AND l.disposition='inflight'
-                 AND c.cancelled_at_ms<=?3)",
+            &format!(
+                "DELETE FROM request_leases WHERE id IN (SELECT l.id FROM request_lease_cancellations c
+                   JOIN request_leases l ON l.id=c.lease_id
+                   JOIN runtime_bindings b ON b.deployment_id=l.deployment_id
+                     AND b.instance_index=l.instance_index
+                   WHERE b.id=?2 AND l.session_id=?1 AND l.disposition='inflight'
+                     AND c.cancelled_at_ms<=?3 AND NOT {})",
+                lane_without_idle_signal("l.deployment_id", "l.instance_index")
+            ),
             params![session.id(), binding_id, asked_at_ms],
         )?;
         if count > 0 {

@@ -171,6 +171,8 @@ fn declared(settings: &LaunchSettings, kind: Kind) -> Option<Option<&str>> {
         LaunchSettings::Sglang(s) => (&s.tool_call_parser, &s.reasoning_parser),
         // ADR 0029 §12: llama-server derives its parsers from the chat template.
         LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => return None,
+        // ADR 0031 §4: no parser is ever rendered for a custom engine.
+        LaunchSettings::Custom(_) => return None,
     };
     Some(match kind {
         Kind::ToolCall => tool.as_deref(),

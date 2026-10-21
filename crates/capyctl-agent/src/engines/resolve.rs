@@ -63,6 +63,9 @@ pub(crate) fn entry(env: &Path, engine: Engine) -> PathBuf {
         Engine::Tensorfold => env.join("bin/tensorfold"),
         // ADR 0029 §2: `env` is the directory holding the binary.
         Engine::Llamacpp => env.join(EXECUTABLE),
+        // ADR 0031 §1: a custom engine's executable is named, never derived;
+        // `env` is it.
+        Engine::Custom => env.to_path_buf(),
     }
 }
 
@@ -231,6 +234,43 @@ fn capyctl_agent_engine_name(engine: Engine) -> &'static str {
     crate::installation::package_name(engine).unwrap_or(engine.name())
 }
 
+/// ADR 0031 §1: `engine add --custom <executable>`. The path is made
+/// absolute lexically, as [`resolve`] does (no `..`, nothing followed), and
+/// must name an executable regular file; anything else is
+/// `engine_not_found`. A symbolic link is refused with what it points to, so
+/// the profile names the file that is measured and run (as for
+/// `llama-server`, ADR 0029 §2). Nothing is executed.
+pub fn resolve_custom(path: &Path) -> Result<PathBuf, ResolveError> {
+    let path = std::path::absolute(path).map_err(|_| {
+        ResolveError::NotFound(format!("{} cannot be made absolute", path.display()))
+    })?;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(ResolveError::NotFound(format!(
+            "{} contains '..'; name the executable directly",
+            path.display()
+        )));
+    }
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|_| ResolveError::NotFound(format!("{} does not exist", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(ResolveError::NotFound(match std::fs::canonicalize(&path) {
+            Ok(target) => format!(
+                "{} is a symbolic link; name the file it points to, {}",
+                path.display(),
+                target.display()
+            ),
+            Err(_) => format!("{} is a symbolic link to nothing", path.display()),
+        }));
+    }
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(ResolveError::NotFound(format!(
+            "{} is not an executable regular file",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionCheckError {
     Spawn,
@@ -302,6 +342,9 @@ pub fn check_version(
     match resolved.engine {
         Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => command.arg("--version"),
         Engine::Sglang => command.args(["-I", "-B", "-c", SGLANG_VERSION, "sglang"]),
+        // ADR 0031 §1: a custom engine is never executed to ask its version;
+        // its version is its manifest's.
+        Engine::Custom => return Err(VersionCheckError::Spawn),
     };
     let reads_stderr = resolved.engine == Engine::Llamacpp;
     let (stdout, stderr) = if reads_stderr {

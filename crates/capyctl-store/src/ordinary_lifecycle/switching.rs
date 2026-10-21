@@ -221,6 +221,24 @@ fn uncertain_leases(
     )?)
 }
 
+/// ADR 0031 §6: whether a cancelling lease on the instance waits for its
+/// verified exit because its engine reports no idle signal.
+fn cancelling_without_idle_signal(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    instance: u32,
+) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2
+                     AND l.disposition='inflight' AND {})",
+            crate::request_lease_cancellations::cancelling_without_idle_signal("l")
+        ),
+        params![deployment, instance],
+        |r| r.get(0),
+    )?)
+}
+
 fn park_refused(
     tx: &Transaction<'_>,
     deployment: &str,
@@ -467,6 +485,9 @@ impl crate::Store {
     /// by a Stop, never a park (SPEC §9.2: unknown work is not proof of
     /// quiescence for parking), and only the Stop's cleanup evidence settles
     /// it (SPEC §10: conservative accounting until controlled cleanup).
+    /// ADR 0031 §6, SPEC §10: nor is a cancelling lease on an engine that
+    /// reports no idle signal; waiting could only end at the drain timeout.
+    /// It stays charged until the release's verified exit settles it.
     pub fn switch_outstanding_leases(
         &self,
         deployment: &str,
@@ -474,7 +495,10 @@ impl crate::Store {
         generation: i64,
     ) -> Result<usize, LifecycleError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND disposition='inflight'",
+            &format!(
+                "SELECT COUNT(*) FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2 AND l.generation=?3 AND l.disposition='inflight' AND NOT {}",
+                crate::request_lease_cancellations::cancelling_without_idle_signal("l")
+            ),
             params![deployment, instance, generation],
             |r| r.get(0),
         )?;
@@ -487,7 +511,9 @@ impl crate::Store {
     /// completing). An `uncertain` lease is not counted: the router could not
     /// prove that request ended (its stream was cut, or its session was lost),
     /// so waiting cannot settle it; only the cleanup's evidence that the engine
-    /// is gone does. `None` when the binding names no instance.
+    /// is gone does. ADR 0031 §6, SPEC §10: nor is a cancelling lease on an
+    /// engine that reports no idle signal: the stop does not wait for it, and
+    /// its verified exit settles it. `None` when the binding names no instance.
     pub fn binding_outstanding_leases(
         &self,
         binding_id: &str,
@@ -496,7 +522,10 @@ impl crate::Store {
             return Ok(None);
         };
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1 AND instance_index=?2 AND disposition='inflight'",
+            &format!(
+                "SELECT COUNT(*) FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2 AND l.disposition='inflight' AND NOT {}",
+                crate::request_lease_cancellations::cancelling_without_idle_signal("l")
+            ),
             params![deployment, instance],
             |r| r.get(0),
         )?;
@@ -514,7 +543,10 @@ impl crate::Store {
     /// first start), where a parked residual would still occupy it, so the
     /// victim stops. Refused
     /// (`Conflict`) while a lease remains or the instance is not the closed
-    /// READY incarnation the switch drained.
+    /// READY incarnation the switch drained. ADR 0031 §6: a cancelling lease
+    /// on an engine that reports no idle signal does not remain for this
+    /// check (the predicate of [`Self::switch_outstanding_leases`]); the
+    /// victim then stops, never parks, and its verified exit settles it.
     #[allow(clippy::too_many_arguments)]
     pub fn accept_switch_release(
         &self,
@@ -534,10 +566,13 @@ impl crate::Store {
             return Err(LifecycleError::Stale);
         }
         let drained: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2
-                    AND generation=?3 AND observed_state='ready' AND dispatch_enabled=0)
-                AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1 AND instance_index=?2
-                                  AND disposition='inflight')",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2
+                        AND generation=?3 AND observed_state='ready' AND dispatch_enabled=0)
+                    AND NOT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2
+                                      AND l.disposition='inflight' AND NOT {})",
+                crate::request_lease_cancellations::cancelling_without_idle_signal("l")
+            ),
             params![deployment, instance, generation],
             |r| r.get(0),
         )?;
@@ -548,7 +583,10 @@ impl crate::Store {
         // quiescence for parking. The victim stops instead; the lease stays
         // charged until that cleanup's evidence settles it (SPEC §10).
         let unknown_work = uncertain_leases(&tx, deployment, instance)?;
-        let may_park = may_park && !unknown_work;
+        // ADR 0031 §6: a cancelling lease no idle signal can settle is
+        // settled by the stop's verified exit, so the victim stops too.
+        let unsettled_cancellation = cancelling_without_idle_signal(&tx, deployment, instance)?;
+        let may_park = may_park && !unknown_work && !unsettled_cancellation;
         // The park or stop accepted below owns the gate from here on. A switch
         // records its closure only on an open gate of this session, so a park
         // handed it may reopen the gate if it ends without effect.
@@ -622,6 +660,9 @@ impl crate::Store {
                 None if unknown_work => {
                     "a request on it is uncertain, which is not quiescence for a park".into()
                 }
+                None if unsettled_cancellation => "a cancelled request on it settles only at \
+                    its engine's verified exit (the engine reports no idle signal)"
+                    .into(),
                 None if may_park => "it does not park".into(),
                 // Discrete GPU design §5: the plan stops a victim whose
                 // parked footprint does not fit after the switch, as it does

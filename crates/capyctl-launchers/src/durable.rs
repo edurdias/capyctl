@@ -176,7 +176,11 @@ impl DurableSpawn {
             .arg("capyctl-init-gate")
             .arg(program)
             .args(args)
-            .envs(&cmd.env);
+            // ADR 0031 §7: the log writer's metadata (the values it owns by
+            // value) is the writer's alone; the engine never sees it.
+            .envs(cmd.env.iter().filter(|(name, _)| {
+                name.as_str() != capyctl_adapters::engine_log::OWNED_VALUES_VARIABLE
+            }));
         match log {
             Some(path) => {
                 // SPEC §13.3 / T21: output reaches the log through the redacting

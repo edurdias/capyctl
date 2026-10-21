@@ -130,11 +130,28 @@ pub struct RenderedCommand {
 }
 
 /// SPEC §13.3: a rendered environment carries the engine key (`VLLM_API_KEY`),
-/// so Debug names the variables and never their values.
+/// so Debug names the variables and never their values. ADR 0031 §7: a custom
+/// engine's key may sit in an argument, so every value the launch metadata
+/// names ([`crate::engine_log::OWNED_VALUES_VARIABLE`]) is redacted from the
+/// argv by value.
 impl std::fmt::Debug for RenderedCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let owned = self
+            .env
+            .get(crate::engine_log::OWNED_VALUES_VARIABLE)
+            .map(|text| crate::engine_log::decode_owned_values(text))
+            .unwrap_or_default();
+        let argv: Vec<String> = self
+            .argv
+            .iter()
+            .map(|arg| {
+                owned.iter().fold(arg.clone(), |arg, value| {
+                    arg.replace(value.as_str(), capyctl_domain::redact::REDACTED)
+                })
+            })
+            .collect();
         f.debug_struct("RenderedCommand")
-            .field("argv", &self.argv)
+            .field("argv", &argv)
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .finish()
     }

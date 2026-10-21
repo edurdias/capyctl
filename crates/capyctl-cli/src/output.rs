@@ -51,6 +51,10 @@ impl ExitCode {
     /// ADR 0023 §2: TensorFold's build toolchain is not on the engine's
     /// closed PATH; nothing was written.
     pub const TOOLCHAIN_MISSING: Self = Self(26);
+    /// ADR 0031 §10: `engine add --custom` refused the manifest (unreadable,
+    /// too large, not closed, a placeholder misused, a bad `health`, `idle`
+    /// or `environment`); nothing was written.
+    pub const CUSTOM_MANIFEST_INVALID: Self = Self(27);
 }
 
 impl From<ExitCode> for u8 {
@@ -258,6 +262,44 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0031 §9: a host too old to run custom engines.
+    (
+        "host_capability_missing:custom_engines",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    // ADR 0031 §10: a manifest refused at `engine add` (or a profile's copy
+    // refused at role start), and resolution's custom engine refusals.
+    (
+        "custom_manifest_invalid",
+        Named::Bare,
+        Some(ExitCode::CUSTOM_MANIFEST_INVALID),
+    ),
+    (
+        "custom_field_unsupported",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    (
+        "custom_placeholder_unset",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    // ADR 0031 §8: a served name or checkpoint directory that would read as
+    // an option, refused at resolution and again at launch.
+    (
+        "custom_value_invalid",
+        Named::Required,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    // ADR 0031 Amendment A1: a custom profile without its engine-key
+    // reference.
+    (
+        "custom_credential_ref_missing",
+        Named::Bare,
+        Some(ExitCode::INVALID_CONFIG),
+    ),
+    ("custom_listener_exposed", Named::Bare, None),
     // ADR 0023 §2: an existing code keeps its exit when a configuration
     // refusal carries it (`capability_missing:deep_park`).
     (
@@ -406,6 +448,8 @@ impl StructuredError {
             "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
             "still_stopping" => ExitCode::STILL_STOPPING,
             "toolchain_missing" => ExitCode::TOOLCHAIN_MISSING,
+            // ADR 0031 §8: the operator answered no at `engine add --custom`.
+            "declined" => ExitCode::INVALID_CONFIG,
             // ADR 0023 §2: a park asked of an engine that cannot park.
             "capability_missing" => ExitCode::UNSUPPORTED,
             _ => ExitCode::UNSUPPORTED,

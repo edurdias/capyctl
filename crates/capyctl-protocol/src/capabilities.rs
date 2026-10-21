@@ -101,6 +101,12 @@ pub const CHECKPOINT_GGUF: &str = "checkpoint_gguf";
 /// refused `host_capability_missing:decisions` before anything is sent, so an
 /// older host never receives a deployment whose checks it would run as chat.
 pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
+/// ADR 0031 §9: the host runs custom engines (a profile of kind `custom`:
+/// the manifest's command, its placeholders, the loopback check). The server
+/// places a deployment whose selected profile is a custom engine only on a
+/// host that declared it; any other is refused
+/// `host_capability_missing:custom_engines` before anything is sent.
+pub const CUSTOM_ENGINES: &str = capyctl_config::custom::CAPABILITY;
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -145,6 +151,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_TABLES, Direction::ServerToHost),
     (CHECKPOINT_GGUF, Direction::ServerToHost),
     (DECISIONS, Direction::ServerToHost),
+    (CUSTOM_ENGINES, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -317,6 +324,13 @@ pub fn group_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
 /// host that did not declare `decisions`, or `None` when it may be placed.
 pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
     (!host_capabilities.contains(DECISIONS)).then(|| missing(DECISIONS))
+}
+
+/// ADR 0031 §9: the typed refusal for placing a deployment on a custom
+/// engine on a host that did not declare `custom_engines`, or `None` when it
+/// may be placed. A decisions custom engine needs [`decisions_refusal`] too.
+pub fn custom_engines_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(CUSTOM_ENGINES)).then(|| missing(CUSTOM_ENGINES))
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state

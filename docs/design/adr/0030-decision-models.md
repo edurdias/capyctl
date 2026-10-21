@@ -95,35 +95,6 @@ readiness proves the model answers, not that it is right. This holds at start, a
 restart, and when a host re-proves a launch after reconnecting. `/health` and `/v1/models`
 alone are not readiness (SPEC §6.1).
 
-The request is version `1` of the probe of kind `decision`
-(`crates/capyctl-adapters/src/decision_probe.rs`), sent to the launch's own loopback
-endpoint with its own key, never through ingress or the router:
-
-```json
-{
-  "model": "<the engine's served model name>",
-  "state": "The ticket says: my card was charged twice.",
-  "questions": {
-    "route": {
-      "type": "choice",
-      "instructions": "Which team should handle this ticket?",
-      "criteria": {
-        "billing": "payments, charges and refunds",
-        "shipping": "deliveries, parcels and tracking",
-        "technical": "errors, crashes and sign-in problems"
-      }
-    }
-  }
-}
-```
-
-The answer is ready evidence when the question `route` is answered as a `choice`, with a
-probability for every option and no other, each finite and within [0, 1], summing to 1
-within 1e-3, and the pick one of the three options. It is a well-formed answer, not the
-correct choice. The kind and version are recorded with the wake canary's reference (§4),
-so any change to the request, its state, question, instructions, options or descriptions,
-is a new version, and a reference recorded by another version is never compared with it.
-
 ### 4. The wake check compares probabilities
 
 The first answer to the fixed request is recorded as the reference, as the chat canary is

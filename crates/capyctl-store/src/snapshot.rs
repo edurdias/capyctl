@@ -405,6 +405,29 @@ pub struct InstanceSnapshot {
     /// instance. Absent for a single-host instance (T39). Additive.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupStatus>,
+    /// ADR 0031 §6, SPEC §10: the instance's cancelling requests and what
+    /// settles them. Additive.
+    pub requests: InstanceRequests,
+}
+
+/// ADR 0031 §6, SPEC §10: requests whose client hung up, whose deadline cut
+/// them, or whose engine answered an error, still charged until settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstanceRequests {
+    /// How many, as a decimal string (the snapshot's counter convention).
+    pub cancelling: String,
+    /// `idle_signal` when the engine's idle signal settles them, `stop` when
+    /// the engine reports none and only the verified exit at the next stop or
+    /// restart does. Read from the instance's retained revision.
+    pub cancelling_settles: CancellingSettles,
+}
+
+/// ADR 0031 §6: what settles an instance's cancelling requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellingSettles {
+    IdleSignal,
+    Stop,
 }
 
 /// ADR 0028 §15: a group instance as status shows it, read from its newest
@@ -864,8 +887,12 @@ impl Store {
         // leaves a running instance on its predecessor), else the deployment's.
         // ADR 0028 §5: an instance's reservation owner is its instance-form
         // owner; a group instance's members are listed as reservations each.
-        let instances_sql = format!("SELECT i.deployment_id,i.instance_index,i.host_id,i.device_json,i.generation,i.state,i.operator_stopped,{},(SELECT o.owner_id FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index AND o.member_rank IS NULL),{},{},{},COALESCE({},{}),{},i.revision,substr(i.last_error,1,1024) FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=COALESCE(i.revision,d.revision) LEFT JOIN host_effective_revisions h ON h.deployment_id=d.id AND h.revision=COALESCE(i.revision,d.revision) AND h.host_id=i.host_id AND h.outcome='resolved' ORDER BY i.deployment_id,i.instance_index",
-            INSTANCE_OBSERVED_STATE, json_text(chosen, "$.profile.engine"), json_text(chosen, "$.profile.security.deep_park"), json_text(chosen, "$.profile.security.deep_park_source"), json_bool(chosen, "$.engine_config.enable_sleep_mode"), json_bool(chosen, "$.profile.launch_settings.enable_sleep_mode"), json_text(chosen, "$.residency"));
+        // ADR 0031 §6, SPEC §10: its cancelling requests (still in flight,
+        // with a cancellation), and whether its engine reports no idle signal,
+        // from the same retained revision the launch ran with.
+        let instances_sql = format!("SELECT i.deployment_id,i.instance_index,i.host_id,i.device_json,i.generation,i.state,i.operator_stopped,{},(SELECT o.owner_id FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index AND o.member_rank IS NULL),{},{},{},COALESCE({},{}),{},i.revision,substr(i.last_error,1,1024),(SELECT COUNT(*) FROM request_leases l JOIN request_lease_cancellations c ON c.lease_id=l.id WHERE l.deployment_id=i.deployment_id AND l.instance_index=i.instance_index AND l.disposition='inflight'),{} FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=COALESCE(i.revision,d.revision) LEFT JOIN host_effective_revisions h ON h.deployment_id=d.id AND h.revision=COALESCE(i.revision,d.revision) AND h.host_id=i.host_id AND h.outcome='resolved' ORDER BY i.deployment_id,i.instance_index",
+            INSTANCE_OBSERVED_STATE, json_text(chosen, "$.profile.engine"), json_text(chosen, "$.profile.security.deep_park"), json_text(chosen, "$.profile.security.deep_park_source"), json_bool(chosen, "$.engine_config.enable_sleep_mode"), json_bool(chosen, "$.profile.launch_settings.enable_sleep_mode"), json_text(chosen, "$.residency"),
+            crate::request_lease_cancellations::lane_without_idle_signal("i.deployment_id", "i.instance_index"));
         let instances = budget.read(&tx, &instances_sql, |r| {
             let devices: Option<String> = r.get(3)?;
             let devices = devices
@@ -895,6 +922,14 @@ impl Store {
                     startup: None,
                     latest_operation: None,
                     group: None,
+                    requests: InstanceRequests {
+                        cancelling: number(r, 16)?,
+                        cancelling_settles: if boolean(r, 17)? {
+                            CancellingSettles::Stop
+                        } else {
+                            CancellingSettles::IdleSignal
+                        },
+                    },
                 },
             ))
         })?;

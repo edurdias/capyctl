@@ -37,6 +37,7 @@ refused: an opt-out that was mistyped must not be read as "on".
 | State root | `state_dir` at the top of a standalone document named by `--config` or `CAPYCTL_CONFIG` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `$XDG_STATE_HOME/capyctl`, else `~/.local/state/capyctl` | every command |
 | Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
 | Registered engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/engines.yaml` | host, standalone, `capyctl engine` |
+| Registered custom engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/custom-engines.yaml` | host, standalone, `capyctl engine` |
 
 The role document cannot name itself, so it has no YAML form. The state root
 is where CapyCTL looks for the implicit role document, so its YAML form is read
@@ -257,7 +258,9 @@ under its cache directory, which CapyCTL does not count.
 
 Engine variables come from two places: the engine profile (every launch with
 it) and the deployment (only that deployment, and only names the profile
-approves). A deployment value wins over a profile value of the same name.
+approves). A deployment value wins over a profile value of the same name. A
+custom engine adds a third, lowest one: its manifest's `env`
+([Custom engines](#custom-engines)).
 
 | Setting | YAML | Flag | Variable |
 |---|---|---|---|
@@ -299,6 +302,112 @@ Names are compared upper-cased. `RUST_LOG`, `TOKENIZERS_PARALLELISM`,
 here replaces the compile-job limits CapyCTL computes at launch (see
 [registering engines](install.md#registering-engines)).
 
+## Custom engines
+
+A custom engine is a program CapyCTL has no integration for, registered with
+`capyctl engine add --custom <executable> --name <profile> --manifest <file>`
+([Add an engine](../guide/engines.md#custom-engines)).
+
+| Setting | YAML | Flag | Variable | Default |
+|---|---|---|---|---|
+| The manifest | `custom.manifest` in the profile | `--manifest <file>` (`capyctl engine add --custom`) | (none) | none; required |
+| Confirm without a terminal | (none) | `--yes` | (none) | ask on a terminal; refused `not_interactive` without one |
+| Profile variables and the names a deployment may set | `env`, `security.approved_env` | `--env K=V`, `--approve-env <glob>` | `CAPYCTL_ENGINE_ADD_ENV`, `CAPYCTL_APPROVE_ENV` | none ([Engine environment](#engine-environment)) |
+| When the installation's files change | `security.installation_drift: warn\|refuse` | `--drift warn\|refuse` | (none) | `warn` |
+
+`capyctl engine add --custom` writes the profile to `custom-engines.yaml`,
+beside `engines.yaml` (the same directory, found the same way), with the same
+first line, `# capyctl-document-revision: N`, and the same lock. `engines.yaml`
+refuses a profile with `engine: custom`, and `custom-engines.yaml` refuses any
+other engine. A profile name is unique across both files and the role's own
+document (`profile_exists`). A CapyCTL older than 0.1.6 does not read
+`custom-engines.yaml`, so a downgrade loses the custom engines and keeps every
+other engine.
+
+A profile in either place, `custom-engines.yaml` or `runtime_profiles` in a
+host or standalone document, has this shape:
+
+```yaml
+runtime_profiles:
+  basal-serve:
+    engine: custom
+    revision: 1
+    executable: /home/me/basal-2.2.0-venv/bin/basal-serve
+    build_fingerprint: "2.2.0"
+    args: []
+    env: {}
+    log_policy:
+      max_file_bytes: "16MiB"
+      retained_files: 3
+    security:
+      deep_park: disabled
+      trust_remote_code: false
+      credential_ref: "secret://engine-key"
+      installation_drift: warn
+    custom:
+      manifest:
+        kind: custom_engine
+        schema_version: 1
+        api: decisions
+        version: "2.2.0"
+        args: [--mode, eager, --host, "{host}", --port, "{port}", --model, "{model_dir}"]
+        health: /health
+      manifest_digest: "sha256:<64 hex digits>"
+      installation_digest: "sha256:<64 hex digits>"
+```
+
+`build_fingerprint` is the manifest's `version`, or `unversioned`.
+`security.deep_park` is always `disabled`: a custom engine never parks.
+`security.credential_ref` names the engine-key reference and is required on a
+custom profile, including one written by hand in the role document (write
+`secret://engine-key`); one without it, or with a blank one, is refused
+`custom_credential_ref_missing`. CapyCTL seals a key for every launch, but
+renders and sends it only when the manifest uses `{api_key}`: an engine whose
+manifest does not gets no `Authorization` header on requests, probes or idle
+reads.
+`custom.manifest_digest` is the digest of the manifest; a profile whose digest
+does not match is refused `custom_manifest_invalid`, and the message gives
+the digest the manifest has. `custom.installation_digest`, optional, is the
+installation digest `engine add` showed at the confirmation; when it is set, it
+is the baseline drift is measured against, and an installation that measures
+differently at the role's start is drifted from then on, never taken as the new
+baseline. A malformed one is refused `custom_manifest_invalid`. `args` stays
+empty: the manifest is the whole command. A profile in the role document is
+checked the same way when the role starts; there is no `local_engine` setting,
+flag or variable for a custom engine.
+
+The manifest's fields:
+
+| Field | Value | Default |
+|---|---|---|
+| `kind` | `custom_engine` | required |
+| `schema_version` | `1` | required |
+| `api` | `chat` or `decisions`: what every deployment on the engine serves; a deployment's `api` must be the same | required |
+| `args` | the argument list after the executable, run without a shell; must hold `{host}`, `{port}` and `{model_dir}`, and may hold `{served_name}`, `{context_length}` and `{api_key}` (`{{` and `}}` are literal braces) | required |
+| `version` | a version string, shown as the engine's version | `unversioned` |
+| `environment` | an absolute directory fingerprinted in place of the default (the executable's virtual environment, else the executable alone) | the default |
+| `env` | variables for every launch; values may use the placeholders; a name CapyCTL sets itself is refused `engine_env_reserved:<name>` | none |
+| `health` | a path on the engine's own port that must answer 200 before the model check | none |
+| `idle.url` | a path on the engine's own port that reports its running and waiting requests | none: a cancelled request stays counted until the next stop or restart |
+| `idle.gauges` | Prometheus gauge names, each present and 0 (summed over its labels) when idle; or `idle.json` instead | one of the two, with `idle.url` |
+| `idle.json` | field paths in a JSON object, each present and 0 or `false` when idle | one of the two, with `idle.url` |
+
+No placeholder is allowed in `health` or `idle`, and `{api_key}` only in
+`args` and `env` values. A manifest is at most 64 KiB, and an unknown field is
+refused (`custom_manifest_invalid`).
+
+**Drift.** `security.installation_drift` works as for every engine: each
+launch measures the installation again (for a custom engine, the executable
+and its virtual environment with the interpreter, or the manifest's
+`environment`), status and the event log show a difference, and the launch is
+refused `installation_drift` only under `refuse`. The role's own
+`local_engine.installation_drift` does not apply to a custom engine.
+
+**Host capability.** A host of this release declares the capability
+`custom_engines`. A server places a deployment on a custom engine only on a
+host that declared it; naming any other host is refused
+`host_capability_missing:custom_engines`, before anything is sent to it.
+
 ## Secrets
 
 A secret is never a command-line flag: flags are visible to every user in the
@@ -331,7 +440,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
 | Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
-| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`, `--allow-remote-code`; they write `engines.yaml`, which a host and standalone read alike) |
+| Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`, `--allow-remote-code`; they write `engines.yaml`, which a host and standalone read alike); or `capyctl engine add --custom` with `--manifest` and `--yes`, which writes `custom-engines.yaml` ([Custom engines](#custom-engines)) |
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
 | Engine logs: `files` (default), or `memory`, which keeps each launch's redacted engine output in memory only ([below](#engine-logs)) | host: `engine_logs` (standalone: `host.engine_logs`) |

@@ -966,7 +966,8 @@ impl EnvEngineProvider {
         // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
             Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args,
-            Engine::Sglang => Vec::new(),
+            // ADR 0031 §1: a role's own installation is never a custom engine.
+            Engine::Sglang | Engine::Custom => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
         // cache; its memory request is the Ready allocation it declares.
@@ -1295,6 +1296,8 @@ fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, Provid
             .map(|build| build.fingerprint())
             .unwrap_or_default(),
         Engine::Vllm | Engine::Sglang => printed.trim().to_owned(),
+        // ADR 0031 §1: a role's own installation is never a custom engine.
+        Engine::Custom => String::new(),
     };
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
@@ -1802,7 +1805,7 @@ async fn start_standalone_in(
     let registered = match &engines {
         Some(path) => {
             let (runnable, skipped) =
-                capyctl_config::registration::EnginesFile::load(path)?.runnable();
+                capyctl_config::registration::EnginesFile::load_with_custom(path)?.runnable();
             for unknown in skipped {
                 role_warning(&unknown.warning(path));
             }

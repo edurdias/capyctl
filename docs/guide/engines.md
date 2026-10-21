@@ -1,7 +1,8 @@
 # Add an engine
 
 CapyCTL runs the vLLM, SGLang, TensorFold or llama.cpp you already have. It does not install engines.
-To install one first, see [Install an engine](install-engines.md).
+To install one first, see [Install an engine](install-engines.md). A program
+that is none of these can run as a [custom engine](#custom-engines).
 You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
 
@@ -63,7 +64,8 @@ the CLI and the running role the same ones.
 
 `CUSTOM yes` means a version other than vLLM 0.29.0, 0.30.0 and 0.31.0, SGLang 0.5.20 and 0.5.21 or
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
-llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. Give it its own
+llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. A custom build is
+not a [custom engine](#custom-engines): CapyCTL still knows its options. Give it its own
 name so it does not replace your main one:
 
 ```bash
@@ -440,6 +442,359 @@ choose.
 
 llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
 
+## Custom engines
+
+A custom engine is a program CapyCTL has no integration for, such as a model's
+own server. You write down how to start it, in a manifest, and CapyCTL runs it,
+sends it requests, counts its memory and keeps its log, as for any engine.
+
+It is not a [custom build](#custom-builds). A custom build is another version
+of vLLM, SGLang, TensorFold or llama.cpp, and CapyCTL still builds and checks
+its command line as that engine's. A custom engine's options are unknown to
+CapyCTL, so it checks none of them: the command in the manifest runs as
+written, and a deployment cannot add to it. Use one when no supported engine
+serves the model.
+
+### The manifest
+
+A manifest is a YAML file of at most 64 KiB. An unknown field is refused.
+
+```yaml title="basal-serve.yaml"
+kind: custom_engine
+schema_version: 1
+api: decisions
+version: "2.2.0"
+args: [--mode, eager, --host, "{host}", --port, "{port}", --model, "{model_dir}"]
+health: /health
+```
+
+| Field | What it holds | Required |
+|---|---|---|
+| `kind`, `schema_version` | `custom_engine` and `1`. | yes |
+| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`) or `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)). | yes |
+| `args` | The whole argument list after the executable, with placeholders (below). | yes |
+| `version` | A version string, shown as the engine's version. Without it the engine shows `unversioned`. CapyCTL never runs the program to ask. | no |
+| `environment` | An absolute directory to fingerprint in place of the default ([Fingerprint and drift](#fingerprint-and-drift)). | no |
+| `env` | Variables for every launch, `{NAME: value}`; values may use placeholders. | no |
+| `health` | A path on the engine's own port, such as `/health`, that must answer 200 before CapyCTL checks the model. | no |
+| `idle` | A path on the engine's own port that says when the engine has no running and no waiting requests: `url`, with `gauges` (Prometheus gauge names) or `json` (field paths in a JSON object), not both ([Cancelled requests](#cancelled-requests)). | no |
+
+An `idle` entry reads like this:
+
+```yaml
+idle:
+  url: /metrics
+  gauges: [requests_running, requests_waiting]
+```
+
+`args` runs directly, never through a shell: there is no `$VARIABLE`, `~` or
+quoting inside it. A placeholder is the only substitution, and its value stays
+one argument, or part of one, even when it holds spaces.
+
+| Placeholder | Value | Required |
+|---|---|---|
+| `{host}` | `127.0.0.1`, always | yes |
+| `{port}` | the engine's own loopback port, from `resource_policy.endpoint_port_range` | yes |
+| `{model_dir}` | the absolute path of the deployment's model directory (one under your models directory, or one CapyCTL downloaded) | yes |
+| `{served_name}` | the model name CapyCTL sends in each request's `model` | no |
+| `{context_length}` | the deployment's `engine_config.context_length` | no |
+| `{api_key}` | a key CapyCTL makes for each launch ([The engine key](#the-engine-key)) | no |
+
+`{{` and `}}` are literal braces: `'{{"port": {port}}}'` becomes
+`{"port": 8101}`. Quote every value that starts with a placeholder in YAML:
+`[--port, {port}]` is read as a YAML mapping, not as text, so write
+`[--port, "{port}"]`.
+
+`engine add` refuses the manifest with `custom_manifest_invalid` for an unknown
+placeholder, a missing `{host}`, `{port}` or `{model_dir}`, a placeholder in
+`health` or `idle`, `{api_key}` anywhere but `args` and `env` values, a `health`
+or `idle.url` that is not a path, or an `environment` that is not an absolute
+directory. A deployment on an engine that uses `{context_length}` must state
+`engine_config.context_length`, or it is refused
+`custom_placeholder_unset:context_length`. A deployment cannot add options to
+the command through a value either: a first route (the served name) or a model
+path that starts with `-` or holds a control character is refused
+`custom_value_invalid:served_name` or `custom_value_invalid:model_dir`.
+
+The manifest's `env` needs no approval, but a name CapyCTL sets itself is
+refused (`engine_env_reserved:<name>`, [the list](../operations/configuration.md#engine-environment)).
+The engine starts with a closed environment: `PATH` is the executable's
+directory and then the system directories, `HOME` and `CUDA_VISIBLE_DEVICES`
+come from CapyCTL, and `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
+since CapyCTL downloads models and the engine does not. Then come the
+manifest's variables, the engine's (`--env`) and the deployment's
+(`engine_config.env`, approved with `--approve-env`), each winning over the one
+before.
+
+### Add a custom engine
+
+```bash
+capyctl engine add --custom ~/basal-2.2.0-venv/bin/basal-serve --name basal-serve \
+  --manifest basal-serve.yaml
+```
+
+`--name` is required. The executable must be an executable file
+(`engine_not_found` otherwise). `engine add` runs nothing: before it writes
+anything, it prints the executable, the argument template with its
+placeholders, the API, the version, the variable names with where each comes
+from, the directory it fingerprints with the Python interpreter and the digest,
+the idle signal and the engine key, then asks
+`register this custom engine? [y/N]`. Only `y` or `yes` registers it; any
+other answer writes nothing (`declined`). Without a terminal, pass `--yes`, or
+the command is refused `not_interactive`. No other `engine add` asks.
+
+`--env`, `--approve-env` and `--drift warn|refuse` work as for every engine
+([Engine variables](#engine-variables)). The options that shape a known
+engine's command (`--arg`, `--approve-option`, `--approve-path`,
+`--allow-remote-code`) are refused with `--custom`, as is an installation
+path beside it, and `--deep-park enabled` is refused `capability_missing`.
+`capyctl engine detect` never lists a custom engine.
+
+Only `capyctl engine add` on the machine itself adds a custom engine, run by
+the role's user or root; no server command or management request can, so only
+the machine's administrator decides what runs there. A server shows what runs:
+`capyctl list engines --json` includes each custom engine's manifest (the
+executable, the argument template, the variable names with where each comes
+from, the idle signal and the API), and `capyctl inspect deployment <name>
+--effective-config` shows the command with the engine key hidden.
+
+The engine is saved in `custom-engines.yaml`, beside `engines.yaml`, with the
+same revision line; `engines.yaml` takes no custom engine. A name is unique
+across both files and the role's own document (`profile_exists`). The manifest
+is copied in with its digest, so editing your manifest file later changes
+nothing: to change the command, run `capyctl engine remove` and add the engine
+again. A CapyCTL older than 0.1.6 does not read `custom-engines.yaml`: after a
+downgrade the custom engines are gone and every other engine keeps working.
+A custom engine can also be written into the role's own document
+([Settings](../operations/configuration.md#custom-engines)).
+
+### Fingerprint and drift
+
+CapyCTL fingerprints the executable and what it runs with. For an executable in
+a virtual environment's `bin` (the directory above it holds `pyvenv.cfg`), that
+is every file of the environment, its `site-packages` included, and the Python
+interpreter it runs, wherever that lives. Otherwise it is the executable
+alone. A Python console script such as `basal-serve` is a few hundred bytes
+that import the environment, so its own digest would pin nothing. The
+manifest's `environment` names another directory instead, narrower (one
+package) or elsewhere (a prefix the program loads from); the executable and the
+interpreter still count.
+
+The first fingerprint reads the whole environment, several GB with PyTorch; later
+ones read only the files that changed. Past 100,000 files, 16 GiB or 32
+directory levels the engine is `unmeasured`, never refused. The digest
+`engine add` shows before you confirm is saved with the engine
+(`custom.installation_digest`) and is the one every later measurement is
+compared with: if the files changed between the confirmation and the role's
+start, the engine starts out drifted rather than taking the new files as its
+baseline. Every launch measures again. A different digest is drift: the
+machine's status and its event log show it, and the launch is refused
+(`installation_drift`) only if you added the engine with `--drift refuse`
+(`security.installation_drift: refuse`); by default it warns. A custom engine
+and a supported engine on the same executable are fingerprinted separately.
+The version shown is the manifest's `version`, or `unversioned`, and every
+custom engine lists as `CUSTOM yes`.
+
+### What CapyCTL keeps and what it refuses
+
+CapyCTL keeps, as for every engine:
+
+- **The process.** It starts the program in its own process group as the
+  role's user, stops it with SIGTERM to the group, and frees its memory only
+  once every process has exited. An engine that exits is a failed instance. A
+  program that starts a background daemon and exits leaves nothing CapyCTL can
+  own, and fails.
+- **The port.** `{host}` and `{port}` give the engine a private loopback
+  port; CapyCTL's endpoint is the only way to it from the network.
+- **Requests.** Lookup by model name, your API key, waiting, starting on
+  demand, the 32 running requests per deployment and fairness between models.
+  A request has the same shape as for any engine: chat completions, or
+  CapyCTL's decision request ([Decision requests](requests.md#decision-requests)).
+- **Readiness** (below).
+- **Memory.** You state `resources`; CapyCTL derives nothing. It watches the
+  engine's memory and shows the startup peak (`startup.measured` in
+  `capyctl status deployment <name> --json`), but it caps nothing inside the
+  engine: an engine that grows past what you stated is seen, not stopped.
+- **Logs.** The engine's output goes to the launch's private, size-bounded log
+  with keys hidden, and the management API returns its end
+  ([engine logs](../operations/install.md#engine-logs-and-troubleshooting)).
+
+CapyCTL refuses:
+
+- **Parking.** A custom engine is `restart_only`, the default. `deep` or
+  `host_backed` is refused `capability_missing:deep_park`, and
+  `capyctl park deployment` refuses it. When CapyCTL needs the memory, or the
+  model sits idle past `ready_idle_timeout`, it stops the engine and starts it
+  again on the next request, as for TensorFold.
+- **Groups.** A `topology` is refused `group_shape_unsupported:custom`. Several
+  `instances` are fine, each its own process on its own port.
+- **Sizing.** `resources` is required, as for TensorFold; `engine_config.memory`
+  is refused.
+- **Engine options from the deployment.** `accept_extra_args`, `extra_args`,
+  a draft model and every typed engine field (`dtype`, `quantization`,
+  `kv_cache_dtype`, `cuda_graphs`, `trust_remote_code`,
+  `max_concurrent_requests`, ...) are refused
+  `custom_field_unsupported:<field>`. `engine_config` takes `context_length`
+  (used only through `{context_length}`) and `env`.
+- **Parsers.** `tool_call_parser` and `reasoning_parser` are refused
+  (`custom_field_unsupported:<field>`). A chat engine that parses tool calls
+  does it with its own options, in the manifest.
+- **`cache_salt`.** A chat request with `cache_salt` is refused
+  `cache_salt_unsupported`: CapyCTL cannot know the engine honours it.
+- **Engine figures.** There are no per-request engine figures (`prefill_ms`,
+  decode speed, cached tokens) and no load reports. `ttft_ms` is CapyCTL's own,
+  the engine's `usage` passes through, and CapyCTL picks an instance by its own
+  count of running requests.
+
+A deployment's `api` must be the manifest's: `api: decisions` on a chat engine
+is refused `capability_missing:decisions`, and a chat deployment on a decisions
+engine `capability_missing:chat`. For a decision model, a `topology` or a
+parking `residency` is refused by the decision-model rules first, with their
+message ("runs on one machine", "restarts instead of parking").
+
+### Readiness
+
+A custom engine is ready when, in order, its port accepts a connection, its
+`health` path (when the manifest has one) answers 200, and the model answers
+the same check as on any engine: a short chat request for `chat`, the fixed
+decision for `decisions` ([Decision models](deploy.md#decision-models)), sent
+with the served name and the engine key when there is one. The engine's own
+`/v1/models` is not read; its shape differs from program to program. Without
+`timeouts.initialize`, the start gets the bound CapyCTL derives for every
+engine; a program that loads slowly may need a longer one.
+
+### The listener check
+
+Since CapyCTL cannot check the program's options, it checks the one that
+matters most after the fact. Once the model passes its check, and before any
+request reaches it, CapyCTL lists the TCP ports the engine's processes listen
+on. A listener on any address but `127.0.0.1` or `::1` stops the engine, and
+the start fails `custom_listener_exposed`, naming the address and port. The
+check runs again whenever the machine proves the engine still runs, after a
+reconnect or a CapyCTL restart. A port opened and closed again before the check,
+or opened later, is not seen: the check narrows the exposure, it does not
+prove there is none. A program that listens on every interface by default
+needs `--host` and `"{host}"` (or its own option for the address) in `args`.
+
+### The engine key
+
+Without `{api_key}` the engine has no key and listens on loopback
+unauthenticated: any local process on the machine can reach its port, as with
+llama.cpp and TensorFold. `capyctl engine list` shows `ENGINE KEY none`.
+
+With `{api_key}`, CapyCTL makes a new key for every launch, puts it where the
+placeholder is, and sends it as `Authorization: Bearer <key>` with every
+request, check and idle reading; the log hides it. Put it in `env` when the
+program reads a key from a variable:
+
+```yaml
+env: {MY_ENGINE_KEY: "{api_key}"}
+```
+
+An argument is visible to every local user in the process list
+(`/proc/<pid>/cmdline`); a variable is not. `engine add` warns when the
+manifest puts the key in `args`.
+
+### Cancelled requests
+
+When a client hangs up, a request runs past its deadline, or the engine
+answers with an error, the engine may still be working on the request.
+CapyCTL keeps the request's memory counted as in use until the engine shows it
+stopped. Known engines show it through their counts of running and waiting
+requests; a custom engine shows it only through `idle`. With `idle`, CapyCTL
+reads the path after the hang-up and counts the request finished once every
+named gauge or field reads 0 (or `false`). A missing, malformed or failing
+reading never counts as idle.
+
+Without `idle`, nothing shows that the engine stopped working on the request,
+and some engines do not: basal finishes a decision whose client has gone. So
+the request stays counted until the engine's next stop or restart, whether you
+stop it, it sits idle past its timeout, or CapyCTL switches to another model,
+and until every one of its processes has exited. Until then its memory, and the
+engine's, stays held. The request no longer takes one of the deployment's
+running requests, so new requests are not held back, and stopping or switching
+does not wait for it: the stop itself settles it. `capyctl status deployment
+<name>` shows them in one line per instance, under the instance table, when
+there are any:
+
+```text
+Instance 0  cancelling: 2 (settles at the next stop or restart: the engine reports no idle signal)
+```
+
+or, with `idle`, `Instance 0  cancelling: 1 (settles on the engine's idle signal)`. With
+`--json`, each instance has `requests.cancelling` and
+`requests.cancelling_settles` (`idle_signal` or `stop`). `capyctl engine list`
+shows each custom engine's `IDLE SIGNAL`, or `none`.
+
+### What CapyCTL cannot promise
+
+For the known engines, CapyCTL keeps request logging off and keeps the engine
+from downloading models, because it sets their options. For a custom engine
+those hold only if the manifest keeps them. basal's `--log-decisions <file>`
+would write every request's answer to a file, and its `--mcp on` adds a route
+with no authentication on the engine's port. `HF_HUB_OFFLINE` and
+`TRANSFORMERS_OFFLINE` stop the Hugging Face libraries from downloading, but a
+program can fetch in other ways. The engine log is still hidden from other
+users and has keys removed.
+
+### Example: basal decision models
+
+basal's `basal-serve` serves the basal-2.0 and basal-omni-1.0 decision models
+on `POST /v1/systemone`. The basal-omni models run only in basal's own
+`--mode eager`, which no supported engine serves, so `basal-serve` 2.2.0 runs
+as a custom engine, installed in a virtual environment, `~/basal-2.2.0-venv`.
+
+The manifest is `basal-serve.yaml` from [The manifest](#the-manifest), added
+with the command in [Add a custom engine](#add-a-custom-engine). CapyCTL
+fingerprints `~/basal-2.2.0-venv` (it holds `pyvenv.cfg`) and its interpreter.
+basal listens on every interface unless told otherwise, so `--host "{host}"`
+matters. It has no key option, so there is no `{api_key}`: it listens on
+loopback unauthenticated. It reports no running or queued count (its `/health`
+always answers `ok`), so there is no `idle`, and a cancelled decision stays
+counted until the next stop or restart. `--media on` is left out: basal reads
+images and audio from a `media` field, which CapyCTL's decision request does
+not carry. basal's other request extensions (`lang`, `detail`, `facts`,
+`think`, the `multi`, `act` and `tool` question types) are refused
+`invalid_request` before they reach it.
+
+A deployment, with the model's repository (its `basal.json` and calibration
+files included) in `basal-omni-1.0-max` under your models directory:
+
+```yaml title="basal-omni-max.yaml"
+name: basal-omni-max
+engine: basal-serve
+model: basal-omni-1.0-max
+api: decisions
+resources: {gpu: 32GiB, ram: 8GiB}
+```
+
+basal states about 24 GB of GPU memory for basal-omni-1.0-max in bf16 and
+about 16 GB for basal-omni-1.0-mini. The `resources` above leave room until
+the first start: then set them from the measured peak
+(`capyctl status deployment basal-omni-max --json`, `startup.measured`).
+CapyCTL starts, with the closed environment:
+
+```text
+/home/me/basal-2.2.0-venv/bin/basal-serve --mode eager --host 127.0.0.1 --port <port> \
+    --model /home/me/models/basal-omni-1.0-max
+```
+
+basal opens its port once the model is loaded, `/health` answers 200, the
+fixed decision comes back with probabilities that sum to 1, the listener check
+finds one listener on `127.0.0.1`, and requests are let in.
+
+<!-- live: CE1-CE4 -->
+
+**basal answers every failure with HTTP 422.** A malformed request and an
+engine failure (out of memory, an internal error) both come back as 422 with a
+JSON body, so CapyCTL passes either on as `engine_rejected`, a rejected
+request, and counts the request as answered. When a request you believe valid
+is rejected, read the end of the instance's engine log
+([engine logs](../operations/install.md#engine-logs-and-troubleshooting)) to
+tell the two apart. A basal release that reports its running and queued
+requests can be given an `idle` entry in a new manifest, with no CapyCTL
+change.
+
 ## Tool calls and reasoning
 
 vLLM and SGLang return structured `tool_calls` and a separate reasoning trace
@@ -772,10 +1127,16 @@ capyctl engine list
 ```
 
 ```text
-PROFILE        SOURCE         ENGINE   VERSION     CUSTOM   DEEP PARK   PUBLISHED   DEPLOYMENTS
-vllm           engines.yaml   vllm     0.31.0      no       enabled     published   -
-vllm-nightly   engines.yaml   vllm     0.32.0rc1   yes      enabled     published   -
+PROFILE        SOURCE                ENGINE   VERSION     CUSTOM   DEEP PARK   IDLE SIGNAL   ENGINE KEY   PUBLISHED   DEPLOYMENTS
+basal-serve    custom-engines.yaml   custom   2.2.0       yes      disabled    none          none         published   -
+vllm           engines.yaml          vllm     0.31.0      no       enabled     -             -            published   -
+vllm-nightly   engines.yaml          vllm     0.32.0rc1   yes      enabled     -             -            published   -
 ```
+
+`IDLE SIGNAL` and `ENGINE KEY` apply to custom engines only (`-` for the
+others): the idle signal the manifest states, or `none`, and whether CapyCTL
+gives the engine a key per launch (`per-launch`) or it listens without one
+(`none`).
 
 `PUBLISHED` shows whether the running CapyCTL uses it (`unknown` while CapyCTL is
 not running). `capyctl list engines` lists the engines of every host on a server, and of this machine on a standalone.

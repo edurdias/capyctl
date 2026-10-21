@@ -425,6 +425,13 @@ fn engine_of(effective: &EffectiveDeployment) -> Result<GroupEngine, GroupActiva
                 "llamacpp: no multi-node mode",
             ))
         }
+        // ADR 0031 §4: a custom engine runs one process per instance.
+        Engine::Custom => {
+            return Err(GroupActivationError::refused(
+                "group_shape_unsupported",
+                "custom: one process per instance",
+            ))
+        }
     })
 }
 

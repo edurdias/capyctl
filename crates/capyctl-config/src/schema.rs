@@ -14,6 +14,9 @@ pub enum ConfigKind {
     Standalone,
     /// ADR 0018 §2: the capyctl-owned `engines.yaml` beside a role document.
     Engines,
+    /// ADR 0031 amendment A1: the capyctl-owned `custom-engines.yaml` beside
+    /// `engines.yaml`, which holds the custom engines' profiles.
+    CustomEngines,
 }
 
 impl ConfigKind {
@@ -24,6 +27,7 @@ impl ConfigKind {
             ConfigKind::Deployment => "deployment",
             ConfigKind::Standalone => "standalone",
             ConfigKind::Engines => "engines",
+            ConfigKind::CustomEngines => "custom_engines",
         }
     }
 }
@@ -38,6 +42,7 @@ impl std::str::FromStr for ConfigKind {
             "deployment" => Ok(ConfigKind::Deployment),
             "standalone" => Ok(ConfigKind::Standalone),
             "engines" => Ok(ConfigKind::Engines),
+            "custom_engines" => Ok(ConfigKind::CustomEngines),
             _ => Err(crate::error::ConfigError::new(
                 crate::error::ConfigErrorCode::SchemaVersion,
                 "kind",
@@ -419,6 +424,53 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
     ]);
+    // ADR 0031 §2: the manifest as a profile carries it; its own validation
+    // (placeholders, paths, the idle signal) runs at resolution.
+    const CUSTOM_MANIFEST: FieldSpec = FieldSpec::Struct(&[
+        ("kind", SCALAR),
+        ("schema_version", SCALAR),
+        ("api", SCALAR),
+        ("version", SCALAR),
+        ("environment", SCALAR),
+        ("args", FieldSpec::Seq(&SCALAR)),
+        ("env", FieldSpec::MapOf(&SCALAR)),
+        ("health", SCALAR),
+        (
+            "idle",
+            FieldSpec::Struct(&[
+                ("url", SCALAR),
+                ("gauges", FieldSpec::Seq(&SCALAR)),
+                ("json", FieldSpec::Seq(&SCALAR)),
+            ]),
+        ),
+    ]);
+    // ADR 0031 §1: [`PROFILE`] and a custom engine's copied manifest. Only
+    // documents no 0.1.5 release reads use it (amendment A1): role documents
+    // and custom-engines.yaml.
+    const CUSTOM_PROFILE: FieldSpec = FieldSpec::Struct(&[
+        ("engine", SCALAR),
+        ("revision", SCALAR),
+        ("executable", SCALAR),
+        ("build_fingerprint", SCALAR),
+        ("args", FieldSpec::Seq(&SCALAR)),
+        ("launch_settings", FieldSpec::Moved(LAUNCH_SETTINGS_MOVED)),
+        ("env", FieldSpec::MapOf(&SCALAR)),
+        ("cuda_home", SCALAR),
+        ("security", FieldSpec::Struct(SECURITY)),
+        (
+            "log_policy",
+            FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
+        ),
+        (
+            "custom",
+            // ADR 0031 §8: the installation digest the operator approved.
+            FieldSpec::Struct(&[
+                ("manifest", CUSTOM_MANIFEST),
+                ("manifest_digest", SCALAR),
+                ("installation_digest", SCALAR),
+            ]),
+        ),
+    ]);
     // Standalone `server:`/`host:` blocks mirror the generated standalone
     // shape minus `kind` (the wrapper document already carries the kind).
     const STANDALONE_SERVER: &[(&str, FieldSpec)] = &[
@@ -545,7 +597,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("environment_fingerprint", SCALAR),
                 ("device_inventory_digest", SCALAR),
                 ("resource_policy", FieldSpec::Struct(F2_RESOURCE_POLICY)),
-                ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
+                // ADR 0031 §1: a role document may declare a custom engine's
+                // profile by hand, in the shape `engine add --custom` writes.
+                ("runtime_profiles", FieldSpec::MapOf(&CUSTOM_PROFILE)),
                 // Role-local: the period of the agent's engine load reports.
                 ("load_report_interval", DURATION),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
@@ -633,7 +687,20 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             fields: &[
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
+                // ADR 0031 amendment A1 (2026-10-21): engines.yaml keeps the
+                // profile shape of 0.1.5, which reads it strictly; a custom
+                // engine's profile lives in custom-engines.yaml instead.
                 ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
+            ],
+        },
+        // ADR 0031 amendment A1: the capyctl-owned custom engines file beside
+        // engines.yaml, which no earlier release reads.
+        ConfigKind::CustomEngines => &KindSchema {
+            required: &["schema_version", "kind"],
+            fields: &[
+                ("schema_version", SCALAR),
+                ("kind", SCALAR),
+                ("runtime_profiles", FieldSpec::MapOf(&CUSTOM_PROFILE)),
             ],
         },
     }

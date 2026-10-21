@@ -240,33 +240,15 @@ pub(super) fn snapshot_inputs(
     Ok((deployment, host))
 }
 
-/// Rebuild the declared `engine_config` block from its resolved form (ADR 0014).
-/// Values the provenance names as `capyctl default` or `derived` are omitted so
-/// resolution re-derives them; the exact-equality check then rejects a snapshot
-/// whose claimed value differs. Returns the block, whether `resources` were
-/// derived, and the checkpoint facts the derivation used.
-pub(super) fn declared_engine_config(
-    resolved: &Value,
-) -> Result<(Value, bool, CheckpointFacts), ConfigError> {
-    let object = resolved
-        .as_object()
-        .ok_or_else(|| invalid("snapshot.engine_config", "engine configuration required"))?;
-    let provenance = object
-        .get("provenance")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid("snapshot.engine_config", "provenance required"))?;
-    let declared = |field: &str| !provenance.contains_key(field);
-    let engine = object.get("engine").and_then(Value::as_str);
-    let mut block = serde_json::Map::new();
-    let common = object
-        .get("common")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid("snapshot.engine_config", "common settings required"))?;
-    for (field, value) in common {
-        if declared(field) {
-            block.insert(field.clone(), value.clone());
-        }
-    }
+/// The memory request, the family block and the extra arguments of a known
+/// engine's resolved `engine_config`, restated where the deployment declared
+/// them.
+fn restate_engine_fields(
+    object: &serde_json::Map<String, Value>,
+    block: &mut serde_json::Map<String, Value>,
+    engine: Option<&str>,
+    declared: &dyn Fn(&str) -> bool,
+) -> Result<(), ConfigError> {
     let memory = &object["memory"];
     let mut raw_memory = serde_json::Map::new();
     for (field, key) in [
@@ -323,6 +305,45 @@ pub(super) fn declared_engine_config(
     if !extra_args.is_empty() {
         block.insert("accept_extra_args".into(), json!(true));
         block.insert("extra_args".into(), Value::Array(extra_args.clone()));
+    }
+    Ok(())
+}
+
+/// Rebuild the declared `engine_config` block from its resolved form (ADR 0014).
+/// Values the provenance names as `capyctl default` or `derived` are omitted so
+/// resolution re-derives them; the exact-equality check then rejects a snapshot
+/// whose claimed value differs. Returns the block, whether `resources` were
+/// derived, and the checkpoint facts the derivation used.
+pub(super) fn declared_engine_config(
+    resolved: &Value,
+) -> Result<(Value, bool, CheckpointFacts), ConfigError> {
+    let object = resolved
+        .as_object()
+        .ok_or_else(|| invalid("snapshot.engine_config", "engine configuration required"))?;
+    let provenance = object
+        .get("provenance")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("snapshot.engine_config", "provenance required"))?;
+    let declared = |field: &str| !provenance.contains_key(field);
+    let engine = object.get("engine").and_then(Value::as_str);
+    let mut block = serde_json::Map::new();
+    let common = object
+        .get("common")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("snapshot.engine_config", "common settings required"))?;
+    for (field, value) in common {
+        if declared(field) {
+            block.insert(field.clone(), value.clone());
+        }
+    }
+    let memory = &object["memory"];
+    // ADR 0031 §4: a custom engine's deployment states nothing but its
+    // context (and `env`, restored with the declaration): everything else
+    // the resolved form holds came from its `resources`.
+    if engine == Some("custom") {
+        block.retain(|field, _| field == "context_length");
+    } else {
+        restate_engine_fields(object, &mut block, engine, &declared)?;
     }
     let weights_bytes = match memory.get("weights_bytes") {
         None => None,

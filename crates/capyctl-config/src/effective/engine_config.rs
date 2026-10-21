@@ -9,9 +9,9 @@ use crate::engine_policy::{
     option_names, typed_field_option, validate_extra_args, ExtraArgsContext, ExtraArgsPolicy,
 };
 use capyctl_domain::launch::{
-    CommonEngineSettings, LaunchSettings, LlamacppGpuLayers, LlamacppLaunchSettings, MemoryRequest,
-    SafetensorsLoadStrategy, SettingSource, SglangLaunchSettings, TensorfoldLaunchSettings,
-    VllmLaunchSettings,
+    CommonEngineSettings, CustomLaunchSettings, LaunchSettings, LlamacppGpuLayers,
+    LlamacppLaunchSettings, MemoryRequest, SafetensorsLoadStrategy, SettingSource,
+    SglangLaunchSettings, TensorfoldLaunchSettings, VllmLaunchSettings,
 };
 
 /// ADR 0014 §5: conservative placeholder overhead margins, per engine family,
@@ -136,7 +136,7 @@ pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
         Engine::Vllm | Engine::Sglang => {
             STARTUP_GRAPH_ALLOWANCE_BYTES * if draft_model { 2 } else { 1 }
         }
-        Engine::Tensorfold | Engine::Llamacpp => 0,
+        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => 0,
     }
 }
 
@@ -188,6 +188,9 @@ pub fn overhead_margin(engine: Engine) -> i64 {
         Engine::Sglang => SGLANG_OVERHEAD_MARGIN_BYTES,
         Engine::Tensorfold => TENSORFOLD_OVERHEAD_MARGIN_BYTES,
         Engine::Llamacpp => LLAMACPP_OVERHEAD_MARGIN_BYTES,
+        // ADR 0031 §4: a custom engine declares its resources; nothing is
+        // derived beside them.
+        Engine::Custom => 0,
     }
 }
 
@@ -350,6 +353,11 @@ impl RawEngineConfig {
     /// The engine environment as written (resolved against the profile later).
     pub(super) fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    /// The declared context (ADR 0031 §2: a custom engine's placeholder).
+    pub(super) fn context_length(&self) -> Option<u32> {
+        self.context_length
     }
 
     /// The extra engine arguments as written (validated later).
@@ -676,7 +684,7 @@ fn device_request_from_weights(
         .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
     let floor = match engine {
         Engine::Vllm => device.declared_total / 100 * 75,
-        Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp => 0,
+        Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => 0,
     };
     let request = request.max(floor);
     let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
@@ -1194,6 +1202,73 @@ fn positive(path: &str, value: Option<u32>) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// ADR 0031 §4, §10: the `engine_config` fields a custom engine's deployment
+/// may not state, each refused `custom_field_unsupported:<field>`, presence
+/// alone (an explicit `false` or `[]` too).
+fn refuse_custom_fields(raw: &RawEngineConfig) -> Result<(), ConfigError> {
+    let parser = |tool: bool, reasoning: bool| {
+        if tool {
+            Some("tool_call_parser")
+        } else if reasoning {
+            Some("reasoning_parser")
+        } else {
+            None
+        }
+    };
+    let vllm_parser = raw
+        .vllm
+        .as_ref()
+        .and_then(|b| parser(b.tool_call_parser.is_some(), b.reasoning_parser.is_some()));
+    let sglang_parser = raw
+        .sglang
+        .as_ref()
+        .and_then(|b| parser(b.tool_call_parser.is_some(), b.reasoning_parser.is_some()));
+    let stated: [(&str, bool); 15] = [
+        ("extra_args", raw.extra_args.is_some()),
+        ("accept_extra_args", raw.accept_extra_args.is_some()),
+        (
+            "tool_call_parser",
+            vllm_parser == Some("tool_call_parser") || sglang_parser == Some("tool_call_parser"),
+        ),
+        (
+            "reasoning_parser",
+            vllm_parser == Some("reasoning_parser") || sglang_parser == Some("reasoning_parser"),
+        ),
+        ("memory", raw.memory.is_some()),
+        ("dtype", raw.dtype.is_some()),
+        ("quantization", raw.quantization.is_some()),
+        ("kv_cache_dtype", raw.kv_cache_dtype.is_some()),
+        (
+            "max_concurrent_requests",
+            raw.max_concurrent_requests.is_some(),
+        ),
+        ("cuda_graphs", raw.cuda_graphs.is_some()),
+        ("language_model_only", raw.language_model_only.is_some()),
+        ("trust_remote_code", raw.trust_remote_code.is_some()),
+        ("vllm", raw.vllm.is_some()),
+        ("sglang", raw.sglang.is_some()),
+        (
+            if raw.tensorfold.is_some() {
+                "tensorfold"
+            } else {
+                "llamacpp"
+            },
+            raw.tensorfold.is_some() || raw.llamacpp.is_some(),
+        ),
+    ];
+    if let Some((field, _)) = stated.iter().find(|(_, set)| *set) {
+        return Err(invalid(
+            format!("engine_config.{field}"),
+            format!(
+                "custom_field_unsupported:{field}: a custom engine's manifest is its whole \
+                 command, and CapyCTL renders none of its options; a deployment states only \
+                 `context_length` (for the `{{context_length}}` placeholder) and `env`"
+            ),
+        ));
+    }
+    positive("engine_config.context_length", raw.context_length)
+}
+
 /// ADR 0014 §2–§6: resolve a deployment's `engine_config` against the selected
 /// installation and residency.
 pub(super) fn normalize_engine_config(
@@ -1201,6 +1276,12 @@ pub(super) fn normalize_engine_config(
     inputs: EngineInputs<'_>,
 ) -> Result<LaunchSettings, ConfigError> {
     let engine = inputs.engine;
+    // ADR 0031 §4: CapyCTL renders none of a custom engine's options, so a
+    // deployment states only `context_length` (for its placeholder) and
+    // `env`; anything else would be silently ignored, and is refused by name.
+    if engine == Engine::Custom {
+        refuse_custom_fields(&raw)?;
+    }
     let family_mismatch = |block: &str| {
         invalid(
             format!("engine_config.{block}"),
@@ -1223,7 +1304,7 @@ pub(super) fn normalize_engine_config(
     if let Some(family) = match engine {
         Engine::Tensorfold => Some("TensorFold"),
         Engine::Llamacpp => Some("llama.cpp"),
-        Engine::Vllm | Engine::Sglang => None,
+        Engine::Vllm | Engine::Sglang | Engine::Custom => None,
     } {
         for (field, set) in [
             ("dtype", raw.dtype.is_some()),
@@ -1505,7 +1586,7 @@ pub(super) fn normalize_engine_config(
             sglang.reasoning_parser.clone(),
         )),
         // ADR 0029 §12: llama-server derives its parsers from the chat template.
-        Engine::Tensorfold | Engine::Llamacpp => None,
+        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => None,
     };
     let (tool_call_parser, reasoning_parser) = match parser_fields {
         Some((block, tool, reasoning)) => (
@@ -1629,8 +1710,10 @@ pub(super) fn normalize_engine_config(
     // ADR 0029 §5, §9: llama.cpp's KV is fixed by the rendered context and
     // slots; beside a declared request or `resources` the declared
     // reservation less the weights bounds it.
-    let declared_kv_bound =
-        matches!(engine, Engine::Tensorfold | Engine::Llamacpp) && kv_cache.is_none();
+    let declared_kv_bound = matches!(
+        engine,
+        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom
+    ) && kv_cache.is_none();
     let kv_cache = match (declared_kv_bound, engine) {
         (true, Engine::Llamacpp) => match (inputs.declared_ready_total, inputs.facts.weights_bytes)
         {
@@ -1692,13 +1775,22 @@ pub(super) fn normalize_engine_config(
         (None, Some(_)) => overhead_margin(engine),
         (None, None) => host_margin(&inputs),
     };
+    // ADR 0031 §4: a custom engine's reservation is its declared `resources`
+    // and nothing is derived: CapyCTL does not know how the program holds the
+    // checkpoint, so the weights bound nothing here (an engine that outgrows
+    // its reservation is seen, not prevented). They are still recorded below.
+    let bounding_weights = match engine {
+        Engine::Custom => None,
+        _ => inputs.facts.weights_bytes,
+    };
     let (mut memory, memory_provenance) = resolve_memory(MemoryInputs {
         request: device_request.or(declared_request),
         kv_cache,
         declared_ready_total: inputs.declared_ready_total,
-        weights: inputs.facts.weights_bytes,
+        weights: bounding_weights,
         margin,
     })?;
+    memory.weights_bytes = inputs.facts.weights_bytes;
     if let Some(required) = fixed_kv.filter(|required| memory.kv_cache_bytes < *required) {
         let path = if raw_memory.kv_cache.is_some() {
             "engine_config.memory.kv_cache"
@@ -1976,6 +2068,13 @@ pub(super) fn normalize_engine_config(
                 provenance,
             })
         }
+        // ADR 0031 §4: the declared `resources` and, at most, the context
+        // its placeholder renders.
+        Engine::Custom => LaunchSettings::Custom(CustomLaunchSettings {
+            common,
+            memory,
+            provenance,
+        }),
     };
     Ok(settings)
 }

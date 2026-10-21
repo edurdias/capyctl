@@ -395,6 +395,11 @@ pub struct RuntimeProfile {
     pub cuda_home: Option<String>,
     pub security: Security,
     pub log_policy: LogPolicy,
+    /// ADR 0031 §1, §2: a custom engine's manifest, as `engine add --custom`
+    /// copied it, with its digest. Absent for every other engine, so their
+    /// profiles serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<crate::custom::CustomProfile>,
 }
 
 /// Whether this profile may park at all.
@@ -1187,6 +1192,9 @@ struct RawProfile {
     cuda_home: Option<String>,
     security: Security,
     log_policy: RawLogPolicy,
+    /// ADR 0031 §1: the copied manifest and its digest, a custom engine's only.
+    #[serde(default)]
+    custom: Option<serde_json::Value>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1296,6 +1304,89 @@ fn decode_host(host: &serde_json::Value) -> Result<HostInput, ConfigError> {
     decode(host, "host")
 }
 
+/// ADR 0031 §2, §4, §10: a custom engine's deployment states its
+/// `resources`, serves the API the manifest names, runs on one host without a
+/// parking residency, and states the context its manifest renders.
+fn check_custom_deployment(
+    raw_profile: &RawProfile,
+    d: &DeploymentInput,
+    grouped: bool,
+) -> Result<(), ConfigError> {
+    let Some(block) = &raw_profile.custom else {
+        // `normalize_profile` names the missing manifest.
+        return Ok(());
+    };
+    let manifest = crate::custom::CustomProfile::from_value(block)
+        .map_err(|e| e.at("runtime_profiles.custom"))?
+        .manifest;
+    if grouped {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "topology",
+            "group_shape_unsupported:custom: a custom engine runs one process per instance \
+             on one host; remove `topology` (several `instances` are allowed)",
+        ));
+    }
+    if let Some(tier @ (Residency::Deep | Residency::HostBacked)) = d.residency {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "residency",
+            format!(
+                "capability_missing:deep_park: a custom engine cannot park, so residency `{}` \
+                 is refused; declare `restart_only` or leave it out",
+                match tier {
+                    Residency::Deep => "deep",
+                    _ => "host_backed",
+                }
+            ),
+        ));
+    }
+    if d.api != manifest.api {
+        let (missing, serves) = match d.api {
+            DeploymentApi::Decisions => ("decisions", "chat"),
+            DeploymentApi::Chat => ("chat", "decisions"),
+        };
+        return Err(invalid(
+            "api",
+            format!(
+                "capability_missing:{missing}: this custom engine's manifest serves `api: \
+                 {serves}`, and every deployment on it serves the same API"
+            ),
+        ));
+    }
+    if d.resources.is_none() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::MissingRequired,
+            "resources",
+            "a custom engine's deployment states resources: CapyCTL derives nothing for a \
+             program it does not know, and the first start's measured peak shows what it used",
+        ));
+    }
+    if manifest
+        .placeholders()
+        .contains(&crate::custom::Placeholder::ContextLength)
+        && d.engine_config.context_length().is_none()
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::MissingRequired,
+            "engine_config.context_length",
+            "custom_placeholder_unset:context_length: the engine's manifest renders \
+             `{context_length}`, so the deployment states engine_config.context_length",
+        ));
+    }
+    // ADR 0031 §8: deployment operators cannot add arguments, so the served
+    // name `{served_name}` renders may not read as an option.
+    if crate::custom::is_invalid_value(&d.routes[0]) {
+        return Err(invalid(
+            "routes",
+            "custom_value_invalid:served_name: a custom engine's served name (the first \
+             route) may not start with `-` or hold a control character, so the engine can \
+             never read it as an option",
+        ));
+    }
+    Ok(())
+}
+
 pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
@@ -1358,6 +1449,11 @@ pub fn resolve_effective_with_checkpoint(
             "resources",
             TENSORFOLD_NEEDS_RESOURCES,
         ));
+    }
+    // ADR 0031 §2, §4: what a custom engine's deployment may state, checked
+    // against the manifest its profile carries before anything is resolved.
+    if raw_profile.engine == Engine::Custom {
+        check_custom_deployment(&raw_profile, &d, instance_spec.group.is_some())?;
     }
     // ADR 0029 §6: llama-server reads options and its configuration and
     // cache directories from these names; a deployment may not set them,
@@ -1488,11 +1584,14 @@ pub fn resolve_effective_with_checkpoint(
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)
             .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6, ADR 0029 §1: TensorFold and llama.cpp never park, so
-        // their default is restart_only.
+        // ADR 0023 §6, ADR 0029 §1, ADR 0031 §4: TensorFold, llama.cpp and
+        // custom engines never park, so their default is restart_only.
         crate::deployment_defaults::default_residency(
             raw_profile.security.deep_park.is_enabled()
-                && !matches!(raw_profile.engine, Engine::Tensorfold | Engine::Llamacpp),
+                && !matches!(
+                    raw_profile.engine,
+                    Engine::Tensorfold | Engine::Llamacpp | Engine::Custom
+                ),
             discrete,
         )
     });
@@ -1533,13 +1632,37 @@ pub fn resolve_effective_with_checkpoint(
     // ADR 0028 §2.1: the deployment's env resolves against its own profile.
     let approved_env = ApprovedEnv::parse(&profile.security.approved_env)
         .map_err(|e| invalid("runtime_profiles.security.approved_env", e.code()))?;
-    let engine_env = resolve_engine_env(&profile.env, &approved_env, d.engine_config.env())
-        .map_err(|e| invalid("engine_config.env", e.code()))?;
+    // ADR 0031 §2: a custom engine's manifest env is the lowest layer.
+    let engine_env = match &profile.custom {
+        Some(custom) => crate::engine_env::resolve_engine_env_with_manifest(
+            &custom.manifest.env,
+            &profile.env,
+            &approved_env,
+            d.engine_config.env(),
+        ),
+        None => resolve_engine_env(&profile.env, &approved_env, d.engine_config.env()),
+    }
+    .map_err(|e| invalid("engine_config.env", e.code()))?;
     let model = core::normalize_model(
         d.model,
         Some(&host.model_store),
         Some(host.model_sources.root(&host.model_store)),
     )?;
+    // ADR 0031 §8: the checkpoint directory `{model_dir}` renders comes from
+    // the deployment's model, so it may not read as an option either.
+    if profile.custom.is_some()
+        && model
+            .resolved_path
+            .as_deref()
+            .is_some_and(crate::custom::is_invalid_value)
+    {
+        return Err(invalid(
+            "model",
+            "custom_value_invalid:model_dir: a custom engine's checkpoint directory may not \
+             start with `-` or hold a control character, so the engine can never read it as \
+             an option",
+        ));
+    }
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
     // ADR 0008 amendment 2026-10-08: and so does a remote drafter source.
@@ -1712,6 +1835,7 @@ pub fn resolve_effective_with_checkpoint(
             cuda_home: profile.cuda_home,
             security: profile.security,
             log_policy: profile.log_policy,
+            custom: profile.custom,
         },
         engine_env,
         host,

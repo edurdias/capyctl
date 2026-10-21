@@ -114,9 +114,10 @@ revision: the same weights served as `chat` and as `decisions` are two
 revisions. In this release a `decisions` deployment:
 
 - needs llama.cpp 0.7.0 or newer, or SGLang 0.5.22 or newer, registered with
-  `capyctl engine add` (which records the engine's version). vLLM and
-  TensorFold are refused with `capability_missing:decisions`
-  ([Exit codes and errors](errors.md));
+  `capyctl engine add` (which records the engine's version), or a
+  [custom engine](engines.md#custom-engines) whose manifest says
+  `api: decisions`. vLLM and TensorFold are refused with
+  `capability_missing:decisions` ([Exit codes and errors](errors.md));
 - runs on one machine: a `topology` is refused;
 - restarts instead of parking: `residency` is `restart_only`, and `deep` or
   `host_backed` is refused;
@@ -138,36 +139,6 @@ never becomes ready, and CapyCTL never sends it a chat request in place of the
 decision. The same check runs when a machine reconnects or CapyCTL restarts
 with the model still running. The first answer is recorded for the wake check
 ([Parking](parking.md#park-and-wake)).
-
-### The readiness question
-
-This is the exact request CapyCTL sends, with `model` set to the name the
-engine serves the model under:
-
-```json
-{
-  "model": "<the engine's served model name>",
-  "state": "The ticket says: my card was charged twice.",
-  "questions": {
-    "route": {
-      "type": "choice",
-      "instructions": "Which team should handle this ticket?",
-      "criteria": {
-        "billing": "payments, charges and refunds",
-        "shipping": "deliveries, parcels and tracking",
-        "technical": "errors, crashes and sign-in problems"
-      }
-    }
-  }
-}
-```
-
-The model is ready when it answers `route` as a `choice` with a probability
-for each of the three options and no other, each between 0 and 1, summing to
-1 within 0.001, and picks one of the three. Any answer that meets this counts,
-whichever team it picks. Any change to the request is a new version of the
-check, and a wake reference recorded with an older version is never compared
-with the new answers.
 
 ## Deploy and start
 

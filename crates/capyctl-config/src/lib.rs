@@ -5,6 +5,8 @@
 pub mod checkpoint_layout;
 // ADR 0014 §5 (owner decision 2026-09-25): context fitted to the KV grant.
 pub mod context_fit;
+// ADR 0031: custom engines, their manifest and its placeholders.
+pub mod custom;
 pub mod defaults;
 // ADR 0030 §1, §7: what a deployment serving decision models may resolve to.
 pub mod decisions;

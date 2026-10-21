@@ -212,14 +212,20 @@ pub(super) fn candidates(
         // declared `decisions` (ADR 0017), as its latest session recorded it;
         // the live session's own declaration still gates the launch before
         // anything is sent. The embedded host is this build and serves them.
-        let serves_api = e.api.is_chat()
-            || tx.query_row(
+        // ADR 0031 §9: likewise a revision on a custom engine needs
+        // `custom_engines`; a decisions custom engine needs both.
+        let declared = |capability: &str| {
+            tx.query_row(
                 "SELECT NOT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
                      OR EXISTS(SELECT 1 FROM host_versions v, json_each(v.capabilities_json) c
                                 WHERE v.host_id=?1 AND c.value=?2)",
-                params![host, capyctl_config::decisions::HOST_CAPABILITY],
+                params![host, capability],
                 |r| r.get::<_, bool>(0),
-            )?;
+            )
+        };
+        let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
+            && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
+                || declared(capyctl_config::custom::CAPABILITY)?);
         candidates.push(HostCandidate {
             device_options,
             preferred_device,

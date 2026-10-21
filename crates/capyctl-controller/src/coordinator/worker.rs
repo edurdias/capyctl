@@ -1478,6 +1478,35 @@ impl OwnedCoordinator {
                                     })?;
                             }
                         }
+                        // ADR 0031 §7: a custom engine's one key, only when
+                        // its manifest uses `{api_key}`, sealed as the
+                        // inference role so adoption gives the running
+                        // engine back exactly the key it holds.
+                        capyctl_adapters::resolve::AdapterSpec::Custom {
+                            api_key: Some(key),
+                            ..
+                        } => {
+                            let sealed: [u8; 32] = hex::decode(key.as_str())
+                                .ok()
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .ok_or_else(|| {
+                                    CoordinatorError::Service(
+                                        "the custom engine key is not 32 bytes".into(),
+                                    )
+                                })?;
+                            store
+                                .store_engine_key(
+                                    work.binding_id(),
+                                    work.incarnation(),
+                                    &sealed,
+                                    capyctl_store::secrets::SecretRole::Inference,
+                                )
+                                .map_err(|error| {
+                                    CoordinatorError::Service(format!(
+                                        "the engine key was not stored: {error}"
+                                    ))
+                                })?;
+                        }
                         _ => {}
                     }
                 }
@@ -3717,7 +3746,9 @@ struct QuiescenceAnswer {
 
 /// SPEC §10 (amended 2026-10-01): at most every 250 ms, the retained bindings
 /// with a cancelling lease, each with its driver. Reading them waits for no
-/// engine.
+/// engine. ADR 0031 §6, SPEC §10: an engine that reports no idle signal is
+/// never listed (`cancelling_bindings`), so it is never asked; its cancelling
+/// leases settle only at its verified exit, in the stop's cleanup.
 async fn cancelling_drivers(
     shared: &Arc<Shared>,
 ) -> Result<
@@ -3818,7 +3849,9 @@ async fn settle_quiescent(
 /// close). SPEC §10: live requests are not killed while the bound runs. When it
 /// passes with requests still charged, the Stop terminates anyway: an explicit
 /// or policy Stop is the separate authorization force termination needs. Their
-/// leases keep their accounting until they settle on evidence.
+/// leases keep their accounting until they settle on evidence. ADR 0031 §6:
+/// a cancelling lease on an engine that reports no idle signal is not waited
+/// for (`binding_outstanding_leases`); this stop's verified exit settles it.
 async fn drain_before_terminate(
     shared: &Arc<Shared>,
     work: &OrdinaryCleanupReceipt,

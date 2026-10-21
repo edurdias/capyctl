@@ -31,6 +31,35 @@ use capyctl_domain::redact::{redact_urls, REDACTED};
 /// nothing that short. The shape rules still apply to it.
 const OWNED_MIN_BYTES: usize = 8;
 
+/// ADR 0031 §7: launch metadata naming values the log writer owns by value
+/// whatever carries them to the engine: an argument, or an environment
+/// variable whose name says nothing (a custom engine's `{api_key}` may sit
+/// in either). Its value is [`encode_owned_values`]. The launcher hands it to
+/// the writer and removes it from the engine's environment before exec
+/// (`capyctl_launchers::durable`), so the engine never sees it; a rendered
+/// command's Debug redacts these values from its argv. A `CAPYCTL_` name, so
+/// no profile, manifest or deployment can set it (ADR 0028 §2.1 rule 1).
+pub const OWNED_VALUES_VARIABLE: &str = "CAPYCTL_ENGINE_LOG_OWNS";
+
+/// The [`OWNED_VALUES_VARIABLE`] value for `values`: each hex-encoded, comma
+/// separated.
+pub fn encode_owned_values<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    values
+        .into_iter()
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The inverse of [`encode_owned_values`]; a malformed entry is skipped.
+pub fn decode_owned_values(text: &str) -> Vec<String> {
+    text.split(',')
+        .filter_map(|entry| hex::decode(entry).ok())
+        .filter_map(|raw| String::from_utf8(raw).ok())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 /// The default tail the management surface returns.
 pub const TAIL_DEFAULT_BYTES: usize = 64 * 1024;
 
@@ -62,10 +91,15 @@ impl LogRedactor {
             .sort_by_key(|known| std::cmp::Reverse(known.len()));
     }
 
-    /// Own every secret-named variable of an engine's environment.
+    /// Own every secret-named variable of an engine's environment, and every
+    /// value its launch metadata names ([`OWNED_VALUES_VARIABLE`]).
     pub fn own_environment(&mut self, env: &BTreeMap<String, String>) {
         for (name, value) in env {
-            if is_secret_variable(name) {
+            if name == OWNED_VALUES_VARIABLE {
+                for owned in decode_owned_values(value) {
+                    self.own(&owned);
+                }
+            } else if is_secret_variable(name) {
                 self.own(value);
             }
         }

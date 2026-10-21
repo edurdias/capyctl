@@ -139,9 +139,10 @@ pub fn validate_config_at(
             }
             Value::Null
         }
-        // ADR 0018 §2: `engines.yaml` validates like any other document kind.
-        ConfigKind::Engines => {
-            capyctl_config::registration::EnginesFile::parse(file, &text)
+        // ADR 0018 §2: `engines.yaml` validates like any other document kind;
+        // ADR 0031 amendment A1: so does `custom-engines.yaml`.
+        ConfigKind::Engines | ConfigKind::CustomEngines => {
+            capyctl_config::registration::EnginesFile::parse_as(kind, file, &text)
                 .map_err(|e| named(file, Some(kind), &e))?;
             Value::Null
         }
@@ -614,6 +615,7 @@ fn detect_kind(text: &str) -> Result<ConfigKind, ConfigError> {
         ConfigKind::Deployment,
         ConfigKind::Standalone,
         ConfigKind::Engines,
+        ConfigKind::CustomEngines,
     ];
     let mut failures = Vec::new();
     for kind in kinds {

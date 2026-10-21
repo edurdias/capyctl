@@ -43,6 +43,10 @@ pub struct RemoteLaunchBinding {
     /// Every launch, park and wake of it then needs the host's `decisions`;
     /// a host without it is refused typed before anything is sent.
     pub decisions: bool,
+    /// ADR 0031 §9: the launch runs a custom engine. Every command of it then
+    /// needs the host's `custom_engines`; a host without it is refused typed
+    /// before anything is sent.
+    pub custom_engine: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
@@ -307,6 +311,9 @@ impl RemoteEngine {
         if b.decisions {
             needs.push(capabilities::DECISIONS);
         }
+        if b.custom_engine {
+            needs.push(capabilities::CUSTOM_ENGINES);
+        }
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -483,6 +490,11 @@ impl EngineAdapter for RemoteEngine {
         }
         if b.decisions {
             needs.push(capabilities::DECISIONS);
+        }
+        // ADR 0031 §9: a custom engine's launch goes only to a host that
+        // declared `custom_engines`.
+        if b.custom_engine {
+            needs.push(capabilities::CUSTOM_ENGINES);
         }
         self.sessions
             .preflight(&b.host_id, &needs, true)
@@ -1197,6 +1209,10 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 // ADR 0030 §1: a decisions launch goes only to a host that
                 // declared it.
                 decisions: !work.effective().api.is_chat(),
+                // ADR 0031 §9: a custom engine's launch goes only to a host
+                // that declared it.
+                custom_engine: work.effective().profile.engine
+                    == capyctl_config::engine_policy::Engine::Custom,
             },
             self.readiness.clone(),
         ))
@@ -1415,6 +1431,7 @@ mod tests {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            custom_engine: false,
         }
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {

@@ -652,6 +652,20 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&block);
         }
     }
+    // ADR 0031 §6, SPEC §10: each instance's cancelled requests still charged,
+    // and what settles them.
+    let cancelling: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(cancelling_line)
+        .collect();
+    if !cancelling.is_empty() {
+        out.push('\n');
+        for line in cancelling {
+            out.push_str(&line);
+        }
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -693,6 +707,22 @@ fn status(value: &Value, names: &HostNames) -> String {
         out.push_str(&line);
     }
     out
+}
+
+/// ADR 0031 §6, SPEC §10: one instance's cancelled requests, shown only when
+/// it has some: `Instance 0  cancelling: 2 (settles ...)`.
+fn cancelling_line(instance: &Value) -> Option<String> {
+    let requests = &instance["requests"];
+    let count = number(&requests["cancelling"]).filter(|n| *n > 0)?;
+    let settles = match requests["cancelling_settles"].as_str() {
+        Some("stop") => " (settles at the next stop or restart: the engine reports no idle signal)",
+        Some("idle_signal") => " (settles on the engine's idle signal)",
+        _ => "",
+    };
+    Some(format!(
+        "Instance {}  cancelling: {count}{settles}\n",
+        text(&instance["index"])
+    ))
 }
 
 /// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch decodes
@@ -770,6 +800,9 @@ fn engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                text(&e["idle_signal"]),
+                text(&e["engine_key"]),
                 state.into(),
                 text(&e["deployments"]),
             ]
@@ -783,6 +816,8 @@ fn engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "IDLE SIGNAL",
+            "ENGINE KEY",
             "STATE",
             "DEPLOYMENTS",
         ],
@@ -803,6 +838,9 @@ fn local_engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                text(&e["idle_signal"]),
+                text(&e["engine_key"]),
                 text(&e["published"]),
                 text(&e["deployments"]),
             ]
@@ -816,6 +854,8 @@ fn local_engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "IDLE SIGNAL",
+            "ENGINE KEY",
             "PUBLISHED",
             "DEPLOYMENTS",
         ],
@@ -1090,6 +1130,32 @@ mod tests {
         let engine = out.find("Engine").expect("the engine line");
         let api = out.find("API").expect("the api line");
         assert!(api > engine && out[api..].contains("decisions"), "{out}");
+    }
+
+    // T44 T17 (ADR 0031 §6): status says how many cancelled requests each
+    // instance still carries and what settles them; nothing when none.
+    #[test]
+    fn status_shows_each_instances_cancelling_requests_and_what_settles_them() {
+        let instance = |index: u32, cancelling: &str, settles: &str| {
+            json!({"index": index, "observed_state": "ready", "lifecycle": "active",
+                "requests": {"cancelling": cancelling, "cancelling_settles": settles}})
+        };
+        let d = json!({"name": "basal", "observed_state": "ready", "instances": [
+            instance(0, "2", "stop"), instance(1, "0", "stop"), instance(2, "1", "idle_signal")]});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.contains(
+                "\nInstance 0  cancelling: 2 (settles at the next stop or restart: \
+                 the engine reports no idle signal)\n\
+                 Instance 2  cancelling: 1 (settles on the engine's idle signal)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Instance 1  cancelling"), "{out}");
+        let quiet = json!({"name": "basal", "observed_state": "ready",
+            "instances": [instance(0, "0", "stop")]});
+        let out = render(View::Status, &quiet, &HostNames::new());
+        assert!(!out.contains("cancelling"), "{out}");
     }
 
     // T14: ADR 0014 amendment A14. Status says when a hybrid model's state
@@ -1374,7 +1440,7 @@ mod tests {
         );
         assert_eq!(
             out.lines().nth(1).unwrap(),
-            "gpu-a   vllm      vllm     0.11.0    no       enabled     online   chat"
+            "gpu-a   vllm      vllm     0.11.0    no       enabled     -             -            online   chat"
         );
         let local = render(
             View::LocalEngines,
@@ -1392,7 +1458,39 @@ mod tests {
             .lines()
             .nth(1)
             .unwrap()
-            .ends_with("yes      -           published   -"));
+            .ends_with("yes      -           -             -            published   -"));
+    }
+
+    // T44 T37 (ADR 0031 §6, §7): a custom engine's row shows `CUSTOM yes`,
+    // its idle signal (or `none`) and its engine key, locally and on the
+    // server.
+    #[test]
+    fn engine_views_show_a_custom_engine_idle_signal_and_key() {
+        let local = render(
+            View::LocalEngines,
+            &json!({"engines": [{"profile": "basal", "source": "custom-engines.yaml",
+                "engine": "custom", "version": "2.2.0", "custom": true,
+                "deep_park": "disabled", "idle_signal": "none", "engine_key": "none",
+                "published": "published", "deployments": []}]}),
+            &HostNames::new(),
+        );
+        let row = local.lines().nth(1).unwrap();
+        assert!(
+            row.starts_with("basal     custom-engines.yaml   custom   2.2.0     yes      disabled    none          none"),
+            "{local}"
+        );
+        let server = render(
+            View::Engines,
+            &json!({"engines": [{"host_id": "01HOSTA", "host": "gpu-a", "online": true,
+                "profile": "keyed", "engine": "custom", "version": "unversioned", "custom": true,
+                "deep_park": "disabled", "idle_signal": "/metrics gauges running",
+                "engine_key": "per-launch", "retiring": false, "deployments": []}]}),
+            &HostNames::new(),
+        );
+        let row = server.lines().nth(1).unwrap();
+        assert!(row.contains("/metrics gauges running"), "{server}");
+        assert!(row.contains("per-launch"), "{server}");
+        assert!(row.contains(" yes "), "{server}");
     }
 
     /// `status deployment --format json` of a Ready two-host vLLM group as

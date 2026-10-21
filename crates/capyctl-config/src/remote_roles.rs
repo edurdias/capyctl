@@ -769,7 +769,8 @@ impl HostConfig {
         })?;
         let document = crate::parse_document(&text)?;
         let mut document = overrides.apply_and_validate(document)?;
-        let engines = crate::registration::EnginesFile::load(engines)?;
+        // ADR 0031 amendment A1: custom-engines.yaml beside it too.
+        let engines = crate::registration::EnginesFile::load_with_custom(engines)?;
         crate::registration::merge_into_host(&mut document, &engines)?;
         let mut config = Self::parse(&document.to_string()).map_err(|e| overrides.annotate(e))?;
         config.overrides = overrides.clone();

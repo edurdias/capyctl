@@ -8,14 +8,17 @@ use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
 use capyctl_agent::control_socket::{request, ClientError, ControlRequest};
 use capyctl_agent::engines::{
-    check_version, detect, resolve, Resolved, ScanBounds, ScanRoots, VERSION_CHECK_TIMEOUT,
+    check_version, detect, resolve, resolve_custom, Resolved, ScanBounds, ScanRoots,
+    VERSION_CHECK_TIMEOUT,
 };
+use capyctl_config::custom::{CustomManifest, CustomProfile, MANIFEST_INVALID, MAX_MANIFEST_BYTES};
 use capyctl_config::effective::InstallationDrift;
 use capyctl_config::engine_env::{is_owned, ApprovedEnv, EnvRefusal};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::registration::{
-    check_profile, lock_engines_for, profile_document, valid_profile_name, write_engines,
-    EnginesFile, ProfileSpec, ENVIRONMENT_PROFILES,
+    check_profile, custom_engines_beside, custom_profile_document, lock_engines_for,
+    profile_document, valid_profile_name, write_engines, CustomProfileSpec, EnginesFile,
+    ProfileSpec, ENGINES_FILE, ENVIRONMENT_PROFILES,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -56,6 +59,7 @@ pub fn is_engine_command(command: &Command) -> bool {
         command,
         Command::EngineDetect { .. }
             | Command::EngineAdd { .. }
+            | Command::EngineAddCustom { .. }
             | Command::EngineList
             | Command::EngineRemove { .. }
     )
@@ -145,6 +149,36 @@ pub async fn execute_with(
                 Toolchain {
                     cuda_home_env: env("CUDA_HOME"),
                     search,
+                },
+            )
+            .await
+        }
+        Command::EngineAddCustom {
+            executable,
+            name,
+            manifest,
+            deep_park,
+            drift,
+            env: env_flags,
+            approved_env,
+            yes,
+        } => {
+            // ADR 0028 §2.1, ADR 0031 §1: refused before anything is read or
+            // written.
+            let (profile_env, approved_env) = engine_add_env(env_flags, approved_env, env)
+                .map_err(|r| error("invalid_config", r.code()))?;
+            let target = resolve_target(config, state_dir, env)?;
+            add_custom(
+                &target,
+                CustomAdd {
+                    executable,
+                    name,
+                    manifest,
+                    deep_park: *deep_park,
+                    drift: *drift,
+                    env: profile_env,
+                    approved_env,
+                    yes: *yes,
                 },
             )
             .await
@@ -291,13 +325,40 @@ fn role_document(target: &Target) -> Result<Value, StructuredError> {
         .map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))
 }
 
-/// Profiles the operator declared in the role document itself.
-/// Whether `name` is registered in engines.yaml or declared in the role
-/// document (an older host may have registered a profile named `local`).
+/// ADR 0031 amendment A1: custom-engines.yaml beside the target's engines.yaml.
+fn custom_engines(target: &Target) -> std::path::PathBuf {
+    custom_engines_beside(&target.engines)
+}
+
+/// The capyctl-owned file `name` is registered in (engines.yaml or, ADR 0031
+/// amendment A1, custom-engines.yaml), if any.
+fn registered_in(target: &Target, name: &str) -> Result<Option<EnginesFile>, StructuredError> {
+    for path in [target.engines.clone(), custom_engines(target)] {
+        let file = EnginesFile::load(&path).map_err(|e| error("invalid_config", e.detail))?;
+        if file.profiles.contains_key(name) {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `name` is registered in engines.yaml or custom-engines.yaml, or
+/// declared in the role document (an older host may have registered a
+/// profile named `local`).
 fn registered_or_declared(target: &Target, name: &str) -> Result<bool, StructuredError> {
-    let engines =
-        EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
-    Ok(engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name))
+    Ok(registered_in(target, name)?.is_some() || declared_by_operator(target)?.contains_key(name))
+}
+
+/// ADR 0018 §1, ADR 0031 §1: `profile_exists`, across both capyctl-owned
+/// files and the role document.
+fn refuse_existing(target: &Target, name: &str) -> Result<(), StructuredError> {
+    if registered_or_declared(target, name)? {
+        return Err(error(
+            "profile_exists",
+            format!("profile {name} exists; use --name, or remove it first"),
+        ));
+    }
+    Ok(())
 }
 
 fn declared_by_operator(
@@ -318,12 +379,7 @@ fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64,
         .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
     let mut engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
-    if engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name) {
-        return Err(error(
-            "profile_exists",
-            format!("profile {name} exists; use --name, or remove it first"),
-        ));
-    }
+    refuse_existing(target, name)?;
     let profile = profile_document(spec);
     check_profile(name, &profile)
         .map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))?;
@@ -405,19 +461,7 @@ async fn add(
     extras: Extras<'_>,
     toolchain: Toolchain<'_>,
 ) -> Result<Value, StructuredError> {
-    // Found live 2026-10-03: a role cannot listen on a control socket whose
-    // path a Unix socket cannot hold, so nothing is saved for one it could
-    // never publish to.
-    if target.socket.as_os_str().len() > capyctl_agent::control_socket::MAX_PATH {
-        return Err(error(
-            "invalid_config",
-            format!(
-                "{} is longer than the {}-byte socket path limit, so capyctl cannot run with this state directory; use a shorter --state-dir (or CAPYCTL_STATE_DIR); nothing was written",
-                target.socket.display(),
-                capyctl_agent::control_socket::MAX_PATH
-            ),
-        ));
-    }
+    check_socket(target)?;
     let path = match path {
         Some(path) => path.to_path_buf(),
         None => pick()?,
@@ -436,18 +480,12 @@ async fn add(
         return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
-    let existing =
-        EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
-    if existing.profiles.contains_key(&name) || declared_by_operator(target)?.contains_key(&name) {
-        return Err(error(
-            "profile_exists",
-            format!("profile {name} exists; use --name, or remove it first"),
-        ));
-    }
+    refuse_existing(target, &name)?;
     // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
     // compiles at run time for llama.cpp, so no toolkit is recorded for it.
     let cuda_home = match resolved.engine {
-        Engine::Llamacpp => None,
+        // ADR 0031 §1: `--custom` registers through its own path.
+        Engine::Llamacpp | Engine::Custom => None,
         Engine::Vllm | Engine::Sglang | Engine::Tensorfold => {
             capyctl_config::registration::detect_cuda_home_in(
                 toolchain.cuda_home_env.as_deref(),
@@ -464,6 +502,8 @@ async fn add(
             Engine::Tensorfold => Some("TensorFold"),
             Engine::Llamacpp => Some("llama.cpp"),
             Engine::Vllm | Engine::Sglang => None,
+            // ADR 0031 §1: `--custom` registers through its own path.
+            Engine::Custom => Some("a custom engine"),
         } {
             return Err(error(
                 "capability_missing",
@@ -556,7 +596,7 @@ async fn add(
         trust_remote_code: extras.remote_code,
     };
     let revision = write_profile(target, &name, &spec)?;
-    let mut out = json!({
+    let out = json!({
         "profile": name, "engine": resolved.engine.name(),
         "version": registration.reported.version,
         "build_fingerprint": spec.build_fingerprint,
@@ -568,6 +608,34 @@ async fn add(
         "cuda_home": spec.cuda_home,
         "trust_remote_code": spec.trust_remote_code,
     });
+    publish(target, out, revision, &target.engines).await
+}
+
+/// Found live 2026-10-03: a role cannot listen on a control socket whose
+/// path a Unix socket cannot hold, so nothing is saved for one it could
+/// never publish to.
+fn check_socket(target: &Target) -> Result<(), StructuredError> {
+    if target.socket.as_os_str().len() > capyctl_agent::control_socket::MAX_PATH {
+        return Err(error(
+            "invalid_config",
+            format!(
+                "{} is longer than the {}-byte socket path limit, so capyctl cannot run with this state directory; use a shorter --state-dir (or CAPYCTL_STATE_DIR); nothing was written",
+                target.socket.display(),
+                capyctl_agent::control_socket::MAX_PATH
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// ADR 0018 §3: ask the running role to publish what `engine add` wrote to
+/// `written` at `revision`; `out` is the command's result.
+async fn publish(
+    target: &Target,
+    mut out: Value,
+    revision: u64,
+    written: &Path,
+) -> Result<Value, StructuredError> {
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {
             out["published"] = reply["published"].clone();
@@ -595,7 +663,7 @@ async fn add(
                  no capyctl answered on {}; if it is already running with another \
                  --state-dir or --config, restart it to publish this profile, and pass \
                  the same option to `capyctl engine`",
-                target.engines.display(),
+                written.display(),
                 match target.kind {
                     RoleKind::Standalone => "capyctl start standalone",
                     RoleKind::Host => "capyctl start host",
@@ -610,15 +678,292 @@ async fn add(
             "agent_unreachable",
             format!(
                 "{e}; {} is written (revision {revision}); it takes effect when the role starts",
-                target.engines.display()
+                written.display()
             ),
         )),
     }
 }
 
+/// ADR 0031 §1: what `engine add --custom` was asked to register.
+struct CustomAdd<'a> {
+    executable: &'a Path,
+    name: &'a str,
+    manifest: &'a Path,
+    deep_park: Option<DeepParkChoice>,
+    drift: DriftChoice,
+    /// ADR 0028 §2.1: `--env` and `--approve-env`, merged with their variables.
+    env: BTreeMap<String, String>,
+    approved_env: Vec<String>,
+    /// ADR 0031 §8: `--yes`.
+    yes: bool,
+}
+
+/// ADR 0031 §7: what `engine key` reads for a custom engine.
+fn engine_key(manifest: &CustomManifest) -> &'static str {
+    if manifest.uses_api_key() {
+        "per-launch"
+    } else {
+        "none"
+    }
+}
+
+/// ADR 0031 §7: the known limitation of an engine without a key.
+const NO_KEY_CAVEAT: &str =
+    "the engine listens unauthenticated on loopback; any local process can reach its port";
+
+/// ADR 0031 §2, §10: the manifest file, read once: at most 64 KiB of UTF-8,
+/// validated. `custom_manifest_invalid` (exit 27), or
+/// `engine_env_reserved:<NAME>` for an `env` name CapyCTL owns.
+fn read_manifest(path: &Path) -> Result<CustomManifest, StructuredError> {
+    use std::io::Read;
+    let invalid = |detail: String| {
+        error(
+            MANIFEST_INVALID,
+            format!("{}: {detail}; nothing was written", path.display()),
+        )
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_MANIFEST_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|e| invalid(format!("the manifest cannot be read: {e}")))?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid(format!(
+            "a manifest is at most 64 KiB ({MAX_MANIFEST_BYTES} bytes)"
+        )));
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| invalid("the manifest is not UTF-8 text".into()))?;
+    let manifest = CustomManifest::parse(&text).map_err(|e| {
+        if e.code == MANIFEST_INVALID {
+            invalid(e.detail.clone())
+        } else {
+            error(
+                "invalid_config",
+                format!("{}: {e}; nothing was written", path.display()),
+            )
+        }
+    })?;
+    // ADR 0031 §3, §10: `environment` names an existing absolute directory.
+    if let Some(root) = &manifest.environment {
+        if !std::fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(invalid(format!(
+                "`environment` {root} is not an existing directory"
+            )));
+        }
+    }
+    Ok(manifest)
+}
+
+/// ADR 0031 §1, §3, §7, §8: `capyctl engine add --custom`. Executes nothing:
+/// the executable is resolved and measured from its files, the manifest is
+/// read once and copied with its digest into custom-engines.yaml (amendment
+/// A1) once the operator confirms (or passed `--yes`), and the running role
+/// is asked to publish it.
+async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, StructuredError> {
+    check_socket(target)?;
+    // ADR 0031 §4: a custom engine never parks.
+    if request.deep_park == Some(DeepParkChoice::Enabled) {
+        return Err(error(
+            "capability_missing",
+            "a custom engine has no sleep or wake CapyCTL can drive; it runs restart_only, \
+             so --deep-park enabled is refused and nothing was written",
+        ));
+    }
+    let name = request.name;
+    if !valid_profile_name(name) {
+        return Err(error(
+            "invalid_config",
+            format!("profile name {name:?} must be lowercase letters, digits, '-' or '_'"),
+        ));
+    }
+    if ENVIRONMENT_PROFILES.contains(&name) {
+        return Err(error(
+            "profile_exists",
+            format!("{name} is reserved for the role's own installation; use another --name"),
+        ));
+    }
+    let executable = resolve_custom(request.executable)
+        .map_err(|e| error(e.code(), format!("{e}; nothing was written")))?;
+    let manifest = read_manifest(request.manifest)?;
+    refuse_existing(target, name)?;
+    // ADR 0031 §3: the installation's identity, from its files only.
+    let (measured, layout) = {
+        let (executable, manifest) = (executable.clone(), manifest.clone());
+        tokio::task::spawn_blocking(move || {
+            let layout =
+                capyctl_agent::installation::custom_installation(&executable, Some(&manifest));
+            let measured = capyctl_agent::installation::InstallationMeasurer::new()
+                .measure_profile(Engine::Custom, &executable, Some(&manifest));
+            (measured, layout)
+        })
+        .await
+        .map_err(|_| error("internal", "measuring the installation failed"))?
+    };
+    // ADR 0031 §8: the digest the summary shows is the one pinned; the role
+    // registers against it and never adopts a different measurement.
+    let mut custom = CustomProfile::new(manifest.clone());
+    custom.installation_digest = measured.as_ref().ok().map(|f| f.digest.clone());
+    let spec = CustomProfileSpec {
+        executable: executable.clone(),
+        custom,
+        installation_drift: match request.drift {
+            DriftChoice::Warn => InstallationDrift::Warn,
+            DriftChoice::Refuse => InstallationDrift::Refuse,
+        },
+        env: request.env,
+        approved_env: request.approved_env,
+    };
+    let profile = custom_profile_document(&spec);
+    // SPEC §15.3: validated as resolution reads it, before anything is asked
+    // or written.
+    check_profile(name, &profile).map_err(|e| {
+        error(
+            "invalid_config",
+            format!("{}: {}; nothing was written", e.path, e.detail),
+        )
+    })?;
+    let environment: Vec<String> = manifest
+        .env
+        .keys()
+        .map(|key| format!("{key} (manifest)"))
+        .chain(spec.env.keys().map(|key| format!("{key} (profile)")))
+        .collect();
+    let root = layout.root.as_ref().map(|root| {
+        format!(
+            "{} ({})",
+            root.display(),
+            if layout.declared_root {
+                "the manifest's environment"
+            } else {
+                "virtual environment"
+            }
+        )
+    });
+    let installation = match &measured {
+        Ok(f) => format!("{} ({} files, {} bytes)", f.digest, f.files, f.bytes),
+        Err(_) => capyctl_agent::installation::UNMEASURED.to_owned(),
+    };
+    let key = engine_key(&manifest);
+    let idle = manifest.idle.as_ref().map(|idle| idle.describe());
+    let written = custom_engines(target);
+    let mut out = json!({
+        "profile": name, "engine": Engine::Custom.name(),
+        "version": manifest.build_fingerprint(),
+        "build_fingerprint": manifest.build_fingerprint(),
+        "custom": true,
+        "executable": executable,
+        "args": manifest.args,
+        "api": manifest.api,
+        "environment": environment,
+        "approved_env": spec.approved_env,
+        "root": root,
+        "interpreter": layout.interpreter,
+        "installation": installation,
+        "fingerprint": measured.as_ref().ok().map(|f| json!({"version": f.version, "digest": f.digest, "files": f.files, "bytes": f.bytes})),
+        "manifest_digest": spec.custom.manifest_digest,
+        "idle_signal": idle.clone().unwrap_or_else(|| "none".into()),
+        "engine_key": key,
+        "installation_drift": match spec.installation_drift {
+            InstallationDrift::Warn => "warn",
+            InstallationDrift::Refuse => "refuse",
+        },
+        "deep_park": "disabled",
+        "engines_file": written,
+    });
+    // ADR 0031 §8: the approval is this summary, confirmed on a terminal.
+    let mut summary = format!(
+        "custom engine {name}\n  executable:   {}\n  arguments:    {}\n  api:          {}\n  version:      {}\n  environment:  {}\n  approved env: {}\n  pinned root:  {}\n  interpreter:  {}\n  installation: {installation}\n  idle signal:  {}\n  engine key:   {}\n  drift:        {}\n",
+        executable.display(),
+        manifest.args.join(" "),
+        out["api"].as_str().unwrap_or_default(),
+        manifest.build_fingerprint(),
+        if environment.is_empty() { "none".into() } else { environment.join(", ") },
+        if spec.approved_env.is_empty() { "none".into() } else { spec.approved_env.join(", ") },
+        root.as_deref().unwrap_or("the executable alone"),
+        layout
+            .interpreter
+            .as_ref()
+            .map_or_else(|| "none".into(), |path| path.display().to_string()),
+        idle.as_deref().unwrap_or("none"),
+        if manifest.uses_api_key() { key.to_owned() } else { format!("none ({NO_KEY_CAVEAT})") },
+        out["installation_drift"].as_str().unwrap_or_default(),
+    );
+    // ADR 0031 §7: a key in the argument vector is readable by every local user.
+    if manifest.api_key_in_args() {
+        let warning = "the engine key is in the argument list, visible to every local user in \
+                       /proc/<pid>/cmdline; prefer an env value such as env: {SOME_KEY: \"{api_key}\"} \
+                       where the engine reads one";
+        summary.push_str(&format!("warning: {warning}\n"));
+        out["warnings"] = json!([warning]);
+    }
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(summary.as_bytes());
+    }
+    confirm_custom(request.yes)?;
+    let revision = write_custom_profile(target, name, profile)?;
+    out["revision"] = json!(revision);
+    publish(target, out, revision, &written).await
+}
+
+/// ADR 0031 §8: `engine add --custom` asks on a terminal (stdin and stderr,
+/// as [`pick`] checks); without one it needs `--yes`, else `not_interactive`.
+fn confirm_custom(yes: bool) -> Result<(), StructuredError> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if yes {
+        return Ok(());
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Err(error(
+            "not_interactive",
+            "engine add --custom asks for confirmation on a terminal; review the summary \
+             above and pass --yes to register it without one; nothing was written",
+        ));
+    }
+    let mut stderr = std::io::stderr();
+    let _ = write!(stderr, "register this custom engine? [y/N] ");
+    let _ = stderr.flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|_| error("not_interactive", "no answer; nothing was written"))?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err(error("declined", "not registered; nothing was written")),
+    }
+}
+
+/// ADR 0031 amendment A1: take the one lock both engines files share, then
+/// re-check the name against both files and the role document, and write.
+/// engines.yaml is never touched. The revision written.
+fn write_custom_profile(
+    target: &Target,
+    name: &str,
+    profile: Value,
+) -> Result<u64, StructuredError> {
+    let path = custom_engines(target);
+    let lock = lock_engines_for(&path, service_owner(target))
+        .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
+    let mut custom = EnginesFile::load(&path).map_err(|e| error("invalid_config", e.detail))?;
+    refuse_existing(target, name)?;
+    custom.profiles.insert(name.to_owned(), profile);
+    let host = match target.kind {
+        RoleKind::Host => Some(role_document(target)?),
+        RoleKind::Standalone => None,
+    };
+    write_engines(&custom, &lock, host.as_ref()).map_err(|e| error("invalid_config", e.detail))
+}
+
 async fn list(target: &Target) -> Result<Value, StructuredError> {
     let engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    // ADR 0031 amendment A1: custom engines are registered in their own file.
+    let custom = EnginesFile::load(&custom_engines(target))
+        .map_err(|e| error("invalid_config", e.detail))?;
     let role = request(&target.socket, &ControlRequest::List, LIST_REPLY)
         .await
         .ok()
@@ -628,7 +973,14 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
         .profiles
         .clone()
         .into_iter()
-        .map(|(n, p)| (n, p, "engines.yaml"))
+        .map(|(n, p)| (n, p, ENGINES_FILE))
+        .chain(
+            custom
+                .profiles
+                .clone()
+                .into_iter()
+                .map(|(n, p)| (n, p, capyctl_config::registration::CUSTOM_ENGINES_FILE)),
+        )
         .collect();
     all.extend(
         declared_by_operator(target)?
@@ -668,9 +1020,15 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
                 reported.as_deref(),
                 profile["build_fingerprint"].as_str(),
             );
+            // ADR 0031 §6, §7: a custom engine's idle signal (or `none`) and
+            // whether its launches carry a per-launch engine key.
+            let manifest = capyctl_agent::installation::custom_manifest(&profile);
             json!({
                 "profile": name, "source": source, "engine": profile["engine"], "version": version,
                 "custom": !capyctl_config::registration::is_verified(engine, &version),
+                "idle_signal": manifest.as_ref().map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe())),
+                "engine_key": manifest.as_ref().map(engine_key),
+                "api": manifest.as_ref().map(|m| m.api),
                 "executable": profile["executable"],
                 "fingerprint": accepted.clone().flatten().map(|a| a["installation"].clone()),
                 "deep_park": profile["security"]["deep_park"],
@@ -686,6 +1044,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
         .collect();
     Ok(
         json!({"engines_file": target.engines, "revision": engines.revision,
+        "custom_engines_file": custom.path, "custom_revision": custom.revision,
         "agent": if role.is_some() { "reachable" } else { "unreachable" }, "engines": rows}),
     )
 }
@@ -703,9 +1062,19 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); unset it and restart the role instead"
         )));
     }
-    let engines =
-        EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
-    let registered = engines.profiles.contains_key(name);
+    // ADR 0031 amendment A1: the profile is in engines.yaml or in
+    // custom-engines.yaml; the one that holds it is rewritten.
+    let holder = registered_in(target, name)?;
+    let registered = holder.is_some();
+    let (file, file_revision) = match &holder {
+        Some(file) => (file.path.clone(), file.revision),
+        None => (
+            target.engines.clone(),
+            EnginesFile::load(&target.engines)
+                .map_err(|e| error("invalid_config", e.detail))?
+                .revision,
+        ),
+    };
     // ADR 0018 §2: a profile declared in the role document is the operator's.
     if !registered && declared_by_operator(target)?.contains_key(name) {
         return Err(error(
@@ -719,7 +1088,11 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
     let not_registered = || {
         error(
             "invalid_config",
-            format!("{} has no profile named {name}", target.engines.display()),
+            format!(
+                "neither {} nor {} has a profile named {name}",
+                target.engines.display(),
+                custom_engines(target).display()
+            ),
         )
     };
     let retired = match request(
@@ -749,7 +1122,7 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
         // running, so nothing is published from this file and nothing runs
         // on it. The file is edited under its lock, as `engine add` does
         // offline; the role publishes the removal when it starts.
-        Err(ClientError::NotRunning(_)) => return remove_offline(target, name),
+        Err(ClientError::NotRunning(_)) => return remove_offline(target, &file, name),
         // Owner decision 2026-09-25: a published profile is never removed unconfirmed.
         Err(e) => {
             return Err(error(
@@ -763,7 +1136,7 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
         return Err(not_registered());
     }
     let revision = if registered {
-        write_without(target, name).map_err(|e| {
+        write_without(target, &file, name).map_err(|e| {
             error(
                 "internal",
                 format!(
@@ -779,9 +1152,9 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             )
         })?
     } else {
-        engines.revision
+        file_revision
     };
-    let mut out = json!({"removed": name, "engines_file": target.engines, "revision": revision});
+    let mut out = json!({"removed": name, "engines_file": file, "revision": revision});
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {
             out["published"] = reply["published"].clone();
@@ -792,38 +1165,38 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             format!(
                 "{}; {name} is out of {} (revision {revision}) but the role has not published its removal; run `capyctl engine remove {name}` again to finish",
                 reply["message"].as_str().unwrap_or("refused"),
-                target.engines.display()
+                file.display()
             ),
         )),
         Err(e) => Err(error(
             "agent_unreachable",
             format!(
                 "{e}; {name} is out of {} (revision {revision}) but its removal may not be published; run `capyctl engine list`, and `capyctl engine remove {name}` again to finish",
-                target.engines.display()
+                file.display()
             ),
         )),
     }
 }
 
 /// ADR 0018 amendment A3: `engine remove` with no role listening. The
-/// profile leaves engines.yaml; a deployment that names it is refused as an
-/// unpublished profile once the role starts.
-fn remove_offline(target: &Target, name: &str) -> Result<Value, StructuredError> {
-    let revision = write_without(target, name).map_err(|e| {
+/// profile leaves `file` (engines.yaml or custom-engines.yaml); a deployment
+/// that names it is refused as an unpublished profile once the role starts.
+fn remove_offline(target: &Target, file: &Path, name: &str) -> Result<Value, StructuredError> {
+    let revision = write_without(target, file, name).map_err(|e| {
         error(
             "internal",
             format!("{}: {}; nothing was removed", e.path, e.detail),
         )
     })?;
     Ok(json!({
-        "removed": name, "engines_file": target.engines, "revision": revision,
+        "removed": name, "engines_file": file, "revision": revision,
         "published": "role_not_running",
         "notice": format!(
             "removed from {} (revision {revision}); no capyctl answered on {}, so the \
              change takes effect when it starts (`{}`). If it is already running with \
              another --state-dir or --config, restart it, and pass the same option to \
              `capyctl engine`",
-            target.engines.display(),
+            file.display(),
             target.socket.display(),
             match target.kind {
                 RoleKind::Standalone => "capyctl start standalone",
@@ -846,10 +1219,15 @@ fn service_owner(target: &Target) -> Option<(u32, u32)> {
     (meta.file_type().is_dir() && meta.uid() != 0).then(|| (meta.uid(), meta.gid()))
 }
 
-/// engines.yaml without `name`, under the lock, keeping its owner and mode.
-fn write_without(target: &Target, name: &str) -> Result<u64, capyctl_config::ConfigError> {
-    let lock = lock_engines_for(&target.engines, service_owner(target))?;
-    let mut engines = EnginesFile::load(&target.engines)?;
+/// `file` (engines.yaml or custom-engines.yaml) without `name`, under its
+/// lock, keeping its owner and mode.
+fn write_without(
+    target: &Target,
+    file: &Path,
+    name: &str,
+) -> Result<u64, capyctl_config::ConfigError> {
+    let lock = lock_engines_for(file, service_owner(target))?;
+    let mut engines = EnginesFile::load(file)?;
     engines.profiles.remove(name);
     write_engines(&engines, &lock, None)
 }

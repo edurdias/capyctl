@@ -19,7 +19,8 @@ Tasks:
 
 - [Install an engine](install-engines.md): vLLM, SGLang or TensorFold in a
   virtual environment, or a llama.cpp build, step by step.
-- [Add an engine](engines.md): register the vLLM, SGLang, TensorFold or llama.cpp you have.
+- [Add an engine](engines.md): register the vLLM, SGLang, TensorFold or llama.cpp you have,
+  or another program as a [custom engine](engines.md#custom-engines).
 - [Deploy a model](deploy.md): the deployment file; start, stop, delete.
 - [Make a request](requests.md): curl, streaming, the Python client, other
   machines.

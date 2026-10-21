@@ -21,15 +21,20 @@ pub enum Engine {
     /// ADR 0029: llama.cpp's `llama-server`, restart-only, one GGUF model per
     /// deployment, registered as a bare binary with `engine add`.
     Llamacpp,
+    /// ADR 0031: a custom engine, a program CapyCTL has no integration for,
+    /// started from a host-approved manifest; restart-only, one process per
+    /// instance, registered with `engine add --custom`.
+    Custom,
 }
 
 impl Engine {
     /// Every engine kind, in the order lists show them.
-    pub const ALL: [Engine; 4] = [
+    pub const ALL: [Engine; 5] = [
         Engine::Vllm,
         Engine::Sglang,
         Engine::Tensorfold,
         Engine::Llamacpp,
+        Engine::Custom,
     ];
 
     /// The serde, CLI and profile name of the kind.
@@ -39,6 +44,7 @@ impl Engine {
             Engine::Sglang => "sglang",
             Engine::Tensorfold => "tensorfold",
             Engine::Llamacpp => "llamacpp",
+            Engine::Custom => "custom",
         }
     }
 
@@ -472,6 +478,8 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
         // ADR 0029 §8: llama.cpp's draft model is a GGUF file
         // (`--model-draft`), never a draft directory.
         Engine::Llamacpp => return None,
+        // ADR 0031 §4: CapyCTL reads nothing from a custom engine's options.
+        Engine::Custom => return None,
     };
     let mut named = None;
     for parsed in parse_options(args).ok()? {
@@ -485,7 +493,7 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
             Engine::Vllm => serde_json::from_str::<serde_json::Value>(&value)
                 .ok()
                 .and_then(|config| config["model"].as_str().map(str::to_owned)),
-            Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp => Some(value),
+            Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => Some(value),
         };
     }
     named.filter(|path| Path::new(path).is_absolute())
@@ -570,6 +578,11 @@ pub fn declared_draft_admitted(engine: Engine, args: &[String]) -> Result<(), St
         // ADR 0029 §8: llama.cpp names its draft model with `--model-draft
         // <file>`, an approved path option; there is no declared drafter.
         Engine::Llamacpp => return Err(LLAMACPP_DECLARED_DRAFTER.into()),
+        // ADR 0031 §4: a custom engine takes no typed engine field.
+        Engine::Custom => return Err(
+            "custom_field_unsupported:draft_model: a custom engine's manifest is its whole command"
+                .into(),
+        ),
     }
     Ok(())
 }
@@ -659,7 +672,7 @@ pub fn disk_table_cache_bytes(engine: Engine, args: &[String]) -> Option<i64> {
             .iter()
             .any(|parsed| matches_name(&parsed.name, "--ple-on-ssd"))
             .then_some(TENSORFOLD_TABLE_CACHE_BYTES),
-        Engine::Vllm | Engine::Llamacpp => None,
+        Engine::Vllm | Engine::Llamacpp | Engine::Custom => None,
     }
 }
 
@@ -1033,6 +1046,8 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
             .chain(crate::llamacpp::RESERVED_NEVER_RENDERED)
             .flat_map(|row| row.iter().map(|name| (*name).to_owned()))
             .collect(),
+        // ADR 0031 §4: CapyCTL renders none of a custom engine's options.
+        Engine::Custom => Vec::new(),
     }
 }
 
@@ -1042,7 +1057,7 @@ pub fn reserved_families(engine: Engine) -> &'static [&'static str] {
         Engine::Vllm => VLLM_RESERVED_FAMILIES,
         Engine::Sglang => SGLANG_RESERVED_FAMILIES,
         Engine::Tensorfold => TENSORFOLD_RESERVED_FAMILIES,
-        Engine::Llamacpp => &[],
+        Engine::Llamacpp | Engine::Custom => &[],
     }
 }
 
@@ -1054,6 +1069,7 @@ pub fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] 
         Engine::Sglang => SGLANG_TYPED_OPTIONS,
         Engine::Tensorfold => TENSORFOLD_TYPED_OPTIONS,
         Engine::Llamacpp => crate::llamacpp::TYPED_OPTIONS,
+        Engine::Custom => &[],
     }
 }
 
@@ -1159,6 +1175,9 @@ pub fn sensitivity(engine: Engine, name: &str) -> Option<Sensitivity> {
         Engine::Vllm => (VLLM_SENSITIVE, VLLM_SHAPED),
         Engine::Sglang => (SGLANG_SENSITIVE, SGLANG_SHAPED),
         Engine::Tensorfold => (TENSORFOLD_SENSITIVE, TENSORFOLD_SHAPED),
+        // ADR 0031 §4: a custom engine's options are its manifest's, which
+        // CapyCTL never classifies.
+        Engine::Custom => return None,
         // ADR 0029 §6: llama-server takes exact names only, so its own table
         // and the name shapes apply to the name as written, never to a
         // prefix or a folded negation.
@@ -1674,12 +1693,15 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
             .iter()
             .flat_map(|(names, _)| names.iter().copied())
             .collect(),
+        // ADR 0031 §4: CapyCTL knows none of a custom engine's options.
+        Engine::Custom => Vec::new(),
     };
     let shaped: &[&str] = match engine {
         Engine::Vllm => VLLM_SHAPED,
         Engine::Sglang => SGLANG_SHAPED,
         Engine::Tensorfold => TENSORFOLD_SHAPED,
         Engine::Llamacpp => &[],
+        Engine::Custom => &[],
     };
     for name in explicit.into_iter().chain(shaped.iter().copied()) {
         if let Some(kind) = sensitivity(engine, name) {
