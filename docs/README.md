@@ -12,6 +12,7 @@ quickstart are in the repository [`README.md`](../README.md).
 | [`operations/configuration.md`](operations/configuration.md) | Every setting with its YAML field, flag and environment variable, `--set` and `capyctl config show`. |
 | [`operations/network-access.md`](operations/network-access.md) | Reaching the inference endpoint from other machines: the API key, narrowing to loopback or a Tailscale address, turning the key off, a TLS reverse proxy. |
 | [`operations/data-retention.md`](operations/data-retention.md) | What CapyCTL keeps about requests, where and for how long, and how to keep engine logs in memory only. |
+| [`guide/controller.md`](guide/controller.md) | Driving CapyCTL from a program through the management API: the admin token, the snapshot, creating, replacing and starting deployments, idempotency keys, revisions, events, request IDs and which errors to retry. |
 | [`operations/release-notes-0.1.0.md`](operations/release-notes-0.1.0.md) | Release notes for 0.1.0. |
 | [`operations/release-notes-0.1.1.md`](operations/release-notes-0.1.1.md) | Release notes for 0.1.1. |
 | [`operations/release-notes-0.1.2.md`](operations/release-notes-0.1.2.md) | Release notes for 0.1.2. |

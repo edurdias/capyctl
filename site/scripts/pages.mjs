@@ -11,6 +11,7 @@ export const PAGES = [
   { source: 'docs/guide/deploy.md', slug: 'docs/deploy' },
   { source: 'docs/guide/requests.md', slug: 'docs/requests' },
   { source: 'docs/guide/parking.md', slug: 'docs/parking' },
+  { source: 'docs/guide/controller.md', slug: 'docs/controller' },
   { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration files' },
   { source: 'docs/operations/configuration.md', slug: 'docs/reference/settings', title: 'Settings' },
   { source: 'docs/operations/network-access.md', slug: 'docs/reference/network-access', title: 'Network access' },
