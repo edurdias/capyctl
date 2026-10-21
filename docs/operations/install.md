@@ -95,7 +95,7 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 
 | Exit | Meaning | Units | What heals it |
 |---|---|---|---|
-| 2 | Invalid configuration | all | Fix the role document (`capyctl validate config`). |
+| 2 | Invalid configuration, including a standalone state directory started under another hostname (`host_name_changed`) | all | Fix the role document (`capyctl validate config`); for `host_name_changed`, start under the hostname the message names (see "Running in a container"). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
 | 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
 | 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
@@ -1023,12 +1023,26 @@ Found in the live runs, four more things the image must carry:
   links to `~/.local/share/uv/python/...`; mount that directory read-only at
   the same path.
 
-**Host name.** The role names its host after the machine's hostname, which
-for a container is the container's: Docker gives each new container a new one.
-A role started from persisted state under a different host name refuses to
-start (`internal: deploy: blocked: resource policy refused: resource policy
-revision conflict`), so give the container a fixed `--hostname`; a restart of
-the same container keeps its hostname.
+**Host name.** The standalone role names its host after the machine's
+hostname, which for a container is the container's, and its state directory
+belongs to that name. Docker gives each new container a new hostname, so
+recreating the container (`docker rm` and `docker run`, or a new image) changes
+it unless `--hostname` fixes it; a restart of the same container keeps it.
+Started on existing state under another hostname, the role refuses to start
+before it changes anything, exit 2:
+
+```text
+error [host_name_changed]: this state directory belongs to the standalone host `capyctl`, but this machine's hostname is now `3f2a9c1d7b4e`, and CapyCTL names its host after the hostname. A container gets a new hostname each time it is created: run it with `docker run --hostname capyctl`, or on a machine set the hostname back to `capyctl`
+```
+
+Give the container a fixed hostname from its first start, and keep it in
+every `docker run` that reuses the state directory (`--hostname capyctl` in
+the example below). There is no setting that names the host instead. On
+state already created under a generated hostname, recreate the container with
+`--hostname` set to the name the message gives. A role that observes no
+NVIDIA device inventory (no NVIDIA GPU visible, or no `python3`) names its
+host `standalone` instead of the hostname, so the hostname does not matter
+to it.
 
 **User and capabilities.** Run the role as the user that owns the state
 directory (`--user <uid>:<gid>`), or as root. It needs no added capabilities

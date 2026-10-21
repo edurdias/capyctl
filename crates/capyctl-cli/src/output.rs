@@ -130,6 +130,12 @@ pub const STORE_FROM_NEWER_VERSION: &str = "store_from_newer_version";
 /// its certificate. Exits with [`ExitCode::HOST_REVOKED`].
 pub const HOST_REVOKED: &str = "host_revoked";
 
+/// SPEC §15.2: a standalone role whose state names another host than this
+/// machine's hostname refuses to start (existing identity mismatched: fail
+/// for recovery). Exits as invalid configuration, which the packaged units do
+/// not restart: only the hostname the state was created under heals it.
+pub const HOST_NAME_CHANGED: &str = "host_name_changed";
+
 /// Design §11: the discrete GPU closed codes. Resolution and admission report
 /// them as a detail prefix (`<code>: ...`) inside a configuration refusal or
 /// an operation's reason, so the CLI finds them there to choose the exit.
@@ -429,6 +435,7 @@ impl StructuredError {
             }
             // Design §11: the invalid-configuration exit.
             "device_policy_mismatch" | "missing_system_allocation" => ExitCode::INVALID_CONFIG,
+            HOST_NAME_CHANGED => ExitCode::INVALID_CONFIG,
             "unreconciled" => ExitCode::UNRECONCILED,
             "device_conflict" => ExitCode::DEVICE_CONFLICT,
             "category_limit" => ExitCode::CATEGORY_LIMIT,

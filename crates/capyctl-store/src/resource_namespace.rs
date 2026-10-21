@@ -152,6 +152,20 @@ impl crate::Store {
             )
             .optional()?)
     }
+    /// SPEC §15.2: the published name of the embedded (standalone) host this
+    /// state belongs to, or `None` before one is recorded. Enrolled hosts the
+    /// same store holds are never returned: only the embedded host's row is
+    /// read.
+    pub fn embedded_host_name(&self) -> Result<Option<String>, ResourcePolicyError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT policy_key FROM host_resource_namespaces WHERE kind='embedded'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
     /// Resolve explicit host/local identity to its persisted accounting key.
     pub fn host_resource_key(
         &self,
