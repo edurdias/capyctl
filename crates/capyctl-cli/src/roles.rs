@@ -33,8 +33,9 @@ use capyctl_launchers::DurableProcessLaunch;
 use capyctl_store::secrets::SecretsKey;
 use capyctl_store::Store;
 
+use crate::device_inventory::InventoryPublication;
 use crate::host_observation::{system_clock, HostMemoryObservation};
-use capyctl_agent::gpu_memory::{GpuSampler, HostShape};
+use capyctl_agent::gpu_memory::{GpuSample, GpuSampler, HostShape};
 
 use crate::grammar::Command as CliCommand;
 use crate::output::{ExitCode, StructuredError};
@@ -1420,6 +1421,7 @@ async fn start_standalone_production(
         // `nvidia-smi` collector. A machine without one samples nothing and
         // publishes the unified shape, exactly as before.
         Arc::new(capyctl_agent::gpu_memory::sample),
+        crate::device_inventory::collect,
         flags,
         overrides,
         config_home,
@@ -1430,9 +1432,10 @@ async fn start_standalone_production(
 /// Boot against an explicit provider, which is how a test supplies an installation
 /// it controls instead of one the environment happens to name.
 ///
-/// The test entry points observe no GPU, so the published policy is the one a
-/// test states rather than the one the machine running it happens to have;
-/// [`start_standalone_with_gpu`] states a sample.
+/// The test entry points observe no GPU and collect no device inventory, so
+/// the published policy is the one a test states rather than the one the
+/// machine running it happens to have; [`start_standalone_with_gpu`] states a
+/// sample.
 pub async fn start_standalone_with(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
@@ -1493,6 +1496,21 @@ pub async fn start_standalone_with_gpu(
 /// The sampler of a boot that observes no GPU.
 fn no_gpu() -> Arc<GpuSampler> {
     Arc::new(|| None)
+}
+
+/// SPEC §3: how a boot collects the host's NVIDIA device inventory, from its
+/// runtime directory and its one GPU sample. Production runs the bounded
+/// Python collector ([`crate::device_inventory::collect`]).
+type InventoryCollector = fn(&Path, Option<&GpuSample>) -> Option<InventoryPublication>;
+
+/// The collector of a boot with an explicit provider (a test's): it reads no
+/// device of the machine running it, as such a boot samples no GPU
+/// ([`no_gpu`]). The real collector reads `/proc` and `/sys`, and on a machine
+/// with an NVIDIA device it publishes that machine's hostname as the host's
+/// name (found on host A: the test boots published their policy and their
+/// memory warnings under the hostname instead of `standalone`).
+fn no_inventory(_: &Path, _: Option<&GpuSample>) -> Option<InventoryPublication> {
+    None
 }
 
 /// As [`start_standalone_with_memory`], with an explicit role document
@@ -1630,6 +1648,7 @@ async fn start_standalone_inner(
         provider,
         memory,
         gpu,
+        no_inventory,
         flags,
         overrides,
         ConfigHome::Isolated(state_dir.join(".config")),
@@ -1660,6 +1679,7 @@ async fn start_standalone_in(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
     gpu: Arc<GpuSampler>,
+    inventory: InventoryCollector,
     flags: &ModelOverrides,
     overrides: &SettingOverrides,
     config_home: ConfigHome,
@@ -1851,7 +1871,7 @@ async fn start_standalone_in(
     // overruns its bound, publishes nothing, and an SGLang deployment then
     // fails placement honestly at the native gate instead of the host
     // claiming placement it cannot corroborate.
-    let inventory = crate::device_inventory::collect(&role.runtime_dir, gpu_sample.as_ref());
+    let inventory = inventory(&role.runtime_dir, gpu_sample.as_ref());
 
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,

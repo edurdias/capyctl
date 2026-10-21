@@ -443,8 +443,8 @@ fn deploy(installation: &Installation) -> Value {
 }
 
 fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> Value {
-    // Sized for the shape the binary publishes on this machine, from an
-    // explicit capacity rather than this machine's (see
+    // Sized for the unified shape the binary publishes with its GPUs pinned
+    // to none, from an explicit capacity rather than this machine's (see
     // `support::binary_template_memory`).
     let document = capyctl_cli::standalone_config::deployment_document(
         "w11-model",
@@ -465,7 +465,7 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
         false,
         "local",
     )
-    .expect("the template fits the stated card");
+    .expect("the unified template");
     let file = installation.root.path().join("deployment.json");
     std::fs::write(&file, document.to_string()).unwrap();
     let out = installation.cli(&[

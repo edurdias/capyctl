@@ -305,15 +305,38 @@ fn executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Test-only, never a user setting: the environment variable the `capyctl`
+/// integration tests set on every process they spawn, so a role samples a
+/// stated GPU reading instead of running this machine's `nvidia-smi`. Its
+/// value is what `nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,memory.total,
+/// memory.used,memory.free --format=csv,noheader,nounits` would print; empty
+/// is a machine with no GPU. SPEC §7.2: a discrete card's free memory gates
+/// admission, so a binary test failed `insufficient_device_memory` whenever
+/// another program held the suite machine's GPU (found 2026-10-21 on the
+/// laptop: 1.9 GiB of 16 free). Only debug builds (the test profile) read it;
+/// a release build compiles the read out and ignores the variable. A
+/// malformed value is a failed sample, never a fallback to the real one.
+pub const TEST_PINNED_GPU_ENV: &str = "CAPYCTL_TEST_PINNED_GPU";
+
+/// Whether this process samples [`TEST_PINNED_GPU_ENV`] instead of the
+/// machine's GPUs. Always `false` in a release build.
+pub fn gpu_pinned() -> bool {
+    cfg!(debug_assertions) && std::env::var_os(TEST_PINNED_GPU_ENV).is_some()
+}
+
 /// The live sample; `None` on any failure (no binary, timeout, bad output).
 pub fn sample() -> Option<GpuSample> {
+    let now = || -> Option<i64> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        i64::try_from(now.as_millis()).ok()
+    };
+    #[cfg(debug_assertions)]
+    if let Some(pinned) = std::env::var_os(TEST_PINNED_GPU_ENV) {
+        return parse_query_gpu(pinned.to_str()?, now()?);
+    }
     let program = nvidia_smi()?;
     let text = run_bounded(&program, &[QUERY, "--format=csv,noheader,nounits"], BOUND)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis();
-    parse_query_gpu(&text, i64::try_from(now).ok()?)
+    parse_query_gpu(&text, now()?)
 }
 
 /// Run `program` with a cleared environment, stdin closed and stderr
