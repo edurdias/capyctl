@@ -374,6 +374,23 @@ fn lmcache_check_names_each_missing_server_option() {
     );
     env.edit("lmcache/v1/distributed/config.py", "('LRU', ", "(");
     assert!(check_failed(&env).contains("declares no LRU eviction policy"));
+    // `--no-l1-use-lazy` (eager L1, ADR 0033 §3, §6): a plain store-true
+    // `--l1-use-lazy` has no negation and fails; an explicit
+    // `--no-l1-use-lazy` option passes.
+    let env = Env::new(Engine::Vllm);
+    env.edit(
+        "lmcache/v1/distributed/config.py",
+        "action=argparse.BooleanOptionalAction,",
+        "action=\"store_true\",",
+    );
+    assert!(check_failed(&env)
+        .contains("lmcache/v1/distributed/config.py declares no --no-l1-use-lazy option"));
+    env.edit(
+        "lmcache/v1/distributed/config.py",
+        "        \"--l1-use-lazy\",\n",
+        "        \"--l1-use-lazy\",\n        \"--no-l1-use-lazy\",\n",
+    );
+    env.check_registered().unwrap();
     let env = Env::new(Engine::Vllm);
     env.edit(
         "lmcache/cli/commands/server.py",

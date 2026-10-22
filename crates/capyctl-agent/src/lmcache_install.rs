@@ -285,10 +285,12 @@ impl Shape<'_> {
 
     /// ADR 0033 §3: `lmcache server` and every option CapyCTL renders for it
     /// (`--host --port --transport --http-host --http-port --l1-size-gb
-    /// --eviction-policy LRU`). In 0.5.x the request, transport and HTTP
+    /// --no-l1-use-lazy --eviction-policy LRU`). In 0.5.x the request, transport and HTTP
     /// options are declared in `lmcache/v1/multiprocess/config.py` and the L1
-    /// size and eviction policy in `lmcache/v1/distributed/config.py`
-    /// (`add_storage_manager_args`); the `server` subcommand composes them.
+    /// size, its eager allocation (`--no-l1-use-lazy`: `--l1-use-lazy` is a
+    /// boolean option defaulting on) and the eviction policy in
+    /// `lmcache/v1/distributed/config.py` (`add_storage_manager_args`); the
+    /// `server` subcommand composes them.
     fn server(&mut self, bin: &Path) {
         let site = self.lmcache;
         const MP_CONFIG: &str = "lmcache/v1/multiprocess/config.py";
@@ -314,6 +316,11 @@ impl Shape<'_> {
             }
             if !text.contains("\"LRU\"") && !text.contains("'LRU'") {
                 self.note(format!("{STORAGE_CONFIG} declares no LRU eviction policy"));
+            }
+            if !accepts_negated_flag(&text, "--l1-use-lazy") {
+                self.note(format!(
+                    "{STORAGE_CONFIG} declares no --no-l1-use-lazy option (--l1-use-lazy as BooleanOptionalAction)"
+                ));
             }
         }
         self.entry_point(bin);
@@ -503,6 +510,23 @@ impl Shape<'_> {
 /// Whether `flag` is declared as a quoted option name.
 fn declares_option(text: &str, flag: &str) -> bool {
     text.contains(&format!("\"{flag}\"")) || text.contains(&format!("'{flag}'"))
+}
+
+/// Whether `--no-<flag>` is accepted: declared outright, or `flag`'s own
+/// `add_argument(...)` call uses `BooleanOptionalAction`.
+fn accepts_negated_flag(text: &str, flag: &str) -> bool {
+    let negated = format!("--no-{}", flag.trim_start_matches("--"));
+    if declares_option(text, &negated) {
+        return true;
+    }
+    ["\"", "'"].iter().any(|quote| {
+        text.match_indices(&format!("{quote}{flag}{quote}"))
+            .any(|(at, _)| {
+                let rest = &text[at..];
+                let call = rest.find("add_argument(").map_or(rest, |end| &rest[..end]);
+                call.contains("BooleanOptionalAction")
+            })
+    })
 }
 
 fn is_identifier(c: char) -> bool {
