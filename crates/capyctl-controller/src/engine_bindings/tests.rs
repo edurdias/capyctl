@@ -852,3 +852,116 @@ fn a_custom_profile_builds_a_custom_spec() {
     assert_eq!(api_key, None, "no key for a manifest without {{api_key}}");
     assert_eq!(idle, None);
 }
+
+/// A `restart_only` vLLM deployment on a profile that registered LMCache
+/// (vLLM 0.32.0, LMCache 0.5.6), so the store plans its server.
+fn lmcache_work(edit: impl FnOnce(&mut Value)) -> InitializeWork {
+    let source: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .expect("fixture JSON parses");
+    let mut host = source["input"]["host"].clone();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["build_fingerprint"] = json!("0.32.0");
+    profile["lmcache"] =
+        json!({"version": "0.5.6", "digest": format!("sha256:{}", "a".repeat(64))});
+    let mut deployment = source["input"]["deployment"].clone();
+    deployment["residency"] = json!("restart_only");
+    deployment["lmcache_pool"] = json!("1GiB");
+    edit(&mut deployment);
+    admit(&deployment, &host)
+}
+
+// T45: a launch the store planned LMCache on for carries a server to start
+// before its engine: the grant's ports and pool, `lmcache` beside the
+// engine's executable, its log beside the engine's and its private
+// directory in the role's root, removed once the launch is proved gone.
+// Without a private root the launch is refused; one planned off carries the
+// store's reason and starts nothing.
+#[test]
+fn a_granted_launch_starts_its_server_from_the_grant() {
+    use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport};
+    use std::os::unix::fs::DirBuilderExt;
+    let work = lmcache_work(|_| {});
+    let plan = work
+        .lmcache()
+        .expect("the store planned the launch's LMCache");
+    let grant = *plan
+        .grant()
+        .unwrap_or_else(|| panic!("planned on: {:?}", plan.planned));
+    assert!(
+        bindings().spec(&work).is_err(),
+        "no private LMCache root, no launch"
+    );
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path().join("lmcache");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let bindings = bindings().with_lmcache_root(root.clone());
+    let AdapterSpec::Vllm {
+        lmcache: Some(lmcache),
+        ..
+    } = bindings.spec(&work).unwrap()
+    else {
+        panic!("a vLLM spec with its LMCache state");
+    };
+    let Some(LmcacheLaunch::Start(server)) = lmcache.launch() else {
+        panic!("a server to start");
+    };
+    let executable = std::path::Path::new(&work.effective().profile.executable);
+    assert_eq!(
+        server.lmcache_bin,
+        executable.parent().unwrap().join("lmcache")
+    );
+    assert_eq!(
+        (server.rpc_port, server.http_port),
+        (grant.rpc_port, grant.http_port)
+    );
+    assert_eq!(server.pool_gib, 1);
+    assert_eq!(server.pool_bytes(), grant.pool_bytes);
+    assert!(!server.required);
+    assert!(server
+        .path
+        .starts_with(&executable.parent().unwrap().to_string_lossy().into_owned()));
+    assert_eq!(server.config_dir, root.join(work.incarnation()));
+    assert!(server
+        .log
+        .as_ref()
+        .is_some_and(|log| log.to_string_lossy().ends_with(".lmcache.log")));
+    assert_eq!(
+        server.start_bound.as_millis(),
+        u128::from(capyctl_config::lmcache::SERVER_START_BOUND_MS)
+    );
+    assert_eq!(lmcache.report(), None, "nothing happened yet");
+    // SGLang's connector writes its file there; the gone launch's goes.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&server.config_dir)
+        .unwrap();
+    bindings.launch_gone(work.incarnation());
+    assert!(!server.config_dir.exists());
+    assert!(root.is_dir(), "the root itself stays");
+
+    let off = lmcache_work(|deployment| {
+        deployment.as_object_mut().unwrap().remove("lmcache_pool");
+        deployment["lmcache"] = json!("off");
+    });
+    let AdapterSpec::Vllm {
+        lmcache: Some(lmcache),
+        ..
+    } = bindings.spec(&off).unwrap()
+    else {
+        panic!("a vLLM spec with its LMCache state");
+    };
+    assert_eq!(lmcache.launch(), None);
+    assert!(matches!(
+        lmcache.report(),
+        Some(LmcacheReport::Off {
+            reason: capyctl_config::lmcache::LmcacheOffReason::Disabled,
+            connector_failed: false,
+            ..
+        })
+    ));
+}

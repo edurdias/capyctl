@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheState, ServerPlan};
 use capyctl_adapters::resolve::AdapterSpec;
 use capyctl_adapters::vllm::args::PlanInputVllm;
 use capyctl_config::engine_policy::Engine;
@@ -40,6 +41,11 @@ pub struct ProfileBindings {
     /// device domain is sized against its card's total; a card's total does not
     /// change while the host runs.
     device_totals: std::collections::BTreeMap<u32, i64>,
+    /// ADR 0033 §4 (lifecycle design §1.8): the private root (0700) each
+    /// launch with an LMCache server keeps its own directory in
+    /// (`<state>/lmcache/<incarnation>`, SGLang's connector configuration).
+    /// Without one a launch the store planned with a server is refused.
+    lmcache: Option<capyctl_agent::rendezvous::RendezvousRoot>,
 }
 
 impl ProfileBindings {
@@ -61,6 +67,7 @@ impl ProfileBindings {
             rendezvous: None,
             engine_cache: None,
             device_totals: std::collections::BTreeMap::new(),
+            lmcache: None,
         }
     }
 
@@ -99,6 +106,100 @@ impl ProfileBindings {
     pub fn with_rendezvous_root(mut self, dir: PathBuf) -> Self {
         self.rendezvous = Some(capyctl_agent::rendezvous::RendezvousRoot::new(dir));
         self
+    }
+
+    /// ADR 0033 §4 (lifecycle design §1.8): launches with an LMCache server
+    /// keep their private directory in `<dir>/<incarnation>` (the role
+    /// creates `dir` 0700), removed once the launch is proved gone.
+    pub fn with_lmcache_root(mut self, dir: PathBuf) -> Self {
+        self.lmcache = Some(capyctl_agent::rendezvous::RendezvousRoot::new(dir));
+        self
+    }
+
+    /// ADR 0033 §§3, 6 (lifecycle design §2.3): the launch's LMCache as the
+    /// store planned it. Planned on: a server started before the engine on
+    /// the grant's ports and pool, from the registered environment, its log
+    /// beside the engine's and its private directory under the role's state.
+    /// Planned off: off with the store's reason, nothing started. `None` for
+    /// a binding planned before ADR 0033.
+    fn lmcache(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+    ) -> Result<Option<std::sync::Arc<LmcacheState>>, CoordinatorError> {
+        use capyctl_store::ordinary_lifecycle::lmcache::PlannedLmcache;
+        const GIB: i64 = 1 << 30;
+        let refuse = |what: &str| {
+            CoordinatorError::Service(format!("cannot build an LMCache launch plan: {what}"))
+        };
+        let Some(plan) = work.lmcache() else {
+            return Ok(None);
+        };
+        let grant = match &plan.planned {
+            PlannedLmcache::Off(off) => {
+                return Ok(Some(LmcacheState::off(off.reason, off.detail.clone())))
+            }
+            PlannedLmcache::On(grant) => grant,
+        };
+        // ADR 0033 §6: the pool is a whole number of GiB, at least one.
+        let pool_gib = u64::try_from(grant.pool_bytes / GIB)
+            .ok()
+            .filter(|gib| *gib > 0 && grant.pool_bytes % GIB == 0)
+            .ok_or_else(|| refuse("the granted pool is not a whole number of GiB"))?;
+        // ADR 0033 §3: `lmcache` of the registered environment, beside the
+        // engine's own executable.
+        let bin = std::path::Path::new(&effective.profile.executable)
+            .parent()
+            .filter(|dir| dir.is_absolute())
+            .ok_or_else(|| refuse("the engine executable names no environment"))?;
+        let config_dir = self
+            .lmcache
+            .as_ref()
+            .ok_or_else(|| refuse("no private LMCache directory"))?
+            .launch_dir(work.incarnation())
+            .ok_or_else(|| {
+                refuse("the private LMCache directory is not this user's with mode 0700")
+            })?;
+        // ADR 0033 §3: the instance's GPU namespace, else the role's own; a
+        // GPU pinned by its driver index also needs the engine's device order.
+        let (cuda_visible_devices, cuda_device_order) = match effective.cuda_namespace() {
+            Ok(Some(namespace)) => {
+                let env = namespace.environment();
+                let find = |wanted: &str| {
+                    env.iter()
+                        .find_map(|(name, value)| (*name == wanted).then(|| value.clone()))
+                };
+                (find("CUDA_VISIBLE_DEVICES"), find("CUDA_DEVICE_ORDER"))
+            }
+            Ok(None) => (std::env::var("CUDA_VISIBLE_DEVICES").ok(), None),
+            Err(error) => return Err(refuse(&error.to_string())),
+        };
+        let engine_log = crate::engine_logs::standalone_log_path(
+            &self.log_dir,
+            &work.fence().deployment_id,
+            work.incarnation(),
+        );
+        Ok(Some(LmcacheState::new(LmcacheLaunch::Start(ServerPlan {
+            lmcache_bin: bin.join("lmcache"),
+            rpc_port: grant.rpc_port,
+            http_port: grant.http_port,
+            pool_gib,
+            path: capyctl_adapters::engine_env::tool_path(
+                bin.to_str(),
+                None,
+                capyctl_config::toolchain::SYSTEM_PATH,
+            ),
+            home: std::env::var("HOME").ok(),
+            cuda_visible_devices,
+            cuda_device_order,
+            log: Some(capyctl_adapters::lmcache::server_log_path(&engine_log)),
+            config_dir,
+            start_bound: std::time::Duration::from_millis(
+                capyctl_config::lmcache::SERVER_START_BOUND_MS,
+            ),
+            proc_root: PathBuf::from("/proc"),
+            required: plan.required(),
+        }))))
     }
 
     /// SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
@@ -312,6 +413,11 @@ impl EngineBindings for ProfileBindings {
         if let Some(root) = &self.rendezvous {
             root.retire(incarnation);
         }
+        // ADR 0033 §4 (lifecycle design §1.8): the launch's private LMCache
+        // directory goes with it, on the same verified evidence.
+        if let Some(root) = &self.lmcache {
+            root.retire(incarnation);
+        }
     }
 
     fn checkpoint_verifier(
@@ -373,8 +479,8 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0030 §1, §6: readiness and the wake canary follow
                     // the deployment's API.
                     api: effective.api,
-                    // ADR 0033: attached by the embedded LMCache grant (later slice).
-                    lmcache: None,
+                    // ADR 0033 §§3, 6: the store's grant (or its reason off).
+                    lmcache: self.lmcache(work, effective)?,
                 })
             }
             Engine::Sglang => {
@@ -455,8 +561,8 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0030 §3: readiness and the canary follow the
                     // deployment's API.
                     api: effective.api,
-                    // ADR 0033: attached by the embedded LMCache grant (later slice).
-                    lmcache: None,
+                    // ADR 0033 §§3, 6: the store's grant (or its reason off).
+                    lmcache: self.lmcache(work, effective)?,
                 })
             }
             Engine::Tensorfold => {

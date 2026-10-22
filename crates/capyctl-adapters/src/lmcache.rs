@@ -73,6 +73,9 @@ pub struct ServerPlan {
     pub home: Option<String>,
     /// The instance's `CUDA_VISIBLE_DEVICES`, when the launch narrows it.
     pub cuda_visible_devices: Option<String>,
+    /// `PCI_BUS_ID` when the instance's GPU is pinned by its driver index,
+    /// exactly as the engine gets it, so the index names the same GPU.
+    pub cuda_device_order: Option<String>,
     /// The server's own log, beside the engine's (`<incarnation>.lmcache.log`).
     pub log: Option<PathBuf>,
     /// The launch's private directory (`<state>/lmcache/<incarnation>`): SGLang's
@@ -278,6 +281,9 @@ pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
     }
     if let Some(devices) = &plan.cuda_visible_devices {
         env.insert("CUDA_VISIBLE_DEVICES".into(), devices.clone());
+    }
+    if let Some(order) = &plan.cuda_device_order {
+        env.insert("CUDA_DEVICE_ORDER".into(), order.clone());
     }
     if let Some(log) = &plan.log {
         env.insert(

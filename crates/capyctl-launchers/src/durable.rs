@@ -87,7 +87,8 @@ impl SpawnRole<'_> {
 /// ADR 0033 §3: the only variables the LMCache server is started with. Its
 /// `/env` route shows them to any local process, so nothing else (no engine
 /// key, no log writer metadata, no `LMCACHE_*`) may reach it.
-const LMCACHE_ENVIRONMENT: [&str; 3] = ["PATH", "HOME", "CUDA_VISIBLE_DEVICES"];
+const LMCACHE_ENVIRONMENT: [&str; 4] =
+    ["PATH", "HOME", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"];
 
 #[derive(Debug)]
 pub enum DurableSpawnOutcome {

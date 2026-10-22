@@ -124,7 +124,7 @@ pub const DUMP_RESERVED_NAMES: &[(&str, &str)] = &[
 pub const LMCACHE_RESERVED_PREFIX: (&str, &str) = (
     "LMCACHE_",
     "LMCache reads its configuration from the environment after any file; CapyCTL \
-     renders LMCache from the deployment's `lmcache` setting (ADR 0033)",
+     renders LMCache from the deployment's `lmcache` setting",
 );
 
 /// Every reserved family: the dump families and LMCache's.

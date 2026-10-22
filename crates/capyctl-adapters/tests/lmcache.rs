@@ -53,6 +53,7 @@ fn server_plan(http_port: u16, proc_root: &Path, required: bool) -> ServerPlan {
         path: "/opt/venv/bin:/usr/bin:/bin".into(),
         home: Some("/var/lib/capyctl".into()),
         cuda_visible_devices: Some("GPU-1".into()),
+        cuda_device_order: None,
         log: None,
         config_dir: proc_root.join("lmcache-dir"),
         start_bound: Duration::from_secs(5),

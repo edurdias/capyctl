@@ -1757,8 +1757,7 @@ fn row(name: &str, name_match: NameMatch, class: FlagClass, reason: String) -> F
 
 /// ADR 0033 §11: why an owned option is CapyCTL's when LMCache renders it
 /// (SGLang's `--enable-lmcache` and every `--lmcache-*` option).
-const LMCACHE_OWNED: &str =
-    "CapyCTL renders LMCache from the deployment's `lmcache` setting (ADR 0033)";
+const LMCACHE_OWNED: &str = "CapyCTL renders LMCache from the deployment's `lmcache` setting";
 
 /// ADR 0033 §4: the connector configuration CapyCTL renders for vLLM, the
 /// value the table's owned `--kv-transfer-config` row is about.
@@ -1854,7 +1853,7 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
                     "with a value naming an LMCache connector (LMCacheConnectorV1, \
                      LMCacheMPConnector, a kv_connector_module_path under `lmcache.`, or \
                      either inside a MultiConnector), in any spelling: CapyCTL renders \
-                     LMCache from the deployment's `lmcache` setting (ADR 0033)"
+                     LMCache from the deployment's `lmcache` setting"
                         .to_owned(),
                 )
             },

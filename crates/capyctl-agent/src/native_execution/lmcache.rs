@@ -348,18 +348,19 @@ impl NativeHostExecution {
             .and_then(Path::parent)
             .or_else(|| executable.parent())?
             .join("lmcache");
-        let cuda_visible_devices =
-            effective
-                .cuda_namespace()
-                .ok()
-                .flatten()
-                .and_then(|namespace| {
-                    namespace
-                        .environment()
-                        .into_iter()
-                        .find(|(name, _)| *name == "CUDA_VISIBLE_DEVICES")
-                        .map(|(_, value)| value)
-                });
+        let gpu_env = effective
+            .cuda_namespace()
+            .ok()
+            .flatten()
+            .map(|namespace| namespace.environment())
+            .unwrap_or_default();
+        let find = |wanted: &str| {
+            gpu_env
+                .iter()
+                .find_map(|(name, value)| (*name == wanted).then(|| value.clone()))
+        };
+        let cuda_visible_devices = find("CUDA_VISIBLE_DEVICES");
+        let cuda_device_order = find("CUDA_DEVICE_ORDER");
         Some(ServerPlan {
             lmcache_bin: bin,
             rpc_port: grant.rpc_port,
@@ -368,6 +369,7 @@ impl NativeHostExecution {
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             home: std::env::var("HOME").ok(),
             cuda_visible_devices,
+            cuda_device_order,
             log: Some(capyctl_adapters::lmcache::server_log_path(
                 &self.engine_log_path(&plan.incarnation),
             )),

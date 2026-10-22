@@ -181,6 +181,24 @@ pub(super) async fn run(
             return WorkerStatus::Failed(error.to_string());
         }
     }
+    // ADR 0033 §§9, 10 (lifecycle design §9): a host that started with
+    // `lmcache: off` or `retention: zero` stops, after adoption, every
+    // instance whose launch runs a server; a Ready one is owed a start
+    // without LMCache (the relaunch pass below).
+    if let Some((host, reason)) = shared.options.retire_lmcache.clone() {
+        match shared
+            .read(move |owner, now| {
+                owner
+                    .store()
+                    .retire_lmcache_on_host(owner.session(), &host, reason, now)
+            })
+            .await
+        {
+            Ok(stops) if !stops.is_empty() => shared.changed.notify_waiters(),
+            Ok(_) => {}
+            Err(error) => return WorkerStatus::Failed(error.to_string()),
+        }
+    }
     let slots = shared.options.max_concurrent_effects;
     let (cancel, _) = watch::channel(false);
     let mut scheduler = Scheduler {
@@ -481,6 +499,23 @@ impl Scheduler {
                     owner
                         .store()
                         .relaunch_failed_groups(owner.session(), now, eligible.as_ref())
+                })
+                .await
+                .map_err(failed)?;
+            if !relaunched.is_empty() {
+                shared.changed.notify_waiters();
+            }
+        }
+        // ADR 0033 §§9, 10 (lifecycle design §9): an instance a role start
+        // stopped with its LMCache server while Ready starts again without
+        // it once that stop completed.
+        if starts {
+            let eligible = shared.observations.eligible_hosts();
+            let relaunched = shared
+                .read(move |owner, now| {
+                    owner
+                        .store()
+                        .relaunch_retired_lmcache(owner.session(), now, eligible.as_ref())
                 })
                 .await
                 .map_err(failed)?;
