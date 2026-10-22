@@ -29,6 +29,7 @@ import os
 import signal
 import stat
 import sys
+import threading
 import time
 
 # The renderer invokes this file under python -IS. SPEC §9.1 / T21: resolve our
@@ -706,6 +707,8 @@ def _import_and_launch(spec, contract, approvals=None):
     # server on its loopback worker port and nothing probes it: its health
     # always passes.
     options = {} if target is None else {"run_scheduler_process_func": target}
+    shared_memory = _SharedMemoryWatch()
+    shared_memory.start()
     try:
         launch.launch_server(checked._native, **options)
     except Exception:
@@ -717,8 +720,13 @@ def _import_and_launch(spec, contract, approvals=None):
         # interpreter exit would join forever, holding this entry, and so the
         # launch, alive until the host's readiness deadline. They are ended and
         # seen gone first: the entry leaves only once nothing it started runs.
+        # Then the shared memory they left in /dev/shm (RAM) is removed.
+        shared_memory.stop()
+        shared_memory.claim()
         _end_engine_processes()
+        shared_memory.release()
         raise LaunchError("engine_launch_failed") from None
+    shared_memory.stop()
 
 
 def _process_table():
@@ -833,6 +841,189 @@ def _end_pass(pause):
     time.sleep(pause)
     _reap(_process_table())
     return not _running_descendants(_process_table())
+
+
+# Where SGLang, Python's multiprocessing and NCCL keep shared memory: RAM.
+SHM_DIRECTORY = "/dev/shm"
+# How often the watch lists that directory for a file the launch created.
+_SHM_WATCH_INTERVAL = 0.25
+# How many listings a new file may go unclaimed before it is taken as not the
+# launch's (a creator opens the file it creates, so it is held from the start).
+_SHM_CLAIM_ATTEMPTS = 3
+
+
+class _SharedMemoryWatch:
+    """SPEC §13.2: the shared memory a failed launch leaves behind is removed.
+
+    Found live 2026-10-22: a scheduler killed while loading left
+    `/dev/shm/sglang_loads_*.shm` behind. SGLang never removes that file, and
+    the resource tracker that removes registered segments is killed with
+    everything else, so each failed launch kept its segments in RAM.
+
+    Ownership is evidence, never a name pattern: a file is the launch's only
+    when it appeared in the directory after the launch began and, when first
+    seen, one of the launch's processes (this entry or a descendant) held it
+    open or mapped. After the verified exit (`_end_engine_processes`), a
+    claimed file is removed only if it is still the same file, owned by this
+    user and private to it (no group or other access), and no live process
+    other than this exiting entry holds it. Every process /proc lets this
+    user inspect is checked. One that hides its descriptors and mappings (a
+    non-dumpable process of this user started after this entry, which could
+    be one of the launch's own) keeps every file; one running since before
+    the entry could only have opened a file by its new name, and is not
+    checked, nor is another user's. A file whose creator ended within one
+    listing interval of creating it is never claimed, and so stays.
+    """
+
+    def __init__(self, directory=SHM_DIRECTORY, interval=_SHM_WATCH_INTERVAL):
+        self._directory = directory
+        self._interval = interval
+        self._before = set(self._names())
+        self._unclaimed = {}  # name -> listings it went unclaimed
+        self._claimed = {}  # (st_dev, st_ino) -> name
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="capyctl-shm-watch",
+                                        daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        """Stop watching; the launch returned or raised."""
+        self._stopped.set()
+        self._thread.join()
+
+    def claim(self):
+        """Claim once more, every new file again, while the processes run."""
+        self._observe(final=True)
+
+    def _names(self):
+        try:
+            return os.listdir(self._directory)
+        except OSError:
+            return []
+
+    def _run(self):
+        while not self._stopped.wait(self._interval):
+            self._observe()
+
+    def _observe(self, final=False):
+        try:
+            names = set(self._names())
+            self._before &= names  # A removed name is never seen as old again.
+            fresh = names - self._before
+            for name in [name for name in self._unclaimed if name not in fresh]:
+                del self._unclaimed[name]
+            pending = {}
+            for name in fresh:
+                attempts = self._unclaimed.get(name, 0)
+                if attempts >= _SHM_CLAIM_ATTEMPTS and not final:
+                    continue
+                key = self._identity(name)
+                if key is not None and key not in self._claimed:
+                    pending[key] = name
+            if not pending:
+                return
+            launch = _running_descendants(_process_table()) + [os.getpid()]
+            held, _ = _held_files(self._directory, launch)
+            for key, name in pending.items():
+                if key in held:
+                    self._claimed[key] = name
+                    self._unclaimed.pop(name, None)
+                    self._before.add(name)  # Claimed: not examined again.
+                else:
+                    self._unclaimed[name] = self._unclaimed.get(name, 0) + 1
+        except (OSError, ValueError):
+            pass  # /proc or the directory unreadable: nothing is claimed.
+
+    def _identity(self, name):
+        """(device, inode) of a regular file this user owns privately, or None."""
+        try:
+            status = os.lstat(os.path.join(self._directory, name))
+        except OSError:
+            return None
+        if (not stat.S_ISREG(status.st_mode) or status.st_uid != os.geteuid()
+                or status.st_mode & 0o077):
+            return None
+        return status.st_dev, status.st_ino
+
+    def release(self):
+        """Remove each claimed file no live process other than this one holds."""
+        if not self._claimed:
+            return
+        try:
+            others = [pid for pid in _process_table() if pid != os.getpid()]
+            held, uncertain = _held_files(self._directory, others,
+                                          since=_start_time(os.getpid()))
+        except (OSError, ValueError):
+            return  # Nothing is seen unheld, so nothing is removed.
+        if uncertain:
+            return
+        for key, name in self._claimed.items():
+            if key in held or self._identity(name) != key:
+                continue
+            try:
+                os.unlink(os.path.join(self._directory, name))
+            except OSError:
+                pass  # Removed by another, or not removable: left as it is.
+
+
+def _held_files(directory, pids, since=None):
+    """The (device, inode) of every file in `directory` the `pids` hold.
+
+    A file is held when a process has it open or mapped. Returns the set and
+    whether a process of this user started at or after `since` (clock ticks
+    after boot) could not be inspected, and so may hold any.
+    """
+    # Mappings and descriptors name the resolved path (/dev/shm may be a link).
+    prefix = os.path.realpath(directory).rstrip("/") + "/"
+    held, uncertain = set(), False
+    for pid in pids:
+        base = "/proc/%d/" % pid
+        try:
+            with open(base + "maps", "rb") as handle:
+                for line in handle:
+                    fields = line.split(None, 5)
+                    if len(fields) == 6 and fields[5].startswith(prefix.encode()):
+                        major, minor = fields[3].split(b":")
+                        held.add((os.makedev(int(major, 16), int(minor, 16)),
+                                  int(fields[4])))
+            for descriptor in os.listdir(base + "fd"):
+                path = base + "fd/" + descriptor
+                try:
+                    if os.readlink(path).startswith(prefix):
+                        status = os.stat(path)
+                        held.add((status.st_dev, status.st_ino))
+                except OSError:
+                    continue  # Closed during the scan.
+        except PermissionError:
+            uncertain = uncertain or (since is not None and _runs_as_this_user(pid)
+                                      and _start_time(pid) >= since)
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # Exited during the scan.
+    return held, uncertain
+
+
+def _runs_as_this_user(pid):
+    """Whether any of the process's user IDs is this one's (it may hold our files)."""
+    try:
+        with open("/proc/%d/status" % pid, "rb") as handle:
+            for line in handle:
+                if line.startswith(b"Uid:"):
+                    return os.geteuid() in [int(field) for field in line.split()[1:]]
+    except (OSError, ValueError):
+        pass  # Exited during the scan.
+    return False
+
+
+def _start_time(pid):
+    """When the process started, in clock ticks after boot; -1 once it is gone."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            raw = handle.read()
+        return int(raw[raw.rindex(b")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return -1
 
 
 def prepare_group_environment(environ, expected_ifname=None):

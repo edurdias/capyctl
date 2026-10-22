@@ -203,5 +203,155 @@ class SchedulerDeathBeforeReadinessTests(unittest.TestCase):
         self.assertFalse(Path(prometheus).exists())
 
 
+# A scheduler that, like SGLang 0.5.22's, makes its load snapshot file
+# (`/dev/shm/sglang_loads_*.shm`, opened and mapped, never removed) and a
+# multiprocessing segment (registered with the resource tracker), maps a
+# segment that existed before the launch, and makes one more that a process
+# outside the launch maps. It is then killed while it loads.
+SHM_HTTP_SERVER = '''
+import mmap
+import multiprocessing as mp
+import os
+import subprocess
+import sys
+import time
+from multiprocessing import shared_memory
+
+class _Route:
+    def __init__(self, path):
+        self.path = path
+class _App:
+    routes = [_Route("/generate"), _Route("/v1/models")]
+app = _App()
+
+HOLDER = """
+import mmap, os, sys, time
+if os.fork():
+    os._exit(0)
+fd = os.open(sys.argv[1], os.O_RDWR)
+mapped = mmap.mmap(fd, 4096)
+with open(sys.argv[2] + ".part", "w") as handle:
+    handle.write(str(os.getpid()))
+os.rename(sys.argv[2] + ".part", sys.argv[2])
+time.sleep(600)
+"""
+
+def _mapped(path, create):
+    fd = os.open(path, (os.O_CREAT | os.O_RDWR) if create else os.O_RDWR, 0o600)
+    os.ftruncate(fd, 4096)
+    return fd, mmap.mmap(fd, 4096)
+
+def _scheduler(token, scratch):
+    kept = [_mapped("/dev/shm/sglang_loads_%s_0.shm" % token, True),
+            shared_memory.SharedMemory(name="%s-psm" % token, create=True, size=4096),
+            _mapped("/dev/shm/%s-old" % token, False),
+            _mapped("/dev/shm/%s-shared" % token, True)]
+    holder = os.path.join(scratch, "holder")
+    subprocess.Popen([sys.executable, "-I", "-S", "-c", HOLDER,
+                      "/dev/shm/%s-shared" % token, holder],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True,
+                     close_fds=True).wait()
+    while not os.path.exists(holder):
+        time.sleep(0.05)
+    record = os.path.join(scratch, "scheduler")
+    with open(record + ".part", "w") as handle:
+        handle.write(str(os.getpid()))
+    os.rename(record + ".part", record)
+    time.sleep(600)
+
+def launch_server(server_args, run_scheduler_process_func=None):
+    mp.set_start_method("spawn", force=True)
+    reader, writer = mp.Pipe(duplex=False)
+    scheduler = mp.Process(target=_scheduler,
+                           args=(os.environ["STUB_TOKEN"], os.environ["STUB_SCRATCH"]))
+    scheduler.start()
+    while not reader.poll(timeout=0.2):
+        if not scheduler.is_alive():
+            raise RuntimeError("Rank 0 scheduler died during initialization")
+'''
+
+
+class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
+    def setUp(self):
+        if not os.path.isdir("/dev/shm"):
+            self.skipTest("no /dev/shm")
+        self.directory = tempfile.TemporaryDirectory(prefix="capyctl-sglang-shm-")
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.tree = root / "venv" / "site-packages"
+        sglang_tree(self.tree, saver_hooks=False)
+        (self.tree / "sglang/srt/entrypoints/http_server.py").write_text(
+            textwrap.dedent(SHM_HTTP_SERVER))
+        self.temp = root / "tmp"
+        self.temp.mkdir()
+        self.scratch = root / "scratch"
+        self.scratch.mkdir()
+        self.token = "capyctl-test-%d-%d" % (os.getpid(), time.monotonic_ns())
+        self.addCleanup(self.remove_segments)
+
+    def segment(self, suffix):
+        return Path("/dev/shm", self.token + suffix)
+
+    def remove_segments(self):
+        holder = self.scratch / "holder"
+        if holder.exists():
+            try:
+                os.kill(int(holder.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for path in Path("/dev/shm").glob("*" + self.token + "*"):
+            path.unlink(missing_ok=True)
+
+    def wait_for(self, path, entry):
+        deadline = time.monotonic() + 30
+        while not path.exists():
+            if entry.poll() is not None or time.monotonic() > deadline:
+                os.killpg(entry.pid, signal.SIGKILL)
+                self.fail("the stub scheduler never started: %s" % (entry.communicate(),))
+            time.sleep(0.05)
+
+    # T12: SPEC §13.2 (found live 2026-10-22). A scheduler killed while it
+    # loads fails the launch, and the shared memory the launch made, which
+    # no live process maps, is removed with it: SGLang's load snapshot file
+    # and a segment the killed resource tracker would have removed. A segment
+    # that existed before the launch, one a process outside the launch maps,
+    # and one another process made during the launch all stay.
+    def test_a_failed_launch_removes_the_shared_memory_it_left(self):
+        old = self.segment("-old")
+        old.write_bytes(b"\0" * 4096)
+        old.chmod(0o600)
+        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                       "TMPDIR": str(self.temp), "STUB_TOKEN": self.token,
+                       "STUB_SCRATCH": str(self.scratch)}
+        entry = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", ENTRY_SCRIPT, str(REPO), str(TESTS),
+             str(self.tree)],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.wait_for(self.scratch / "scheduler", entry)
+        foreign = self.segment("-foreign")
+        foreign.write_bytes(b"\0" * 4096)
+        foreign.chmod(0o600)
+        # Long enough for the watch to list the directory several times.
+        time.sleep(1.0)
+        os.kill(int((self.scratch / "scheduler").read_text()), signal.SIGKILL)
+        try:
+            _, stderr = entry.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(entry.pid, signal.SIGKILL)
+            entry.communicate()
+            self.fail("the entry outlived its failed launch")
+        self.assertEqual(entry.returncode, 1, stderr)
+        self.assertTrue(stderr.splitlines()[-1].startswith(
+            "sglang_startup_failed: engine_launch_failed ("), stderr)
+        self.assertEqual(running_group_members(entry.pid), [])
+        self.assertFalse(Path("/dev/shm/sglang_loads_%s_0.shm" % self.token).exists())
+        self.assertFalse(self.segment("-psm").exists())
+        self.assertTrue(old.exists())
+        self.assertTrue(self.segment("-shared").exists())
+        self.assertTrue(foreign.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
