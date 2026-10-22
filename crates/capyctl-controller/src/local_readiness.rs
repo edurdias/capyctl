@@ -382,9 +382,11 @@ impl LocalReadiness {
         server: &[ProcessIdentity],
     ) -> Result<(), String> {
         if self.lmcache_forbidden {
-            return Err("the host's settings say `lmcache: off` or `retention: zero`; \
+            return Err(
+                "the host's settings say `lmcache: off` or `retention: zero`; \
                         the launch's LMCache server is not re-proved"
-                .into());
+                    .into(),
+            );
         }
         let grant = {
             let owner = self

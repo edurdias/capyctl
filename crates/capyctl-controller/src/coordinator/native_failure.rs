@@ -317,7 +317,9 @@ async fn conclude(
         _ => None,
     };
     let other_off = match &lmcache {
-        Some(report @ capyctl_adapters::lmcache::LmcacheReport::Off { .. }) if fallback.is_none() => {
+        Some(report @ capyctl_adapters::lmcache::LmcacheReport::Off { .. })
+            if fallback.is_none() =>
+        {
             Some(lmcache_outcome(report))
         }
         _ => None,
@@ -608,7 +610,10 @@ mod lmcache_tests {
             super::lmcache_unavailable("lmcache_unavailable:listener_exposed").as_deref(),
             Some("lmcache_unavailable:listener_exposed")
         );
-        assert_eq!(super::lmcache_unavailable("lmcache_unavailable:bogus"), None);
+        assert_eq!(
+            super::lmcache_unavailable("lmcache_unavailable:bogus"),
+            None
+        );
         assert_eq!(super::lmcache_unavailable("engine exited"), None);
     }
 }

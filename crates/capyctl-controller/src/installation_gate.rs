@@ -378,9 +378,9 @@ impl InstallationGate {
                     InstallationDrift::Warn => Ok(()),
                 }
             }
-            Err(failure) if lmcache.required => Err(RuntimeError::Refused(
-                failure.reason.required_refusal(),
-            )),
+            Err(failure) if lmcache.required => {
+                Err(RuntimeError::Refused(failure.reason.required_refusal()))
+            }
             Err(failure) => {
                 lmcache.state.turn_off(failure.reason, failure.detail);
                 Ok(())
@@ -933,8 +933,7 @@ mod tests {
         use capyctl_config::lmcache::LmcacheOffReason;
         use std::os::unix::fs::PermissionsExt;
         let state_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
-        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let owner = Arc::new(std::sync::Mutex::new(
             crate::ownership::OwnedCoordinatorState::open(state_dir.path()).unwrap(),
         ));

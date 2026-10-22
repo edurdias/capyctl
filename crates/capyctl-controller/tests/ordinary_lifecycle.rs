@@ -1943,7 +1943,9 @@ async fn start_receipt_concurrent_same_key_has_one_acceptance() {
             .zip(&before)
             .map(|(a, b)| a - b)
             .collect::<Vec<_>>(),
-        [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+        // T45 (ADR 0033 §10): the accepted launch journals `lmcache_off`
+        // once beside its acceptance (the fixture profile has no LMCache).
+        [1, 1, 1, 1, 1, 2, 1, 0, 0, 0]
     );
     assert!(store
         .initialize_execution(&session, receipts[0].step_id())
@@ -1977,7 +1979,8 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
             .zip(&before)
             .map(|(a, b)| a - b)
             .collect::<Vec<_>>(),
-        [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+        // T45 (ADR 0033 §10): `lmcache_off` once beside the acceptance.
+        [1, 1, 1, 1, 1, 2, 1, 0, 0, 0]
     );
     assert_eq!(store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(

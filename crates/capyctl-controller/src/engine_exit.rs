@@ -198,7 +198,11 @@ impl EngineExits {
         let Ok(mut seen) = self.overhead.lock() else {
             return;
         };
-        if overhead == 0 || seen.get(&launch.binding_id).is_some_and(|most| *most >= overhead) {
+        if overhead == 0
+            || seen
+                .get(&launch.binding_id)
+                .is_some_and(|most| *most >= overhead)
+        {
             return;
         }
         let Ok(owner) = self.commands.owner_for_read() else {

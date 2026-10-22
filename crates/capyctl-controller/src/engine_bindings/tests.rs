@@ -863,7 +863,8 @@ fn lmcache_work(edit: impl FnOnce(&mut Value)) -> InitializeWork {
     let mut host = source["input"]["host"].clone();
     let profile = &mut host["runtime_profiles"]["local"];
     profile["build_fingerprint"] = json!("0.32.0");
-    profile["lmcache"] = json!({"version": "0.5.6", "digest": format!("sha256:{}", "a".repeat(64))});
+    profile["lmcache"] =
+        json!({"version": "0.5.6", "digest": format!("sha256:{}", "a".repeat(64))});
     let mut deployment = source["input"]["deployment"].clone();
     deployment["residency"] = json!("restart_only");
     deployment["lmcache_pool"] = json!("1GiB");
@@ -882,7 +883,9 @@ fn a_granted_launch_starts_its_server_from_the_grant() {
     use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport};
     use std::os::unix::fs::DirBuilderExt;
     let work = lmcache_work(|_| {});
-    let plan = work.lmcache().expect("the store planned the launch's LMCache");
+    let plan = work
+        .lmcache()
+        .expect("the store planned the launch's LMCache");
     let grant = *plan
         .grant()
         .unwrap_or_else(|| panic!("planned on: {:?}", plan.planned));
@@ -892,7 +895,10 @@ fn a_granted_launch_starts_its_server_from_the_grant() {
     );
     let state = tempfile::tempdir().unwrap();
     let root = state.path().join("lmcache");
-    std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
     let bindings = bindings().with_lmcache_root(root.clone());
     let AdapterSpec::Vllm {
         lmcache: Some(lmcache),
@@ -938,7 +944,10 @@ fn a_granted_launch_starts_its_server_from_the_grant() {
     assert!(!server.config_dir.exists());
     assert!(root.is_dir(), "the root itself stays");
 
-    let off = lmcache_work(|deployment| deployment["lmcache"] = json!("off"));
+    let off = lmcache_work(|deployment| {
+        deployment.as_object_mut().unwrap().remove("lmcache_pool");
+        deployment["lmcache"] = json!("off");
+    });
     let AdapterSpec::Vllm {
         lmcache: Some(lmcache),
         ..

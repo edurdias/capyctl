@@ -1201,7 +1201,13 @@ impl LaunchAssociation for StoreAssociation {
         })?;
         owner
             .store()
-            .record_wake_identity(owner.session(), &self.fence, &self.binding_id, wake, identity)
+            .record_wake_identity(
+                owner.session(),
+                &self.fence,
+                &self.binding_id,
+                wake,
+                identity,
+            )
             .map_err(|error| AssociationError::Uncertain(error.to_string()))
     }
 }
@@ -2344,21 +2350,27 @@ impl StartupPeak {
     /// the LMCache `server` group held in one sample taken while the engine
     /// started (a discrete GPU's samples name each process); `(0, 0)` with
     /// none.
-    fn server_residency(&self, server: &[capyctl_domain::completion::ProcessIdentity]) -> (i64, i64) {
+    fn server_residency(
+        &self,
+        server: &[capyctl_domain::completion::ProcessIdentity],
+    ) -> (i64, i64) {
         let ours = |r: &ProcessResident| {
-            server.iter().any(|i| {
-                i.pid == r.pid && i.boot_id == r.boot_id && i.start_ticks == r.start_ticks
-            })
+            server
+                .iter()
+                .any(|i| i.pid == r.pid && i.boot_id == r.boot_id && i.start_ticks == r.start_ticks)
         };
         self.residents
             .iter()
             .map(|(_, processes)| {
-                processes.iter().filter(|r| ours(r)).fold((0_i64, 0_i64), |(h, d), r| {
-                    (
-                        h.saturating_add(r.host_bytes.max(0)),
-                        d.saturating_add(r.device_bytes.max(0)),
-                    )
-                })
+                processes
+                    .iter()
+                    .filter(|r| ours(r))
+                    .fold((0_i64, 0_i64), |(h, d), r| {
+                        (
+                            h.saturating_add(r.host_bytes.max(0)),
+                            d.saturating_add(r.device_bytes.max(0)),
+                        )
+                    })
             })
             .fold((0, 0), |(h, d), (sh, sd)| (h.max(sh), d.max(sd)))
     }

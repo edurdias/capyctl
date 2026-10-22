@@ -155,7 +155,9 @@ pub(super) fn factory(
                     Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(plan))
                         if !server.is_empty() =>
                     {
-                        Some(capyctl_adapters::lmcache::LmcacheState::adopted(server, plan))
+                        Some(capyctl_adapters::lmcache::LmcacheState::adopted(
+                            server, plan,
+                        ))
                     }
                     _ => None,
                 };
