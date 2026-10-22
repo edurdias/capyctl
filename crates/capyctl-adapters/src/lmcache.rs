@@ -151,6 +151,22 @@ impl LmcacheState {
         Arc::new(state)
     }
 
+    /// ADR 0033 §7: a running launch whose LMCache is on, rebuilt by a host
+    /// that keeps no adapter between steps (the remote host's Park and
+    /// Restore of a restart-parked launch): the server `server` started on
+    /// `plan`, connected. Restore re-proves it before the engine starts again.
+    pub fn attached(server: Vec<ProcessIdentity>, plan: ServerPlan) -> Arc<Self> {
+        let state = Self::default();
+        state.set_report(LmcacheReport::On {
+            server: server.clone(),
+            rpc_port: plan.rpc_port,
+            http_port: plan.http_port,
+            pool_bytes: plan.pool_bytes(),
+        });
+        *lock(&state.launch) = Some(LmcacheLaunch::Attached { server, plan });
+        Arc::new(state)
+    }
+
     /// ADR 0033 §1: turn LMCache off for this launch before Initialize (the
     /// launch-time check failed under `auto`); nothing is started.
     pub fn turn_off(&self, reason: LmcacheOffReason, detail: String) {

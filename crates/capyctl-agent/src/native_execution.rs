@@ -56,13 +56,15 @@ pub use saver_source::{EnrolledSaver, LaunchSglangObserver};
 // SPEC §13 (WE3 limit 1): pre-effect policy refusals are terminal results.
 mod refusal;
 // Discrete GPU design §4: the launch check the switch planner agrees with.
-use refusal::charges_device;
 pub use refusal::{admit_memory_with, LaunchVerdict};
+use refusal::{charges_device, lmcache_ports_free};
 // SPEC §§3.1, 7.3 (per-launch claims): host-side co-residence admission.
 mod coresidence;
 // ADR 0028 §12 (R12): each SGLang group member's saver map, reported by its
 // own host on its session.
 mod member_savers;
+// ADR 0033: the host's half of a launch's LMCache.
+mod lmcache;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -144,6 +146,14 @@ pub struct NativeHostExecution {
     /// group members, sampled off the session loop and reported with every
     /// availability refresh.
     member_savers: Arc<member_savers::MemberSavers>,
+    /// ADR 0033 §4: the private root of each launch's LMCache directory
+    /// (SGLang's connector configuration). `None`: no launch starts a server.
+    lmcache_dirs: Option<crate::lmcache_dir::LmcacheDirs>,
+    /// ADR 0033 §1: the launch-time check's verdict, kept from admission
+    /// for the launch that turns LMCache off before Initialize.
+    lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
+    /// ADR 0033 §12: the load source that samples the LMCache servers.
+    host_load: Arc<crate::load::HostLoad>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -232,7 +242,9 @@ impl NativeHostExecution {
         // a custom engine's load is its manifest's idle signal, never a
         // built-in family's `/metrics`; each ingress entry carries the signal
         // frozen with its launch (`Ingress::bind_handle`).
-        let load = crate::load::LoadReporter::new(ingress.clone(), host_id.clone())
+        // ADR 0033 §12: and each Ready or parked launch's LMCache server.
+        let host_load = crate::load::HostLoad::new(ingress.clone(), journal.clone());
+        let load = crate::load::LoadReporter::new(host_load.clone(), host_id.clone())
             .and_then(|reporter| reporter.with_interval(config.load_report_interval))
             .ok()
             .map(Arc::new);
@@ -280,6 +292,9 @@ impl NativeHostExecution {
             gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
                 crate::gpu_memory::sample,
             ))),
+            lmcache_dirs: None,
+            lmcache_verdicts: Arc::default(),
+            host_load,
         });
         this.prime_gpu();
         this
@@ -365,6 +380,10 @@ impl NativeHostExecution {
     /// installation measurement and capability probe its tier depends on. A
     /// pass is remembered for the cheap recheck under the lock.
     fn pre_admit(&self, command: &MemberCommand) -> Result<(), LaunchVerdict> {
+        // ADR 0033 §3 (lifecycle design §1.6): the grant's two LMCache ports
+        // must be free too. Probed here, before acceptance, and never at the
+        // engine's spawn, when the launch's own server already holds them.
+        lmcache_ports_free(command)?;
         if self.pre_admitted(command) {
             return Ok(());
         }
@@ -387,7 +406,12 @@ impl NativeHostExecution {
                 let effective = self
                     .resolve_retained(&owner)
                     .map_err(|_| LaunchVerdict::Refused("unauthorized"))?;
-                if let Some(reason) = self.park_capability(&effective, &plan.profile_name) {
+                // ADR 0033 §7: a restart-park stops the engine; nothing of
+                // a sleep is driven, so no parking capability is needed.
+                if let Some(reason) = (!self.restart_parks(&owner, &effective))
+                    .then(|| self.park_capability(&effective, &plan.profile_name))
+                    .flatten()
+                {
                     return Err(LaunchVerdict::Refused(reason));
                 }
             }
@@ -414,12 +438,21 @@ impl NativeHostExecution {
         })
     }
     /// ADR 0007: report each GPU process's resident memory with every
-    /// availability refresh (`process_residency`).
+    /// availability refresh (`process_residency`). ADR 0033 §6: the same
+    /// sampler gives the LMCache servers' GPU memory.
     pub fn with_process_residency(
         mut self: Arc<Self>,
         sampler: Arc<crate::process_residency::ResidencySampler>,
     ) -> Arc<Self> {
+        self.host_load.set_residency(sampler.clone());
         Arc::make_mut(&mut self).residency = Some(sampler);
+        self
+    }
+    /// ADR 0033 §4: each launch's LMCache keeps SGLang's connector
+    /// configuration in `<dir>/<incarnation>` (the role creates `dir` 0700),
+    /// removed once the launch is proved gone.
+    pub fn with_lmcache_dirs(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
+        Arc::make_mut(&mut self).lmcache_dirs = Some(crate::lmcache_dir::LmcacheDirs::new(dir));
         self
     }
     /// SPEC §7.2 / ADR 0019: read device domains through `sampler` instead
@@ -648,6 +681,15 @@ impl NativeHostExecution {
                 } else if cold.domain == host {
                     cold.bytes = host_bytes;
                 }
+            }
+        }
+        // ADR 0033 §§3, 6 (lifecycle design §7): the LMCache grant's ports are
+        // this host's to lease, and its charge is laid over the phases after
+        // the startup overrides, so admission, co-residence and retained
+        // claims see the bytes the store reserved.
+        if let Some(grant) = &plan.lmcache {
+            if !lmcache::apply_grant(&mut effective, grant, plan.service_port) {
+                return Err(JournalError::Unauthorized);
             }
         }
         // ADR 0028 §4, §8: a group member runs on exactly the plan's devices,
@@ -1364,7 +1406,9 @@ impl NativeHostExecution {
     /// `keys` are the launch's protected credentials: the API keys of a single
     /// launch or a group head; for a deep SGLang group worker, its admin key is
     /// its saver observation credential (ADR 0028 §12, R12); other workers
-    /// hold none (ADR 0012: the keyed surfaces are the head's).
+    /// hold none (ADR 0012: the keyed surfaces are the head's). ADR 0033 §3:
+    /// `lmcache` is what a vLLM or SGLang Initialize does about LMCache.
+    #[allow(clippy::too_many_arguments)]
     fn launch_adapter(
         &self,
         prepared: PreparedLaunch,
@@ -1373,6 +1417,7 @@ impl NativeHostExecution {
         keys: Option<&NativeCredentials>,
         served: &str,
         tools: Arc<dyn OwnedProcessLaunch>,
+        lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
         Ok(match prepared {
             PreparedLaunch::Sglang(frozen) => {
@@ -1418,6 +1463,9 @@ impl NativeHostExecution {
                     }
                     None => {}
                 }
+                if let Some(state) = lmcache {
+                    adapter = adapter.with_lmcache(state);
+                }
                 Box::new(
                     adapter
                         .with_launch(*frozen)
@@ -1427,11 +1475,14 @@ impl NativeHostExecution {
                         .with_log(self.engine_log_path(&plan.incarnation).to_string_lossy()),
                 )
             }
-            PreparedLaunch::Vllm(launch) => Box::new(
-                self.vllm_adapter(effective, plan, keys, served)?
-                    .with_launch(*launch)
-                    .with_tools(tools),
-            ),
+            PreparedLaunch::Vllm(mut launch) => {
+                launch.lmcache = lmcache;
+                Box::new(
+                    self.vllm_adapter(effective, plan, keys, served)?
+                        .with_launch(*launch)
+                        .with_tools(tools),
+                )
+            }
             PreparedLaunch::Tensorfold(prepared) => {
                 let (input, built) = *prepared;
                 Box::new(
@@ -1542,16 +1593,36 @@ impl NativeHostExecution {
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         let group = self.group_args(command).map_err(|_| SessionError)?;
         let prepared = self.prepare(&effective, plan, &served, group)?;
+        // ADR 0033 §§1, 3, 9: what Initialize does about LMCache, from the
+        // grant and this host's own plan; a launch-time check that failed
+        // under `auto` turns it off before Initialize (lifecycle design §2.3).
+        let host = self.clone();
+        let (checked, granted, resolved) = (command.clone(), plan.clone(), effective.clone());
+        let lmcache =
+            tokio::task::spawn_blocking(move || host.lmcache_state(&checked, &granted, &resolved))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|code| LaunchError {
+                    engine: Some(code.into()),
+                })?;
         let tools = self
             .journal
             .launch_tools(
                 ticket,
                 capyctl_protocol::now_unix_ms(),
                 Arc::new(self.clone()),
+                spawn_policy(&effective),
             )
             .map_err(|_| SessionError)?;
-        let adapter =
-            self.launch_adapter(prepared, &effective, plan, keys.as_ref(), &served, tools)?;
+        let adapter = self.launch_adapter(
+            prepared,
+            &effective,
+            plan,
+            keys.as_ref(),
+            &served,
+            tools,
+            lmcache.clone(),
+        )?;
         if let Some(keys) = keys.as_ref().filter(|_| serves) {
             self.ingress
                 .register(
@@ -1580,6 +1651,20 @@ impl NativeHostExecution {
         let initialized = adapter
             .execute_persisted(&initialize_command(command, plan, &effective))
             .await;
+        // ADR 0033 §§8, 9: what became of the launch's LMCache is journaled
+        // with the launch, Ready or failed, before its result is sent: an
+        // engine that failed with the connector reaches the server as
+        // `engine_start_failed`, which relaunches it without LMCache.
+        if let Some(report) = lmcache.as_ref().and_then(|state| state.report()) {
+            let journal = self.journal.clone();
+            let id = command.identity.command_id.clone();
+            tokio::task::spawn_blocking(move || {
+                journal.record_launch_lmcache(&id, &lmcache::launch_report(&report))
+            })
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
+        }
         let observation = match initialized {
             Ok(observation) => observation,
             Err(capyctl_adapters::traits::RuntimeError::LaunchFailed(text)) => {
@@ -1743,6 +1828,9 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)?;
             checked?;
         }
+        // ADR 0033 §§3, 5, 9: a launch with an LMCache server re-proves it
+        // too, and is never re-proved while this host forbids LMCache.
+        self.reprove_lmcache(plan, &effective, &expected).await?;
         let journal = self.journal.clone();
         let id = command.identity.command_id.clone();
         tokio::task::spawn_blocking(move || {
@@ -2174,6 +2262,10 @@ impl NativeHostExecution {
                     if let Some(rendezvous) = &self.rendezvous {
                         rendezvous.retire(&scope.incarnation);
                     }
+                    // ADR 0033 §4: and its LMCache directory.
+                    if let Some(dirs) = &self.lmcache_dirs {
+                        dirs.retire(&scope.incarnation);
+                    }
                 }
             }
         }
@@ -2215,6 +2307,18 @@ struct LaunchError {
 impl From<SessionError> for LaunchError {
     fn from(_: SessionError) -> Self {
         Self { engine: None }
+    }
+}
+
+/// ADR 0033 §10: under the host's or the deployment's zero retention every
+/// process a launch starts (its engine, its server, a wake's engine) runs
+/// with `RLIMIT_CORE` 0 and keeps its output in memory.
+fn spawn_policy(effective: &EffectiveDeployment) -> capyctl_launchers::SpawnPolicy {
+    let zero = effective.retention == capyctl_config::lmcache::Retention::Zero
+        || effective.host.retention == capyctl_config::lmcache::Retention::Zero;
+    capyctl_launchers::SpawnPolicy {
+        no_core_dumps: zero,
+        memory_logs: zero,
     }
 }
 
@@ -2451,6 +2555,11 @@ impl LocalExecutionPolicy for NativeHostExecution {
         // The owner's approved configuration, resolved from this host's own
         // policy: never the controller's description of it.
         let effective = self.resolve_retained(owner)?;
+        // ADR 0033 §7: a `restart_only` launch with its LMCache on parks by
+        // stopping its engine and keeping its server; no sleep is driven.
+        if self.restart_parks(owner, &effective) {
+            return Ok(());
+        }
         // Owner decision (ADR 0012): park only at the declared tier. A
         // `restart_only` deployment never parks. `host_backed` is refused on
         // unified pools at resolution (ADR 0010 decision 5), so where it
@@ -4341,7 +4450,7 @@ mod tests {
         };
         let tools = executor
             .journal
-            .launch_tools(ticket, now, sleeper.clone())
+            .launch_tools(ticket, now, sleeper.clone(), Default::default())
             .unwrap();
         let command = sleeper.render_launch(&launch).unwrap().command;
         let api = tools.spawn_durable(&plan.incarnation, &command).unwrap();
@@ -5568,5 +5677,223 @@ mod tests {
                 || finding == "host_tuning_warning:compaction"
                 || finding.starts_with("host_tuning_missing:")
         }));
+    }
+
+    /// ADR 0033 §§3, 6: a grant on two free ports with a 1 GiB pool.
+    fn grant() -> capyctl_protocol::execution::LmcacheGrant {
+        capyctl_protocol::execution::LmcacheGrant {
+            rpc_port: closed_port(),
+            http_port: closed_port(),
+            pool_bytes: 1 << 30,
+            overhead_bytes: 1280 << 20,
+            device_bytes: 512 << 20,
+            held_kv_bytes: 256 << 20,
+        }
+    }
+
+    fn granted(
+        deployment: &serde_json::Value,
+        policy: &str,
+        grant: capyctl_protocol::execution::LmcacheGrant,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut command, mut plan) = launch_with(deployment, policy, "");
+        plan.lmcache = Some(grant);
+        command.action = MemberAction::LaunchSingle(plan.clone());
+        command.identity.payload_digest = command.canonical_digest();
+        (command, plan)
+    }
+
+    /// ADR 0033 §§6, 7 (lifecycle design §7): the host charges a granted
+    /// launch exactly what `apply_charge` lays over its phases, the bytes the
+    /// store reserved; ports outside the range, equal, or the service port's
+    /// are refused.
+    // T45 T24
+    #[test]
+    fn a_grant_is_charged_as_apply_charge_lays_it() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let (plain, _) = launch_with(&deployment, &policy, "");
+        let mut expected = executor.resolve(&plain).unwrap();
+        let grant = grant();
+        let domains =
+            capyctl_config::lmcache::charge_domains(&expected.host, &expected.selected_devices)
+                .unwrap();
+        capyctl_config::lmcache::apply_charge(
+            &mut expected.resources,
+            &grant.charge(),
+            expected.residency == capyctl_config::effective::Residency::RestartOnly,
+            &domains,
+        );
+        let (launch, _) = granted(&deployment, &policy, grant);
+        assert_eq!(
+            executor.resolve(&launch).unwrap().resources,
+            expected.resources
+        );
+        assert_ne!(
+            executor.resolve(&plain).unwrap().resources,
+            expected.resources
+        );
+        for bad in [
+            capyctl_protocol::execution::LmcacheGrant {
+                http_port: grant.rpc_port,
+                ..grant
+            },
+            capyctl_protocol::execution::LmcacheGrant {
+                rpc_port: 80,
+                ..grant
+            },
+        ] {
+            let (launch, _) = granted(&deployment, &policy, bad);
+            assert!(executor.resolve(&launch).is_err(), "{bad:?}");
+        }
+        let (mut launch, mut plan) = granted(&deployment, &policy, grant);
+        plan.service_port = grant.http_port;
+        launch.action = MemberAction::LaunchSingle(plan);
+        assert!(executor.resolve(&launch).is_err(), "the service port");
+    }
+
+    /// A vLLM 0.32.0 `restart_only` launch whose environment holds LMCache
+    /// 0.5.6, registered, but none of the shape the check reads.
+    fn lmcache_check_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        mode: &str,
+    ) -> (Arc<NativeHostExecution>, MemberCommand, SingleLaunchPlan) {
+        let venv = root.join("venv");
+        let site = venv.join("lib/python3.12/site-packages");
+        for package in ["lmcache", "vllm", "lmcache-0.5.6.dist-info"] {
+            std::fs::create_dir_all(site.join(package)).unwrap();
+        }
+        std::fs::write(site.join("lmcache/__init__.py"), "").unwrap();
+        std::fs::write(site.join("vllm/__init__.py"), "").unwrap();
+        std::fs::write(
+            site.join("lmcache-0.5.6.dist-info/METADATA"),
+            "Name: lmcache\nVersion: 0.5.6\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("bin/python3"), "").unwrap();
+        let executable = venv.join("bin/python3");
+        let (executor, mut deployment, _) =
+            checkpoint_fixture_with(root, identity_dir, |document| {
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["executable"] = executable.to_string_lossy().into_owned().into();
+                profile["build_fingerprint"] = "0.32.0".into();
+                profile["lmcache"] = serde_json::json!({
+                    "version": "0.5.6",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                });
+            });
+        let policy = capyctl_config::remote_resources::policy_fingerprint(
+            &executor.profiles.accepted().config.document,
+        );
+        let lmcache = root.join("lmcache");
+        std::fs::create_dir_all(&lmcache).unwrap();
+        std::fs::set_permissions(&lmcache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = executor.with_lmcache_dirs(lmcache);
+        deployment["residency"] = "restart_only".into();
+        deployment["lmcache"] = mode.into();
+        let (mut launch, plan) = granted(&deployment, &policy, grant());
+        launch.identity.profile_fingerprint = "0.32.0".into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (executor, launch, plan)
+    }
+
+    /// ADR 0033 §§1, 9, 14: under `lmcache: required` a failed launch-time
+    /// check refuses the launch `lmcache_unavailable:check_failed` before
+    /// anything is journaled or started; under `auto` the verdict is kept
+    /// and the launch's LMCache is off with the check's reason.
+    // T45 T24 T37
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_lmcache_check_refuses_required_and_turns_auto_off() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, _) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "required");
+        assert_eq!(
+            executor.pre_admit(&launch),
+            Err(LaunchVerdict::Refused("lmcache_unavailable:check_failed"))
+        );
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let refused = executor.execute(session, launch.clone()).await.unwrap();
+        assert_eq!(refused.refused, "lmcache_unavailable:check_failed");
+        assert_eq!(refused.state, "completed");
+        assert!(refused.processes.is_empty() && !refused.claim_retained);
+        assert!(executor.journal.history(0, 10).unwrap().is_empty());
+
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, plan) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "auto");
+        // The launch goes on (refused here only by the fixture's checkpoint).
+        assert_eq!(
+            executor.pre_admit(&launch),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+        let effective = executor.resolve(&launch).unwrap();
+        let state = executor
+            .lmcache_state(&launch, &plan, &effective)
+            .unwrap()
+            .expect("a granted launch has LMCache state");
+        assert!(state.launch().is_none(), "no server starts");
+        assert!(matches!(
+            state.report(),
+            Some(capyctl_adapters::lmcache::LmcacheReport::Off {
+                reason: capyctl_config::lmcache::LmcacheOffReason::CheckFailed,
+                connector_failed: false,
+                ..
+            })
+        ));
+    }
+
+    /// ADR 0033 §§9, 10: a launch with a server is never re-proved while
+    /// this host's approved document turns LMCache off or keeps zero
+    /// retention, so its dispatch stays closed; one without a server is.
+    // T45 T37
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reproof_is_refused_while_the_host_forbids_lmcache() {
+        let server = capyctl_domain::completion::ProcessIdentity {
+            role: "lmcache".into(),
+            pid: std::process::id(),
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        for (key, value) in [
+            ("lmcache", "auto"),
+            ("retention", "standard"),
+            ("lmcache", "off"),
+            ("retention", "zero"),
+        ] {
+            let root = directory();
+            let identity_dir = directory();
+            let (executor, deployment, policy) =
+                checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                    document[key] = value.into();
+                    if let Some(host) = document.as_object_mut() {
+                        host.remove("engine_logs");
+                    }
+                });
+            let (launch, plan) = granted(&deployment, &policy, grant());
+            let effective = executor.resolve_retained(&launch).unwrap();
+            let forbidden = matches!(value, "off" | "zero");
+            assert_eq!(
+                executor.lmcache_forbidden(&effective),
+                forbidden,
+                "{key}: {value}"
+            );
+            if forbidden {
+                assert!(executor
+                    .reprove_lmcache(&plan, &effective, std::slice::from_ref(&server))
+                    .await
+                    .is_err());
+            }
+            // A launch without a server has nothing of LMCache to prove.
+            assert!(executor
+                .reprove_lmcache(&plan, &effective, &[])
+                .await
+                .is_ok());
+        }
     }
 }

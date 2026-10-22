@@ -231,7 +231,12 @@ fn two_instances_of_one_deployment_are_fenced_independently() {
     // Instance 0's durable attempt is checked against its own assignment
     // (generation 5), not the deployment's newest (6).
     let tools = j
-        .launch_tools(ticket_zero, 10, std::sync::Arc::new(PerInstance::new(0)))
+        .launch_tools(
+            ticket_zero,
+            10,
+            std::sync::Arc::new(PerInstance::new(0)),
+            Default::default(),
+        )
         .expect("instance 0 is not fenced by instance 1's generation");
     drop(tools);
 

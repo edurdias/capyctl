@@ -3,6 +3,7 @@
 //! must recompute the canonical payload digest, fence generations and deduplicate
 //! command identities before acknowledging or performing any effect.
 use crate::pb;
+use capyctl_domain::completion::{is_lmcache_role, LMCACHE_ROLE};
 use capyctl_domain::disk_tables::CheckpointTables;
 use capyctl_domain::gguf::{GgufFacts, GgufKv, GgufKvRefusal, GgufKvShape};
 use capyctl_domain::group::{
@@ -1323,15 +1324,6 @@ pub fn validate_result(
     Ok(())
 }
 
-/// ADR 0033 §3: whether `role` belongs to a launch's LMCache server group
-/// (`lmcache`, or `lmcache-N`).
-fn lmcache_role(role: &str) -> bool {
-    role == "lmcache"
-        || role
-            .strip_prefix("lmcache-")
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
 /// The alive processes of a result, as identities.
 fn alive(result: &pb::MemberExecutionResult) -> Vec<capyctl_domain::completion::ProcessIdentity> {
     result
@@ -1360,7 +1352,7 @@ fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
         && result
             .processes
             .iter()
-            .filter(|p| !lmcache_role(&p.role))
+            .filter(|p| !is_lmcache_role(&p.role))
             .count()
             == 1;
     current.iter().any(|p| p.role == "api")
@@ -1372,8 +1364,8 @@ fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
 /// server's group alone: the `lmcache` leader, no engine process, one boot.
 fn live_server_alone(result: &pb::MemberExecutionResult) -> bool {
     let current = alive(result);
-    current.iter().any(|p| p.role == "lmcache")
-        && current.iter().all(|p| lmcache_role(&p.role))
+    current.iter().any(|p| p.role == LMCACHE_ROLE)
+        && current.iter().all(|p| p.is_lmcache())
         && capyctl_domain::group::validate_local_processes(&current).is_ok()
 }
 

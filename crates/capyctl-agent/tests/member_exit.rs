@@ -172,7 +172,9 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
     else {
         panic!("fresh acceptance");
     };
-    let tools = journal.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = journal
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let api = tools
         .spawn_durable(
             &incarnation,
@@ -334,7 +336,9 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
     else {
         panic!("fresh acceptance");
     };
-    let tools = journal.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = journal
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let api = tools
         .spawn_durable(
             &incarnation,

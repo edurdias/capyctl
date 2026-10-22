@@ -2075,3 +2075,299 @@ async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
         .unwrap();
     assert_eq!(stopped.state, "completed");
 }
+
+// --------------------------------------------------------------- ADR 0033
+// A remote launch's LMCache server: started with the launch, re-proved with
+// it, kept by a restart-park, watched for its exit and stopped with it.
+
+/// A stand-in for `lmcache server`: `GET /status` on its loopback HTTP port.
+/// It ends itself with the test or the fixture directory, as the engine's.
+const FAKE_LMCACHE: &str = r#"
+import os, signal, sys, threading, time, http.server
+args = sys.argv[1:]
+port = int(args[args.index("--http-port") + 1])
+here = os.path.dirname(os.path.abspath(__file__))
+parent = os.getppid()
+def orphaned():
+    while os.getppid() == parent and os.path.isdir(here):
+        time.sleep(0.5)
+    os.killpg(0, signal.SIGKILL)
+threading.Thread(target=orphaned, daemon=True).start()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        self.send_response(200 if self.path == "/status" else 404)
+        self.send_header("Content-Length", "2")
+        self.end_headers(); self.wfile.write(b"{}")
+http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
+/// LMCache 0.5.6 in the fixture's environment beside vLLM 0.32.0 (the
+/// check's source excerpts), its server the stand-in above; the profile
+/// registers it as `engine add` does.
+fn lmcache_environment(host: &mut Value) {
+    let engine = PathBuf::from(
+        host["runtime_profiles"]["local"]["executable"]
+            .as_str()
+            .unwrap(),
+    );
+    let venv = engine.parent().unwrap().parent().unwrap();
+    let site = venv.join("lib/python3.12/site-packages");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lmcache");
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    copy_tree(&fixtures.join("vllm-0.32.0"), &site);
+    copy_tree(&fixtures.join("lmcache-0.5.6"), &site);
+    let dist = site.join("lmcache-0.5.6.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        "Metadata-Version: 2.4\nName: lmcache\nVersion: 0.5.6\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dist.join("entry_points.txt"),
+        "[console_scripts]\nlmcache = lmcache.cli.main:main\n",
+    )
+    .unwrap();
+    capyctl_config::test_support::write_executable(
+        &venv.join("bin/lmcache"),
+        format!("#!{}\n{FAKE_LMCACHE}", python3().display()),
+        0o755,
+    )
+    .unwrap();
+    let measured = capyctl_agent::lmcache_install::measure_lmcache(
+        &capyctl_agent::installation::InstallationMeasurer::new(),
+        &engine,
+    )
+    .unwrap()
+    .expect("LMCache is installed");
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["build_fingerprint"] = json!("0.32.0");
+    profile["lmcache"] = json!({"version": measured.version, "digest": measured.digest});
+}
+
+/// A `restart_only` vLLM launch granted an LMCache server on two leased
+/// ports with a 1 GiB pool, on a host whose LMCache directory root exists.
+fn lmcache_fixture() -> (Fixture, MemberCommand, [u16; 2]) {
+    let ports = [engine_port(), engine_port()];
+    let fixture = Fixture::build(Some(false), true, |host, _| {
+        lmcache_environment(host);
+        let engine = host["resource_policy"]["endpoint_port_range"]["start"]
+            .as_u64()
+            .unwrap() as u16;
+        let all = [engine, ports[0], ports[1]];
+        host["resource_policy"]["endpoint_port_range"] =
+            json!({"start": all.iter().min(), "end": all.iter().max()});
+        host["resource_policy"]["domains"]["unified"] = json!({
+            "free_reserve": "16MiB", "host_kv_limit": "2GiB", "managed_limit": "3GiB",
+            "memory": "unified", "parked_limit": "2GiB"
+        });
+    });
+    let mut launch = fixture.launch();
+    if let MemberAction::LaunchSingle(plan) = &mut launch.action {
+        plan.lmcache = Some(capyctl_protocol::execution::LmcacheGrant {
+            rpc_port: ports[0],
+            http_port: ports[1],
+            pool_bytes: 1 << 30,
+            overhead_bytes: 64 << 20,
+            device_bytes: 0,
+            held_kv_bytes: 0,
+        });
+    }
+    let launch = sign(launch);
+    (fixture, launch, ports)
+}
+
+fn lmcache_host(fixture: &Fixture) -> Host {
+    let mut host = host(fixture);
+    let dirs = private(&fixture.root.path().join("state/lmcache"));
+    host.executor = host.executor.clone().with_lmcache_dirs(dirs);
+    host
+}
+
+fn roles<'a>(
+    result: &'a capyctl_protocol::pb::MemberExecutionResult,
+    presence: &'a str,
+) -> impl Iterator<Item = &'a capyctl_protocol::pb::OwnedProcessObservation> + 'a {
+    result
+        .processes
+        .iter()
+        .filter(move |p| p.presence == presence)
+}
+
+fn server_exit(journal: &Arc<HostJournal>) -> capyctl_protocol::reports::MemberExit {
+    let started = std::time::Instant::now();
+    loop {
+        let exited = capyctl_agent::exits::scan(journal, "host", now_ms());
+        if let Some(launch) = exited
+            .into_iter()
+            .find(|l| l.exit.process.role == "lmcache")
+        {
+            return launch.exit;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+// T45 T24 T37 (ADR 0033 §§3, 5, 7, 8): the server starts before the engine
+// and the engine gets the connector; a re-proof proves both groups; a
+// restart-park stops the engine alone (verified) and keeps the server; the
+// wake starts a new engine on that same server; a server that dies is
+// reported under its role with its identity kept; Terminate stops both
+// groups and removes the launch's LMCache directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_lmcache_launch_restart_parks_wakes_and_terminates_whole() {
+    let (fixture, launch, ports) = lmcache_fixture();
+    let host = lmcache_host(&fixture);
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let report = ready.lmcache.clone().expect("the launch reports LMCache");
+    assert_eq!(report.state, "on", "{report:?}");
+    assert_eq!(
+        (report.rpc_port, report.http_port),
+        (u32::from(ports[0]), u32::from(ports[1]))
+    );
+    let server: Vec<_> = roles(&ready, "alive")
+        .filter(|p| p.role == "lmcache")
+        .cloned()
+        .collect();
+    assert_eq!(server.len(), 1, "{ready:?}");
+    let first_api = roles(&ready, "alive")
+        .find(|p| p.role == "api")
+        .unwrap()
+        .pid;
+    let argv: Vec<String> =
+        serde_json::from_value(fixture.record().unwrap()["argv"].clone()).unwrap();
+    assert!(
+        argv.iter().any(|a| a.contains("LMCacheMPConnector")),
+        "{argv:?}"
+    );
+
+    // A re-proof proves the engine and the server.
+    let probed = host
+        .executor
+        .execute(host.session, fixture.probe(&launch, "probe"))
+        .await
+        .unwrap();
+    assert!(probed.model_usable, "{probed:?}");
+
+    // Park: the engine group is stopped, the server is all the launch holds.
+    let parked = host
+        .executor
+        .execute(host.session, fixture.park(&launch, "park"))
+        .await
+        .unwrap();
+    let evidence = parked.residency.clone().unwrap();
+    assert_eq!(evidence.state, "parked", "{parked:?}");
+    assert!(evidence.engine_stopped);
+    assert!(
+        roles(&parked, "alive").all(|p| p.role.starts_with("lmcache")),
+        "{parked:?}"
+    );
+    assert!(parked
+        .processes
+        .iter()
+        .any(|p| p.pid == server[0].pid && p.presence == "alive"));
+
+    // Restore: a new engine on the same server, Ready again.
+    let restored = host
+        .executor
+        .execute(host.session, fixture.restore(&launch, "restore"))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.residency.as_ref().unwrap().state,
+        "restored",
+        "{restored:?}"
+    );
+    assert!(restored.model_usable);
+    assert_eq!(restored.lmcache.as_ref().unwrap().state, "on");
+    let api = roles(&restored, "alive")
+        .find(|p| p.role == "api")
+        .unwrap()
+        .pid;
+    assert_ne!(api, first_api, "a new engine");
+    assert!(roles(&restored, "alive").any(|p| p.pid == server[0].pid));
+
+    // The server dies: reported under its role, its identity kept.
+    unsafe { libc::kill(server[0].pid as i32, libc::SIGKILL) };
+    let exit = server_exit(&host.journal);
+    assert_eq!(
+        (exit.process.pid, exit.owned_handle.as_str()),
+        (server[0].pid, "launch")
+    );
+    assert!(host
+        .journal
+        .inspect_owned("launch")
+        .unwrap()
+        .iter()
+        .any(|(p, presence)| p.pid == server[0].pid
+            && *presence == capyctl_domain::completion::Presence::Gone));
+
+    // Terminate: both groups gone, the LMCache directory removed.
+    let dir = fixture.root.path().join("state/lmcache").join(INCARNATION);
+    private(&dir);
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(!stopped.claim_retained, "{stopped:?}");
+    assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
+    assert!(stopped.processes.iter().any(|p| p.role == "lmcache"));
+    assert!(!dir.exists());
+}
+
+// T45 (ADR 0033 §§3, 5): the server of a restart-parked launch is watched
+// too; its exit is reported under its role while the launch is parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_launchs_server_exit_is_reported() {
+    let (fixture, launch, _) = lmcache_fixture();
+    let host = lmcache_host(&fixture);
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    assert!(ready.model_usable, "{ready:?}");
+    let parked = host
+        .executor
+        .execute(host.session, fixture.park(&launch, "park"))
+        .await
+        .unwrap();
+    assert_eq!(
+        parked.residency.as_ref().unwrap().state,
+        "parked",
+        "{parked:?}"
+    );
+    let server = roles(&parked, "alive")
+        .find(|p| p.role == "lmcache")
+        .unwrap()
+        .pid;
+    unsafe { libc::kill(server as i32, libc::SIGKILL) };
+    assert_eq!(server_exit(&host.journal).process.pid, server);
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
+}
