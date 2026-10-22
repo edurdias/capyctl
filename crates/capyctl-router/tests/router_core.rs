@@ -1555,6 +1555,97 @@ async fn a_hang_up_after_an_engine_chunk_is_answered() {
     .await;
 }
 
+// T17 T38 (SPEC §10, amended 2026-10-21, owner decision for 0.1.7): a client
+// that disconnects in the middle of a collected chat request cancels its
+// forward, so the engine sees its connection close within a bound, as for a
+// stream: before the engine's response head, and after a head and a chunk
+// that only opens the reply. The engine never answered it, so it is held as
+// cancelling until the instance's verified stop, and its in-flight slot is
+// released.
+#[tokio::test]
+async fn a_hang_up_mid_collected_request_closes_the_engine_connection() {
+    for opening in [false, true] {
+        let engine = if opening {
+            capyctl_testkit::HeldEngine::opening().await
+        } else {
+            capyctl_testkit::HeldEngine::start().await
+        };
+        let (authority, deps) = stub_router(&engine.endpoint());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = capyctl_router::serve_router(deps.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "public-alias",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .send()
+                .await
+        });
+        let bound = std::time::Duration::from_secs(5);
+        assert!(
+            engine.arrived_within(1, bound).await,
+            "never reached the engine"
+        );
+        // Long enough for the router to read the opening chunk, if any.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(engine.closed(), 0, "opening: {opening}");
+        // The client hangs up mid-request, long before its deadline.
+        client.abort();
+        let _ = client.await;
+        assert!(
+            engine.closed_within(1, bound).await,
+            "the engine connection stayed open after the hang-up (opening: {opening})"
+        );
+        eventually(|| {
+            ends(&authority)
+                == vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+                    answered: false,
+                })]
+        })
+        .await;
+        eventually(|| deps.inflight.current("dep-1") == 0).await;
+    }
+}
+
+// T17 T38 (SPEC §10, amended 2026-10-02 and 2026-10-21): a collected request
+// cut at its deadline drops its forward too, so the engine sees its
+// connection close.
+#[tokio::test]
+async fn a_collected_request_cut_at_its_deadline_closes_the_engine_connection() {
+    let engine = capyctl_testkit::HeldEngine::start().await;
+    let (authority, deps) = stub_router(&engine.endpoint());
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, answer) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_once(&router, "public-alias"),
+    )
+    .await
+    .expect("cut at the request deadline");
+    assert_eq!(status, 500, "{answer}");
+    assert!(
+        engine
+            .closed_within(1, std::time::Duration::from_secs(5))
+            .await,
+        "the engine connection stayed open after the cut"
+    );
+    assert_eq!(
+        ends(&authority),
+        vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+            answered: false
+        })]
+    );
+}
+
 // T15 (SPEC §10 step 2): a detached activation whose task panics answers its
 // waiters and frees its slot, so the next request starts a fresh activation
 // instead of joining a claim nobody completes.

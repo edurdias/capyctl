@@ -810,3 +810,86 @@ async fn the_native_key_reaches_only_an_engine_that_takes_it() {
     }
     task.abort();
 }
+
+// T17 T38 T43 (SPEC §10, amended 2026-10-21, owner decision for 0.1.7): when
+// the router's connection to the ingress goes away in the middle of a
+// forwarded request (the router cancelled it: its client hung up or its
+// deadline cut it), the ingress drops its engine connection within a bound
+// and the request's forwarding slot is freed. A chat request before the
+// engine's response head and after a head and an opening chunk, and a
+// decision, whose answer comes whole.
+#[tokio::test]
+async fn the_engine_connection_closes_when_the_upstream_goes_away() {
+    let chat = serde_json::json!({"model":"model","messages":[],"stream":true});
+    let decision = serde_json::json!({"model": "model", "state": "hi",
+        "questions": {"q": {"type": "noul", "instructions": "Angry?"}}});
+    for (path, body, opening) in [
+        ("/v1/chat/completions", chat.clone(), false),
+        ("/v1/chat/completions", chat, true),
+        ("/v1/systemone", decision, false),
+    ] {
+        let engine = if opening {
+            capyctl_testkit::HeldEngine::opening().await
+        } else {
+            capyctl_testkit::HeldEngine::start().await
+        };
+        let ingress = Ingress::new().unwrap();
+        let live = scope(1);
+        ingress
+            .register(
+                live.clone(),
+                engine.address(),
+                "model".into(),
+                [1; 32],
+                [2; 32],
+            )
+            .unwrap();
+        ingress.open(&live).unwrap();
+        let (address, task) = serve(ingress.clone().router()).await;
+        let mut upstream = reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send();
+        let bound = std::time::Duration::from_secs(5);
+        // Drive the upstream request until the engine has it.
+        let response = tokio::select! {
+            response = &mut upstream => Some(response.unwrap()),
+            arrived = engine.arrived_within(1, bound) => {
+                assert!(arrived, "{path}: never reached the engine");
+                None
+            }
+        };
+        let mut body = match response {
+            Some(response) => {
+                assert!(opening, "{path}: answered without an engine answer");
+                assert_eq!(response.status(), StatusCode::OK);
+                Some(response)
+            }
+            None if opening => {
+                let mut response = (&mut upstream).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(response.chunk().await.unwrap().is_some());
+                Some(response)
+            }
+            None => None,
+        };
+        assert_eq!(engine.closed(), 0, "{path} (opening: {opening})");
+        assert_eq!(ingress.current_requests(&live).unwrap(), 1);
+        // The router goes away with its connection.
+        drop(body.take());
+        drop(upstream);
+        assert!(
+            engine.closed_within(1, bound).await,
+            "{path} (opening: {opening}): the engine connection stayed open"
+        );
+        tokio::time::timeout(bound, async {
+            while ingress.current_requests(&live).unwrap() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the forwarding slot is freed");
+        task.abort();
+    }
+}
