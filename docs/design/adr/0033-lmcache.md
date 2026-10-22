@@ -165,7 +165,8 @@ list` say "LMCache off" with the reason (§9).
 state, linear or sliding-window attention): models are qualified as they are run, and a
 model whose engine fails to start with the connector falls back as §8 says. **Decision
 deployments** (`api: decisions`, ADR 0030) use it like chat deployments wherever their
-engine is supported (vLLM 0.32.0 or newer, SGLang 0.5.22 or newer); a decision request
+engine serves decisions and supports LMCache: SGLang 0.5.22 or newer (vLLM is refused for
+decisions, ADR 0030 §6 amendment of 2026-10-21); a decision request
 carries no salt, so decisions share the deployment's unsalted partition. The one layout
 without LMCache in 0.1.7 is a deployment with a `topology` (`group_unsupported`: one
 private server on one machine cannot serve the ranks of a group across machines, ADR
@@ -688,7 +689,7 @@ engine:
 | LC4 | Park and wake per engine: `restart_only` with LMCache (the server stays up and charged while parked; the first request after the wake hits from LMCache with the same answer); a `deep` deployment on a combination outside the table runs deep with LMCache off and the reason shown; then `deep` with LMCache for the combination under test, on a build whose table lists it: park, wake, a hit with the same answer as without the cache. A pass adds the combination to the released table; a failure leaves it out. |
 | LC5 | Zero retention: a host with `retention: zero` refuses `lmcache: required` (`retention_zero:lmcache`), runs an `auto` deployment with LMCache off (`retention_zero`), writes no engine log file, and its engine shows `Max core file size 0` in `/proc/<pid>/limits`; turning it on with a server running stops that server (verified exit) and relaunches its instance without LMCache. |
 | LC6 | Missing package: a deployment on the approved environment without LMCache (`~/sglang-0.5.22-venv` as registered) runs with LMCache off (`not_installed`) in status, `engine list` and an `lmcache_off` event; `lmcache: required` on it is refused. |
-| LC7 | Decisions: a decision deployment (Clef-Flash) on SGLang 0.5.22, and on vLLM 0.32.0, starts with LMCache on; the same state asked twice, the second time after the engine's own cache no longer holds it, hits from LMCache and gives the same pick with probabilities within ADR 0030's 0.05; it parks `restart_only` and the first decision after the wake hits. |
+| LC7 | Decisions: a decision deployment (Clef-Flash) on SGLang 0.5.22 starts with LMCache on; the same state asked twice, the second time after the engine's own cache no longer holds it, hits from LMCache and gives the same pick with probabilities within ADR 0030's 0.05; it parks `restart_only` and the first decision after the wake hits. (vLLM is refused for decisions, ADR 0030 §6.) |
 | LC8 | Relaunch without LMCache: the LMCache server of a starting instance is killed (SIGKILL to its owned PID) before the engine is ready; the engine is stopped with a verified exit and relaunched once without LMCache, which serves; the warning, the `lmcache_off` event (`engine_start_failed`) and status show it, and the next start of that revision goes without LMCache. With `lmcache: required` the same launch fails `lmcache_unavailable:engine_start_failed` and nothing is left running. |
 | LC9 | Server exit while serving: the server of a ready instance is killed; the instance fails, its engine is stopped with a verified exit, and recovery relaunches the engine and a new server (`lmcache_server_exited`). |
 | LC10 | Host off: a host with `lmcache: off` runs an `auto` deployment with LMCache off (`host_off`) in status and `engine list`; restarting a role with a server running into `lmcache: off` stops that server (verified exit) and relaunches its instance without LMCache. |
@@ -745,8 +746,9 @@ The answers to the first draft's ten open questions:
 5. **Layouts:** every model gets LMCache by default, hybrid included; models are
    qualified as they run, and one whose engine fails with the connector falls back by
    answer 2 (§2).
-6. **Decision deployments:** on where supported (vLLM 0.32.0 or newer, SGLang 0.5.22),
-   like chat, with a qualification row (§2, LC7).
+6. **Decision deployments:** on where supported, like chat, with a qualification row
+   (§2, LC7). Amended 2026-10-21: SGLang only, since vLLM stays refused for decisions
+   (ADR 0030 §6 amendment of 2026-10-21).
 7. **LMCache versions:** any 0.5.x release from 0.5.6 is used when CapyCTL's launch-time
    check passes (§1).
 8. **SGLang after 0.5.22:** LMCache is used when the launch-time check passes (§§1–2).

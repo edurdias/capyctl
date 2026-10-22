@@ -9,7 +9,8 @@ SGLang 0.5.22 or newer through `--enable-lmcache --lmcache-config-file`; the in-
 `LMCacheConnectorV1` is refused because it ignores `cache_salt` (LMCache issue #2878).
 vLLM 0.31, older SGLang, llama.cpp, TensorFold and custom engines show "LMCache off" with
 the reason. Every model gets LMCache by default, hybrid layouts and decision deployments
-included. Each deployment instance gets its own LMCache server, started and stopped by
+included (decisions on SGLang only: vLLM stays refused for decisions, ADR 0030 §6
+amendment of 2026-10-21). Each deployment instance gets its own LMCache server, started and stopped by
 CapyCTL with it, on loopback ports CapyCTL leases, checked with ADR 0031's listener check
 because the 0.5.6 admin HTTP API has no authentication; the script API stays off; host
 RAM (L1) only, LRU within the private pool, nothing on disk. The server stays up while
