@@ -57,6 +57,10 @@ pub enum AdapterSpec {
         /// ADR 0030 §1, §6 (amended 2026-10-21): the API the deployment
         /// serves, which decides how readiness and the wake canary are proven.
         api: capyctl_config::effective::DeploymentApi,
+        /// ADR 0033: the launch's LMCache server and report, shared with the
+        /// caller; `None` for a launch that never uses LMCache. It becomes
+        /// the launch plan's `lmcache`.
+        lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch
     /// it was verified against, the two per-launch credentials, and — when the
@@ -94,6 +98,9 @@ pub enum AdapterSpec {
         /// ADR 0030 §1: the API the deployment serves, which decides how
         /// readiness and the wake canary are proven.
         api: capyctl_config::effective::DeploymentApi,
+        /// ADR 0033: the launch's LMCache server and report, shared with the
+        /// caller; `None` for a launch that never uses LMCache.
+        lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
     },
     /// ADR 0023: TensorFold talks plain HTTP on loopback and has no key; an
     /// owned launch carries its plan.
@@ -181,11 +188,19 @@ pub fn resolve(
             admin_key,
             residency,
             api,
+            lmcache,
         } => {
             let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id)
                 .with_residency(residency)
                 .with_api(api);
-            if let Some(launch) = launch {
+            if let Some(mut launch) = launch {
+                if let Some(state) = lmcache {
+                    // ADR 0033 §3: the server's log beside the engine's.
+                    if let Some(log) = &launch.engine_log {
+                        state.log_beside(log);
+                    }
+                    launch.lmcache = Some(state);
+                }
                 adapter = adapter.with_launch(launch);
             }
             if let Some(tools) = tools {
@@ -210,6 +225,7 @@ pub fn resolve(
             extra_approvals,
             rendezvous,
             api,
+            lmcache,
         } => {
             let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
                 .map_err(|error| match error {
@@ -229,7 +245,14 @@ pub fn resolve(
                 adapter = adapter.with_wrapper(wrapper);
             }
             if let Some(log) = log {
+                if let Some(state) = &lmcache {
+                    // ADR 0033 §3: the server's log beside the engine's.
+                    state.log_beside(&log);
+                }
                 adapter = adapter.with_log(log);
+            }
+            if let Some(state) = lmcache {
+                adapter = adapter.with_lmcache(state);
             }
             if let Some(session) = session {
                 adapter = adapter.with_session(session);

@@ -403,6 +403,24 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
                 public["settings"]["draft_model_path"] = value
                 self.rejects(self.argv(public), self.payloads(public))
 
+    # T45 T37 (ADR 0033 §4): present only on a launch whose LMCache server is
+    # up: the absolute path of its owner-only connector file, never on a group
+    # member (ADR 0033 §2).
+    def test_an_lmcache_config_file_is_an_optional_absolute_path(self):
+        public = copy.deepcopy(self.public)
+        public["settings"]["lmcache_config_file"] = "/var/lib/capyctl/lmcache/i/config.yaml"
+        self.build(self.argv(public), self.payloads(public))
+        for value in (None, "", "config.yaml", "/var/../etc/x", "/var/./x", 1, True,
+                      "/a\nb", "/" + "c" * 4096):
+            with self.subTest(value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["lmcache_config_file"] = value
+                self.rejects(self.argv(public), self.payloads(public))
+        public = group_public(0)
+        public["settings"]["lmcache_config_file"] = "/var/lib/capyctl/lmcache/i/config.yaml"
+        with self.assertRaises(entry.LaunchError):
+            self.build_member(public)
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.

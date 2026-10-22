@@ -373,6 +373,8 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0030 §1, §6: readiness and the wake canary follow
                     // the deployment's API.
                     api: effective.api,
+                    // ADR 0033: attached by the embedded LMCache grant (later slice).
+                    lmcache: None,
                 })
             }
             Engine::Sglang => {
@@ -453,6 +455,8 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0030 §3: readiness and the canary follow the
                     // deployment's API.
                     api: effective.api,
+                    // ADR 0033: attached by the embedded LMCache grant (later slice).
+                    lmcache: None,
                 })
             }
             Engine::Tensorfold => {

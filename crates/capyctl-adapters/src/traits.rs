@@ -521,6 +521,51 @@ pub trait OwnedProcessLaunch: Send + Sync {
         identities: &[capyctl_domain::completion::ProcessIdentity],
         grace: std::time::Duration,
     ) -> Result<(), RuntimeError>;
+    /// ADR 0033 §3: spawn the launch's LMCache server gated, as a second owned
+    /// process group of the same launch (key `"{incarnation}#lmcache"`, role
+    /// `lmcache`), its identity recorded before it runs. Its output goes to
+    /// the file `cmd.env["CAPYCTL_ENGINE_LOG"]` names through its own
+    /// redacting writer; its environment is exactly `PATH`, `HOME` and
+    /// `CUDA_VISIBLE_DEVICES`. `Unsupported` where the tools cannot.
+    fn spawn_lmcache(
+        &self,
+        _incarnation: &str,
+        _cmd: &RenderedCommand,
+    ) -> Result<capyctl_domain::completion::ProcessIdentity, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+    /// ADR 0033 §3: every live member of the server's group: the recorded
+    /// `lmcache` leader first while it lives, then `lmcache-0`, `lmcache-1`,
+    /// ... in start order; empty when no member is live.
+    fn observe_lmcache_group(
+        &self,
+        _leader: &capyctl_domain::completion::ProcessIdentity,
+    ) -> Result<Vec<capyctl_domain::completion::ProcessIdentity>, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+    /// ADR 0033 §§3, 7: the verified stop of a subset that is exactly one owned
+    /// group of the launch (the server's group, or the engine's with its
+    /// helpers), as `terminate_owned` stops a launch. The claim and the
+    /// accounting stay until the launch's own Terminate (ADR 0031 §7).
+    fn stop_group(
+        &self,
+        _identities: &[capyctl_domain::completion::ProcessIdentity],
+        _grace: std::time::Duration,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+    /// ADR 0033 §7: a restart-parked launch's engine, spawned again on wake
+    /// under the key `"{incarnation}#wake-{wake}"` (one spawn per wake step),
+    /// its `api` identity recorded for that wake before it runs.
+    fn spawn_durable_wake(
+        &self,
+        _incarnation: &str,
+        _wake: &str,
+        _cmd: &RenderedCommand,
+        _descriptors: Option<&crate::protected::ProtectedLaunchDescriptors>,
+    ) -> Result<capyctl_domain::completion::ProcessIdentity, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
 }
 
 /// How a forwarded stream ended (engine-neutral; mirrors SSE semantics).

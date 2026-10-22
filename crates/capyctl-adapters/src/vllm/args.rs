@@ -117,6 +117,14 @@ pub struct PlanInputVllm {
     /// ADR 0028 §10: this member's multi-node arguments; `None` is a
     /// single-rank launch, rendered exactly as before (T39).
     pub group: Option<capyctl_domain::group::GroupMemberArgs>,
+    /// ADR 0033 §4: the owned `--kv-transfer-config` naming the launch's
+    /// LMCache server, rendered in the reserved block before
+    /// [`USER_ARGS_MARKER`]. Set by Initialize once the server is up, never
+    /// by a deployment (its own LMCache connector is refused at validation).
+    pub kv_transfer_config: Option<String>,
+    /// ADR 0033: the launch's LMCache server and its report; `None` for a
+    /// launch that never uses LMCache.
+    pub lmcache: Option<std::sync::Arc<crate::lmcache::LmcacheState>>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -159,6 +167,8 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("runtime_dir", &self.runtime_dir)
             .field("cuda_namespace", &self.cuda_namespace)
             .field("group", &self.group)
+            .field("kv_transfer_config", &self.kv_transfer_config)
+            .field("lmcache", &self.lmcache)
             .finish()
     }
 }
@@ -394,6 +404,18 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
     if let Some(group) = &input.group {
         render_group(group, &mut argv, &mut env);
+    }
+    // ADR 0033 §4: CapyCTL's own connector, in the reserved block. It is
+    // rendered after the pass-through validation above, which refuses an
+    // LMCache connector from `engine_args`/`extra_args`; a deployment with
+    // another connector there runs without LMCache (`kv_transfer_config_set`),
+    // so nothing after the marker sets this option beside it.
+    if let Some(config) = &input.kv_transfer_config {
+        push(
+            &mut argv,
+            capyctl_config::engine_policy::KV_TRANSFER_CONFIG,
+            config.clone(),
+        );
     }
     // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
     // refuses it if any reserved field above resolves differently.

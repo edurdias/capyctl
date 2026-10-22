@@ -183,6 +183,23 @@ impl SglangLaunch {
         &self.public
     }
 
+    /// ADR 0033 §4: the launch's LMCache connector configuration, a public
+    /// setting (`lmcache_config_file`) the entry validates and renders as the
+    /// reserved `enable_lmcache=True, lmcache_config_file=<path>`, pinned after
+    /// SGLang resolved its arguments. Absent, the entry keeps LMCache off as
+    /// before. A group member never uses LMCache (`group_unsupported`).
+    pub fn with_lmcache_config_file(mut self, path: &Path) -> Result<Self, RuntimeError> {
+        let path = path
+            .to_str()
+            .filter(|path| absolute_path(path) && !path.split('/').any(|p| p == "." || p == ".."))
+            .ok_or(RuntimeError::Unsupported)?;
+        if self.public["settings"].get("group").is_some() {
+            return Err(RuntimeError::Unsupported);
+        }
+        self.public["settings"]["lmcache_config_file"] = json!(path);
+        Ok(self)
+    }
+
     /// The final launcher substitutes three distinct protected descriptor numbers
     /// (for a group worker, the private launch descriptor and, when deep, its
     /// observation credential) only after resolving the private frozen inputs
