@@ -46,17 +46,22 @@ capability cases in `every_post_baseline_field_names_its_capability`
 (protocol). The unified startup tests pass unchanged. CPU and Fake-engine tests
 are not qualification.
 
-Live check still needed (discrete-GPU laptop, vLLM): deploy a model stating
-only `name`, `engine` and `model` (for example Qwen3-4B on vLLM 0.31.0), start
-it once and check `capyctl status deployment <name> --json`: `startup.measured`
-has one record on `gpu0` and one on `system`, the card's close to what
-`nvidia-smi` showed for the engine's processes during the load and the host
-RAM's close to their peak `RssAnon` + `RssShmem`, and `startup.device_provenance`
-and `startup.host_provenance` are `measured`. Stop and start it again: the
-starting instance's `startup` reserves those figures (each at least the steady
-charge), it reaches Ready, and the STARTUP column shows the measured card
-figure with the measured host RAM beside it. Repeat once in the container
-setup of the discrete container qualification.
+Live on the laptop, 2026-10-21 (RTX 4090 Laptop GPU, 16 GiB; vLLM 0.31.0;
+release build of `main` d9d5640d with this branch and `fix/hostname-changed`),
+a deployment stating only `name`, `engine` and `model`. Qwen3-4B did not fit:
+its host RAM estimate (15.2 GiB) was above the 12 GiB the laptop had free, so
+the run used Qwen2.5-1.5B-Instruct. Isolated standalone on the host: the first
+start became Ready in 200 s with `startup.measured` one `gpu0` record of
+8149532672 bytes (7772 MiB; `nvidia-smi` peaked at 7774 MiB for the engine's
+processes) and one `system` record of 6874185728 bytes (sampled peak
+`RssAnon` + `RssShmem` of the engine's processes 7.3 GB), both `measured`.
+After a stop, the starting instance's `startup` reserved 13.2 GiB on the card
+and 8.3 GiB of RAM (`measured`; each the steady charge, above the measured
+peak) and was Ready in 39 s. In the discrete container setup (`ubuntu:24.04`,
+CDI, `--user 1000:1000`, `--hostname capyctl-laptop`): first start Ready in
+165 s, `gpu0` 8149532672 bytes (`nvidia-smi` 7774 MiB) and `system`
+6209007616 bytes (sampled 7.1 GB), both `measured`; the restart reserved the
+same figures and was Ready in 42 s.
 
 # Release note: Memory
 
