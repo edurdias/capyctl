@@ -698,6 +698,9 @@ fn identity(conn: &rusqlite::Connection, binding_id: &str) -> Result<Identity, L
 /// inside the caller's transaction; `lmcache_off` once when off. The first
 /// report decides: a launch's charge never changes under a reservation
 /// already made from it, so a later report that disagrees changes nothing.
+/// A report that repeats the reason the store planned the launch off for
+/// journals nothing: the plan decided that event (ADR 0033 §8: a relaunch
+/// forced off repeats what its failed launch's event already said).
 pub(super) fn record_outcome(
     tx: &Transaction<'_>,
     binding_id: &str,
@@ -705,11 +708,12 @@ pub(super) fn record_outcome(
     now: i64,
 ) -> Result<(), LifecycleError> {
     let (deployment, instance, generation, host) = identity(tx, binding_id)?;
-    let (planned_on, state): (bool, Option<String>) = tx.query_row(
-        "SELECT planned='on',state FROM launch_lmcache WHERE binding_id=?1",
-        [binding_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (planned_on, state, planned_reason): (bool, Option<String>, Option<String>) = tx
+        .query_row(
+            "SELECT planned='on',state,planned_reason FROM launch_lmcache WHERE binding_id=?1",
+            [binding_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
     match outcome {
         LmcacheOutcome::On => {
             // A host never runs a server the store did not plan.
@@ -731,7 +735,9 @@ pub(super) fn record_outcome(
                   WHERE binding_id=?1 AND state IS NULL",
                 params![binding_id, reason.code(), detail, now],
             )?;
-            if *reason != LmcacheOffReason::Disabled {
+            if *reason != LmcacheOffReason::Disabled
+                && planned_reason.as_deref() != Some(reason.code())
+            {
                 let launch = launch_of(&deployment, instance, generation, binding_id, &host);
                 if off_event(tx, &launch, *reason, &detail)? {
                     tx.execute(

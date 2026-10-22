@@ -30,6 +30,10 @@ mod switching_tests;
 #[path = "tests_groups.rs"]
 mod tests_groups;
 
+// ADR 0033: LMCache fallback, server exit and restart-park round trip.
+#[path = "tests_lmcache.rs"]
+mod lmcache_tests;
+
 use capyctl_testkit::{fixture, FakeEngine};
 
 struct Observations(Vec<MemoryObservation>);

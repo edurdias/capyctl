@@ -969,3 +969,502 @@ fn launch_identities_record_both_leaders_once() {
         2
     );
 }
+
+// T45 T14: ADR 0033 §§6, 12 (lifecycle design §7). What a host measured of
+// its launch's server (resident memory beyond the pool is the overhead, and
+// its GPU memory) is recorded for the revision on that host, max-merged per
+// figure. The revision's next launch there charges it in place of the
+// allowances; the same revision on another host still charges the
+// allowances. A sample from another host, of another generation or naming
+// no launch, changes nothing.
+#[test]
+fn a_host_measurement_replaces_the_allowances_of_the_next_launch_there() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    let recorded = lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    let step = context.token.step_id.clone();
+    // The server group's resident memory is the 1 GiB pool plus `beyond`
+    // MiB; its GPU memory is `device` MiB.
+    let measure = |host: &str, step: &str, generation: i64, beyond: i64, device: i64| {
+        lab.store
+            .record_host_lmcache_measurement(
+                &lab.session,
+                host,
+                &a.deployment_id,
+                generation,
+                step,
+                GIB + beyond * MIB,
+                device * MIB,
+                300,
+            )
+            .unwrap()
+    };
+    let rows = || -> Vec<(String, i64, i64)> {
+        lab.store
+            .conn
+            .prepare(
+                "SELECT host_id,overhead_bytes,device_bytes FROM lmcache_measurements
+                  WHERE deployment_id=?1 ORDER BY host_id",
+            )
+            .unwrap()
+            .query_map([&a.deployment_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let generation = a.generation;
+    assert!(!measure("other", &step, generation, 600, 300));
+    assert!(!measure("lab", &step, generation + 1, 600, 300));
+    assert!(!measure("lab", "no-such-launch", generation, 600, 300));
+    // A server within its pool using no GPU memory measured no overhead.
+    assert!(!measure("lab", &step, generation, 0, 0));
+    assert!(rows().is_empty());
+
+    assert!(measure("lab", &step, generation, 600, 300));
+    // A smaller sample does not lower it; a larger figure grows on its own.
+    assert!(!measure("lab", &step, generation, 500, 200));
+    assert!(measure("lab", &step, generation, 700, 100));
+    assert_eq!(rows(), [("lab".to_owned(), 700 * MIB, 300 * MIB)]);
+    // The running launch keeps the charge it was granted.
+    assert_eq!(unified(&lab.footprint(&a)), (8 * GIB + CHARGE, 2 * GIB));
+
+    // Stopped, then started again: the next launch of the revision on this
+    // host is granted the measured figures.
+    let stop = lab
+        .store
+        .accept_ordinary_stop_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            a.revision,
+            "stop-1",
+            1_000,
+            61_000,
+        )
+        .unwrap();
+    let (_, cleanup) = lab
+        .store
+        .arm_ordinary_cleanup_with_context(&lab.session, &stop.step_id, 1_100)
+        .unwrap();
+    let cleanup = cleanup.unwrap();
+    let ttl = lab
+        .store
+        .resource_policy("lab")
+        .unwrap()
+        .unwrap()
+        .controls
+        .observation_ttl_ms;
+    lab.store
+        .complete_cleanup(
+            &lab.session,
+            &stop.step_id,
+            &CleanupEvidence {
+                binding_id: cleanup.binding_id,
+                incarnation: cleanup.incarnation,
+                identities: recorded,
+                observed_at_ms: 1_200,
+                receipt: "every recorded process observed gone".into(),
+            },
+            1_200,
+            ttl,
+        )
+        .unwrap();
+    let restarted = DeploymentFence {
+        generation: lab.row(
+            "SELECT current_generation FROM deployments WHERE id=?1",
+            &a.deployment_id,
+        ),
+        ..a.clone()
+    };
+    let (_, next) = lab.start(&restarted, 2_000);
+    let grant = lab
+        .store
+        .launch_lmcache_grant(&next.binding_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (grant.pool_bytes, grant.overhead_bytes, grant.device_bytes),
+        (GIB, 700 * MIB, 300 * MIB)
+    );
+    assert_eq!(
+        unified(&lab.footprint(&a)),
+        (10 * GIB + GIB + 700 * MIB + 300 * MIB, 2 * GIB)
+    );
+    // The same revision on another host is charged the allowances.
+    let tx = lab.store.conn.unchecked_transaction().unwrap();
+    let (_, e) = effective(&tx, &a).unwrap();
+    let plan = plan_on(&tx, &a.deployment_id, a.revision, "other", &e).unwrap();
+    let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "other", &e)
+        .unwrap()
+        .unwrap();
+    assert!(!measured);
+    assert_eq!(
+        (charge.overhead_bytes, charge.device_bytes),
+        (1280 * MIB, 512 * MIB)
+    );
+}
+
+/// Instance 0 of `fence` in the status snapshot, as the management API
+/// serializes it.
+fn instance_status(lab: &Lab, fence: &DeploymentFence) -> Value {
+    let snapshot = serde_json::to_value(lab.store.snapshot().unwrap()).unwrap();
+    let deployment = snapshot["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == json!(fence.deployment_id))
+        .unwrap()
+        .clone();
+    deployment["instances"][0].clone()
+}
+
+/// The `lmcache` object status shows for a launch with LMCache on that was
+/// charged the allowances.
+fn on_with_allowances(server: &str, charge: i64) -> Value {
+    json!({
+        "state": "on",
+        "server": server,
+        "pool_bytes": GIB,
+        "overhead_bytes": 1280 * MIB,
+        "device_bytes": 512 * MIB,
+        "held_kv_bytes": 4 * GIB,
+        "charge_bytes": charge,
+        "measured": false,
+    })
+}
+
+// T45 T10 T14: ADR 0033 §§6, 7, 9. Status shows the charge the launch holds
+// for its server, and it is the charge the store reserves: the pool and the
+// allowances while starting and Ready; while restart-parked, the engine KV
+// cache the server keeps mapped as well. A stop of the parked instance
+// releases all of it, held KV included, and the stopped instance shows no
+// LMCache.
+#[test]
+fn status_shows_the_server_charge_the_store_holds_through_park_and_stop() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    assert_eq!(
+        instance_status(&lab, &a)["lmcache"],
+        on_with_allowances("starting", CHARGE)
+    );
+    lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    assert_eq!(
+        instance_status(&lab, &a)["lmcache"],
+        on_with_allowances("running", CHARGE)
+    );
+    // The Ready footprint is the engine's 8 GiB plus exactly that charge.
+    assert_eq!(unified(&lab.footprint(&a)).0, 8 * GIB + CHARGE);
+
+    let park = lab
+        .store
+        .accept_park_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            a.revision,
+            "park-1",
+            1_000,
+            61_000,
+        )
+        .unwrap();
+    let parking = lab.arm_residency(&park.step_id, 1_100);
+    lab.complete_residency(
+        &parking,
+        server(10),
+        vec![Milestone::Quiesced, Milestone::MemoryReleased],
+        1_200,
+    )
+    .unwrap();
+    let parked = instance_status(&lab, &a);
+    assert_eq!(parked["observed_state"], "parked");
+    assert_eq!(
+        parked["lmcache"],
+        on_with_allowances("running", CHARGE + 4 * GIB)
+    );
+    // LC1: the parked footprint is the server's charge and the held KV.
+    assert_eq!(unified(&lab.footprint(&a)).0, CHARGE + 4 * GIB);
+
+    let stop = lab
+        .store
+        .accept_instance_stop_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            0,
+            a.revision,
+            "stop-1",
+            2_000,
+            62_000,
+        )
+        .unwrap()
+        .unwrap();
+    finish_stop(&lab, &stop.step_id, server(10), 2_100);
+    let owner = crate::instances::instance_owner_id(&a.deployment_id, 0);
+    assert!(!lab
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&owner));
+    // The stop retired the incarnation: the instance shows no LMCache until
+    // its next start plans one.
+    let stopped = instance_status(&lab, &a);
+    assert_eq!(stopped["observed_state"], "stopped", "{stopped}");
+    assert!(stopped.get("lmcache").is_none(), "{stopped}");
+}
+
+// T45 T14: ADR 0033 §§6, 9. A running launch keeps the allowances it was
+// granted after its server is measured; the revision's next launch on the
+// host shows the measured overhead and GPU memory, marked `measured`, and
+// that is what the store charges for it.
+#[test]
+fn status_marks_the_measured_overhead_of_the_next_launch() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    let recorded = lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    assert!(lab
+        .store
+        .record_lmcache_overhead(&lab.session, &context.binding_id, 600 * MIB, 300 * MIB, 300)
+        .unwrap());
+    assert_eq!(
+        instance_status(&lab, &a)["lmcache"],
+        on_with_allowances("running", CHARGE)
+    );
+
+    let stop = lab
+        .store
+        .accept_ordinary_stop_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            a.revision,
+            "stop-1",
+            1_000,
+            61_000,
+        )
+        .unwrap();
+    finish_stop(&lab, &stop.step_id, recorded, 1_100);
+    let restarted = DeploymentFence {
+        generation: lab.row(
+            "SELECT current_generation FROM deployments WHERE id=?1",
+            &a.deployment_id,
+        ),
+        ..a.clone()
+    };
+    lab.start(&restarted, 2_000);
+    let measured = GIB + 600 * MIB + 300 * MIB;
+    assert_eq!(
+        instance_status(&lab, &a)["lmcache"],
+        json!({
+            "state": "on",
+            "server": "starting",
+            "pool_bytes": GIB,
+            "overhead_bytes": 600 * MIB,
+            "device_bytes": 300 * MIB,
+            "held_kv_bytes": 4 * GIB,
+            "charge_bytes": measured,
+            "measured": true,
+        })
+    );
+    assert_eq!(unified(&lab.footprint(&a)).0, 10 * GIB + measured);
+}
+
+/// Arm the stop `step` and complete it on the host's evidence that
+/// `identities` are gone.
+fn finish_stop(lab: &Lab, step: &str, identities: Vec<ProcessIdentity>, now: i64) {
+    let (_, cleanup) = lab
+        .store
+        .arm_ordinary_cleanup_with_context(&lab.session, step, now)
+        .unwrap();
+    let cleanup = cleanup.unwrap();
+    let ttl = lab
+        .store
+        .resource_policy("lab")
+        .unwrap()
+        .unwrap()
+        .controls
+        .observation_ttl_ms;
+    lab.store
+        .complete_cleanup(
+            &lab.session,
+            step,
+            &CleanupEvidence {
+                binding_id: cleanup.binding_id,
+                incarnation: cleanup.incarnation,
+                identities,
+                observed_at_ms: now + 100,
+                receipt: "every recorded process observed gone".into(),
+            },
+            now + 100,
+            ttl,
+        )
+        .unwrap();
+}
+
+// T45 T24 T30: ADR 0033 §§8, 9, 14. Status says why LMCache is off: the
+// closed reason with the host's one-line detail, or the reason's sentence
+// for a multi-line diagnostic, for the engine's log tail and for the
+// deployment's own `off`; an off instance shows no figures. A server that
+// exited shows `exited` while its launch is still held; a launch released
+// before Ready shows it `stopped` with no charge. An instance never started
+// shows no LMCache at all. One host per case: each start holds its charge.
+#[test]
+fn status_says_why_lmcache_is_off_and_when_its_server_exited() {
+    let lmcache =
+        |lab: &Lab, fence: &DeploymentFence| instance_status(lab, fence)["lmcache"].clone();
+    let reported_off = |reason: LmcacheOffReason, detail: &str| {
+        let lab = Lab::new(|_| {});
+        let a = lab.deploy("a", |_| {});
+        let (_, context) = lab.start(&a, 100);
+        lab.ready(
+            &context,
+            10,
+            Some(LmcacheOutcome::Off {
+                reason,
+                detail: detail.into(),
+            }),
+            200,
+        );
+        lmcache(&lab, &a)
+    };
+    assert_eq!(
+        reported_off(
+            LmcacheOffReason::ServerStartFailed,
+            "no /status within 30 s"
+        ),
+        json!({"state": "off", "reason": "server_start_failed", "message": "no /status within 30 s"})
+    );
+    assert_eq!(
+        reported_off(
+            LmcacheOffReason::CheckFailed,
+            "missing: lmcache/v1/multiprocess\nmissing: salt threading"
+        ),
+        json!({
+            "state": "off",
+            "reason": "check_failed",
+            "message": "the launch-time check of the LMCache installation failed",
+        })
+    );
+
+    let lab = Lab::new(|_| {});
+    let disabled = lab.deploy("disabled", |c| {
+        c["lmcache"] = json!("off");
+        c.as_object_mut().unwrap().remove("lmcache_pool");
+    });
+    lab.start(&disabled, 100);
+    assert_eq!(
+        lmcache(&lab, &disabled),
+        json!({"state": "off", "reason": "disabled", "message": "turned off by the deployment"})
+    );
+
+    // ADR 0033 §8: the relaunch without LMCache shows the reason's sentence,
+    // never the engine's log tail.
+    let lab = Lab::new(|_| {});
+    let fallback = lab.deploy("fallback", |_| {});
+    let (_, context) = lab.start(&fallback, 100);
+    lab.store
+        .record_launch_identity(&lab.session, &fallback, &context.binding_id, &server(30)[0])
+        .unwrap();
+    let ttl = lab
+        .store
+        .observation_ttl_for_step(&context.token.step_id)
+        .unwrap();
+    let outcome = lab
+        .store
+        .release_failed_launch_lmcache(
+            &lab.session,
+            &context.token.step_id,
+            &gone(&context, server(30), 200),
+            200,
+            ttl,
+            "RuntimeError: connector handshake failed",
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, LmcacheFallback::Relaunched(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        lmcache(&lab, &fallback),
+        json!({
+            "state": "off",
+            "reason": "engine_start_failed",
+            "message": "the engine did not start with LMCache",
+        })
+    );
+
+    let lab = Lab::new(|_| {});
+    let exited = lab.deploy("exited", |_| {});
+    let (_, context) = lab.start(&exited, 100);
+    lab.ready(&context, 40, Some(LmcacheOutcome::On), 200);
+    lab.store
+        .record_engine_exit(
+            &lab.session,
+            ExitSource::Embedded,
+            &EngineExit {
+                deployment_id: exited.deployment_id.clone(),
+                generation: exited.generation,
+                step_id: context.token.step_id.clone(),
+                process: server(40)[0].clone(),
+                status: "signal 9".into(),
+                observed_at_ms: 300,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lmcache(&lab, &exited),
+        on_with_allowances("exited", CHARGE),
+        "the launch is still held until its stop proves it gone"
+    );
+
+    // A launch released before Ready keeps its incarnation: its server is
+    // stopped and the launch holds no charge.
+    let lab = Lab::new(|_| {});
+    let released = lab.deploy("released", |_| {});
+    let (_, context) = lab.start(&released, 100);
+    lab.release(&context, Vec::new(), 200);
+    let shown = lmcache(&lab, &released);
+    assert_eq!(
+        shown,
+        json!({
+            "state": "on",
+            "server": "stopped",
+            "pool_bytes": GIB,
+            "overhead_bytes": 1280 * MIB,
+            "device_bytes": 512 * MIB,
+            "held_kv_bytes": 4 * GIB,
+            "measured": false,
+        })
+    );
+    let owner = crate::instances::instance_owner_id(&released.deployment_id, 0);
+    assert!(!lab
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&owner));
+
+    let never = lab.deploy("never", |_| {});
+    let snapshot = serde_json::to_value(lab.store.snapshot().unwrap()).unwrap();
+    let never = snapshot["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == json!(never.deployment_id))
+        .unwrap()
+        .clone();
+    assert!(
+        never["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i.get("lmcache").is_none()),
+        "{never}"
+    );
+}

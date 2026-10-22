@@ -268,3 +268,631 @@ pub fn republish(
         .republish_host_configuration(&publication, &previous.policy_fingerprint)
         .map_err(|refusal| refusal.reason())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capyctl_domain::completion::{
+        CompletionEvidence, Milestone, OwnedLaunchReceipt, ProcessIdentity,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// The enrolled hosts' names, which placement names them by.
+    const NAMES: [&str; 2] = ["spark-a", "spark-b"];
+
+    /// Two enrolled hosts that declared `lmcache`, each publishing the vLLM
+    /// golden host on vLLM 0.32.0 with LMCache 0.5.6 registered, and one
+    /// `restart_only` deployment with an instance Ready on each, its launch
+    /// running an LMCache server. CPU only: every launch is scripted evidence.
+    struct Hosts {
+        _dir: tempfile::TempDir,
+        state: SharedCoordinatorState,
+        sql: rusqlite::Connection,
+        hosts: [String; 2],
+        deployment: String,
+    }
+
+    fn document(settings: Value) -> Value {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut host = golden["input"]["host"].clone();
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["build_fingerprint"] = json!("0.32.0");
+        profile["lmcache"] =
+            json!({"version": "0.5.6", "digest": format!("sha256:{}", "0".repeat(64))});
+        host["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("8GiB");
+        host["state_dir"] = json!("/home/operator/.local/state/capyctl");
+        host["identity_dir"] = json!("/home/operator/.local/state/capyctl/identity");
+        host["ingress"] = json!({
+            "transport": "trusted_private_link",
+            "address": "http://100.64.0.2:9443",
+            "bind": "100.64.0.2:9443"
+        });
+        for (key, value) in settings.as_object().unwrap() {
+            host[key] = value.clone();
+        }
+        host
+    }
+
+    fn identity(role: &str, pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            role: role.into(),
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: u64::from(pid) * 10,
+        }
+    }
+
+    impl Hosts {
+        fn new() -> Self {
+            let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+            std::fs::set_permissions(
+                dir.path(),
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
+            let state = Arc::new(Mutex::new(
+                crate::OwnedCoordinatorState::open(dir.path()).unwrap(),
+            ));
+            let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+            let hosts = NAMES.map(|name| {
+                let owner = state.lock().unwrap();
+                let store = owner.store();
+                // Hex digests distinct per host (its name's last letter) and kind.
+                let digest = |kind: char| format!("{kind}{}", name[6..].repeat(63));
+                let invitation = digest('1');
+                store
+                    .create_host_invitation(&invitation, name, 100, 0)
+                    .unwrap();
+                let host = store
+                    .redeem_host_invitation(
+                        &capyctl_store::enrollment::Redemption {
+                            invitation_digest: invitation,
+                            transaction_id: format!("tx-{name}"),
+                            host_name: name.into(),
+                            key_digest: digest('2'),
+                            csr_digest: "d".repeat(64),
+                        },
+                        1,
+                        |id| {
+                            Ok(capyctl_store::enrollment::CertificateRecord {
+                                host_id: id.into(),
+                                fingerprint: digest('3'),
+                                certificate_pem: "certificate".into(),
+                                expires_unix: 500,
+                            })
+                        },
+                    )
+                    .unwrap()
+                    .host_id;
+                store
+                    .record_host_version(
+                        &host,
+                        &capyctl_store::host_versions::HostVersion {
+                            binary_version: capyctl_protocol::version::BINARY_VERSION.into(),
+                            compatibility: "supported".into(),
+                            reason: String::new(),
+                            capabilities: ["engine_groups", "lmcache", "retention"]
+                                .map(String::from)
+                                .to_vec(),
+                            recorded_at_ms: 1,
+                        },
+                    )
+                    .unwrap();
+                host
+            });
+            let mut lab = Self {
+                _dir: dir,
+                state,
+                sql,
+                hosts,
+                deployment: String::new(),
+            };
+            for host in lab.hosts.clone() {
+                lab.publish(&host, json!({}));
+            }
+            lab.deployment = lab.deploy_ready();
+            lab
+        }
+
+        /// `host` publishes the golden document with `settings` at its root.
+        fn publish(&self, host: &str, settings: Value) {
+            let document = document(settings);
+            let config =
+                capyctl_config::remote_roles::HostConfig::parse(&document.to_string()).unwrap();
+            let now = capyctl_protocol::now_unix_ms();
+            let inventory = ReportInventory {
+                domains: vec![capyctl_protocol::pb::DomainObservation {
+                    domain_id: "unified".into(),
+                    kind: "system".into(),
+                    observed_bytes: 100 << 30,
+                    observed_at_unix: now / 1000,
+                    capacity_bytes: 128 << 30,
+                    available_bytes: 100 << 30,
+                    observed_at_unix_ms: now,
+                    ..Default::default()
+                }],
+                approved_host_config_json: config.document.to_string(),
+                host_boot_id: "boot".into(),
+                policy_fingerprint: capyctl_config::remote_resources::policy_fingerprint(
+                    &config.document,
+                ),
+                ..Default::default()
+            };
+            publish(&self.state, host, &inventory).unwrap();
+        }
+
+        /// One instance on each host, each Ready with its LMCache server.
+        fn deploy_ready(&self) -> String {
+            use capyctl_scheduler::residency::AdmissionContext;
+            let owner = self.state.lock().unwrap();
+            let store = owner.store();
+            let now = capyctl_protocol::now_unix_ms();
+            let targets: Vec<_> = self
+                .hosts
+                .iter()
+                .zip(NAMES)
+                .map(|(host, name)| {
+                    let trusted = capyctl_config::remote_resources::scope_host_document(
+                        host,
+                        &document(json!({})),
+                    )
+                    .unwrap();
+                    let policy = store.resource_policy(host).unwrap().unwrap();
+                    capyctl_store::managed_configuration::HostTarget {
+                        host_id: host.clone(),
+                        host_name: name.into(),
+                        trusted_host: capyctl_config::effective::compose_current_resource_controls(
+                            &trusted,
+                            &policy.context,
+                            &policy.controls,
+                        )
+                        .unwrap(),
+                        scoped: true,
+                    }
+                })
+                .collect();
+            let golden: Value = serde_json::from_str(include_str!(
+                "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+            ))
+            .unwrap();
+            let mut config = golden["input"]["deployment"].clone();
+            config.as_object_mut().unwrap().remove("host");
+            config["devices"] = json!([{ "sharing": "shared" }]);
+            for phase in ["cold", "ready", "parking", "wake"] {
+                config["resources"][phase]["devices"] = json!([{ "sharing": "shared" }]);
+            }
+            config["placement"] = json!({ "hosts": NAMES });
+            config["instances"] = json!(2);
+            config["residency"] = json!("restart_only");
+            config["lmcache_pool"] = json!("1GiB");
+            let receipt = store
+                .create_managed_configuration_on_hosts(
+                    owner.session(),
+                    "owner",
+                    "deploy",
+                    &json!({ "config": config }).to_string(),
+                    &targets,
+                    &[],
+                    now,
+                )
+                .unwrap();
+            let id = receipt.deployment_id;
+            store
+                .accept_scoped_start_command(
+                    owner.session(),
+                    "owner",
+                    &id,
+                    capyctl_store::ordinary_lifecycle::placement::StartScope::All,
+                    receipt.revision,
+                    "start",
+                    now,
+                    now + 120_000,
+                    None,
+                )
+                .unwrap();
+            let planned: Vec<(String, String)> = self
+                .sql
+                .prepare(
+                    "SELECT s.id,i.host_id FROM lifecycle_steps s
+                       JOIN runtime_bindings b ON b.id=s.binding_id
+                       JOIN deployment_instances i ON i.deployment_id=b.deployment_id
+                        AND i.instance_index=b.instance_index
+                      WHERE s.deployment_id=?1 AND s.state='planned' ORDER BY i.host_id",
+                )
+                .unwrap()
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                planned.iter().map(|(_, h)| h.clone()).collect::<Vec<_>>(),
+                {
+                    let mut hosts = self.hosts.to_vec();
+                    hosts.sort();
+                    hosts
+                }
+            );
+            for (n, (step, host)) in planned.into_iter().enumerate() {
+                let policy = store.resource_policy(&host).unwrap().unwrap();
+                let limits: Vec<_> = policy
+                    .controls
+                    .domains
+                    .iter()
+                    .map(|(domain, d)| capyctl_domain::resources::MemoryLimit {
+                        domain: domain.clone(),
+                        managed_bytes: d.managed_limit,
+                        free_reserve_bytes: d.free_reserve,
+                        reserve_absorbs_unmanaged: false,
+                        host_kv_bytes: d.host_kv_limit,
+                        parked_bytes: d.parked_limit,
+                    })
+                    .collect();
+                let observations = vec![capyctl_domain::resources::MemoryObservation {
+                    domain: capyctl_config::remote_resources::ledger_key(
+                        &host, "domain", "unified",
+                    ),
+                    capacity_bytes: 128 << 30,
+                    available_bytes: 100 << 30,
+                    sampled_at_ms: now,
+                }];
+                let ttl = policy.controls.observation_ttl_ms;
+                let (_, context) = store
+                    .arm_initialize_with_context(
+                        owner.session(),
+                        &step,
+                        AdmissionContext::new(
+                            &observations,
+                            &limits,
+                            now,
+                            ttl,
+                            policy.controls.max_parked as usize,
+                        ),
+                    )
+                    .unwrap();
+                let context = context.unwrap();
+                let grant = store.launch_lmcache_grant(&context.binding_id).unwrap();
+                assert!(grant.is_some(), "LMCache is planned on {host}");
+                let base = 100 + 10 * n as u32;
+                let server = identity("lmcache", base + 5);
+                let fence = capyctl_store::lifecycle::DeploymentFence {
+                    deployment_id: context.token.deployment_id.clone(),
+                    revision: context.token.revision,
+                    generation: context.token.generation,
+                };
+                store
+                    .record_launch_identity(owner.session(), &fence, &context.binding_id, &server)
+                    .unwrap();
+                store
+                    .record_launch_lmcache(
+                        owner.session(),
+                        &context.binding_id,
+                        &capyctl_store::ordinary_lifecycle::lmcache::LmcacheOutcome::On,
+                        now,
+                    )
+                    .unwrap();
+                let group = vec![
+                    identity("api", base),
+                    identity("worker-0", base + 1),
+                    server,
+                ];
+                store
+                    .record_owned_launch(
+                        owner.session(),
+                        &step,
+                        &OwnedLaunchReceipt {
+                            binding_id: context.binding_id.clone(),
+                            incarnation: context.incarnation.clone(),
+                            identities: group.clone(),
+                            observed_at_ms: now,
+                            receipt: "scripted host native model probe".into(),
+                        },
+                        now,
+                    )
+                    .unwrap();
+                store
+                    .complete_step(
+                        owner.session(),
+                        &step,
+                        &CompletionEvidence {
+                            token: context.token,
+                            identities: group,
+                            observed_at_ms: now,
+                            control_receipt: Some("scripted host native model probe".into()),
+                            milestones: vec![
+                                Milestone::AllocationsRestored,
+                                Milestone::WeightsUsable,
+                                Milestone::CacheValid,
+                                Milestone::ModelUsable,
+                            ],
+                        },
+                        now,
+                        ttl,
+                    )
+                    .unwrap();
+            }
+            id
+        }
+
+        /// The stops a retirement accepted for the instance on `host`.
+        fn retirement_stops(&self, host: &str) -> i64 {
+            self.sql
+                .query_row(
+                    "SELECT COUNT(DISTINCT o.id) FROM operations o
+                       JOIN command_receipts r ON r.operation_id=o.id
+                       JOIN lifecycle_steps s ON s.operation_id=o.id
+                       JOIN runtime_bindings b ON b.id=s.binding_id
+                       JOIN deployment_instances i ON i.deployment_id=b.deployment_id
+                        AND i.instance_index=b.instance_index
+                      WHERE o.deployment_id=?1 AND i.host_id=?2 AND o.kind='ordinary_cleanup'
+                        AND r.principal_id=?3",
+                    rusqlite::params![
+                        self.deployment,
+                        host,
+                        capyctl_store::ordinary_lifecycle::lmcache::RETIRE_PRINCIPAL
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// The reasons the relaunch pass owes the instance on `host` a start
+        /// without LMCache.
+        fn owed(&self, host: &str) -> Vec<String> {
+            self.sql
+                .prepare(
+                    "SELECT m.reason FROM lmcache_relaunches m
+                       JOIN deployment_instances i ON i.deployment_id=m.deployment_id
+                        AND i.instance_index=m.instance_index
+                      WHERE m.deployment_id=?1 AND i.host_id=?2",
+                )
+                .unwrap()
+                .query_map([&self.deployment, &host.to_owned()], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        /// The `lmcache_off` reasons journaled for the launch on `host`.
+        fn off_events(&self, host: &str) -> Vec<String> {
+            self.sql
+                .prepare(
+                    "SELECT json_extract(e.payload_json,'$.reason') FROM management_events e
+                       JOIN launch_lmcache l ON l.binding_id=json_extract(e.payload_json,'$.binding_id')
+                      WHERE e.kind='lmcache_off' AND e.deployment_id=?1 AND l.host_id=?2
+                      ORDER BY e.sequence",
+                )
+                .unwrap()
+                .query_map([&self.deployment, &host.to_owned()], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        fn dispatch_open(&self, host: &str) -> bool {
+            self.sql
+                .query_row(
+                    "SELECT dispatch_enabled=1 FROM deployment_instances
+                      WHERE deployment_id=?1 AND host_id=?2",
+                    [&self.deployment, &host.to_owned()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// The step of the stop accepted for the instance on `host`.
+        fn stop_step(&self, host: &str) -> String {
+            self.sql
+                .query_row(
+                    "SELECT s.id FROM lifecycle_steps s
+                       JOIN operations o ON o.id=s.operation_id AND o.kind='ordinary_cleanup'
+                       JOIN runtime_bindings b ON b.id=s.binding_id
+                       JOIN deployment_instances i ON i.deployment_id=b.deployment_id
+                        AND i.instance_index=b.instance_index
+                      WHERE s.deployment_id=?1 AND i.host_id=?2",
+                    [&self.deployment, &host.to_owned()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    /// ADR 0033 §§9, 10 (lifecycle design §9): a host publishing
+    /// `lmcache: off` has the Ready instance whose launch runs a server there
+    /// stopped by the retirement principal and owed a start without LMCache
+    /// (`host_off`, journaled once); the instance on the other host is
+    /// untouched. Publishing the same settings again stops nothing more. A
+    /// document that allows LMCache retires nothing.
+    // T45 T10 T34
+    #[test]
+    fn publishing_lmcache_off_retires_that_hosts_servers_only() {
+        let lab = Hosts::new();
+        let [a, b] = lab.hosts.clone();
+        lab.publish(&b, json!({"lmcache": "auto", "retention": "standard"}));
+        for host in [&a, &b] {
+            assert_eq!(lab.retirement_stops(host), 0);
+            assert!(lab.owed(host).is_empty());
+            assert!(lab.off_events(host).is_empty());
+        }
+
+        lab.publish(&a, json!({"lmcache": "off"}));
+        assert_eq!(lab.retirement_stops(&a), 1);
+        assert_eq!(lab.owed(&a), ["host_off"]);
+        assert_eq!(lab.off_events(&a), ["host_off"]);
+        assert!(
+            !lab.dispatch_open(&a),
+            "a stopping instance takes no traffic"
+        );
+        assert_eq!(lab.retirement_stops(&b), 0);
+        assert!(lab.owed(&b).is_empty());
+        assert!(lab.off_events(&b).is_empty());
+        assert!(lab.dispatch_open(&b));
+
+        // The host's next publication asks again: nothing more is stopped.
+        lab.publish(&a, json!({"lmcache": "off"}));
+        assert_eq!(lab.retirement_stops(&a), 1);
+        assert_eq!(lab.owed(&a), ["host_off"]);
+        assert_eq!(lab.off_events(&a), ["host_off"]);
+        // Nothing is relaunched before the stop completed.
+        let owner = lab.state.lock().unwrap();
+        let store = owner.store();
+        let now = capyctl_protocol::now_unix_ms();
+        assert!(store
+            .relaunch_retired_lmcache(owner.session(), now, None)
+            .unwrap()
+            .is_empty());
+        // The stop completes on the host's gone evidence; the relaunch pass
+        // then starts the instance again there, planned without LMCache for
+        // the host's reason, and later publications retire nothing more.
+        let step = lab.stop_step(&a);
+        let (_, cleanup) = store
+            .arm_ordinary_cleanup_with_context(owner.session(), &step, now)
+            .unwrap();
+        let cleanup = cleanup.unwrap();
+        let ttl = store
+            .resource_policy(&a)
+            .unwrap()
+            .unwrap()
+            .controls
+            .observation_ttl_ms;
+        store
+            .complete_cleanup(
+                owner.session(),
+                &step,
+                &capyctl_domain::completion::CleanupEvidence {
+                    binding_id: cleanup.binding_id,
+                    incarnation: cleanup.incarnation,
+                    identities: cleanup.identities,
+                    observed_at_ms: now,
+                    receipt: "scripted host observed the owned group gone".into(),
+                },
+                now,
+                ttl,
+            )
+            .unwrap();
+        let starts = store
+            .relaunch_retired_lmcache(owner.session(), now, None)
+            .unwrap();
+        assert_eq!(starts.len(), 1);
+        let plan = store
+            .launch_lmcache(&starts[0].binding_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                &plan.planned,
+                capyctl_store::ordinary_lifecycle::lmcache::PlannedLmcache::Off(off)
+                    if off.reason == capyctl_config::lmcache::LmcacheOffReason::HostOff
+            ),
+            "{plan:?}"
+        );
+        let relaunched_on: String = lab
+            .sql
+            .query_row(
+                "SELECT host_id FROM launch_lmcache WHERE binding_id=?1",
+                [&starts[0].binding_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(relaunched_on, a);
+        drop(owner);
+        lab.publish(&a, json!({"lmcache": "off"}));
+        assert_eq!(lab.retirement_stops(&a), 1);
+    }
+
+    /// ADR 0033 §§9, 10: `retention: zero` retires a host's servers as
+    /// `lmcache: off` does, under its own reason; a document stating both
+    /// names `host_off`, as a standalone role does.
+    // T45 T10
+    #[test]
+    fn retention_zero_retires_too_and_host_off_names_both() {
+        let lab = Hosts::new();
+        let [a, b] = lab.hosts.clone();
+        lab.publish(&a, json!({"retention": "zero"}));
+        lab.publish(&b, json!({"lmcache": "off", "retention": "zero"}));
+        assert_eq!(lab.retirement_stops(&a), 1);
+        assert_eq!(lab.owed(&a), ["retention_zero"]);
+        assert_eq!(lab.off_events(&a), ["retention_zero"]);
+        assert_eq!(lab.retirement_stops(&b), 1);
+        assert_eq!(lab.owed(&b), ["host_off"]);
+        assert_eq!(lab.off_events(&b), ["host_off"]);
+    }
+
+    /// ADR 0033 §§6, 12 (lifecycle design §7): what a host's load report
+    /// measured of its own launch's LMCache server is recorded for the
+    /// revision on that host, max-merged; a sample naming another host's
+    /// launch records nothing and never keeps that host's own report out.
+    // T45 T14
+    #[test]
+    fn a_hosts_lmcache_samples_measure_its_own_launch_only() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let lab = Hosts::new();
+        let [a, b] = lab.hosts.clone();
+        let launch = |host: &str| -> (String, i64) {
+            lab.sql
+                .query_row(
+                    "SELECT s.id,l.generation FROM launch_lmcache l
+                       JOIN lifecycle_steps s ON s.binding_id=l.binding_id
+                       JOIN operations o ON o.id=s.operation_id AND o.kind='initialize'
+                      WHERE l.deployment_id=?1 AND l.host_id=?2",
+                    [&lab.deployment, &host.to_owned()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let measured = || -> Vec<(String, i64, i64)> {
+            lab.sql
+                .prepare(
+                    "SELECT host_id,overhead_bytes,device_bytes FROM lmcache_measurements
+                      WHERE deployment_id=?1 ORDER BY host_id",
+                )
+                .unwrap()
+                .query_map([&lab.deployment], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let sample = |(step, generation): &(String, i64), rss: u64, device: Option<u64>| {
+            capyctl_protocol::reports::LmcacheSample {
+                deployment_id: lab.deployment.clone(),
+                generation: *generation,
+                owned_handle: step.clone(),
+                sampled_at_ms: capyctl_protocol::now_unix_ms(),
+                scrape_ok: true,
+                used_bytes: None,
+                usage_ppm: None,
+                inflight_bytes: None,
+                alloc_failures: None,
+                lookups: None,
+                hits: None,
+                l2_bytes: None,
+                rss_bytes: Some(rss),
+                device_bytes: device,
+            }
+        };
+        let (on_a, on_b) = (launch(&a), launch(&b));
+        let authority = crate::enrollment::EnrollmentAuthority::new(
+            lab.state.clone(),
+            capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+        );
+        authority.record_lmcache_samples(&a, &[sample(&on_b, GIB + 900 * MIB, Some(400 * MIB))]);
+        assert!(measured().is_empty());
+        authority.record_lmcache_samples(&b, &[sample(&on_b, GIB + 600 * MIB, Some(300 * MIB))]);
+        let mi = |bytes: u64| bytes as i64;
+        assert_eq!(measured(), [(b.clone(), mi(600 * MIB), mi(300 * MIB))]);
+        // Smaller does not lower it; a larger figure grows on its own.
+        authority.record_lmcache_samples(&b, &[sample(&on_b, GIB + 500 * MIB, Some(200 * MIB))]);
+        authority.record_lmcache_samples(&b, &[sample(&on_b, GIB + 800 * MIB, None)]);
+        authority.record_lmcache_samples(&a, &[sample(&on_a, GIB + 100 * MIB, None)]);
+        let mut expected = vec![
+            (a.clone(), mi(100 * MIB), 0),
+            (b.clone(), mi(800 * MIB), mi(300 * MIB)),
+        ];
+        expected.sort();
+        assert_eq!(measured(), expected);
+    }
+}

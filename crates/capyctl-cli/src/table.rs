@@ -1166,6 +1166,92 @@ mod tests {
         assert!(!host(Value::Null).contains("warning"));
     }
 
+    // T45 (ADR 0033 §1): a host's profile whose LMCache drifted from its
+    // registration is warned below the hosts table, by host and profile,
+    // with the digest measured; a profile without drift, and a host without
+    // any, add nothing. The profiles are the server's own `/hosts` view
+    // serialized.
+    #[test]
+    fn hosts_warn_of_a_drifted_lmcache_below_the_table() {
+        use capyctl_controller::agent_sessions::{InstallationView, LmcacheDriftView, ProfileView};
+        let observed = format!("sha256:{}", "b".repeat(64));
+        let profile = |name: &str, lmcache: Option<LmcacheDriftView>| {
+            serde_json::to_value(ProfileView {
+                name: name.into(),
+                build_fingerprint: "vllm-0.32.0".into(),
+                eligibility: "eligible".into(),
+                installation: InstallationView {
+                    version: "0.32.0".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    state: "measured".into(),
+                    observed_digest: String::new(),
+                    capabilities_missing: vec![],
+                    lmcache,
+                },
+            })
+            .unwrap()
+        };
+        let hosts = |profiles: Vec<Value>| {
+            render(
+                View::Hosts,
+                &json!({"hosts": [{"host_id": "01HOSTA", "name": "gpu-a", "online": true,
+                    "session": {"reconciled": true, "profiles": profiles}}]}),
+                &HostNames::new(),
+            )
+        };
+        let out = hosts(vec![
+            profile(
+                "vllm-lmcache",
+                Some(LmcacheDriftView {
+                    state: "drifted",
+                    observed_digest: observed.clone(),
+                }),
+            ),
+            profile("sglang", None),
+        ]);
+        assert!(
+            out.ends_with(&format!(
+                "\nwarning: gpu-a: LMCache of profile vllm-lmcache drifted from its \
+                 registration: measured {observed}\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(out.matches("warning").count(), 1, "{out}");
+        let out = hosts(vec![profile("vllm-lmcache", None)]);
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    // T45 (ADR 0033 §1): standalone status says, under the engine line, that
+    // the LMCache in the engine's environment drifted from its registration,
+    // with both digests; nothing while it has not. The installation object is
+    // shaped as the embedded installation view emits it.
+    #[test]
+    fn status_warns_of_a_drifted_lmcache_under_the_engine_line() {
+        let registered = format!("sha256:{}", "a".repeat(64));
+        let observed = format!("sha256:{}", "b".repeat(64));
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+            "installation": {"profile": "local", "executable": "/opt/vllm/bin/vllm",
+                "version": "0.32.0", "digest": format!("sha256:{}", "c".repeat(64)),
+                "state": "measured", "capabilities_missing": []}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nEngine  local 0.32.0 (/opt/vllm/bin/vllm)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("LMCache"), "{out}");
+        d["installation"]["lmcache"] = json!({"state": "drifted", "digest": registered,
+            "observed_digest": observed});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(&format!(
+                "\nEngine  local 0.32.0 (/opt/vllm/bin/vllm)\n\
+                 LMCache drifted from its registration: registered {registered}, \
+                 measured {observed}\n"
+            )),
+            "{out}"
+        );
+    }
+
     #[test]
     fn host_states_are_named() {
         let row = |host: Value| {

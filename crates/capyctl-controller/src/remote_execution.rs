@@ -436,7 +436,7 @@ impl RemoteEngine {
 /// recorded server's group alone (`engine_stopped`), and the restore of such
 /// a launch (which records the server alone) names a new engine beside that
 /// same server. The store judges both again before it records them.
-fn residency_evidence(
+pub(crate) fn residency_evidence(
     park: bool,
     recorded: &[ProcessIdentity],
     result: &pb::MemberExecutionResult,
@@ -458,8 +458,14 @@ fn residency_evidence(
     let held = result.state == "completed"
         && result.claim_retained
         && if restart_park {
+            // A park leaves the server alone; a restore names a new engine
+            // (its `api`) beside it.
             same_lmcache(recorded, &alive)
-                && (!park || alive.iter().all(ProcessIdentity::is_lmcache))
+                && if park {
+                    alive.iter().all(ProcessIdentity::is_lmcache)
+                } else {
+                    alive.iter().any(|p| p.role == "api")
+                }
         } else {
             same_engine(recorded, &alive)
         };
@@ -983,7 +989,7 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
 /// as the coordinator reads it for an embedded launch. `On` names the
 /// server's group among the result's alive processes. The result was
 /// validated, so a report that does not convert was never there.
-fn lmcache_report(
+pub(crate) fn lmcache_report(
     result: &pb::MemberExecutionResult,
 ) -> Option<capyctl_adapters::lmcache::LmcacheReport> {
     use capyctl_adapters::lmcache::LmcacheReport;
@@ -1903,5 +1909,215 @@ mod tests {
             .record_host_version(&host, &declared(capabilities::agent_capabilities()))
             .unwrap();
         assert_eq!(recorded_for(&sessions, &remote, &identities), identities);
+    }
+
+    /// ADR 0033 (lifecycle design §10): a launch result's LMCache report
+    /// reaches the coordinator as an embedded launch reports it. `On` names
+    /// the server's group among the result's alive processes (never the
+    /// engine's, never one gone) with the host's ports and pool; `Off` its
+    /// closed reason, detail and whether the engine failed with the
+    /// connector. A report that does not convert (an unknown reason, a
+    /// malformed `on`, `connector_failed` beside another reason) is none.
+    // T45 T30
+    #[test]
+    fn a_launch_results_lmcache_report_names_the_alive_server_group() {
+        use capyctl_adapters::lmcache::LmcacheReport;
+        use capyctl_config::lmcache::{LmcacheOffReason, GIB};
+        use capyctl_protocol::execution::LaunchLmcache;
+        let gib = GIB as i64;
+        let mut ready = result(vec![
+            observed("api", 10, "alive"),
+            observed("worker-0", 11, "alive"),
+            observed("lmcache", 60, "alive"),
+            observed("lmcache-1", 61, "alive"),
+            observed("lmcache-2", 62, "gone"),
+        ]);
+        assert_eq!(lmcache_report(&ready), None);
+        ready.lmcache = Some(LaunchLmcache::on(8150, 8151, 2 * gib).to_wire());
+        assert_eq!(
+            lmcache_report(&ready),
+            Some(LmcacheReport::On {
+                server: vec![
+                    process(&observed("lmcache", 60, "alive")),
+                    process(&observed("lmcache-1", 61, "alive")),
+                ],
+                rpc_port: 8150,
+                http_port: 8151,
+                pool_bytes: 2 * gib,
+            })
+        );
+        let mut failed = result(vec![observed("api", 10, "gone")]);
+        failed.lmcache = Some(
+            LaunchLmcache::off(
+                LmcacheOffReason::EngineStartFailed,
+                "RuntimeError: connector handshake failed",
+                true,
+            )
+            .to_wire(),
+        );
+        assert_eq!(
+            lmcache_report(&failed),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::EngineStartFailed,
+                detail: "RuntimeError: connector handshake failed".into(),
+                connector_failed: true,
+            })
+        );
+        let mut off = failed.clone();
+        off.lmcache = Some(
+            LaunchLmcache::off(LmcacheOffReason::ServerStartFailed, "no /status", false).to_wire(),
+        );
+        assert_eq!(
+            lmcache_report(&off),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::ServerStartFailed,
+                detail: "no /status".into(),
+                connector_failed: false,
+            })
+        );
+        type Edit = fn(&mut pb::LaunchLmcacheReport);
+        let malformed: &[(&pb::MemberExecutionResult, Edit)] = &[
+            (&off, |r| r.reason = "lmcache_bored".into()),
+            (&off, |r| r.connector_failed = true),
+            (&off, |r| r.rpc_port = 8150),
+            (&off, |r| r.detail = "a\u{1b}[2J".into()),
+            (&off, |r| r.state = "maybe".into()),
+            (&ready, |r| r.http_port = r.rpc_port),
+            (&ready, |r| r.rpc_port = 0),
+            (&ready, |r| r.rpc_port = 70_000),
+            (&ready, |r| r.pool_bytes = 3 << 29),
+            (&ready, |r| r.reason = "host_off".into()),
+        ];
+        for (base, edit) in malformed {
+            let mut r = (*base).clone();
+            edit(r.lmcache.as_mut().unwrap());
+            assert_eq!(lmcache_report(&r), None, "{:?}", r.lmcache);
+        }
+    }
+
+    fn residency(
+        state: &str,
+        engine_stopped: bool,
+        usable: bool,
+        processes: Vec<pb::OwnedProcessObservation>,
+    ) -> pb::MemberExecutionResult {
+        let mut r = result(processes);
+        r.claim_retained = true;
+        r.model_usable = usable;
+        r.residency = Some(pb::ResidencyEvidence {
+            state: state.into(),
+            engine_stopped,
+            ..Default::default()
+        });
+        r
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.1): a `restart_only` park stops the
+    /// engine and keeps the LMCache server, so the host's `engine_stopped`
+    /// evidence proves it only when what is alive is exactly the recorded
+    /// server group: an engine process still alive, another server, or a
+    /// server process missing stays uncertain, and so does such evidence
+    /// for a launch that recorded no server.
+    // T45 T16 T34
+    #[test]
+    fn a_restart_park_is_proven_by_the_recorded_server_alone() {
+        let recorded: Vec<_> = [
+            ("api", 10),
+            ("worker-0", 11),
+            ("lmcache", 60),
+            ("lmcache-1", 61),
+        ]
+        .into_iter()
+        .map(|(role, pid)| process(&observed(role, pid, "alive")))
+        .collect();
+        let parked = |api: &str, server: u32, helper: &str| {
+            residency(
+                "parked",
+                true,
+                false,
+                vec![
+                    observed("api", 10, api),
+                    observed("worker-0", 11, "gone"),
+                    observed("lmcache", server, "alive"),
+                    observed("lmcache-1", 61, helper),
+                ],
+            )
+        };
+        let (alive, facts) =
+            residency_evidence(true, &recorded, &parked("gone", 60, "alive")).unwrap();
+        assert_eq!(alive, recorded[2..].to_vec());
+        assert_eq!(facts, [Milestone::MemoryReleased]);
+        for uncertain in [
+            parked("alive", 60, "alive"),
+            parked("gone", 99, "alive"),
+            parked("gone", 60, "gone"),
+        ] {
+            assert!(
+                matches!(
+                    residency_evidence(true, &recorded, &uncertain),
+                    Err(RuntimeError::Uncertain(_))
+                ),
+                "{uncertain:?}"
+            );
+        }
+        // Without `engine_stopped` the park is judged as an ordinary one: the
+        // engine stopped is not the engine held.
+        let mut ordinary = parked("gone", 60, "alive");
+        ordinary.residency.as_mut().unwrap().engine_stopped = false;
+        assert!(matches!(
+            residency_evidence(true, &recorded, &ordinary),
+            Err(RuntimeError::Uncertain(_))
+        ));
+        // A launch that recorded no server is never restart-parked.
+        assert!(matches!(
+            residency_evidence(true, &recorded[..2], &parked("gone", 60, "alive")),
+            Err(RuntimeError::Uncertain(_))
+        ));
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.3): the restore of a restart-parked
+    /// launch (which records its server alone) is proven by a new engine
+    /// beside that same server group; another server, or the server with no
+    /// engine, stays uncertain however usable the host calls it.
+    // T45 T10 T34
+    #[test]
+    fn a_restart_park_restore_is_a_new_engine_beside_the_same_server() {
+        let recorded = vec![
+            process(&observed("lmcache", 60, "alive")),
+            process(&observed("lmcache-1", 61, "alive")),
+        ];
+        let restored = |server: u32, engine: bool| {
+            let mut processes = vec![
+                observed("lmcache", server, "alive"),
+                observed("lmcache-1", 61, "alive"),
+            ];
+            if engine {
+                processes.extend([
+                    observed("api", 70, "alive"),
+                    observed("worker-0", 71, "alive"),
+                ]);
+            }
+            residency("restored", false, true, processes)
+        };
+        let (alive, facts) = residency_evidence(false, &recorded, &restored(60, true)).unwrap();
+        assert_eq!(alive.len(), 4);
+        assert!(alive.contains(&process(&observed("api", 70, "alive"))));
+        assert_eq!(facts.last(), Some(&Milestone::ModelUsable));
+        for uncertain in [restored(99, true), restored(60, false)] {
+            assert!(
+                matches!(
+                    residency_evidence(false, &recorded, &uncertain),
+                    Err(RuntimeError::Uncertain(_))
+                ),
+                "{uncertain:?}"
+            );
+        }
+        // Not usable: the restore proves nothing.
+        let mut unusable = restored(60, true);
+        unusable.model_usable = false;
+        assert!(matches!(
+            residency_evidence(false, &recorded, &unusable),
+            Err(RuntimeError::Uncertain(_))
+        ));
     }
 }

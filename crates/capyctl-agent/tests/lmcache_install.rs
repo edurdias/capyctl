@@ -683,3 +683,77 @@ fn lmcache_without_one_dist_info_fails() {
         "{failure}"
     );
 }
+
+// T45 T21 T22 (ADR 0033 §1, ADR 0008): the host's launch-time check of a
+// profile's LMCache, through the installation registry its launches use.
+// Unchanged, it passes and the profile's status carries no LMCache drift.
+// One installed LMCache file changed, the check measures another `sha256:`
+// digest: the launch goes on under `warn`, is refused `installation_drift`
+// under `refuse`, and the status the host reports carries the measured digest
+// in `lmcache_observed_digest` until a check measures the registered digest
+// again.
+#[test]
+fn a_drifted_lmcache_is_reported_in_the_profile_status() {
+    use capyctl_agent::installation::{InstallationDrift, InstallationRegistry};
+    use capyctl_protocol::pb;
+    let env = Env::new(Engine::Vllm);
+    let registration = env.register();
+    let published = pb::RuntimeProfileStatus {
+        name: "vllm-lmcache".into(),
+        ..Default::default()
+    };
+    let registry = InstallationRegistry::from_inventory(&pb::ReportInventory {
+        profiles: vec![published.clone()],
+        ..Default::default()
+    });
+    let launch = |policy| {
+        let verdict = registry.verify_lmcache(
+            "vllm-lmcache",
+            env.engine,
+            &env.executable(),
+            Some(&registration),
+            policy,
+        );
+        env.assert_nothing_ran();
+        verdict
+    };
+    let status = || {
+        let mut profiles = [published.clone()];
+        registry.overlay(&mut profiles);
+        let [profile] = profiles;
+        profile.lmcache_observed_digest
+    };
+
+    let unchanged = launch(InstallationDrift::Refuse).unwrap().unwrap();
+    assert!(!unchanged.drifted);
+    assert_eq!(status(), "", "an unchanged LMCache shows no drift");
+
+    let file = "lmcache/v1/multiprocess/config.py";
+    let original = std::fs::read_to_string(env.site.join(file)).unwrap();
+    env.write(file, &format!("{original}\n# patched after engine add\n"));
+    let drifted = launch(InstallationDrift::Warn).unwrap().unwrap();
+    assert!(drifted.drifted, "warn uses LMCache and shows the drift");
+    assert_ne!(drifted.digest, registration.digest);
+    let observed = status();
+    assert_eq!(observed, drifted.digest);
+    // The form the server accepts (`sha256:` and 64 lowercase hex digits).
+    let hex = observed.strip_prefix("sha256:").expect("a sha256 digest");
+    assert_eq!(hex.len(), 64, "{observed}");
+    assert!(
+        hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{observed}"
+    );
+    assert_eq!(
+        launch(InstallationDrift::Refuse).unwrap_err(),
+        "installation_drift"
+    );
+    assert_eq!(status(), observed, "a refused launch still shows the drift");
+
+    env.write(file, &original);
+    assert!(!launch(InstallationDrift::Refuse).unwrap().unwrap().drifted);
+    assert_eq!(
+        status(),
+        "",
+        "measured as registered again, the drift clears"
+    );
+}

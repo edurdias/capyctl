@@ -1524,3 +1524,104 @@ fn terminate_of_an_unrecorded_launch_reports_the_recorded_identities_without_sig
     );
     assert!(!policy.marker.exists());
 }
+
+fn launch_single(id: &str) -> MemberCommand {
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut c = command(id);
+    c.action = MemberAction::LaunchSingle(capyctl_protocol::execution::SingleLaunchPlan {
+        deployment_config: golden["input"]["deployment"].to_string(),
+        profile_name: "profile".into(),
+        checkpoint_fingerprint: "sha256:model".into(),
+        host_policy_fingerprint: "a".repeat(64),
+        binding_id: "01K00000000000000000000001".into(),
+        incarnation: "01K00000000000000000000002".into(),
+        grant_id: "01K00000000000000000000003".into(),
+        service_port: 30000,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
+        checkpoint_tables: None,
+        checkpoint_gguf: None,
+        startup_bytes: None,
+        startup_host_bytes: None,
+        lmcache: None,
+    });
+    sign(c)
+}
+
+// T45 T30 T13: ADR 0033 §§8, 9 (lifecycle design §10). What became of a
+// launch's LMCache is journaled with the launch and carried on its result,
+// replayed after a restart; the latest report stands. An `off` detail keeps
+// the newest MAX_LMCACHE_DETAIL_BYTES of the log tail, on a character
+// boundary, with control characters but newline and tab blanked, so the
+// result converts on the server. Only a LaunchSingle or Restore has one.
+#[test]
+fn a_launchs_lmcache_report_is_journaled_bounded_and_replayed() {
+    use capyctl_config::lmcache::{LmcacheOffReason, GIB};
+    use capyctl_protocol::execution::{
+        LaunchLmcache, LaunchLmcacheState, MAX_LMCACHE_DETAIL_BYTES,
+    };
+    let d = directory();
+    let j = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let s = j.connect().unwrap();
+    let c = launch_single("lmcache-launch");
+    drop(fresh(j.accept(s, &c, 10, &Policy).unwrap()));
+    assert_eq!(
+        j.execution_result("lmcache-launch", 20).unwrap().lmcache,
+        None
+    );
+    assert!(!j.lmcache_on("lmcache-launch").unwrap());
+
+    let on = LaunchLmcache::on(8150, 8151, 2 * GIB as i64);
+    j.record_launch_lmcache("lmcache-launch", &on).unwrap();
+    let reported = j.execution_result("lmcache-launch", 20).unwrap().lmcache;
+    assert_eq!(reported, Some(on.to_wire()));
+    assert!(j.lmcache_on("lmcache-launch").unwrap());
+
+    // The engine then failed with the connector: an off report replaces it.
+    let tail = "RuntimeError: connector handshake failed";
+    let log = format!("{}\u{1b}[31m{tail}", "é".repeat(1_500));
+    j.record_launch_lmcache(
+        "lmcache-launch",
+        &LaunchLmcache::off(LmcacheOffReason::EngineStartFailed, &log, true),
+    )
+    .unwrap();
+    drop(j);
+    let j = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let wire = j
+        .execution_result("lmcache-launch", 30)
+        .unwrap()
+        .lmcache
+        .expect("the journaled report is replayed");
+    let report = LaunchLmcache::try_from(&wire).expect("the server accepts the report");
+    assert_eq!(report.state, LaunchLmcacheState::Off);
+    assert_eq!(report.reason, Some(LmcacheOffReason::EngineStartFailed));
+    assert!(report.connector_failed);
+    assert!(report.detail.len() <= MAX_LMCACHE_DETAIL_BYTES);
+    assert!(report.detail.len() > MAX_LMCACHE_DETAIL_BYTES - 4);
+    assert!(report.detail.starts_with('é'));
+    assert!(report.detail.ends_with(&format!(" [31m{tail}")));
+    assert!(!j.lmcache_on("lmcache-launch").unwrap());
+
+    // `connector_failed` stands only beside `engine_start_failed`.
+    let other = LaunchLmcache::off(LmcacheOffReason::ServerStartFailed, "no /status", true);
+    assert!(!other.connector_failed);
+    assert!(LaunchLmcache::try_from(&other.to_wire()).is_ok());
+
+    // Nothing but a LaunchSingle or Restore records one; an unknown command
+    // records nothing.
+    let s = j.connect().unwrap();
+    j.accept(s, &command("inspect"), 10, &Policy).unwrap();
+    assert!(matches!(
+        j.record_launch_lmcache("inspect", &on),
+        Err(JournalError::Unauthorized)
+    ));
+    assert!(j.record_launch_lmcache("never-accepted", &on).is_err());
+    assert_eq!(j.execution_result("inspect", 40).unwrap().lmcache, None);
+}

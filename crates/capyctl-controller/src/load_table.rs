@@ -403,7 +403,7 @@ fn view(key: &InstanceKey, entry: &Entry, age_ms: i64) -> LoadView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capyctl_protocol::reports::{EngineLoad, LoadSample};
+    use capyctl_protocol::reports::{EngineLoad, LmcacheSample, LoadSample};
 
     const NOW: i64 = 1_800_000_000_000;
 
@@ -665,5 +665,170 @@ mod tests {
             .filter(|v| v.host_id == "h3")
             .count();
         assert_eq!(per_host, MAX_LOAD_ENTRIES_PER_HOST);
+    }
+
+    fn lmcache(deployment: &str, generation: i64, at: i64, hits: u64) -> LmcacheSample {
+        LmcacheSample {
+            deployment_id: deployment.into(),
+            generation,
+            owned_handle: format!("launch-{deployment}-{generation}"),
+            sampled_at_ms: at,
+            scrape_ok: true,
+            used_bytes: Some(1 << 30),
+            usage_ppm: Some(250_000),
+            inflight_bytes: None,
+            alloc_failures: Some(0),
+            lookups: Some(hits * 2),
+            hits: Some(hits),
+            l2_bytes: Some(0),
+            rss_bytes: Some(3 << 30),
+            device_bytes: None,
+        }
+    }
+
+    fn lmcache_report(host: &str, lmcache: Vec<LmcacheSample>) -> LoadReport {
+        LoadReport {
+            host_id: host.into(),
+            samples: Vec::new(),
+            lmcache,
+        }
+    }
+
+    // T45 T34: ADR 0033 §12. An LMCache sample is kept per instance
+    // incarnation (deployment, generation) under the engine sample's rules:
+    // a report naming another host is refused whole; a sample from the
+    // future, already stale, older than the one kept, or claiming another
+    // host's fresh one is skipped; a read names one generation, reads stale
+    // after 3 s and nothing after the retention bound; a failed scrape is
+    // kept with every figure unknown, never zero.
+    #[test]
+    fn lmcache_samples_are_kept_per_instance_under_the_engine_sample_rules() {
+        let table = LoadTable::new();
+        let key = |deployment: &str, generation: i64| InstanceKey::new(deployment, generation);
+        assert_eq!(
+            table.accept(
+                "h1",
+                lmcache_report("h2", vec![lmcache("d", 1, NOW, 1)]),
+                NOW
+            ),
+            Err(LoadRejected::HostMismatch)
+        );
+        assert!(table.lmcache_at(&key("d", 1), NOW).is_none());
+
+        let mut failed = lmcache("f", 1, NOW, 0);
+        failed.scrape_ok = false;
+        (failed.used_bytes, failed.usage_ppm, failed.alloc_failures) = (None, None, None);
+        (failed.lookups, failed.hits, failed.l2_bytes) = (None, None, None);
+        let applied = table
+            .accept(
+                "h1",
+                lmcache_report(
+                    "h1",
+                    vec![
+                        lmcache("d", 1, NOW, 5),
+                        lmcache("d", 2, NOW, 9),
+                        lmcache("e", 1, NOW - LOAD_STALE_AFTER_MS - 1, 3),
+                        lmcache("e", 2, NOW + 10_000, 3),
+                        failed,
+                    ],
+                ),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            applied,
+            LoadApplied {
+                applied: 3,
+                skipped: 2
+            }
+        );
+        assert_eq!(
+            table.lmcache_at(&key("d", 1), NOW),
+            Some(LmcacheView {
+                host_id: "h1".into(),
+                owned_handle: "launch-d-1".into(),
+                sampled_at_ms: NOW,
+                age_ms: 0,
+                fresh: true,
+                scrape_ok: true,
+                used_bytes: Some(1 << 30),
+                usage_ppm: Some(250_000),
+                lookups: Some(10),
+                hits: Some(5),
+                alloc_failures: Some(0),
+                l2_bytes: Some(0),
+                rss_bytes: Some(3 << 30),
+                device_bytes: None,
+            })
+        );
+        assert_eq!(table.lmcache_at(&key("d", 2), NOW).unwrap().hits, Some(9));
+        assert!(table.lmcache_at(&key("d", 3), NOW).is_none());
+        assert!(table.lmcache_at(&key("e", 1), NOW).is_none());
+        assert!(table.lmcache_at(&key("e", 2), NOW).is_none());
+        let unknown = table.lmcache_at(&key("f", 1), NOW).unwrap();
+        assert!(!unknown.scrape_ok);
+        assert_eq!(
+            (unknown.used_bytes, unknown.lookups, unknown.hits),
+            (None, None, None)
+        );
+        // The LMCache samples are not engine load.
+        assert!(table.sample_at(&key("d", 1), NOW).is_none());
+
+        let older = table
+            .accept(
+                "h1",
+                lmcache_report("h1", vec![lmcache("d", 1, NOW - 100, 1)]),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(older.skipped, 1);
+        let claimed = table
+            .accept(
+                "h2",
+                lmcache_report("h2", vec![lmcache("d", 1, NOW + 1, 0)]),
+                NOW + 1,
+            )
+            .unwrap();
+        assert_eq!(claimed.skipped, 1);
+        let kept = table.lmcache_at(&key("d", 1), NOW + 1).unwrap();
+        assert_eq!((kept.host_id.as_str(), kept.hits), ("h1", Some(5)));
+
+        let stale = table
+            .lmcache_at(&key("d", 1), NOW + LOAD_STALE_AFTER_MS + 1)
+            .unwrap();
+        assert!(!stale.fresh);
+        assert_eq!(stale.age_ms, LOAD_STALE_AFTER_MS + 1);
+        assert!(table
+            .lmcache_at(&key("d", 1), NOW + LOAD_RETAIN_MS + 1)
+            .is_none());
+    }
+
+    // T45 T34 T33: ADR 0033 §12, SPEC §13.2. A retired generation's LMCache
+    // sample is dropped with its engine sample, and a host whose session
+    // ended leaves none behind; another host's samples stay.
+    #[test]
+    fn lmcache_samples_leave_with_their_generation_and_their_host() {
+        let table = LoadTable::new();
+        let key = |deployment: &str, generation: i64| InstanceKey::new(deployment, generation);
+        table
+            .accept(
+                "h1",
+                lmcache_report("h1", vec![lmcache("d", 1, NOW, 1), lmcache("d", 2, NOW, 2)]),
+                NOW,
+            )
+            .unwrap();
+        table
+            .accept(
+                "h2",
+                lmcache_report("h2", vec![lmcache("e", 1, NOW, 3)]),
+                NOW,
+            )
+            .unwrap();
+        table.retain_generations("d", &[2]);
+        assert!(table.lmcache_at(&key("d", 1), NOW).is_none());
+        assert!(table.lmcache_at(&key("d", 2), NOW).is_some());
+        table.forget_host("h1");
+        assert!(table.lmcache_at(&key("d", 2), NOW).is_none());
+        assert_eq!(table.lmcache_at(&key("e", 1), NOW).unwrap().hits, Some(3));
     }
 }

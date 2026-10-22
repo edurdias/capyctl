@@ -26,13 +26,18 @@ pub struct HostInvitation {
     /// id it re-enrolls. `host_name` is then that host's enrolled name.
     pub recover_host_id: Option<String>,
 }
+/// ADR 0033 §6: the LMCache figures already offered to the store, per
+/// (host, deployment, generation, owned handle): (resident, device).
+type LmcacheSeen = std::collections::BTreeMap<(String, String, i64, String), (i64, i64)>;
 pub struct EnrollmentAuthority {
     state: SharedCoordinatorState,
     ca: CertificateAuthority,
     revocations: watch::Sender<u64>,
-    /// ADR 0033 §6: the largest LMCache figures recorded per launch (owned
-    /// handle), so a host's every load report does not write the store.
-    lmcache_measured: std::sync::Mutex<std::collections::BTreeMap<String, (i64, i64)>>,
+    /// ADR 0033 §6: the largest LMCache figures offered per launch, keyed by
+    /// what the store matches the launch on (host, deployment, generation,
+    /// owned handle), so a host's every load report does not write the store
+    /// and a sample naming another host's launch never hides that host's own.
+    lmcache_measured: std::sync::Mutex<LmcacheSeen>,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("host identity authorization failed")]
@@ -120,8 +125,14 @@ impl EnrollmentAuthority {
             let Ok(mut seen) = self.lmcache_measured.lock() else {
                 return;
             };
+            let key = (
+                host.to_owned(),
+                sample.deployment_id.clone(),
+                sample.generation,
+                sample.owned_handle.clone(),
+            );
             if seen
-                .get(&sample.owned_handle)
+                .get(&key)
                 .is_some_and(|(r, d)| *r >= resident && *d >= device)
             {
                 continue;
@@ -146,7 +157,7 @@ impl EnrollmentAuthority {
                 if seen.len() >= MAX_SEEN {
                     seen.clear();
                 }
-                let entry = seen.entry(sample.owned_handle.clone()).or_default();
+                let entry = seen.entry(key).or_default();
                 *entry = (entry.0.max(resident), entry.1.max(device));
             }
         }
