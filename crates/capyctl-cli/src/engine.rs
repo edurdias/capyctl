@@ -254,6 +254,8 @@ struct Registration {
     reported: capyctl_agent::engines::ReportedVersion,
     fingerprint: Option<capyctl_agent::installation::InstallationFingerprint>,
     deep_park_missing: Option<bool>,
+    /// ADR 0033 §1: the LMCache of a vLLM or SGLang environment.
+    lmcache: Option<capyctl_agent::lmcache_install::LmcacheMeasurement>,
 }
 
 /// ADR 0018 §1 step 3: executed only now, because the operator named it.
@@ -267,9 +269,19 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
             ),
         )
     })?;
-    let fingerprint = capyctl_agent::installation::InstallationMeasurer::new()
-        .measure(resolved.engine, &resolved.executable)
-        .ok();
+    let measurer = capyctl_agent::installation::InstallationMeasurer::new();
+    let fingerprint = measurer.measure(resolved.engine, &resolved.executable).ok();
+    // ADR 0033 §1: LMCache's version and digest, read from the environment's
+    // files (nothing runs); recorded only when found and measurable, and
+    // never installed by capyctl.
+    let lmcache = match resolved.engine {
+        Engine::Vllm | Engine::Sglang => {
+            capyctl_agent::lmcache_install::measure_lmcache(&measurer, &resolved.executable)
+                .ok()
+                .flatten()
+        }
+        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => None,
+    };
     // review decision 2026-09-25: `engine add` before any role has started
     // is the first run. The state root the role will use is created
     // owner-only, as the role creates it, so the probe has somewhere private
@@ -301,6 +313,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
         reported,
         fingerprint,
         deep_park_missing: report.and_then(|r| r.available("deep_park")).map(|a| !a),
+        lmcache,
     })
 }
 
@@ -594,8 +607,10 @@ async fn add(
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         trust_remote_code: extras.remote_code,
-        // ADR 0033 §1: the LMCache package measured in the environment.
-        lmcache: None,
+        lmcache: registration
+            .lmcache
+            .as_ref()
+            .map(capyctl_agent::lmcache_install::LmcacheMeasurement::registration),
     };
     let revision = write_profile(target, &name, &spec)?;
     let out = json!({
@@ -609,6 +624,8 @@ async fn add(
         "engines_file": target.engines, "revision": revision,
         "cuda_home": spec.cuda_home,
         "trust_remote_code": spec.trust_remote_code,
+        // ADR 0033 §1: what was recorded, or null when LMCache was not found.
+        "lmcache": spec.lmcache,
     });
     publish(target, out, revision, &target.engines).await
 }
@@ -1007,7 +1024,8 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             all.push((name.clone(), profile, "environment"));
         }
     }
-    let rows: Vec<Value> = all
+    let profiles: Vec<Value> = all.iter().map(|(_, profile, _)| profile.clone()).collect();
+    let mut rows: Vec<Value> = all
         .into_iter()
         .map(|(name, profile, source)| {
             let kind = profile["engine"].as_str().and_then(Engine::from_name);
@@ -1044,11 +1062,86 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             })
         })
         .collect();
+    // ADR 0033 §9: the host's own `lmcache` and `retention`, when its role
+    // document says.
+    let host = role_document(target)
+        .ok()
+        .map(|document| match target.kind {
+            RoleKind::Host => capyctl_config::lmcache::host_settings(&document),
+            RoleKind::Standalone => capyctl_config::lmcache::host_settings(&document["host"]),
+        })
+        .unwrap_or_default();
+    let inputs: Vec<(String, Value)> = rows
+        .iter()
+        .map(|row| row["version"].as_str().unwrap_or_default().to_owned())
+        .zip(profiles)
+        .collect();
+    let views = tokio::task::spawn_blocking(move || {
+        let measurer = capyctl_agent::installation::InstallationMeasurer::new();
+        inputs
+            .iter()
+            .map(|(version, profile)| listed_lmcache(&measurer, host, version, profile))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| error("internal", "the LMCache check failed"))?;
+    for (row, view) in rows.iter_mut().zip(views) {
+        row["lmcache"] = view;
+    }
     Ok(
         json!({"engines_file": target.engines, "revision": engines.revision,
         "custom_engines_file": custom.path, "custom_revision": custom.revision,
         "agent": if role.is_some() { "reachable" } else { "unreachable" }, "engines": rows}),
     )
+}
+
+/// ADR 0033 §9: a local profile's `lmcache` field: off with the first reason
+/// of the host's settings and the engine gate, else the launch-time check
+/// run on the profile's environment (files only, nothing runs), showing the
+/// registered version and whether the files drifted from it.
+fn listed_lmcache(
+    measurer: &capyctl_agent::installation::InstallationMeasurer,
+    host: (
+        capyctl_config::lmcache::HostLmcache,
+        capyctl_config::lmcache::Retention,
+    ),
+    version: &str,
+    profile: &Value,
+) -> Value {
+    use capyctl_config::lmcache::{listed_view, profile_gate, LmcacheOff, LmcacheOffReason};
+    let off =
+        |reason: LmcacheOffReason, detail: String| listed_view(&Err(LmcacheOff { reason, detail }));
+    let Some(engine) = profile["engine"].as_str().and_then(Engine::from_name) else {
+        let reason = LmcacheOffReason::EngineUnsupported;
+        return off(reason, reason.sentence().to_owned());
+    };
+    if let Some(gated) = profile_gate(host, engine, version) {
+        return listed_view(&Err(gated));
+    }
+    let registration: Option<capyctl_config::lmcache::LmcacheRegistration> =
+        serde_json::from_value(profile["lmcache"].clone()).ok();
+    let Some(executable) = profile["executable"].as_str() else {
+        return listed_view(&capyctl_config::lmcache::listed(
+            host,
+            engine,
+            version,
+            registration.as_ref(),
+        ));
+    };
+    match capyctl_agent::lmcache_install::check_lmcache(
+        measurer,
+        engine,
+        Path::new(executable),
+        registration.as_ref(),
+    ) {
+        Ok(install) => {
+            let registered = registration.map_or(install.version, |r| r.version);
+            let mut view = listed_view(&Ok(registered));
+            view["drift"] = install.drifted.into();
+            view
+        }
+        Err(failure) => off(failure.reason, failure.detail),
+    }
 }
 
 /// ADR 0018 §4 (review decision C1): the CLI is the only writer of
@@ -1249,6 +1342,61 @@ fn unknown_outcome(cause: &str, name: &str) -> StructuredError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T45 (ADR 0033 §§2, 9, 10): before any file is read, a profile is off
+    // for the host's zero retention, then the host's `lmcache: off`, then
+    // its engine and version, in that order; nothing of the environment is
+    // read for them (the executable does not exist).
+    #[test]
+    fn lmcache_listing_follows_the_host_settings_and_the_engine() {
+        use capyctl_config::lmcache::{HostLmcache, Retention};
+        let measurer = capyctl_agent::installation::InstallationMeasurer::new();
+        let vllm = json!({"engine": "vllm", "executable": "/nonexistent/bin/vllm",
+            "lmcache": {"version": "0.5.6", "digest": "sha256:00"}});
+        let reason = |host, version: &str, profile: &Value| {
+            listed_lmcache(&measurer, host, version, profile)["reason"].clone()
+        };
+        let defaults = (HostLmcache::Auto, Retention::Standard);
+        assert_eq!(
+            reason((HostLmcache::Off, Retention::Zero), "0.32.0", &vllm),
+            "retention_zero"
+        );
+        assert_eq!(
+            reason((HostLmcache::Off, Retention::Standard), "0.32.0", &vllm),
+            "host_off"
+        );
+        assert_eq!(
+            reason((HostLmcache::Auto, Retention::Zero), "0.31.0", &vllm),
+            "retention_zero"
+        );
+        assert_eq!(
+            reason(defaults, "0.31.0", &vllm),
+            "engine_version_unsupported"
+        );
+        let sglang = json!({"engine": "sglang", "executable": "/nonexistent/bin/python3"});
+        assert_eq!(
+            reason(defaults, "0.5.21", &sglang),
+            "engine_version_unsupported"
+        );
+        assert_eq!(
+            listed_lmcache(&measurer, defaults, "0.5.21", &sglang)["detail"],
+            "LMCache needs SGLang 0.5.22 or newer"
+        );
+        for engine in ["llamacpp", "tensorfold", "custom", "unknown"] {
+            let profile = json!({"engine": engine, "executable": "/nonexistent/x"});
+            assert_eq!(reason(defaults, "1.0.0", &profile), "engine_unsupported");
+        }
+        // The environment is read only past those gates.
+        assert_eq!(reason(defaults, "0.32.0", &vllm), "not_installed");
+        assert_eq!(
+            capyctl_config::lmcache::host_settings(&json!({"lmcache": "off", "retention": "zero"})),
+            (HostLmcache::Off, Retention::Zero)
+        );
+        assert_eq!(
+            capyctl_config::lmcache::host_settings(&json!({"lmcache": "sometimes"})),
+            defaults
+        );
+    }
 
     // T37 (review decision I4): the CLI's bound on `remove` outlasts the
     // role's own bound on a retirement by a clear margin, so a drain that runs

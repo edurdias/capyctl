@@ -922,6 +922,75 @@ fn engine_display(engine: Engine) -> &'static str {
     }
 }
 
+/// ADR 0033 §9, §10: a host's `lmcache` and `retention` as a document states
+/// them at its root (a host role document, the `host` block of a standalone
+/// one, the document a host publishes). An absent or unreadable value reads
+/// as the default: a listing never refuses.
+pub fn host_settings(document: &serde_json::Value) -> (HostLmcache, Retention) {
+    let lmcache = serde_json::from_value(document["lmcache"].clone()).unwrap_or_default();
+    let retention = serde_json::from_value(document["retention"].clone()).unwrap_or_default();
+    (lmcache, retention)
+}
+
+/// ADR 0033 §9: why a profile cannot use LMCache before its environment is
+/// read, in the order every role applies (contract 2): `retention_zero`,
+/// `host_off`, then the engine gate.
+pub fn profile_gate(
+    host: (HostLmcache, Retention),
+    engine: Engine,
+    build_fingerprint: &str,
+) -> Option<LmcacheOff> {
+    if host.1 == Retention::Zero {
+        return Some(LmcacheOff::new(LmcacheOffReason::RetentionZero));
+    }
+    if host.0 == HostLmcache::Off {
+        return Some(LmcacheOff::new(LmcacheOffReason::HostOff));
+    }
+    engine_gate(engine, build_fingerprint)
+}
+
+/// ADR 0033 §9: what `engine list` shows for a profile from what is known
+/// without its environment's files: [`profile_gate`], then the profile's
+/// registration (`not_installed` without one, `version_unsupported` for a
+/// registered release outside 0.5.x from 0.5.6). `Ok` is the registered
+/// version. A role that can read the environment shows its launch-time
+/// check instead of the registration.
+pub fn listed(
+    host: (HostLmcache, Retention),
+    engine: Engine,
+    build_fingerprint: &str,
+    registration: Option<&LmcacheRegistration>,
+) -> Result<String, LmcacheOff> {
+    if let Some(off) = profile_gate(host, engine, build_fingerprint) {
+        return Err(off);
+    }
+    match registration {
+        None => Err(LmcacheOff::new(LmcacheOffReason::NotInstalled)),
+        Some(registration) if !lmcache_version_supported(&registration.version) => {
+            Err(LmcacheOff::with_detail(
+                LmcacheOffReason::VersionUnsupported,
+                format!(
+                    "LMCache {} is registered; {}",
+                    registration.version,
+                    LmcacheOffReason::VersionUnsupported.sentence()
+                ),
+            ))
+        }
+        Some(registration) => Ok(registration.version.clone()),
+    }
+}
+
+/// ADR 0033 §9 (contract 8): the `lmcache` field of an `engine list` row:
+/// `{"state": "on", "version"}` or `{"state": "off", "reason", "detail"}`.
+pub fn listed_view(listed: &Result<String, LmcacheOff>) -> serde_json::Value {
+    match listed {
+        Ok(version) => serde_json::json!({"state": "on", "version": version}),
+        Err(off) => serde_json::json!({
+            "state": "off", "reason": off.reason.code(), "detail": off.detail,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
