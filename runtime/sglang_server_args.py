@@ -482,6 +482,12 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
                     # ADR 0028 §12 (R12): on every rank of a group alike.
                     enable_memory_saver=settings["memory_saver"],
                     enable_weights_cpu_backup=settings["cpu_weight_backup"])
+    # ADR 0033 §4: a launch whose LMCache server is up names its owner-only
+    # connector file; capyctl renders the connector, and `expected` (below)
+    # pins both after resolution. Absent, the constant pins keep it off.
+    if "lmcache_config_file" in settings:
+        reserved.update(enable_lmcache=True,
+                        lmcache_config_file=settings["lmcache_config_file"])
     # ADR 0028 §10: a group member's parallelism and rendezvous come from its
     # descriptor's group, never the single-rank constants. On a worker the key
     # fields stay None (it is handed no credential, ADR 0012) and its health

@@ -59,11 +59,12 @@ pub enum GroupObservationError {
 /// Only fixed `/proc` paths are accepted. Any unreadable process, or a group that
 /// changes between the two snapshots, fails closed; a process that exits during a
 /// scan is simply not in it. No signals, role inference, retries, or receipt
-/// creation occur.
+/// creation occur. ADR 0033 §3: the leader is the engine's `api` or the launch's
+/// LMCache server (`lmcache`), the leader of its own group.
 pub fn observe_process_group(
     expected_api: &ProcessIdentity,
 ) -> Result<ProcessGroupObservation, GroupObservationError> {
-    if expected_api.role != "api" || expected_api.pid == 0 || expected_api.start_ticks == 0 {
+    if !leader_role(&expected_api.role) || expected_api.pid == 0 || expected_api.start_ticks == 0 {
         return Err(GroupObservationError::ApiIdentity);
     }
     let mounts = read_bounded("/proc/mounts", MAX_METADATA_BYTES)?;
@@ -446,7 +447,7 @@ fn validate_api(
     expected: &ProcessIdentity,
     facts: &[GroupProcessFact],
 ) -> Result<(), GroupObservationError> {
-    if expected.role != "api"
+    if !leader_role(&expected.role)
         || !facts.iter().any(|fact| {
             fact.pid == expected.pid
                 && fact.process_group == expected.pid
@@ -457,6 +458,11 @@ fn validate_api(
         return Err(GroupObservationError::ApiIdentity);
     }
     Ok(())
+}
+
+/// ADR 0033 §3: the roles that lead an owned process group of a launch.
+fn leader_role(role: &str) -> bool {
+    role == "api" || role == capyctl_domain::completion::LMCACHE_ROLE
 }
 
 fn finish(

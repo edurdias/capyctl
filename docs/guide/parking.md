@@ -71,9 +71,33 @@ fresh.
 A [decision model](deploy.md#decision-models) is checked the same way with its
 fixed decision instead of a prompt: the wake passes when it picks the same
 option with every probability within 0.05 of the first answer, and fails with
-`wake_mismatch` otherwise. Decision models restart instead of parking in this
-release, and every restart records a new first answer, so today the check has
-nothing to compare.
+`wake_mismatch` otherwise. A decision model without LMCache restarts instead of
+parking, and every restart records a new first answer, so the check has
+nothing to compare; with LMCache it parks as `restart_only` below, and the
+engine started at the wake is compared with the first answer of the launch.
+
+### Parking with LMCache
+
+A deployment that uses [LMCache](engines.md#lmcache) keeps its LMCache server,
+and the server's pool of host RAM stays reserved, while the model is parked;
+the server stops when the model stops.
+
+- **`restart_only`** (declared, or what a decision model or a machine with
+  deep parking turned off resolves to): parking stops the engine and keeps the
+  LMCache server; waking starts the engine again on the same server, so the
+  first request after the wake can be answered from the cache. Without
+  LMCache such a model stops instead of parking, as before. While it is
+  parked, the reservation also holds the engine's KV cache: the server keeps
+  the stopped engine's KV memory mapped until the next engine connects
+  (measured on a GB10).
+- **`deep` and `host_backed`** use LMCache only on an engine version, model
+  type and GPU combination qualified live for parking with it. This release
+  qualifies none, so a deep-parking deployment keeps parking deep and runs
+  without LMCache, and status says "LMCache off: not qualified with deep park
+  on <engine version> / <model type> / <GPU>". Parking wins: CapyCTL never
+  switches it to `restart_only` for you. To have LMCache, declare
+  `residency: restart_only`; with `lmcache: required` and a parking residency
+  the deployment is refused (`lmcache_unavailable:park_unqualified`).
 
 ## Switch between models
 

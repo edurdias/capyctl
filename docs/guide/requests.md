@@ -286,9 +286,11 @@ endpoint and its API key to `$KEY`.
 ## Keep tenants' prompt caches apart
 
 vLLM and SGLang reuse the cached start of an earlier prompt when a new one
-begins the same way. When several tenants share one model, give each its own
-`cache_salt`: a request then reuses cached prefixes only from requests that
-carry the same salt.
+begins the same way, and so does a deployment's
+[LMCache](engines.md#lmcache) server, which keeps those prefixes in host RAM
+across a park or a restart. When several tenants share one model, give each
+its own `cache_salt`: a request then reuses cached prefixes, in the engine and
+in LMCache, only from requests that carry the same salt.
 
 ```bash
 curl -s http://127.0.0.1:8443/v1/chat/completions \
@@ -297,9 +299,21 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
        "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-CapyCTL passes the salt to vLLM and SGLang unchanged. It must be a non-empty
-string of at most 1024 bytes; anything else is refused with
-`400 invalid_request`.
+The salt must be a non-empty string of at most 1024 bytes; anything else is
+refused with `400 invalid_request`. CapyCTL does not pass it on unchanged: it
+sends vLLM and SGLang the effective salt, a 64-character SHA-256 digest of
+the deployment, the revision serving the request and your salt, and the engine
+passes the same value to LMCache. So:
+
+- the same salt shares a cache only within one deployment and revision; a
+  new revision, or another deployment, starts apart;
+- different salts never share;
+- a request without `cache_salt` is sent without one, and shares the cache
+  with every other unsalted request to that deployment;
+- a salt partitions a cache; it authorizes nothing. Anyone with the API key
+  may send any salt.
+
+CapyCTL never logs or stores the effective salt.
 
 TensorFold and llama.cpp ignore the field, so a request with a `cache_salt` for a
 model that runs on either is refused rather than served without the isolation it asks

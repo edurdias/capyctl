@@ -94,7 +94,7 @@ pub(super) async fn initialize(
     // Unsupported when any part is missing: a builder without its launch, its
     // tools or its credentials cannot launch anything, and must not half-run
     // the step. A group worker has no credentials to miss (ADR 0012).
-    let (launch, tools, credentials) = adapter.launch_parts()?;
+    let parts = adapter.launch_parts()?;
     if !matches!(context.launch_settings, Some(LaunchSettings::Sglang(_)))
         || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
@@ -103,8 +103,71 @@ pub(super) async fn initialize(
     // One launch per incarnation: a repeat would start a second engine holding
     // the same device memory while the first is still recorded as owned.
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
+    launch(adapter, command, parts, Spawn::Launch).await
+}
+
+/// ADR 0033 §7: the Restore of a restart-parked launch: the Initialize body
+/// again, on the launch's running server (`LmcacheLaunch::Attached`), its
+/// engine spawned once for this wake step. The adapter's one-launch claim is
+/// not taken again: the wake key (`"{incarnation}#wake-{step}"`) is the
+/// once-only guard, one per step.
+pub(super) async fn restore_engine(
+    adapter: &SglangAdapter,
+    command: &RuntimeCommand,
+) -> Result<EffectObservation, RuntimeError> {
+    let parts = adapter.launch_parts()?;
+    crate::lmcache::restore_server(command)?;
+    if !matches!(
+        adapter.lmcache().and_then(|state| state.launch()),
+        Some(crate::lmcache::LmcacheLaunch::Attached { .. })
+    ) {
+        return Err(RuntimeError::Unsupported);
+    }
+    launch(adapter, command, parts, Spawn::Wake).await
+}
+
+/// How the engine of this step is spawned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spawn {
+    /// The launch's engine (`spawn_durable_protected`).
+    Launch,
+    /// ADR 0033 §7: a restart-parked launch's engine again, for this wake step.
+    Wake,
+}
+
+async fn launch(
+    adapter: &SglangAdapter,
+    command: &RuntimeCommand,
+    (mut launch, tools, credentials): super::adapter::LaunchParts,
+    spawn: Spawn,
+) -> Result<EffectObservation, RuntimeError> {
+    let context = &command.context;
     let wrapper = adapter.wrapper_path()?.to_path_buf();
     let session = adapter.session()?;
+
+    // ADR 0033 §3 "Order": the server first, proven up and on loopback, then
+    // the engine with the connector. Under `required` a server that did not
+    // start ends the step here, before any engine exists.
+    let connector = crate::lmcache::connect(
+        adapter.lmcache(),
+        &tools,
+        &context.incarnation,
+        &context.binding_id,
+    )
+    .await?;
+    if let Some(connector) = &connector {
+        // ADR 0033 §4: the owner-only connector file, named by the public
+        // settings; the entry renders `enable_lmcache` and the file and pins
+        // both after SGLang resolved its arguments.
+        let dir = connector.plan().config_dir.clone();
+        let port = connector.rpc_port();
+        let file =
+            tokio::task::spawn_blocking(move || crate::lmcache::write_sglang_config(&dir, port))
+                .await
+                .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
+                .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
+        launch.rendered = launch.rendered.with_lmcache_config_file(&file)?;
+    }
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
     // descriptors the launcher hands the child; nothing enters argv or env.
@@ -263,12 +326,21 @@ pub(super) async fn initialize(
     // The tool is synchronous on purpose (capyctl-launchers has no runtime), so every
     // call into it leaves the async threads free.
     let incarnation = context.incarnation.clone();
+    let wake = context.token.step_id.clone();
     let spawn_tools = tools.clone();
-    let api = tokio::task::spawn_blocking(move || {
-        spawn_tools.spawn_durable_protected(&incarnation, &cmd, &descriptors)
+    let api = tokio::task::spawn_blocking(move || match spawn {
+        Spawn::Launch => spawn_tools.spawn_durable_protected(&incarnation, &cmd, &descriptors),
+        Spawn::Wake => {
+            spawn_tools.spawn_durable_wake(&incarnation, &wake, &cmd, Some(&descriptors))
+        }
     })
     .await
     .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
+    // ADR 0033 §8: from here a failure before Ready is the engine's start
+    // with the connector failing; ownership errors are not.
+    let failed = |error: RuntimeError| {
+        crate::lmcache::engine_failed(connector.as_ref(), adapter.engine_log(), error)
+    };
     // ADR 0014 amendment A12: note any kernel build until the step ends.
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
@@ -310,9 +382,9 @@ pub(super) async fn initialize(
             // Spec §4: the builder's own bound ends first, so its reason, not a
             // bare coordinator timeout, is what gets recorded.
             Err(_elapsed) => {
-                return Err(RuntimeError::Uncertain(
+                return Err(failed(RuntimeError::Uncertain(
                     "readiness poll deadline reached with the engine alive".into(),
-                ))
+                )))
             }
             Ok(Ok(Readiness::Ready)) => break,
             Ok(Ok(Readiness::Initializing)) => {}
@@ -336,7 +408,7 @@ pub(super) async fn initialize(
             Presence::Alive => {}
             // SPEC §§6.4, 13.2: an engine that left before readiness is a
             // launch failure with its own reason, not ownership uncertainty.
-            Presence::Gone => return Err(launch_failed(adapter, debug_logs)),
+            Presence::Gone => return Err(failed(launch_failed(adapter, debug_logs))),
             // Unknown is retained, never absent: the step fails but says why.
             Presence::Unknown => {
                 return Err(RuntimeError::Uncertain(
@@ -344,10 +416,17 @@ pub(super) async fn initialize(
                 ))
             }
         }
+        // ADR 0033 §3: a server that exits while its engine is still starting
+        // is an engine start failure with the connector.
+        if let Some(connector) = &connector {
+            if connector.server_gone(&tools).await {
+                return Err(failed(connector.server_exited(adapter.engine_log())));
+            }
+        }
         if now_ms()? >= stop_at {
-            return Err(RuntimeError::Uncertain(
+            return Err(failed(RuntimeError::Uncertain(
                 "readiness deadline reached with the engine alive".into(),
-            ));
+            )));
         }
         tokio::time::sleep(READINESS_POLL).await;
     }
@@ -373,7 +452,9 @@ pub(super) async fn initialize(
         )
         .await
         .map_err(|_| {
-            RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+            failed(RuntimeError::Uncertain(
+                "probe deadline reached with the engine alive".into(),
+            ))
         })?
         .map_err(|e| {
             RuntimeError::Uncertain(redact_text(&format!(
@@ -390,7 +471,9 @@ pub(super) async fn initialize(
         let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
             .await
             .ok_or_else(|| {
-                RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+                failed(RuntimeError::Uncertain(
+                    "probe deadline reached with the engine alive".into(),
+                ))
             })?
             .map_err(|e| {
                 RuntimeError::Uncertain(redact_text(&format!(
@@ -412,12 +495,18 @@ pub(super) async fn initialize(
     // A group without its API process, or without a single worker, is not the
     // deployment this step was asked to build; reporting it would record an
     // ownership set that does not cover the processes holding the device.
+    // ADR 0033 §3: the engine's own group alone is counted here.
     if identities.first().map(|i| i.role.as_str()) != Some("api") || identities.len() < 2 {
         return Err(RuntimeError::Uncertain(format!(
             "engine group incomplete: {}",
             roles(&identities)
         )));
     }
+    // ADR 0033 §3: the launch owns both groups; LMCache is on.
+    let identities = match &connector {
+        Some(connector) => connector.ready(identities),
+        None => identities,
+    };
 
     Ok(EffectObservation {
         token: context.token.clone(),
@@ -427,9 +516,14 @@ pub(super) async fn initialize(
         observed_at_ms: now_ms()?,
         // The receipt carries provenance, never a credential.
         receipt: format!(
-            "sglang {} ready on {}; probe answered",
+            "sglang {} ready on {}; probe answered{}",
             adapter.fingerprint()?,
-            adapter.endpoint()?
+            adapter.endpoint()?,
+            if connector.is_some() {
+                "; LMCache on"
+            } else {
+                ""
+            }
         ),
         facts: vec![
             Milestone::AllocationsRestored,

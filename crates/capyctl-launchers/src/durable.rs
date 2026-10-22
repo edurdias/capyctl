@@ -7,6 +7,8 @@ use capyctl_adapters::protected::ProtectedLaunchDescriptors;
 use capyctl_adapters::traits::{OwnedHandle, RenderedCommand};
 use capyctl_domain::completion::ProcessIdentity;
 
+use crate::spawn_policy::SpawnPolicy;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AssociationError {
     #[error("launch association uncertain: {0}")]
@@ -17,7 +19,75 @@ pub enum AssociationError {
 /// It does not assert or manufacture complete worker ownership.
 pub trait LaunchAssociation {
     fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError>;
+    /// ADR 0033 §3: persist the launch's LMCache server identity (role
+    /// `lmcache`) under the same fences, before the server runs.
+    fn persist_lmcache_identity(
+        &self,
+        _identity: &ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        Err(AssociationError::Uncertain("unsupported".into()))
+    }
+    /// ADR 0033 §7: persist the `api` identity of a restart-parked launch's
+    /// engine spawned again for the wake step `wake`, before it runs.
+    fn persist_wake_api_identity(
+        &self,
+        _wake: &str,
+        _identity: &ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        Err(AssociationError::Uncertain("unsupported".into()))
+    }
 }
+
+/// ADR 0033 §§3, 7: which process of a launch one gated spawn starts. Each
+/// has its own once-only key, so a launch spawns its engine once, its server
+/// once and its engine again once per wake step, and never anything twice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SpawnRole<'a> {
+    /// The engine, keyed by the incarnation; its leader is `api`.
+    Engine,
+    /// The LMCache server, keyed `"{incarnation}#lmcache"`; its leader is `lmcache`.
+    Lmcache,
+    /// The engine again for wake step `.0`, keyed `"{incarnation}#wake-{step}"`.
+    Wake(&'a str),
+}
+
+impl SpawnRole<'_> {
+    fn key(self, incarnation: &str) -> Option<String> {
+        if incarnation.is_empty() {
+            return None;
+        }
+        match self {
+            Self::Engine => Some(incarnation.into()),
+            Self::Lmcache => Some(format!("{incarnation}#lmcache")),
+            Self::Wake("") => None,
+            Self::Wake(step) => Some(format!("{incarnation}#wake-{step}")),
+        }
+    }
+
+    fn leader_role(self) -> &'static str {
+        match self {
+            Self::Lmcache => capyctl_domain::completion::LMCACHE_ROLE,
+            Self::Engine | Self::Wake(_) => "api",
+        }
+    }
+
+    fn persist(
+        self,
+        association: &dyn LaunchAssociation,
+        identity: &ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        match self {
+            Self::Engine => association.persist_api_identity(identity),
+            Self::Lmcache => association.persist_lmcache_identity(identity),
+            Self::Wake(step) => association.persist_wake_api_identity(step, identity),
+        }
+    }
+}
+
+/// ADR 0033 §3: the only variables the LMCache server is started with. Its
+/// `/env` route shows them to any local process, so nothing else (no engine
+/// key, no log writer metadata, no `LMCACHE_*`) may reach it.
+const LMCACHE_ENVIRONMENT: [&str; 3] = ["PATH", "HOME", "CUDA_VISIBLE_DEVICES"];
 
 #[derive(Debug)]
 pub enum DurableSpawnOutcome {
@@ -91,7 +161,14 @@ impl DurableSpawn {
         cmd: &RenderedCommand,
         association: &dyn LaunchAssociation,
     ) -> Result<DurableSpawnOutcome, DurableSpawnError> {
-        self.spawn_inner(incarnation, cmd, association, None)
+        self.spawn_inner(
+            incarnation,
+            SpawnRole::Engine,
+            cmd,
+            association,
+            None,
+            SpawnPolicy::default(),
+        )
     }
 
     /// The single entry point with optional descriptors, so the plain and the
@@ -103,7 +180,14 @@ impl DurableSpawn {
         descriptors: Option<&ProtectedLaunchDescriptors>,
         association: &dyn LaunchAssociation,
     ) -> Result<DurableSpawnOutcome, DurableSpawnError> {
-        self.spawn_inner(incarnation, cmd, association, descriptors)
+        self.spawn_inner(
+            incarnation,
+            SpawnRole::Engine,
+            cmd,
+            association,
+            descriptors,
+            SpawnPolicy::default(),
+        )
     }
 
     /// Inherit private descriptors only into this supervised child. The parent's
@@ -115,7 +199,28 @@ impl DurableSpawn {
         descriptors: &ProtectedLaunchDescriptors,
         association: &dyn LaunchAssociation,
     ) -> Result<DurableSpawnOutcome, DurableSpawnError> {
-        self.spawn_inner(incarnation, cmd, association, Some(descriptors))
+        self.spawn_inner(
+            incarnation,
+            SpawnRole::Engine,
+            cmd,
+            association,
+            Some(descriptors),
+            SpawnPolicy::default(),
+        )
+    }
+
+    /// ADR 0033 §§3, 7, 10: the gated spawn of `role` for the launch
+    /// `incarnation`, its processes started under `policy`.
+    pub(crate) fn spawn_role(
+        &self,
+        incarnation: &str,
+        role: SpawnRole<'_>,
+        cmd: &RenderedCommand,
+        descriptors: Option<&ProtectedLaunchDescriptors>,
+        association: &dyn LaunchAssociation,
+        policy: SpawnPolicy,
+    ) -> Result<DurableSpawnOutcome, DurableSpawnError> {
+        self.spawn_inner(incarnation, role, cmd, association, descriptors, policy)
     }
 
     /// A child whose identity was never recorded must not be left blocked on its
@@ -143,13 +248,20 @@ impl DurableSpawn {
     fn spawn_inner(
         &self,
         incarnation: &str,
+        role: SpawnRole<'_>,
         cmd: &RenderedCommand,
         association: &dyn LaunchAssociation,
         descriptors: Option<&ProtectedLaunchDescriptors>,
+        policy: SpawnPolicy,
     ) -> Result<DurableSpawnOutcome, DurableSpawnError> {
-        if incarnation.is_empty() || !self.attempted.lock().unwrap().insert(incarnation.into()) {
+        let Some(key) = role.key(incarnation) else {
+            return Err(DurableSpawnError::AlreadyAttempted);
+        };
+        if !self.attempted.lock().unwrap().insert(key.clone()) {
             return Err(DurableSpawnError::AlreadyAttempted);
         }
+        let incarnation = key.as_str();
+        let server = matches!(role, SpawnRole::Lmcache);
         let (read_gate, write_gate) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
         let (program, args) = cmd
@@ -165,21 +277,31 @@ impl DurableSpawn {
         // sees only what its rendered command names (the adapter's closed
         // allowlist); nothing of the agent's own environment is inherited.
         command.env_clear();
-        if descriptors.is_some() {
+        if descriptors.is_some() || server {
             command.stdin(std::process::Stdio::null());
         }
+        // ADR 0033 §3: the gate shell exports `PWD` itself (dash does); the
+        // server's environment is exactly its three names, so the gate drops
+        // what the shell added before it execs the server.
+        let unset = if server { "unset PWD _; " } else { "" };
         command
             .arg("-c")
             .arg(format!(
-                "ack=$(dd bs=1 count=1 <&{CHILD_GATE_FD} 2>/dev/null); [ \"$ack\" = x ] || exit 125; exec \"$@\""
+                "ack=$(dd bs=1 count=1 <&{CHILD_GATE_FD} 2>/dev/null); [ \"$ack\" = x ] || exit 125; {unset}exec \"$@\""
             ))
             .arg("capyctl-init-gate")
             .arg(program)
             .args(args)
             // ADR 0031 §7: the log writer's metadata (the values it owns by
-            // value) is the writer's alone; the engine never sees it.
+            // value) is the writer's alone; the engine never sees it. ADR 0033
+            // §3: the LMCache server sees exactly its closed environment, not
+            // even the name of its log.
             .envs(cmd.env.iter().filter(|(name, _)| {
-                name.as_str() != capyctl_adapters::engine_log::OWNED_VALUES_VARIABLE
+                if server {
+                    LMCACHE_ENVIRONMENT.contains(&name.as_str())
+                } else {
+                    name.as_str() != capyctl_adapters::engine_log::OWNED_VALUES_VARIABLE
+                }
             }));
         match log {
             Some(path) => {
@@ -191,6 +313,7 @@ impl DurableSpawn {
                     &cmd.env,
                     descriptors,
                     open_private_log,
+                    policy.memory_logs,
                 )
                 .map_err(|error| {
                     DurableSpawnError::Spawn(format!("engine log {}: {error}", path.display()))
@@ -204,10 +327,17 @@ impl DurableSpawn {
             }
         }
         let inherited = descriptors.map(ProtectedLaunchDescriptors::numbers);
+        let no_core_dumps = policy.no_core_dumps;
         unsafe {
             command.pre_exec(move || {
                 nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
                     .map_err(std::io::Error::other)?;
+                // ADR 0033 §10: under zero retention a crash writes no core
+                // dump of request data; neither limit can be raised again.
+                if no_core_dumps {
+                    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+                        .map_err(std::io::Error::other)?;
+                }
                 nix::unistd::close(write_fd).map_err(std::io::Error::other)?;
                 if read_fd != CHILD_GATE_FD {
                     nix::unistd::dup2(read_fd, CHILD_GATE_FD).map_err(std::io::Error::other)?;
@@ -236,7 +366,7 @@ impl DurableSpawn {
             .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
         let pid = child.id();
         drop(read_gate);
-        let identity = (self.identity_collector)(pid, "api");
+        let identity = (self.identity_collector)(pid, role.leader_role());
         let handle = OwnedHandle {
             pid,
             start_identity: identity
@@ -261,7 +391,7 @@ impl DurableSpawn {
                 reason: "API identity unavailable after spawn; disposed: true".into(),
             });
         };
-        match association.persist_api_identity(&identity) {
+        match role.persist(association, &identity) {
             Ok(()) => {
                 let mut retained = self
                     .retained

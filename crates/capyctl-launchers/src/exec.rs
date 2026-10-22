@@ -209,6 +209,7 @@ impl Launcher for ExecLauncher {
                 &cmd.env,
                 None,
                 crate::durable::open_private_log,
+                false,
             )
             .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
             command.stdout(stdout).stderr(stderr);
