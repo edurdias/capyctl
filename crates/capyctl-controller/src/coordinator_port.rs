@@ -304,6 +304,7 @@ impl CoordinatorLifecycle {
             engine_key,
             incarnation: binding.incarnation,
             engine,
+            request_abort: false,
         })
     }
 
