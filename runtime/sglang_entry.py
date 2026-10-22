@@ -868,11 +868,12 @@ class _SharedMemoryWatch:
     user and private to it (no group or other access), and no live process
     other than this exiting entry holds it. Every process /proc lets this
     user inspect is checked. One that hides its descriptors and mappings (a
-    non-dumpable process of this user started after this entry, which could
-    be one of the launch's own) keeps every file; one running since before
-    the entry could only have opened a file by its new name, and is not
-    checked, nor is another user's. A file whose creator ended within one
-    listing interval of creating it is never claimed, and so stays.
+    non-dumpable process) keeps every file when it runs in this entry's
+    process group, where it could be one of the launch's own that left this
+    entry's tree; elsewhere (CapyCTL's own commands are non-dumpable, as are
+    SSH sessions) it could only have opened a file by its new name, and is
+    not checked. A file whose creator ended within one listing interval of
+    creating it is never claimed, and so stays.
     """
 
     def __init__(self, directory=SHM_DIRECTORY, interval=_SHM_WATCH_INTERVAL):
@@ -953,8 +954,7 @@ class _SharedMemoryWatch:
             return
         try:
             others = [pid for pid in _process_table() if pid != os.getpid()]
-            held, uncertain = _held_files(self._directory, others,
-                                          since=_start_time(os.getpid()))
+            held, uncertain = _held_files(self._directory, others, group=os.getpgrp())
         except (OSError, ValueError):
             return  # Nothing is seen unheld, so nothing is removed.
         if uncertain:
@@ -968,12 +968,12 @@ class _SharedMemoryWatch:
                 pass  # Removed by another, or not removable: left as it is.
 
 
-def _held_files(directory, pids, since=None):
+def _held_files(directory, pids, group=None):
     """The (device, inode) of every file in `directory` the `pids` hold.
 
     A file is held when a process has it open or mapped. Returns the set and
-    whether a process of this user started at or after `since` (clock ticks
-    after boot) could not be inspected, and so may hold any.
+    whether a process of this user in process group `group` could not be
+    inspected, and so may hold any.
     """
     # Mappings and descriptors name the resolved path (/dev/shm may be a link).
     prefix = os.path.realpath(directory).rstrip("/") + "/"
@@ -997,33 +997,31 @@ def _held_files(directory, pids, since=None):
                 except OSError:
                     continue  # Closed during the scan.
         except PermissionError:
-            uncertain = uncertain or (since is not None and _runs_as_this_user(pid)
-                                      and _start_time(pid) >= since)
+            uncertain = uncertain or (group is not None and _may_hide_ours(pid, group))
         except (FileNotFoundError, ProcessLookupError):
             continue  # Exited during the scan.
     return held, uncertain
 
 
-def _runs_as_this_user(pid):
-    """Whether any of the process's user IDs is this one's (it may hold our files)."""
+def _may_hide_ours(pid, group):
+    """Whether a process /proc hides could still hold one of the launch's files.
+
+    Only a live process of this user in the launch's process group could: a
+    zombie's descriptors and mappings went at its exit.
+    """
     try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            raw = handle.read()
+        fields = raw[raw.rindex(b")") + 2:].split()
+        if fields[0] in (b"Z", b"X") or int(fields[2]) != group:
+            return False
         with open("/proc/%d/status" % pid, "rb") as handle:
             for line in handle:
                 if line.startswith(b"Uid:"):
                     return os.geteuid() in [int(field) for field in line.split()[1:]]
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass  # Exited during the scan.
     return False
-
-
-def _start_time(pid):
-    """When the process started, in clock ticks after boot; -1 once it is gone."""
-    try:
-        with open("/proc/%d/stat" % pid, "rb") as handle:
-            raw = handle.read()
-        return int(raw[raw.rindex(b")") + 2:].split()[19])
-    except (OSError, ValueError, IndexError):
-        return -1
 
 
 def prepare_group_environment(environ, expected_ifname=None):
