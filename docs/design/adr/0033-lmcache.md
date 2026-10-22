@@ -1,9 +1,11 @@
 # ADR 0033 — LMCache: a private KV cache server per deployment instance
 
 **Status:** Accepted (owner decisions 2026-10-21: the design, and the owner's answers to
-the ten open questions of the first draft, recorded below). Target release 0.1.7.
-Nothing is implemented yet; the SPEC, guide and operations texts this ADR lists change
-with the implementation (§15), as for ADRs 0030 and 0031.
+the ten open questions of the first draft, recorded below). Implemented for 0.1.7
+(2026-10-22), with the amendments of the implementation at the end of this record (A1–A6):
+the measured defaults of §6, the server's command line and log, the SGLang salt check
+(LMCache issue 4825), the charge of the engine KV a server keeps while its engine is
+stopped, and `restart_only` decision deployments parking with LMCache.
 **Amends (with the implementation):** `SPEC.md` §7.4 (a private cache service per
 instance), §8.2 (the rendered connector is owned), §9.1 and §9.2 (LMCache beside a
 parking residency only where qualified), §10 (`cache_salt` is no longer forwarded
@@ -757,3 +759,69 @@ The answers to the first draft's ten open questions:
 10. **Host switch:** a host setting `lmcache: auto|off`; `off` turns LMCache off for every
     deployment on that machine, and `lmcache: required` is refused there with a code
     (§9).
+
+## Amendments with the implementation (2026-10-22)
+
+Facts found while implementing and measuring, within the owner's decisions above.
+
+**A1. The measured defaults (§6).** Live row LC1 on host A (GB10; LMCache 0.5.6, Qwen3-4B
+chat on vLLM 0.32.0 and SGLang 0.5.22, pools of 4 and 8 GiB, five engine runs and twenty
+bare server starts) measured: the server's resident memory beyond its pool at most
+824.3 MiB (781–824 MiB across runs, about the same at 8 GiB); its per-process GPU memory
+at most 408 MiB while its engine ran (170 MiB alone); the slowest start to `GET /status`
+4.80 s (2.90–4.80 s). The defaults are therefore: overhead allowance 1280 MiB (824.3 MiB
+plus 25 %, rounded up to 256 MiB), device allowance 512 MiB (408 MiB plus 25 %), start
+bound 30 s (4.80 s × 3 = 14.4 s, rounded up to 20 s, raised to the 30 s floor). On a
+unified-memory machine the server's GPU memory lies outside its resident set and inside
+the one memory pool (measured: a 2 GiB CUDA allocation moved `MemAvailable` by 2 GiB and
+the resident set by nothing), so there the charge is the pool, the overhead and the device
+figure, all in the one domain; on a discrete GPU the device figure goes to the device
+domain as §6 says.
+
+**A2. The command line (§3).** In LMCache 0.5.6 the L1 pool is lazy by default
+(`--l1-use-lazy` is a boolean option defaulting to true, starting at
+`--l1-init-size-gb 20`), so §3's "the pool is allocated at start" needs the option stated:
+CapyCTL renders `--no-l1-use-lazy` after §3's options. The server's `--shm-name` default
+(empty) keeps LMCache's shared-memory transfer off and is not passed. The L1 options are
+declared in `lmcache/v1/distributed/config.py`, the server's own in
+`lmcache/v1/multiprocess/config.py`; the launch-time check reads both.
+
+**A3. The server's log (§3).** The server's output goes to its own log beside the engine's
+(`<launch>.lmcache.log`), through its own redacting writer in the same `engine_logs` mode,
+rather than into the engine's log: the in-memory log buffer is one per log path, the
+writer is started with the engine's credentials (which do not exist yet when the server
+starts first), and a `restart_only` server outlives each engine. §8's log tail stays the
+engine's.
+
+**A4. The SGLang salt check (§1).** LMCache issue 4825 (owner input 2026-10-22) found that
+LMCache's legacy SGLang multiprocess adapter drops `cache_salt`; only the unified SGLang
+integration threads it end to end (LMCache main b28250e, regression tests in LMCache PR
+5964). LMCache 0.5.6 has the unified path: `unified_lmcache_mp_connector.py` builds
+`IPCCacheServerKey(..., cache_salt=...)`, and SGLang 0.5.22's
+`lmcache_unified_radix_cache.py` passes `req.cache_salt` on lookup and store (confirmed on
+host A, and LMCache's own object keys carried the salt in LC1). The launch-time check for
+SGLang therefore verifies the salt support, not only the files: the unified connector
+passes the salt into the key, the IPC key and object key carry it, SGLang's radix cache
+passes the request's salt to the unified connector and imports neither
+`sglang_adapter` nor `multi_process_adapter`, and SGLang's cache registry selects the
+unified radix cache under `enable_lmcache` (SGLang 0.5.22 declares `enable_lmcache` and
+`lmcache_config_file` in `arg_groups/fields/memory.py`, not `server_args.py`). A release
+without it fails `check_failed`, and SGLang runs with LMCache off until a release has it.
+Live row LC3 on SGLang also reads LMCache's own record of the stored keys for a
+non-empty salt.
+
+**A5. A stopped engine's KV (§§6, 7).** LC1 found that after an engine exits, its LMCache
+server keeps the engine's KV cache mapped through CUDA IPC (the server's GPU figure rose
+to 1430 MiB with a 1 GiB vLLM KV cache, 1656 MiB on SGLang, unchanged after 92 s) until
+the next engine registers (it then dropped back to 406–408 MiB, the old KV released, not
+both held) or the server stops. A `restart_only` instance parked with its server
+therefore charges, in its parked phase, the server's charge plus the engine's KV cache.
+Each server that had an engine connected also leaves a CUDA driver file,
+`/dev/shm/cuda.shm.<uid>.<pid>.1` (80 KiB, owner-only), after its verified exit; CapyCTL
+removes the stopped server's file. The engine processes leave the same kind of files, as
+they did before this ADR.
+
+**A6. Decision deployments park with LMCache.** A decision deployment resolves
+`restart_only` (ADR 0030); with LMCache on, it parks as §7 says (the engine stops, the
+server stays) instead of stopping, and the engine started at the wake is checked against
+the launch's wake reference (ADR 0030 §3) like any wake.
