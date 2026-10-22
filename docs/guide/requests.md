@@ -125,7 +125,9 @@ asks the engine to stop. That holds for streamed and non-streamed chat
 requests and for decision requests alike, and for a model served on a host,
 whose ingress closes its own engine connection when CapyCTL's goes away.
 (Before 0.1.7, a non-streamed request whose client hung up ran on to its
-end.) Closing a connection does not prove the engine stopped, so the request
+end, and a stream whose client hung up before its first token kept its
+engine connection until the engine produced that token.) Closing a
+connection does not prove the engine stopped, so the request
 stays counted against its model's memory until CapyCTL sees the engine stop:
 
 - If the engine had already answered (it produced part of the answer, or

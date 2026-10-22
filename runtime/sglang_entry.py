@@ -761,17 +761,37 @@ def _signal(pid, number):
 
 
 def _reap(table):
-    """Collect this process's exited children, multiprocessing's first."""
+    """Collect this process's exited children, each by its owner first."""
     multiprocessing = sys.modules.get("multiprocessing")
     if multiprocessing is not None:
         # Each Process object reaps its own child and records its exit.
         multiprocessing.active_children()
+    _stop_resource_tracker()
     for pid, (parent, state) in table.items():
         if parent == os.getpid() and state in ("Z", "X"):
             try:
                 os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                pass  # Already reaped through its Process object.
+                pass  # Already reaped by its owner.
+
+
+def _stop_resource_tracker():
+    """Have multiprocessing's resource tracker reap its own (ended) process.
+
+    Found live 2026-10-22: reaped by `_reap` instead, the tracker's finalizer
+    at interpreter exit waited for a child already gone, and Python 3.12
+    printed its `ChildProcessError` after the failure line, so the line the
+    host shows was no longer the log's last. Stopping it closes its pipe and
+    waits for its pid; one never started, or already stopped, is left alone.
+    """
+    module = sys.modules.get("multiprocessing.resource_tracker")
+    stop = getattr(getattr(module, "_resource_tracker", None), "_stop", None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except ChildProcessError:
+        pass  # Already reaped; its pipe is closed, so its finalizer does nothing.
 
 
 def _end_engine_processes(pause=0.05):

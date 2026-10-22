@@ -333,13 +333,25 @@ pub fn stream_planned_timed(
             let generation = attempt.generation;
             sink.timing.forwarding(attempt.instance, generation);
             let stall = attempt.stall.take();
-            let result = bounded(
-                attempt.forward.forward_chat_stream_async(&body, &mut sink),
-                &progress,
-                &bounds,
-                stall,
-            )
-            .await;
+            // SPEC §10 (found live 2026-10-22): the client's hang-up is
+            // noticed when its response body is dropped, not at the next
+            // chunk the sink delivers. Before the first token there is none
+            // to deliver, and live on SGLang a queued stream was cancelled
+            // only once the engine started it. Dropping the forward closes
+            // the engine connection; a forward whose end is ready at the
+            // same moment still ends with that end.
+            let gone = sink.tx.clone();
+            let result = tokio::select! {
+                biased;
+                result = bounded(
+                    attempt.forward.forward_chat_stream_async(&body, &mut sink),
+                    &progress,
+                    &bounds,
+                    stall,
+                ) => result,
+                () = gone.closed() => Ok(Ok(StreamEnded::Cancelled)),
+            };
+            drop(gone);
             if matches!(result, Ok(Ok(StreamEnded::Completed))) {
                 completed = Some(attempt);
                 break (result, None);

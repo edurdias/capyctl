@@ -275,29 +275,66 @@ async fn full_final_queue_waits_for_delivery_of_done() {
     assert_eq!(counts.current("d"), 0);
 }
 
+/// A backend that has not produced its first token, and never will; its
+/// forward marks `dropped` when the router drops it, which closes the engine
+/// connection.
+struct BeforeFirstToken {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct MarkDropped(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for MarkDropped {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl ChatForward for BeforeFirstToken {
+    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+        std::future::pending().await
+    }
+
+    async fn forward_chat_stream_async(
+        &self,
+        _: &Value,
+        _: &mut dyn capyctl_adapters::traits::ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        let _mark = MarkDropped(self.dropped.clone());
+        std::future::pending().await
+    }
+}
+
+// T17 T38 (SPEC §10, found live 2026-10-22): a client that hangs up before
+// the backend's first token cancels the forward at once, with no chunk to
+// fail delivery; without a durable ledger the slot stays charged, as for any
+// hang-up.
 #[tokio::test]
-async fn a_backend_that_completes_after_a_hang_up_releases_on_completion() {
+async fn a_hang_up_before_the_first_token_drops_the_forward() {
     let counts = Arc::new(InFlight::default());
-    let gate = Arc::new(Notify::new());
-    drop(response(
-        Forward {
-            chunks: 1,
-            chunk_bytes: 1,
-            finish: Ok(StreamEnded::Completed),
-            finish_gate: Some(gate.clone()),
-            cancel_on_failure: false,
-        },
-        &counts,
-    ));
-    assert_eq!(counts.current("d"), 1);
-    gate.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while counts.current("d") != 0 {
-            tokio::task::yield_now().await;
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let response = stream_response(
+        Arc::new(BeforeFirstToken {
+            dropped: dropped.clone(),
+        }),
+        json!({"model":"m"}),
+        counts.guard_arc("d"),
+        None,
+    )
+    .into_response();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+    drop(response);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("the forward outlived its client");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(counts.current("d"), 1);
 }
 
 #[tokio::test]
