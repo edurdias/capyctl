@@ -305,14 +305,21 @@ pub fn parking_qualified_in(
     })
 }
 
-/// ADR 0033 §6, measured by live row LC1 on host A. LC1_PENDING: these three
-/// figures are replaced by the measured defaults before the change merges
-/// (the largest measured overhead beyond the pool plus 25 %, rounded up to a
-/// whole 256 MiB; the largest per-process GPU memory chosen the same way; the
-/// slowest start to `/status` times 3, rounded up to whole 10 s, at least 30 s).
-pub const OVERHEAD_ALLOWANCE_BYTES: u64 = 2 * GIB; // LC1_PENDING
-pub const DEVICE_ALLOWANCE_BYTES: u64 = 1 << 30; // LC1_PENDING
-pub const SERVER_START_BOUND_MS: u64 = 60_000; // LC1_PENDING
+/// ADR 0033 §6: the defaults live row LC1 set on host A (GB10, 2026-10-22;
+/// LMCache 0.5.6, Qwen3-4B chat on vLLM 0.32.0 and SGLang 0.5.22, pools of 4
+/// and 8 GiB; 5 engine runs and 20 bare starts).
+///
+/// Overhead allowance: the largest resident memory LC1 measured beyond the
+/// pool, 824.3 MiB, plus 25 % (1030.4 MiB), rounded up to a whole 256 MiB.
+pub const OVERHEAD_ALLOWANCE_BYTES: u64 = 1280 << 20;
+/// Device allowance: the largest per-process GPU memory LC1 measured for the
+/// server while its engine ran, 408 MiB, plus 25 % (510 MiB), rounded up to a
+/// whole 256 MiB. On unified memory it is outside the resident set and inside
+/// the same pool (measured), so it is charged there beside the overhead.
+pub const DEVICE_ALLOWANCE_BYTES: u64 = 512 << 20;
+/// Start bound: the slowest start to `GET /status` LC1 measured, 4.80 s,
+/// times 3 (14.4 s), rounded up to whole 10 s (20 s), and never below 30 s.
+pub const SERVER_START_BOUND_MS: u64 = 30_000;
 
 /// ADR 0033 §1, contract decision 3: the LMCache package `capyctl engine add`
 /// found in the registered environment (`lmcache-*.dist-info`), recorded on
@@ -537,9 +544,18 @@ pub struct LmcacheCharge {
     /// The server's footprint beyond its pool, in the same domain: the
     /// allowance, or the deployment's measured figure.
     pub overhead_bytes: i64,
-    /// The server's own CUDA context in a discrete GPU's device domain: the
-    /// allowance, or the measured figure; zero elsewhere.
+    /// The server's per-process GPU memory: the allowance, or the measured
+    /// figure. On a discrete GPU it is charged to the device domain; on a
+    /// unified-memory machine it lies outside the server's resident set and
+    /// inside the one shared pool (measured by LC1), so it is charged there.
     pub device_bytes: i64,
+    /// The engine KV cache the server keeps mapped once its engine has exited
+    /// (measured by LC1: a stopped engine's whole KV cache stays held until
+    /// the next engine registers or the server stops). Charged only in the
+    /// parked phase of a `restart_only` park, in the device domain on a
+    /// discrete GPU, the shared pool elsewhere. The caller sets it from the
+    /// engine's KV cache; [`LmcachePlan::charge`] leaves it zero.
+    pub held_kv_bytes: i64,
 }
 
 impl LmcachePlan {
@@ -574,11 +590,8 @@ impl LmcachePlan {
         self.is_on().then(|| LmcacheCharge {
             pool_bytes: figure(self.pool_bytes),
             overhead_bytes: overhead_bytes.unwrap_or(figure(OVERHEAD_ALLOWANCE_BYTES)),
-            device_bytes: if self.discrete_gpu {
-                device_bytes.unwrap_or(figure(DEVICE_ALLOWANCE_BYTES))
-            } else {
-                0
-            },
+            device_bytes: device_bytes.unwrap_or(figure(DEVICE_ALLOWANCE_BYTES)),
+            held_kv_bytes: 0,
         })
     }
 
@@ -756,12 +769,19 @@ pub fn apply_charge<F: ChargeFootprints + ?Sized>(
             allocations.clear_allocations();
         }
         allocations.add_charge(&domains.system, system, charge.pool_bytes);
-        if let Some(device) = domains
-            .device
-            .as_deref()
-            .filter(|_| charge.device_bytes > 0)
-        {
-            allocations.add_charge(device, charge.device_bytes, 0);
+        // LC1: the server's GPU memory, and while its engine is stopped the
+        // engine KV it keeps mapped, land in the device domain on a discrete
+        // GPU and in the one shared pool on unified memory.
+        let gpu = charge
+            .device_bytes
+            .saturating_add(if parked && restart_park {
+                charge.held_kv_bytes
+            } else {
+                0
+            });
+        if gpu > 0 {
+            let domain = domains.device.as_deref().unwrap_or(&domains.system);
+            allocations.add_charge(domain, gpu, 0);
         }
     }
 }
@@ -1548,8 +1568,8 @@ mod tests {
 
     // T45 T25 (ADR 0033 §6): the charge is the pool plus the overhead
     // allowance in the system domain, the pool against host_kv_limit, the
-    // device allowance on a discrete GPU only; measured figures replace the
-    // allowances; nothing is charged while off.
+    // device allowance on unified memory and on a discrete GPU alike (LC1);
+    // measured figures replace the allowances; nothing is charged while off.
     #[test]
     fn the_charge() {
         let registration = registered();
@@ -1561,7 +1581,8 @@ mod tests {
             Some(LmcacheCharge {
                 pool_bytes: 4 << 30,
                 overhead_bytes: allowance(OVERHEAD_ALLOWANCE_BYTES),
-                device_bytes: 0,
+                device_bytes: allowance(DEVICE_ALLOWANCE_BYTES),
+                held_kv_bytes: 0,
             })
         );
         let discrete = plan(&PlanInputs {
@@ -1575,6 +1596,7 @@ mod tests {
                 pool_bytes: 8 << 30,
                 overhead_bytes: allowance(OVERHEAD_ALLOWANCE_BYTES),
                 device_bytes: allowance(DEVICE_ALLOWANCE_BYTES),
+                held_kv_bytes: 0,
             })
         );
         assert_eq!(
@@ -1583,6 +1605,7 @@ mod tests {
                 pool_bytes: 8 << 30,
                 overhead_bytes: 700 << 20,
                 device_bytes: 300 << 20,
+                held_kv_bytes: 0,
             })
         );
         let off = plan(&PlanInputs {
@@ -1669,12 +1692,13 @@ mod tests {
         pool_bytes: 4 * G,
         overhead_bytes: 2 * G,
         device_bytes: G,
+        held_kv_bytes: 2 * G,
     };
 
-    // T45 T24 (ADR 0033 §6, §7): on unified memory every phase, parked
-    // included, gains pool plus overhead in the one shared domain with the
-    // pool as host KV; a restart_only park is the charge alone; the device
-    // figure never lands without a device domain.
+    // T45 T24 (ADR 0033 §6, §7, LC1): on unified memory every phase, parked
+    // included, gains pool, overhead and the server's GPU memory in the one
+    // shared domain with the pool as host KV; a restart_only park is the
+    // charge alone plus the engine KV the server keeps mapped.
     #[test]
     fn the_overlay_on_unified_memory() {
         let domains = charge_domains(&unified_host(), &gpu0()).unwrap();
@@ -1694,9 +1718,9 @@ mod tests {
         };
         let mut deep = engine.clone();
         apply_charge(&mut deep, &CHARGE, false, &domains);
-        assert_eq!(deep.cold.allocations[0].bytes, 26 * G);
+        assert_eq!(deep.cold.allocations[0].bytes, 27 * G);
         assert_eq!(deep.cold.allocations[0].host_kv_bytes, 5 * G);
-        assert_eq!(deep.parked.allocations[0].bytes, 8 * G);
+        assert_eq!(deep.parked.allocations[0].bytes, 9 * G);
         assert_eq!(deep.parked.allocations[0].host_kv_bytes, 4 * G);
         assert_eq!(deep.wake.allocations.len(), 1);
         let mut restart = engine.clone();
@@ -1706,7 +1730,7 @@ mod tests {
             restart.parked.allocations,
             vec![crate::effective::Allocation {
                 domain: "unified".into(),
-                bytes: 6 * G,
+                bytes: 9 * G,
                 host_kv_bytes: 4 * G,
             }]
         );
@@ -1757,7 +1781,7 @@ mod tests {
         let mut restart = engine.clone();
         apply_charge(&mut restart, &CHARGE, true, &domains);
         assert_eq!(find(&restart.parked, "system"), Some((6 * G, 4 * G)));
-        assert_eq!(find(&restart.parked, "gpu0"), Some((G, 0)));
+        assert_eq!(find(&restart.parked, "gpu0"), Some((3 * G, 0)));
         for allocation in every_allocation(&charged).chain(every_allocation(&restart)) {
             assert!(
                 allocation.host_kv_bytes <= allocation.bytes,
@@ -1789,7 +1813,8 @@ mod tests {
         let mut ledger_side = convert(&engine);
         apply_charge(&mut ledger_side, &CHARGE, true, &domains);
         assert_eq!(ledger_side, convert(&restart));
-        // Without a device figure no device allocation is opened.
+        // Without a device figure (and outside a restart park) no device
+        // allocation is opened.
         let mut no_device = engine.clone();
         let unified_charge = LmcacheCharge {
             device_bytes: 0,
