@@ -32,9 +32,15 @@ fresh state proceeds under any name, and another name is refused
 the errors page documents the code with its exit. Docs: the errors guide, the
 exit-code table and the container section of the install guide.
 
-CPU and Fake-engine tests are not qualification. Still to check live: a
-standalone container recreated without `--hostname` on existing state refuses
-with `host_name_changed`, and recreated with the stored hostname starts.
+CPU and Fake-engine tests are not qualification. Live on the laptop,
+2026-10-21 (release build of `main` d9d5640d with this branch and
+`fix/discrete-startup-peak`, the discrete container setup: `ubuntu:24.04`,
+CDI, `--user 1000:1000`): on state created under `--hostname capyctl-laptop`
+with a stopped vLLM deployment, the container recreated without `--hostname`
+(hostname `22be0919ef8d`) exited 2 with `host_name_changed` naming
+`capyctl-laptop`, `22be0919ef8d` and `docker run --hostname capyctl-laptop`;
+recreated with `--hostname capyctl-laptop` it started, its host online and the
+deployment listed.
 
 # Release note: Fixes
 
