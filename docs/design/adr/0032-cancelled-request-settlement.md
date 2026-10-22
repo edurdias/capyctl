@@ -2,7 +2,8 @@
 
 **Status:** Accepted (owner decisions 2026-10-21). Proposed 2026-10-21; the owner answered
 every open question the same day, and the answers are recorded below ("Owner decisions of
-2026-10-21"). Not implemented yet; the plan targets 0.1.7.
+2026-10-21"). Implemented 2026-10-22 for 0.1.7 (branch `feat/sglang-request-abort`; its
+change file `docs/changes/sglang-request-abort.md` records the live rows L1–L4).
 **Amends (with the implementation):** `SPEC.md` §10 (amended 2026-10-01: when a
 `cancelling` request settles; note of 2026-10-19: CapyCTL's request ID crosses a host's
 ingress), §13.1 (the "cancel supported work" operation family becomes a host-agent
